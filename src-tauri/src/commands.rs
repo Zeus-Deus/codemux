@@ -8,8 +8,12 @@ use crate::memory::{
     HandoffPacket, MemoryEntryKind, MemorySource, ProjectMemorySnapshot, ProjectMemoryUpdate,
 };
 use crate::openflow::{
-    OpenFlowCreateRunRequest, OpenFlowDesignSpec, OpenFlowRunRecord, OpenFlowRuntimeSnapshot,
-    OpenFlowRuntimeStore,
+    OpenFlowCreateRunRequest, OpenFlowDesignSpec, OpenFlowRunRecord, OpenFlowRunStatus,
+    OpenFlowRuntimeSnapshot, OpenFlowRuntimeStore,
+};
+use crate::observability::{
+    FeatureFlags, LogLevel, ObservabilitySnapshot, ObservabilityStore, PermissionPolicy,
+    SafetyConfig,
 };
 use crate::state::{AppStateSnapshot, AppStateStore, NotificationLevel};
 use notify_rust::Notification;
@@ -522,4 +526,100 @@ pub fn retry_openflow_run(
     run_id: String,
 ) -> Result<OpenFlowRunRecord, String> {
     store.retry_run(&run_id)
+}
+
+#[tauri::command]
+pub fn run_openflow_autonomous_loop(
+    store: State<'_, OpenFlowRuntimeStore>,
+    run_id: String,
+) -> Result<OpenFlowRunRecord, String> {
+    store.run_autonomous_loop(&run_id)
+}
+
+#[tauri::command]
+pub fn apply_openflow_review_result(
+    store: State<'_, OpenFlowRuntimeStore>,
+    run_id: String,
+    reviewer_score: u8,
+    accepted: bool,
+    issue: Option<String>,
+) -> Result<OpenFlowRunRecord, String> {
+    store.apply_review_result(&run_id, reviewer_score, accepted, issue)
+}
+
+#[tauri::command]
+pub fn stop_openflow_run(
+    store: State<'_, OpenFlowRuntimeStore>,
+    run_id: String,
+    status: String,
+    reason: String,
+) -> Result<OpenFlowRunRecord, String> {
+    let status = match status.as_str() {
+        "failed" => OpenFlowRunStatus::Failed,
+        "cancelled" => OpenFlowRunStatus::Cancelled,
+        "awaiting_approval" => OpenFlowRunStatus::AwaitingApproval,
+        _ => OpenFlowRunStatus::Failed,
+    };
+    store.stop_run(&run_id, status, reason)
+}
+
+#[tauri::command]
+pub fn get_observability_snapshot(
+    store: State<'_, ObservabilityStore>,
+) -> Result<ObservabilitySnapshot, String> {
+    Ok(store.snapshot())
+}
+
+#[tauri::command]
+pub fn add_structured_log(
+    store: State<'_, ObservabilityStore>,
+    source: String,
+    level: String,
+    message: String,
+    metadata: Vec<(String, String)>,
+) -> Result<(), String> {
+    let level = match level.as_str() {
+        "warning" => LogLevel::Warning,
+        "error" => LogLevel::Error,
+        _ => LogLevel::Info,
+    };
+    store.log(&source, level, message, metadata);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_feature_flags(
+    store: State<'_, ObservabilityStore>,
+    flags: FeatureFlags,
+) -> Result<(), String> {
+    store.set_feature_flags(flags);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_permission_policy(
+    store: State<'_, ObservabilityStore>,
+    policy: PermissionPolicy,
+) -> Result<(), String> {
+    store.set_permission_policy(policy);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn update_safety_config(
+    store: State<'_, ObservabilityStore>,
+    config: SafetyConfig,
+) -> Result<(), String> {
+    store.set_safety_config(config);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn add_replay_record(
+    store: State<'_, ObservabilityStore>,
+    title: String,
+    summary: String,
+) -> Result<(), String> {
+    store.add_replay_record(title, summary);
+    Ok(())
 }

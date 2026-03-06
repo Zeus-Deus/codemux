@@ -32,7 +32,10 @@
         generateProjectHandoff,
         createOpenFlowRun,
         advanceOpenFlowRunPhase,
+        applyOpenFlowReviewResult,
         retryOpenFlowRun,
+        runOpenFlowAutonomousLoop,
+        stopOpenFlowRun,
         splitPane
     } from './stores/appState';
     import PaneNode from './components/panes/PaneNode.svelte';
@@ -314,6 +317,46 @@
         }
     }
 
+    async function handleRunOpenFlowLoop(runId: string) {
+        try {
+            await runOpenFlowAutonomousLoop(runId);
+        } catch (error) {
+            console.error(`Failed to run OpenFlow loop for ${runId}:`, error);
+        }
+    }
+
+    async function handleApproveOpenFlowRun(runId: string) {
+        try {
+            await applyOpenFlowReviewResult(runId, 95, true, null);
+        } catch (error) {
+            console.error(`Failed to approve OpenFlow run ${runId}:`, error);
+        }
+    }
+
+    async function handleRejectOpenFlowRun(runId: string) {
+        try {
+            await applyOpenFlowReviewResult(runId, 58, false, 'Reviewer requested additional fixes');
+        } catch (error) {
+            console.error(`Failed to reject OpenFlow run ${runId}:`, error);
+        }
+    }
+
+    async function handlePauseOpenFlowRun(runId: string) {
+        try {
+            await stopOpenFlowRun(runId, 'awaiting_approval', 'Paused for user approval');
+        } catch (error) {
+            console.error(`Failed to pause OpenFlow run ${runId}:`, error);
+        }
+    }
+
+    async function handleCancelOpenFlowRun(runId: string) {
+        try {
+            await stopOpenFlowRun(runId, 'cancelled', 'Cancelled by user');
+        } catch (error) {
+            console.error(`Failed to cancel OpenFlow run ${runId}:`, error);
+        }
+    }
+
     function workspaceNotifications(workspaceId: string) {
         return $appState?.notifications.filter((notification) => notification.workspace_id === workspaceId) ?? [];
     }
@@ -575,12 +618,26 @@
                                 <small>{run.goal}</small>
                                 <div class="openflow-run-actions">
                                     <button type="button" onclick={() => handleAdvanceOpenFlowRun(run.run_id)}>Advance</button>
+                                    <button type="button" onclick={() => handleRunOpenFlowLoop(run.run_id)}>Loop</button>
                                     <button type="button" onclick={() => handleRetryOpenFlowRun(run.run_id)}>Retry</button>
+                                    <button type="button" onclick={() => handlePauseOpenFlowRun(run.run_id)}>Pause</button>
+                                    <button type="button" onclick={() => handleCancelOpenFlowRun(run.run_id)}>Cancel</button>
                                 </div>
                                 <div class="openflow-run-meta">
                                     <span>Roles: {run.assigned_roles.join(', ')}</span>
                                     <span>Tasks: {run.task_graph.length}</span>
                                     <span>Resumable: {run.resumable ? 'yes' : 'no'}</span>
+                                    <span>Verify: {run.verification_required ? 'yes' : 'done'}</span>
+                                    <span>Browser checks: {run.browser_validation_required ? 'yes' : 'done'}</span>
+                                    <span>Commands: {run.command_validation_required ? 'yes' : 'done'}</span>
+                                </div>
+                                <div class="openflow-run-meta">
+                                    <span>Reviewer score: {run.reviewer_score ?? 'pending'}</span>
+                                    <span>Stop reason: {run.stop_reason ?? 'none'}</span>
+                                </div>
+                                <div class="openflow-run-actions">
+                                    <button type="button" onclick={() => handleApproveOpenFlowRun(run.run_id)}>Approve</button>
+                                    <button type="button" onclick={() => handleRejectOpenFlowRun(run.run_id)}>Request Fixes</button>
                                 </div>
                             </div>
                         {/each}

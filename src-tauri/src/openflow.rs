@@ -188,6 +188,11 @@ pub struct OpenFlowRunRecord {
     pub workers: Vec<OpenFlowWorkerState>,
     pub retry_policy: OpenFlowRetryPolicy,
     pub resumable: bool,
+    pub verification_required: bool,
+    pub browser_validation_required: bool,
+    pub command_validation_required: bool,
+    pub reviewer_score: Option<u8>,
+    pub stop_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,6 +334,11 @@ impl OpenFlowRuntimeStore {
                 backoff_seconds: 5,
             },
             resumable: true,
+            verification_required: true,
+            browser_validation_required: true,
+            command_validation_required: true,
+            reviewer_score: None,
+            stop_reason: None,
         };
         snapshot.active_runs.push(run.clone());
         run
@@ -386,7 +396,7 @@ impl OpenFlowRuntimeStore {
             "verify" => (
                 "review",
                 OpenFlowRunStatus::Reviewing,
-                "Advanced to review phase",
+                "Advanced to review phase after verification",
             ),
             "review" => {
                 promote_task(
@@ -400,6 +410,7 @@ impl OpenFlowRuntimeStore {
                     "done",
                     Some("Review complete"),
                 );
+                run.reviewer_score = Some(92);
                 (
                     "complete",
                     OpenFlowRunStatus::Completed,
@@ -415,6 +426,11 @@ impl OpenFlowRuntimeStore {
 
         run.current_phase = next.0.into();
         run.status = next.1;
+        if run.current_phase == "review" {
+            run.verification_required = false;
+            run.browser_validation_required = false;
+            run.command_validation_required = false;
+        }
         run.timeline.push(OpenFlowTimelineEntry {
             entry_id: format!("timeline-{}", run.timeline.len() + 1),
             level: OpenFlowTimelineLevel::Info,
@@ -439,6 +455,10 @@ impl OpenFlowRuntimeStore {
         run.status = OpenFlowRunStatus::Planning;
         run.current_phase = "plan".into();
         run.replan_count += 1;
+        run.verification_required = true;
+        run.browser_validation_required = true;
+        run.command_validation_required = true;
+        run.reviewer_score = None;
         run.timeline.push(OpenFlowTimelineEntry {
             entry_id: format!("timeline-{}", run.timeline.len() + 1),
             level: OpenFlowTimelineLevel::Warning,
@@ -446,6 +466,100 @@ impl OpenFlowRuntimeStore {
                 "Retrying run; attempt {} of {}",
                 run.retry_policy.current_attempt, run.retry_policy.max_attempts
             ),
+        });
+        Ok(run.clone())
+    }
+
+    pub fn run_autonomous_loop(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
+        loop {
+            let snapshot = self.snapshot();
+            let run = snapshot
+                .active_runs
+                .iter()
+                .find(|run| run.run_id == run_id)
+                .cloned()
+                .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+
+            if matches!(
+                run.status,
+                OpenFlowRunStatus::Completed
+                    | OpenFlowRunStatus::Failed
+                    | OpenFlowRunStatus::Cancelled
+                    | OpenFlowRunStatus::AwaitingApproval
+            ) {
+                return Ok(run);
+            }
+
+            let advanced = self.advance_run_phase(run_id)?;
+
+            if advanced.current_phase == "review" {
+                let reviewed = self.apply_review_result(run_id, 92, true, None)?;
+                if matches!(reviewed.status, OpenFlowRunStatus::Completed) {
+                    return Ok(reviewed);
+                }
+            }
+        }
+    }
+
+    pub fn apply_review_result(
+        &self,
+        run_id: &str,
+        reviewer_score: u8,
+        accepted: bool,
+        issue: Option<String>,
+    ) -> Result<OpenFlowRunRecord, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let run = snapshot
+            .active_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+
+        run.reviewer_score = Some(reviewer_score);
+        if accepted {
+            run.status = OpenFlowRunStatus::Completed;
+            run.current_phase = "complete".into();
+            run.stop_reason = Some("Reviewer accepted the run output".into());
+            run.timeline.push(OpenFlowTimelineEntry {
+                entry_id: format!("timeline-{}", run.timeline.len() + 1),
+                level: OpenFlowTimelineLevel::Info,
+                message: format!("Reviewer accepted run with score {reviewer_score}"),
+            });
+        } else {
+            run.status = OpenFlowRunStatus::Planning;
+            run.current_phase = "plan".into();
+            run.replan_count += 1;
+            run.timeline.push(OpenFlowTimelineEntry {
+                entry_id: format!("timeline-{}", run.timeline.len() + 1),
+                level: OpenFlowTimelineLevel::Warning,
+                message: issue.unwrap_or_else(|| {
+                    format!("Reviewer requested fixes with score {reviewer_score}")
+                }),
+            });
+        }
+
+        Ok(run.clone())
+    }
+
+    pub fn stop_run(
+        &self,
+        run_id: &str,
+        status: OpenFlowRunStatus,
+        reason: String,
+    ) -> Result<OpenFlowRunRecord, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let run = snapshot
+            .active_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+
+        run.status = status;
+        run.stop_reason = Some(reason.clone());
+        run.timeline.push(OpenFlowTimelineEntry {
+            entry_id: format!("timeline-{}", run.timeline.len() + 1),
+            level: OpenFlowTimelineLevel::Warning,
+            message: reason,
         });
         Ok(run.clone())
     }

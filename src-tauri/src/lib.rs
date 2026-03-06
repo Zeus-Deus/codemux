@@ -7,6 +7,7 @@ pub mod control;
 pub mod indexing;
 pub mod memory;
 pub mod openflow;
+pub mod observability;
 pub mod state;
 pub mod terminal;
 
@@ -17,6 +18,7 @@ pub fn run() {
         .manage(commands::BrowserAutomationCoordinator::default())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
+        .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -26,6 +28,9 @@ pub fn run() {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(snapshot);
             }
+            let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
+            observability.increment_metric("startup_count");
+            observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
             config::watch_theme_file(handle.clone());
             terminal::spawn_initial_pty(handle);
             let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
@@ -71,6 +76,15 @@ pub fn run() {
             commands::create_openflow_run,
             commands::advance_openflow_run_phase,
             commands::retry_openflow_run,
+            commands::run_openflow_autonomous_loop,
+            commands::apply_openflow_review_result,
+            commands::stop_openflow_run,
+            commands::get_observability_snapshot,
+            commands::add_structured_log,
+            commands::update_feature_flags,
+            commands::update_permission_policy,
+            commands::update_safety_config,
+            commands::add_replay_record,
             terminal::create_terminal_session,
             terminal::activate_terminal_session,
             terminal::close_terminal_session,

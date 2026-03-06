@@ -14,6 +14,13 @@ package/
 src-tauri/target/
 src-tauri/gen/
 
+# Codemux local project state
+.codemux/index.json
+.codemux/project-memory.json
+
+# Local editor/IDE folders
+.vscode/
+
 # Environment files (keep template)
 .env
 .env.*

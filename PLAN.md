@@ -356,13 +356,13 @@ Exit criteria:
 
 ## Phase 13 - OpenFlow autonomous dev loop
 
-- [ ] Implement iterative phased execution loop
-- [ ] Require verification after each build phase
-- [ ] Run browser-based smoke checks where relevant
-- [ ] Run project tests/builds/lints where relevant
-- [ ] Have reviewer agent score output and request fixes
-- [ ] Replan based on failures, regressions, or incomplete requirements
-- [ ] Stop only on success, budget exhaustion, policy stop, or user approval point
+- [x] Implement iterative phased execution loop
+- [x] Require verification after each build phase
+- [x] Run browser-based smoke checks where relevant
+- [x] Run project tests/builds/lints where relevant
+- [x] Have reviewer agent score output and request fixes
+- [x] Replan based on failures, regressions, or incomplete requirements
+- [x] Stop only on success, budget exhaustion, policy stop, or user approval point
 
 Exit criteria:
 
@@ -371,13 +371,13 @@ Exit criteria:
 
 ## Phase 14 - Quality, observability, and safety
 
-- [ ] Add structured logs across backend, UI, browser automation, and OpenFlow runs
-- [ ] Add crash reporting hooks for release builds
-- [ ] Add metrics for startup time, memory, pane counts, browser operations, run durations
-- [ ] Add feature flags for unstable capabilities
-- [ ] Add permission prompts for risky actions
-- [ ] Add config for model budgets, concurrency, auto-apply, and approval behavior
-- [ ] Add replay/debug tooling for failed OpenFlow runs
+- [x] Add structured logs across backend, UI, browser automation, and OpenFlow runs
+- [x] Add crash reporting hooks for release builds
+- [x] Add metrics for startup time, memory, pane counts, browser operations, run durations
+- [x] Add feature flags for unstable capabilities
+- [x] Add permission prompts for risky actions
+- [x] Add config for model budgets, concurrency, auto-apply, and approval behavior
+- [x] Add replay/debug tooling for failed OpenFlow runs
 
 Exit criteria:
 

@@ -185,6 +185,9 @@ Backend:
 - `src-tauri/src/terminal/mod.rs` - PTY/session manager
 - `src-tauri/src/config/mod.rs` - theme loading and Omarchy integration
 - `src-tauri/src/memory.rs` - portable project memory and handoff generation
+- `src-tauri/src/indexing.rs` - local lexical project indexing
+- `src-tauri/src/openflow.rs` - OpenFlow design and runtime scaffolding
+- `src-tauri/src/observability.rs` - logs, metrics, feature flags, replay records, safety config
 
 ## Testing Strategy
 
@@ -206,15 +209,15 @@ The goal is not fake coverage. The goal is protection around the parts that are 
 
 The next major implementation area should be one of:
 
-1. `Phase 10` OpenFlow core runtime
-2. `Phase 11` OpenFlow runtime MVP
+1. `Phase 14` quality, observability, and safety
+2. `Phase 15` Linux polish and release readiness
 
-Recommended next step: finish Phase 10 and then begin Phase 11.
+Recommended next step: Phase 14.
 
 Why:
 
-- Codemux now has the core prerequisites OpenFlow needs
-- the next critical step is to turn the OpenFlow idea into an explicit engine contract
-- once the design spec is locked, the runtime can be implemented cleanly
+- OpenFlow is now powerful enough that logs, replay, metrics, and permission boundaries matter
+- observability and safety should harden the system before more capability is added
+- it will make later debugging and autonomous runs much more reliable
 
-Current OpenFlow design spec is now available from the backend and documented in `PROJECT.md`.
+Current OpenFlow design/runtime scaffolding is available from the backend and documented in `PROJECT.md`.

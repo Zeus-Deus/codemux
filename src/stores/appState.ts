@@ -167,6 +167,11 @@ export interface OpenFlowRunRecord {
     workers: OpenFlowWorkerState[];
     retry_policy: OpenFlowRetryPolicy;
     resumable: boolean;
+    verification_required: boolean;
+    browser_validation_required: boolean;
+    command_validation_required: boolean;
+    reviewer_score: number | null;
+    stop_reason: string | null;
 }
 
 export interface OpenFlowRuntimeSnapshot {
@@ -439,6 +444,41 @@ export async function advanceOpenFlowRunPhase(runId: string) {
 
 export async function retryOpenFlowRun(runId: string) {
     const run = await invoke<OpenFlowRunRecord>('retry_openflow_run', { runId });
+    const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
+    openflowRuntime.set(snapshot);
+    return run;
+}
+
+export async function runOpenFlowAutonomousLoop(runId: string) {
+    const run = await invoke<OpenFlowRunRecord>('run_openflow_autonomous_loop', { runId });
+    const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
+    openflowRuntime.set(snapshot);
+    return run;
+}
+
+export async function applyOpenFlowReviewResult(
+    runId: string,
+    reviewerScore: number,
+    accepted: boolean,
+    issue?: string | null
+) {
+    const run = await invoke<OpenFlowRunRecord>('apply_openflow_review_result', {
+        runId,
+        reviewerScore,
+        accepted,
+        issue
+    });
+    const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
+    openflowRuntime.set(snapshot);
+    return run;
+}
+
+export async function stopOpenFlowRun(runId: string, status: 'failed' | 'cancelled' | 'awaiting_approval', reason: string) {
+    const run = await invoke<OpenFlowRunRecord>('stop_openflow_run', {
+        runId,
+        status,
+        reason
+    });
     const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
     openflowRuntime.set(snapshot);
     return run;
