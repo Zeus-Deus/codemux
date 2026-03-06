@@ -1,0 +1,326 @@
+<script lang="ts">
+    import { onDestroy, onMount } from 'svelte';
+    import { Terminal } from '@xterm/xterm';
+    import type { ITheme } from '@xterm/xterm';
+    import { FitAddon } from '@xterm/addon-fit';
+    import { WebglAddon } from '@xterm/addon-webgl';
+    import { Channel, invoke } from '@tauri-apps/api/core';
+    import { listen } from '@tauri-apps/api/event';
+    import { theme, fallbackTheme } from '../../stores/theme';
+    import '@xterm/xterm/css/xterm.css';
+
+    type DisposeHandle = { dispose: () => void };
+
+    let { sessionId }: { sessionId: string } = $props();
+
+    interface TerminalStatusPayload {
+        session_id: string;
+        state: 'starting' | 'ready' | 'exited' | 'failed';
+        message: string | null;
+        exit_code: number | null;
+    }
+
+    let terminalContainer: HTMLDivElement;
+    let term: Terminal | null = null;
+    let fitAddon: FitAddon | null = null;
+    let resizeObserver: ResizeObserver | null = null;
+    let dataDisposable: DisposeHandle | null = null;
+    let resizeHandler: (() => void) | null = null;
+    let themeUnsubscribe: (() => void) | null = null;
+    let statusUnlisten: (() => void) | null = null;
+    let currentSessionId = $derived(sessionId);
+    let terminalStatus = $state<TerminalStatusPayload>({
+        session_id: '',
+        state: 'starting',
+        message: 'Starting shell...',
+        exit_code: null
+    });
+
+    $effect(() => {
+        terminalStatus.session_id = currentSessionId;
+    });
+
+    function terminalTheme(): ITheme {
+        const css = getComputedStyle(document.documentElement);
+        return {
+            background: css.getPropertyValue('--theme-background').trim() || fallbackTheme.background,
+            foreground: css.getPropertyValue('--theme-foreground').trim() || fallbackTheme.foreground,
+            cursor: css.getPropertyValue('--theme-cursor').trim() || fallbackTheme.cursor,
+            selectionBackground:
+                css.getPropertyValue('--theme-selection-background').trim() || fallbackTheme.selection_background,
+            selectionForeground:
+                css.getPropertyValue('--theme-selection-foreground').trim() || fallbackTheme.selection_foreground,
+            black: css.getPropertyValue('--theme-color0').trim() || fallbackTheme.color0,
+            red: css.getPropertyValue('--theme-color1').trim() || fallbackTheme.color1,
+            green: css.getPropertyValue('--theme-color2').trim() || fallbackTheme.color2,
+            yellow: css.getPropertyValue('--theme-color3').trim() || fallbackTheme.color3,
+            blue: css.getPropertyValue('--theme-color4').trim() || fallbackTheme.color4,
+            magenta: css.getPropertyValue('--theme-color5').trim() || fallbackTheme.color5,
+            cyan: css.getPropertyValue('--theme-color6').trim() || fallbackTheme.color6,
+            white: css.getPropertyValue('--theme-color7').trim() || fallbackTheme.color7,
+            brightBlack: css.getPropertyValue('--theme-color8').trim() || fallbackTheme.color8,
+            brightRed: css.getPropertyValue('--theme-color9').trim() || fallbackTheme.color9,
+            brightGreen: css.getPropertyValue('--theme-color10').trim() || fallbackTheme.color10,
+            brightYellow: css.getPropertyValue('--theme-color11').trim() || fallbackTheme.color11,
+            brightBlue: css.getPropertyValue('--theme-color12').trim() || fallbackTheme.color12,
+            brightMagenta: css.getPropertyValue('--theme-color13').trim() || fallbackTheme.color13,
+            brightCyan: css.getPropertyValue('--theme-color14').trim() || fallbackTheme.color14,
+            brightWhite: css.getPropertyValue('--theme-color15').trim() || fallbackTheme.color15
+        };
+    }
+
+    function applyTerminalTheme() {
+        if (!term) {
+            return;
+        }
+
+        term.options.theme = terminalTheme();
+        fitAddon?.fit();
+    }
+
+    function clearTerminal() {
+        term?.reset();
+    }
+
+    function writePtyChunk(payload: unknown) {
+        if (!term) {
+            return;
+        }
+
+        if (payload instanceof Uint8Array) {
+            term.write(payload);
+            return;
+        }
+
+        if (payload instanceof ArrayBuffer) {
+            term.write(new Uint8Array(payload));
+            return;
+        }
+
+        if (Array.isArray(payload)) {
+            term.write(new Uint8Array(payload as number[]));
+            return;
+        }
+
+        if (typeof payload === 'string') {
+            term.write(payload);
+        }
+    }
+
+    async function syncTerminalSize() {
+        if (!term || !fitAddon) {
+            return;
+        }
+
+        fitAddon.fit();
+
+        if (term.cols === 0 || term.rows === 0) {
+            return;
+        }
+
+        try {
+            await invoke('resize_pty', { cols: term.cols, rows: term.rows, sessionId: currentSessionId });
+        } catch (error) {
+            console.error(`Failed to resize PTY for ${currentSessionId}:`, error);
+        }
+    }
+
+    async function attachSession() {
+        if (!term) {
+            return;
+        }
+
+        clearTerminal();
+
+        try {
+            terminalStatus = await invoke<TerminalStatusPayload>('get_terminal_status', { sessionId: currentSessionId });
+        } catch (error) {
+            terminalStatus = {
+                session_id: currentSessionId,
+                state: 'failed',
+                message: `Failed to read terminal status: ${String(error)}`,
+                exit_code: null
+            };
+        }
+
+        const ptyOutChannel = new Channel<unknown>((payload) => {
+            writePtyChunk(payload);
+        });
+
+        try {
+            await invoke('attach_pty_output', { channel: ptyOutChannel, sessionId: currentSessionId });
+        } catch (error) {
+            terminalStatus = {
+                session_id: currentSessionId,
+                state: 'failed',
+                message: `Failed to attach terminal output: ${String(error)}`,
+                exit_code: null
+            };
+        }
+
+        await syncTerminalSize();
+    }
+
+    onMount(async () => {
+        term = new Terminal({
+            fontFamily: 'monospace',
+            theme: terminalTheme(),
+            allowProposedApi: false,
+            convertEol: true,
+            cursorBlink: true
+        });
+
+        fitAddon = new FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(terminalContainer);
+
+        try {
+            const webglAddon = new WebglAddon();
+            term.loadAddon(webglAddon);
+        } catch (error) {
+            console.warn('WebGL addon could not be loaded, falling back to canvas/dom renderer', error);
+        }
+
+        themeUnsubscribe = theme.subscribe(() => {
+            applyTerminalTheme();
+        });
+
+        statusUnlisten = await listen<TerminalStatusPayload>('terminal-status', (event) => {
+            if (event.payload.session_id !== currentSessionId) {
+                return;
+            }
+            terminalStatus = event.payload;
+        });
+
+        dataDisposable = term.onData((data) => {
+            invoke('write_to_pty', { data, sessionId: currentSessionId }).catch((error) => {
+                console.error(`Failed to write to PTY for ${currentSessionId}:`, error);
+                terminalStatus = {
+                    session_id: currentSessionId,
+                    state: 'failed',
+                    message: `Failed to write to shell: ${String(error)}`,
+                    exit_code: null
+                };
+            });
+        });
+
+        await attachSession();
+
+        resizeHandler = () => {
+            void syncTerminalSize();
+        };
+        window.addEventListener('resize', resizeHandler);
+
+        resizeObserver = new ResizeObserver(() => {
+            void syncTerminalSize();
+        });
+        resizeObserver.observe(terminalContainer);
+    });
+
+    $effect(() => {
+        if (!term) {
+            return;
+        }
+
+        void attachSession();
+    });
+
+    onDestroy(() => {
+        if (resizeHandler) {
+            window.removeEventListener('resize', resizeHandler);
+        }
+        if (dataDisposable) {
+            dataDisposable.dispose();
+        }
+        if (statusUnlisten) {
+            statusUnlisten();
+        }
+        if (themeUnsubscribe) {
+            themeUnsubscribe();
+        }
+        term?.dispose();
+        resizeObserver?.disconnect();
+    });
+</script>
+
+<div class="terminal-shell">
+    <div class="terminal-wrapper" bind:this={terminalContainer}></div>
+
+    {#if terminalStatus.state !== 'ready'}
+        <div class={`terminal-overlay ${terminalStatus.state}`}>
+            <div class="overlay-card">
+                <h2>{terminalStatus.state === 'failed' ? 'Terminal unavailable' : 'Terminal starting'}</h2>
+                <p>{terminalStatus.message ?? 'Waiting for shell status...'}</p>
+                {#if terminalStatus.exit_code !== null}
+                    <span class="status-meta">Exit code: {terminalStatus.exit_code}</span>
+                {/if}
+            </div>
+        </div>
+    {/if}
+</div>
+
+<style>
+    .terminal-shell {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        background: var(--theme-background, #1a1b26);
+    }
+
+    .terminal-wrapper {
+        display: block;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        padding: 4px;
+        box-sizing: border-box;
+    }
+
+    .terminal-overlay {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 88%, black 12%);
+    }
+
+    .overlay-card {
+        width: min(440px, 100%);
+        padding: 20px;
+        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
+        border-radius: 14px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, white 8%);
+        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+    }
+
+    .overlay-card h2 {
+        margin: 0 0 8px;
+        font-size: 1rem;
+        color: var(--theme-foreground, #c0caf5);
+    }
+
+    .overlay-card p {
+        margin: 0;
+        line-height: 1.45;
+        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 78%, white 22%);
+    }
+
+    .status-meta {
+        display: inline-block;
+        margin-top: 12px;
+        font-size: 0.85rem;
+        color: var(--theme-accent, #7aa2f7);
+    }
+
+    .terminal-overlay.failed .overlay-card {
+        border-color: color-mix(in srgb, #f7768e 45%, transparent);
+    }
+
+    :global(.terminal-wrapper .terminal) {
+        height: 100%;
+    }
+</style>

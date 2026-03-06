@@ -1,0 +1,46 @@
+---
+description: "CodeMux core architecture & folder structure"
+alwaysApply: true
+---
+
+You are an expert in Tauri 2 + Svelte + Rust for Omarchy/Hyprland projects.
+
+Enforce this project structure 100%:
+
+- Never create files outside the defined folders.
+- Rust = all heavy logic (terminal, config, sockets, agent API).
+- Svelte = UI only (sidebar, splits, glowing rings).
+- Keep every file small and modular. Never put everything in one file.
+- Follow the exact tree:
+
+codemux/
+├── src-tauri/
+│ ├── src/
+│ │ ├── main.rs
+│ │ ├── lib.rs
+│ │ ├── commands.rs
+│ │ ├── state.rs
+│ │ ├── config/
+│ │ ├── terminal/
+│ │ ├── browser/
+│ │ ├── agent/
+│ │ ├── ui/
+│ │ └── error.rs
+│ ├── Cargo.toml
+│ └── tauri.conf.json
+├── src/
+│ ├── components/
+│ │ ├── sidebar/
+│ │ ├── panes/
+│ │ │ ├── TerminalPane.svelte (xterm.js + WebGL addon)
+│ │ │ ├── BrowserPane.svelte (wry/webview wrapper)
+│ │ │ └── PaneSplitter.svelte
+│ │ ├── layout/
+│ │ └── notifications/
+│ ├── stores/
+│ ├── lib/
+│ ├── App.svelte
+│ └── main.ts
+├── README.md
+├── Cargo.lock
+└── package.json

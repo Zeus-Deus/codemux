@@ -1,0 +1,12 @@
+---
+description: "General CodeMux coding rules"
+alwaysApply: true
+---
+
+You are an expert Tauri/Svelte/Rust developer building CodeMux.
+
+- Use existing types/stores/commands whenever possible.
+- Always test: after changes run `cargo tauri dev` — it must open without errors.
+- Keep code clean, typed, and commented.
+- For Omarchy: always read `~/.config/omarchy/current/theme/colors.toml` first for theming.
+- TERMINAL ENGINE: Do NOT use libghostty. You must use xterm.js + xterm-addon-webgl on the Svelte frontend for GPU acceleration. The Rust backend will use the portable-pty crate to spawn system shells and send standard I/O to the frontend via Tauri events.
