@@ -16,6 +16,7 @@ use crate::observability::{
     SafetyConfig,
 };
 use crate::state::{AppStateSnapshot, AppStateStore, NotificationLevel};
+use crate::terminal;
 use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -105,6 +106,9 @@ pub fn create_workspace(
     state: State<'_, AppStateStore>,
 ) -> Result<String, String> {
     let workspace_id = state.create_workspace();
+    if let Some(session_id) = state.active_terminal_session_id() {
+        terminal::spawn_pty_for_session(app.clone(), session_id.0);
+    }
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -181,6 +185,7 @@ pub fn split_pane(
     };
 
     let session_id = state.split_pane(&pane_id, direction)?;
+    terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
     crate::state::emit_app_state(&app);
     Ok(session_id.0)
 }

@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 
+use crate::project::current_project_root;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
 const DEFAULT_ROWS: u16 = 24;
@@ -148,6 +149,16 @@ fn default_shell() -> String {
         .unwrap_or_else(|| "/bin/bash".to_string())
 }
 
+fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -> String {
+    app_state
+        .snapshot()
+        .terminal_sessions
+        .into_iter()
+        .find(|session| session.session_id.0 == session_id)
+        .map(|session| session.cwd)
+        .unwrap_or_else(|| current_project_root().display().to_string())
+}
+
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
@@ -191,7 +202,9 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     app_state.update_terminal_session_shell(&session_id, shell.clone());
     state::emit_app_state(&app);
 
-    let cmd = CommandBuilder::new(shell.clone());
+    let cwd = session_working_dir(&app_state, &session_id);
+    let mut cmd = CommandBuilder::new(shell.clone());
+    cmd.cwd(cwd);
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(error) => {
@@ -322,10 +335,17 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     });
 }
 
-pub fn spawn_initial_pty(app: AppHandle) {
+pub fn spawn_missing_ptys(app: AppHandle) {
     let app_state: State<'_, AppStateStore> = app.state();
-    if let Some(session_id) = app_state.active_terminal_session_id() {
-        spawn_pty_for_session(app, session_id.0);
+    let session_ids = app_state
+        .snapshot()
+        .terminal_sessions
+        .into_iter()
+        .map(|session| session.session_id.0)
+        .collect::<Vec<_>>();
+
+    for session_id in session_ids {
+        spawn_pty_for_session(app.clone(), session_id);
     }
 }
 

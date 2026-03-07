@@ -163,11 +163,15 @@
 
     onMount(async () => {
         term = new Terminal({
-            fontFamily: 'monospace',
+            fontFamily: 'IBM Plex Mono, JetBrains Mono, SFMono-Regular, Menlo, monospace',
             theme: terminalTheme(),
             allowProposedApi: false,
             convertEol: true,
-            cursorBlink: true
+            cursorBlink: true,
+            cursorWidth: 2,
+            lineHeight: 1.15,
+            letterSpacing: 0,
+            fontSize: 13
         });
 
         fitAddon = new FitAddon();
@@ -262,19 +266,24 @@
 <style>
     .terminal-shell {
         position: relative;
+        display: flex;
+        flex: 1;
         width: 100%;
         height: 100%;
         min-width: 0;
         min-height: 0;
-        background: var(--theme-background, #1a1b26);
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 98%, black 2%);
     }
 
     .terminal-wrapper {
         display: block;
+        flex: 1;
         width: 100%;
         height: 100%;
+        min-width: 0;
+        min-height: 0;
         overflow: hidden;
-        padding: 4px;
+        padding: 6px 8px 8px;
         box-sizing: border-box;
     }
 
@@ -284,22 +293,22 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 24px;
+        padding: 18px;
         background: color-mix(in srgb, var(--theme-background, #1a1b26) 88%, black 12%);
     }
 
     .overlay-card {
         width: min(440px, 100%);
-        padding: 20px;
+        padding: 16px;
         border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
-        border-radius: 14px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, white 8%);
-        box-shadow: 0 18px 40px rgba(0, 0, 0, 0.28);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 90%, white 10%);
     }
 
     .overlay-card h2 {
         margin: 0 0 8px;
-        font-size: 1rem;
+        font-size: 0.92rem;
+        font-weight: 600;
         color: var(--theme-foreground, #c0caf5);
     }
 
@@ -312,7 +321,7 @@
     .status-meta {
         display: inline-block;
         margin-top: 12px;
-        font-size: 0.85rem;
+        font-size: 0.74rem;
         color: var(--theme-accent, #7aa2f7);
     }
 
@@ -322,5 +331,22 @@
 
     :global(.terminal-wrapper .terminal) {
         height: 100%;
+        width: 100%;
+    }
+
+    :global(.terminal-wrapper .xterm) {
+        padding-top: 2px;
+    }
+
+    :global(.terminal-wrapper .xterm),
+    :global(.terminal-wrapper .xterm-viewport),
+    :global(.terminal-wrapper .xterm-screen),
+    :global(.terminal-wrapper .xterm-helpers) {
+        width: 100%;
+        height: 100%;
+    }
+
+    :global(.terminal-wrapper .xterm-viewport) {
+        background: transparent !important;
     }
 </style>

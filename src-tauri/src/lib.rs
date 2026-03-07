@@ -8,6 +8,7 @@ pub mod indexing;
 pub mod memory;
 pub mod openflow;
 pub mod observability;
+pub mod project;
 pub mod state;
 pub mod terminal;
 
@@ -32,7 +33,7 @@ pub fn run() {
             observability.increment_metric("startup_count");
             observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
             config::watch_theme_file(handle.clone());
-            terminal::spawn_initial_pty(handle);
+            terminal::spawn_missing_ptys(handle);
             let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
             indexing::spawn_index_watcher(index_store);
             control::spawn_control_server(app.handle().clone());

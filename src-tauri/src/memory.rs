@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::project::current_project_root;
 
 const PROJECT_MEMORY_SCHEMA_VERSION: u32 = 1;
 const MAX_PINNED_CONTEXT_ITEMS: usize = 24;
@@ -262,8 +263,7 @@ fn save_project_memory(snapshot: &ProjectMemorySnapshot) -> Result<(), String> {
 fn resolve_project_root(project_root: Option<String>) -> Result<PathBuf, String> {
     match project_root {
         Some(root) => Ok(PathBuf::from(root)),
-        None => env::current_dir()
-            .map_err(|error| format!("Failed to determine current project root: {error}")),
+        None => Ok(current_project_root()),
     }
 }
 

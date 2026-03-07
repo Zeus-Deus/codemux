@@ -92,37 +92,63 @@
 </script>
 
 {#if node.kind === 'terminal'}
-    <section class:active={isActivePane(node.pane_id)} class="pane leaf-pane terminal-pane">
+    <section class:active={isActivePane(node.pane_id)} class="pane-shell terminal-pane-shell">
         <header class="pane-header">
-            <div>
+            <div class="pane-header-main">
                 <strong>{node.title}</strong>
-                <span>{node.session_id}</span>
+                <span>Live shell</span>
             </div>
+
             <div class="pane-actions">
-                <button type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'vertical' })}>Split Down</button>
-                <button type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'horizontal' })}>Split Right</button>
-                <button type="button" onclick={() => dispatch('browser', { paneId: node.pane_id })}>Browser</button>
-                <button type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
+                <button class="pane-action" type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'vertical' })}>Split down</button>
+                <button class="pane-action" type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'horizontal' })}>Split right</button>
+                <button class="pane-action" type="button" onclick={() => dispatch('browser', { paneId: node.pane_id })}>Browser</button>
+                <button class="pane-action danger" type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
             </div>
         </header>
-        <button class="focus-hitbox" type="button" onclick={() => dispatch('activate', { paneId: node.pane_id })}>
+
+        <div
+            class="pane-content"
+            role="button"
+            tabindex="0"
+            onclick={() => dispatch('activate', { paneId: node.pane_id })}
+            onkeydown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    dispatch('activate', { paneId: node.pane_id });
+                }
+            }}
+        >
             <TerminalPane sessionId={node.session_id} />
-        </button>
+        </div>
     </section>
 {:else if node.kind === 'browser'}
-    <section class:active={isActivePane(node.pane_id)} class="pane leaf-pane browser-pane">
+    <section class:active={isActivePane(node.pane_id)} class="pane-shell browser-pane-shell">
         <header class="pane-header">
-            <div>
+            <div class="pane-header-main">
                 <strong>{node.title}</strong>
-                <span>{node.browser_id}</span>
+                <span>Browser tools</span>
             </div>
-            <div class="pane-actions">
-                <button type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
+
+            <div class="pane-actions always-visible">
+                <button class="pane-action danger" type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
             </div>
         </header>
-        <button class="focus-hitbox browser-content" type="button" onclick={() => dispatch('activate', { paneId: node.pane_id })}>
+
+        <div
+            class="pane-content browser-pane-content"
+            role="button"
+            tabindex="0"
+            onclick={() => dispatch('activate', { paneId: node.pane_id })}
+            onkeydown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    dispatch('activate', { paneId: node.pane_id });
+                }
+            }}
+        >
             <BrowserPane browserId={node.browser_id} />
-        </button>
+        </div>
     </section>
 {:else}
     <section bind:this={container} class={`split-pane ${node.direction}`} style={splitStyle()}>
@@ -137,15 +163,16 @@
                     on:resize={(event) => dispatch('resize', event.detail)}
                     on:browser={(event) => dispatch('browser', event.detail)}
                 />
+                {#if index < node.children.length - 1}
+                    <button
+                        class={`split-handle ${node.direction} ${dragIndex === index ? 'dragging' : ''}`}
+                        style={node.direction === 'horizontal' ? 'right: -4px;' : 'bottom: -4px;'}
+                        type="button"
+                        aria-label="Resize split"
+                        onpointerdown={(event) => startResize(event, index)}
+                    ></button>
+                {/if}
             </div>
-            {#if index < node.children.length - 1}
-                <button
-                    class={`split-handle ${node.direction} ${dragIndex === index ? 'dragging' : ''}`}
-                    type="button"
-                    aria-label="Resize split"
-                    onpointerdown={(event) => startResize(event, index)}
-                ></button>
-            {/if}
         {/each}
     </section>
 {/if}
@@ -153,43 +180,57 @@
 <style>
     .split-pane {
         display: grid;
-        gap: 10px;
+        gap: 6px;
         width: 100%;
         height: 100%;
         min-width: 0;
         min-height: 0;
+        padding: 6px;
+        box-sizing: border-box;
     }
 
     .split-pane.horizontal {
         grid-auto-flow: column;
         align-items: stretch;
+        grid-auto-columns: minmax(0, 1fr);
     }
 
     .split-pane.vertical {
         grid-auto-flow: row;
         align-items: stretch;
+        grid-auto-rows: minmax(0, 1fr);
     }
 
     .split-child,
-    .pane,
-    .focus-hitbox,
-    .browser-content {
+    .pane-shell,
+    .pane-content,
+    .browser-pane-content {
         min-width: 0;
         min-height: 0;
     }
 
-    .leaf-pane {
-        display: flex;
-        flex-direction: column;
-        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 10%, transparent);
-        border-radius: 16px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, white 8%);
+    .split-child {
+        position: relative;
         overflow: hidden;
     }
 
-    .leaf-pane.active {
-        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 50%, transparent);
-        box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--theme-accent, #7aa2f7) 28%, transparent);
+    .pane-shell {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 10%, transparent);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 94%, black 6%);
+        transition:
+            border-color 140ms ease-out,
+            background 140ms ease-out;
+    }
+
+    .pane-shell.active {
+        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 30%, transparent);
+        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 6%, var(--theme-background, #1a1b26) 94%);
     }
 
     .pane-header {
@@ -197,68 +238,137 @@
         align-items: center;
         justify-content: space-between;
         gap: 12px;
-        padding: 10px 12px;
-        border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 10%, transparent);
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 86%, black 14%);
+        padding: 8px 10px;
+        border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 8%, transparent);
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, transparent);
+        flex: 0 0 auto;
     }
 
-    .pane-header strong,
-    .pane-header span {
+    .pane-header-main {
+        min-width: 0;
+    }
+
+    .pane-header-main strong {
         display: block;
+        font-size: 0.84rem;
+        font-weight: 600;
     }
 
-    .pane-header span {
-        font-size: 0.75rem;
-        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 72%, white 28%);
+    .pane-header-main span {
+        display: block;
+        margin-top: 2px;
+        font-size: 0.7rem;
+        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 56%, transparent);
     }
 
     .pane-actions {
         display: flex;
-        gap: 8px;
+        align-items: center;
         flex-wrap: wrap;
+        justify-content: flex-end;
+        gap: 6px;
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(-2px);
+        transition:
+            opacity 140ms ease-out,
+            transform 140ms ease-out;
     }
 
-    .pane-actions button,
-    .focus-hitbox {
-        border: 0;
-        background: transparent;
-        color: inherit;
+    .pane-shell:hover .pane-actions,
+    .pane-shell.active .pane-actions,
+    .pane-actions.always-visible {
+        opacity: 1;
+        pointer-events: auto;
+        transform: translateY(0);
     }
 
-    .pane-actions button {
-        padding: 6px 9px;
-        border-radius: 999px;
-        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 14%, transparent);
+    .pane-action {
+        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 82%, transparent);
+        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 82%, white 18%);
+        padding: 5px 8px;
+        font: inherit;
+        font-size: 0.7rem;
         cursor: pointer;
+        transition:
+            border-color 100ms ease-out,
+            background 100ms ease-out,
+            color 100ms ease-out;
     }
 
-    .focus-hitbox {
+    .pane-action:hover {
+        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 24%, transparent);
+        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 10%, transparent);
+        color: var(--theme-foreground, #c0caf5);
+    }
+
+    .pane-action.danger:hover {
+        border-color: color-mix(in srgb, var(--theme-color1, #f7768e) 26%, transparent);
+        background: color-mix(in srgb, var(--theme-color1, #f7768e) 10%, transparent);
+        color: color-mix(in srgb, var(--theme-color1, #f7768e) 82%, white 18%);
+    }
+
+    .pane-content {
         flex: 1;
-        padding: 0;
-        text-align: left;
-        cursor: pointer;
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        overflow: hidden;
+        cursor: text;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 98%, black 2%);
     }
 
-    .browser-content {
-        display: block;
+    .browser-pane-content {
+        cursor: default;
     }
 
     .split-handle {
+        position: absolute;
+        z-index: 20;
         border: 0;
-        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 24%, transparent);
-        border-radius: 999px;
-        align-self: stretch;
-        justify-self: stretch;
-        min-width: 8px;
-        min-height: 8px;
+        border-radius: 6px;
+        background: transparent;
+        transition: background 100ms ease-out;
+    }
+
+    .split-pane.horizontal > .split-child > .split-handle {
+        width: 8px;
+        height: calc(100% - 12px);
+        top: 6px;
         cursor: col-resize;
     }
 
-    .split-handle.vertical {
+    .split-pane.vertical > .split-child > .split-handle {
+        width: calc(100% - 12px);
+        height: 8px;
+        left: 6px;
         cursor: row-resize;
     }
 
+    .split-handle:hover,
     .split-handle.dragging {
         background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 48%, transparent);
+    }
+
+    @media (max-width: 840px) {
+        .split-pane {
+            padding: 4px;
+            gap: 4px;
+        }
+
+        .pane-header {
+            flex-direction: column;
+            align-items: flex-start;
+        }
+
+        .pane-actions {
+            opacity: 1;
+            pointer-events: auto;
+            transform: none;
+            width: 100%;
+            justify-content: flex-start;
+        }
     }
 </style>

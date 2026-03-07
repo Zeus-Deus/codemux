@@ -72,8 +72,14 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Run the app:
 
 ```bash
-npm run tauri dev
+GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
 ```
+
+Why this launch command is recommended right now:
+
+- on Hyprland/Omarchy Wayland sessions, the default Tauri/WebKit launch can fail with a Wayland protocol error
+- forcing X11 for this one launch avoids changing your whole desktop/session configuration
+- disabling the DMABUF renderer avoids the GBM buffer creation failure seen during startup
 
 ## CLI Control
 

@@ -17,6 +17,10 @@ src-tauri/gen/
 # Codemux local project state
 .codemux/index.json
 .codemux/project-memory.json
+src-tauri/.codemux/
+
+# Ad hoc local patch scripts
+/*.cjs
 
 # Local editor/IDE folders
 .vscode/

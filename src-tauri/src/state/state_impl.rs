@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::project::current_project_root;
+
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const CODEMUX_CONFIG_VERSION: u32 = 1;
 const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
@@ -267,10 +269,7 @@ impl AppStateStore {
         let surface_id = SurfaceId(next_id("surface"));
         let pane_id = PaneId(next_id("pane"));
         let session_id = SessionId(next_id("session"));
-        let cwd = env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "~".to_string());
+        let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
         let workspace_index = snapshot.workspaces.len() + 1;
         let terminal_index = snapshot.terminal_sessions.len() + 1;
@@ -468,10 +467,7 @@ impl AppStateStore {
         let session_id = SessionId(next_id("session"));
         let pane_id = PaneId(next_id("pane"));
         let active_workspace_id = snapshot.active_workspace_id.clone();
-        let cwd = env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "~".to_string());
+        let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
         let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
@@ -538,10 +534,7 @@ impl AppStateStore {
         let session_id = SessionId(next_id("session"));
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
-        let cwd = env::current_dir()
-            .ok()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "~".to_string());
+        let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
         let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
@@ -1004,10 +997,7 @@ fn default_app_state() -> AppStateSnapshot {
     let surface_id = SurfaceId(next_id("surface"));
     let pane_id = PaneId(next_id("pane"));
     let session_id = SessionId(next_id("session"));
-    let cwd = env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "~".to_string());
+    let cwd = current_project_root().display().to_string();
     let shell = env::var("SHELL").ok();
 
     AppStateSnapshot {

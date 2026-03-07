@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from 'svelte';
+    import { openUrl } from '@tauri-apps/plugin-opener';
     import { listen } from '@tauri-apps/api/event';
     import {
         browserAutomationComplete,
@@ -185,6 +186,14 @@
         }, 300);
     }
 
+    async function openExternal() {
+        if (!address.trim()) {
+            return;
+        }
+
+        await openUrl(address.trim());
+    }
+
     async function goBack() {
         await browserHistoryBack(browserId);
         setTimeout(() => {
@@ -262,6 +271,7 @@
                 type="button"
                 onclick={() => runAutomation({ kind: 'dom_snapshot' })}
             >DOM</button>
+            <button type="button" onclick={openExternal}>Open</button>
         </div>
         <form
             class="address-form"
@@ -302,6 +312,11 @@
         {#if automationResult}
             <pre class="automation-result">{automationResult}</pre>
         {/if}
+
+        <div class="browser-state info-inline">
+            <h3>Browser MVP</h3>
+            <p>Use `Open` to launch the current URL externally until embedded rendering is finished.</p>
+        </div>
     </div>
 </section>
 
@@ -309,18 +324,21 @@
     .browser-shell {
         display: flex;
         flex-direction: column;
+        flex: 1;
         width: 100%;
         height: 100%;
         min-width: 0;
         min-height: 0;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 96%, white 4%);
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 98%, black 2%);
     }
 
     .browser-toolbar {
         display: flex;
         gap: 10px;
-        padding: 10px;
-        border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 10%, transparent);
+        padding: 8px 10px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, transparent);
+        border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 8%, transparent);
+        flex: 0 0 auto;
     }
 
     .browser-actions {
@@ -332,10 +350,19 @@
     .browser-actions button,
     .address-form input {
         border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
-        border-radius: 10px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 90%, white 10%);
+        border-radius: 8px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 82%, transparent);
         color: inherit;
-        padding: 8px 10px;
+        padding: 6px 8px;
+        transition:
+            border-color 100ms ease-out,
+            background 100ms ease-out,
+            color 100ms ease-out;
+    }
+
+    .browser-actions button:hover {
+        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 24%, transparent);
+        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 10%, transparent);
     }
 
     .address-form {
@@ -345,18 +372,29 @@
     .address-form input {
         width: 100%;
         box-sizing: border-box;
+        outline: none;
+    }
+
+    .address-form input:focus {
+        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 26%, transparent);
     }
 
     .browser-body {
         position: relative;
         flex: 1;
+        width: 100%;
         min-height: 0;
+        overflow: hidden;
+        padding: 8px;
+        box-sizing: border-box;
     }
 
     iframe {
+        display: block;
         width: 100%;
         height: 100%;
         border: 0;
+        border-radius: 10px;
         background: white;
     }
 
@@ -369,26 +407,26 @@
     .browser-state,
     .automation-result {
         position: absolute;
-        left: 12px;
-        right: 12px;
+        left: 16px;
+        right: 16px;
         z-index: 2;
-        border-radius: 12px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, white 8%);
+        border-radius: 10px;
+        background: color-mix(in srgb, var(--theme-background, #1a1b26) 90%, white 10%);
         border: 1px solid color-mix(in srgb, var(--theme-accent, #7aa2f7) 22%, transparent);
     }
 
     .loading-banner {
-        bottom: 12px;
+        bottom: 16px;
         padding: 10px 12px;
     }
 
     .screenshot-banner {
-        bottom: 56px;
+        bottom: 60px;
         padding: 10px 12px;
     }
 
     .automation-result {
-        top: 12px;
+        top: 16px;
         max-height: 160px;
         overflow: auto;
         padding: 12px;
@@ -396,8 +434,16 @@
     }
 
     .browser-state {
-        top: 12px;
-        padding: 14px;
+        top: 16px;
+        padding: 12px;
+    }
+
+    .browser-state.info-inline {
+        top: auto;
+        bottom: 16px;
+        right: auto;
+        max-width: 360px;
+        opacity: 0.92;
     }
 
     .browser-state h3,

@@ -1,10 +1,11 @@
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
+
+use crate::project::current_project_root;
 
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024;
@@ -451,8 +452,7 @@ fn default_index(project_root: PathBuf) -> ProjectIndexSnapshot {
 fn resolve_project_root(project_root: Option<String>) -> Result<PathBuf, String> {
     match project_root {
         Some(root) => Ok(PathBuf::from(root)),
-        None => env::current_dir()
-            .map_err(|error| format!("Failed to determine current project root: {error}")),
+        None => Ok(current_project_root()),
     }
 }
 
