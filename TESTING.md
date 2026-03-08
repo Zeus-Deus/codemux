@@ -88,6 +88,7 @@ Rust tests currently cover:
 - pane swap invariants across all built-in layouts
 - incrementally built terminal layouts
 - mixed terminal/browser layouts
+- workspace-scoped terminal limit behavior across multiple workspaces
 
 Vitest currently covers:
 

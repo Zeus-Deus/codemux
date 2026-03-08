@@ -17,6 +17,7 @@
     import OpenFlowLauncher from './OpenFlowLauncher.svelte';
     import MemoryDrawer from './MemoryDrawer.svelte';
     import NewWorkspaceLauncher from './NewWorkspaceLauncher.svelte';
+    import { errorMessage, showUiNotice } from '../../stores/uiNotice';
 
     let { windowFocused }: { windowFocused: boolean } = $props();
 
@@ -119,6 +120,7 @@
             await createTerminalSession();
         } catch (error) {
             console.error('Failed to create session:', error);
+            showUiNotice(errorMessage(error), 'error');
         }
     }
 
@@ -240,38 +242,38 @@
         {/if}
     </div>
 
-    <div class="sidebar-spacer"></div>
+    <div class="sidebar-bottom">
+        <!-- Secondary sections -->
+        <div class="sidebar-sections">
+            {#if activeWorkspace}
+                <div class="sidebar-divider"></div>
+                <NotificationsSection workspaceId={activeWorkspace.workspace_id} />
+            {/if}
 
-    <!-- Secondary sections -->
-    <div class="sidebar-sections">
-        {#if activeWorkspace}
             <div class="sidebar-divider"></div>
-            <NotificationsSection workspaceId={activeWorkspace.workspace_id} />
-        {/if}
+            <OpenFlowLauncher on:newrun={handleOpenFlowLauncher} />
 
-        <div class="sidebar-divider"></div>
-        <OpenFlowLauncher on:newrun={handleOpenFlowLauncher} />
+            <div class="sidebar-divider"></div>
+            <MemoryDrawer />
+        </div>
 
-        <div class="sidebar-divider"></div>
-        <MemoryDrawer />
+        <!-- Footer -->
+        <footer class="sidebar-footer">
+            {#if $appState}
+                <label class="sound-toggle">
+                    <input
+                        type="checkbox"
+                        checked={$appState.config.notification_sound_enabled}
+                        onchange={(e) => handleSoundToggle((e.currentTarget as HTMLInputElement).checked)}
+                    />
+                    <span>Alert sound</span>
+                </label>
+            {/if}
+            <button class="footer-debug-btn" type="button" onclick={handleTestNotification} title="Test attention signal">
+                Test alert
+            </button>
+        </footer>
     </div>
-
-    <!-- Footer -->
-    <footer class="sidebar-footer">
-        {#if $appState}
-            <label class="sound-toggle">
-                <input
-                    type="checkbox"
-                    checked={$appState.config.notification_sound_enabled}
-                    onchange={(e) => handleSoundToggle((e.currentTarget as HTMLInputElement).checked)}
-                />
-                <span>Alert sound</span>
-            </label>
-        {/if}
-        <button class="footer-debug-btn" type="button" onclick={handleTestNotification} title="Test attention signal">
-            Test alert
-        </button>
-    </footer>
 </aside>
 
 <style>
@@ -508,11 +510,12 @@
         background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     }
 
-    /* ---- Spacer pushes secondary sections to bottom ---- */
-
-    .sidebar-spacer {
-        flex: 1;
-        min-height: 12px;
+    .sidebar-bottom {
+        display: flex;
+        flex-direction: column;
+        margin-top: auto;
+        min-height: 0;
+        flex-shrink: 0;
     }
 
     /* ---- Secondary sections ---- */
@@ -522,7 +525,7 @@
         flex-direction: column;
         overflow-y: auto;
         overflow-x: hidden;
-        flex-shrink: 0;
+        min-height: 0;
         max-height: 60vh;
     }
 

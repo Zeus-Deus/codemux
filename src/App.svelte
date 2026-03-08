@@ -3,6 +3,7 @@
     import { get } from 'svelte/store';
     import { theme, fallbackTheme, initTheme, shellAppearance, type ShellAppearance } from './stores/theme';
     import { paneDragState } from './stores/paneDrag';
+    import { uiNotice, clearUiNotice, errorMessage, showUiNotice } from './stores/uiNotice';
     import {
         appState,
         initAppState,
@@ -67,7 +68,7 @@
     }
 
     async function handleSplitPane(paneId: string, direction: 'horizontal' | 'vertical') {
-        try { await splitPane(paneId, direction); } catch (e) { console.error('split pane:', e); }
+        try { await splitPane(paneId, direction); } catch (e) { console.error('split pane:', e); showUiNotice(errorMessage(e), 'error'); }
     }
 
     async function handleClosePane(paneId: string) {
@@ -79,7 +80,7 @@
     }
 
     async function handleCreateBrowserPane(paneId: string) {
-        try { await createBrowserPane(paneId); } catch (e) { console.error('create browser pane:', e); }
+        try { await createBrowserPane(paneId); } catch (e) { console.error('create browser pane:', e); showUiNotice(errorMessage(e), 'error'); }
     }
 
     async function handleSwapPanes(sourcePaneId: string, targetPaneId: string) {
@@ -182,6 +183,19 @@
                 </div>
             </section>
         </div>
+
+        {#if $uiNotice}
+            <div class="global-notice-wrap" aria-live="polite">
+                <div class="global-notice" class:error={$uiNotice.kind === 'error'}>
+                    <span>{$uiNotice.message}</span>
+                    <button type="button" class="global-notice-close" onclick={clearUiNotice} aria-label="Dismiss message">
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                            <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        {/if}
     {:else}
         <div class="loading-shell">
             <div class="loading-card">
@@ -311,6 +325,58 @@
         opacity: 1;
         pointer-events: auto;
         z-index: 1;
+    }
+
+    .global-notice-wrap {
+        position: absolute;
+        right: 18px;
+        bottom: 18px;
+        z-index: 30;
+        pointer-events: none;
+    }
+
+    .global-notice {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        max-width: min(520px, calc(100vw - 36px));
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid color-mix(in srgb, var(--ui-accent) 26%, transparent);
+        background: color-mix(in srgb, var(--ui-layer-2) 92%, black 8%);
+        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+        color: var(--ui-text-primary);
+        pointer-events: auto;
+    }
+
+    .global-notice.error {
+        border-color: color-mix(in srgb, var(--ui-danger) 42%, transparent);
+        background: color-mix(in srgb, var(--ui-danger) 10%, var(--ui-layer-2) 90%);
+    }
+
+    .global-notice span {
+        font-size: 0.8rem;
+        line-height: 1.45;
+    }
+
+    .global-notice-close {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: transparent;
+        color: var(--ui-text-muted);
+        cursor: pointer;
+        flex-shrink: 0;
+    }
+
+    .global-notice-close:hover {
+        background: color-mix(in srgb, var(--ui-layer-3) 70%, transparent);
+        color: var(--ui-text-primary);
     }
 
     /* ---- Empty state ---- */

@@ -247,6 +247,10 @@ pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
 }
 
+fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
+    collect_terminal_sessions(&workspace.surfaces).len()
+}
+
 impl Default for AppStateStore {
     fn default() -> Self {
         Self {
@@ -568,16 +572,22 @@ impl AppStateStore {
 
     pub fn create_terminal_session(&self) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
+        let active_workspace_id = snapshot.active_workspace_id.clone();
+        let workspace_terminal_count = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == active_workspace_id)
+            .map(terminal_count_for_workspace)
+            .ok_or_else(|| "No active workspace available".to_string())?;
 
-        if snapshot.terminal_sessions.len() >= MAX_TERMINAL_SESSIONS {
+        if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
             return Err(format!(
-                "Reached the current terminal session limit of {MAX_TERMINAL_SESSIONS}"
+                "Reached the current workspace terminal limit of {MAX_TERMINAL_SESSIONS}"
             ));
         }
 
         let session_id = SessionId(next_id("session"));
         let pane_id = PaneId(next_id("pane"));
-        let active_workspace_id = snapshot.active_workspace_id.clone();
         let cwd = current_project_root().display().to_string();
         let shell = env::var("SHELL").ok();
         let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
@@ -634,15 +644,20 @@ impl AppStateStore {
         direction: SplitDirection,
     ) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
+        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
+            .ok_or_else(|| format!("No pane found for {pane_id}"))?;
+        let workspace_terminal_count = snapshot
+            .workspaces
+            .get(workspace_index)
+            .map(terminal_count_for_workspace)
+            .ok_or_else(|| "Workspace disappeared while splitting pane".to_string())?;
 
-        if snapshot.terminal_sessions.len() >= MAX_TERMINAL_SESSIONS {
+        if workspace_terminal_count >= MAX_TERMINAL_SESSIONS {
             return Err(format!(
-                "Reached the current terminal session limit of {MAX_TERMINAL_SESSIONS}"
+                "Reached the current workspace terminal limit of {MAX_TERMINAL_SESSIONS}"
             ));
         }
 
-        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
-            .ok_or_else(|| format!("No pane found for {pane_id}"))?;
         let session_id = SessionId(next_id("session"));
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
@@ -2234,5 +2249,64 @@ mod tests {
         store.create_terminal_session().unwrap();
 
         assert_swap_invariants_for_workspace(&store, &workspace_id);
+    }
+
+    #[test]
+    fn terminal_creation_and_split_respect_workspace_session_limit() {
+        let store = AppStateStore::default();
+
+        for _ in 0..(MAX_TERMINAL_SESSIONS - 1) {
+            store.create_terminal_session().unwrap();
+        }
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.terminal_sessions.len(), MAX_TERMINAL_SESSIONS);
+        let active_workspace = workspace_by_id(&snapshot, &snapshot.active_workspace_id);
+        let active_pane_id = active_workspace.surfaces[0].active_pane_id.0.clone();
+        assert_eq!(
+            terminal_count_for_workspace(active_workspace),
+            MAX_TERMINAL_SESSIONS
+        );
+
+        let create_error = store.create_terminal_session().unwrap_err();
+        assert!(create_error.contains("limit"));
+
+        let split_error = store
+            .split_pane(&active_pane_id, SplitDirection::Horizontal)
+            .unwrap_err();
+        assert!(split_error.contains("limit"));
+    }
+
+    #[test]
+    fn workspace_terminal_limit_does_not_block_other_workspaces() {
+        let store = AppStateStore::default();
+
+        for _ in 0..(MAX_TERMINAL_SESSIONS - 1) {
+            store.create_terminal_session().unwrap();
+        }
+
+        let second_workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Single,
+        );
+
+        let second_snapshot = store.snapshot();
+        let second_workspace = workspace_by_id(&second_snapshot, &second_workspace_id);
+        assert_eq!(terminal_count_for_workspace(second_workspace), 1);
+
+        store.create_terminal_session().unwrap();
+
+        let after_create = store.snapshot();
+        let second_workspace = workspace_by_id(&after_create, &second_workspace_id);
+        assert_eq!(terminal_count_for_workspace(second_workspace), 2);
+
+        let active_pane_id = second_workspace.surfaces[0].active_pane_id.0.clone();
+        store
+            .split_pane(&active_pane_id, SplitDirection::Vertical)
+            .unwrap();
+
+        let after_split = store.snapshot();
+        let second_workspace = workspace_by_id(&after_split, &second_workspace_id);
+        assert_eq!(terminal_count_for_workspace(second_workspace), 3);
     }
 }
