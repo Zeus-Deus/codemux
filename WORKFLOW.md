@@ -38,6 +38,8 @@ After meaningful changes, run the relevant checks:
 - `npm run check`
 - `npm run test`
 
+Default to `npm run verify` when you want the full standard verification pass.
+
 If something new changes how the app is used, update the docs.
 
 ## Current Process Pattern

@@ -2001,12 +2001,16 @@ mod tests {
         }
     }
 
-    fn collect_leaf_session_ids(root: &PaneNodeSnapshot) -> Vec<String> {
+    fn collect_leaf_payload_ids(root: &PaneNodeSnapshot) -> Vec<String> {
         match root {
-            PaneNodeSnapshot::Terminal { session_id, .. } => vec![session_id.0.clone()],
-            PaneNodeSnapshot::Browser { browser_id, .. } => vec![browser_id.0.clone()],
+            PaneNodeSnapshot::Terminal { session_id, .. } => {
+                vec![format!("terminal:{}", session_id.0)]
+            }
+            PaneNodeSnapshot::Browser { browser_id, .. } => {
+                vec![format!("browser:{}", browser_id.0)]
+            }
             PaneNodeSnapshot::Split { children, .. } => {
-                children.iter().flat_map(collect_leaf_session_ids).collect()
+                children.iter().flat_map(collect_leaf_payload_ids).collect()
             }
         }
     }
@@ -2015,6 +2019,67 @@ mod tests {
         let mut swapped = items.to_vec();
         swapped.swap(first, second);
         swapped
+    }
+
+    fn workspace_by_id<'a>(
+        snapshot: &'a AppStateSnapshot,
+        workspace_id: &WorkspaceId,
+    ) -> &'a WorkspaceSnapshot {
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == *workspace_id)
+            .unwrap()
+    }
+
+    fn assert_swap_invariants_for_workspace(store: &AppStateStore, workspace_id: &WorkspaceId) {
+        let base_snapshot = store.snapshot();
+        let base_workspace = workspace_by_id(&base_snapshot, workspace_id);
+        let base_surface = &base_workspace.surfaces[0];
+        let pane_ids = collect_leaf_pane_ids(&base_surface.root);
+        let payload_ids = collect_leaf_payload_ids(&base_surface.root);
+
+        assert_eq!(pane_ids.len(), payload_ids.len());
+
+        for source_index in 0..pane_ids.len() {
+            for target_index in 0..pane_ids.len() {
+                if source_index == target_index {
+                    continue;
+                }
+
+                store.replace_snapshot(base_snapshot.clone());
+                store
+                    .swap_panes(&pane_ids[source_index].0, &pane_ids[target_index].0)
+                    .unwrap();
+
+                let swapped_snapshot = store.snapshot();
+                let swapped_surface = &workspace_by_id(&swapped_snapshot, workspace_id).surfaces[0];
+
+                assert_eq!(
+                    collect_leaf_payload_ids(&swapped_surface.root),
+                    swap_positions(&payload_ids, source_index, target_index),
+                    "unexpected leaf order for source index {source_index} and target index {target_index}"
+                );
+                assert!(pane_tree_contains_pane(
+                    &swapped_surface.root,
+                    &swapped_surface.active_pane_id.0,
+                ));
+
+                store
+                    .swap_panes(&pane_ids[source_index].0, &pane_ids[target_index].0)
+                    .unwrap();
+
+                let restored_snapshot = store.snapshot();
+                let restored_surface =
+                    &workspace_by_id(&restored_snapshot, workspace_id).surfaces[0];
+                assert_eq!(
+                    collect_leaf_payload_ids(&restored_surface.root),
+                    payload_ids
+                );
+            }
+        }
+
+        store.replace_snapshot(base_snapshot);
     }
 
     #[test]
@@ -2120,66 +2185,54 @@ mod tests {
     }
 
     #[test]
-    fn swap_panes_works_when_source_precedes_target_in_traversal() {
-        let store = AppStateStore::default();
-        let workspace_id = store.create_workspace_with_layout(
-            PathBuf::from("/tmp/codemux"),
+    fn swap_invariants_hold_for_all_builtin_workspace_layouts() {
+        let layouts = [
+            WorkspacePresetLayout::Single,
+            WorkspacePresetLayout::Pair,
+            WorkspacePresetLayout::Quad,
             WorkspacePresetLayout::Six,
-        );
+            WorkspacePresetLayout::Eight,
+            WorkspacePresetLayout::ShellBrowser,
+        ];
 
-        let before = store.snapshot();
-        let workspace = before
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .unwrap();
-        let pane_ids = collect_leaf_pane_ids(&workspace.surfaces[0].root);
-        let session_ids_before = collect_leaf_session_ids(&workspace.surfaces[0].root);
-
-        store.swap_panes(&pane_ids[0].0, &pane_ids[3].0).unwrap();
-
-        let after = store.snapshot();
-        let workspace = after
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .unwrap();
-
-        assert_eq!(
-            collect_leaf_session_ids(&workspace.surfaces[0].root),
-            swap_positions(&session_ids_before, 0, 3)
-        );
+        for layout in layouts {
+            let store = AppStateStore::default();
+            let workspace_id =
+                store.create_workspace_with_layout(PathBuf::from("/tmp/codemux"), layout);
+            assert_swap_invariants_for_workspace(&store, &workspace_id);
+        }
     }
 
     #[test]
-    fn swap_panes_works_within_same_row() {
+    fn swap_invariants_hold_for_incrementally_built_terminal_workspace() {
         let store = AppStateStore::default();
         let workspace_id = store.create_workspace_with_layout(
             PathBuf::from("/tmp/codemux"),
-            WorkspacePresetLayout::Six,
+            WorkspacePresetLayout::Single,
         );
 
-        let before = store.snapshot();
-        let workspace = before
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .unwrap();
-        let pane_ids = collect_leaf_pane_ids(&workspace.surfaces[0].root);
-        let session_ids_before = collect_leaf_session_ids(&workspace.surfaces[0].root);
+        for _ in 0..5 {
+            store.create_terminal_session().unwrap();
+        }
 
-        store.swap_panes(&pane_ids[0].0, &pane_ids[1].0).unwrap();
+        assert_swap_invariants_for_workspace(&store, &workspace_id);
+    }
 
-        let after = store.snapshot();
-        let workspace = after
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .unwrap();
-
-        assert_eq!(
-            collect_leaf_session_ids(&workspace.surfaces[0].root),
-            swap_positions(&session_ids_before, 0, 1)
+    #[test]
+    fn swap_invariants_hold_for_mixed_terminal_browser_workspace() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::ShellBrowser,
         );
+
+        let initial_snapshot = store.snapshot();
+        let workspace = workspace_by_id(&initial_snapshot, &workspace_id);
+        let active_pane_id = workspace.surfaces[0].active_pane_id.0.clone();
+
+        store.create_browser_pane(&active_pane_id).unwrap();
+        store.create_terminal_session().unwrap();
+
+        assert_swap_invariants_for_workspace(&store, &workspace_id);
     }
 }

@@ -67,6 +67,35 @@ Use three layers:
 - frontend interaction tests for important UI flows
 - a small number of future end-to-end tests for whole-app workflows
 
+## Current Commands
+
+Use these as the standard verification entry points:
+
+- `npm run verify` - runs the full default verification pass
+- `cargo check --manifest-path src-tauri/Cargo.toml` - Rust compile check
+- `cargo test --manifest-path src-tauri/Cargo.toml` - Rust backend/state tests
+- `npm run check` - Svelte/type checks
+- `npm run test` - Vitest frontend tests
+
+`npm run verify` should be the main command to remember. The others are still useful when iterating on one layer.
+
+## Current Coverage
+
+Rust tests currently cover:
+
+- app-state and pane-tree domain logic
+- workspace preset construction
+- pane swap invariants across all built-in layouts
+- incrementally built terminal layouts
+- mixed terminal/browser layouts
+
+Vitest currently covers:
+
+- pane tree helper behavior
+- pane swap invariants across multiple layout shapes in a dynamic all-pairs fashion
+
+The swap regression coverage is dynamic rather than hardcoded to one layout pair. The tests create isolated layouts during execution and do not depend on or mutate the user's currently open workspaces.
+
 ## Current tooling direction
 
 - Rust built-in test runner for backend logic
