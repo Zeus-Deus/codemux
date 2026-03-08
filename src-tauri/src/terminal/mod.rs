@@ -112,8 +112,6 @@ fn emit_terminal_status(
     if let Err(error) = app.emit("terminal-status", payload) {
         eprintln!("[codemux::terminal] Failed to emit terminal status: {error}");
     }
-
-    state::emit_app_state(app);
 }
 
 fn queue_or_send_output(
@@ -210,7 +208,6 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     let shell = default_shell();
     app_state.update_terminal_session_shell(&session_id, shell.clone());
-    state::emit_app_state(&app);
 
     let cwd = session_working_dir(&app_state, &session_id);
     let mut cmd = CommandBuilder::new(shell.clone());

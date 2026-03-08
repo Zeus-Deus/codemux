@@ -878,13 +878,22 @@ impl AppStateStore {
             .ok_or_else(|| format!("Failed to clone source pane {source_pane_id}"))?;
         let target_node = clone_pane_node(&surface.root, target_pane_id)
             .ok_or_else(|| format!("Failed to clone target pane {target_pane_id}"))?;
+        let temp_pane_id = PaneId(next_id("pane-swap-temp"));
+        let temp_source_node = with_pane_id(source_node.clone(), temp_pane_id.clone());
 
-        if !replace_pane_node(&mut surface.root, source_pane_id, target_node.clone()) {
+        if !replace_pane_node(&mut surface.root, source_pane_id, temp_source_node) {
             return Err(format!("Failed to replace source pane {source_pane_id}"));
         }
 
         if !replace_pane_node(&mut surface.root, target_pane_id, source_node.clone()) {
             return Err(format!("Failed to replace target pane {target_pane_id}"));
+        }
+
+        if !replace_pane_node(&mut surface.root, &temp_pane_id.0, target_node.clone()) {
+            return Err(format!(
+                "Failed to replace temporary pane {}",
+                temp_pane_id.0
+            ));
         }
 
         if surface.active_pane_id.0 == source_pane_id {
@@ -1713,6 +1722,36 @@ fn clone_pane_node(root: &PaneNodeSnapshot, target_pane_id: &str) -> Option<Pane
     }
 }
 
+fn with_pane_id(node: PaneNodeSnapshot, pane_id: PaneId) -> PaneNodeSnapshot {
+    match node {
+        PaneNodeSnapshot::Terminal {
+            session_id, title, ..
+        } => PaneNodeSnapshot::Terminal {
+            pane_id,
+            session_id,
+            title,
+        },
+        PaneNodeSnapshot::Browser {
+            browser_id, title, ..
+        } => PaneNodeSnapshot::Browser {
+            pane_id,
+            browser_id,
+            title,
+        },
+        PaneNodeSnapshot::Split {
+            direction,
+            child_sizes,
+            children,
+            ..
+        } => PaneNodeSnapshot::Split {
+            pane_id,
+            direction,
+            child_sizes,
+            children,
+        },
+    }
+}
+
 fn replace_pane_node(
     root: &mut PaneNodeSnapshot,
     target_pane_id: &str,
@@ -1962,6 +2001,22 @@ mod tests {
         }
     }
 
+    fn collect_leaf_session_ids(root: &PaneNodeSnapshot) -> Vec<String> {
+        match root {
+            PaneNodeSnapshot::Terminal { session_id, .. } => vec![session_id.0.clone()],
+            PaneNodeSnapshot::Browser { browser_id, .. } => vec![browser_id.0.clone()],
+            PaneNodeSnapshot::Split { children, .. } => {
+                children.iter().flat_map(collect_leaf_session_ids).collect()
+            }
+        }
+    }
+
+    fn swap_positions<T: Clone>(items: &[T], first: usize, second: usize) -> Vec<T> {
+        let mut swapped = items.to_vec();
+        swapped.swap(first, second);
+        swapped
+    }
+
     #[test]
     fn removing_terminal_collapses_split_tree() {
         let updated = remove_terminal_from_tree(&sample_split_tree(), "session-a").unwrap();
@@ -2062,5 +2117,69 @@ mod tests {
             }
             _ => panic!("expected shell+browser preset to be a horizontal split"),
         }
+    }
+
+    #[test]
+    fn swap_panes_works_when_source_precedes_target_in_traversal() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Six,
+        );
+
+        let before = store.snapshot();
+        let workspace = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        let pane_ids = collect_leaf_pane_ids(&workspace.surfaces[0].root);
+        let session_ids_before = collect_leaf_session_ids(&workspace.surfaces[0].root);
+
+        store.swap_panes(&pane_ids[0].0, &pane_ids[3].0).unwrap();
+
+        let after = store.snapshot();
+        let workspace = after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+
+        assert_eq!(
+            collect_leaf_session_ids(&workspace.surfaces[0].root),
+            swap_positions(&session_ids_before, 0, 3)
+        );
+    }
+
+    #[test]
+    fn swap_panes_works_within_same_row() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Six,
+        );
+
+        let before = store.snapshot();
+        let workspace = before
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        let pane_ids = collect_leaf_pane_ids(&workspace.surfaces[0].root);
+        let session_ids_before = collect_leaf_session_ids(&workspace.surfaces[0].root);
+
+        store.swap_panes(&pane_ids[0].0, &pane_ids[1].0).unwrap();
+
+        let after = store.snapshot();
+        let workspace = after
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+
+        assert_eq!(
+            collect_leaf_session_ids(&workspace.surfaces[0].root),
+            swap_positions(&session_ids_before, 0, 1)
+        );
     }
 }

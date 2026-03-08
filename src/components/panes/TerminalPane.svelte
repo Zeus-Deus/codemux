@@ -31,7 +31,6 @@
     let shellAppearanceUnsubscribe: (() => void) | null = null;
     let statusUnlisten: (() => void) | null = null;
     let attachedSessionId: string | null = null;
-    let currentSessionId = $derived(sessionId);
     let terminalStatus = $state<TerminalStatusPayload>({
         session_id: '',
         state: 'starting',
@@ -40,7 +39,7 @@
     });
 
     $effect(() => {
-        terminalStatus.session_id = currentSessionId;
+        terminalStatus.session_id = sessionId;
     });
 
     function terminalTheme(): ITheme {
@@ -78,7 +77,6 @@
         }
 
         term.options.theme = terminalTheme();
-        fitAddon?.fit();
     }
 
     function writePtyChunk(payload: unknown) {
@@ -118,9 +116,9 @@
         }
 
         try {
-            await invoke('resize_pty', { cols: term.cols, rows: term.rows, sessionId: currentSessionId });
+            await invoke('resize_pty', { cols: term.cols, rows: term.rows, sessionId: sessionId });
         } catch (error) {
-            console.error(`Failed to resize PTY for ${currentSessionId}:`, error);
+            console.error(`Failed to resize PTY for ${sessionId}:`, error);
         }
     }
 
@@ -129,7 +127,7 @@
             return;
         }
 
-        if (attachedSessionId === currentSessionId) {
+        if (attachedSessionId === sessionId) {
             await syncTerminalSize();
             return;
         }
@@ -139,7 +137,7 @@
         // already holds the correct visible content, so we can skip clearing
         // the buffer and replaying the full pending_output history.
         // If we're switching to a *different* session (attachedSessionId !== null
-        // but !== currentSessionId) we must clear so old content doesn't bleed
+        // but !== sessionId) we must clear so old content doesn't bleed
         // through — the early-return above already handles the identical-session
         // fast path, so reaching this point always means a session switch.
         const isReattachingSameSession = false;
@@ -155,13 +153,13 @@
         if (!isReattachingSameSession) {
             term.clear();
         }
-        attachedSessionId = currentSessionId;
+        attachedSessionId = sessionId;
 
         try {
-            terminalStatus = await invoke<TerminalStatusPayload>('get_terminal_status', { sessionId: currentSessionId });
+            terminalStatus = await invoke<TerminalStatusPayload>('get_terminal_status', { sessionId: sessionId });
         } catch (error) {
             terminalStatus = {
-                session_id: currentSessionId,
+                session_id: sessionId,
                 state: 'failed',
                 message: `Failed to read terminal status: ${String(error)}`,
                 exit_code: null
@@ -175,12 +173,12 @@
         try {
             await invoke('attach_pty_output', {
                 channel: ptyOutChannel,
-                sessionId: currentSessionId,
+                sessionId: sessionId,
                 skipPending: isReattachingSameSession,
             });
         } catch (error) {
             terminalStatus = {
-                session_id: currentSessionId,
+                session_id: sessionId,
                 state: 'failed',
                 message: `Failed to attach terminal output: ${String(error)}`,
                 exit_code: null
@@ -228,22 +226,34 @@
         });
 
         statusUnlisten = await listen<TerminalStatusPayload>('terminal-status', (event) => {
-            if (event.payload.session_id !== currentSessionId) {
+            if (event.payload.session_id !== sessionId) {
                 return;
             }
             terminalStatus = event.payload;
         });
 
+        let pendingInput = '';
+        let inputQueued = false;
+
         dataDisposable = term.onData((data) => {
-            invoke('write_to_pty', { data, sessionId: currentSessionId }).catch((error) => {
-                console.error(`Failed to write to PTY for ${currentSessionId}:`, error);
-                terminalStatus = {
-                    session_id: currentSessionId,
-                    state: 'failed',
-                    message: `Failed to write to shell: ${String(error)}`,
-                    exit_code: null
-                };
-            });
+            pendingInput += data;
+            if (!inputQueued) {
+                inputQueued = true;
+                queueMicrotask(() => {
+                    const batch = pendingInput;
+                    pendingInput = '';
+                    inputQueued = false;
+                    invoke('write_to_pty', { data: batch, sessionId }).catch((error) => {
+                        console.error(`Failed to write to PTY for ${sessionId}:`, error);
+                        terminalStatus = {
+                            session_id: sessionId,
+                            state: 'failed',
+                            message: `Failed to write to shell: ${String(error)}`,
+                            exit_code: null
+                        };
+                    });
+                });
+            }
         });
 
         await attachSession();
@@ -260,19 +270,18 @@
             resizeDebounceTimer = setTimeout(() => {
                 resizeDebounceTimer = null;
                 void syncTerminalSize();
-            }, 50);
+            }, 150);
         });
         resizeObserver.observe(terminalContainer);
     });
 
     $effect(() => {
-        if (!term) {
+        const sid = sessionId;
+        if (!term || !sid || sid === attachedSessionId) {
             return;
         }
 
-        if (currentSessionId) {
-            void attachSession();
-        }
+        void attachSession();
     });
 
     onMount(() => {

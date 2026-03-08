@@ -48,15 +48,40 @@
     }
 
     function paneDropTargetAtPoint(clientX: number, clientY: number, sourcePaneId: string) {
-        // Use elementsFromPoint (plural) to pierce through overlapping elements
-        // like the drag overlay sitting on top of the source pane
-        const elements = document.elementsFromPoint(clientX, clientY) as HTMLElement[];
+        const paneShells = Array.from(document.querySelectorAll<HTMLElement>('.pane-shell[data-pane-drop-id]'));
         let dropHandle: HTMLElement | null = null;
-        for (const el of elements) {
-            const found = el.closest('[data-pane-drop-id]') as HTMLElement | null;
-            if (found && found.dataset.paneDropId && found.dataset.paneDropId !== sourcePaneId) {
-                dropHandle = found;
-                break;
+        let smallestArea = Number.POSITIVE_INFINITY;
+
+        for (const paneShell of paneShells) {
+            const targetPaneId = paneShell.dataset.paneDropId;
+            if (!targetPaneId || targetPaneId === sourcePaneId) {
+                continue;
+            }
+
+            const style = getComputedStyle(paneShell);
+            if (style.visibility !== 'visible' || style.pointerEvents === 'none') {
+                continue;
+            }
+
+            const rect = paneShell.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) {
+                continue;
+            }
+
+            const containsPoint =
+                clientX >= rect.left &&
+                clientX <= rect.right &&
+                clientY >= rect.top &&
+                clientY <= rect.bottom;
+
+            if (!containsPoint) {
+                continue;
+            }
+
+            const area = rect.width * rect.height;
+            if (area < smallestArea) {
+                smallestArea = area;
+                dropHandle = paneShell;
             }
         }
 
@@ -117,7 +142,10 @@
             return;
         }
 
-        const target = event.currentTarget as HTMLElement;
+        const target = event.target as HTMLElement | null;
+        if (target?.closest('.pane-actions, .pane-icon-btn, button')) {
+            return;
+        }
 
         const onPointerMove = (moveEvent: PointerEvent) => {
             if (!activePointerDrag || activePointerDrag.pointerId !== moveEvent.pointerId) {
@@ -143,10 +171,7 @@
 
             if (activePointerDrag.dragging) {
                 moveEvent.preventDefault();
-                // Release capture temporarily so elementsFromPoint works correctly
-                target.releasePointerCapture(moveEvent.pointerId);
                 paneDropTargetAtPoint(moveEvent.clientX, moveEvent.clientY, activePointerDrag.sourcePaneId);
-                target.setPointerCapture(moveEvent.pointerId);
             }
         };
 
@@ -154,9 +179,6 @@
             if (!activePointerDrag || activePointerDrag.pointerId !== upEvent.pointerId) {
                 return;
             }
-
-            // Release capture before hit-testing so we get accurate results
-            target.releasePointerCapture(upEvent.pointerId);
 
             const targetPaneId = activePointerDrag.dragging
                 ? paneDropTargetAtPoint(upEvent.clientX, upEvent.clientY, activePointerDrag.sourcePaneId)
@@ -167,6 +189,22 @@
                     sourcePaneId: activePointerDrag.sourcePaneId,
                     targetPaneId,
                 });
+            }
+
+            clearPaneDragState();
+        };
+
+        const onPointerCancel = (cancelEvent: PointerEvent) => {
+            if (!activePointerDrag || activePointerDrag.pointerId !== cancelEvent.pointerId) {
+                return;
+            }
+
+            clearPaneDragState();
+        };
+
+        const onWindowBlur = () => {
+            if (!activePointerDrag || activePointerDrag.pointerId !== event.pointerId) {
+                return;
             }
 
             clearPaneDragState();
@@ -183,18 +221,17 @@
             targetTitle: null,
             highlightedElement: null,
             cleanup: () => {
-                target.removeEventListener('pointermove', onPointerMove);
-                target.removeEventListener('pointerup', onPointerUp);
-                target.removeEventListener('pointercancel', onPointerUp);
+                window.removeEventListener('pointermove', onPointerMove);
+                window.removeEventListener('pointerup', onPointerUp);
+                window.removeEventListener('pointercancel', onPointerCancel);
+                window.removeEventListener('blur', onWindowBlur);
             },
         };
 
-        // Capture the pointer on the element so move events never get lost
-        // even when the cursor moves quickly across other panes
-        target.setPointerCapture(event.pointerId);
-        target.addEventListener('pointermove', onPointerMove);
-        target.addEventListener('pointerup', onPointerUp);
-        target.addEventListener('pointercancel', onPointerUp);
+        window.addEventListener('pointermove', onPointerMove);
+        window.addEventListener('pointerup', onPointerUp);
+        window.addEventListener('pointercancel', onPointerCancel);
+        window.addEventListener('blur', onWindowBlur);
         event.preventDefault();
     }
 
@@ -257,11 +294,11 @@
 </script>
 
 {#if node.kind === 'terminal'}
-    <section
-        class="pane-shell"
-        class:active={isActive(node.pane_id)}
-        class:dragging={draggingSelf}
-        class:swap-target={isSwapTarget(node.pane_id)}
+        <section
+            class="pane-shell"
+            class:active={isActive(node.pane_id)}
+            class:dragging={draggingSelf}
+            class:swap-target={isSwapTarget(node.pane_id)}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
     >
@@ -607,7 +644,12 @@
         background: color-mix(in srgb, var(--ui-layer-1) 80%, transparent 20%);
         flex: 0 0 auto;
         min-height: 34px;
+        cursor: grab;
         transition: background var(--ui-motion-fast);
+    }
+
+    .pane-header:active {
+        cursor: grabbing;
     }
 
     .pane-shell.active .pane-header {
@@ -620,17 +662,12 @@
         gap: 8px;
         min-width: 0;
         flex: 1;
-        cursor: grab;
         user-select: none;
     }
 
     :global(.codemux-pane-drop-target) {
         outline: none;
         background: transparent;
-    }
-
-    .pane-title-block:active {
-        cursor: grabbing;
     }
 
     .pane-title {
