@@ -13,6 +13,23 @@ const CODEMUX_CONFIG_VERSION: u32 = 1;
 const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TERMINAL_SESSIONS: usize = 8;
 
+#[derive(Debug, Clone)]
+enum WorkspaceInsertBehavior {
+    Horizontal,
+    Smart,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspacePresetLayout {
+    Single,
+    Pair,
+    Quad,
+    Six,
+    Eight,
+    ShellBrowser,
+}
+
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -35,7 +52,7 @@ pub struct SessionId(pub String);
 #[serde(transparent)]
 pub struct BrowserId(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
     Horizontal,
@@ -264,27 +281,65 @@ impl AppStateStore {
     }
 
     pub fn create_workspace(&self) -> WorkspaceId {
+        self.create_workspace_at_path(current_project_root())
+    }
+
+    pub fn create_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
+        self.create_workspace_with_layout(cwd_path, WorkspacePresetLayout::Single)
+    }
+
+    pub fn create_workspace_with_layout(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+    ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
         let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
-        let pane_id = PaneId(next_id("pane"));
-        let session_id = SessionId(next_id("session"));
-        let cwd = current_project_root().display().to_string();
+        let cwd = cwd_path.display().to_string();
         let shell = env::var("SHELL").ok();
         let workspace_index = snapshot.workspaces.len() + 1;
-        let terminal_index = snapshot.terminal_sessions.len() + 1;
+        let base_terminal_index = snapshot.terminal_sessions.len() + 1;
+        let shell_count = layout_shell_count(&layout);
+        let mut session_ids = Vec::with_capacity(shell_count);
 
-        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
-            session_id: session_id.clone(),
-            title: format!("Terminal {terminal_index}"),
-            shell,
-            cwd: cwd.clone(),
-            cols: 80,
-            rows: 24,
-            state: TerminalSessionState::Starting,
-            last_message: Some("Preparing shell session".into()),
-            exit_code: None,
-        });
+        for offset in 0..shell_count {
+            let session_id = SessionId(next_id("session"));
+            snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+                session_id: session_id.clone(),
+                title: format!("Terminal {}", base_terminal_index + offset),
+                shell: shell.clone(),
+                cwd: cwd.clone(),
+                cols: 80,
+                rows: 24,
+                state: TerminalSessionState::Starting,
+                last_message: Some("Preparing shell session".into()),
+                exit_code: None,
+            });
+            session_ids.push(session_id);
+        }
+
+        let mut browser = None;
+        if matches!(layout, WorkspacePresetLayout::ShellBrowser) {
+            let browser_id = BrowserId(next_id("browser"));
+            let browser_title = format!("Browser {}", snapshot.browser_sessions.len() + 1);
+            snapshot.browser_sessions.push(BrowserSessionSnapshot {
+                browser_id: browser_id.clone(),
+                title: browser_title,
+                current_url: Some("https://example.com".into()),
+                history: vec!["https://example.com".into()],
+                history_index: 0,
+                is_loading: false,
+                last_error: None,
+                reload_nonce: 0,
+                last_screenshot_path: None,
+            });
+            browser = Some(browser_id);
+        }
+
+        let root = build_workspace_layout(&layout, &session_ids, browser.as_ref());
+        let active_pane_id =
+            rightmost_leaf_pane_id(&root).unwrap_or_else(|| PaneId(next_id("pane")));
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
@@ -297,12 +352,8 @@ impl AppStateStore {
             surfaces: vec![SurfaceSnapshot {
                 surface_id,
                 title: "Main Surface".into(),
-                active_pane_id: pane_id.clone(),
-                root: PaneNodeSnapshot::Terminal {
-                    pane_id,
-                    session_id,
-                    title: "Terminal".into(),
-                },
+                active_pane_id,
+                root,
             }],
         });
 
@@ -493,23 +544,24 @@ impl AppStateStore {
                 .iter_mut()
                 .find(|surface| surface.surface_id == workspace.active_surface_id)
             {
-                let previous_root = surface.root.clone();
+                let target_pane_id = surface.active_pane_id.0.clone();
                 let split_pane_id = PaneId(next_id("pane"));
+                let inserted = insert_split_at_pane_with_behavior(
+                    &mut surface.root,
+                    &target_pane_id,
+                    split_pane_id,
+                    SplitDirection::Horizontal,
+                    PaneNodeSnapshot::Terminal {
+                        pane_id: pane_id.clone(),
+                        session_id: session_id.clone(),
+                        title: title.clone(),
+                    },
+                    WorkspaceInsertBehavior::Smart,
+                );
 
-                surface.root = PaneNodeSnapshot::Split {
-                    pane_id: split_pane_id,
-                    direction: SplitDirection::Vertical,
-                    child_sizes: vec![0.5, 0.5],
-                    children: vec![
-                        previous_root,
-                        PaneNodeSnapshot::Terminal {
-                            pane_id: pane_id.clone(),
-                            session_id: session_id.clone(),
-                            title: title.clone(),
-                        },
-                    ],
-                };
-                surface.active_pane_id = pane_id;
+                if inserted {
+                    surface.active_pane_id = pane_id;
+                }
             }
         }
 
@@ -734,6 +786,55 @@ impl AppStateStore {
         }
 
         Ok(removed_session_id)
+    }
+
+    pub fn swap_panes(&self, source_pane_id: &str, target_pane_id: &str) -> Result<(), String> {
+        if source_pane_id == target_pane_id {
+            return Ok(());
+        }
+
+        let mut snapshot = self.inner.lock().unwrap();
+
+        let source_location = find_pane_location(&snapshot.workspaces, source_pane_id)
+            .ok_or_else(|| format!("No pane found for {source_pane_id}"))?;
+        let target_location = find_pane_location(&snapshot.workspaces, target_pane_id)
+            .ok_or_else(|| format!("No pane found for {target_pane_id}"))?;
+
+        if source_location != target_location {
+            return Err("Pane swapping is currently limited to the same workspace surface".into());
+        }
+
+        let (workspace_index, surface_index) = source_location;
+        let workspace = snapshot
+            .workspaces
+            .get_mut(workspace_index)
+            .ok_or_else(|| "Workspace disappeared while swapping panes".to_string())?;
+        let surface = workspace
+            .surfaces
+            .get_mut(surface_index)
+            .ok_or_else(|| "Surface disappeared while swapping panes".to_string())?;
+
+        let source_node = clone_pane_node(&surface.root, source_pane_id)
+            .ok_or_else(|| format!("Failed to clone source pane {source_pane_id}"))?;
+        let target_node = clone_pane_node(&surface.root, target_pane_id)
+            .ok_or_else(|| format!("Failed to clone target pane {target_pane_id}"))?;
+
+        if !replace_pane_node(&mut surface.root, source_pane_id, target_node.clone()) {
+            return Err(format!("Failed to replace source pane {source_pane_id}"));
+        }
+
+        if !replace_pane_node(&mut surface.root, target_pane_id, source_node.clone()) {
+            return Err(format!("Failed to replace target pane {target_pane_id}"));
+        }
+
+        if surface.active_pane_id.0 == source_pane_id {
+            surface.active_pane_id = pane_id_from_node(&target_node);
+        } else if surface.active_pane_id.0 == target_pane_id {
+            surface.active_pane_id = pane_id_from_node(&source_node);
+        }
+
+        snapshot.active_workspace_id = workspace.workspace_id.clone();
+        Ok(())
     }
 
     pub fn update_browser_url(&self, browser_id: &str, url: String) -> Result<(), String> {
@@ -1147,7 +1248,7 @@ fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -> Op
     }
 }
 
-fn collect_terminal_sessions(surfaces: &[SurfaceSnapshot]) -> Vec<String> {
+pub fn collect_terminal_sessions(surfaces: &[SurfaceSnapshot]) -> Vec<String> {
     surfaces
         .iter()
         .flat_map(|surface| collect_terminal_sessions_from_node(&surface.root))
@@ -1265,6 +1366,143 @@ fn normalize_url(url: &str) -> String {
     }
 
     format!("https://{trimmed}")
+}
+
+fn layout_shell_count(layout: &WorkspacePresetLayout) -> usize {
+    match layout {
+        WorkspacePresetLayout::Single => 1,
+        WorkspacePresetLayout::Pair => 2,
+        WorkspacePresetLayout::Quad => 4,
+        WorkspacePresetLayout::Six => 6,
+        WorkspacePresetLayout::Eight => 8,
+        WorkspacePresetLayout::ShellBrowser => 1,
+    }
+}
+
+fn build_workspace_layout(
+    layout: &WorkspacePresetLayout,
+    session_ids: &[SessionId],
+    browser_id: Option<&BrowserId>,
+) -> PaneNodeSnapshot {
+    match layout {
+        WorkspacePresetLayout::Single => terminal_node(&session_ids[0], 0),
+        WorkspacePresetLayout::Pair => split_node(
+            SplitDirection::Horizontal,
+            vec![
+                terminal_node(&session_ids[0], 0),
+                terminal_node(&session_ids[1], 1),
+            ],
+        ),
+        WorkspacePresetLayout::Quad => split_node(
+            SplitDirection::Vertical,
+            vec![
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[0], 0),
+                        terminal_node(&session_ids[1], 1),
+                    ],
+                ),
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[2], 2),
+                        terminal_node(&session_ids[3], 3),
+                    ],
+                ),
+            ],
+        ),
+        WorkspacePresetLayout::Six => split_node(
+            SplitDirection::Vertical,
+            vec![
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[0], 0),
+                        terminal_node(&session_ids[1], 1),
+                        terminal_node(&session_ids[2], 2),
+                    ],
+                ),
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[3], 3),
+                        terminal_node(&session_ids[4], 4),
+                        terminal_node(&session_ids[5], 5),
+                    ],
+                ),
+            ],
+        ),
+        WorkspacePresetLayout::Eight => split_node(
+            SplitDirection::Vertical,
+            vec![
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[0], 0),
+                        terminal_node(&session_ids[1], 1),
+                        terminal_node(&session_ids[2], 2),
+                        terminal_node(&session_ids[3], 3),
+                    ],
+                ),
+                split_node(
+                    SplitDirection::Horizontal,
+                    vec![
+                        terminal_node(&session_ids[4], 4),
+                        terminal_node(&session_ids[5], 5),
+                        terminal_node(&session_ids[6], 6),
+                        terminal_node(&session_ids[7], 7),
+                    ],
+                ),
+            ],
+        ),
+        WorkspacePresetLayout::ShellBrowser => split_node(
+            SplitDirection::Horizontal,
+            vec![
+                terminal_node(&session_ids[0], 0),
+                browser_node(
+                    browser_id.expect("browser layout requires browser session"),
+                    0,
+                ),
+            ],
+        ),
+    }
+}
+
+fn terminal_node(session_id: &SessionId, index: usize) -> PaneNodeSnapshot {
+    PaneNodeSnapshot::Terminal {
+        pane_id: PaneId(next_id("pane")),
+        session_id: session_id.clone(),
+        title: format!("Terminal {}", index + 1),
+    }
+}
+
+fn browser_node(browser_id: &BrowserId, index: usize) -> PaneNodeSnapshot {
+    PaneNodeSnapshot::Browser {
+        pane_id: PaneId(next_id("pane")),
+        browser_id: browser_id.clone(),
+        title: format!("Browser {}", index + 1),
+    }
+}
+
+fn split_node(direction: SplitDirection, children: Vec<PaneNodeSnapshot>) -> PaneNodeSnapshot {
+    PaneNodeSnapshot::Split {
+        pane_id: PaneId(next_id("pane")),
+        direction,
+        child_sizes: normalize_sizes(vec![1.0 / children.len() as f32; children.len()]),
+        children,
+    }
+}
+
+fn rightmost_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
+    match root {
+        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
+            Some(pane_id.clone())
+        }
+        PaneNodeSnapshot::Split { children, .. } => {
+            children.last().and_then(rightmost_leaf_pane_id)
+        }
+    }
 }
 
 fn active_workspace_surface_indices(snapshot: &AppStateSnapshot) -> Option<(usize, usize)> {
@@ -1401,6 +1639,48 @@ fn first_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
     }
 }
 
+fn clone_pane_node(root: &PaneNodeSnapshot, target_pane_id: &str) -> Option<PaneNodeSnapshot> {
+    match root {
+        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+            if pane_id.0 == target_pane_id =>
+        {
+            Some(root.clone())
+        }
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| clone_pane_node(child, target_pane_id)),
+        _ => None,
+    }
+}
+
+fn replace_pane_node(
+    root: &mut PaneNodeSnapshot,
+    target_pane_id: &str,
+    replacement: PaneNodeSnapshot,
+) -> bool {
+    match root {
+        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+            if pane_id.0 == target_pane_id =>
+        {
+            *root = replacement;
+            true
+        }
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter_mut()
+            .any(|child| replace_pane_node(child, target_pane_id, replacement.clone())),
+        _ => false,
+    }
+}
+
+fn pane_id_from_node(node: &PaneNodeSnapshot) -> PaneId {
+    match node {
+        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
+            pane_id.clone()
+        }
+        PaneNodeSnapshot::Split { pane_id, .. } => pane_id.clone(),
+    }
+}
+
 fn find_pane_location(workspaces: &[WorkspaceSnapshot], pane_id: &str) -> Option<(usize, usize)> {
     for (workspace_index, workspace) in workspaces.iter().enumerate() {
         for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
@@ -1420,6 +1700,24 @@ fn insert_split_at_pane(
     direction: SplitDirection,
     new_node: PaneNodeSnapshot,
 ) -> bool {
+    insert_split_at_pane_with_behavior(
+        root,
+        target_pane_id,
+        split_pane_id,
+        direction,
+        new_node,
+        WorkspaceInsertBehavior::Horizontal,
+    )
+}
+
+fn insert_split_at_pane_with_behavior(
+    root: &mut PaneNodeSnapshot,
+    target_pane_id: &str,
+    split_pane_id: PaneId,
+    direction: SplitDirection,
+    new_node: PaneNodeSnapshot,
+    behavior: WorkspaceInsertBehavior,
+) -> bool {
     match root {
         PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
             if pane_id.0 == target_pane_id =>
@@ -1433,15 +1731,76 @@ fn insert_split_at_pane(
             };
             true
         }
-        PaneNodeSnapshot::Split { children, .. } => children.iter_mut().any(|child| {
-            insert_split_at_pane(
-                child,
-                target_pane_id,
-                split_pane_id.clone(),
-                direction.clone(),
-                new_node.clone(),
-            )
-        }),
+        PaneNodeSnapshot::Split {
+            child_sizes,
+            children,
+            ..
+        } => {
+            if matches!(behavior, WorkspaceInsertBehavior::Smart)
+                && direction == SplitDirection::Horizontal
+            {
+                if let Some((_, target_child)) = children
+                    .iter_mut()
+                    .enumerate()
+                    .find(|(_, child)| pane_tree_contains_pane(child, target_pane_id))
+                {
+                    match target_child {
+                        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => {
+                            let existing_child = target_child.clone();
+                            let nested_split_id = PaneId(next_id("pane"));
+                            *target_child = PaneNodeSnapshot::Split {
+                                pane_id: nested_split_id,
+                                direction: SplitDirection::Vertical,
+                                child_sizes: vec![0.5, 0.5],
+                                children: vec![existing_child, new_node],
+                            };
+                            return true;
+                        }
+                        PaneNodeSnapshot::Split {
+                            direction: child_direction,
+                            child_sizes: nested_sizes,
+                            children: nested_children,
+                            ..
+                        } if *child_direction == SplitDirection::Vertical
+                            && nested_children.len() < 2 =>
+                        {
+                            nested_children.push(new_node);
+                            *nested_sizes = rebalance_sizes(nested_sizes, nested_children.len());
+                            return true;
+                        }
+                        PaneNodeSnapshot::Split { .. } => {
+                            if insert_split_at_pane_with_behavior(
+                                target_child,
+                                target_pane_id,
+                                split_pane_id.clone(),
+                                direction.clone(),
+                                new_node.clone(),
+                                behavior.clone(),
+                            ) {
+                                *child_sizes = rebalance_sizes(child_sizes, children.len());
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let inserted = children.iter_mut().any(|child| {
+                insert_split_at_pane_with_behavior(
+                    child,
+                    target_pane_id,
+                    split_pane_id.clone(),
+                    direction.clone(),
+                    new_node.clone(),
+                    behavior.clone(),
+                )
+            });
+
+            if inserted {
+                *child_sizes = rebalance_sizes(child_sizes, children.len());
+            }
+            inserted
+        }
         _ => false,
     }
 }
@@ -1576,5 +1935,72 @@ mod tests {
         let total: f32 = normalized.iter().sum();
         assert!((total - 1.0).abs() < 0.0001);
         assert!(normalized.iter().all(|value| *value >= 0.1));
+    }
+
+    #[test]
+    fn workspace_preset_six_creates_three_by_three_grid() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Six,
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+        let root = &workspace.surfaces[0].root;
+
+        match root {
+            PaneNodeSnapshot::Split {
+                direction: SplitDirection::Vertical,
+                children,
+                ..
+            } => {
+                assert_eq!(children.len(), 2);
+                for child in children {
+                    match child {
+                        PaneNodeSnapshot::Split {
+                            direction: SplitDirection::Horizontal,
+                            children,
+                            ..
+                        } => assert_eq!(children.len(), 3),
+                        _ => panic!("expected each row to be a horizontal split"),
+                    }
+                }
+            }
+            _ => panic!("expected six-slot preset root to be vertical split"),
+        }
+    }
+
+    #[test]
+    fn workspace_preset_shell_browser_creates_one_shell_and_one_browser() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::ShellBrowser,
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .unwrap();
+
+        assert_eq!(snapshot.browser_sessions.len(), 1);
+
+        match &workspace.surfaces[0].root {
+            PaneNodeSnapshot::Split {
+                direction: SplitDirection::Horizontal,
+                children,
+                ..
+            } => {
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0], PaneNodeSnapshot::Terminal { .. }));
+                assert!(matches!(children[1], PaneNodeSnapshot::Browser { .. }));
+            }
+            _ => panic!("expected shell+browser preset to be a horizontal split"),
+        }
     }
 }

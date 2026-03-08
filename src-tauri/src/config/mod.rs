@@ -6,6 +6,11 @@ use std::sync::mpsc::channel;
 use tauri::Emitter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellAppearance {
+    pub font_family: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeColors {
     pub accent: String,
     pub cursor: String,
@@ -84,6 +89,99 @@ pub fn read_theme_colors_or_default() -> ThemeColors {
             ThemeColors::default()
         }
     }
+}
+
+pub fn read_shell_appearance() -> Result<ShellAppearance, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Err("Could not determine home directory for shell appearance lookup".into());
+    };
+
+    let candidates = [
+        (
+            home.join(".config/ghostty/config"),
+            parse_ghostty_font_family as fn(&str) -> Option<String>,
+        ),
+        (
+            home.join(".config/kitty/kitty.conf"),
+            parse_kitty_font_family as fn(&str) -> Option<String>,
+        ),
+        (
+            home.join(".config/alacritty/alacritty.toml"),
+            parse_alacritty_font_family as fn(&str) -> Option<String>,
+        ),
+    ];
+
+    for (path, parser) in candidates {
+        let Ok(contents) = fs::read_to_string(&path) else {
+            continue;
+        };
+
+        if let Some(font_family) = parser(&contents) {
+            return Ok(ShellAppearance { font_family });
+        }
+    }
+
+    Err("No terminal font configuration found in Ghostty, Kitty, or Alacritty configs".into())
+}
+
+pub fn read_shell_appearance_or_default() -> ShellAppearance {
+    read_shell_appearance().unwrap_or_else(|error| {
+        eprintln!("[codemux::shell_appearance] {error}. Falling back to monospace.");
+        ShellAppearance {
+            font_family: "monospace".into(),
+        }
+    })
+}
+
+fn parse_ghostty_font_family(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.starts_with("font-family") {
+            return None;
+        }
+
+        trimmed
+            .split_once('=')
+            .map(|(_, value)| clean_font_value(value))
+    })
+}
+
+fn parse_kitty_font_family(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.starts_with("font_family") {
+            return None;
+        }
+
+        trimmed
+            .split_once(' ')
+            .map(|(_, value)| clean_font_value(value))
+    })
+}
+
+fn parse_alacritty_font_family(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || !trimmed.contains("family") {
+            return None;
+        }
+
+        trimmed
+            .split_once('=')
+            .map(|(_, value)| clean_font_value(value))
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn clean_font_value(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('}')
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string()
 }
 
 pub fn watch_theme_file(app_handle: tauri::AppHandle) {

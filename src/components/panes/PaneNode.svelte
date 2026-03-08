@@ -4,6 +4,7 @@
     import TerminalPane from './TerminalPane.svelte';
     import BrowserPane from './BrowserPane.svelte';
     import type { PaneNodeSnapshot } from '../../stores/appState';
+    import { paneDragState } from '../../stores/paneDrag';
 
     let {
         node,
@@ -19,60 +20,224 @@
         close: { paneId: string };
         resize: { paneId: string; childSizes: number[] };
         browser: { paneId: string };
+        swap: { sourcePaneId: string; targetPaneId: string };
     }>();
 
     let container = $state<HTMLElement | null>(null);
     let dragIndex = $state<number | null>(null);
+    let draggingSelf = $state(false);
 
-    function isActivePane(paneId: string) {
+    let activePointerDrag = $state<{
+        sourcePaneId: string;
+        sourceTitle: string;
+        pointerId: number;
+        startX: number;
+        startY: number;
+        dragging: boolean;
+        targetPaneId: string | null;
+        targetTitle: string | null;
+        highlightedElement: HTMLElement | null;
+        cleanup?: () => void;
+    } | null>(null);
+
+    function clearDropHighlight() {
+        if (activePointerDrag?.highlightedElement) {
+            activePointerDrag.highlightedElement.classList.remove('codemux-pane-drop-target');
+            activePointerDrag.highlightedElement = null;
+        }
+    }
+
+    function paneDropTargetAtPoint(clientX: number, clientY: number, sourcePaneId: string) {
+        // Use elementsFromPoint (plural) to pierce through overlapping elements
+        // like the drag overlay sitting on top of the source pane
+        const elements = document.elementsFromPoint(clientX, clientY) as HTMLElement[];
+        let dropHandle: HTMLElement | null = null;
+        for (const el of elements) {
+            const found = el.closest('[data-pane-drop-id]') as HTMLElement | null;
+            if (found && found.dataset.paneDropId && found.dataset.paneDropId !== sourcePaneId) {
+                dropHandle = found;
+                break;
+            }
+        }
+
+        const targetPaneId = dropHandle?.dataset.paneDropId;
+        const targetTitle = dropHandle?.dataset.paneTitle ?? 'pane';
+
+        if (!dropHandle || !targetPaneId) {
+            clearDropHighlight();
+            if (activePointerDrag) {
+                activePointerDrag.targetPaneId = null;
+                activePointerDrag.targetTitle = null;
+                paneDragState.set({
+                    sourcePaneId: activePointerDrag.sourcePaneId,
+                    sourceTitle: activePointerDrag.sourceTitle,
+                    dragging: activePointerDrag.dragging,
+                    targetPaneId: null,
+                    targetTitle: null,
+                });
+            }
+            return null;
+        }
+
+        if (activePointerDrag?.highlightedElement !== dropHandle) {
+            clearDropHighlight();
+            dropHandle.classList.add('codemux-pane-drop-target');
+            if (activePointerDrag) {
+                activePointerDrag.highlightedElement = dropHandle;
+            }
+        }
+
+        if (activePointerDrag) {
+            activePointerDrag.targetPaneId = targetPaneId;
+            activePointerDrag.targetTitle = targetTitle;
+            paneDragState.set({
+                sourcePaneId: activePointerDrag.sourcePaneId,
+                sourceTitle: activePointerDrag.sourceTitle,
+                dragging: activePointerDrag.dragging,
+                targetPaneId,
+                targetTitle,
+            });
+        }
+
+        return targetPaneId;
+    }
+
+    function clearPaneDragState() {
+        clearDropHighlight();
+        draggingSelf = false;
+        paneDragState.set(null);
+        if (activePointerDrag?.cleanup) {
+            activePointerDrag.cleanup();
+        }
+        activePointerDrag = null;
+    }
+
+    function handlePanePointerDown(event: PointerEvent, paneId: string, title: string) {
+        if (event.button !== 0) {
+            return;
+        }
+
+        const target = event.currentTarget as HTMLElement;
+
+        const onPointerMove = (moveEvent: PointerEvent) => {
+            if (!activePointerDrag || activePointerDrag.pointerId !== moveEvent.pointerId) {
+                return;
+            }
+
+            const distance = Math.hypot(
+                moveEvent.clientX - activePointerDrag.startX,
+                moveEvent.clientY - activePointerDrag.startY,
+            );
+
+            if (!activePointerDrag.dragging && distance > 8) {
+                activePointerDrag.dragging = true;
+                draggingSelf = true;
+                paneDragState.set({
+                    sourcePaneId: activePointerDrag.sourcePaneId,
+                    sourceTitle: activePointerDrag.sourceTitle,
+                    dragging: true,
+                    targetPaneId: null,
+                    targetTitle: null,
+                });
+            }
+
+            if (activePointerDrag.dragging) {
+                moveEvent.preventDefault();
+                // Release capture temporarily so elementsFromPoint works correctly
+                target.releasePointerCapture(moveEvent.pointerId);
+                paneDropTargetAtPoint(moveEvent.clientX, moveEvent.clientY, activePointerDrag.sourcePaneId);
+                target.setPointerCapture(moveEvent.pointerId);
+            }
+        };
+
+        const onPointerUp = (upEvent: PointerEvent) => {
+            if (!activePointerDrag || activePointerDrag.pointerId !== upEvent.pointerId) {
+                return;
+            }
+
+            // Release capture before hit-testing so we get accurate results
+            target.releasePointerCapture(upEvent.pointerId);
+
+            const targetPaneId = activePointerDrag.dragging
+                ? paneDropTargetAtPoint(upEvent.clientX, upEvent.clientY, activePointerDrag.sourcePaneId)
+                : null;
+
+            if (targetPaneId) {
+                dispatch('swap', {
+                    sourcePaneId: activePointerDrag.sourcePaneId,
+                    targetPaneId,
+                });
+            }
+
+            clearPaneDragState();
+        };
+
+        activePointerDrag = {
+            sourcePaneId: paneId,
+            sourceTitle: title,
+            pointerId: event.pointerId,
+            startX: event.clientX,
+            startY: event.clientY,
+            dragging: false,
+            targetPaneId: null,
+            targetTitle: null,
+            highlightedElement: null,
+            cleanup: () => {
+                target.removeEventListener('pointermove', onPointerMove);
+                target.removeEventListener('pointerup', onPointerUp);
+                target.removeEventListener('pointercancel', onPointerUp);
+            },
+        };
+
+        // Capture the pointer on the element so move events never get lost
+        // even when the cursor moves quickly across other panes
+        target.setPointerCapture(event.pointerId);
+        target.addEventListener('pointermove', onPointerMove);
+        target.addEventListener('pointerup', onPointerUp);
+        target.addEventListener('pointercancel', onPointerUp);
+        event.preventDefault();
+    }
+
+    function isActive(paneId: string) {
         return paneId === activePaneId;
     }
 
-    function getChildSizes() {
-        if (node.kind !== 'split') {
-            return [];
-        }
+    function isSwapTarget(paneId: string) {
+        const state = $paneDragState;
+        return state !== null && state.targetPaneId === paneId && state.sourcePaneId !== paneId;
+    }
 
+    function getChildSizes() {
+        if (node.kind !== 'split') return [];
         const raw = node.child_sizes?.length === node.children.length
             ? [...node.child_sizes]
             : Array.from({ length: node.children.length }, () => 1 / node.children.length);
-        const total = raw.reduce((sum, value) => sum + value, 0) || 1;
-        return raw.map((value) => value / total);
+        const total = raw.reduce((s, v) => s + v, 0) || 1;
+        return raw.map((v) => v / total);
     }
 
     function splitStyle() {
-        if (node.kind !== 'split') {
-            return '';
-        }
-
-        const sizes = getChildSizes().map((size) => `${Math.max(size, 0.1)}fr`).join(' ');
+        if (node.kind !== 'split') return '';
+        const sizes = getChildSizes().map((s) => `${Math.max(s, 0.1)}fr`).join(' ');
         return node.direction === 'horizontal'
             ? `grid-template-columns: ${sizes};`
             : `grid-template-rows: ${sizes};`;
     }
 
     function startResize(event: PointerEvent, index: number) {
-        if (node.kind !== 'split' || !container) {
-            return;
-        }
-
+        if (node.kind !== 'split' || !container) return;
         dragIndex = index;
         const rect = container.getBoundingClientRect();
         const sizes = getChildSizes();
         const axisSize = node.direction === 'horizontal' ? rect.width : rect.height;
-        if (axisSize <= 0) {
-            dragIndex = null;
-            return;
-        }
+        if (axisSize <= 0) { dragIndex = null; return; }
 
-        const onMove = (moveEvent: PointerEvent) => {
-            const pointerOffset = node.direction === 'horizontal'
-                ? moveEvent.clientX - rect.left
-                : moveEvent.clientY - rect.top;
-            const before = Math.max(0.1, Math.min(pointerOffset / axisSize, 0.9));
-            const totalPair = sizes[index] + sizes[index + 1];
-            const first = Math.max(0.1, Math.min(before, totalPair - 0.1));
-            const second = Math.max(0.1, totalPair - first);
+        const onMove = (e: PointerEvent) => {
+            const pos = node.direction === 'horizontal' ? e.clientX - rect.left : e.clientY - rect.top;
+            const before = Math.max(0.1, Math.min(pos / axisSize, 0.9));
+            const pair = sizes[index] + sizes[index + 1];
+            const first = Math.max(0.1, Math.min(before, pair - 0.1));
+            const second = Math.max(0.1, pair - first);
             const next = [...sizes];
             next[index] = first;
             next[index + 1] = second;
@@ -92,84 +257,205 @@
 </script>
 
 {#if node.kind === 'terminal'}
-    <section class:active={isActivePane(node.pane_id)} class="pane-shell terminal-pane-shell">
+    <section
+        class="pane-shell"
+        class:active={isActive(node.pane_id)}
+        class:dragging={draggingSelf}
+        class:swap-target={isSwapTarget(node.pane_id)}
+        data-pane-drop-id={node.pane_id}
+        data-pane-title={node.title}
+    >
         <header class="pane-header">
-            <div class="pane-header-main">
-                <strong>{node.title}</strong>
-                <span>Live shell</span>
+            <div
+                class="pane-title-block"
+                data-pane-drop-id={node.pane_id}
+                data-pane-title={node.title}
+                role="button"
+                tabindex="0"
+                onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
+                onkeydown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        dispatch('activate', { paneId: node.pane_id });
+                    }
+                }}
+            >
+                <span class="pane-title">{node.title}</span>
+                <span class="pane-subtitle">shell</span>
             </div>
-
             <div class="pane-actions">
-                <button class="pane-action" type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'vertical' })}>Split down</button>
-                <button class="pane-action" type="button" onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'horizontal' })}>Split right</button>
-                <button class="pane-action" type="button" onclick={() => dispatch('browser', { paneId: node.pane_id })}>Browser</button>
-                <button class="pane-action danger" type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
+                <!-- Split vertical (down) -->
+                <button
+                    class="pane-icon-btn"
+                    type="button"
+                    title="Split down"
+                    onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'vertical' })}
+                    aria-label="Split pane down"
+                >
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                        <rect x="1" y="1" width="12" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                        <rect x="1" y="7.5" width="12" height="5.5" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
+                </button>
+                <!-- Split horizontal (right) -->
+                <button
+                    class="pane-icon-btn"
+                    type="button"
+                    title="Split right"
+                    onclick={() => dispatch('split', { paneId: node.pane_id, direction: 'horizontal' })}
+                    aria-label="Split pane right"
+                >
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                        <rect x="1" y="1" width="5.5" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                        <rect x="7.5" y="1" width="5.5" height="12" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
+                </button>
+                <!-- Open browser -->
+                <button
+                    class="pane-icon-btn"
+                    type="button"
+                    title="Open browser pane"
+                    onclick={() => dispatch('browser', { paneId: node.pane_id })}
+                    aria-label="Open browser pane"
+                >
+                    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                        <rect x="1" y="2.5" width="12" height="9" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+                        <path d="M1 5h12" stroke="currentColor" stroke-width="1.2"/>
+                        <circle cx="3.5" cy="3.75" r="0.7" fill="currentColor"/>
+                        <circle cx="5.5" cy="3.75" r="0.7" fill="currentColor"/>
+                    </svg>
+                </button>
+                <!-- Close -->
+                <button
+                    class="pane-icon-btn close"
+                    type="button"
+                    title="Close pane"
+                    onclick={() => dispatch('close', { paneId: node.pane_id })}
+                    aria-label="Close pane"
+                >
+                    <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+                        <path d="M1.5 1.5l8 8M9.5 1.5l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                    </svg>
+                </button>
             </div>
         </header>
 
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
         <div
             class="pane-content"
-            role="button"
-            tabindex="0"
+            data-pane-drop-id={node.pane_id}
+            data-pane-title={node.title}
             onclick={() => dispatch('activate', { paneId: node.pane_id })}
-            onkeydown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    dispatch('activate', { paneId: node.pane_id });
-                }
-            }}
         >
             <TerminalPane sessionId={node.session_id} />
         </div>
-    </section>
-{:else if node.kind === 'browser'}
-    <section class:active={isActivePane(node.pane_id)} class="pane-shell browser-pane-shell">
-        <header class="pane-header">
-            <div class="pane-header-main">
-                <strong>{node.title}</strong>
-                <span>Browser tools</span>
-            </div>
 
+        {#if draggingSelf && activePointerDrag?.sourcePaneId === node.pane_id}
+            <div class="drag-overlay drag-origin" aria-hidden="true">
+                <div class="drag-chip">Moving {activePointerDrag.sourceTitle}</div>
+                <p>Drop on any other pane to swap places</p>
+            </div>
+        {:else if isSwapTarget(node.pane_id)}
+            <div class="drag-overlay drag-origin" aria-hidden="true">
+                <div class="drag-chip">Swap with {node.title}</div>
+                <p>Drop to swap places</p>
+            </div>
+        {/if}
+
+    </section>
+
+{:else if node.kind === 'browser'}
+    <section
+        class="pane-shell browser"
+        class:active={isActive(node.pane_id)}
+        class:dragging={draggingSelf}
+        class:swap-target={isSwapTarget(node.pane_id)}
+        data-pane-drop-id={node.pane_id}
+        data-pane-title={node.title}
+    >
+        <header class="pane-header">
+            <div
+                class="pane-title-block"
+                data-pane-drop-id={node.pane_id}
+                data-pane-title={node.title}
+                role="button"
+                tabindex="0"
+                onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
+                onkeydown={(event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        dispatch('activate', { paneId: node.pane_id });
+                    }
+                }}
+            >
+                <span class="pane-title">{node.title}</span>
+                <span class="pane-subtitle">browser</span>
+            </div>
             <div class="pane-actions always-visible">
-                <button class="pane-action danger" type="button" onclick={() => dispatch('close', { paneId: node.pane_id })}>Close</button>
+                <button
+                    class="pane-icon-btn close"
+                    type="button"
+                    title="Close pane"
+                    onclick={() => dispatch('close', { paneId: node.pane_id })}
+                    aria-label="Close browser pane"
+                >
+                    <svg width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
+                        <path d="M1.5 1.5l8 8M9.5 1.5l-8 8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+                    </svg>
+                </button>
             </div>
         </header>
 
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
         <div
-            class="pane-content browser-pane-content"
-            role="button"
-            tabindex="0"
+            class="pane-content browser-content"
+            data-pane-drop-id={node.pane_id}
+            data-pane-title={node.title}
             onclick={() => dispatch('activate', { paneId: node.pane_id })}
-            onkeydown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    dispatch('activate', { paneId: node.pane_id });
-                }
-            }}
         >
             <BrowserPane browserId={node.browser_id} />
         </div>
+
+        {#if draggingSelf && activePointerDrag?.sourcePaneId === node.pane_id}
+            <div class="drag-overlay drag-origin" aria-hidden="true">
+                <div class="drag-chip">Moving {activePointerDrag.sourceTitle}</div>
+                <p>Drop on any other pane to swap places</p>
+            </div>
+        {:else if isSwapTarget(node.pane_id)}
+            <div class="drag-overlay drag-origin" aria-hidden="true">
+                <div class="drag-chip">Swap with {node.title}</div>
+                <p>Drop to swap places</p>
+            </div>
+        {/if}
+
     </section>
+
 {:else}
-    <section bind:this={container} class={`split-pane ${node.direction}`} style={splitStyle()}>
+    <section
+        bind:this={container}
+        class="split-pane {node.direction}"
+        style={splitStyle()}
+    >
         {#each node.children as child, index (child.pane_id)}
             <div class="split-child">
                 <PaneNode
                     node={child}
                     {activePaneId}
-                    on:activate={(event) => dispatch('activate', event.detail)}
-                    on:split={(event) => dispatch('split', event.detail)}
-                    on:close={(event) => dispatch('close', event.detail)}
-                    on:resize={(event) => dispatch('resize', event.detail)}
-                    on:browser={(event) => dispatch('browser', event.detail)}
+                    on:activate={(e) => dispatch('activate', e.detail)}
+                    on:split={(e) => dispatch('split', e.detail)}
+                    on:close={(e) => dispatch('close', e.detail)}
+                    on:resize={(e) => dispatch('resize', e.detail)}
+                    on:browser={(e) => dispatch('browser', e.detail)}
+                    on:swap={(e) => dispatch('swap', e.detail)}
                 />
                 {#if index < node.children.length - 1}
                     <button
-                        class={`split-handle ${node.direction} ${dragIndex === index ? 'dragging' : ''}`}
-                        style={node.direction === 'horizontal' ? 'right: -4px;' : 'bottom: -4px;'}
+                        class="split-handle {node.direction}"
+                        class:dragging={dragIndex === index}
+                        style={node.direction === 'horizontal' ? 'right: -5px;' : 'bottom: -5px;'}
                         type="button"
                         aria-label="Resize split"
-                        onpointerdown={(event) => startResize(event, index)}
+                        onpointerdown={(e) => startResize(e, index)}
                     ></button>
                 {/if}
             </div>
@@ -178,15 +464,18 @@
 {/if}
 
 <style>
+    /* ---- Split container ---- */
+
     .split-pane {
         display: grid;
-        gap: 6px;
+        gap: 4px;
         width: 100%;
         height: 100%;
         min-width: 0;
         min-height: 0;
-        padding: 6px;
+        padding: 4px;
         box-sizing: border-box;
+        background: var(--ui-layer-0);
     }
 
     .split-pane.horizontal {
@@ -201,78 +490,177 @@
         grid-auto-rows: minmax(0, 1fr);
     }
 
-    .split-child,
-    .pane-shell,
-    .pane-content,
-    .browser-pane-content {
-        min-width: 0;
-        min-height: 0;
-    }
-
     .split-child {
         position: relative;
+        min-width: 0;
+        min-height: 0;
         overflow: hidden;
     }
 
+    /* ---- Pane shell ---- */
+
     .pane-shell {
+        position: relative;
         display: flex;
         flex-direction: column;
         width: 100%;
         height: 100%;
         overflow: hidden;
-        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 10%, transparent);
-        border-radius: 10px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 94%, black 6%);
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-lg, 10px);
+        background: var(--ui-layer-0);
         transition:
-            border-color 140ms ease-out,
-            background 140ms ease-out;
+            border-color var(--ui-motion-fast),
+            box-shadow var(--ui-motion-fast);
     }
 
     .pane-shell.active {
-        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 30%, transparent);
-        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 6%, var(--theme-background, #1a1b26) 94%);
+        border-color: color-mix(in srgb, var(--ui-accent) 32%, transparent);
+        box-shadow:
+            0 0 0 1px color-mix(in srgb, var(--ui-accent) 14%, transparent),
+            inset 0 0 0 1px color-mix(in srgb, var(--ui-accent) 8%, transparent);
     }
+
+    .pane-shell.dragging {
+        opacity: 0.92;
+    }
+
+    .pane-shell.swap-target {
+        opacity: 0.92;
+        border-color: rgba(122, 162, 247, 0.88);
+        background: rgba(122, 162, 247, 0.06);
+        box-shadow:
+            0 0 0 2px rgba(122, 162, 247, 0.44),
+            inset 0 0 0 1px rgba(122, 162, 247, 0.22);
+        transition:
+            border-color 80ms ease,
+            box-shadow 80ms ease,
+            background 80ms ease;
+    }
+
+    .pane-shell.swap-target .drag-overlay {
+        border: 1px dashed rgba(122, 162, 247, 0.6);
+        background: rgba(12, 16, 28, 0.72);
+        backdrop-filter: blur(6px);
+    }
+
+    .pane-shell.swap-target .pane-header {
+        background: rgba(122, 162, 247, 0.22);
+    }
+
+    .drag-overlay {
+        position: absolute;
+        inset: 8px;
+        z-index: 50;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        border-radius: 12px;
+        pointer-events: none;
+        text-align: center;
+        backdrop-filter: blur(4px);
+    }
+
+    .pane-shell.swap-target .drag-overlay .drag-chip {
+        border-color: rgba(122, 162, 247, 0.72);
+        background: rgba(122, 162, 247, 0.18);
+        color: rgba(180, 200, 255, 1);
+    }
+
+    .pane-shell.swap-target .drag-overlay p {
+        color: rgba(160, 185, 255, 0.8);
+    }
+
+    .drag-origin {
+        border: 1px dashed rgba(122, 162, 247, 0.34);
+        background: rgba(12, 16, 28, 0.36);
+    }
+
+    .drag-chip {
+        padding: 6px 10px;
+        border: 1px solid rgba(122, 162, 247, 0.28);
+        border-radius: 999px;
+        background: rgba(14, 18, 31, 0.9);
+        color: var(--ui-text-primary);
+        font-size: 0.76rem;
+        font-weight: 600;
+    }
+
+    .drag-overlay p {
+        margin: 0;
+        color: var(--ui-text-secondary);
+        font-size: 0.78rem;
+        max-width: 28ch;
+    }
+
+    /* ---- Pane header ---- */
 
     .pane-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 12px;
-        padding: 8px 10px;
-        border-bottom: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 8%, transparent);
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 92%, transparent);
+        gap: 8px;
+        padding: 6px 8px 6px 10px;
+        border-bottom: 1px solid var(--ui-border-soft);
+        background: color-mix(in srgb, var(--ui-layer-1) 80%, transparent 20%);
         flex: 0 0 auto;
+        min-height: 34px;
+        transition: background var(--ui-motion-fast);
     }
 
-    .pane-header-main {
+    .pane-shell.active .pane-header {
+        background: color-mix(in srgb, var(--ui-accent) 5%, var(--ui-layer-1) 95%);
+    }
+
+    .pane-title-block {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
         min-width: 0;
+        flex: 1;
+        cursor: grab;
+        user-select: none;
     }
 
-    .pane-header-main strong {
-        display: block;
-        font-size: 0.84rem;
+    :global(.codemux-pane-drop-target) {
+        outline: none;
+        background: transparent;
+    }
+
+    .pane-title-block:active {
+        cursor: grabbing;
+    }
+
+    .pane-title {
+        font-size: 0.8rem;
         font-weight: 600;
+        color: var(--ui-text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
 
-    .pane-header-main span {
-        display: block;
-        margin-top: 2px;
+    .pane-subtitle {
         font-size: 0.7rem;
-        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 56%, transparent);
+        color: var(--ui-text-muted);
+        white-space: nowrap;
     }
+
+    /* ---- Pane icon actions ---- */
 
     .pane-actions {
         display: flex;
         align-items: center;
-        flex-wrap: wrap;
-        justify-content: flex-end;
-        gap: 6px;
+        gap: 2px;
         opacity: 0;
         pointer-events: none;
-        transform: translateY(-2px);
         transition:
-            opacity 140ms ease-out,
-            transform 140ms ease-out;
+            opacity var(--ui-motion-fast),
+            transform var(--ui-motion-fast);
+        transform: translateX(4px);
+        flex-shrink: 0;
     }
 
     .pane-shell:hover .pane-actions,
@@ -280,95 +668,86 @@
     .pane-actions.always-visible {
         opacity: 1;
         pointer-events: auto;
-        transform: translateY(0);
+        transform: translateX(0);
     }
 
-    .pane-action {
-        border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
-        border-radius: 8px;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 82%, transparent);
-        color: color-mix(in srgb, var(--theme-foreground, #c0caf5) 82%, white 18%);
-        padding: 5px 8px;
-        font: inherit;
-        font-size: 0.7rem;
+    .pane-icon-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border: 1px solid transparent;
+        border-radius: 5px;
+        background: transparent;
+        color: var(--ui-text-muted);
         cursor: pointer;
         transition:
-            border-color 100ms ease-out,
-            background 100ms ease-out,
-            color 100ms ease-out;
+            background var(--ui-motion-fast),
+            color var(--ui-motion-fast),
+            border-color var(--ui-motion-fast);
+        padding: 0;
+        font: inherit;
     }
 
-    .pane-action:hover {
-        border-color: color-mix(in srgb, var(--theme-accent, #7aa2f7) 24%, transparent);
-        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 10%, transparent);
-        color: var(--theme-foreground, #c0caf5);
+    .pane-icon-btn:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-primary);
+        border-color: var(--ui-border-soft);
     }
 
-    .pane-action.danger:hover {
-        border-color: color-mix(in srgb, var(--theme-color1, #f7768e) 26%, transparent);
-        background: color-mix(in srgb, var(--theme-color1, #f7768e) 10%, transparent);
-        color: color-mix(in srgb, var(--theme-color1, #f7768e) 82%, white 18%);
+    .pane-icon-btn.close:hover {
+        background: color-mix(in srgb, var(--ui-danger) 12%, transparent);
+        color: var(--ui-danger);
+        border-color: color-mix(in srgb, var(--ui-danger) 22%, transparent);
     }
+
+    /* ---- Pane content ---- */
 
     .pane-content {
+        position: relative;
         flex: 1;
         width: 100%;
         height: 100%;
         min-height: 0;
         overflow: hidden;
         cursor: text;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 98%, black 2%);
+        background: var(--ui-layer-0);
     }
 
-    .browser-pane-content {
+    .browser-content {
         cursor: default;
     }
+
+    /* ---- Resize handle ---- */
 
     .split-handle {
         position: absolute;
         z-index: 20;
         border: 0;
-        border-radius: 6px;
+        border-radius: 4px;
         background: transparent;
-        transition: background 100ms ease-out;
+        transition: background var(--ui-motion-fast);
+        padding: 0;
+        cursor: col-resize;
     }
 
     .split-pane.horizontal > .split-child > .split-handle {
-        width: 8px;
-        height: calc(100% - 12px);
-        top: 6px;
+        width: 10px;
+        height: calc(100% - 8px);
+        top: 4px;
         cursor: col-resize;
     }
 
     .split-pane.vertical > .split-child > .split-handle {
-        width: calc(100% - 12px);
-        height: 8px;
-        left: 6px;
+        width: calc(100% - 8px);
+        height: 10px;
+        left: 4px;
         cursor: row-resize;
     }
 
     .split-handle:hover,
     .split-handle.dragging {
-        background: color-mix(in srgb, var(--theme-accent, #7aa2f7) 48%, transparent);
-    }
-
-    @media (max-width: 840px) {
-        .split-pane {
-            padding: 4px;
-            gap: 4px;
-        }
-
-        .pane-header {
-            flex-direction: column;
-            align-items: flex-start;
-        }
-
-        .pane-actions {
-            opacity: 1;
-            pointer-events: auto;
-            transform: none;
-            width: 100%;
-            justify-content: flex-start;
-        }
+        background: color-mix(in srgb, var(--ui-accent) 42%, transparent);
     }
 </style>

@@ -41,8 +41,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_current_theme,
+            commands::get_shell_appearance,
             commands::get_app_state,
             commands::create_workspace,
+            commands::create_workspace_with_preset,
             commands::activate_workspace,
             commands::rename_workspace,
             commands::close_workspace,
@@ -51,6 +53,7 @@ pub fn run() {
             commands::activate_pane,
             commands::cycle_pane,
             commands::close_pane,
+            commands::swap_panes,
             commands::resize_split,
             commands::resize_active_pane,
             commands::notify_attention,
@@ -92,6 +95,7 @@ pub fn run() {
             terminal::restart_terminal_session,
             terminal::get_terminal_status,
             terminal::attach_pty_output,
+            terminal::detach_pty_output,
             terminal::write_to_pty,
             terminal::resize_pty
         ])

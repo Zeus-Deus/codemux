@@ -27,7 +27,12 @@ export interface ThemeColors {
     color15: string;
 }
 
+export interface ShellAppearance {
+    font_family: string;
+}
+
 export const theme = writable<ThemeColors | null>(null);
+export const shellAppearance = writable<ShellAppearance | null>(null);
 
 export const fallbackTheme: ThemeColors = {
     accent: '#7aa2f7',
@@ -66,4 +71,12 @@ export async function initTheme() {
     await listen<ThemeColors>('theme-changed', (event) => {
         theme.set(event.payload);
     });
+
+    try {
+        const appearance = await invoke<ShellAppearance>('get_shell_appearance');
+        shellAppearance.set(appearance);
+    } catch (error) {
+        console.error('Failed to get shell appearance:', error);
+        shellAppearance.set({ font_family: 'monospace' });
+    }
 }

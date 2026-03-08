@@ -1,4 +1,4 @@
-use crate::config::{read_theme_colors_or_default, ThemeColors};
+use crate::config::{read_shell_appearance_or_default, read_theme_colors_or_default, ShellAppearance, ThemeColors};
 use crate::indexing::{
     rebuild_index, search_index, IndexSearchResult, ProjectIndexSnapshot, ProjectIndexStatus,
     ProjectIndexStore,
@@ -16,11 +16,13 @@ use crate::observability::{
     SafetyConfig,
 };
 use crate::state::{AppStateSnapshot, AppStateStore, NotificationLevel};
+use crate::state::WorkspacePresetLayout;
 use crate::terminal;
 use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -96,6 +98,11 @@ pub fn get_current_theme() -> Result<ThemeColors, String> {
 }
 
 #[tauri::command]
+pub fn get_shell_appearance() -> Result<ShellAppearance, String> {
+    Ok(read_shell_appearance_or_default())
+}
+
+#[tauri::command]
 pub fn get_app_state(state: State<'_, AppStateStore>) -> Result<AppStateSnapshot, String> {
     Ok(state.snapshot())
 }
@@ -104,11 +111,53 @@ pub fn get_app_state(state: State<'_, AppStateStore>) -> Result<AppStateSnapshot
 pub fn create_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    cwd: Option<String>,
 ) -> Result<String, String> {
-    let workspace_id = state.create_workspace();
+    let workspace_id = match cwd {
+        Some(path) => state.create_workspace_at_path(PathBuf::from(path)),
+        None => state.create_workspace(),
+    };
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
     }
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+#[tauri::command]
+pub fn create_workspace_with_preset(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    cwd: Option<String>,
+    layout: String,
+) -> Result<String, String> {
+    let layout = match layout.as_str() {
+        "single" => WorkspacePresetLayout::Single,
+        "pair" => WorkspacePresetLayout::Pair,
+        "quad" => WorkspacePresetLayout::Quad,
+        "six" => WorkspacePresetLayout::Six,
+        "eight" => WorkspacePresetLayout::Eight,
+        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
+        _ => return Err(format!("Unsupported workspace preset layout: {layout}")),
+    };
+
+    let workspace_id = match cwd {
+        Some(path) => state.create_workspace_with_layout(PathBuf::from(path), layout),
+        None => state.create_workspace_with_layout(crate::project::current_project_root(), layout),
+    };
+
+    let snapshot = state.snapshot();
+    let session_ids = snapshot
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id.0)
+        .map(|workspace| crate::state::collect_terminal_sessions(&workspace.surfaces))
+        .unwrap_or_default();
+
+    for session_id in session_ids {
+        terminal::spawn_pty_for_session(app.clone(), session_id);
+    }
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -230,6 +279,18 @@ pub fn close_pane(
     let removed = state.close_pane(&pane_id)?;
     crate::state::emit_app_state(&app);
     Ok(removed.map(|session_id| session_id.0))
+}
+
+#[tauri::command]
+pub fn swap_panes(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    source_pane_id: String,
+    target_pane_id: String,
+) -> Result<(), String> {
+    state.swap_panes(&source_pane_id, &target_pane_id)?;
+    crate::state::emit_app_state(&app);
+    Ok(())
 }
 
 #[tauri::command]

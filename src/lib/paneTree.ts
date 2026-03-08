@@ -44,3 +44,24 @@ export function collectWorkspaceSessionIds(surfaceList: SurfaceSnapshot[]): Set<
 
     return sessionIds;
 }
+
+export function collectLeafPaneIds(root: PaneNodeSnapshot): string[] {
+    const paneIds: string[] = [];
+    const stack: PaneNodeSnapshot[] = [root];
+
+    while (stack.length > 0) {
+        const node = stack.pop();
+        if (!node) {
+            continue;
+        }
+
+        if (node.kind === 'split') {
+            stack.push(...node.children);
+            continue;
+        }
+
+        paneIds.push(node.pane_id);
+    }
+
+    return paneIds;
+}

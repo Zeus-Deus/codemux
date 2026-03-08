@@ -183,6 +183,9 @@ export interface OpenFlowCreateRunRequest {
     goal: string;
 }
 
+export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
+export type LayoutPreset = 'single' | 'pair' | 'quad' | 'six' | 'eight' | 'shell_browser';
+
 export type PaneNodeSnapshot =
     | {
             kind: 'terminal';
@@ -300,7 +303,47 @@ export async function restartTerminalSession(sessionId: string) {
 }
 
 export async function createWorkspace() {
-    return invoke<string>('create_workspace');
+    return invoke<string>('create_workspace', { cwd: null });
+}
+
+export async function createWorkspaceAtPath(cwd: string) {
+    return invoke<string>('create_workspace', { cwd });
+}
+
+export async function createWorkspaceWithPreset(options: {
+    kind: WorkspaceTemplateKind;
+    layout: LayoutPreset;
+    cwd?: string | null;
+    openflowTitle?: string;
+    openflowGoal?: string;
+}) {
+    const workspaceId = await invoke<string>('create_workspace_with_preset', {
+        cwd: options.cwd?.trim() ? options.cwd.trim() : null,
+        layout: options.layout
+    });
+    await activateWorkspace(workspaceId);
+
+    const snapshot = await invoke<AppStateSnapshot>('get_app_state');
+    appState.set(snapshot);
+
+    return await maybeCreateOpenFlowRun(workspaceId, options);
+}
+
+async function maybeCreateOpenFlowRun(
+    workspaceId: string,
+    options: { kind: WorkspaceTemplateKind; openflowTitle?: string; openflowGoal?: string }
+) {
+    let runId: string | null = null;
+
+    if (options.kind === 'openflow' && options.openflowTitle?.trim() && options.openflowGoal?.trim()) {
+        const run = await createOpenFlowRun({
+            title: options.openflowTitle.trim(),
+            goal: options.openflowGoal.trim()
+        });
+        runId = run.run_id;
+    }
+
+    return { workspaceId, runId };
 }
 
 export async function activateWorkspace(workspaceId: string) {
@@ -333,6 +376,10 @@ export async function cyclePane(step: number) {
 
 export async function closePane(paneId: string) {
     return invoke<string | null>('close_pane', { paneId });
+}
+
+export async function swapPanes(sourcePaneId: string, targetPaneId: string) {
+    return invoke('swap_panes', { sourcePaneId, targetPaneId });
 }
 
 export async function resizeSplit(paneId: string, childSizes: number[]) {

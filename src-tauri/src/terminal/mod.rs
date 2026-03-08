@@ -11,7 +11,7 @@ use crate::state::{self, AppStateStore, TerminalSessionState};
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const OUTPUT_BUFFER_LIMIT: usize = 512;
+const OUTPUT_BUFFER_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,17 +126,16 @@ fn queue_or_send_output(
         session_id,
         || SessionRuntime::new(session_id),
         |runtime| {
-            if let Some(channel) = runtime.output_channel.clone() {
-                if let Err(error) = channel.send(chunk.clone()) {
-                    eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
-                    runtime.pending_output.push_back(chunk);
-                }
-            } else {
-                runtime.pending_output.push_back(chunk);
-            }
-
+            runtime.pending_output.push_back(chunk.clone());
             while runtime.pending_output.len() > OUTPUT_BUFFER_LIMIT {
                 runtime.pending_output.pop_front();
+            }
+
+            if let Some(channel) = runtime.output_channel.clone() {
+                if let Err(error) = channel.send(chunk) {
+                    eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
+                    runtime.output_channel = None;
+                }
             }
         },
     );
@@ -163,6 +162,17 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
+
+    let already_running = sessions
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|runtime| runtime.writer.is_some() || runtime.master.is_some())
+        .unwrap_or(false);
+
+    if already_running {
+        return;
+    }
 
     emit_terminal_status(
         &app,
@@ -460,7 +470,7 @@ pub fn attach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = Some(channel.clone());
-            runtime.pending_output.drain(..).collect::<Vec<_>>()
+            runtime.pending_output.iter().cloned().collect::<Vec<_>>()
         },
     );
 
@@ -469,6 +479,32 @@ pub fn attach_pty_output(
             .send(chunk)
             .map_err(|error| format!("Failed to flush buffered PTY output: {error}"))?;
     }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn detach_pty_output(
+    terminal_state: State<'_, PtyState>,
+    app_state: State<'_, AppStateStore>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let session_id = session_id
+        .or_else(|| {
+            app_state
+                .active_terminal_session_id()
+                .map(|session| session.0)
+        })
+        .ok_or_else(|| "No active terminal session found".to_string())?;
+
+    with_session_runtime(
+        &terminal_state.sessions,
+        &session_id,
+        || SessionRuntime::new(&session_id),
+        |runtime| {
+            runtime.output_channel = None;
+        },
+    );
 
     Ok(())
 }

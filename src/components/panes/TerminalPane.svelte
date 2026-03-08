@@ -1,12 +1,12 @@
 <script lang="ts">
-    import { onDestroy, onMount } from 'svelte';
+    import { onMount } from 'svelte';
     import { Terminal } from '@xterm/xterm';
     import type { ITheme } from '@xterm/xterm';
     import { FitAddon } from '@xterm/addon-fit';
     import { WebglAddon } from '@xterm/addon-webgl';
     import { Channel, invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
-    import { theme, fallbackTheme } from '../../stores/theme';
+    import { theme, fallbackTheme, shellAppearance, type ShellAppearance } from '../../stores/theme';
     import '@xterm/xterm/css/xterm.css';
 
     type DisposeHandle = { dispose: () => void };
@@ -27,7 +27,9 @@
     let dataDisposable: DisposeHandle | null = null;
     let resizeHandler: (() => void) | null = null;
     let themeUnsubscribe: (() => void) | null = null;
+    let shellAppearanceUnsubscribe: (() => void) | null = null;
     let statusUnlisten: (() => void) | null = null;
+    let attachedSessionId: string | null = null;
     let currentSessionId = $derived(sessionId);
     let terminalStatus = $state<TerminalStatusPayload>({
         session_id: '',
@@ -78,10 +80,6 @@
         fitAddon?.fit();
     }
 
-    function clearTerminal() {
-        term?.reset();
-    }
-
     function writePtyChunk(payload: unknown) {
         if (!term) {
             return;
@@ -130,7 +128,21 @@
             return;
         }
 
-        clearTerminal();
+        if (attachedSessionId === currentSessionId) {
+            await syncTerminalSize();
+            return;
+        }
+
+        if (attachedSessionId) {
+            try {
+                await invoke('detach_pty_output', { sessionId: attachedSessionId });
+            } catch (error) {
+                console.error(`Failed to detach terminal output for ${attachedSessionId}:`, error);
+            }
+        }
+
+        term.clear();
+        attachedSessionId = currentSessionId;
 
         try {
             terminalStatus = await invoke<TerminalStatusPayload>('get_terminal_status', { sessionId: currentSessionId });
@@ -163,7 +175,7 @@
 
     onMount(async () => {
         term = new Terminal({
-            fontFamily: 'IBM Plex Mono, JetBrains Mono, SFMono-Regular, Menlo, monospace',
+            fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--shell-font-family').trim() || 'monospace',
             theme: terminalTheme(),
             allowProposedApi: false,
             convertEol: true,
@@ -187,6 +199,15 @@
 
         themeUnsubscribe = theme.subscribe(() => {
             applyTerminalTheme();
+        });
+
+        shellAppearanceUnsubscribe = shellAppearance.subscribe((appearance: ShellAppearance | null) => {
+            if (!term) {
+                return;
+            }
+
+            term.options.fontFamily = appearance?.font_family?.trim() || 'monospace';
+            fitAddon?.fit();
         });
 
         statusUnlisten = await listen<TerminalStatusPayload>('terminal-status', (event) => {
@@ -226,24 +247,36 @@
             return;
         }
 
-        void attachSession();
+        if (currentSessionId) {
+            void attachSession();
+        }
     });
 
-    onDestroy(() => {
-        if (resizeHandler) {
-            window.removeEventListener('resize', resizeHandler);
-        }
-        if (dataDisposable) {
-            dataDisposable.dispose();
-        }
-        if (statusUnlisten) {
-            statusUnlisten();
-        }
-        if (themeUnsubscribe) {
-            themeUnsubscribe();
-        }
-        term?.dispose();
-        resizeObserver?.disconnect();
+    onMount(() => {
+        return () => {
+            if (attachedSessionId) {
+                void invoke('detach_pty_output', { sessionId: attachedSessionId }).catch((error) => {
+                    console.error(`Failed to detach terminal output for ${attachedSessionId}:`, error);
+                });
+            }
+            if (resizeHandler) {
+                window.removeEventListener('resize', resizeHandler);
+            }
+            if (dataDisposable) {
+                dataDisposable.dispose();
+            }
+            if (statusUnlisten) {
+                statusUnlisten();
+            }
+            if (themeUnsubscribe) {
+                themeUnsubscribe();
+            }
+            if (shellAppearanceUnsubscribe) {
+                shellAppearanceUnsubscribe();
+            }
+            term?.dispose();
+            resizeObserver?.disconnect();
+        };
     });
 </script>
 
