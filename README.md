@@ -72,14 +72,19 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Run the app:
 
 ```bash
-GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
+WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
 ```
 
-Why this launch command is recommended right now:
+Why this launch command is recommended:
 
-- on Hyprland/Omarchy Wayland sessions, the default Tauri/WebKit launch can fail with a Wayland protocol error
-- forcing X11 for this one launch avoids changing your whole desktop/session configuration
-- disabling the DMABUF renderer avoids the GBM buffer creation failure seen during startup
+- runs as a native Wayland app (no XWayland), so window tiling and file picker dialogs behave correctly on Hyprland/Omarchy
+- disabling the DMABUF renderer avoids a GBM buffer creation failure seen on some Wayland compositors during startup
+
+If native Wayland fails (e.g. on an older system or with a different compositor), fall back to:
+
+```bash
+npm run tauri:dev:x11
+```
 
 ## CLI Control
 
@@ -210,6 +215,16 @@ The goal is not fake coverage. The goal is protection around the parts that are 
 - Linux is the first-class target right now
 - Omarchy support exists but falls back cleanly when unavailable
 - some browser features are currently Linux-leaning, such as screenshot capture using `grim`
+
+### Wayland / Hyprland notes
+
+The app runs as a native Wayland process. No special compositor config is needed.
+
+**File picker dialogs** float correctly as a transient window above the app, matching the behaviour of VS Code and Cursor. Two things are required for this:
+
+1. `tauri-plugin-dialog` must use the `xdg-portal` feature (not the default `gtk3`). This is set in `src-tauri/Cargo.toml`: `tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }`. The `gtk3` backend spawns a raw GTK3 dialog that cannot establish a Wayland transient-for relationship. The `xdg-portal` backend routes through `ashpd` → `xdg-desktop-portal-gtk`, which properly exports the parent window's Wayland surface handle.
+
+2. A custom `pick_folder_dialog` Tauri command (`src-tauri/src/commands.rs`) calls `set_parent` on all desktop platforms, working around a bug in `tauri-plugin-dialog` 2.6.0 where the upstream `open` command skips `set_parent` on Linux (`#[cfg(any(windows, target_os = "macos"))]` instead of `#[cfg(desktop)]`). Without this, the portal dialog opens with no transient-for and tiles instead of floating.
 
 ## What Is Next
 

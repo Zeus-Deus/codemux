@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Runtime, State};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
@@ -688,4 +688,40 @@ pub fn add_replay_record(
 ) -> Result<(), String> {
     store.add_replay_record(title, summary);
     Ok(())
+}
+
+/// Open a native folder-picker dialog, properly parented to the calling window on all
+/// desktop platforms (including Linux/Wayland). The built-in JS `open()` from
+/// `tauri-plugin-dialog` skips `set_parent` on Linux due to an upstream bug
+/// (https://github.com/tauri-apps/plugins-workspace/issues — `commands.rs` uses
+/// `#[cfg(any(windows, target_os = "macos"))]` instead of `#[cfg(desktop)]`), which
+/// means the portal-gtk dialog opens with no transient-for relationship and tiles
+/// instead of floating. This command fixes that by calling `set_parent` unconditionally
+/// on all desktop platforms.
+#[tauri::command]
+pub async fn pick_folder_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Choose folder"));
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.pick_folder(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+
+    rx.await.map_err(|e| e.to_string())
 }

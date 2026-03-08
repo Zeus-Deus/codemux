@@ -65,7 +65,7 @@
 
         if (!dropHandle || !targetPaneId) {
             clearDropHighlight();
-            if (activePointerDrag) {
+            if (activePointerDrag && activePointerDrag.targetPaneId !== null) {
                 activePointerDrag.targetPaneId = null;
                 activePointerDrag.targetTitle = null;
                 paneDragState.set({
@@ -87,7 +87,7 @@
             }
         }
 
-        if (activePointerDrag) {
+        if (activePointerDrag && activePointerDrag.targetPaneId !== targetPaneId) {
             activePointerDrag.targetPaneId = targetPaneId;
             activePointerDrag.targetTitle = targetTitle;
             paneDragState.set({

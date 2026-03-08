@@ -2,9 +2,69 @@ use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
+/// multiple resize events) only result in a single write after a quiet period.
+struct PersistDebouncer {
+    pending: Arc<AtomicBool>,
+    last_snapshot: Arc<Mutex<Option<AppStateSnapshot>>>,
+}
+
+impl PersistDebouncer {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+            last_snapshot: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Queue a persist. If a write is already scheduled, just update the
+    /// buffered snapshot — the background thread will pick up the latest value.
+    fn schedule(&self, snapshot: AppStateSnapshot) {
+        {
+            let mut guard = self.last_snapshot.lock().unwrap();
+            *guard = Some(snapshot);
+        }
+
+        // If a background task is already running, nothing more to do.
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let pending = Arc::clone(&self.pending);
+        let last_snapshot = Arc::clone(&self.last_snapshot);
+
+        std::thread::spawn(move || {
+            // Wait for the quiet period before writing.
+            std::thread::sleep(Duration::from_millis(500));
+
+            // Take the snapshot and clear the flag while still holding the
+            // mutex. This ensures no second worker can slip through the
+            // pending.swap guard between the flag clear and the file write.
+            let snapshot = {
+                let mut guard = last_snapshot.lock().unwrap();
+                pending.store(false, Ordering::Release);
+                guard.take()
+            };
+
+            if let Some(snapshot) = snapshot {
+                if let Err(error) = save_persisted_state(&snapshot) {
+                    eprintln!("[codemux::state] Failed to persist layout state: {error}");
+                }
+            }
+        });
+    }
+}
+
+static PERSIST_DEBOUNCER: std::sync::OnceLock<PersistDebouncer> = std::sync::OnceLock::new();
+
+fn persist_debouncer() -> &'static PersistDebouncer {
+    PERSIST_DEBOUNCER.get_or_init(PersistDebouncer::new)
+}
 
 use crate::project::current_project_root;
 
@@ -1050,12 +1110,12 @@ impl AppStateStore {
 pub fn emit_app_state(app: &AppHandle) {
     let state: State<'_, AppStateStore> = app.state();
     let snapshot = state.snapshot();
-    if let Err(error) = app.emit("app-state-changed", snapshot) {
+    if let Err(error) = app.emit("app-state-changed", &snapshot) {
         eprintln!("[codemux::state] Failed to emit app state: {error}");
     }
-    if let Err(error) = save_persisted_state(&state.snapshot()) {
-        eprintln!("[codemux::state] Failed to persist layout state: {error}");
-    }
+    // Persist asynchronously with debounce — rapid consecutive calls (e.g.
+    // swap + multiple resize events) collapse into a single disk write.
+    persist_debouncer().schedule(snapshot);
 }
 
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {

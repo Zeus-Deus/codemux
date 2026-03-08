@@ -1,6 +1,6 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
-    import { open } from '@tauri-apps/plugin-dialog';
+    import { invoke } from '@tauri-apps/api/core';
     import {
         createWorkspaceWithPreset,
         type LayoutPreset,
@@ -175,9 +175,7 @@
     }
 
     async function chooseFolder() {
-        const selection = await open({
-            directory: true,
-            multiple: false,
+        const selection = await invoke<string | null>('pick_folder_dialog', {
             title: 'Choose workspace folder'
         });
 

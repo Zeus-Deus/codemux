@@ -24,6 +24,7 @@
     let term: Terminal | null = null;
     let fitAddon: FitAddon | null = null;
     let resizeObserver: ResizeObserver | null = null;
+    let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     let dataDisposable: DisposeHandle | null = null;
     let resizeHandler: (() => void) | null = null;
     let themeUnsubscribe: (() => void) | null = null;
@@ -133,6 +134,16 @@
             return;
         }
 
+        // Remember whether we're re-attaching to the *same* session that was
+        // previously wired up (e.g. after a pane resize). In that case xterm
+        // already holds the correct visible content, so we can skip clearing
+        // the buffer and replaying the full pending_output history.
+        // If we're switching to a *different* session (attachedSessionId !== null
+        // but !== currentSessionId) we must clear so old content doesn't bleed
+        // through — the early-return above already handles the identical-session
+        // fast path, so reaching this point always means a session switch.
+        const isReattachingSameSession = false;
+
         if (attachedSessionId) {
             try {
                 await invoke('detach_pty_output', { sessionId: attachedSessionId });
@@ -141,7 +152,9 @@
             }
         }
 
-        term.clear();
+        if (!isReattachingSameSession) {
+            term.clear();
+        }
         attachedSessionId = currentSessionId;
 
         try {
@@ -160,7 +173,11 @@
         });
 
         try {
-            await invoke('attach_pty_output', { channel: ptyOutChannel, sessionId: currentSessionId });
+            await invoke('attach_pty_output', {
+                channel: ptyOutChannel,
+                sessionId: currentSessionId,
+                skipPending: isReattachingSameSession,
+            });
         } catch (error) {
             terminalStatus = {
                 session_id: currentSessionId,
@@ -237,7 +254,13 @@
         window.addEventListener('resize', resizeHandler);
 
         resizeObserver = new ResizeObserver(() => {
-            void syncTerminalSize();
+            if (resizeDebounceTimer !== null) {
+                clearTimeout(resizeDebounceTimer);
+            }
+            resizeDebounceTimer = setTimeout(() => {
+                resizeDebounceTimer = null;
+                void syncTerminalSize();
+            }, 50);
         });
         resizeObserver.observe(terminalContainer);
     });
@@ -273,6 +296,10 @@
             }
             if (shellAppearanceUnsubscribe) {
                 shellAppearanceUnsubscribe();
+            }
+            if (resizeDebounceTimer !== null) {
+                clearTimeout(resizeDebounceTimer);
+                resizeDebounceTimer = null;
             }
             term?.dispose();
             resizeObserver?.disconnect();

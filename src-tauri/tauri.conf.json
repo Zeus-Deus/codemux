@@ -15,7 +15,8 @@
         "title": "codemux",
         "width": 800,
         "height": 600,
-        "backgroundColor": "#1a1b26"
+        "backgroundColor": "#1a1b26",
+        "decorations": false
       }
     ],
     "security": {

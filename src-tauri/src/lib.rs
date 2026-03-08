@@ -22,6 +22,7 @@ pub fn run() {
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle().clone();
             if let Some(snapshot) = state::load_persisted_state() {
@@ -89,6 +90,7 @@ pub fn run() {
             commands::update_permission_policy,
             commands::update_safety_config,
             commands::add_replay_record,
+            commands::pick_folder_dialog,
             terminal::create_terminal_session,
             terminal::activate_terminal_session,
             terminal::close_terminal_session,

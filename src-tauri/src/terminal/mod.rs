@@ -455,6 +455,7 @@ pub fn attach_pty_output(
     app_state: State<'_, AppStateStore>,
     channel: Channel<Vec<u8>>,
     session_id: Option<String>,
+    skip_pending: Option<bool>,
 ) -> Result<(), String> {
     let session_id = session_id
         .or_else(|| {
@@ -470,7 +471,11 @@ pub fn attach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = Some(channel.clone());
-            runtime.pending_output.iter().cloned().collect::<Vec<_>>()
+            if skip_pending.unwrap_or(false) {
+                vec![]
+            } else {
+                runtime.pending_output.iter().cloned().collect::<Vec<_>>()
+            }
         },
     );
 
