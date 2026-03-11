@@ -1,3 +1,4 @@
+use crate::browser::BrowserManager;
 use crate::config::{read_shell_appearance_or_default, read_theme_colors_or_default, ShellAppearance, ThemeColors};
 use crate::indexing::{
     rebuild_index, search_index, IndexSearchResult, ProjectIndexSnapshot, ProjectIndexStatus,
@@ -29,8 +30,23 @@ use std::sync::Mutex;
 use tauri::{Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 static BROWSER_AUTOMATION_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserProxyFetchResult {
+    pub html: String,
+    pub final_url: String,
+    pub status: u16,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserEvalResult {
+    pub result: String,
+    pub error: Option<String>,
+}
 
 #[derive(Default)]
 pub struct BrowserAutomationCoordinator {
@@ -276,7 +292,17 @@ pub fn close_pane(
     state: State<'_, AppStateStore>,
     pane_id: String,
 ) -> Result<Option<String>, String> {
+    let removed_browser_id = state.pane_browser_id(&pane_id);
     let removed = state.close_pane(&pane_id)?;
+    if let Some(browser_id) = removed_browser_id {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager: State<'_, BrowserManager> = app_handle.state();
+            if let Err(error) = manager.close_browser(&browser_id).await {
+                eprintln!("[BROWSER] Failed to close browser {browser_id}: {error}");
+            }
+        });
+    }
     crate::state::emit_app_state(&app);
     Ok(removed.map(|session_id| session_id.0))
 }
@@ -513,6 +539,76 @@ pub fn browser_automation_complete(
 }
 
 #[tauri::command]
+pub fn browser_proxy_fetch(url: String) -> Result<BrowserProxyFetchResult, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let final_url = response.url().to_string();
+    let html = response.text().map_err(|e| format!("Failed to read response: {}", e))?;
+
+    Ok(BrowserProxyFetchResult {
+        html,
+        final_url,
+        status,
+        content_type,
+    })
+}
+
+#[tauri::command]
+pub fn browser_proxy_screenshot(url: String) -> Result<String, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "image/png".to_string());
+
+    let bytes = response.bytes().map_err(|e| format!("Failed to read response: {}", e))?;
+
+    let base64_data = BASE64.encode(&bytes);
+
+    let mime_type = if content_type.contains("jpeg") || content_type.contains("jpg") {
+        "image/jpeg"
+    } else if content_type.contains("png") {
+        "image/png"
+    } else if content_type.contains("gif") {
+        "image/gif"
+    } else if content_type.contains("webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    };
+
+    Ok(format!("data:{};base64,{}", mime_type, base64_data))
+}
+
+#[tauri::command]
 pub fn get_project_memory_snapshot(project_root: Option<String>) -> Result<ProjectMemorySnapshot, String> {
     get_project_memory(project_root)
 }
@@ -741,4 +837,67 @@ pub async fn pick_folder_dialog<R: Runtime>(
     });
 
     rx.await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn browser_spawn(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+) -> Result<String, String> {
+    manager.spawn_browser(browser_id).await?;
+    Ok("Browser spawned".to_string())
+}
+
+#[tauri::command]
+pub async fn browser_navigate(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+    url: String,
+) -> Result<String, String> {
+    manager.navigate(&browser_id, &url).await
+}
+
+#[tauri::command]
+pub async fn browser_screenshot(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+) -> Result<String, String> {
+    manager.screenshot(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn browser_click(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+    x: f64,
+    y: f64,
+) -> Result<String, String> {
+    manager.click(&browser_id, x, y).await
+}
+
+#[tauri::command]
+pub async fn browser_type(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+    text: String,
+) -> Result<String, String> {
+    manager.type_text(&browser_id, &text).await
+}
+
+#[tauri::command]
+pub async fn browser_close(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+) -> Result<(), String> {
+    manager.close_browser(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn browser_resize_viewport(
+    manager: State<'_, BrowserManager>,
+    browser_id: String,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    manager.resize_viewport(&browser_id, width, height).await
 }

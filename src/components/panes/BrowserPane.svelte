@@ -1,113 +1,215 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onMount, onDestroy, tick } from 'svelte';
     import { openUrl } from '@tauri-apps/plugin-opener';
-    import { listen } from '@tauri-apps/api/event';
     import {
-        browserAutomationComplete,
-        browserAutomationRun,
-        browserCaptureScreenshot,
-        browserHistoryBack,
-        browserHistoryForward,
+        browserSpawn,
+        browserNavigate,
         browserOpenUrl,
-        browserReload,
+        browserResizeViewport,
         browserSetLoadingState,
-        appState,
-        type BrowserAutomationAction,
-        type BrowserAutomationResult
+        browserScreenshot,
+        browserClick,
+        browserType,
+        appState
     } from '../../stores/appState';
 
     let { browserId }: { browserId: string } = $props();
 
-    let address = $state('');
-    let iframeElement = $state<HTMLIFrameElement | null>(null);
-    let automationLog = $state<string[]>([]);
-    let automationResult = $state<string>('');
+    let address = $state('about:blank');
+    let screenshotData = $state<string | null>(null);
+    let isLoading = $state(false);
+    let errorMessage = $state<string | null>(null);
+    let browserReady = $state(false);
+    let screenshotInterval: ReturnType<typeof setInterval> | null = null;
+    let screenshotInFlight = $state(false);
+    let isEditingAddress = $state(false);
+    let mounted = true;
+    let viewportElement = $state<HTMLDivElement | null>(null);
+    let resizeObserver: ResizeObserver | null = null;
+    let viewportWidth = $state(1280);
+    let viewportHeight = $state(720);
 
     const browser = $derived(
         $appState?.browser_sessions.find((b) => b.browser_id === browserId) ?? null
     );
 
     $effect(() => {
-        address = browser?.current_url ?? '';
+        const currentUrl = browser?.current_url?.trim();
+        if (currentUrl && currentUrl !== address && !isLoading && !isEditingAddress) {
+            address = currentUrl;
+        }
+
+        if (browser?.last_error && browser.last_error !== errorMessage) {
+            errorMessage = browser.last_error;
+        }
     });
 
-    function frameWindow() {
-        return iframeElement?.contentWindow ?? null;
-    }
+    async function initBrowser() {
+        try {
+            isLoading = true;
+            errorMessage = null;
+            await browserSpawn(browserId);
 
-    function frameDocument() {
-        return iframeElement?.contentDocument ?? null;
-    }
+            browserReady = true;
+            await tick();
+            await syncViewportSize();
 
-    function ensureSameOriginDocument() {
-        const doc = frameDocument();
-        if (!doc) throw new Error('Browser document not available');
-        return doc;
-    }
+            const initialUrl = browser?.current_url?.trim() || address.trim() || 'about:blank';
+            address = initialUrl;
 
-    function performAutomation(action: BrowserAutomationAction): BrowserAutomationResult {
-        switch (action.kind) {
-            case 'open_url':
-                address = action.url;
-                void navigate(action.url);
-                return { request_id: '', browser_id: browserId, data: { url: action.url }, message: 'Navigation requested' };
-            case 'dom_snapshot': {
-                const doc = ensureSameOriginDocument();
-                return { request_id: '', browser_id: browserId, data: { title: doc.title, body_text: doc.body?.innerText?.slice(0, 4000) ?? '' }, message: 'DOM snapshot captured' };
+            if (initialUrl !== 'about:blank') {
+                await navigate(initialUrl, false);
+            } else {
+                await refreshScreenshot();
+                await browserSetLoadingState(browserId, false, null);
+                isLoading = false;
             }
-            case 'accessibility_snapshot': {
-                const doc = ensureSameOriginDocument();
-                const elements = Array.from(doc.querySelectorAll('button, a, input, textarea, select, [role]'))
-                    .slice(0, 100)
-                    .map((el) => ({ tag: el.tagName.toLowerCase(), role: el.getAttribute('role'), text: el.textContent?.trim() ?? '', aria_label: el.getAttribute('aria-label') }));
-                return { request_id: '', browser_id: browserId, data: { elements }, message: 'Accessibility snapshot captured' };
-            }
-            case 'click': {
-                const doc = ensureSameOriginDocument();
-                const el = doc.querySelector<HTMLElement>(action.selector);
-                if (!el) throw new Error(`No element matched: ${action.selector}`);
-                el.click();
-                return { request_id: '', browser_id: browserId, data: { selector: action.selector }, message: 'Clicked' };
-            }
-            case 'fill': {
-                const doc = ensureSameOriginDocument();
-                const el = doc.querySelector<HTMLInputElement | HTMLTextAreaElement>(action.selector);
-                if (!el) throw new Error(`No fill target: ${action.selector}`);
-                el.value = action.value;
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                return { request_id: '', browser_id: browserId, data: { selector: action.selector, value: action.value }, message: 'Filled' };
-            }
-            case 'type_text': {
-                const win = frameWindow();
-                if (!win) throw new Error('Browser window not available');
-                win.document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: action.text }));
-                return { request_id: '', browser_id: browserId, data: { text: action.text }, message: 'Typed' };
-            }
-            case 'scroll': {
-                const win = frameWindow();
-                if (!win) throw new Error('Browser window not available');
-                win.scrollBy(action.x, action.y);
-                return { request_id: '', browser_id: browserId, data: { x: action.x, y: action.y }, message: 'Scrolled' };
-            }
-            case 'evaluate': {
-                const win = frameWindow();
-                if (!win) throw new Error('Browser window not available');
-                const value = (win as Window & typeof globalThis & { eval: (s: string) => unknown }).eval(action.script);
-                return { request_id: '', browser_id: browserId, data: { value }, message: 'Evaluated' };
-            }
-            case 'screenshot':
-                void captureScreenshot();
-                return { request_id: '', browser_id: browserId, data: { requested: true }, message: 'Screenshot requested' };
-            case 'console_logs':
-                return { request_id: '', browser_id: browserId, data: { logs: automationLog }, message: 'Console logs returned' };
+
+            screenshotInterval = setInterval(() => {
+                void refreshScreenshot();
+            }, 1000);
+        } catch (e) {
+            errorMessage = e instanceof Error ? e.message : String(e);
+            await browserSetLoadingState(browserId, false, errorMessage).catch(() => {});
+            isLoading = false;
         }
     }
 
-    async function navigate(url = address) {
-        if (!url.trim()) return;
-        await browserOpenUrl(browserId, url);
-        setTimeout(() => { void browserSetLoadingState(browserId, false, null); }, 300);
+    async function navigate(url = address, syncState = true) {
+        const nextUrl = url.trim();
+        if (!nextUrl) return;
+
+        try {
+            isLoading = true;
+            errorMessage = null;
+
+            if (syncState) {
+                await browserOpenUrl(browserId, nextUrl);
+            }
+
+            await browserSetLoadingState(browserId, true, null);
+            await browserNavigate(browserId, nextUrl);
+            address = nextUrl;
+            await refreshScreenshot();
+            await browserSetLoadingState(browserId, false, null);
+        } catch (e) {
+            errorMessage = e instanceof Error ? e.message : String(e);
+            await browserSetLoadingState(browserId, false, errorMessage).catch(() => {});
+        } finally {
+            isLoading = false;
+        }
+    }
+
+    async function handleClick(x: number, y: number) {
+        try {
+            await browserClick(browserId, x, y);
+            await refreshScreenshot();
+        } catch (e) {
+            errorMessage = e instanceof Error ? e.message : String(e);
+        }
+    }
+
+    function clickCoordinates(event: MouseEvent) {
+        const viewport = event.currentTarget as HTMLElement;
+        const rect = viewport.getBoundingClientRect();
+        const renderedAspect = rect.width / rect.height;
+        const browserAspect = viewportWidth / viewportHeight;
+
+        let contentWidth = rect.width;
+        let contentHeight = rect.height;
+        let offsetX = 0;
+        let offsetY = 0;
+
+        if (renderedAspect > browserAspect) {
+            contentWidth = rect.height * browserAspect;
+            offsetX = (rect.width - contentWidth) / 2;
+        } else {
+            contentHeight = rect.width / browserAspect;
+            offsetY = (rect.height - contentHeight) / 2;
+        }
+
+        const localX = Math.min(Math.max(event.clientX - rect.left - offsetX, 0), contentWidth);
+        const localY = Math.min(Math.max(event.clientY - rect.top - offsetY, 0), contentHeight);
+
+        return {
+            x: (localX / contentWidth) * viewportWidth,
+            y: (localY / contentHeight) * viewportHeight,
+        };
+    }
+
+    async function handleKeydown(event: KeyboardEvent) {
+        if (event.key === 'Enter') {
+            void navigate();
+        }
+    }
+
+    function handleAddressFocus() {
+        isEditingAddress = true;
+    }
+
+    function handleAddressBlur() {
+        isEditingAddress = false;
+        const currentUrl = browser?.current_url?.trim();
+        if (currentUrl && !isLoading) {
+            address = currentUrl;
+        }
+    }
+
+    function initialHintText() {
+        if (errorMessage) {
+            return 'Browser ready, but the last navigation failed.';
+        }
+
+        if (address === 'about:blank') {
+            return 'Type a URL like google.com, then press Enter.';
+        }
+
+        return 'Browser initializing...';
+    }
+
+    async function refreshScreenshot() {
+        if (!browserReady || screenshotInFlight || !mounted) {
+            return;
+        }
+
+        try {
+            screenshotInFlight = true;
+            const data = await browserScreenshot(browserId);
+            if (mounted) {
+                screenshotData = data;
+                errorMessage = null;
+            }
+        } catch (e) {
+            if (mounted) {
+                errorMessage = e instanceof Error ? e.message : String(e);
+            }
+        } finally {
+            screenshotInFlight = false;
+        }
+    }
+
+    async function syncViewportSize() {
+        if (!viewportElement || !browserReady) {
+            return;
+        }
+
+        const rect = viewportElement.getBoundingClientRect();
+        const nextWidth = Math.max(320, Math.round(rect.width));
+        const nextHeight = Math.max(240, Math.round(rect.height));
+
+        if (nextWidth === viewportWidth && nextHeight === viewportHeight) {
+            return;
+        }
+
+        viewportWidth = nextWidth;
+        viewportHeight = nextHeight;
+
+        try {
+            await browserResizeViewport(browserId, nextWidth, nextHeight);
+            await refreshScreenshot();
+        } catch (e) {
+            errorMessage = e instanceof Error ? e.message : String(e);
+        }
     }
 
     async function openExternal() {
@@ -115,72 +217,58 @@
         await openUrl(address.trim());
     }
 
-    async function goBack() {
-        await browserHistoryBack(browserId);
-        setTimeout(() => { void browserSetLoadingState(browserId, false, null); }, 150);
-    }
-
-    async function goForward() {
-        await browserHistoryForward(browserId);
-        setTimeout(() => { void browserSetLoadingState(browserId, false, null); }, 150);
-    }
-
-    async function reload() {
-        await browserReload(browserId);
-        setTimeout(() => { void browserSetLoadingState(browserId, false, null); }, 150);
-    }
-
-    async function captureScreenshot() {
-        await browserCaptureScreenshot(browserId);
-    }
-
     onMount(() => {
-        if (browser?.current_url) address = browser.current_url;
+        mounted = true;
+        resizeObserver = new ResizeObserver(() => {
+            void syncViewportSize();
+        });
 
-        let unlisten: (() => void) | null = null;
-        void listen<{ request_id: string; browser_id: string; action: BrowserAutomationAction }>('browser-automation-request', async (event) => {
-            if (event.payload.browser_id !== browserId) return;
-            try {
-                const result = performAutomation(event.payload.action);
-                result.request_id = event.payload.request_id;
-                await browserAutomationComplete(event.payload.request_id, result);
-            } catch (error) {
-                await browserAutomationComplete(event.payload.request_id, null, error instanceof Error ? error.message : String(error));
-            }
-        }).then((d) => { unlisten = d; });
+        void initBrowser();
+    });
 
-        return () => { unlisten?.(); };
+    $effect(() => {
+        if (!resizeObserver || !viewportElement) {
+            return;
+        }
+
+        resizeObserver.disconnect();
+        resizeObserver.observe(viewportElement);
+        void syncViewportSize();
+
+        return () => {
+            resizeObserver?.disconnect();
+        };
+    });
+
+    onDestroy(() => {
+        mounted = false;
+        if (screenshotInterval) {
+            clearInterval(screenshotInterval);
+        }
+        resizeObserver?.disconnect();
+        resizeObserver = null;
     });
 </script>
 
 <section class="browser-shell">
-    <header class="browser-toolbar">
-        <!-- Nav buttons -->
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+    <header class="browser-toolbar" onclick={(event) => event.stopPropagation()}>
         <div class="nav-buttons">
-            <button class="nav-btn" type="button" onclick={goBack} title="Back" aria-label="Go back">
+            <button class="nav-btn" type="button" onclick={() => void navigate('about:blank')} title="Home" aria-label="Go home">
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M7.5 2L3.5 6l4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M6 1L1 5.5V11h4V7h2v4h4V5.5L6 1z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
                 </svg>
             </button>
-            <button class="nav-btn" type="button" onclick={goForward} title="Forward" aria-label="Go forward">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M4.5 2L8.5 6l-4 4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-            </button>
-            <button class="nav-btn" type="button" onclick={reload} title="Reload" aria-label="Reload page">
+            <button class="nav-btn" type="button" onclick={refreshScreenshot} title="Refresh" aria-label="Refresh screenshot">
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
                     <path d="M10 6A4 4 0 1 1 8 2.5L10 2v3h-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
             </button>
         </div>
 
-        <!-- Address bar -->
-        <form
-            class="address-form"
-            onsubmit={(e) => { e.preventDefault(); void navigate(); }}
-        >
-            <div class="address-bar" class:loading={browser?.is_loading}>
-                {#if browser?.is_loading}
+        <form class="address-form" onsubmit={(e) => { e.preventDefault(); void navigate(); }}>
+            <div class="address-bar" class:loading={isLoading}>
+                {#if isLoading}
                     <span class="addr-spinner"></span>
                 {:else}
                     <svg class="addr-icon" width="11" height="11" viewBox="0 0 11 11" fill="none" aria-hidden="true">
@@ -194,19 +282,14 @@
                     placeholder="Enter URL"
                     spellcheck="false"
                     autocomplete="off"
+                    onfocus={handleAddressFocus}
+                    onblur={handleAddressBlur}
+                    onkeydown={handleKeydown}
                 />
             </div>
         </form>
 
-        <!-- Utility buttons -->
         <div class="util-buttons">
-            <button class="nav-btn" type="button" onclick={captureScreenshot} title="Capture screenshot" aria-label="Capture screenshot">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <rect x="1" y="2.5" width="10" height="7.5" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
-                    <circle cx="6" cy="6.5" r="1.8" stroke="currentColor" stroke-width="1.2"/>
-                    <path d="M4 2.5l.5-1h3l.5 1" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
-                </svg>
-            </button>
             <button class="nav-btn" type="button" onclick={openExternal} title="Open in external browser" aria-label="Open externally">
                 <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
                     <path d="M5 2H2.5A1.5 1.5 0 0 0 1 3.5v6A1.5 1.5 0 0 0 2.5 11h6A1.5 1.5 0 0 0 10 9.5V7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
@@ -216,38 +299,42 @@
         </div>
     </header>
 
-    <div class="browser-body">
-        {#if browser?.last_error}
+    <div bind:this={viewportElement} class="browser-body">
+        {#if errorMessage && !screenshotData}
             <div class="browser-overlay error">
-                <h3>Failed to load</h3>
-                <p>{browser.last_error}</p>
+                <h3>Error</h3>
+                <p>{errorMessage}</p>
+            </div>
+        {/if}
+
+        {#if errorMessage && screenshotData}
+            <div class="browser-status-banner error" aria-live="polite">
+                <strong>Error:</strong>
+                <span>{errorMessage}</span>
+            </div>
+        {/if}
+
+        {#if isLoading && !screenshotData}
+            <div class="browser-loading">
+                <span class="addr-spinner"></span>
+                <p>Starting browser...</p>
+            </div>
+        {:else if screenshotData}
+            <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+            <div class="browser-viewport" onclick={(e) => {
+                const coords = clickCoordinates(e);
+                void handleClick(coords.x, coords.y);
+            }}>
+                <img src={screenshotData} alt="Browser content" />
             </div>
         {:else}
-            <iframe
-                bind:this={iframeElement}
-                title={browser?.title ?? 'Browser'}
-                src={browser?.current_url ?? 'https://example.com'}
-                class:loading={browser?.is_loading}
-                onload={() => browserSetLoadingState(browserId, false, null)}
-                onerror={() => browserSetLoadingState(browserId, false, 'Failed to load page')}
-            ></iframe>
-        {/if}
-
-        {#if browser?.last_screenshot_path}
-            <div class="status-toast">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M2 6l3 3 5-5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
-                Saved: {browser.last_screenshot_path}
+            <div class="browser-empty">
+                <p>{initialHintText()}</p>
             </div>
-        {/if}
-
-        {#if automationResult}
-            <pre class="automation-result">{automationResult}</pre>
         {/if}
 
         <div class="browser-hint">
-            <p>Use <strong>Open</strong> to launch the URL externally until embedded rendering is available.</p>
+            <p>Click on the browser viewport to interact. Screenshot refreshes every second.</p>
         </div>
     </div>
 </section>
@@ -263,8 +350,6 @@
         min-height: 0;
         background: var(--ui-layer-0);
     }
-
-    /* ---- Toolbar ---- */
 
     .browser-toolbar {
         display: flex;
@@ -295,10 +380,7 @@
         color: var(--ui-text-muted);
         cursor: pointer;
         font: inherit;
-        transition:
-            background var(--ui-motion-fast),
-            color var(--ui-motion-fast),
-            border-color var(--ui-motion-fast);
+        transition: background var(--ui-motion-fast), color var(--ui-motion-fast), border-color var(--ui-motion-fast);
         padding: 0;
     }
 
@@ -307,8 +389,6 @@
         color: var(--ui-text-primary);
         border-color: var(--ui-border-soft);
     }
-
-    /* ---- Address bar ---- */
 
     .address-form {
         flex: 1;
@@ -324,9 +404,7 @@
         background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
         border-radius: 5px;
-        transition:
-            border-color var(--ui-motion-fast),
-            background var(--ui-motion-fast);
+        transition: border-color var(--ui-motion-fast), background var(--ui-motion-fast);
     }
 
     .address-bar:focus-within {
@@ -369,27 +447,26 @@
         color: var(--ui-text-muted);
     }
 
-    /* ---- Browser body ---- */
-
     .browser-body {
         position: relative;
         flex: 1;
         width: 100%;
         min-height: 0;
         overflow: hidden;
+        background: white;
     }
 
-    iframe {
-        display: block;
+    .browser-viewport {
         width: 100%;
         height: 100%;
-        border: 0;
-        background: white;
-        transition: opacity var(--ui-motion-fast);
+        cursor: crosshair;
     }
 
-    iframe.loading {
-        opacity: 0.6;
+    .browser-viewport img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: white;
     }
 
     .browser-overlay {
@@ -421,37 +498,59 @@
         line-height: 1.45;
     }
 
-    .status-toast {
-        position: absolute;
-        bottom: 12px;
-        right: 12px;
-        z-index: 10;
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        padding: 6px 10px;
-        background: var(--ui-layer-2);
-        border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
-        font-size: 0.74rem;
-        color: var(--ui-success);
-    }
-
-    .automation-result {
+    .browser-status-banner {
         position: absolute;
         top: 12px;
         left: 12px;
-        right: 12px;
-        z-index: 10;
-        max-height: 160px;
-        overflow: auto;
-        padding: 10px;
-        background: var(--ui-layer-2);
+        z-index: 8;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        max-width: min(640px, calc(100% - 24px));
+        padding: 8px 10px;
         border: 1px solid var(--ui-border-soft);
         border-radius: 6px;
-        font-size: 0.74rem;
-        white-space: pre-wrap;
-        color: var(--ui-text-primary);
+        background: color-mix(in srgb, var(--ui-layer-1) 90%, transparent 10%);
+        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+        pointer-events: none;
+    }
+
+    .browser-status-banner.error {
+        border-color: color-mix(in srgb, var(--ui-danger) 28%, transparent);
+        background: color-mix(in srgb, var(--ui-danger) 8%, var(--ui-layer-1) 92%);
+    }
+
+    .browser-status-banner strong,
+    .browser-status-banner span {
+        font-size: 0.72rem;
+        line-height: 1.35;
+    }
+
+    .browser-status-banner strong {
+        color: var(--ui-danger);
+    }
+
+    .browser-status-banner span {
+        color: var(--ui-text-secondary);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .browser-loading,
+    .browser-empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: var(--ui-text-muted);
+    }
+
+    .browser-loading p,
+    .browser-empty p {
+        margin-top: 12px;
+        font-size: 0.86rem;
     }
 
     .browser-hint {
@@ -472,9 +571,5 @@
         font-size: 0.72rem;
         color: var(--ui-text-muted);
         line-height: 1.4;
-    }
-
-    .browser-hint strong {
-        color: var(--ui-text-secondary);
     }
 </style>

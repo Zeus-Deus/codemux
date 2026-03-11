@@ -72,6 +72,7 @@ const APP_STATE_SCHEMA_VERSION: u32 = 1;
 const CODEMUX_CONFIG_VERSION: u32 = 1;
 const PERSISTENCE_SCHEMA_VERSION: u32 = 1;
 pub const MAX_TERMINAL_SESSIONS: usize = 8;
+const DEFAULT_BROWSER_URL: &str = "about:blank";
 
 #[derive(Debug, Clone)]
 enum WorkspaceInsertBehavior {
@@ -390,8 +391,8 @@ impl AppStateStore {
             snapshot.browser_sessions.push(BrowserSessionSnapshot {
                 browser_id: browser_id.clone(),
                 title: browser_title,
-                current_url: Some("https://example.com".into()),
-                history: vec!["https://example.com".into()],
+                current_url: Some(DEFAULT_BROWSER_URL.into()),
+                history: vec![DEFAULT_BROWSER_URL.into()],
                 history_index: 0,
                 is_loading: false,
                 last_error: None,
@@ -437,7 +438,7 @@ impl AppStateStore {
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
         let title = format!("Browser {}", snapshot.browser_sessions.len() + 1);
-        let initial_url = "https://example.com".to_string();
+        let initial_url = DEFAULT_BROWSER_URL.to_string();
 
         snapshot.browser_sessions.push(BrowserSessionSnapshot {
             browser_id: browser_id.clone(),
@@ -878,6 +879,18 @@ impl AppStateStore {
         }
 
         Ok(removed_session_id)
+    }
+
+    pub fn pane_browser_id(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)?;
+        let surface = snapshot
+            .workspaces
+            .get(workspace_index)
+            .and_then(|workspace| workspace.surfaces.get(surface_index))?;
+
+        browser_id_for_pane(&surface.root, &PaneId(pane_id.to_string()))
+            .map(|browser_id| browser_id.0)
     }
 
     pub fn swap_panes(&self, source_pane_id: &str, target_pane_id: &str) -> Result<(), String> {

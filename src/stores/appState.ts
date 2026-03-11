@@ -448,6 +448,49 @@ export async function browserAutomationComplete(requestId: string, result: Brows
     });
 }
 
+export interface BrowserProxyFetchResult {
+    html: string;
+    final_url: string;
+    status: number;
+    content_type: string | null;
+}
+
+export async function browserProxyFetch(url: string) {
+    return invoke<BrowserProxyFetchResult>('browser_proxy_fetch', { url });
+}
+
+export async function browserProxyScreenshot(url: string) {
+    return invoke<string>('browser_proxy_screenshot', { url });
+}
+
+export async function browserSpawn(browserId: string) {
+    return invoke<string>('browser_spawn', { browserId });
+}
+
+export async function browserNavigate(browserId: string, url: string) {
+    return invoke<string>('browser_navigate', { browserId, url });
+}
+
+export async function browserScreenshot(browserId: string) {
+    return invoke<string>('browser_screenshot', { browserId });
+}
+
+export async function browserClick(browserId: string, x: number, y: number) {
+    return invoke<string>('browser_click', { browserId, x, y });
+}
+
+export async function browserType(browserId: string, text: string) {
+    return invoke<string>('browser_type', { browserId, text });
+}
+
+export async function browserClose(browserId: string) {
+    return invoke('browser_close', { browserId });
+}
+
+export async function browserResizeViewport(browserId: string, width: number, height: number) {
+    return invoke('browser_resize_viewport', { browserId, width, height });
+}
+
 export async function updateProjectMemory(update: ProjectMemoryUpdate) {
     const snapshot = await invoke<ProjectMemorySnapshot>('update_project_memory_snapshot', { update });
     projectMemory.set(snapshot);

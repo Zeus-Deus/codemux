@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+pub mod browser;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -17,6 +18,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(state::AppStateStore::default())
         .manage(commands::BrowserAutomationCoordinator::default())
+        .manage(browser::BrowserManager::new())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
         .manage(observability::load_observability_store())
@@ -69,6 +71,15 @@ pub fn run() {
             commands::browser_capture_screenshot,
             commands::browser_automation_run,
             commands::browser_automation_complete,
+            commands::browser_proxy_fetch,
+            commands::browser_proxy_screenshot,
+            commands::browser_spawn,
+            commands::browser_navigate,
+            commands::browser_screenshot,
+            commands::browser_click,
+            commands::browser_type,
+            commands::browser_close,
+            commands::browser_resize_viewport,
             commands::get_project_memory_snapshot,
             commands::update_project_memory_snapshot,
             commands::add_project_memory_entry,
