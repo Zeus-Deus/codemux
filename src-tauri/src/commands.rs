@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use tauri::{Emitter, Runtime, State};
+use tauri::{Emitter, Manager, Runtime, State};
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 
@@ -329,7 +329,24 @@ pub fn notify_attention(
     let notification_id =
         state.add_notification(session_id, pane_id, message, NotificationLevel::Attention)?;
     if desktop.unwrap_or(true) {
-        let _ = Notification::new().summary("Codemux").body(&body).show();
+        let _ = Notification::new()
+            .summary("Codemux")
+            .body(&body)
+            .hint(notify_rust::Hint::DesktopEntry("com.codemux.app".to_string()))
+            .hint(notify_rust::Hint::Transient(true))
+            .urgency(notify_rust::Urgency::Critical)
+            .show();
+        
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
+        }
+        
+        let _ = std::process::Command::new("hyprctl")
+            .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+            .output();
     }
     crate::state::emit_app_state(&app);
     Ok(notification_id)

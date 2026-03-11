@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Codemux
+Comment=AI coding workspace with terminals, browser panes, and multi-agent orchestration
+GenericName=Code Editor
+Exec=codemux %U
+Icon=codemux
+Type=Application
+StartupNotify=false
+StartupWMClass=com.codemux.app
+Categories=Development;IDE;Utility;
+MimeType=x-scheme-handler/codemux;
+Keywords=codemux;terminal;browser;workspace;ai;coding;
