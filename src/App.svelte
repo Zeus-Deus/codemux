@@ -26,6 +26,7 @@
     } from './stores/appState';
     import PaneNode from './components/panes/PaneNode.svelte';
     import Sidebar from './components/sidebar/Sidebar.svelte';
+    import NewWorkspaceLauncher from './components/sidebar/NewWorkspaceLauncher.svelte';
     import { findActiveSessionId } from './lib/paneTree';
 
     const themeKeys = [
@@ -37,6 +38,7 @@
     ] as const;
 
     let windowFocused = $state(true);
+    let showNewWorkspaceLauncher = $state(false);
 
     function applyThemeVars(nextTheme = fallbackTheme) {
         const root = document.documentElement;
@@ -197,15 +199,27 @@
             </div>
         {/if}
     {:else}
-        <div class="loading-shell">
-            <div class="loading-card">
-                <div class="loading-spinner"></div>
-                <h2>Codemux</h2>
-                <p>Connecting to workspace backend…</p>
+        <div class="empty-shell">
+            <div class="empty-card">
+                <div class="empty-icon">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                        <rect x="2" y="4" width="20" height="16" rx="3" stroke="currentColor" stroke-width="1.5"/>
+                        <path d="M6 9l3 3-3 3M11 15h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                </div>
+                <h2>No workspace</h2>
+                <p>Create a workspace to start working.</p>
+                <button class="empty-create-btn" onclick={() => showNewWorkspaceLauncher = true}>
+                    Create workspace
+                </button>
             </div>
         </div>
     {/if}
 </main>
+
+{#if showNewWorkspaceLauncher}
+    <NewWorkspaceLauncher on:close={() => showNewWorkspaceLauncher = false} />
+{/if}
 
 <style>
     :global(html),
@@ -470,5 +484,59 @@
         margin: 0;
         font-size: 0.8rem;
         color: var(--ui-text-muted);
+    }
+
+    /* ---- Empty state ---- */
+
+    .empty-shell {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1;
+        width: 100%;
+        height: 100%;
+        background: var(--ui-layer-0);
+    }
+
+    .empty-card {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 12px;
+        text-align: center;
+    }
+
+    .empty-icon {
+        color: var(--ui-text-muted);
+    }
+
+    .empty-card h2 {
+        margin: 0;
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--ui-text-primary);
+    }
+
+    .empty-card p {
+        margin: 0;
+        font-size: 0.85rem;
+        color: var(--ui-text-muted);
+    }
+
+    .empty-create-btn {
+        margin-top: 8px;
+        padding: 8px 16px;
+        font-size: 0.85rem;
+        font-weight: 500;
+        color: var(--ui-layer-0);
+        background: var(--ui-accent);
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: opacity 0.15s;
+    }
+
+    .empty-create-btn:hover {
+        opacity: 0.9;
     }
 </style>

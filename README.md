@@ -22,20 +22,28 @@ Portable agent memory has now started landing as a local-first project memory la
 
 ## Current Status
 
-This repo is now beyond the initial prototype stage.
+This repo is beyond the original single-terminal prototype, but it is not ship-ready yet.
 
-Implemented so far:
+Implemented and worth treating as real product surface:
 
 - multi-session terminal backend
 - workspace and pane model
-- split pane rendering and resizing
-- browser pane MVP
-- browser automation MVP
+- split pane rendering, resizing, close, and swap
 - notification system
 - local control socket and CLI commands
 - local project memory and handoff packet generation
+- local lexical indexing
 - persisted layout state
 - backend and frontend test foundations
+
+Implemented only in partial or prototype form:
+
+- browser pane currently uses an `iframe` prototype rather than a true native embedded Tauri webview
+- browser automation currently targets that prototype browser model and has same-origin limitations
+- browser screenshots currently use `grim`, which captures the screen rather than a browser-pane-native surface
+- OpenFlow currently provides design/runtime scaffolding and UI controls, not a full multi-agent execution system
+
+For the up-to-date repo reality and manual testing checklist, read `STATUS.md` before treating any roadmap checkbox as release proof.
 
 ## Run
 
@@ -72,7 +80,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 Run the app:
 
 ```bash
-WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev
+npm run tauri:dev
 ```
 
 Why this launch command is recommended:
@@ -167,6 +175,7 @@ These are the most important top-level docs:
 
 - `PROJECT.md` - product vision and architecture intent
 - `PLAN.md` - phased implementation roadmap and progress
+- `STATUS.md` - current reality, known gaps, and manual testing checklist
 - `TESTING.md` - testing strategy and what kinds of tests matter
 - `docs/CONTROL.md` - local control protocol and CLI usage
 - `.codemux/project-memory.json` - per-project shared memory store
@@ -228,17 +237,12 @@ The app runs as a native Wayland process. No special compositor config is needed
 
 ## What Is Next
 
-The next major implementation area should be one of:
+The next major implementation area should be `Phase 15` Linux polish and release readiness, with one correction:
 
-1. `Phase 14` quality, observability, and safety
-2. `Phase 15` Linux polish and release readiness
+- the browser pane should still be treated as incomplete until the iframe prototype is replaced by a real embedded browser surface
 
-Recommended next step: Phase 14.
+Recommended next steps:
 
-Why:
-
-- OpenFlow is now powerful enough that logs, replay, metrics, and permission boundaries matter
-- observability and safety should harden the system before more capability is added
-- it will make later debugging and autonomous runs much more reliable
-
-Current OpenFlow design/runtime scaffolding is available from the backend and documented in `PROJECT.md`.
+1. finish manual validation of the current terminal/workspace/notification/CLI flows using `STATUS.md`
+2. decide which checked roadmap items need to be downgraded from "done" to "partial"
+3. implement a real embedded browser pane before claiming Linux MVP

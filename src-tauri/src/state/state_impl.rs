@@ -500,7 +500,24 @@ impl AppStateStore {
         let mut snapshot = self.inner.lock().unwrap();
 
         if snapshot.workspaces.len() <= 1 {
-            return Err("Cannot close the last workspace".into());
+            let workspace_index = snapshot
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.workspace_id.0 == workspace_id)
+                .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+            let removed = snapshot.workspaces.remove(workspace_index);
+            let removed_session_ids = collect_terminal_sessions(&removed.surfaces);
+            snapshot
+                .notifications
+                .retain(|notification| notification.workspace_id != removed.workspace_id);
+            snapshot.terminal_sessions.retain(|session| {
+                !removed_session_ids
+                    .iter()
+                    .any(|id| id == &session.session_id.0)
+            });
+            snapshot.active_workspace_id = WorkspaceId("".into());
+            return Ok(WorkspaceId("".into()));
         }
 
         let workspace_index = snapshot
