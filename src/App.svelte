@@ -440,52 +440,6 @@
         line-height: 1.5;
     }
 
-    /* ---- Loading state ---- */
-
-    .loading-shell {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex: 1;
-        width: 100%;
-        height: 100%;
-        background: var(--ui-layer-0);
-    }
-
-    .loading-card {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 12px;
-        text-align: center;
-    }
-
-    .loading-spinner {
-        width: 20px;
-        height: 20px;
-        border: 2px solid var(--ui-border-soft);
-        border-top-color: var(--ui-accent);
-        border-radius: 50%;
-        animation: spin 0.8s linear infinite;
-    }
-
-    @keyframes spin {
-        to { transform: rotate(360deg); }
-    }
-
-    .loading-card h2 {
-        margin: 0;
-        font-size: 0.96rem;
-        font-weight: 600;
-        color: var(--ui-text-secondary);
-    }
-
-    .loading-card p {
-        margin: 0;
-        font-size: 0.8rem;
-        color: var(--ui-text-muted);
-    }
-
     /* ---- Empty state ---- */
 
     .empty-shell {
