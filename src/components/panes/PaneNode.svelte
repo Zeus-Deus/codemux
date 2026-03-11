@@ -302,14 +302,17 @@
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
     >
-        <header class="pane-header">
+        <header 
+            class="pane-header"
+            role="presentation"
+            data-pane-drop-id={node.pane_id}
+            data-pane-title={node.title}
+            onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
+        >
             <div
                 class="pane-title-block"
-                data-pane-drop-id={node.pane_id}
-                data-pane-title={node.title}
                 role="button"
                 tabindex="0"
-                onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
                 onkeydown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault();
@@ -410,14 +413,17 @@
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
     >
-        <header class="pane-header">
+        <header 
+            class="pane-header"
+            role="presentation"
+            data-pane-drop-id={node.pane_id}
+            data-pane-title={node.title}
+            onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
+        >
             <div
                 class="pane-title-block"
-                data-pane-drop-id={node.pane_id}
-                data-pane-title={node.title}
                 role="button"
                 tabindex="0"
-                onpointerdown={(event) => handlePanePointerDown(event, node.pane_id, node.title)}
                 onkeydown={(event) => {
                     if (event.key === 'Enter' || event.key === ' ') {
                         event.preventDefault();
