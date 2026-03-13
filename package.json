@@ -11,10 +11,11 @@
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
     "test": "vitest run",
     "verify": "cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml && npm run check && npm run test",
-    "test:watch": "vitest",
+    "test:watch": "vitest run --watch",
     "tauri": "tauri",
     "tauri:dev:x11": "GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
-    "tauri:dev": "WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev"
+    "tauri:dev": "WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
+    "cli": "cargo run --manifest-path src-tauri/Cargo.toml --"
   },
   "license": "MIT",
   "dependencies": {
@@ -23,15 +24,16 @@
     "@tauri-apps/plugin-opener": "^2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-webgl": "^0.19.0",
-    "@xterm/xterm": "^6.0.0"
+    "@xterm/xterm": "^6.0.0",
+    "agent-browser": "^0.19.0"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.6",
     "@sveltejs/kit": "^2.9.0",
     "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/svelte": "^5.2.8",
-    "@tauri-apps/cli": "^2",
     "jsdom": "^26.0.0",
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",

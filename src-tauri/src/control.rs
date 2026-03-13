@@ -1,4 +1,3 @@
-use crate::commands::{self, BrowserAutomationCoordinator};
 use crate::indexing;
 use crate::memory;
 use crate::state::AppStateStore;
@@ -134,6 +133,16 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                     serde_json::json!({ "session_id": session_id.0 })
                 })
         }
+        "create_browser_pane" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request.params.get("pane_id").and_then(Value::as_str).unwrap_or_default();
+            state
+                .create_browser_pane(pane_id)
+                .map(|browser_id| {
+                    crate::state::emit_app_state(app);
+                    serde_json::json!({ "browser_id": browser_id.0 })
+                })
+        }
         "open_url" => {
             let state: State<'_, AppStateStore> = app.state();
             let browser_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or_default();
@@ -164,16 +173,20 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .map(|_| serde_json::json!({ "written": true }))
         }
         "browser_automation" => {
-            let coordinator: State<'_, BrowserAutomationCoordinator> = app.state();
-            let browser_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or_default().to_string();
-            match serde_json::from_value::<commands::BrowserAutomationAction>(
-                request.params.get("action").cloned().unwrap_or(Value::Null),
-            ) {
-                Ok(action) => commands::browser_automation_run(app.clone(), coordinator, browser_id, action)
-                    .await
-                    .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string())),
-                Err(error) => Err(format!("Invalid automation action: {error}")),
-            }
+            let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
+            let browser_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or("default").to_string();
+            
+            let action_kind = request.params.get("action")
+                .and_then(|v| v.get("kind"))
+                .and_then(Value::as_str)
+                .unwrap_or("open_url")
+                .to_string();
+            
+            let params = request.params.get("action").cloned().unwrap_or(Value::Null);
+            
+            agent_browser.run_command(&browser_id, &action_kind, params)
+                .await
+                .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
         }
         "get_project_memory" => memory::get_project_memory(
             request.params

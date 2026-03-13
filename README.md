@@ -106,6 +106,31 @@ cargo run --manifest-path src-tauri/Cargo.toml -- notify "Agent needs input"
 cargo run --manifest-path src-tauri/Cargo.toml -- json get_app_state
 ```
 
+## Browser Automation
+
+Codemux has a built-in browser pane that agents can control programmatically.
+
+### For Agents
+
+To test a webpage inside Codemux, tell the agent:
+
+> **"Test this in the Codemux browser"**
+
+The agent will automatically use the embedded browser instead of your system browser.
+
+Commands available:
+```bash
+codemux browser create          # Create browser pane (run first if none exists)
+codemux browser open <url>    # Open URL in browser pane
+codemux browser snapshot      # Get page structure
+codemux browser click "#btn" # Click element
+codemux browser fill "#in" "text"  # Fill input
+codemux browser screenshot   # Take screenshot
+codemux browser console-logs # Get console logs
+```
+
+The browser pane must be visible for commands to work.
+
 ## Project Memory Workflow
 
 Codemux stores shared project memory in:

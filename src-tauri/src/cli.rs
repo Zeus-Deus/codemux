@@ -26,6 +26,21 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: IndexCommand,
     },
+    Browser {
+        #[command(subcommand)]
+        command: BrowserCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum BrowserCommand {
+    Create,
+    Open { url: String },
+    Snapshot { browser_id: Option<String> },
+    Click { selector: String, browser_id: Option<String> },
+    Fill { selector: String, value: String, browser_id: Option<String> },
+    Screenshot { browser_id: Option<String> },
+    ConsoleLogs { browser_id: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -185,6 +200,58 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
             Ok(true)
         }
+        Some(CommandSet::Browser { command }) => {
+            let result = match command {
+                BrowserCommand::Create => {
+                    let response = send_request(ControlRequest {
+                        command: "create_browser_pane".to_string(),
+                        params: json!({"pane_id": ""}),
+                    }).await?;
+                    Ok(json!({ "ok": true, "browser_id": response.data.unwrap_or(json!(null)) }))
+                }
+                BrowserCommand::Open { url } => {
+                    run_agent_browser(&["open", &format!("'{}'", url), "--session", "default"])
+                }
+                BrowserCommand::Snapshot { browser_id: _ } => {
+                    run_agent_browser(&["snapshot", "-i", "--session", "default"])
+                }
+                BrowserCommand::Click { selector, browser_id: _ } => {
+                    run_agent_browser(&["click", &format!("'{}'", selector), "--session", "default"])
+                }
+                BrowserCommand::Fill { selector, value, browser_id: _ } => {
+                    run_agent_browser(&["fill", &format!("'{}'", selector), &format!("'{}'", value), "--session", "default"])
+                }
+                BrowserCommand::Screenshot { browser_id: _ } => {
+                    run_agent_browser(&["screenshot", "--session", "default"])
+                }
+                BrowserCommand::ConsoleLogs { browser_id: _ } => {
+                    run_agent_browser(&["console", "--session", "default"])
+                }
+            }?;
+            println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
+            Ok(true)
+        }
+    }
+}
+
+fn run_agent_browser(args: &[&str]) -> Result<serde_json::Value, String> {
+    let shell_cmd = format!("npx agent-browser {}", args.join(" "));
+    let output = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .output()
+        .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") {
+        return Err(format!("agent-browser failed: {} {}", stdout, stderr));
+    }
+
+    if stdout.contains("{") {
+        serde_json::from_str(&stdout).map_err(|e| format!("Failed to parse JSON: {}", e))
+    } else {
+        Ok(serde_json::json!({ "output": stdout, "success": output.status.success() }))
     }
 }
 

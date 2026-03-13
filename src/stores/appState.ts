@@ -573,3 +573,23 @@ export async function stopOpenFlowRun(runId: string, status: 'failed' | 'cancell
     openflowRuntime.set(snapshot);
     return run;
 }
+
+export async function agentBrowserSpawn(browserId: string) {
+    return invoke('agent_browser_spawn', { browserId });
+}
+
+export async function agentBrowserRun(browserId: string, action: string, params: Record<string, unknown> = {}) {
+    return invoke('agent_browser_run', { browserId, action, params });
+}
+
+export async function agentBrowserClose(browserId: string) {
+    return invoke('agent_browser_close', { browserId });
+}
+
+export async function agentBrowserGetStreamUrl() {
+    return invoke<string>('agent_browser_get_stream_url');
+}
+
+export async function agentBrowserScreenshot(browserId: string) {
+    return invoke<string>('agent_browser_screenshot', { browserId });
+}

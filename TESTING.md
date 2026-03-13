@@ -79,6 +79,15 @@ Use these as the standard verification entry points:
 
 `npm run verify` should be the main command to remember. The others are still useful when iterating on one layer.
 
+## Manual Validation Rule
+
+Automated checks are necessary but not enough for roadmap and release claims.
+
+- A feature can be implemented and still fail manual product testing.
+- Use `STATUS.md` as the current manual testing checklist for what should work right now.
+- Do not treat a checked roadmap box in `PLAN.md` as proof that the workflow is release-ready.
+- Browser and OpenFlow features need especially careful manual validation because some current implementations are still prototype-level.
+
 ## Current Coverage
 
 Rust tests currently cover:

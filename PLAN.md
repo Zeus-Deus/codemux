@@ -9,6 +9,12 @@ This plan assumes:
 - The current codebase is a prototype seed, not a finished foundation.
 - We optimize for a working Linux MVP first, then grow toward full `cmux` parity and `OpenFlow`.
 
+Important note about roadmap status:
+
+- `PLAN.md` is the build-order roadmap, not the release-readiness checklist.
+- A checked box should mean the code landed in some meaningful form, but it does not automatically mean the feature is manually validated, polished, or shippable.
+- Use `STATUS.md` for the current reality, known gaps, and the manual testing checklist.
+
 ## Can we continue from the current code?
 
 Yes, but only as a prototype base.
@@ -229,16 +235,22 @@ Exit criteria:
 - agents can reliably signal for attention
 - user can identify which pane/workspace needs input immediately
 
-## Phase 7 - Browser pane MVP
+## Phase 7 - Browser pane prototype toward MVP
 
 - [x] Add browser pane type to the pane tree
-- [x] Implement browser surface embedding using Tauri-compatible webview capabilities
+- [ ] Implement browser surface embedding using Tauri-compatible webview capabilities
 - [x] Add address bar, back/forward/reload, open URL
 - [x] Persist URL and basic navigation state
 - [x] Support split terminal + browser layouts
-- [x] Handle focus, resize, and redraw lifecycle carefully
+- [ ] Handle focus, resize, and redraw lifecycle carefully
 - [x] Add screenshot capability
 - [x] Add browser error/loading states
+
+Current status note:
+
+- The current browser pane is still an `iframe` prototype in the frontend.
+- It is not yet a true native embedded Tauri webview pane.
+- This phase should not be treated as meeting Linux MVP exit criteria yet.
 
 Exit criteria:
 
@@ -252,8 +264,14 @@ Exit criteria:
 - [x] Add DOM snapshot / accessibility tree API where supported
 - [x] Add click/type/fill/scroll/evaluate APIs
 - [x] Add screenshot and console log capture APIs
-- [x] Add permission/safety boundaries for automation commands
+- [ ] Add permission/safety boundaries for automation commands
 - [x] Add durable error reporting for failed automation steps
+
+Current status note:
+
+- The current automation layer targets the iframe-based browser prototype.
+- Same-origin and iframe-embedding limitations still apply.
+- Do not treat this phase as proof of robust embedded-browser automation yet.
 
 Exit criteria:
 
@@ -266,9 +284,14 @@ Exit criteria:
 - [x] Add local socket server for app control
 - [x] Support commands for workspace creation, pane splitting, focus, send keys, notify, open URL
 - [x] Add machine-readable JSON output mode
-- [x] Add auth/permissions model for local control
+- [ ] Add auth/permissions model for local control
 - [x] Add protocol versioning
-- [x] Document example integrations for OpenCode, Claude Code, Codex, Aider
+- [ ] Document example integrations for OpenCode, Claude Code, Codex, Aider
+
+Current status note:
+
+- Current control access is local-user and same-machine only.
+- Stronger auth/capability checks are still future work.
 
 Exit criteria:
 
@@ -321,48 +344,63 @@ Exit criteria:
 - OpenFlow is specified as an engine, not just an idea
 - roles, state, and loop behavior are documented clearly
 
-## Phase 11 - OpenFlow runtime MVP
+## Phase 11 - OpenFlow runtime scaffold
 
-- [x] Build backend orchestration engine for multi-agent runs
+- [ ] Build backend orchestration engine for multi-agent runs
 - [x] Add run state machine with resumable tasks
 - [x] Add worker abstraction for terminal-based agents
 - [x] Add planner worker contract
 - [x] Add builder worker contract
 - [x] Add reviewer/tester worker contract
-- [x] Add shared context/memory store
+- [ ] Add shared context/memory store
 - [x] Add run timeline and logs
 - [x] Add basic retry, backoff, and failure recovery
+
+Current status note:
+
+- The current implementation provides design/runtime scaffolding, run records, and a simulated phase loop.
+- It is not yet a full worker-execution engine that actually drives multiple live agents through real tasks.
 
 Exit criteria:
 
 - one high-level request can spawn multiple coordinated agent tasks
 - each run is observable, resumable, and auditable
 
-## Phase 12 - OpenFlow + Codemux integration
+## Phase 12 - OpenFlow + Codemux integration scaffold
 
-- [x] Allow OpenFlow to create workspaces and panes automatically
-- [x] Launch one terminal agent per role or per task branch
-- [x] Link browser panes to active workspaces/tasks
-- [x] Feed browser screenshots/DOM snapshots back into the orchestration loop
+- [ ] Allow OpenFlow to create workspaces and panes automatically
+- [ ] Launch one terminal agent per role or per task branch
+- [ ] Link browser panes to active workspaces/tasks
+- [ ] Feed browser screenshots/DOM snapshots back into the orchestration loop
 - [x] Show run progress in sidebar and workspace UI
 - [x] Surface review verdicts, blockers, and pending approvals
-- [x] Allow pause/resume/cancel of live flows
-- [x] Allow user takeover of any pane at any time
+- [x] Allow pause/cancel/retry control of scaffolded flows
+- [ ] Allow user takeover of any pane at any time
+
+Current status note:
+
+- Current integration is mostly sidebar/UI state and run controls.
+- The full workspace/pane/agent orchestration loop is still not implemented.
 
 Exit criteria:
 
 - a single user prompt can create a working multi-agent workspace
 - user can watch the swarm operate and intervene when needed
 
-## Phase 13 - OpenFlow autonomous dev loop
+## Phase 13 - OpenFlow autonomous loop scaffold
 
 - [x] Implement iterative phased execution loop
-- [x] Require verification after each build phase
-- [x] Run browser-based smoke checks where relevant
-- [x] Run project tests/builds/lints where relevant
-- [x] Have reviewer agent score output and request fixes
-- [x] Replan based on failures, regressions, or incomplete requirements
+- [ ] Require verification after each build phase
+- [ ] Run browser-based smoke checks where relevant
+- [ ] Run project tests/builds/lints where relevant
+- [ ] Have reviewer agent score output and request fixes
+- [ ] Replan based on failures, regressions, or incomplete requirements
 - [x] Stop only on success, budget exhaustion, policy stop, or user approval point
+
+Current status note:
+
+- The current loop advances internal run state.
+- It does not yet execute a real autonomous development cycle with actual agents, tests, browser validation, and replanning.
 
 Exit criteria:
 

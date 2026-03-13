@@ -212,6 +212,12 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let cwd = session_working_dir(&app_state, &session_id);
     let mut cmd = CommandBuilder::new(shell.clone());
     cmd.cwd(cwd);
+
+    let snapshot = app_state.snapshot();
+    let active_workspace_id = snapshot.active_workspace_id.0.clone();
+    cmd.env("CODEMUX_WORKSPACE_ID", active_workspace_id);
+    cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
+
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(error) => {

@@ -901,3 +901,44 @@ pub async fn browser_resize_viewport(
 ) -> Result<(), String> {
     manager.resize_viewport(&browser_id, width, height).await
 }
+
+#[tauri::command]
+pub async fn agent_browser_spawn(
+    manager: State<'_, crate::agent_browser::AgentBrowserManager>,
+    browser_id: String,
+) -> Result<(), String> {
+    manager.spawn(&browser_id).await
+}
+
+#[tauri::command]
+pub async fn agent_browser_run(
+    manager: State<'_, crate::agent_browser::AgentBrowserManager>,
+    browser_id: String,
+    action: String,
+    params: serde_json::Value,
+) -> Result<crate::agent_browser::BrowserAutomationResult, String> {
+    manager.run_command(&browser_id, &action, params).await
+}
+
+#[tauri::command]
+pub async fn agent_browser_close(
+    manager: State<'_, crate::agent_browser::AgentBrowserManager>,
+    browser_id: String,
+) -> Result<(), String> {
+    manager.close(&browser_id).await
+}
+
+#[tauri::command]
+pub fn agent_browser_get_stream_url(
+    manager: State<'_, crate::agent_browser::AgentBrowserManager>,
+) -> Result<String, String> {
+    Ok(manager.get_stream_url())
+}
+
+#[tauri::command]
+pub async fn agent_browser_screenshot(
+    manager: State<'_, crate::agent_browser::AgentBrowserManager>,
+    browser_id: String,
+) -> Result<String, String> {
+    manager.get_screenshot(&browser_id).await
+}

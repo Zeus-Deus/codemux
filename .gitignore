@@ -16,6 +16,7 @@ src-tauri/gen/
 
 # Codemux local project state
 .codemux/index.json
+.codemux/observability.json
 .codemux/project-memory.json
 src-tauri/.codemux/
 

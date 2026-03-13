@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+pub mod agent_browser;
 pub mod browser;
 pub mod cli;
 pub mod commands;
@@ -19,6 +20,7 @@ pub fn run() {
         .manage(state::AppStateStore::default())
         .manage(commands::BrowserAutomationCoordinator::default())
         .manage(browser::BrowserManager::new())
+        .manage(agent_browser::AgentBrowserManager::new())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
         .manage(observability::load_observability_store())
@@ -80,6 +82,11 @@ pub fn run() {
             commands::browser_type,
             commands::browser_close,
             commands::browser_resize_viewport,
+            commands::agent_browser_spawn,
+            commands::agent_browser_run,
+            commands::agent_browser_close,
+            commands::agent_browser_get_stream_url,
+            commands::agent_browser_screenshot,
             commands::get_project_memory_snapshot,
             commands::update_project_memory_snapshot,
             commands::add_project_memory_entry,

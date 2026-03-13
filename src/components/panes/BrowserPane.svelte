@@ -10,7 +10,10 @@
         browserScreenshot,
         browserClick,
         browserType,
-        appState
+        appState,
+        agentBrowserSpawn,
+        agentBrowserRun,
+        agentBrowserScreenshot
     } from '../../stores/appState';
 
     let { browserId }: { browserId: string } = $props();
@@ -28,6 +31,9 @@
     let resizeObserver: ResizeObserver | null = null;
     let viewportWidth = $state(1280);
     let viewportHeight = $state(720);
+    
+    const useAgentBrowser = true;
+    const BROWSER_SESSION = 'default';
 
     const browser = $derived(
         $appState?.browser_sessions.find((b) => b.browser_id === browserId) ?? null
@@ -48,6 +54,21 @@
         try {
             isLoading = true;
             errorMessage = null;
+            
+            if (useAgentBrowser) {
+                await agentBrowserSpawn(BROWSER_SESSION);
+                browserReady = true;
+                await tick();
+                await syncViewportSize();
+                
+                screenshotInterval = setInterval(() => {
+                    void refreshScreenshot();
+                }, 1000);
+                
+                isLoading = false;
+                return;
+            }
+
             await browserSpawn(browserId);
 
             browserReady = true;
@@ -83,6 +104,14 @@
             isLoading = true;
             errorMessage = null;
 
+            if (useAgentBrowser) {
+                await agentBrowserRun(BROWSER_SESSION, 'open', { url: nextUrl });
+                address = nextUrl;
+                await refreshScreenshot();
+                isLoading = false;
+                return;
+            }
+
             if (syncState) {
                 await browserOpenUrl(browserId, nextUrl);
             }
@@ -94,7 +123,9 @@
             await browserSetLoadingState(browserId, false, null);
         } catch (e) {
             errorMessage = e instanceof Error ? e.message : String(e);
-            await browserSetLoadingState(browserId, false, errorMessage).catch(() => {});
+            if (!useAgentBrowser) {
+                await browserSetLoadingState(browserId, false, errorMessage).catch(() => {});
+            }
         } finally {
             isLoading = false;
         }
@@ -102,7 +133,11 @@
 
     async function handleClick(x: number, y: number) {
         try {
-            await browserClick(browserId, x, y);
+            if (useAgentBrowser) {
+                await agentBrowserRun(BROWSER_SESSION, 'click', { selector: 'body' });
+            } else {
+                await browserClick(browserId, x, y);
+            }
             await refreshScreenshot();
         } catch (e) {
             errorMessage = e instanceof Error ? e.message : String(e);
@@ -174,6 +209,17 @@
 
         try {
             screenshotInFlight = true;
+            
+            if (useAgentBrowser) {
+                const data = await agentBrowserScreenshot(BROWSER_SESSION);
+                if (mounted && data) {
+                    screenshotData = data.startsWith('data:') ? data : `data:image/png;base64,${data}`;
+                    errorMessage = null;
+                }
+                screenshotInFlight = false;
+                return;
+            }
+            
             const data = await browserScreenshot(browserId);
             if (mounted) {
                 screenshotData = data;

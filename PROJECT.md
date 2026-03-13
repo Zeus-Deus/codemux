@@ -378,18 +378,22 @@ When continuing this project in future chats, treat these two files as the share
 At the time of writing this file, the project has:
 
 - a Rust app-state model
-- a multi-session terminal foundation
-- session creation/activation/restart/close behavior
-- a prototype sidebar/workspace shell in progress
+- multi-session terminals with session lifecycle handling
+- workspace creation, activation, rename, and close flows
+- split-pane rendering, resizing, close, and swap behavior
+- sidebar-driven workspace navigation and notifications UI
+- local CLI/socket control
+- local project memory and lexical indexing
+- OpenFlow design/runtime scaffolding
 
 It does not yet have:
 
-- full workspace management
-- real split-pane rendering UI
-- browser panes
-- notifications system
-- CLI/socket automation layer
-- OpenFlow runtime
+- a real native embedded browser pane backed by Tauri webview primitives
+- production-ready browser automation
+- a fully integrated OpenFlow worker execution runtime
+- release-ready Linux polish and validated daily-driver stability
+
+For exact current reality and what still needs manual validation, see `STATUS.md`.
 
 ## Short Version
 
