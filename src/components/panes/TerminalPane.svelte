@@ -201,7 +201,38 @@
             lineHeight: 1.15,
             letterSpacing: 0,
             fontSize: 13,
-            cursorStyle: 'bar'
+            cursorStyle: 'bar',
+            altClickMovesCursor: true
+        });
+
+        // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
+        term.attachCustomKeyEventHandler((ev) => {
+            // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
+            if (ev.ctrlKey && ev.key === 'Backspace') {
+                invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
+                ev.preventDefault?.();
+                return false;
+            }
+            // Ctrl+Shift+C -> copy (when text is selected)
+            if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
+                const selection = term?.getSelection();
+                if (selection) {
+                    navigator.clipboard.writeText(selection).catch(console.error);
+                }
+                ev.preventDefault?.();
+                return false;
+            }
+            // Ctrl+Shift+V -> paste
+            if (ev.ctrlKey && ev.shiftKey && ev.key === 'V') {
+                navigator.clipboard.readText().then((text) => {
+                    if (text && term) {
+                        term.paste(text);
+                    }
+                }).catch(console.error);
+                ev.preventDefault?.();
+                return false;
+            }
+            return true;
         });
 
         fitAddon = new FitAddon();
