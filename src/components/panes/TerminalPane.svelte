@@ -4,6 +4,8 @@
     import type { ITheme } from '@xterm/xterm';
     import { FitAddon } from '@xterm/addon-fit';
     import { WebglAddon } from '@xterm/addon-webgl';
+    import { ClipboardAddon } from '@xterm/addon-clipboard';
+    import { SearchAddon } from '@xterm/addon-search';
     import { Channel, invoke } from '@tauri-apps/api/core';
     import { listen } from '@tauri-apps/api/event';
     import { theme, fallbackTheme, shellAppearance, type ShellAppearance } from '../../stores/theme';
@@ -198,11 +200,19 @@
             cursorWidth: 2,
             lineHeight: 1.15,
             letterSpacing: 0,
-            fontSize: 13
+            fontSize: 13,
+            cursorStyle: 'bar'
         });
 
         fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
+        
+        const clipboardAddon = new ClipboardAddon();
+        term.loadAddon(clipboardAddon);
+        
+        const searchAddon = new SearchAddon();
+        term.loadAddon(searchAddon);
+        
         term.open(terminalContainer);
 
         try {
