@@ -54,14 +54,17 @@
         };
 
         if (phase === 'plan' || phase === 'execute') {
-            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('builder'), label: 'assigning tasks' });
+            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('researcher'), label: 'research' });
             conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('planner'), label: 'planning' });
+            conns.push({ from: getWorkerId('researcher'), to: getWorkerId('planner'), label: 'findings' });
+            conns.push({ from: getWorkerId('planner'), to: getWorkerId('builder'), label: 'tasks' });
         }
         if (phase === 'execute') {
             conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'building' });
         }
         if (phase === 'verify') {
             conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'testing' });
+            conns.push({ from: getWorkerId('tester'), to: getWorkerId('debugger'), label: 'failures' });
             conns.push({ from: getWorkerId('tester'), to: getWorkerId('reviewer'), label: 'results' });
         }
         if (phase === 'review') {

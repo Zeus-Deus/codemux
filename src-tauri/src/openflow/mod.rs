@@ -255,11 +255,22 @@ impl OpenFlowRuntimeStore {
             "openflow-run-{}",
             uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
         );
-        let assigned_roles: Vec<OpenFlowRole> = request
-            .agent_roles
-            .iter()
-            .filter_map(|r| OpenFlowRole::from_str(r))
-            .collect();
+        let assigned_roles: Vec<OpenFlowRole> = {
+            let mut seen = std::collections::HashSet::new();
+            request
+                .agent_roles
+                .iter()
+                .filter_map(|r| OpenFlowRole::from_str(r))
+                // Orchestrator must appear exactly once; all other roles can repeat
+                .filter(|role| {
+                    if matches!(role, OpenFlowRole::Orchestrator) {
+                        seen.insert("orchestrator")
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        };
 
         let workers = assigned_roles
             .iter()

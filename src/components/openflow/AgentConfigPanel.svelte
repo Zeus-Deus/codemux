@@ -48,9 +48,17 @@
     ];
 
     // ── helpers ──────────────────────────────────────────────────────────────
+    // Orchestrator is always agent 0. For all subsequent agents cycle through
+    // the non-orchestrator roles so we never accidentally assign a second orchestrator.
     function getDefaultRole(index: number): string {
-        const roles = ['orchestrator', 'builder', 'reviewer', 'tester', 'debugger', 'researcher'];
-        return roles[index % roles.length];
+        if (index === 0) return 'orchestrator';
+        const otherRoles = ['researcher', 'planner', 'builder', 'tester', 'debugger', 'reviewer'];
+        return otherRoles[(index - 1) % otherRoles.length];
+    }
+
+    // Returns true if a second orchestrator would be added if agent `forIndex` is set to orchestrator
+    function orchestratorTaken(forIndex: number): boolean {
+        return agents.some((a, i) => i !== forIndex && a.role === 'orchestrator');
     }
 
     function defaultToolId(): string {
@@ -236,7 +244,12 @@
                         <!-- Role -->
                         <select bind:value={agent.role}>
                             {#each availableRoles as role}
-                                <option value={role.id}>{role.name}</option>
+                                <option
+                                    value={role.id}
+                                    disabled={role.id === 'orchestrator' && orchestratorTaken(i)}
+                                >
+                                    {role.name}{role.id === 'orchestrator' && orchestratorTaken(i) ? ' (taken)' : ''}
+                                </option>
                             {/each}
                         </select>
 
