@@ -33,6 +33,11 @@
     let shellAppearanceUnsubscribe: (() => void) | null = null;
     let statusUnlisten: (() => void) | null = null;
     let attachedSessionId: string | null = null;
+    // Tracks whether the running application has pushed the kitty keyboard protocol
+    // (e.g. OpenCode/crossterm sends ESC [ > 1 u to enable enhanced key reporting).
+    // When active, Shift+Enter is sent as the CSI u sequence instead of \r.
+    let kittyProtocolLevel = 0;
+    const ptyDecoder = new TextDecoder('utf-8', { fatal: false });
     let terminalStatus = $state<TerminalStatusPayload>({
         session_id: '',
         state: 'starting',
@@ -81,27 +86,71 @@
         term.options.theme = terminalTheme();
     }
 
+    // Scan PTY output for kitty keyboard protocol sequences.
+    //
+    // Detection works in two steps:
+    //
+    // Step 1 — capability query (crossterm sends \x1b[?u\x1b[c together):
+    //   crossterm races the kitty-flags response against the DA1 response.
+    //   If the kitty-flags response (\x1b[?<n>u) arrives FIRST, it knows the
+    //   terminal supports keyboard enhancement.  xterm.js never responds to
+    //   \x1b[?u, so crossterm only ever sees the DA1 response and concludes
+    //   "not supported."  We fix this by detecting \x1b[?u in PTY output and
+    //   immediately writing \x1b[?0u back to the PTY (meaning "supported, but
+    //   no flags currently active").  This invoke is dispatched *before*
+    //   term.write() runs, so it beats xterm.js's own DA1 response through the
+    //   onData → queueMicrotask → invoke chain.
+    //
+    // Step 2 — push/pop tracking:
+    //   Once crossterm knows the terminal supports enhancement it pushes its
+    //   desired flags (\x1b[>Nu).  We count push/pop depth so that
+    //   customKeyEventHandler knows when to send CSI u sequences vs plain \r.
+    function scanKittyProtocol(data: Uint8Array | string): void {
+        const str = typeof data === 'string' ? data : ptyDecoder.decode(data);
+
+        // Step 1: respond to capability query before DA1 response can arrive.
+        // \x1b[?u with no digits = the kitty keyboard capability query.
+        // (A DEC private sequence \x1b[?<digits>h/l would have digits before the
+        // final byte, so \x1b[?u cannot be confused with those.)
+        if (str.includes('\x1b[?u')) {
+            invoke('write_to_pty', { data: '\x1b[?0u', sessionId }).catch(console.error);
+        }
+
+        // Step 2: track push/pop depth.
+        // Push: ESC [ > <flags> u  (e.g. \x1b[>1u sent by crossterm after detecting support)
+        // Pop:  ESC [ < u
+        const pushes = (str.match(/\x1b\[>[0-9]+u/g) ?? []).length;
+        const pops   = (str.match(/\x1b\[<u/g)       ?? []).length;
+        kittyProtocolLevel = Math.max(0, kittyProtocolLevel + pushes - pops);
+    }
+
     function writePtyChunk(payload: unknown) {
         if (!term) {
             return;
         }
 
         if (payload instanceof Uint8Array) {
+            scanKittyProtocol(payload);
             term.write(payload);
             return;
         }
 
         if (payload instanceof ArrayBuffer) {
-            term.write(new Uint8Array(payload));
+            const data = new Uint8Array(payload);
+            scanKittyProtocol(data);
+            term.write(data);
             return;
         }
 
         if (Array.isArray(payload)) {
-            term.write(new Uint8Array(payload as number[]));
+            const data = new Uint8Array(payload as number[]);
+            scanKittyProtocol(data);
+            term.write(data);
             return;
         }
 
         if (typeof payload === 'string') {
+            scanKittyProtocol(payload);
             term.write(payload);
         }
     }
@@ -143,6 +192,9 @@
         // through — the early-return above already handles the identical-session
         // fast path, so reaching this point always means a session switch.
         const isReattachingSameSession = false;
+
+        // New session: clear any previously tracked keyboard protocol state.
+        kittyProtocolLevel = 0;
 
         if (attachedSessionId) {
             try {
@@ -205,8 +257,22 @@
             altClickMovesCursor: true
         });
 
-        // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
+        // Add custom key handler for special key combos.
         term.attachCustomKeyEventHandler((ev) => {
+            // Shift+Enter
+            // - Kitty protocol active (e.g. OpenCode): send CSI 13;2u so the app sees
+            //   "Shift+Enter" and inserts a newline without submitting.
+            // - Kitty protocol not active (regular shell): return true so xterm handles
+            //   it normally, sending \r — identical to plain Enter, which is the correct
+            //   behaviour in a standard terminal.
+            if (ev.shiftKey && ev.key === 'Enter') {
+                if (kittyProtocolLevel > 0) {
+                    invoke('write_to_pty', { data: '\x1b[13;2u', sessionId }).catch(console.error);
+                    ev.preventDefault?.();
+                    return false;
+                }
+                return true;
+            }
             // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
             if (ev.ctrlKey && ev.key === 'Backspace') {
                 invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
@@ -234,18 +300,6 @@
             }
             return true;
         });
-
-        // Handle Shift+Enter via DOM event to send newline (for OpenCode etc)
-        const terminalElement = terminalContainer;
-        if (terminalElement) {
-            terminalElement.addEventListener('keydown', function handleShiftEnter(e: KeyboardEvent) {
-                if (e.shiftKey && e.key === 'Enter') {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
-                }
-            });
-        }
 
         fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
