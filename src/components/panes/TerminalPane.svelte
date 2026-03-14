@@ -205,7 +205,7 @@
             altClickMovesCursor: true
         });
 
-        let shiftEnterBlocked = false;
+        let shiftEnterHandled = false;
         
         // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
         term.attachCustomKeyEventHandler((ev) => {
@@ -217,10 +217,11 @@
             }
             // Shift+Enter -> send newline (for OpenCode)
             if (ev.shiftKey && ev.key === 'Enter') {
-                if (!shiftEnterBlocked) {
+                if (!shiftEnterHandled) {
+                    shiftEnterHandled = true;
                     invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
-                    shiftEnterBlocked = true;
-                    setTimeout(() => { shiftEnterBlocked = false; }, 100);
+                    // Reset flag after a short delay
+                    setTimeout(() => { shiftEnterHandled = false; }, 50);
                 }
                 ev.preventDefault?.();
                 return false;
