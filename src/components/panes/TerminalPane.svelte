@@ -33,6 +33,7 @@
     let shellAppearanceUnsubscribe: (() => void) | null = null;
     let statusUnlisten: (() => void) | null = null;
     let attachedSessionId: string | null = null;
+    let blockNewlineInput: ((e: Event) => void) | null = null;
     // Tracks whether the running application has pushed the kitty keyboard protocol
     // (e.g. OpenCode/crossterm sends ESC [ > 1 u to enable enhanced key reporting).
     // When active, Shift+Enter is sent as the CSI u sequence instead of \r.
@@ -258,6 +259,13 @@
         });
 
         // Add custom key handler for special key combos.
+        //
+        // IMPORTANT: xterm.js calls customKeyEventHandler for keydown, keypress,
+        // AND keyup events.  WebKit fires keypress for Enter, so without the
+        // `ev.type !== 'keydown'` guard below, every Shift+Enter would invoke
+        // this handler twice and send two sequences to the PTY.  We guard all
+        // data-sending branches to only act on keydown; for keypress/keyup we
+        // still return false to suppress xterm's own handling of the same combo.
         term.attachCustomKeyEventHandler((ev) => {
             // Shift+Enter
             // - Kitty protocol active (e.g. OpenCode): send CSI 13;2u so the app sees
@@ -267,7 +275,9 @@
             //   behaviour in a standard terminal.
             if (ev.shiftKey && ev.key === 'Enter') {
                 if (kittyProtocolLevel > 0) {
-                    invoke('write_to_pty', { data: '\x1b[13;2u', sessionId }).catch(console.error);
+                    if (ev.type === 'keydown') {
+                        invoke('write_to_pty', { data: '\x1b[13;2u', sessionId }).catch(console.error);
+                    }
                     ev.preventDefault?.();
                     return false;
                 }
@@ -275,26 +285,32 @@
             }
             // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
             if (ev.ctrlKey && ev.key === 'Backspace') {
-                invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
+                if (ev.type === 'keydown') {
+                    invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
+                }
                 ev.preventDefault?.();
                 return false;
             }
             // Ctrl+Shift+C -> copy (when text is selected)
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
-                const selection = term?.getSelection();
-                if (selection) {
-                    navigator.clipboard.writeText(selection).catch(console.error);
+                if (ev.type === 'keydown') {
+                    const selection = term?.getSelection();
+                    if (selection) {
+                        navigator.clipboard.writeText(selection).catch(console.error);
+                    }
                 }
                 ev.preventDefault?.();
                 return false;
             }
             // Ctrl+Shift+V -> paste
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'V') {
-                navigator.clipboard.readText().then((text) => {
-                    if (text && term) {
-                        term.paste(text);
-                    }
-                }).catch(console.error);
+                if (ev.type === 'keydown') {
+                    navigator.clipboard.readText().then((text) => {
+                        if (text && term) {
+                            term.paste(text);
+                        }
+                    }).catch(console.error);
+                }
                 ev.preventDefault?.();
                 return false;
             }
@@ -311,6 +327,36 @@
         term.loadAddon(searchAddon);
         
         term.open(terminalContainer);
+
+        // WKWebView (Tauri) does not reliably suppress `input` events on the
+        // xterm helper textarea even after `preventDefault()` on `keydown`.
+        // When kitty protocol is active and we intercept Shift+Enter in
+        // `customKeyEventHandler`, the WKWebView still fires an `input` event
+        // with `inputType: "insertText"` and `data: "\n"` (or
+        // `"insertLineBreak"` with `data: null`).  xterm's `_inputEvent`
+        // handler would call `onData("\n")` for the `insertText` variant,
+        // doubling the newline we already sent as `\x1b[13;2u`.
+        //
+        // Fix: attach a capture-phase `input` listener on the container so it
+        // fires before xterm's textarea listener.  When kitty protocol is
+        // active we cancel any `input` event that would insert a newline.
+        blockNewlineInput = (e: Event) => {
+            if (kittyProtocolLevel <= 0) return;
+            const ie = e as InputEvent;
+            if (
+                ie.inputType === 'insertLineBreak' ||
+                ie.inputType === 'insertParagraph' ||
+                (ie.inputType === 'insertText' && ie.data === '\n')
+            ) {
+                // Stop the event from reaching the xterm textarea listener so
+                // xterm's _inputEvent handler never calls onData.  Use
+                // stopPropagation (not stopImmediatePropagation) because xterm's
+                // listener is on the child <textarea>, not on this container.
+                e.stopPropagation();
+                e.preventDefault();
+            }
+        };
+        terminalContainer.addEventListener('input', blockNewlineInput, true);
 
         try {
             const webglAddon = new WebglAddon();
@@ -419,6 +465,10 @@
             }
             term?.dispose();
             resizeObserver?.disconnect();
+            if (blockNewlineInput) {
+                terminalContainer.removeEventListener('input', blockNewlineInput, true);
+                blockNewlineInput = null;
+            }
         };
     });
 </script>
