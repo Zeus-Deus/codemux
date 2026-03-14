@@ -1,6 +1,6 @@
 # OpenFlow Orchestration Plan
 
-## Status: 🔄 Phase 3 Next (Phases 1–2 Complete)
+## Status: 🔄 Phase 4 Next (Phases 1–3 Complete)
 
 This document describes the implementation of **OpenFlow**, a multi-agent orchestration system where a swarm of AI coding agents collaboratively build, test, and review software based on a user prompt.
 
@@ -276,10 +276,10 @@ src-tauri/src/
 > 4. Display the *actual* applied thinking mode in the agent node (parse from CLI output or query model info)
 
 ### Phase 3: Communication Layer
-- [ ] Shared communication log file per run
-- [ ] Agent writes messages with format: `[TIMESTAMP] [ROLE] message`
-- [ ] CommunicationPanel.svelte polls/displays log
-- [ ] Inject command feature (user → orchestrator only)
+- [x] Shared communication log file per run
+- [x] Agent writes messages with format: `[TIMESTAMP] [ROLE] message`
+- [x] CommunicationPanel.svelte polls/displays log
+- [x] Inject command feature (user → orchestrator only)
 
 ### Phase 4: Visual Node Graph
 - [ ] AgentNode.svelte component (shows agent name, role, status)

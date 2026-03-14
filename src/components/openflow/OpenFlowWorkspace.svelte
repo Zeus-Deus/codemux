@@ -11,17 +11,30 @@
     let currentRunId = $state<string | null>(null);
     let spawnError = $state<string | null>(null);
 
+    // Run is determined by currentRunId directly (set when user clicks Start)
     const run = $derived(
-        $openflowRuntime?.active_runs.find(
-            r => r.status !== 'completed' && r.status !== 'failed' && r.status !== 'cancelled'
-        ) ?? null
+        currentRunId && $openflowRuntime 
+            ? $openflowRuntime.active_runs.find(r => r.run_id === currentRunId) ?? null 
+            : null
     );
 
+    // Switch to orchestration when we have a run
     $effect(() => {
         if (run) {
-            currentRunId = run.run_id;
             view = 'orchestration';
         }
+    });
+
+    // Reset when workspace changes - track previous workspace ID
+    let prevWorkspaceId: string | null = null;
+    $effect(() => {
+        const wsId = workspace.workspace_id;
+        if (prevWorkspaceId !== null && prevWorkspaceId !== wsId) {
+            view = 'config';
+            currentRunId = null;
+            spawnError = null;
+        }
+        prevWorkspaceId = wsId;
     });
 
     async function handleStartRun(
@@ -29,14 +42,19 @@
     ) {
         spawnError = null;
         try {
+            // Create the run
             const created = await createOpenFlowRun({
                 title: event.detail.title,
                 goal: event.detail.goal,
             });
+            console.log('[OpenFlow] Created NEW run with ID:', created.run_id, 'title:', created.title);
+            
+            // Switch to orchestration immediately
             currentRunId = created.run_id;
-
-            // Phase 2: spawn one terminal pane per agent config.
-            await spawnOpenflowAgents(
+            view = 'orchestration';
+            
+            // Try to spawn agents (non-blocking)
+            spawnOpenflowAgents(
                 workspace.workspace_id,
                 created.run_id,
                 event.detail.agentConfigs.map((cfg, i) => ({
@@ -47,11 +65,10 @@
                     thinking_mode: cfg.thinkingMode ?? '',
                     role: cfg.role,
                 })),
-            );
-
-            view = 'orchestration';
+            ).catch(e => console.error('[OpenFlow] Spawn error:', e));
+            
         } catch (error) {
-            console.error('Failed to start run:', error);
+            console.error('[OpenFlow] Failed to start run:', error);
             spawnError = String(error);
         }
     }

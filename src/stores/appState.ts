@@ -345,10 +345,8 @@ export async function createWorkspaceWithPreset(options: {
     const snapshot = await invoke<AppStateSnapshot>('get_app_state');
     appState.set(snapshot);
 
-    // For openflow, also create the run record
-    if (options.kind === 'openflow') {
-        return await maybeCreateOpenFlowRun(workspaceId, options);
-    }
+    // Don't create run here - user configures agents first in AgentConfigPanel
+    // Run is created when they click "Start Orchestration"
 
     return { workspaceId, runId: null };
 }
@@ -683,4 +681,18 @@ export async function spawnOpenflowAgents(
 
 export async function getAgentSessionsForRun(runId: string): Promise<AgentSessionState[]> {
     return invoke<AgentSessionState[]>('get_agent_sessions_for_run', { runId });
+}
+
+export interface CommLogEntry {
+    timestamp: string;
+    role: string;
+    message: string;
+}
+
+export async function getCommunicationLog(runId: string): Promise<CommLogEntry[]> {
+    return invoke<CommLogEntry[]>('get_communication_log', { runId });
+}
+
+export async function injectOrchestratorMessage(runId: string, message: string): Promise<void> {
+    return invoke<void>('inject_orchestrator_message', { runId, message });
 }

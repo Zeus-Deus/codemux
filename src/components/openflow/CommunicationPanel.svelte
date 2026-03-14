@@ -1,35 +1,69 @@
 <script lang="ts">
-    import { openflowRuntime } from '../../stores/appState';
+    import { onMount, onDestroy } from 'svelte';
+    import { getCommunicationLog, injectOrchestratorMessage, type CommLogEntry } from '../../stores/appState';
 
     let { runId }: { runId: string | null } = $props();
 
     let newMessage = $state('');
     let messagesContainer: HTMLDivElement;
+    let messages = $state<CommLogEntry[]>([]);
+    let pollInterval: ReturnType<typeof setInterval> | null = null;
+    let lastRunId: string | null = null;
+    let injectError = $state<string | null>(null);
 
-    const run = $derived(
-        runId ? $openflowRuntime?.active_runs.find(r => r.run_id === runId) ?? null : null
-    );
-
-    const messages = $derived(
-        run?.timeline.map(entry => ({
-            role: entry.level,
-            message: entry.message,
-            timestamp: entry.entry_id,
-            type: entry.level
-        })) ?? []
-    );
-
-    function getMessageClass(msg: { type: string }): string {
-        if (msg.type === 'warning') return 'warning';
-        if (msg.type === 'error') return 'error';
-        return '';
+    async function loadMessages() {
+        console.log('[CommPanel] loadMessages called, runId:', runId);
+        if (!runId) {
+            messages = [];
+            return;
+        }
+        injectError = null;
+        try {
+            const loaded = await getCommunicationLog(runId);
+            console.log('[CommPanel] Loaded', loaded.length, 'messages for runId:', runId);
+            messages = loaded;
+        } catch (e) {
+            console.log('[CommPanel] Error loading messages:', e);
+            messages = [];
+        }
     }
 
-    function handleSend() {
-        // TODO: Send message to orchestrator
-        // This will be implemented in Phase 3
-        console.log('User message:', newMessage);
-        newMessage = '';
+    onMount(() => {
+        pollInterval = setInterval(loadMessages, 2000);
+    });
+
+    onDestroy(() => {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+        }
+    });
+
+    $effect(() => {
+        console.log('[CommPanel] runId:', runId, 'lastRunId:', lastRunId, 'messages count before:', messages.length);
+        // Clear messages when runId changes to a different value
+        if (runId !== lastRunId) {
+            console.log('[CommPanel] Switching runs, clearing messages, loading for:', runId);
+            lastRunId = runId;
+            messages = [];
+            if (runId) {
+                loadMessages().then(() => {
+                    console.log('[CommPanel] Loaded messages count:', messages.length);
+                });
+            }
+        }
+    });
+
+    async function handleSend() {
+        if (!newMessage.trim() || !runId) return;
+        injectError = null;
+        try {
+            await injectOrchestratorMessage(runId, newMessage.trim());
+            newMessage = '';
+            await loadMessages();
+        } catch (e) {
+            console.error('Failed to inject message:', e);
+            injectError = String(e);
+        }
     }
 
     function handleKeydown(e: KeyboardEvent) {
@@ -37,6 +71,22 @@
             e.preventDefault();
             handleSend();
         }
+    }
+
+    function getRoleClass(role: string): string {
+        if (role.startsWith('user')) return 'user';
+        if (role.startsWith('orchestrator')) return 'orchestrator';
+        if (role.startsWith('builder')) return 'builder';
+        if (role.startsWith('reviewer')) return 'reviewer';
+        if (role.startsWith('tester')) return 'tester';
+        return '';
+    }
+
+    function formatRole(role: string): string {
+        // Convert "orchestrator" to "Orchestrator", "user/inject" to "User"
+        const parts = role.split('/');
+        const main = parts[0];
+        return main.charAt(0).toUpperCase() + main.slice(1);
     }
 </script>
 
@@ -49,16 +99,20 @@
     <div class="messages" bind:this={messagesContainer}>
         {#if messages.length > 0}
             {#each messages as msg}
-                <div class="message {getMessageClass(msg)}">
+                <div class="message {getRoleClass(msg.role)}">
+                    <span class="message-role">{formatRole(msg.role)}</span>
                     <span class="message-text">{msg.message}</span>
                 </div>
             {/each}
         {:else}
-            <p class="no-messages">No messages yet</p>
+            <p class="no-messages">No messages yet. Agents will communicate here.</p>
         {/if}
     </div>
 
     <div class="inject-form">
+        {#if injectError}
+            <div class="inject-error">{injectError}</div>
+        {/if}
         <input
             type="text"
             bind:value={newMessage}
@@ -122,9 +176,33 @@
         font-size: 0.85rem;
     }
 
-    .message.user {
-        background: color-mix(in srgb, var(--ui-accent) 15%, var(--ui-layer-2));
-        border-left: 3px solid var(--ui-accent);
+    .message-role {
+        display: block;
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--ui-accent);
+        margin-bottom: 4px;
+        text-transform: uppercase;
+    }
+
+    .message.user .message-role {
+        color: var(--ui-accent);
+    }
+
+    .message.orchestrator .message-role {
+        color: var(--ui-success);
+    }
+
+    .message.builder .message-role {
+        color: var(--ui-attention);
+    }
+
+    .message.reviewer .message-role {
+        color: #a78bfa;
+    }
+
+    .message.tester .message-role {
+        color: #34d399;
     }
 
     .message.warning {
@@ -149,9 +227,19 @@
 
     .inject-form {
         display: flex;
+        flex-direction: column;
         gap: 8px;
         padding: 12px;
         border-top: 1px solid var(--ui-border-soft);
+    }
+
+    .inject-error {
+        padding: 8px;
+        background: color-mix(in srgb, var(--ui-danger) 15%, transparent);
+        border: 1px solid var(--ui-danger);
+        border-radius: 6px;
+        color: var(--ui-danger);
+        font-size: 0.8rem;
     }
 
     .inject-form input {

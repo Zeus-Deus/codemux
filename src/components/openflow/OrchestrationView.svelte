@@ -6,17 +6,23 @@
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
 
+    // Find run by runId directly - this is more reliable than deriving from runtime
     const run = $derived(
-        runId ? $openflowRuntime?.active_runs.find(r => r.run_id === runId) ?? null : null
+        runId && $openflowRuntime 
+            ? $openflowRuntime.active_runs.find(r => r.run_id === runId) ?? null 
+            : null
     );
 
     let agentSessions = $state<AgentSessionState[]>([]);
 
     $effect(() => {
         if (runId) {
+            agentSessions = []; // Clear when switching runs
             getAgentSessionsForRun(runId).then(sessions => {
                 agentSessions = sessions;
             }).catch(console.error);
+        } else {
+            agentSessions = [];
         }
     });
 
@@ -109,8 +115,33 @@
         return icons[role] || '🤖';
     }
 
+    let commPanelWidth = $state(320);
+    let isDragging = $state(false);
+    let startX = $state(0);
+    let startWidth = $state(0);
+
+    function startResize(e: MouseEvent) {
+        isDragging = true;
+        startX = e.clientX;
+        startWidth = commPanelWidth;
+        window.addEventListener('mousemove', onResize);
+        window.addEventListener('mouseup', stopResize);
+    }
+
+    function onResize(e: MouseEvent) {
+        if (!isDragging) return;
+        const delta = startX - e.clientX;
+        const newWidth = Math.max(200, Math.min(600, startWidth + delta));
+        commPanelWidth = newWidth;
+    }
+
+    function stopResize() {
+        isDragging = false;
+        window.removeEventListener('mousemove', onResize);
+        window.removeEventListener('mouseup', stopResize);
+    }
+
     function shortenModel(modelId: string): string {
-        // Remove provider prefix (e.g., "minimax-coding-plan/MiniMax-M2" -> "MiniMax-M2")
         const parts = modelId.split('/');
         return parts.length > 1 ? parts[parts.length - 1] : modelId;
     }
@@ -176,24 +207,53 @@
         {/if}
     </div>
 
-    <CommunicationPanel {runId} />
+    <!-- Resizable divider -->
+    <div 
+        class="panel-resizer" 
+        class:active={isDragging}
+        onmousedown={startResize}
+        role="separator"
+        aria-orientation="vertical"
+    ></div>
+
+    <div class="comm-panel-wrapper" style="width: {commPanelWidth}px">
+        <CommunicationPanel {runId} />
+    </div>
 </div>
 
 <style>
     .orchestration-view {
-        display: grid;
-        grid-template-columns: 1fr 320px;
-        gap: 0;
+        display: flex;
         width: 100%;
         height: 100%;
         overflow: hidden;
     }
 
     .orchestration-main {
+        flex: 1;
         display: flex;
         flex-direction: column;
         padding: 24px;
         overflow-y: auto;
+        min-width: 0;
+    }
+
+    .panel-resizer {
+        width: 6px;
+        background: var(--ui-border-soft);
+        cursor: col-resize;
+        transition: background 0.15s;
+        flex-shrink: 0;
+    }
+
+    .panel-resizer:hover,
+    .panel-resizer.active {
+        background: var(--ui-accent);
+    }
+
+    .comm-panel-wrapper {
+        flex-shrink: 0;
+        overflow: hidden;
     }
 
     .orch-header {

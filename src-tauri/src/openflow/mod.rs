@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent::{AgentSessionState, AgentSessionStatus};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -235,8 +236,12 @@ impl OpenFlowRuntimeStore {
 
     pub fn create_run(&self, request: OpenFlowCreateRunRequest) -> OpenFlowRunRecord {
         let mut snapshot = self.inner.lock().unwrap();
+        let run_id = format!(
+            "openflow-run-{}",
+            uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
+        );
         let run = OpenFlowRunRecord {
-            run_id: format!("openflow-run-{}", snapshot.active_runs.len() + 1),
+            run_id,
             title: request.title,
             goal: request.goal,
             status: OpenFlowRunStatus::Planning,

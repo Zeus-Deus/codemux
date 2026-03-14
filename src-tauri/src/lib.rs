@@ -116,6 +116,8 @@ pub fn run() {
             commands::list_thinking_modes_for_tool,
             commands::spawn_openflow_agents,
             commands::get_agent_sessions_for_run,
+            commands::get_communication_log,
+            commands::inject_orchestrator_message,
             terminal::create_terminal_session,
             terminal::activate_terminal_session,
             terminal::close_terminal_session,

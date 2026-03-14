@@ -356,6 +356,77 @@ pub fn get_agent_sessions_for_run(
     Ok(agent_store.for_run(&run_id))
 }
 
+/// Read communication log entries for a given OpenFlow run.
+#[tauri::command]
+pub fn get_communication_log(run_id: String) -> Result<Vec<CommLogEntry>, String> {
+    let path = comm_log_path(&run_id);
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return "No communication log yet".to_string();
+        }
+        format!("Failed to read comm log: {e}")
+    })?;
+
+    let entries: Vec<CommLogEntry> = content
+        .lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| parse_comm_log_line(line))
+        .collect();
+
+    Ok(entries)
+}
+
+/// Inject a user message into the communication log (goes to orchestrator).
+#[tauri::command]
+pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<(), String> {
+    let path = comm_log_path(&run_id);
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let entry = format!("[{}] [user/inject] {}\n", timestamp, message);
+    
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))
+        .map_err(|e| format!("Failed to write to comm log: {e}"))?;
+
+    Ok(())
+}
+
+/// Parse a single line from the communication log.
+fn parse_comm_log_line(line: &str) -> Option<CommLogEntry> {
+    // Format: [TIMESTAMP] [ROLE] message
+    let line = line.trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+
+    let timestamp_end = line.find("] ")? + 2;
+    let timestamp = &line[1..timestamp_end - 2];
+
+    let remaining = &line[timestamp_end..];
+    if !remaining.starts_with('[') {
+        return None;
+    }
+
+    let role_end = remaining.find("] ")? + 2;
+    let role = &remaining[1..role_end - 2];
+    let message = &remaining[role_end..];
+
+    Some(CommLogEntry {
+        timestamp: timestamp.to_string(),
+        role: role.to_string(),
+        message: message.to_string(),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct CommLogEntry {
+    pub timestamp: String,
+    pub role: String,
+    pub message: String,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
