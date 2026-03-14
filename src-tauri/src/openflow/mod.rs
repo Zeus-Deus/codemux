@@ -19,6 +19,21 @@ pub enum OpenFlowRole {
     Researcher,
 }
 
+impl OpenFlowRole {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "orchestrator" => Some(Self::Orchestrator),
+            "planner" => Some(Self::Planner),
+            "builder" => Some(Self::Builder),
+            "reviewer" => Some(Self::Reviewer),
+            "tester" => Some(Self::Tester),
+            "debugger" => Some(Self::Debugger),
+            "researcher" => Some(Self::Researcher),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenFlowRunStatus {
@@ -212,6 +227,7 @@ pub struct OpenFlowRuntimeSnapshot {
 pub struct OpenFlowCreateRunRequest {
     pub title: String,
     pub goal: String,
+    pub agent_roles: Vec<String>,
 }
 
 pub struct OpenFlowRuntimeStore {
@@ -239,6 +255,44 @@ impl OpenFlowRuntimeStore {
             "openflow-run-{}",
             uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
         );
+        let assigned_roles: Vec<OpenFlowRole> = request
+            .agent_roles
+            .iter()
+            .filter_map(|r| OpenFlowRole::from_str(r))
+            .collect();
+
+        let workers = assigned_roles
+            .iter()
+            .map(|role| {
+                let status = match role {
+                    OpenFlowRole::Orchestrator => "active",
+                    OpenFlowRole::Planner => "ready",
+                    _ => "pending",
+                };
+                let last_output = match role {
+                    OpenFlowRole::Orchestrator => {
+                        Some("Run created and waiting on planner".to_string())
+                    }
+                    _ => None,
+                };
+                let task_id = match role {
+                    OpenFlowRole::Planner => vec!["task-plan".to_string()],
+                    OpenFlowRole::Builder => vec!["task-build".to_string()],
+                    OpenFlowRole::Reviewer => vec!["task-review".to_string()],
+                    _ => vec![],
+                };
+
+                OpenFlowWorkerState {
+                    role: role.clone(),
+                    assigned_task_ids: task_id,
+                    status: status.to_string(),
+                    last_output,
+                    model: None,
+                    thinking_mode: None,
+                }
+            })
+            .collect();
+
         let run = OpenFlowRunRecord {
             run_id,
             title: request.title,
@@ -246,13 +300,7 @@ impl OpenFlowRuntimeStore {
             status: OpenFlowRunStatus::Planning,
             current_phase: "plan".into(),
             replan_count: 0,
-            assigned_roles: vec![
-                OpenFlowRole::Orchestrator,
-                OpenFlowRole::Planner,
-                OpenFlowRole::Builder,
-                OpenFlowRole::Reviewer,
-                OpenFlowRole::Tester,
-            ],
+            assigned_roles,
             task_graph: vec![
                 OpenFlowTaskNode {
                     task_id: "task-plan".into(),
@@ -314,40 +362,7 @@ impl OpenFlowRuntimeStore {
                     message: "Entered planning phase".into(),
                 },
             ],
-            workers: vec![
-                OpenFlowWorkerState {
-                    role: OpenFlowRole::Orchestrator,
-                    assigned_task_ids: vec![],
-                    status: "active".into(),
-                    last_output: Some("Run created and waiting on planner".into()),
-                    model: None,
-                    thinking_mode: None,
-                },
-                OpenFlowWorkerState {
-                    role: OpenFlowRole::Planner,
-                    assigned_task_ids: vec!["task-plan".into()],
-                    status: "ready".into(),
-                    last_output: None,
-                    model: None,
-                    thinking_mode: None,
-                },
-                OpenFlowWorkerState {
-                    role: OpenFlowRole::Builder,
-                    assigned_task_ids: vec!["task-build".into()],
-                    status: "pending".into(),
-                    last_output: None,
-                    model: None,
-                    thinking_mode: None,
-                },
-                OpenFlowWorkerState {
-                    role: OpenFlowRole::Reviewer,
-                    assigned_task_ids: vec!["task-review".into()],
-                    status: "pending".into(),
-                    last_output: None,
-                    model: None,
-                    thinking_mode: None,
-                },
-            ],
+            workers,
             retry_policy: OpenFlowRetryPolicy {
                 max_attempts: 3,
                 current_attempt: 1,

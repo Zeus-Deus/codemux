@@ -39,7 +39,11 @@
     async function handleStart() {
         if (!titleDraft.trim() || !goalDraft.trim()) return;
         try {
-            await createOpenFlowRun({ title: titleDraft.trim(), goal: goalDraft.trim() });
+            await createOpenFlowRun({ 
+                title: titleDraft.trim(), 
+                goal: goalDraft.trim(),
+                agent_roles: ['orchestrator', 'builder'] // basic default
+            });
             titleDraft = '';
             goalDraft = '';
             composing = false;

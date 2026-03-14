@@ -181,6 +181,7 @@ export interface OpenFlowRuntimeSnapshot {
 export interface OpenFlowCreateRunRequest {
     title: string;
     goal: string;
+    agent_roles: string[];
 }
 
 export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
@@ -360,7 +361,8 @@ async function maybeCreateOpenFlowRun(
     if (options.kind === 'openflow' && options.openflowTitle?.trim() && options.openflowGoal?.trim()) {
         const run = await createOpenFlowRun({
             title: options.openflowTitle.trim(),
-            goal: options.openflowGoal.trim()
+            goal: options.openflowGoal.trim(),
+            agent_roles: ['orchestrator', 'builder'] // fallback defaults
         });
         runId = run.run_id;
     }

@@ -46,6 +46,7 @@
             const created = await createOpenFlowRun({
                 title: event.detail.title,
                 goal: event.detail.goal,
+                agent_roles: event.detail.agentConfigs.map(c => c.role)
             });
             console.log('[OpenFlow] Created NEW run with ID:', created.run_id, 'title:', created.title);
             

@@ -2,6 +2,7 @@
     import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, type AgentSessionState } from '../../stores/appState';
     import type { OpenFlowRunRecord } from '../../stores/appState';
     import CommunicationPanel from './CommunicationPanel.svelte';
+    import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
     import { onMount } from 'svelte';
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
@@ -33,12 +34,35 @@
                 id: w.role,
                 role: w.role,
                 status: w.status,
-                lastOutput: w.last_output,
                 model: session?.config.model ?? null,
                 thinkingMode: session?.config.thinking_mode ?? null
             };
         }) ?? []
     );
+
+    const activeConnections = $derived.by(() => {
+        if (!run) return [];
+        const phase = run.current_phase;
+        const conns: Connection[] = [];
+        
+        if (phase === 'plan' || phase === 'execute') {
+            conns.push({ from: 'orchestrator', to: 'builder', label: 'assigning tasks' });
+            conns.push({ from: 'orchestrator', to: 'planner', label: 'planning' });
+        }
+        if (phase === 'execute') {
+            conns.push({ from: 'builder', to: 'tester', label: 'building' });
+        }
+        if (phase === 'verify') {
+            conns.push({ from: 'builder', to: 'tester', label: 'testing' });
+            conns.push({ from: 'tester', to: 'reviewer', label: 'results' });
+        }
+        if (phase === 'review') {
+            conns.push({ from: 'builder', to: 'reviewer', label: 'review' });
+            conns.push({ from: 'reviewer', to: 'orchestrator', label: 'feedback' });
+        }
+        
+        return conns;
+    });
 
     async function handleLoop() {
         if (!runId) return;
@@ -174,19 +198,11 @@
         </header>
 
         <div class="node-graph">
-            {#if run}
-                {#each agentNodes as node}
-                    <div class="agent-node" style="--status-color: {getStatusColor(node.status)}">
-                        <div class="node-icon">{getRoleIcon(node.role)}</div>
-                        <div class="node-info">
-                            <span class="node-role">{node.role}</span>
-                            <span class="node-status">{node.status}</span>
-                            {#if node.model}
-                                <span class="node-model">{shortenModel(node.model)}{node.thinkingMode && node.thinkingMode !== 'auto' ? ` (${node.thinkingMode})` : ''}</span>
-                            {/if}
-                        </div>
-                    </div>
-                {/each}
+            {#if run && agentNodes.length > 0}
+                <NodeGraph 
+                    nodes={agentNodes} 
+                    activeConnections={activeConnections}
+                />
             {:else}
                 <p class="no-run">No active run</p>
             {/if}
@@ -332,54 +348,9 @@
     }
 
     .node-graph {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 16px;
-        padding: 24px;
-        background: var(--ui-layer-2);
-        border-radius: 12px;
-        border: 1px solid var(--ui-border-soft);
+        width: 100%;
+        min-height: 300px;
         margin-bottom: 24px;
-    }
-
-    .agent-node {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 16px 20px;
-        background: var(--ui-layer-1);
-        border: 2px solid var(--status-color, var(--ui-border-soft));
-        border-radius: 10px;
-        min-width: 140px;
-    }
-
-    .node-icon {
-        font-size: 1.5rem;
-    }
-
-    .node-info {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
-    }
-
-    .node-role {
-        font-weight: 600;
-        font-size: 0.9rem;
-        color: var(--ui-text-primary);
-        text-transform: capitalize;
-    }
-
-    .node-status {
-        font-size: 0.75rem;
-        color: var(--ui-text-muted);
-        text-transform: capitalize;
-    }
-
-    .node-model {
-        font-size: 0.7rem;
-        color: var(--ui-accent);
-        font-weight: 500;
     }
 
     .no-run {
