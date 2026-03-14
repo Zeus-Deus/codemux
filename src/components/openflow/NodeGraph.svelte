@@ -107,22 +107,39 @@
         // Sort nodes by Y position (higher Y = lower in hierarchy)
         const sortedByLevel = [...positionedNodes].sort((a, b) => a.y - b.y);
         
-        // For each node, connect it to all nodes that are below it (higher Y)
-        for (let i = 0; i < sortedByLevel.length; i++) {
-            const currentNode = sortedByLevel[i];
-            for (let j = i + 1; j < sortedByLevel.length; j++) {
-                const targetNode = sortedByLevel[j];
-                conns.push({ from: currentNode.id, to: targetNode.id });
+        // Group nodes by their Y level (same Y = same level)
+        const levelGroups: PositionedNode[][] = [];
+        sortedByLevel.forEach(node => {
+            const lastLevel = levelGroups[levelGroups.length - 1];
+            if (!lastLevel || lastLevel[0].y !== node.y) {
+                levelGroups.push([node]);
+            } else {
+                lastLevel.push(node);
             }
+        });
+        
+        // Connect each level to the next level down (forward flow)
+        for (let i = 0; i < levelGroups.length - 1; i++) {
+            const currentLevel = levelGroups[i];
+            const nextLevel = levelGroups[i + 1];
+            
+            currentLevel.forEach(fromNode => {
+                nextLevel.forEach(toNode => {
+                    conns.push({ from: fromNode.id, to: toNode.id });
+                });
+            });
         }
         
-        // Also add reverse connections to show the feedback loop
-        for (let i = sortedByLevel.length - 1; i >= 0; i--) {
-            const currentNode = sortedByLevel[i];
-            for (let j = i - 1; j >= 0; j--) {
-                const targetNode = sortedByLevel[j];
-                conns.push({ from: currentNode.id, to: targetNode.id });
-            }
+        // Connect the last level back to Orchestrator (feedback loop)
+        const lastLevel = levelGroups[levelGroups.length - 1];
+        const orchestratorLevel = levelGroups[0];
+        
+        if (levelGroups.length > 1) {
+            lastLevel.forEach(lastNode => {
+                orchestratorLevel.forEach(orchNode => {
+                    conns.push({ from: lastNode.id, to: orchNode.id });
+                });
+            });
         }
 
         return conns;
