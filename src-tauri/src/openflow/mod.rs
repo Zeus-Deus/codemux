@@ -6,7 +6,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent::{AgentSessionState, AgentSessionStatus};
-use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
