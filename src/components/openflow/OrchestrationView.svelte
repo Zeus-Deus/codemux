@@ -277,60 +277,68 @@
         justify-content: space-between;
         align-items: center;
         margin-bottom: 24px;
-        padding-bottom: 16px;
+        padding-bottom: 20px;
         border-bottom: 1px solid var(--ui-border-soft);
     }
 
     .orch-info {
         display: flex;
         align-items: center;
-        gap: 12px;
+        gap: 16px;
     }
 
     .orch-info h2 {
         margin: 0;
-        font-size: 1.25rem;
-        font-weight: 600;
+        font-size: 1.5rem;
+        font-weight: 700;
         color: var(--ui-text-primary);
+        letter-spacing: -0.02em;
     }
 
     .phase-badge {
-        padding: 4px 10px;
+        padding: 6px 12px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 12px;
+        border-radius: 20px;
         font-size: 0.75rem;
-        font-weight: 600;
+        font-weight: 700;
         color: var(--ui-text-muted);
         text-transform: uppercase;
+        letter-spacing: 0.05em;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        transition: all 0.3s ease;
     }
 
     .phase-badge.busy {
         color: var(--ui-accent);
-        border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
-        background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+        border-color: color-mix(in srgb, var(--ui-accent) 40%, transparent);
+        background: color-mix(in srgb, var(--ui-accent) 15%, transparent);
+        box-shadow: 0 0 12px color-mix(in srgb, var(--ui-accent) 30%, transparent);
     }
 
     .orch-controls {
         display: flex;
-        gap: 8px;
+        gap: 12px;
     }
 
     .control-btn {
-        padding: 8px 16px;
+        padding: 10px 20px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
-        color: var(--ui-text-secondary);
+        border-radius: 8px;
+        color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.85rem;
+        font-size: 0.9rem;
+        font-weight: 500;
         cursor: pointer;
         transition: all var(--ui-motion-fast);
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
     }
 
     .control-btn:hover {
         background: var(--ui-layer-3);
-        color: var(--ui-text-primary);
+        transform: translateY(-1px);
+        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
 
     .control-btn.danger:hover {

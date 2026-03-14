@@ -194,63 +194,65 @@
             </label>
         </div>
 
-        <div class="agents-list">
-            <div class="agents-list-header">
-                <span class="col-num">#</span>
-                <span class="col-tool">CLI Tool</span>
-                <span class="col-model">Model</span>
-                <span class="col-role">Role</span>
-                <span class="col-thinking">Thinking</span>
-            </div>
+        <div class="agents-table-container">
+            <div class="agents-list">
+                <div class="agents-list-header">
+                    <span class="col-num">#</span>
+                    <span class="col-tool">CLI Tool</span>
+                    <span class="col-model">Model</span>
+                    <span class="col-role">Role</span>
+                    <span class="col-thinking">Thinking</span>
+                </div>
 
-            {#each agents as agent, i (i)}
-                <div class="agent-row">
-                    <span class="agent-number">#{i + 1}</span>
+                {#each agents as agent, i (i)}
+                    <div class="agent-row">
+                        <span class="agent-number">#{i + 1}</span>
 
-                    <!-- CLI Tool -->
-                    <select
-                        value={agent.cliTool}
-                        onchange={(e) => onToolChange(i, (e.target as HTMLSelectElement).value)}
-                    >
-                        {#each availableTools as tool}
-                            <option value={tool.id} disabled={!tool.available}>
-                                {tool.name}{tool.available ? '' : ' (not installed)'}
-                            </option>
-                        {/each}
-                        {#if availableTools.length === 0}
-                            <option value="opencode">OpenCode</option>
-                        {/if}
-                    </select>
+                        <!-- CLI Tool -->
+                        <select
+                            value={agent.cliTool}
+                            onchange={(e) => onToolChange(i, (e.target as HTMLSelectElement).value)}
+                        >
+                            {#each availableTools as tool}
+                                <option value={tool.id} disabled={!tool.available}>
+                                    {tool.name}{tool.available ? '' : ' (not installed)'}
+                                </option>
+                            {/each}
+                            {#if availableTools.length === 0}
+                                <option value="opencode">OpenCode</option>
+                            {/if}
+                        </select>
 
-                    <!-- Model -->
-                    <select bind:value={agent.model}>
-                        {#each modelsByTool[agent.cliTool] ?? [] as model}
-                            <option value={model.id}>{model.name}{model.provider ? ` (${model.provider})` : ''}</option>
-                        {/each}
-                        {#if (modelsByTool[agent.cliTool]?.length ?? 0) === 0}
-                            <option value="">Loading…</option>
-                        {/if}
-                    </select>
+                        <!-- Model -->
+                        <select bind:value={agent.model}>
+                            {#each modelsByTool[agent.cliTool] ?? [] as model}
+                                <option value={model.id}>{model.name}{model.provider ? ` (${model.provider})` : ''}</option>
+                            {/each}
+                            {#if (modelsByTool[agent.cliTool]?.length ?? 0) === 0}
+                                <option value="">Loading…</option>
+                            {/if}
+                        </select>
 
-                    <!-- Role -->
-                    <select bind:value={agent.role}>
-                        {#each availableRoles as role}
-                            <option value={role.id}>{role.name}</option>
-                        {/each}
-                    </select>
-
-                    <!-- Thinking mode (only for tools that support it) -->
-                    {#if hasThinkingModes(agent.cliTool)}
-                        <select bind:value={agent.thinkingMode}>
-                            {#each thinkingModesByTool[agent.cliTool] as mode}
-                                <option value={mode.id} title={mode.description}>{mode.name}</option>
+                        <!-- Role -->
+                        <select bind:value={agent.role}>
+                            {#each availableRoles as role}
+                                <option value={role.id}>{role.name}</option>
                             {/each}
                         </select>
-                    {:else}
-                        <span class="no-thinking">—</span>
-                    {/if}
-                </div>
-            {/each}
+
+                        <!-- Thinking mode (only for tools that support it) -->
+                        {#if hasThinkingModes(agent.cliTool)}
+                            <select bind:value={agent.thinkingMode}>
+                                {#each thinkingModesByTool[agent.cliTool] as mode}
+                                    <option value={mode.id} title={mode.description}>{mode.name}</option>
+                                {/each}
+                            </select>
+                        {:else}
+                            <span class="no-thinking">—</span>
+                        {/if}
+                    </div>
+                {/each}
+            </div>
         </div>
 
         <div class="config-section goal-section">
@@ -285,29 +287,35 @@
     .agent-config-panel {
         display: flex;
         flex-direction: column;
-        gap: 24px;
-        padding: 32px;
-        max-width: 900px;
+        gap: 32px;
+        padding: clamp(16px, 4vw, 48px);
+        max-width: 1000px;
         margin: 0 auto;
         width: 100%;
         overflow-y: auto;
+        box-sizing: border-box;
     }
 
     .config-header {
         text-align: center;
+        margin-bottom: 16px;
     }
 
     .config-header h2 {
-        margin: 0 0 8px;
-        font-size: 1.5rem;
-        font-weight: 600;
+        margin: 0 0 12px;
+        font-size: 2rem;
+        font-weight: 700;
         color: var(--ui-text-primary);
+        letter-spacing: -0.02em;
     }
 
     .config-header p {
         margin: 0;
         color: var(--ui-text-muted);
-        font-size: 0.9rem;
+        font-size: 1rem;
+        max-width: 600px;
+        margin: 0 auto;
+        line-height: 1.5;
     }
 
     .loading-state {
@@ -346,55 +354,75 @@
     .config-section {
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 16px;
+        background: var(--ui-layer-2);
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid var(--ui-border-soft);
     }
 
     .section-label {
         display: flex;
         align-items: center;
-        gap: 12px;
-        font-size: 0.9rem;
-        color: var(--ui-text-secondary);
+        gap: 16px;
+        font-size: 1rem;
+        font-weight: 500;
+        color: var(--ui-text-primary);
     }
 
     .section-label input[type="range"] {
         flex: 1;
-        max-width: 200px;
+        max-width: 300px;
+        accent-color: var(--ui-accent);
     }
 
     .range-value {
-        font-weight: 600;
+        font-weight: 700;
         color: var(--ui-accent);
         min-width: 24px;
+        font-size: 1.1rem;
+    }
+
+    .agents-table-container {
+        width: 100%;
+        overflow-x: auto;
+        padding-bottom: 8px; /* space for scrollbar */
     }
 
     .agents-list {
         display: flex;
         flex-direction: column;
-        gap: 4px;
+        gap: 8px;
+        min-width: 600px;
     }
 
     .agents-list-header {
         display: grid;
-        grid-template-columns: 40px 1fr 2fr 1fr 1fr;
-        gap: 8px;
-        padding: 0 12px 4px;
+        grid-template-columns: 40px 1fr 2fr 1.5fr 1fr;
+        gap: 12px;
+        padding: 0 16px 8px;
         font-size: 0.75rem;
-        font-weight: 600;
-        color: var(--ui-text-muted);
+        font-weight: 700;
+        color: var(--ui-text-secondary);
         text-transform: uppercase;
         letter-spacing: 0.05em;
     }
 
     .agent-row {
         display: grid;
-        grid-template-columns: 40px 1fr 2fr 1fr 1fr;
-        gap: 8px;
+        grid-template-columns: 40px 1fr 2fr 1.5fr 1fr;
+        gap: 12px;
         align-items: center;
-        padding: 10px 12px;
-        background: var(--ui-layer-2);
+        padding: 12px 16px;
+        background: var(--ui-layer-1);
         border-radius: 8px;
         border: 1px solid var(--ui-border-soft);
+        transition: border-color 0.2s ease, background 0.2s ease;
+    }
+
+    .agent-row:hover {
+        border-color: color-mix(in srgb, var(--ui-accent) 40%, transparent);
+        background: var(--ui-layer-2);
     }
 
     .agent-number {
@@ -404,17 +432,19 @@
     }
 
     .agent-row select {
-        padding: 6px 10px;
-        background: var(--ui-layer-1);
+        padding: 8px 12px;
+        background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
         border-radius: 6px;
         color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.82rem;
+        font-size: 0.95rem;
+        font-weight: 500;
         cursor: pointer;
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
+        transition: border-color 0.2s ease;
     }
 
     .agent-row select:focus {
@@ -429,8 +459,8 @@
     }
 
     .goal-section h3 {
-        margin: 0 0 12px;
-        font-size: 1rem;
+        margin: 0 0 16px;
+        font-size: 1.1rem;
         font-weight: 600;
         color: var(--ui-text-primary);
     }
@@ -438,52 +468,63 @@
     .goal-input,
     .goal-textarea {
         width: 100%;
-        padding: 12px;
-        background: var(--ui-layer-1);
+        padding: 16px;
+        background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
         border-radius: 8px;
         color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.9rem;
+        font-size: 1rem;
         outline: none;
         box-sizing: border-box;
+        transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
 
     .goal-input:focus,
     .goal-textarea:focus {
         border-color: var(--ui-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--ui-accent) 20%, transparent);
     }
 
     .goal-textarea {
         resize: vertical;
-        min-height: 100px;
+        min-height: 140px;
+        line-height: 1.5;
     }
 
     .config-actions {
         display: flex;
-        justify-content: center;
-        padding-top: 12px;
+        justify-content: flex-end;
+        padding-top: 16px;
     }
 
     .start-btn {
-        padding: 14px 32px;
+        padding: 16px 40px;
         background: var(--ui-accent);
         border: none;
         border-radius: 8px;
         color: #fff;
         font: inherit;
-        font-size: 1rem;
+        font-size: 1.1rem;
         font-weight: 600;
         cursor: pointer;
-        transition: opacity var(--ui-motion-fast);
+        transition: transform 0.2s ease, box-shadow 0.2s ease, opacity 0.2s;
+        box-shadow: 0 4px 12px color-mix(in srgb, var(--ui-accent) 30%, transparent);
     }
 
     .start-btn:hover:not(:disabled) {
-        opacity: 0.9;
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px color-mix(in srgb, var(--ui-accent) 40%, transparent);
+    }
+
+    .start-btn:active:not(:disabled) {
+        transform: translateY(0);
     }
 
     .start-btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+        box-shadow: none;
+        transform: none;
     }
 </style>

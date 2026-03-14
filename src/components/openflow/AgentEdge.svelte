@@ -68,8 +68,9 @@
     
     <path
         class="edge-path-bg"
+        class:dashed={!isActive}
         d={path}
-        marker-end="url(#arrow-{sourceX}-{sourceY}-{targetX}-{targetY})"
+        marker-end={isActive ? "" : "url(#arrow-{sourceX}-{sourceY}-{targetX}-{targetY})"}
     />
     
     {#if isActive}
@@ -100,6 +101,12 @@
         fill: none;
         stroke: var(--ui-border-soft, #3a3a3a);
         stroke-width: 2;
+        transition: stroke 0.3s ease, opacity 0.3s ease;
+    }
+
+    .edge-path-bg.dashed {
+        stroke-dasharray: 4 6;
+        opacity: 0.4;
     }
 
     .edge-path-active {
@@ -108,6 +115,7 @@
         stroke-width: 3;
         stroke-dasharray: 8 4;
         animation: flow 0.8s linear infinite;
+        opacity: 0.9;
     }
 
     @keyframes flow {

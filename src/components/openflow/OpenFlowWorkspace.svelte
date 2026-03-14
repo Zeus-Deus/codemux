@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { fade } from 'svelte/transition';
     import type { WorkspaceSnapshot } from '../../stores/appState';
     import { openflowRuntime, createOpenFlowRun, spawnOpenflowAgents } from '../../stores/appState';
     import AgentConfigPanel from './AgentConfigPanel.svelte';
@@ -77,25 +78,41 @@
 
 <div class="openflow-workspace">
     {#if view === 'config'}
-        {#if spawnError}
-            <div class="spawn-error">Failed to start agents: {spawnError}</div>
-        {/if}
-        <AgentConfigPanel on:start={handleStartRun} />
+        <div class="view-wrapper" in:fade={{duration: 200, delay: 200}} out:fade={{duration: 200}}>
+            {#if spawnError}
+                <div class="spawn-error">Failed to start agents: {spawnError}</div>
+            {/if}
+            <AgentConfigPanel on:start={handleStartRun} />
+        </div>
     {:else if view === 'orchestration'}
-        <OrchestrationView
-            workspaceTitle={workspace.title}
-            runId={currentRunId}
-        />
+        <div class="view-wrapper" in:fade={{duration: 300, delay: 200}} out:fade={{duration: 200}}>
+            <OrchestrationView
+                workspaceTitle={workspace.title}
+                runId={currentRunId}
+            />
+        </div>
     {/if}
 </div>
 
 <style>
     .openflow-workspace {
+        position: relative;
         display: flex;
         flex-direction: column;
         width: 100%;
         height: 100%;
         background: var(--ui-layer-0);
+        overflow: hidden;
+    }
+
+    .view-wrapper {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        display: flex;
+        flex-direction: column;
     }
 
     .spawn-error {
