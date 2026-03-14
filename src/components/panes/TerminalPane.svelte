@@ -213,10 +213,11 @@
                 ev.preventDefault?.();
                 return false;
             }
-            // Shift+Enter -> send newline (for OpenCode and other tools)
+            // Shift+Enter -> send newline (for OpenCode multi-line input)
             if (ev.shiftKey && ev.key === 'Enter') {
-                invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
+                term?.paste('\n');
                 ev.preventDefault?.();
+                ev.stopPropagation?.();
                 return false;
             }
             // Ctrl+Shift+C -> copy (when text is selected)
