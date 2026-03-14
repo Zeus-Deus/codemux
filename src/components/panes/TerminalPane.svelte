@@ -207,10 +207,6 @@
 
         // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
         term.attachCustomKeyEventHandler((ev) => {
-            // Debug: log Shift+Enter to see what's happening
-            if (ev.shiftKey && ev.key === 'Enter') {
-                console.log('Shift+Enter detected, default prevented:', ev.defaultPrevented);
-            }
             // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
             if (ev.ctrlKey && ev.key === 'Backspace') {
                 invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
