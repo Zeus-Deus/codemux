@@ -100,41 +100,29 @@
     });
 
     const structuralConnections = $derived.by(() => {
-        const conns: Connection[] = [];
-        const levelsMap = new Map<number, PositionedNode[]>();
+        if (positionedNodes.length < 2) return [];
         
-        // Group nodes by their level index
-        positionedNodes.forEach(node => {
-            if (!levelsMap.has(node.levelIndex)) {
-                levelsMap.set(node.levelIndex, []);
+        const conns: Connection[] = [];
+        
+        // Sort nodes by Y position (higher Y = lower in hierarchy)
+        const sortedByLevel = [...positionedNodes].sort((a, b) => a.y - b.y);
+        
+        // For each node, connect it to all nodes that are below it (higher Y)
+        for (let i = 0; i < sortedByLevel.length; i++) {
+            const currentNode = sortedByLevel[i];
+            for (let j = i + 1; j < sortedByLevel.length; j++) {
+                const targetNode = sortedByLevel[j];
+                conns.push({ from: currentNode.id, to: targetNode.id });
             }
-            levelsMap.get(node.levelIndex)!.push(node);
-        });
-
-        const maxLevel = Math.max(...Array.from(levelsMap.keys()), -1);
-
-        // Connect each node to all nodes in the next level
-        for (let i = 0; i < maxLevel; i++) {
-            const currentLevelNodes = levelsMap.get(i) || [];
-            const nextLevelNodes = levelsMap.get(i + 1) || [];
-
-            currentLevelNodes.forEach(fromNode => {
-                nextLevelNodes.forEach(toNode => {
-                    conns.push({ from: fromNode.id, to: toNode.id });
-                });
-            });
         }
         
-        // Connect the last level back to orchestrator to show the loop
-        const lastLevelNodes = levelsMap.get(maxLevel) || [];
-        const orchestrators = levelsMap.get(0) || [];
-        if (maxLevel > 0) {
-            lastLevelNodes.forEach(lastNode => {
-                orchestrators.forEach(orch => {
-                    // Only add if not already an active connection taking precedence
-                    conns.push({ from: lastNode.id, to: orch.id });
-                });
-            });
+        // Also add reverse connections to show the feedback loop
+        for (let i = sortedByLevel.length - 1; i >= 0; i--) {
+            const currentNode = sortedByLevel[i];
+            for (let j = i - 1; j >= 0; j--) {
+                const targetNode = sortedByLevel[j];
+                conns.push({ from: currentNode.id, to: targetNode.id });
+            }
         }
 
         return conns;
