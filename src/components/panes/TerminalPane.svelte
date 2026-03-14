@@ -207,17 +207,14 @@
 
         // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
         term.attachCustomKeyEventHandler((ev) => {
+            // Debug: log Shift+Enter to see what's happening
+            if (ev.shiftKey && ev.key === 'Enter') {
+                console.log('Shift+Enter detected, default prevented:', ev.defaultPrevented);
+            }
             // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
             if (ev.ctrlKey && ev.key === 'Backspace') {
                 invoke('write_to_pty', { data: '\x17', sessionId }).catch(console.error);
                 ev.preventDefault?.();
-                return false;
-            }
-            // Shift+Enter -> send newline (for OpenCode multi-line input)
-            if (ev.shiftKey && ev.key === 'Enter') {
-                term?.paste('\n');
-                ev.preventDefault?.();
-                ev.stopPropagation?.();
                 return false;
             }
             // Ctrl+Shift+C -> copy (when text is selected)
