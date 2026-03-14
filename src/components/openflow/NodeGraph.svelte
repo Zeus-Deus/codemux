@@ -38,40 +38,31 @@
     const positionedNodes = $derived.by(() => {
         if (nodes.length === 0) return [];
 
-        const orchestrator = nodes.find(n => n.role === 'orchestrator');
-        const others = nodes.filter(n => n.role !== 'orchestrator');
-
         const result: PositionedNode[] = [];
         
-        // Define hierarchy levels based on typical workflow
+        // Strict role hierarchy - each role gets its own row, in workflow order:
+        // Orchestrator → Researcher → Planner → Builder → Tester → Debugger → Reviewer
+        const roleOrder = [
+            'orchestrator',
+            'researcher',
+            'planner',
+            'builder',
+            'tester',
+            'debugger',
+            'reviewer',
+        ];
+
+        // Build levels using only roles that are actually present, preserving order
         const levels: AgentNodeData[][] = [];
-        
-        if (orchestrator) {
-            levels.push([orchestrator]);
-        }
-        
-        // Level 2: Planners and Researchers
-        const planners = others.filter(n => n.role === 'planner' || n.role === 'researcher');
-        if (planners.length > 0) levels.push(planners);
-        
-        // Level 3: Builders
-        const builders = others.filter(n => n.role === 'builder');
-        if (builders.length > 0) levels.push(builders);
-        
-        // Level 4: Testers, Reviewers, Debuggers
-        const qa = others.filter(n => n.role === 'tester' || n.role === 'reviewer' || n.role === 'debugger');
-        if (qa.length > 0) levels.push(qa);
-        
-        // Any other unrecognized roles go to the last level
-        const remaining = others.filter(n => 
-            n.role !== 'planner' && n.role !== 'researcher' && 
-            n.role !== 'builder' && n.role !== 'tester' && 
-            n.role !== 'reviewer' && n.role !== 'debugger'
-        );
-        if (remaining.length > 0) {
-            if (levels.length === 0) levels.push(remaining);
-            else levels[levels.length - 1].push(...remaining);
-        }
+        roleOrder.forEach(role => {
+            const roleNodes = nodes.filter(n => n.role === role);
+            if (roleNodes.length > 0) levels.push(roleNodes);
+        });
+
+        // Any unrecognized roles go on their own row at the bottom
+        const knownRoles = new Set(roleOrder);
+        const unknown = nodes.filter(n => !knownRoles.has(n.role));
+        if (unknown.length > 0) levels.push(unknown);
 
         // Calculate max width required
         let maxRowWidth = 0;
@@ -91,7 +82,7 @@
                     ...node,
                     x: startX + colIndex * (nodeWidth + horizontalGap),
                     y,
-                    levelIndex: rowIndex // Store level index for structural connections
+                    levelIndex: rowIndex
                 });
             });
         });
@@ -104,24 +95,20 @@
         
         const conns: Connection[] = [];
         
-        // Sort nodes by Y position (higher Y = lower in hierarchy)
-        const sortedByLevel = [...positionedNodes].sort((a, b) => a.y - b.y);
-        
-        // Group nodes by their Y level (same Y = same level)
-        const levelGroups: PositionedNode[][] = [];
-        sortedByLevel.forEach(node => {
-            const lastLevel = levelGroups[levelGroups.length - 1];
-            if (!lastLevel || lastLevel[0].y !== node.y) {
-                levelGroups.push([node]);
-            } else {
-                lastLevel.push(node);
-            }
+        // Group by levelIndex (most reliable, avoids float comparison issues)
+        const levelMap = new Map<number, PositionedNode[]>();
+        positionedNodes.forEach(node => {
+            if (!levelMap.has(node.levelIndex)) levelMap.set(node.levelIndex, []);
+            levelMap.get(node.levelIndex)!.push(node);
         });
-        
-        // Connect each level to the next level down (forward flow)
-        for (let i = 0; i < levelGroups.length - 1; i++) {
-            const currentLevel = levelGroups[i];
-            const nextLevel = levelGroups[i + 1];
+
+        const levelKeys = Array.from(levelMap.keys()).sort((a, b) => a - b);
+        const numLevels = levelKeys.length;
+
+        // Connect each level ONLY to the immediately next level (no skip connections)
+        for (let i = 0; i < numLevels - 1; i++) {
+            const currentLevel = levelMap.get(levelKeys[i])!;
+            const nextLevel = levelMap.get(levelKeys[i + 1])!;
             
             currentLevel.forEach(fromNode => {
                 nextLevel.forEach(toNode => {
@@ -130,13 +117,14 @@
             });
         }
         
-        // Connect the last level back to Orchestrator (feedback loop)
-        const lastLevel = levelGroups[levelGroups.length - 1];
-        const orchestratorLevel = levelGroups[0];
+        // Connect the last level back to Orchestrator only (feedback loop)
+        const lastLevel = levelMap.get(levelKeys[numLevels - 1])!;
+        const firstLevel = levelMap.get(levelKeys[0])!;
         
-        if (levelGroups.length > 1) {
+        // Only add feedback if it's not already covered (e.g. 2-level graph)
+        if (numLevels > 1) {
             lastLevel.forEach(lastNode => {
-                orchestratorLevel.forEach(orchNode => {
+                firstLevel.forEach(orchNode => {
                     conns.push({ from: lastNode.id, to: orchNode.id });
                 });
             });
