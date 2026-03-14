@@ -205,7 +205,7 @@
             altClickMovesCursor: true
         });
 
-        let lastShiftEnterTime = 0;
+        let shiftEnterBlocked = false;
         
         // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
         term.attachCustomKeyEventHandler((ev) => {
@@ -217,14 +217,13 @@
             }
             // Shift+Enter -> send newline (for OpenCode)
             if (ev.shiftKey && ev.key === 'Enter') {
-                const now = Date.now();
-                // Only send if we haven't just sent one (debounce)
-                if (now - lastShiftEnterTime > 50) {
+                if (!shiftEnterBlocked) {
                     invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
-                    lastShiftEnterTime = now;
+                    shiftEnterBlocked = true;
+                    setTimeout(() => { shiftEnterBlocked = false; }, 100);
                 }
                 ev.preventDefault?.();
-                return false; // Block xterm's normal Enter processing
+                return false;
             }
             // Ctrl+Shift+C -> copy (when text is selected)
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
