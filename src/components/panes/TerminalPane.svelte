@@ -205,8 +205,6 @@
             altClickMovesCursor: true
         });
 
-        let shiftEnterHandled = false;
-        
         // Add custom key handler for Ctrl+Backspace -> Ctrl+W (delete word)
         term.attachCustomKeyEventHandler((ev) => {
             // Ctrl+Backspace -> send Ctrl+W (backward-kill-word)
@@ -216,15 +214,13 @@
                 return false;
             }
             // Shift+Enter -> send newline (for OpenCode)
+            // Block default and only send one newline
             if (ev.shiftKey && ev.key === 'Enter') {
-                if (!shiftEnterHandled) {
-                    shiftEnterHandled = true;
-                    invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
-                    // Reset flag after a short delay
-                    setTimeout(() => { shiftEnterHandled = false; }, 50);
-                }
+                // Don't send here, let the event propagate to the terminal
+                // But prevent browser default
                 ev.preventDefault?.();
-                return false;
+                // Return true to let xterm process but with our modification
+                return true;
             }
             // Ctrl+Shift+C -> copy (when text is selected)
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
