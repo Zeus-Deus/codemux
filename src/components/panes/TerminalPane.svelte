@@ -213,15 +213,6 @@
                 ev.preventDefault?.();
                 return false;
             }
-            // Shift+Enter -> send newline (for OpenCode)
-            // Block default and only send one newline
-            if (ev.shiftKey && ev.key === 'Enter') {
-                // Don't send here, let the event propagate to the terminal
-                // But prevent browser default
-                ev.preventDefault?.();
-                // Return true to let xterm process but with our modification
-                return true;
-            }
             // Ctrl+Shift+C -> copy (when text is selected)
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
                 const selection = term?.getSelection();
@@ -243,6 +234,18 @@
             }
             return true;
         });
+
+        // Handle Shift+Enter via DOM event to send newline (for OpenCode etc)
+        const terminalElement = terminalContainer;
+        if (terminalElement) {
+            terminalElement.addEventListener('keydown', function handleShiftEnter(e: KeyboardEvent) {
+                if (e.shiftKey && e.key === 'Enter') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    invoke('write_to_pty', { data: '\n', sessionId }).catch(console.error);
+                }
+            });
+        }
 
         fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
