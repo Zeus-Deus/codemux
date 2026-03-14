@@ -28,10 +28,10 @@
     });
 
     const agentNodes = $derived(
-        run?.workers.map(w => {
+        run?.workers.map((w, index) => {
             const session = agentSessions.find(s => s.config.role === w.role);
             return {
-                id: w.role,
+                id: `${w.role}-${index}`,
                 role: w.role,
                 status: w.status,
                 model: session?.config.model ?? null,
@@ -41,24 +41,32 @@
     );
 
     const activeConnections = $derived.by(() => {
-        if (!run) return [];
+        if (!run || run.workers.length === 0) return [];
         const phase = run.current_phase;
         const conns: Connection[] = [];
         
+        const getWorkerId = (role: string, fallbackIndex: number = 0) => {
+            const workersWithRole = run.workers
+                .map((w, i) => ({ role: w.role, index: i }))
+                .filter(w => w.role === role);
+            if (workersWithRole.length === 0) return `${role}-${fallbackIndex}`;
+            return `${role}-${workersWithRole[0].index}`;
+        };
+
         if (phase === 'plan' || phase === 'execute') {
-            conns.push({ from: 'orchestrator', to: 'builder', label: 'assigning tasks' });
-            conns.push({ from: 'orchestrator', to: 'planner', label: 'planning' });
+            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('builder'), label: 'assigning tasks' });
+            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('planner'), label: 'planning' });
         }
         if (phase === 'execute') {
-            conns.push({ from: 'builder', to: 'tester', label: 'building' });
+            conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'building' });
         }
         if (phase === 'verify') {
-            conns.push({ from: 'builder', to: 'tester', label: 'testing' });
-            conns.push({ from: 'tester', to: 'reviewer', label: 'results' });
+            conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'testing' });
+            conns.push({ from: getWorkerId('tester'), to: getWorkerId('reviewer'), label: 'results' });
         }
         if (phase === 'review') {
-            conns.push({ from: 'builder', to: 'reviewer', label: 'review' });
-            conns.push({ from: 'reviewer', to: 'orchestrator', label: 'feedback' });
+            conns.push({ from: getWorkerId('builder'), to: getWorkerId('reviewer'), label: 'review' });
+            conns.push({ from: getWorkerId('reviewer'), to: getWorkerId('orchestrator'), label: 'feedback' });
         }
         
         return conns;
