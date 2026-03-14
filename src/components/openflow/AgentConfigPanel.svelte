@@ -1,0 +1,489 @@
+<script module lang="ts">
+    export interface AgentConfig {
+        cliTool: string;
+        model: string;
+        role: string;
+        thinkingMode: string;
+    }
+</script>
+
+<script lang="ts">
+    import { onMount } from 'svelte';
+    import { createEventDispatcher } from 'svelte';
+    import {
+        listAvailableCliTools,
+        listModelsForTool,
+        listThinkingModesForTool,
+        type CliToolInfo,
+        type ModelInfo,
+        type ThinkingModeInfo,
+    } from '../../stores/appState';
+
+    const dispatch = createEventDispatcher<{
+        start: { title: string; goal: string; agentConfigs: AgentConfig[] };
+    }>();
+
+    // ── local state ──────────────────────────────────────────────────────────
+    let agentCount = $state(5);
+    let titleDraft = $state('');
+    let goalDraft = $state('');
+
+    // Discovery state
+    let availableTools = $state<CliToolInfo[]>([]);
+    let modelsByTool = $state<Record<string, ModelInfo[]>>({});
+    let thinkingModesByTool = $state<Record<string, ThinkingModeInfo[]>>({});
+    let loading = $state(true);
+    let loadError = $state<string | null>(null);
+
+    // Agent rows - use $state so mutations work correctly in Svelte 5
+    let agents = $state<AgentConfig[]>([]);
+
+    const availableRoles = [
+        { id: 'orchestrator', name: 'Orchestrator' },
+        { id: 'builder', name: 'Builder' },
+        { id: 'reviewer', name: 'Reviewer' },
+        { id: 'tester', name: 'Tester' },
+        { id: 'debugger', name: 'Debugger' },
+        { id: 'researcher', name: 'Researcher' },
+    ];
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+    function getDefaultRole(index: number): string {
+        const roles = ['orchestrator', 'builder', 'reviewer', 'tester', 'debugger', 'researcher'];
+        return roles[index % roles.length];
+    }
+
+    function defaultToolId(): string {
+        // Prefer first available tool; fall back to 'opencode'
+        const first = availableTools.find(t => t.available);
+        return first?.id ?? 'opencode';
+    }
+
+    function defaultModelForTool(toolId: string): string {
+        const models = modelsByTool[toolId];
+        return models?.[0]?.id ?? '';
+    }
+
+    function defaultThinkingMode(toolId: string): string {
+        const modes = thinkingModesByTool[toolId];
+        return modes?.[0]?.id ?? 'auto';
+    }
+
+    function buildNewAgent(index: number): AgentConfig {
+        const toolId = defaultToolId();
+        return {
+            cliTool: toolId,
+            model: defaultModelForTool(toolId),
+            role: getDefaultRole(index),
+            thinkingMode: defaultThinkingMode(toolId),
+        };
+    }
+
+    // Resize agents array when agentCount changes (preserve existing configs)
+    function syncAgentsToCount(newCount: number) {
+        if (newCount > agents.length) {
+            for (let i = agents.length; i < newCount; i++) {
+                agents.push(buildNewAgent(i));
+            }
+        } else if (newCount < agents.length) {
+            agents.splice(newCount);
+        }
+    }
+
+    // When a tool is changed for an agent, reload its model options if not cached
+    async function onToolChange(agentIndex: number, toolId: string) {
+        agents[agentIndex].cliTool = toolId;
+        // Load models for this tool if not already loaded
+        if (!modelsByTool[toolId]) {
+            try {
+                const models = await listModelsForTool(toolId);
+                modelsByTool[toolId] = models;
+            } catch {
+                modelsByTool[toolId] = [];
+            }
+        }
+        // Reset model/thinking to first available
+        agents[agentIndex].model = defaultModelForTool(toolId);
+        agents[agentIndex].thinkingMode = defaultThinkingMode(toolId);
+    }
+
+    // ── discovery on mount ───────────────────────────────────────────────────
+    onMount(async () => {
+        try {
+            // Discover available tools
+            const tools = await listAvailableCliTools();
+            availableTools = tools;
+
+            // For each available tool, fetch its models and thinking modes in parallel
+            const availList = tools.filter(t => t.available);
+            // Always include opencode even if not technically "available" on this machine
+            const toolsToLoad = availList.length > 0 ? availList : [{ id: 'opencode', name: 'OpenCode', available: true, path: null }];
+
+            await Promise.all(
+                toolsToLoad.map(async (tool) => {
+                    const [models, modes] = await Promise.all([
+                        listModelsForTool(tool.id).catch(() => []),
+                        listThinkingModesForTool(tool.id).catch(() => []),
+                    ]);
+                    modelsByTool[tool.id] = models;
+                    thinkingModesByTool[tool.id] = modes;
+                })
+            );
+
+            // Build initial agent list after discovery
+            agents = Array.from({ length: agentCount }, (_, i) => buildNewAgent(i));
+        } catch (err) {
+            loadError = err instanceof Error ? err.message : String(err);
+            // Still build agents with empty defaults so the UI isn't stuck
+            agents = Array.from({ length: agentCount }, (_, i) => ({
+                cliTool: 'opencode',
+                model: '',
+                role: getDefaultRole(i),
+                thinkingMode: 'auto',
+            }));
+        } finally {
+            loading = false;
+        }
+    });
+
+    // ── form submit ──────────────────────────────────────────────────────────
+    function handleStart() {
+        if (!titleDraft.trim() || !goalDraft.trim()) return;
+        dispatch('start', {
+            title: titleDraft.trim(),
+            goal: goalDraft.trim(),
+            agentConfigs: agents.map(a => ({ ...a })),
+        });
+    }
+
+    // ── derived helpers ──────────────────────────────────────────────────────
+    function hasThinkingModes(toolId: string): boolean {
+        return (thinkingModesByTool[toolId]?.length ?? 0) > 0;
+    }
+</script>
+
+<div class="agent-config-panel">
+    <div class="config-header">
+        <h2>Configure OpenFlow</h2>
+        <p>Set up your agent swarm</p>
+    </div>
+
+    {#if loading}
+        <div class="loading-state">
+            <span class="spinner"></span>
+            <span>Discovering available tools and models…</span>
+        </div>
+    {:else}
+        {#if loadError}
+            <div class="error-banner">
+                Could not fully discover tools: {loadError}. Using defaults.
+            </div>
+        {/if}
+
+        <div class="config-section">
+            <label class="section-label">
+                <span>Number of agents</span>
+                <input
+                    type="range"
+                    min="2"
+                    max="20"
+                    bind:value={agentCount}
+                    oninput={() => syncAgentsToCount(agentCount)}
+                />
+                <span class="range-value">{agentCount}</span>
+            </label>
+        </div>
+
+        <div class="agents-list">
+            <div class="agents-list-header">
+                <span class="col-num">#</span>
+                <span class="col-tool">CLI Tool</span>
+                <span class="col-model">Model</span>
+                <span class="col-role">Role</span>
+                <span class="col-thinking">Thinking</span>
+            </div>
+
+            {#each agents as agent, i (i)}
+                <div class="agent-row">
+                    <span class="agent-number">#{i + 1}</span>
+
+                    <!-- CLI Tool -->
+                    <select
+                        value={agent.cliTool}
+                        onchange={(e) => onToolChange(i, (e.target as HTMLSelectElement).value)}
+                    >
+                        {#each availableTools as tool}
+                            <option value={tool.id} disabled={!tool.available}>
+                                {tool.name}{tool.available ? '' : ' (not installed)'}
+                            </option>
+                        {/each}
+                        {#if availableTools.length === 0}
+                            <option value="opencode">OpenCode</option>
+                        {/if}
+                    </select>
+
+                    <!-- Model -->
+                    <select bind:value={agent.model}>
+                        {#each modelsByTool[agent.cliTool] ?? [] as model}
+                            <option value={model.id}>{model.name}{model.provider ? ` (${model.provider})` : ''}</option>
+                        {/each}
+                        {#if (modelsByTool[agent.cliTool]?.length ?? 0) === 0}
+                            <option value="">Loading…</option>
+                        {/if}
+                    </select>
+
+                    <!-- Role -->
+                    <select bind:value={agent.role}>
+                        {#each availableRoles as role}
+                            <option value={role.id}>{role.name}</option>
+                        {/each}
+                    </select>
+
+                    <!-- Thinking mode (only for tools that support it) -->
+                    {#if hasThinkingModes(agent.cliTool)}
+                        <select bind:value={agent.thinkingMode}>
+                            {#each thinkingModesByTool[agent.cliTool] as mode}
+                                <option value={mode.id} title={mode.description}>{mode.name}</option>
+                            {/each}
+                        </select>
+                    {:else}
+                        <span class="no-thinking">—</span>
+                    {/if}
+                </div>
+            {/each}
+        </div>
+
+        <div class="config-section goal-section">
+            <h3>What do you want to build?</h3>
+            <input
+                class="goal-input"
+                bind:value={titleDraft}
+                placeholder="Run title (e.g., Login Page Project)"
+            />
+            <textarea
+                class="goal-textarea"
+                bind:value={goalDraft}
+                rows="4"
+                placeholder="Describe what you want to build in detail…"
+            ></textarea>
+        </div>
+
+        <div class="config-actions">
+            <button
+                class="start-btn"
+                type="button"
+                onclick={handleStart}
+                disabled={!titleDraft.trim() || !goalDraft.trim()}
+            >
+                Start Orchestration
+            </button>
+        </div>
+    {/if}
+</div>
+
+<style>
+    .agent-config-panel {
+        display: flex;
+        flex-direction: column;
+        gap: 24px;
+        padding: 32px;
+        max-width: 900px;
+        margin: 0 auto;
+        width: 100%;
+        overflow-y: auto;
+    }
+
+    .config-header {
+        text-align: center;
+    }
+
+    .config-header h2 {
+        margin: 0 0 8px;
+        font-size: 1.5rem;
+        font-weight: 600;
+        color: var(--ui-text-primary);
+    }
+
+    .config-header p {
+        margin: 0;
+        color: var(--ui-text-muted);
+        font-size: 0.9rem;
+    }
+
+    .loading-state {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        padding: 48px;
+        color: var(--ui-text-muted);
+        font-size: 0.9rem;
+    }
+
+    .spinner {
+        display: inline-block;
+        width: 16px;
+        height: 16px;
+        border: 2px solid var(--ui-border-soft);
+        border-top-color: var(--ui-accent);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+        to { transform: rotate(360deg); }
+    }
+
+    .error-banner {
+        padding: 10px 14px;
+        background: color-mix(in srgb, var(--ui-accent-error, #e55) 12%, transparent);
+        border: 1px solid var(--ui-accent-error, #e55);
+        border-radius: 6px;
+        font-size: 0.85rem;
+        color: var(--ui-text-secondary);
+    }
+
+    .config-section {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .section-label {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        font-size: 0.9rem;
+        color: var(--ui-text-secondary);
+    }
+
+    .section-label input[type="range"] {
+        flex: 1;
+        max-width: 200px;
+    }
+
+    .range-value {
+        font-weight: 600;
+        color: var(--ui-accent);
+        min-width: 24px;
+    }
+
+    .agents-list {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+    }
+
+    .agents-list-header {
+        display: grid;
+        grid-template-columns: 40px 1fr 2fr 1fr 1fr;
+        gap: 8px;
+        padding: 0 12px 4px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        color: var(--ui-text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    .agent-row {
+        display: grid;
+        grid-template-columns: 40px 1fr 2fr 1fr 1fr;
+        gap: 8px;
+        align-items: center;
+        padding: 10px 12px;
+        background: var(--ui-layer-2);
+        border-radius: 8px;
+        border: 1px solid var(--ui-border-soft);
+    }
+
+    .agent-number {
+        font-weight: 600;
+        color: var(--ui-accent);
+        font-size: 0.85rem;
+    }
+
+    .agent-row select {
+        padding: 6px 10px;
+        background: var(--ui-layer-1);
+        border: 1px solid var(--ui-border-soft);
+        border-radius: 6px;
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.82rem;
+        cursor: pointer;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .agent-row select:focus {
+        outline: none;
+        border-color: var(--ui-accent);
+    }
+
+    .no-thinking {
+        color: var(--ui-text-muted);
+        font-size: 0.85rem;
+        text-align: center;
+    }
+
+    .goal-section h3 {
+        margin: 0 0 12px;
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--ui-text-primary);
+    }
+
+    .goal-input,
+    .goal-textarea {
+        width: 100%;
+        padding: 12px;
+        background: var(--ui-layer-1);
+        border: 1px solid var(--ui-border-soft);
+        border-radius: 8px;
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.9rem;
+        outline: none;
+        box-sizing: border-box;
+    }
+
+    .goal-input:focus,
+    .goal-textarea:focus {
+        border-color: var(--ui-accent);
+    }
+
+    .goal-textarea {
+        resize: vertical;
+        min-height: 100px;
+    }
+
+    .config-actions {
+        display: flex;
+        justify-content: center;
+        padding-top: 12px;
+    }
+
+    .start-btn {
+        padding: 14px 32px;
+        background: var(--ui-accent);
+        border: none;
+        border-radius: 8px;
+        color: #fff;
+        font: inherit;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        transition: opacity var(--ui-motion-fast);
+    }
+
+    .start-btn:hover:not(:disabled) {
+        opacity: 0.9;
+    }
+
+    .start-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+    }
+</style>

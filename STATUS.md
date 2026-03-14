@@ -51,7 +51,7 @@ Because of that, the first Linux MVP should still be considered in progress.
 - Browser screenshots: comes from agent-browser session, shared with CLI commands
 - Console log capture: command shape exists, but current frontend browser implementation does not populate a real log stream
 - Notification sound: config toggle exists, but actual sound playback is not implemented
-- OpenFlow runtime: run records, phases, retry, and sidebar controls exist, but worker execution is still scaffolded
+- OpenFlow runtime: run records, phases, retry, and sidebar controls exist; Phase 1 (workspace/UI shell) and Phase 2 (agent spawning system) are complete; Phase 3 (communication layer) is next
 
 ## Major Known Gaps Before Calling It A Linux MVP
 
@@ -191,3 +191,43 @@ Current expectation note:
 Current expectation note:
 
 - Do not treat this section as proof of a finished autonomous agent system. Current OpenFlow behavior is stateful scaffolding, not a fully integrated worker execution runtime.
+
+## 10. OpenFlow Workspace (NEW - Phase 1)
+
+### Setup Flow
+
+- [ ] Creating new workspace and selecting "OpenFlow run" skips pane layout options and goes to goal/title input
+- [ ] Can enter title and goal for OpenFlow run
+- [ ] OpenFlow workspace is created with the entered title
+
+### OpenFlow Workspace UI
+
+- [ ] OpenFlow workspace renders differently from regular workspace
+- [ ] Can switch between workspaces when OpenFlow workspace is active
+- [ ] Sidebar shows all workspaces (including OpenFlow)
+- [ ] Can click on other workspaces in sidebar to switch away from OpenFlow
+
+### Agent Configuration Panel
+
+- [ ] Agent count slider works (2-20)
+- [ ] Can select CLI tool per agent (dynamically discovered from PATH at runtime)
+- [ ] Can select model per agent (dynamically loaded from `opencode models`, updates when tool changes)
+- [ ] Can select thinking mode per agent (auto/none/low/medium/high for opencode)
+- [ ] Can select role per agent
+- [ ] Goal textarea accepts input
+- [ ] Start button creates OpenFlow run
+
+### Orchestration View
+
+- [ ] After starting run, switches to orchestration view
+- [ ] Shows agent nodes with roles and status
+- [ ] Shows timeline entries
+- [ ] Control buttons work: Loop, Next, Pause, Cancel
+- [ ] Communication panel shows messages
+
+### Known Issues
+
+- [ ] OpenFlow workspace does not have a browser pane yet (planned for Phase 6)
+    - [ ] Agents are not actually running yet — `spawn_openflow_agents` command wires agent configs to terminal panes with opencode, but the communication layer (Phase 3) is needed before agents can exchange messages
+    - [ ] Communication is simulated (planned for Phase 3)
+- Note: WorkspaceType serde was previously serializing as PascalCase ("OpenFlow"); now fixed to snake_case ("open_flow") matching frontend expectations

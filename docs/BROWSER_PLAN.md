@@ -2,7 +2,9 @@
 
 ## Status: ✅ WORKING
 
-Browser automation is now fully functional!
+Browser automation is fully functional for agents!
+
+Agent can control the browser via CLI commands, and users see the result in the browser pane (like a TV showing the agent's work).
 
 ---
 
@@ -223,6 +225,19 @@ Create `src/lib/browserService.ts`:
 
 - ~~No CLI commands for agents to control browser~~ (DONE)
 - ~~No socket protocol for agents~~ (Using existing browser_automation)
-- No accessibility tree snapshots (Now using agent-browser)
-- No semantic element selection (Now using agent-browser)
+- ~~No accessibility tree snapshots~~ (Now using agent-browser)
+- ~~No semantic element selection~~ (Now using agent-browser)
 - Frontend not using agent-browser (Partially done - event handler uses it)
+
+### Known Limitations (Acceptable for "TV" Use Case)
+
+The browser pane is primarily a display ("TV") for agents to show their work to users. User interaction with the browser is not the main use case.
+
+- Frontend toolbar: Only Home + Refresh screenshot buttons (no actual back/forward/reload)
+- User clicking in browser: Clicks "body" always, not specific coordinates
+- No scroll support in frontend (agents can scroll via eval if needed)
+
+These limitations are acceptable because:
+1. Agents control the browser via CLI commands
+2. Users see what agents are doing via screenshot display
+3. The address bar allows manual navigation if needed

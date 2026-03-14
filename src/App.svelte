@@ -27,6 +27,7 @@
     import PaneNode from './components/panes/PaneNode.svelte';
     import Sidebar from './components/sidebar/Sidebar.svelte';
     import NewWorkspaceLauncher from './components/sidebar/NewWorkspaceLauncher.svelte';
+    import OpenFlowWorkspace from './components/openflow/OpenFlowWorkspace.svelte';
     import { findActiveSessionId } from './lib/paneTree';
 
     const themeKeys = [
@@ -54,6 +55,11 @@
 
     function currentWorkspace() {
         return $appState?.workspaces.find((w) => w.workspace_id === $appState?.active_workspace_id) ?? null;
+    }
+
+    function isOpenFlowWorkspace(ws: any) {
+        const type = ws?.workspace_type;
+        return ws && type === 'open_flow';
     }
 
     function currentSurface() {
@@ -146,15 +152,18 @@
 
             <section class="workspace-main">
                 <div class="workspace-stage">
-                    {#if currentSurface()}
-                        {#each $appState.workspaces as workspace (workspace.workspace_id)}
-                            {@const surface = surfaceForWorkspace(workspace)}
-                            {#if surface}
-                                <div
-                                    class="workspace-surface-layer"
-                                    class:active={workspace.workspace_id === $appState.active_workspace_id}
-                                    aria-hidden={workspace.workspace_id === $appState.active_workspace_id ? 'false' : 'true'}
-                                >
+                    {#each $appState.workspaces as workspace (workspace.workspace_id)}
+                        {@const isOf = isOpenFlowWorkspace(workspace)}
+                        {@const surface = isOf ? null : surfaceForWorkspace(workspace)}
+                        {#if isOf || (surface && surface.root)}
+                            <div
+                                class="workspace-surface-layer"
+                                class:active={workspace.workspace_id === $appState.active_workspace_id}
+                                aria-hidden={workspace.workspace_id === $appState.active_workspace_id ? 'false' : 'true'}
+                            >
+                                {#if isOf}
+                                    <OpenFlowWorkspace {workspace} />
+                                {:else if surface}
                                     <PaneNode
                                         node={surface.root}
                                         activePaneId={surface.active_pane_id}
@@ -165,10 +174,11 @@
                                         on:browser={(e) => handleCreateBrowserPane(e.detail.paneId)}
                                         on:swap={(e) => handleSwapPanes(e.detail.sourcePaneId, e.detail.targetPaneId)}
                                     />
-                                </div>
-                            {/if}
-                        {/each}
-                    {:else}
+                                {/if}
+                            </div>
+                        {/if}
+                    {/each}
+                    {#if !$appState.workspaces.some(w => isOpenFlowWorkspace(w) || surfaceForWorkspace(w))}
                         <div class="empty-stage">
                             <div class="empty-stage-card">
                                 <div class="empty-stage-icon">

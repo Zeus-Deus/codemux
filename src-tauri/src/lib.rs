@@ -23,6 +23,7 @@ pub fn run() {
         .manage(agent_browser::AgentBrowserManager::new())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
+        .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .plugin(tauri_plugin_opener::init())
@@ -50,6 +51,7 @@ pub fn run() {
             commands::get_app_state,
             commands::create_workspace,
             commands::create_workspace_with_preset,
+            commands::create_openflow_workspace,
             commands::activate_workspace,
             commands::rename_workspace,
             commands::close_workspace,
@@ -109,6 +111,11 @@ pub fn run() {
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,
+            commands::list_available_cli_tools,
+            commands::list_models_for_tool,
+            commands::list_thinking_modes_for_tool,
+            commands::spawn_openflow_agents,
+            commands::get_agent_sessions_for_run,
             terminal::create_terminal_session,
             terminal::activate_terminal_session,
             terminal::close_terminal_session,

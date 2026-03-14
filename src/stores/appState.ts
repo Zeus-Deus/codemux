@@ -214,9 +214,12 @@ export interface SurfaceSnapshot {
     active_pane_id: string;
 }
 
+export type WorkspaceType = 'standard' | 'open_flow';
+
 export interface WorkspaceSnapshot {
     workspace_id: string;
     title: string;
+    workspace_type: WorkspaceType;
     cwd: string;
     git_branch: string | null;
     notification_count: number;
@@ -310,6 +313,10 @@ export async function createWorkspaceAtPath(cwd: string) {
     return invoke<string>('create_workspace', { cwd });
 }
 
+export async function createOpenFlowWorkspace(title: string, goal: string) {
+    return invoke<string>('create_openflow_workspace', { title, goal });
+}
+
 export async function createWorkspaceWithPreset(options: {
     kind: WorkspaceTemplateKind;
     layout: LayoutPreset;
@@ -317,16 +324,33 @@ export async function createWorkspaceWithPreset(options: {
     openflowTitle?: string;
     openflowGoal?: string;
 }) {
-    const workspaceId = await invoke<string>('create_workspace_with_preset', {
-        cwd: options.cwd?.trim() ? options.cwd.trim() : null,
-        layout: options.layout
-    });
+    let workspaceId: string;
+
+    if (options.kind === 'openflow') {
+        // Create OpenFlow workspace directly
+        workspaceId = await invoke<string>('create_openflow_workspace', {
+            title: options.openflowTitle || 'OpenFlow',
+            goal: options.openflowGoal || ''
+        });
+    } else {
+        // Create standard workspace
+        workspaceId = await invoke<string>('create_workspace_with_preset', {
+            cwd: options.cwd?.trim() ? options.cwd.trim() : null,
+            layout: options.layout
+        });
+    }
+
     await activateWorkspace(workspaceId);
 
     const snapshot = await invoke<AppStateSnapshot>('get_app_state');
     appState.set(snapshot);
 
-    return await maybeCreateOpenFlowRun(workspaceId, options);
+    // For openflow, also create the run record
+    if (options.kind === 'openflow') {
+        return await maybeCreateOpenFlowRun(workspaceId, options);
+    }
+
+    return { workspaceId, runId: null };
 }
 
 async function maybeCreateOpenFlowRun(
@@ -592,4 +616,71 @@ export async function agentBrowserGetStreamUrl() {
 
 export async function agentBrowserScreenshot(browserId: string) {
     return invoke<string>('agent_browser_screenshot', { browserId });
+}
+
+// ─── OpenFlow: CLI tool and model discovery ───────────────────────────────────
+
+export interface CliToolInfo {
+    id: string;
+    name: string;
+    available: boolean;
+    path: string | null;
+}
+
+export interface ModelInfo {
+    id: string;
+    name: string;
+    provider: string | null;
+}
+
+export interface ThinkingModeInfo {
+    id: string;
+    name: string;
+    description: string;
+}
+
+export async function listAvailableCliTools(): Promise<CliToolInfo[]> {
+    return invoke<CliToolInfo[]>('list_available_cli_tools');
+}
+
+export async function listModelsForTool(toolId: string): Promise<ModelInfo[]> {
+    return invoke<ModelInfo[]>('list_models_for_tool', { toolId });
+}
+
+export async function listThinkingModesForTool(toolId: string): Promise<ThinkingModeInfo[]> {
+    return invoke<ThinkingModeInfo[]>('list_thinking_modes_for_tool', { toolId });
+}
+
+// ─── OpenFlow: Agent spawning (Phase 2) ──────────────────────────────────────
+
+export interface AgentConfig {
+    agent_index: number;
+    cli_tool: string;
+    model: string;
+    provider: string;
+    thinking_mode: string;
+    role: string;
+}
+
+export interface AgentSessionState {
+    session_id: string;
+    run_id: string;
+    config: AgentConfig;
+    status: 'spawning' | 'running' | 'done' | 'failed';
+}
+
+export async function spawnOpenflowAgents(
+    workspaceId: string,
+    runId: string,
+    agentConfigs: AgentConfig[],
+): Promise<string[]> {
+    return invoke<string[]>('spawn_openflow_agents', {
+        workspaceId,
+        runId,
+        agentConfigs,
+    });
+}
+
+export async function getAgentSessionsForRun(runId: string): Promise<AgentSessionState[]> {
+    return invoke<AgentSessionState[]>('get_agent_sessions_for_run', { runId });
 }

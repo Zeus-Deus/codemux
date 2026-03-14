@@ -7,6 +7,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceType {
+    Standard,
+    OpenFlow,
+}
+
+impl Default for WorkspaceType {
+    fn default() -> Self {
+        WorkspaceType::Standard
+    }
+}
+
 /// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
 /// multiple resize events) only result in a single write after a quiet period.
 struct PersistDebouncer {
@@ -207,6 +220,7 @@ pub struct SurfaceSnapshot {
 pub struct WorkspaceSnapshot {
     pub workspace_id: WorkspaceId,
     pub title: String,
+    pub workspace_type: WorkspaceType,
     pub cwd: String,
     pub git_branch: Option<String>,
     pub notification_count: u32,
@@ -349,6 +363,112 @@ impl AppStateStore {
         self.create_workspace_at_path(current_project_root())
     }
 
+    pub fn create_openflow_workspace(&self, title: String, _goal: String) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+        let surface_id = SurfaceId(next_id("surface"));
+        let cwd = current_project_root().display().to_string();
+        let _workspace_index = snapshot.workspaces.len() + 1;
+        let pane_id = PaneId(next_id("pane"));
+
+        eprintln!("DEBUG: Creating OpenFlow workspace with title: {}", title);
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::OpenFlow,
+            cwd,
+            git_branch: None,
+            notification_count: 0,
+            latest_agent_state: Some("configuring".into()),
+            active_surface_id: surface_id.clone(),
+            surfaces: vec![SurfaceSnapshot {
+                surface_id,
+                title: "OpenFlow".into(),
+                active_pane_id: pane_id.clone(),
+                root: PaneNodeSnapshot::Split {
+                    pane_id,
+                    direction: SplitDirection::Vertical,
+                    child_sizes: vec![100.0],
+                    children: vec![],
+                },
+            }],
+        });
+
+        snapshot.active_workspace_id = workspace_id.clone();
+        workspace_id
+    }
+
+    /// Add a new terminal session to a specific OpenFlow workspace.
+    ///
+    /// Returns the new `SessionId`.  Unlike `create_terminal_session` (which
+    /// uses the *active* workspace and enforces the normal per-workspace
+    /// terminal limit), this method targets an explicit workspace and bypasses
+    /// the limit because OpenFlow workspaces need one pane per agent.
+    pub fn add_agent_terminal_to_workspace(
+        &self,
+        workspace_id: &str,
+        title: String,
+    ) -> Result<SessionId, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let cwd = current_project_root().display().to_string();
+
+        let session_id = SessionId(next_id("session"));
+        let pane_id = PaneId(next_id("pane"));
+
+        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+            session_id: session_id.clone(),
+            title: title.clone(),
+            shell: None, // will be set when the PTY spawns
+            cwd: cwd.clone(),
+            cols: 80,
+            rows: 24,
+            state: TerminalSessionState::Starting,
+            last_message: Some("Preparing agent session".into()),
+            exit_code: None,
+        });
+
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        let surface = workspace
+            .surfaces
+            .iter_mut()
+            .find(|s| s.surface_id == workspace.active_surface_id)
+            .ok_or_else(|| "OpenFlow workspace has no active surface".to_string())?;
+
+        // The OpenFlow workspace root is a Split with no children.  Append
+        // the new terminal pane as a child.
+        match &mut surface.root {
+            PaneNodeSnapshot::Split {
+                children,
+                child_sizes,
+                ..
+            } => {
+                children.push(PaneNodeSnapshot::Terminal {
+                    pane_id: pane_id.clone(),
+                    session_id: session_id.clone(),
+                    title,
+                });
+                // Keep child_sizes length in sync: equal weights.
+                let n = children.len() as f32;
+                let each = 100.0 / n;
+                *child_sizes = vec![each; children.len()];
+                surface.active_pane_id = pane_id;
+            }
+            _ => {
+                return Err(
+                    "OpenFlow workspace root is not a split node; cannot add agent pane".into(),
+                )
+            }
+        }
+
+        Ok(session_id)
+    }
+
     pub fn create_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
         self.create_workspace_with_layout(cwd_path, WorkspacePresetLayout::Single)
     }
@@ -409,6 +529,7 @@ impl AppStateStore {
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
             title: format!("Workspace {workspace_index}"),
+            workspace_type: WorkspaceType::Standard,
             cwd,
             git_branch: None,
             notification_count: 0,
@@ -1221,6 +1342,7 @@ fn default_app_state() -> AppStateSnapshot {
         workspaces: vec![WorkspaceSnapshot {
             workspace_id,
             title: "Workspace 1".into(),
+            workspace_type: WorkspaceType::Standard,
             cwd: cwd.clone(),
             git_branch: None,
             notification_count: 0,

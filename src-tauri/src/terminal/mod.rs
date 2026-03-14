@@ -599,3 +599,225 @@ pub fn resize_pty(
 
     Ok(())
 }
+
+/// Spawn a PTY for an OpenFlow agent terminal session.
+///
+/// Unlike `spawn_pty_for_session` (which launches the user's default shell),
+/// this function runs a specific command (e.g. `opencode`) with extra
+/// environment variables injected for the agent role, run ID, and communication
+/// log path.
+///
+/// `argv` must be non-empty; the first element is the executable and the rest
+/// are arguments.  `extra_env` is a list of `(key, value)` pairs that will be
+/// set on the spawned process on top of the normal Codemux env vars.
+pub fn spawn_pty_for_agent(
+    app: AppHandle,
+    session_id: String,
+    workspace_id: String,
+    argv: Vec<String>,
+    extra_env: Vec<(String, String)>,
+) {
+    let terminal_state: State<'_, PtyState> = app.state();
+    let app_state: State<'_, AppStateStore> = app.state();
+    let sessions = terminal_state.sessions.clone();
+
+    let already_running = sessions
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|r| r.writer.is_some() || r.master.is_some())
+        .unwrap_or(false);
+
+    if already_running {
+        return;
+    }
+
+    let executable = match argv.first() {
+        Some(e) => e.clone(),
+        None => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id,
+                    state: TerminalLifecycleState::Failed,
+                    message: Some("Agent spawn failed: empty argv".into()),
+                    exit_code: None,
+                },
+            );
+            return;
+        }
+    };
+
+    emit_terminal_status(
+        &app,
+        &sessions,
+        TerminalStatusPayload {
+            session_id: session_id.clone(),
+            state: TerminalLifecycleState::Starting,
+            message: Some(format!("Starting agent: {executable}")),
+            exit_code: None,
+        },
+    );
+
+    let pty_system = native_pty_system();
+    let pty_pair = match pty_system.openpty(PtySize {
+        rows: DEFAULT_ROWS,
+        cols: DEFAULT_COLS,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id,
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to open PTY for agent: {error}")),
+                    exit_code: None,
+                },
+            );
+            return;
+        }
+    };
+
+    app_state.update_terminal_session_shell(&session_id, executable.clone());
+
+    let cwd = session_working_dir(&app_state, &session_id);
+    let mut cmd = CommandBuilder::new(&executable);
+    for arg in argv.iter().skip(1) {
+        cmd.arg(arg);
+    }
+    cmd.cwd(cwd);
+
+    // Standard Codemux env vars.
+    cmd.env("CODEMUX_WORKSPACE_ID", &workspace_id);
+    cmd.env("CODEMUX_SURFACE_ID", &session_id);
+
+    // Agent-specific env vars from the adapter.
+    for (key, val) in &extra_env {
+        cmd.env(key, val);
+    }
+
+    let mut child = match pty_pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id,
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to spawn agent {executable}: {error}")),
+                    exit_code: None,
+                },
+            );
+            return;
+        }
+    };
+
+    drop(pty_pair.slave);
+
+    let mut reader = match pty_pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(error) => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id,
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to clone PTY reader for agent: {error}")),
+                    exit_code: None,
+                },
+            );
+            return;
+        }
+    };
+
+    let writer = match pty_pair.master.take_writer() {
+        Ok(w) => w,
+        Err(error) => {
+            emit_terminal_status(
+                &app,
+                &sessions,
+                TerminalStatusPayload {
+                    session_id,
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to take PTY writer for agent: {error}")),
+                    exit_code: None,
+                },
+            );
+            return;
+        }
+    };
+
+    with_session_runtime(
+        &sessions,
+        &session_id,
+        || SessionRuntime::new(&session_id),
+        |runtime| {
+            runtime.writer = Some(writer);
+            runtime.master = Some(pty_pair.master);
+        },
+    );
+
+    emit_terminal_status(
+        &app,
+        &sessions,
+        TerminalStatusPayload {
+            session_id: session_id.clone(),
+            state: TerminalLifecycleState::Ready,
+            message: Some(format!("Agent ready: {executable}")),
+            exit_code: None,
+        },
+    );
+
+    let read_sessions = sessions.clone();
+    let read_session_id = session_id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(n) if n > 0 => {
+                    let chunk = buf[..n].to_vec();
+                    queue_or_send_output(&read_sessions, &read_session_id, chunk);
+                }
+                Ok(_) => break,
+                Err(error) => {
+                    eprintln!("[codemux::terminal] Agent PTY read error: {error}");
+                    break;
+                }
+            }
+        }
+    });
+
+    let wait_app = app.clone();
+    let wait_sessions = sessions.clone();
+    let wait_session_id = session_id.clone();
+    std::thread::spawn(move || {
+        let payload = match child.wait() {
+            Ok(status) => TerminalStatusPayload {
+                session_id: wait_session_id.clone(),
+                state: TerminalLifecycleState::Exited,
+                message: Some(if status.success() {
+                    "Agent exited successfully".into()
+                } else {
+                    format!("Agent exited with code {}", status.exit_code())
+                }),
+                exit_code: Some(status.exit_code()),
+            },
+            Err(error) => TerminalStatusPayload {
+                session_id: wait_session_id.clone(),
+                state: TerminalLifecycleState::Failed,
+                message: Some(format!("Failed to wait for agent: {error}")),
+                exit_code: None,
+            },
+        };
+
+        emit_terminal_status(&wait_app, &wait_sessions, payload);
+        state::emit_app_state(&wait_app);
+    });
+}

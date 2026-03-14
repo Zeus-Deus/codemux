@@ -10,8 +10,11 @@ use crate::memory::{
 };
 use crate::openflow::{
     OpenFlowCreateRunRequest, OpenFlowDesignSpec, OpenFlowRunRecord, OpenFlowRunStatus,
-    OpenFlowRuntimeSnapshot, OpenFlowRuntimeStore,
+    OpenFlowRuntimeSnapshot, OpenFlowRuntimeStore, AgentSessionStore,
 };
+use crate::openflow::agent::{AgentConfig, AgentSessionState, AgentSessionStatus};
+use crate::openflow::adapters::AgentAdapter;
+use crate::openflow::adapters::opencode::OpenCodeAdapter;
 use crate::observability::{
     FeatureFlags, LogLevel, ObservabilitySnapshot, ObservabilityStore, PermissionPolicy,
     SafetyConfig,
@@ -108,6 +111,253 @@ async fn dispatch_browser_automation(
     }
 }
 
+// ─── OpenFlow: CLI tool and model discovery ──────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CliToolInfo {
+    pub id: String,
+    pub name: String,
+    pub available: bool,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingModeInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+fn which_tool(name: &str) -> Option<String> {
+    Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[tauri::command]
+pub fn list_available_cli_tools() -> Result<Vec<CliToolInfo>, String> {
+    let known: &[(&str, &str)] = &[
+        ("opencode", "OpenCode"),
+        ("claude", "Claude CLI"),
+        ("codex", "OpenAI Codex"),
+        ("aider", "Aider"),
+        ("gemini", "Gemini CLI"),
+    ];
+
+    Ok(known
+        .iter()
+        .map(|(id, name)| {
+            let path = which_tool(id);
+            CliToolInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                available: path.is_some(),
+                path,
+            }
+        })
+        .collect())
+}
+
+fn parse_opencode_models(raw: &str) -> Vec<ModelInfo> {
+    raw.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let provider = line.split('/').next().map(|p| p.to_string());
+            let short = line.split('/').last().unwrap_or(line).to_string();
+            ModelInfo {
+                id: line.to_string(),
+                name: short,
+                provider,
+            }
+        })
+        .collect()
+}
+
+fn opencode_fallback_models() -> Vec<ModelInfo> {
+    parse_opencode_models(
+        "github-copilot/claude-sonnet-4.6\n\
+         github-copilot/claude-sonnet-4.5\n\
+         github-copilot/gpt-4.1\n\
+         github-copilot/gpt-5\n\
+         github-copilot/gpt-5-mini\n\
+         github-copilot/gemini-2.5-pro\n\
+         minimax-coding-plan/MiniMax-M2.5",
+    )
+}
+
+fn claude_default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo { id: "claude-opus-4-5".into(), name: "claude-opus-4-5".into(), provider: Some("anthropic".into()) },
+        ModelInfo { id: "claude-sonnet-4-5".into(), name: "claude-sonnet-4-5".into(), provider: Some("anthropic".into()) },
+        ModelInfo { id: "claude-haiku-3-5".into(), name: "claude-haiku-3-5".into(), provider: Some("anthropic".into()) },
+    ]
+}
+
+fn codex_default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo { id: "codex-mini-latest".into(), name: "codex-mini-latest".into(), provider: Some("openai".into()) },
+    ]
+}
+
+fn aider_default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo { id: "gpt-4o".into(), name: "gpt-4o".into(), provider: Some("openai".into()) },
+        ModelInfo { id: "claude-sonnet-4-5".into(), name: "claude-sonnet-4-5".into(), provider: Some("anthropic".into()) },
+    ]
+}
+
+fn gemini_default_models() -> Vec<ModelInfo> {
+    vec![
+        ModelInfo { id: "gemini-2.5-pro".into(), name: "gemini-2.5-pro".into(), provider: Some("google".into()) },
+        ModelInfo { id: "gemini-2.5-flash".into(), name: "gemini-2.5-flash".into(), provider: Some("google".into()) },
+    ]
+}
+
+#[tauri::command]
+pub fn list_models_for_tool(tool_id: String) -> Result<Vec<ModelInfo>, String> {
+    match tool_id.as_str() {
+        "opencode" => {
+            let output = Command::new("opencode").arg("models").output();
+            match output {
+                Ok(o) if o.status.success() => {
+                    let text = String::from_utf8_lossy(&o.stdout);
+                    let models = parse_opencode_models(&text);
+                    if models.is_empty() {
+                        Ok(opencode_fallback_models())
+                    } else {
+                        Ok(models)
+                    }
+                }
+                _ => Ok(opencode_fallback_models()),
+            }
+        }
+        "claude" => Ok(claude_default_models()),
+        "codex" => Ok(codex_default_models()),
+        "aider" => Ok(aider_default_models()),
+        "gemini" => Ok(gemini_default_models()),
+        _ => Err(format!("Unknown tool: {tool_id}")),
+    }
+}
+
+#[tauri::command]
+pub fn list_thinking_modes_for_tool(tool_id: String) -> Result<Vec<ThinkingModeInfo>, String> {
+    // Thinking modes are relevant for models that support extended reasoning
+    // Currently exposed as a configurable option when using Claude models
+    let modes = match tool_id.as_str() {
+        "opencode" => vec![
+            ThinkingModeInfo { id: "auto".into(), name: "Auto".into(), description: "Let the model decide".into() },
+            ThinkingModeInfo { id: "none".into(), name: "None".into(), description: "Disable extended thinking".into() },
+            ThinkingModeInfo { id: "low".into(), name: "Low".into(), description: "Minimal thinking budget".into() },
+            ThinkingModeInfo { id: "medium".into(), name: "Medium".into(), description: "Balanced thinking budget".into() },
+            ThinkingModeInfo { id: "high".into(), name: "High".into(), description: "Deep reasoning budget".into() },
+        ],
+        _ => vec![],
+    };
+    Ok(modes)
+}
+
+// ─── OpenFlow: Agent spawning (Phase 2) ──────────────────────────────────────
+
+/// Communication log path for a given run.
+fn comm_log_path(run_id: &str) -> String {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("codemux")
+        .join("openflow")
+        .join(format!("{run_id}.log"))
+        .display()
+        .to_string()
+}
+
+/// Resolve the adapter for a given CLI tool id.
+fn adapter_for_tool(tool_id: &str) -> Result<Box<dyn AgentAdapter>, String> {
+    match tool_id {
+        "opencode" => Ok(Box::new(OpenCodeAdapter)),
+        other => Err(format!("No adapter available for CLI tool: {other}")),
+    }
+}
+
+/// Spawn one terminal pane per agent config and start the agent process inside
+/// each pane.  Returns the list of created session IDs in config order.
+#[tauri::command]
+pub fn spawn_openflow_agents(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    agent_store: State<'_, AgentSessionStore>,
+    workspace_id: String,
+    run_id: String,
+    agent_configs: Vec<AgentConfig>,
+) -> Result<Vec<String>, String> {
+    // Ensure the communication log directory exists.
+    let log_path = comm_log_path(&run_id);
+    if let Some(parent) = std::path::Path::new(&log_path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create comm log directory: {e}"))?;
+    }
+
+    let mut session_ids = Vec::with_capacity(agent_configs.len());
+
+    for config in &agent_configs {
+        let adapter = adapter_for_tool(&config.cli_tool)?;
+        let spec = adapter.spawn_spec(config, &run_id, &log_path);
+
+        // Create a terminal session record in the workspace.
+        let session_id = state.add_agent_terminal_to_workspace(&workspace_id, spec.title.clone())?;
+
+        // Register in the agent session store.
+        agent_store.insert(
+            session_id.0.clone(),
+            AgentSessionState {
+                session_id: session_id.0.clone(),
+                run_id: run_id.clone(),
+                config: config.clone(),
+                status: AgentSessionStatus::Spawning,
+            },
+        );
+
+        // Spawn the PTY with the agent command and env vars.
+        crate::terminal::spawn_pty_for_agent(
+            app.clone(),
+            session_id.0.clone(),
+            workspace_id.clone(),
+            spec.argv,
+            spec.env,
+        );
+
+        // Mark as running once PTY spawn is initiated.
+        agent_store.update_status(&session_id.0, AgentSessionStatus::Running);
+
+        session_ids.push(session_id.0);
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(session_ids)
+}
+
+/// Return all agent session states for a given OpenFlow run.
+#[tauri::command]
+pub fn get_agent_sessions_for_run(
+    agent_store: State<'_, AgentSessionStore>,
+    run_id: String,
+) -> Result<Vec<AgentSessionState>, String> {
+    Ok(agent_store.for_run(&run_id))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[tauri::command]
 pub fn get_current_theme() -> Result<ThemeColors, String> {
     Ok(read_theme_colors_or_default())
@@ -136,6 +386,18 @@ pub fn create_workspace(
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
     }
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+#[tauri::command]
+pub fn create_openflow_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    title: String,
+    goal: String,
+) -> Result<String, String> {
+    let workspace_id = state.create_openflow_workspace(title, goal);
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }

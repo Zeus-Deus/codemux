@@ -111,7 +111,12 @@
 
     function goToLayout() {
         if (step === 'kind') {
-            step = 'layout';
+            // OpenFlow skips layout selection - goes straight to details
+            if (selectedKind === 'openflow') {
+                step = 'details';
+            } else {
+                step = 'layout';
+            }
         }
     }
 
@@ -124,7 +129,12 @@
     function chooseKind(kind: WorkspaceTemplateKind) {
         selectedKind = kind;
         selectedFolder = '';
-        goToLayout();
+        // OpenFlow skips layout and goes to details directly
+        if (kind === 'openflow') {
+            step = 'details';
+        } else {
+            step = 'layout';
+        }
     }
 
     function chooseLayout(layout: LayoutPreset) {

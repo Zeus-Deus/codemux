@@ -1,5 +1,11 @@
+pub mod adapters;
+pub mod agent;
+
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+
+use agent::{AgentSessionState, AgentSessionStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -163,6 +169,8 @@ pub struct OpenFlowWorkerState {
     pub assigned_task_ids: Vec<String>,
     pub status: String,
     pub last_output: Option<String>,
+    pub model: Option<String>,
+    pub thinking_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,24 +316,32 @@ impl OpenFlowRuntimeStore {
                     assigned_task_ids: vec![],
                     status: "active".into(),
                     last_output: Some("Run created and waiting on planner".into()),
+                    model: None,
+                    thinking_mode: None,
                 },
                 OpenFlowWorkerState {
                     role: OpenFlowRole::Planner,
                     assigned_task_ids: vec!["task-plan".into()],
                     status: "ready".into(),
                     last_output: None,
+                    model: None,
+                    thinking_mode: None,
                 },
                 OpenFlowWorkerState {
                     role: OpenFlowRole::Builder,
                     assigned_task_ids: vec!["task-build".into()],
                     status: "pending".into(),
                     last_output: None,
+                    model: None,
+                    thinking_mode: None,
                 },
                 OpenFlowWorkerState {
                     role: OpenFlowRole::Reviewer,
                     assigned_task_ids: vec!["task-review".into()],
                     status: "pending".into(),
                     last_output: None,
+                    model: None,
+                    thinking_mode: None,
                 },
             ],
             retry_policy: OpenFlowRetryPolicy {
@@ -777,5 +793,44 @@ fn update_worker_status(
     if let Some(worker) = workers.iter_mut().find(|worker| worker.role == role) {
         worker.status = status.into();
         worker.last_output = last_output.map(str::to_string);
+    }
+}
+
+// ─── Agent session tracking (Phase 2) ────────────────────────────────────────
+
+/// Stores the per-agent-session state for all active OpenFlow runs.
+/// Keyed by terminal session ID.
+#[derive(Default)]
+pub struct AgentSessionStore {
+    inner: Arc<Mutex<HashMap<String, AgentSessionState>>>,
+}
+
+impl AgentSessionStore {
+    pub fn insert(&self, session_id: String, state: AgentSessionState) {
+        self.inner.lock().unwrap().insert(session_id, state);
+    }
+
+    pub fn update_status(&self, session_id: &str, status: AgentSessionStatus) {
+        if let Some(entry) = self.inner.lock().unwrap().get_mut(session_id) {
+            entry.status = status;
+        }
+    }
+
+    pub fn get(&self, session_id: &str) -> Option<AgentSessionState> {
+        self.inner.lock().unwrap().get(session_id).cloned()
+    }
+
+    pub fn for_run(&self, run_id: &str) -> Vec<AgentSessionState> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| s.run_id == run_id)
+            .cloned()
+            .collect()
+    }
+
+    pub fn all(&self) -> Vec<AgentSessionState> {
+        self.inner.lock().unwrap().values().cloned().collect()
     }
 }
