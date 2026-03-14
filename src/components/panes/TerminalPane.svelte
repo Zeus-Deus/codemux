@@ -213,6 +213,12 @@
                 ev.preventDefault?.();
                 return false;
             }
+            // Shift+Enter -> send newline (for OpenCode)
+            if (ev.shiftKey && ev.key === 'Enter') {
+                term?.input('\n');
+                ev.preventDefault?.();
+                return false;
+            }
             // Ctrl+Shift+C -> copy (when text is selected)
             if (ev.ctrlKey && ev.shiftKey && ev.key === 'C') {
                 const selection = term?.getSelection();
