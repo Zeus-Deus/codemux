@@ -128,7 +128,8 @@ impl Orchestrator {
         let mut blocked = Vec::new();
         let mut assignments = Vec::new();
         let mut status_updates = Vec::new();
-        let mut user_injections = Vec::new();
+        let mut all_injections = Vec::new();
+        let mut last_handled_count: usize = 0;
 
         for entry in entries {
             let role_lower = entry.role.to_lowercase();
@@ -150,16 +151,33 @@ impl Orchestrator {
             } else if role_lower.contains("status") || role_lower.contains("phase") {
                 status_updates.push(entry.message.clone());
             } else if role_lower.contains("user/inject") || entry.message.starts_with("@instruct") {
-                user_injections.push(entry.message.clone());
+                all_injections.push(entry.message.clone());
+            } else if role_lower == "system" {
+                // Track the highest HANDLED_INJECTIONS marker seen so far
+                if let Some(rest) = entry.message.strip_prefix("HANDLED_INJECTIONS: ") {
+                    if let Ok(n) = rest.trim().parse::<usize>() {
+                        if n > last_handled_count {
+                            last_handled_count = n;
+                        }
+                    }
+                }
             }
         }
+
+        // Only return injections that have not yet been handled
+        let unhandled_injections = if last_handled_count < all_injections.len() {
+            all_injections[last_handled_count..].to_vec()
+        } else {
+            vec![]
+        };
 
         OrchestratorAnalysis {
             completed_roles: completed,
             blocked_roles: blocked,
             assignments,
             status_updates,
-            user_injections,
+            user_injections: unhandled_injections,
+            total_injections: all_injections.len(),
         }
     }
 
@@ -208,10 +226,16 @@ impl Orchestrator {
             .iter()
             .any(|s| s.to_lowercase().contains("run complete"));
 
+        // User injections always take priority in any active phase.
+        let has_unhandled_injection = !analysis.user_injections.is_empty();
+
         match current_phase {
             OrchestratorPhase::Planning => {
                 if run_complete {
                     Some(OrchestratorPhase::Completed)
+                } else if has_unhandled_injection {
+                    // Re-enter planning so the orchestrator AI picks up the new context
+                    Some(OrchestratorPhase::Replanning)
                 } else if analysis.assignments.is_empty() {
                     None
                 } else {
@@ -221,6 +245,8 @@ impl Orchestrator {
             OrchestratorPhase::Executing => {
                 if run_complete {
                     Some(OrchestratorPhase::Completed)
+                } else if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
                 } else if !analysis.blocked_roles.is_empty() {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.completed_roles.contains(&OpenFlowRole::Builder) {
@@ -232,6 +258,8 @@ impl Orchestrator {
             OrchestratorPhase::Verifying => {
                 if run_complete {
                     Some(OrchestratorPhase::Completed)
+                } else if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
                 } else if !analysis.blocked_roles.is_empty() {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.completed_roles.contains(&OpenFlowRole::Tester)
@@ -242,17 +270,23 @@ impl Orchestrator {
                     None
                 }
             }
-            OrchestratorPhase::Reviewing => Some(OrchestratorPhase::WaitingApproval),
+            OrchestratorPhase::Reviewing => {
+                if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
+                } else {
+                    Some(OrchestratorPhase::WaitingApproval)
+                }
+            }
             OrchestratorPhase::WaitingApproval => {
-                if !analysis.user_injections.is_empty() {
-                    Some(OrchestratorPhase::Planning)
+                if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
                 } else {
                     None
                 }
             }
             OrchestratorPhase::Replanning => Some(OrchestratorPhase::Planning),
             OrchestratorPhase::Completed => {
-                if !analysis.user_injections.is_empty() {
+                if has_unhandled_injection {
                     Some(OrchestratorPhase::Planning)
                 } else {
                     None
@@ -276,5 +310,8 @@ pub struct OrchestratorAnalysis {
     pub blocked_roles: Vec<OpenFlowRole>,
     pub assignments: Vec<String>,
     pub status_updates: Vec<String>,
+    /// Injections that have NOT yet been handled (i.e. count > last HANDLED_INJECTIONS marker).
     pub user_injections: Vec<String>,
+    /// Total number of injections ever written to the log (including already-handled ones).
+    pub total_injections: usize,
 }
