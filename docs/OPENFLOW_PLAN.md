@@ -1,6 +1,6 @@
 # OpenFlow Orchestration Plan
 
-## Status: 🔄 Phase 4 Next (Phases 1–3 Complete)
+## Status: 🔄 Phase 5 Complete (Phases 1–5 Complete)
 
 This document describes the implementation of **OpenFlow**, a multi-agent orchestration system where a swarm of AI coding agents collaboratively build, test, and review software based on a user prompt.
 
@@ -288,10 +288,15 @@ src-tauri/src/
 - [ ] Smooth animations
 
 ### Phase 5: Orchestrator Logic
-- [ ] Orchestrator agent has special system prompt
-- [ ] Orchestrator reads other agents' outputs from communication log
-- [ ] Orchestrator assigns tasks and decides next phase
-- [ ] Phase loop: plan → execute → verify → review → (replan if needed)
+- [x] System prompts for each agent role (orchestrator, planner, builder, reviewer, tester, debugger, researcher)
+- [x] Agent adapter includes system prompt path via CODEMUX_SYSTEM_PROMPT_PATH env var
+- [x] Wrapper script that reads prompt and passes to opencode via --prompt flag
+- [x] Orchestrator module with communication log analysis
+- [x] Task assignment message generation
+- [x] Phase advancement logic based on DONE/BLOCKED messages
+- [x] Tauri command `trigger_orchestrator_cycle` to drive orchestration
+- [x] Frontend "Orchestrate" button to trigger the cycle
+- [x] Communication panel auto-refreshes every 2 seconds
 
 ### Phase 6: Browser Verification Integration
 - [ ] Test agents can call `codemux browser ...` commands

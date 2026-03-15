@@ -15,6 +15,7 @@ use crate::openflow::{
 use crate::openflow::agent::{AgentConfig, AgentSessionState, AgentSessionStatus};
 use crate::openflow::adapters::AgentAdapter;
 use crate::openflow::adapters::opencode::OpenCodeAdapter;
+use crate::openflow::orchestrator::{Orchestrator, OrchestratorPhase};
 use crate::observability::{
     FeatureFlags, LogLevel, ObservabilitySnapshot, ObservabilityStore, PermissionPolicy,
     SafetyConfig,
@@ -273,11 +274,12 @@ pub fn list_thinking_modes_for_tool(tool_id: String) -> Result<Vec<ThinkingModeI
 
 /// Communication log path for a given run.
 fn comm_log_path(run_id: &str) -> String {
-    dirs::cache_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("codemux")
-        .join("openflow")
-        .join(format!("{run_id}.log"))
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".codemux")
+        .join("runs")
+        .join(run_id)
+        .join("communication.log")
         .display()
         .to_string()
 }
@@ -299,6 +301,8 @@ pub fn spawn_openflow_agents(
     agent_store: State<'_, AgentSessionStore>,
     workspace_id: String,
     run_id: String,
+    goal: String,
+    working_directory: String,
     agent_configs: Vec<AgentConfig>,
 ) -> Result<Vec<String>, String> {
     // Ensure the communication log directory exists.
@@ -308,14 +312,45 @@ pub fn spawn_openflow_agents(
             .map_err(|e| format!("Failed to create comm log directory: {e}"))?;
     }
 
+    // Write the goal to a file so agents can read it
+    let goal_path = std::path::Path::new(&log_path)
+        .parent()
+        .unwrap()
+        .join("goal.txt");
+    std::fs::write(&goal_path, &goal)
+        .map_err(|e| format!("Failed to write goal file: {e}"))?;
+    let goal_path_str = goal_path.display().to_string();
+
+    // Write initial goal message to the communication log
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    let roles_str: Vec<String> = agent_configs.iter().map(|c| c.role.as_str().to_string()).collect();
+    let initial_msg = format!(
+        "[{}] [SYSTEM] GOAL: {}\n[{}] [SYSTEM] AGENTS: {}\n",
+        timestamp, goal, timestamp, roles_str.join(", ")
+    );
+    std::fs::write(&log_path, &initial_msg)
+        .map_err(|e| format!("Failed to write initial log: {e}"))?;
+
+    // Ensure system prompts exist and write role-specific prompts for this run.
+    use crate::openflow::prompts::SystemPrompts;
+    SystemPrompts::ensure_prompts_exist()
+        .map_err(|e| format!("Failed to create prompts directory: {e}"))?;
+    SystemPrompts::ensure_wrapper_exists()
+        .map_err(|e| format!("Failed to create wrapper script: {e}"))?;
+    
+    for config in &agent_configs {
+        SystemPrompts::write_prompt_for_run(&config.role, &run_id, &log_path)
+            .map_err(|e| format!("Failed to write prompt for {:?}: {}", config.role, e))?;
+    }
+
     let mut session_ids = Vec::with_capacity(agent_configs.len());
 
     for config in &agent_configs {
         let adapter = adapter_for_tool(&config.cli_tool)?;
-        let spec = adapter.spawn_spec(config, &run_id, &log_path);
+        let spec = adapter.spawn_spec(config, &run_id, &log_path, &goal_path_str, &working_directory);
 
-        // Create a terminal session record in the workspace.
-        let session_id = state.add_agent_terminal_to_workspace(&workspace_id, spec.title.clone())?;
+        // Create a terminal session record in the workspace with the correct directory.
+        let session_id = state.add_agent_terminal_to_workspace(&workspace_id, spec.title.clone(), working_directory.clone())?;
 
         // Register in the agent session store.
         agent_store.insert(
@@ -334,11 +369,30 @@ pub fn spawn_openflow_agents(
             session_id.0.clone(),
             workspace_id.clone(),
             spec.argv,
-            spec.env,
+            spec.env.clone(),
         );
 
         // Mark as running once PTY spawn is initiated.
         agent_store.update_status(&session_id.0, AgentSessionStatus::Running);
+
+        // Log that this agent was started
+        let role_str = config.role.as_str().to_uppercase();
+        let log_path_clone = log_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if let Err(e) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path_clone)
+                .and_then(|mut f| {
+                    let entry = format!("[{}] [SYSTEM] Started agent: {}\n", 
+                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                        role_str);
+                    std::io::Write::write_all(&mut f, entry.as_bytes())
+                }) {
+                eprintln!("Failed to log agent start: {}", e);
+            }
+        });
 
         session_ids.push(session_id.0);
     }
@@ -391,6 +445,62 @@ pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<()
         .map_err(|e| format!("Failed to write to comm log: {e}"))?;
 
     Ok(())
+}
+
+/// Trigger the orchestrator to analyze communication log and advance the run.
+#[tauri::command]
+pub fn trigger_orchestrator_cycle(
+    runtime: State<'_, OpenFlowRuntimeStore>,
+    run_id: String,
+) -> Result<OrchestratorTriggerResult, String> {
+    let snapshot = runtime.snapshot();
+    let run = snapshot
+        .active_runs
+        .iter()
+        .find(|r| r.run_id == run_id)
+        .ok_or_else(|| format!("No run found for {run_id}"))?;
+
+    let phase = OrchestratorPhase::from_string(&run.current_phase);
+    let entries = Orchestrator::read_communication_log(&run_id)
+        .map_err(|e| format!("Failed to read comm log: {e}"))?;
+    
+    let analysis = Orchestrator::analyze_comm_log(&entries);
+    
+    let next_phase = Orchestrator::determine_next_phase(&phase, &analysis);
+    
+    let actions_taken = if !analysis.user_injections.is_empty() {
+        vec![format!("Incorporated {} user injections", analysis.user_injections.len())]
+    } else {
+        vec![]
+    };
+
+    Ok(OrchestratorTriggerResult {
+        current_phase: phase.as_str().to_string(),
+        next_phase: next_phase.as_ref().map(|p| p.as_str().to_string()),
+        analysis: OrchestratorAnalysisDto {
+            completed_roles: analysis.completed_roles.iter().map(|r| r.as_str().to_string()).collect(),
+            blocked_roles: analysis.blocked_roles.iter().map(|r| r.as_str().to_string()).collect(),
+            assignments_count: analysis.assignments.len(),
+            user_injections_count: analysis.user_injections.len(),
+        },
+        actions_taken,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct OrchestratorTriggerResult {
+    pub current_phase: String,
+    pub next_phase: Option<String>,
+    pub analysis: OrchestratorAnalysisDto,
+    pub actions_taken: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+pub struct OrchestratorAnalysisDto {
+    pub completed_roles: Vec<String>,
+    pub blocked_roles: Vec<String>,
+    pub assignments_count: usize,
+    pub user_injections_count: usize,
 }
 
 /// Parse a single line from the communication log.
@@ -467,8 +577,12 @@ pub fn create_openflow_workspace(
     state: State<'_, AppStateStore>,
     title: String,
     goal: String,
+    cwd: Option<String>,
 ) -> Result<String, String> {
-    let workspace_id = state.create_openflow_workspace(title, goal);
+    let workspace_id = match cwd {
+        Some(path) => state.create_openflow_workspace_at_path(title, goal, PathBuf::from(path)),
+        None => state.create_openflow_workspace(title, goal),
+    };
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -533,6 +647,21 @@ pub fn rename_workspace(
     title: String,
 ) -> Result<(), String> {
     if state.rename_workspace(&workspace_id, title) {
+        crate::state::emit_app_state(&app);
+        Ok(())
+    } else {
+        Err(format!("No workspace found for {workspace_id}"))
+    }
+}
+
+#[tauri::command]
+pub fn update_workspace_cwd(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    cwd: String,
+) -> Result<(), String> {
+    if state.update_workspace_cwd(&workspace_id, cwd) {
         crate::state::emit_app_state(&app);
         Ok(())
     } else {

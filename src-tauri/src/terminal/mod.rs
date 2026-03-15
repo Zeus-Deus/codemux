@@ -9,6 +9,40 @@ use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 use crate::project::current_project_root;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
+fn strip_ansi_codes(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+    let mut escape_buf = String::new();
+
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            escape_buf.clear();
+        } else if in_escape {
+            if c.is_ascii_alphanumeric()
+                || c == '@'
+                || c == '['
+                || c == ']'
+                || c == ';'
+                || c == '?'
+                || c == ' '
+            {
+                escape_buf.push(c);
+                // CSI sequences end with letters, OSC with bell/ST
+                if c.is_ascii_lowercase() || c.is_ascii_uppercase() || c == '@' || c == '`' {
+                    in_escape = false;
+                }
+            } else if c == '\\' || c == '\x07' {
+                // ST (String Terminator) or BEL
+                in_escape = false;
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const OUTPUT_BUFFER_LIMIT: usize = 4096;
@@ -775,14 +809,58 @@ pub fn spawn_pty_for_agent(
         },
     );
 
+    // Get communication log path from env vars
+    let comm_log_path = extra_env
+        .iter()
+        .find(|(k, _)| k == "CODEMUX_COMMUNICATION_LOG")
+        .map(|(_, v)| v.clone());
+    let agent_role = extra_env
+        .iter()
+        .find(|(k, _)| k == "CODEMUX_AGENT_ROLE")
+        .map(|(_, v)| v.clone());
+
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+
         loop {
             match reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let chunk = buf[..n].to_vec();
+
+                    // Write agent output to communication log (cleaned)
+                    if let (Some(comm_log), Some(role)) =
+                        (comm_log_path.as_ref(), agent_role.as_ref())
+                    {
+                        if let Ok(text) = String::from_utf8(chunk.clone()) {
+                            // Strip ANSI escape codes
+                            let cleaned = strip_ansi_codes(&text);
+                            let trimmed = cleaned.trim();
+
+                            // Only log meaningful lines (not empty, not just prompt chars)
+                            if !trimmed.is_empty() && trimmed.len() > 2 
+                                && !trimmed.starts_with('\x1b')  // escape
+                                && !trimmed.chars().all(|c| c.is_whitespace() || c == '▀' || c == '▄' || c == '█' || c == ' ')
+                            {
+                                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                let entry = format!(
+                                    "[{}] [{}] {}\n",
+                                    timestamp,
+                                    role.to_uppercase(),
+                                    trimmed
+                                );
+                                let _ = std::fs::OpenOptions::new()
+                                    .create(true)
+                                    .append(true)
+                                    .open(comm_log)
+                                    .and_then(|mut f: std::fs::File| {
+                                        std::io::Write::write_all(&mut f, entry.as_bytes())
+                                    });
+                            }
+                        }
+                    }
+
                     queue_or_send_output(&read_sessions, &read_session_id, chunk);
                 }
                 Ok(_) => break,

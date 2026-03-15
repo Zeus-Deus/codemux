@@ -21,7 +21,16 @@
         try {
             const loaded = await getCommunicationLog(runId);
             console.log('[CommPanel] Loaded', loaded.length, 'messages for runId:', runId);
+            
+            const hadMessages = messages.length;
             messages = loaded;
+            
+            // Auto-scroll to bottom when new messages arrive
+            if (messages.length > hadMessages && messagesContainer) {
+                setTimeout(() => {
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }, 50);
+            }
         } catch (e) {
             console.log('[CommPanel] Error loading messages:', e);
             messages = [];

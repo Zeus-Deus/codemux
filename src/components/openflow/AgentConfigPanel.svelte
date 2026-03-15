@@ -18,15 +18,17 @@
         type ModelInfo,
         type ThinkingModeInfo,
     } from '../../stores/appState';
+    import { invoke } from '@tauri-apps/api/core';
 
     const dispatch = createEventDispatcher<{
-        start: { title: string; goal: string; agentConfigs: AgentConfig[] };
+        start: { title: string; goal: string; directory: string; agentConfigs: AgentConfig[] };
     }>();
 
     // ── local state ──────────────────────────────────────────────────────────
     let agentCount = $state(5);
     let titleDraft = $state('');
     let goalDraft = $state('');
+    let selectedDirectory = $state<string | null>(null);
 
     // Discovery state
     let availableTools = $state<CliToolInfo[]>([]);
@@ -156,12 +158,23 @@
 
     // ── form submit ──────────────────────────────────────────────────────────
     function handleStart() {
-        if (!titleDraft.trim() || !goalDraft.trim()) return;
+        if (!titleDraft.trim() || !goalDraft.trim() || !selectedDirectory) return;
         dispatch('start', {
             title: titleDraft.trim(),
             goal: goalDraft.trim(),
+            directory: selectedDirectory,
             agentConfigs: agents.map(a => ({ ...a })),
         });
+    }
+
+    async function chooseFolder() {
+        const selection = await invoke<string | null>('pick_folder_dialog', {
+            title: 'Choose project folder for OpenFlow'
+        });
+
+        if (typeof selection === 'string') {
+            selectedDirectory = selection;
+        }
     }
 
     // ── derived helpers ──────────────────────────────────────────────────────
@@ -268,6 +281,20 @@
             </div>
         </div>
 
+        <div class="config-section directory-section">
+            <h3>Project Directory</h3>
+            <div class="directory-picker">
+                {#if selectedDirectory}
+                    <span class="selected-directory">{selectedDirectory}</span>
+                {:else}
+                    <span class="no-directory">No directory selected</span>
+                {/if}
+                <button class="folder-btn" type="button" onclick={chooseFolder}>
+                    Choose Folder
+                </button>
+            </div>
+        </div>
+
         <div class="config-section goal-section">
             <h3>What do you want to build?</h3>
             <input
@@ -288,7 +315,7 @@
                 class="start-btn"
                 type="button"
                 onclick={handleStart}
-                disabled={!titleDraft.trim() || !goalDraft.trim()}
+                disabled={!titleDraft.trim() || !goalDraft.trim() || !selectedDirectory}
             >
                 Start Orchestration
             </button>
@@ -469,6 +496,54 @@
         color: var(--ui-text-muted);
         font-size: 0.85rem;
         text-align: center;
+    }
+
+    .directory-section h3 {
+        margin: 0 0 16px;
+        font-size: 1.1rem;
+        font-weight: 600;
+        color: var(--ui-text-primary);
+    }
+
+    .directory-picker {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 16px;
+        background: var(--ui-layer-0);
+        border: 1px solid var(--ui-border-soft);
+        border-radius: 8px;
+    }
+
+    .selected-directory {
+        flex: 1;
+        color: var(--ui-text-primary);
+        font-size: 0.9rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .no-directory {
+        flex: 1;
+        color: var(--ui-text-muted);
+        font-size: 0.9rem;
+    }
+
+    .folder-btn {
+        padding: 10px 20px;
+        background: var(--ui-layer-2);
+        border: 1px solid var(--ui-border-soft);
+        border-radius: 6px;
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.9rem;
+        cursor: pointer;
+        transition: background 0.2s ease;
+    }
+
+    .folder-btn:hover {
+        background: var(--ui-layer-3);
     }
 
     .goal-section h3 {

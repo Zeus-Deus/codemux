@@ -13,13 +13,21 @@ pub struct AgentSpawnSpec {
     pub env: Vec<(String, String)>,
     /// Suggested terminal title for this agent's pane.
     pub title: String,
+    /// Path to the system prompt file for this agent.
+    pub system_prompt_path: Option<String>,
 }
 
 /// Pluggable adapter interface for spawning agent CLI tools.
 pub trait AgentAdapter: Send + Sync {
     /// Return the spawn spec for this agent config.
-    fn spawn_spec(&self, config: &AgentConfig, run_id: &str, comm_log_path: &str)
-        -> AgentSpawnSpec;
+    fn spawn_spec(
+        &self,
+        config: &AgentConfig,
+        run_id: &str,
+        comm_log_path: &str,
+        goal_path: &str,
+        working_directory: &str,
+    ) -> AgentSpawnSpec;
 }
 
 pub mod opencode;

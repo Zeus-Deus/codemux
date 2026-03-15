@@ -364,14 +364,26 @@ impl AppStateStore {
     }
 
     pub fn create_openflow_workspace(&self, title: String, _goal: String) -> WorkspaceId {
+        self.create_openflow_workspace_at_path(title, _goal, current_project_root())
+    }
+
+    pub fn create_openflow_workspace_at_path(
+        &self,
+        title: String,
+        _goal: String,
+        cwd_path: PathBuf,
+    ) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
         let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
-        let cwd = current_project_root().display().to_string();
+        let cwd = cwd_path.display().to_string();
         let _workspace_index = snapshot.workspaces.len() + 1;
         let pane_id = PaneId(next_id("pane"));
 
-        eprintln!("DEBUG: Creating OpenFlow workspace with title: {}", title);
+        eprintln!(
+            "DEBUG: Creating OpenFlow workspace with title: {} at {}",
+            title, cwd
+        );
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
@@ -409,9 +421,10 @@ impl AppStateStore {
         &self,
         workspace_id: &str,
         title: String,
+        working_directory: String,
     ) -> Result<SessionId, String> {
         let mut snapshot = self.inner.lock().unwrap();
-        let cwd = current_project_root().display().to_string();
+        let cwd = working_directory;
 
         let session_id = SessionId(next_id("session"));
         let pane_id = PaneId(next_id("pane"));
@@ -613,6 +626,19 @@ impl AppStateStore {
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
             workspace.title = title;
+            return true;
+        }
+        false
+    }
+
+    pub fn update_workspace_cwd(&self, workspace_id: &str, cwd: String) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.cwd = cwd;
             return true;
         }
         false

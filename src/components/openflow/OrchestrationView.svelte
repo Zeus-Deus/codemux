@@ -1,11 +1,15 @@
 <script lang="ts">
-    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, type AgentSessionState } from '../../stores/appState';
+    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, createBrowserPane, type AgentSessionState } from '../../stores/appState';
     import type { OpenFlowRunRecord } from '../../stores/appState';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
     import { onMount } from 'svelte';
 
+    import { onDestroy } from 'svelte';
+
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
+
+    let browserPaneCreated = $state(false);
 
     // Find run by runId directly - this is more reliable than deriving from runtime
     const run = $derived(
@@ -15,6 +19,33 @@
     );
 
     let agentSessions = $state<AgentSessionState[]>([]);
+    let orchestratorInterval: ReturnType<typeof setInterval> | null = null;
+
+    // Auto-trigger orchestration on mount
+    $effect(() => {
+        if (runId) {
+            // Trigger orchestration after a short delay to let agents initialize
+            setTimeout(() => {
+                if (runId) {
+                    triggerOrchestratorCycle(runId).catch(console.error);
+                }
+            }, 3000);
+
+            // Start auto-orchestration loop
+            orchestratorInterval = setInterval(() => {
+                if (runId && run && run.status !== 'completed' && run.status !== 'cancelled') {
+                    triggerOrchestratorCycle(runId).catch(console.error);
+                }
+            }, 10000);
+        }
+
+        return () => {
+            if (orchestratorInterval) {
+                clearInterval(orchestratorInterval);
+                orchestratorInterval = null;
+            }
+        };
+    });
 
     $effect(() => {
         if (runId) {
@@ -93,6 +124,16 @@
         }
     }
 
+    async function handleOrchestrate() {
+        if (!runId) return;
+        try {
+            const result = await triggerOrchestratorCycle(runId);
+            console.log('Orchestrator result:', result);
+        } catch (e) {
+            console.error('Orchestrator error:', e);
+        }
+    }
+
     async function handlePause() {
         if (!runId) return;
         try {
@@ -126,6 +167,17 @@
             await retryOpenFlowRun(runId);
         } catch (e) {
             console.error('Retry error:', e);
+        }
+    }
+
+    async function handleToggleBrowser() {
+        try {
+            if (!browserPaneCreated) {
+                await createBrowserPane('openflow-browser');
+                browserPaneCreated = true;
+            }
+        } catch (e) {
+            console.error('Browser toggle error:', e);
         }
     }
 
@@ -194,7 +246,9 @@
                 {/if}
             </div>
             <div class="orch-controls">
+                <button class="control-btn" class:active={browserPaneCreated} type="button" onclick={handleToggleBrowser}>Browser</button>
                 {#if run && run.status !== 'completed' && run.status !== 'cancelled' && run.status !== 'failed'}
+                    <button class="control-btn" type="button" onclick={handleOrchestrate}>Orchestrate</button>
                     <button class="control-btn" type="button" onclick={handleLoop}>Loop</button>
                     <button class="control-btn" type="button" onclick={handleNext}>Next</button>
                     <button class="control-btn" type="button" onclick={handlePause}>Pause</button>

@@ -182,6 +182,7 @@ export interface OpenFlowCreateRunRequest {
     title: string;
     goal: string;
     agent_roles: string[];
+    cwd?: string;
 }
 
 export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
@@ -314,8 +315,12 @@ export async function createWorkspaceAtPath(cwd: string) {
     return invoke<string>('create_workspace', { cwd });
 }
 
-export async function createOpenFlowWorkspace(title: string, goal: string) {
-    return invoke<string>('create_openflow_workspace', { title, goal });
+export async function updateWorkspaceCwd(workspaceId: string, cwd: string) {
+    return invoke('update_workspace_cwd', { workspaceId, cwd });
+}
+
+export async function createOpenFlowWorkspace(title: string, goal: string, cwd?: string) {
+    return invoke<string>('create_openflow_workspace', { title, goal, cwd: cwd || null });
 }
 
 export async function createWorkspaceWithPreset(options: {
@@ -328,10 +333,11 @@ export async function createWorkspaceWithPreset(options: {
     let workspaceId: string;
 
     if (options.kind === 'openflow') {
-        // Create OpenFlow workspace directly
+        // Create OpenFlow workspace directly with optional cwd
         workspaceId = await invoke<string>('create_openflow_workspace', {
             title: options.openflowTitle || 'OpenFlow',
-            goal: options.openflowGoal || ''
+            goal: options.openflowGoal || '',
+            cwd: options.cwd?.trim() ? options.cwd.trim() : null
         });
     } else {
         // Create standard workspace
@@ -672,11 +678,15 @@ export interface AgentSessionState {
 export async function spawnOpenflowAgents(
     workspaceId: string,
     runId: string,
+    goal: string,
+    workingDirectory: string,
     agentConfigs: AgentConfig[],
 ): Promise<string[]> {
     return invoke<string[]>('spawn_openflow_agents', {
         workspaceId,
         runId,
+        goal,
+        workingDirectory,
         agentConfigs,
     });
 }
@@ -697,4 +707,20 @@ export async function getCommunicationLog(runId: string): Promise<CommLogEntry[]
 
 export async function injectOrchestratorMessage(runId: string, message: string): Promise<void> {
     return invoke<void>('inject_orchestrator_message', { runId, message });
+}
+
+export interface OrchestratorTriggerResult {
+    current_phase: string;
+    next_phase: string | null;
+    analysis: {
+        completed_roles: string[];
+        blocked_roles: string[];
+        assignments_count: number;
+        user_injections_count: number;
+    };
+    actions_taken: string[];
+}
+
+export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
+    return invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
 }

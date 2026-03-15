@@ -1,5 +1,7 @@
 pub mod adapters;
 pub mod agent;
+pub mod orchestrator;
+pub mod prompts;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -30,6 +32,18 @@ impl OpenFlowRole {
             "debugger" => Some(Self::Debugger),
             "researcher" => Some(Self::Researcher),
             _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Orchestrator => "orchestrator",
+            Self::Planner => "planner",
+            Self::Builder => "builder",
+            Self::Reviewer => "reviewer",
+            Self::Tester => "tester",
+            Self::Debugger => "debugger",
+            Self::Researcher => "researcher",
         }
     }
 }

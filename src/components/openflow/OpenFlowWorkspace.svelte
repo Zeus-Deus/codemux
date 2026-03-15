@@ -1,7 +1,7 @@
 <script lang="ts">
     import { fade } from 'svelte/transition';
     import type { WorkspaceSnapshot } from '../../stores/appState';
-    import { openflowRuntime, createOpenFlowRun, spawnOpenflowAgents } from '../../stores/appState';
+    import { openflowRuntime, createOpenFlowRun, spawnOpenflowAgents, updateWorkspaceCwd } from '../../stores/appState';
     import AgentConfigPanel from './AgentConfigPanel.svelte';
     import OrchestrationView from './OrchestrationView.svelte';
     import type { AgentConfig } from './AgentConfigPanel.svelte';
@@ -39,26 +39,33 @@
     });
 
     async function handleStartRun(
-        event: CustomEvent<{ title: string; goal: string; agentConfigs: AgentConfig[] }>
+        event: CustomEvent<{ title: string; goal: string; directory: string; agentConfigs: AgentConfig[] }>
     ) {
         spawnError = null;
         try {
+            // Update workspace cwd to the selected directory
+            await updateWorkspaceCwd(workspace.workspace_id, event.detail.directory);
+            console.log('[OpenFlow] Updated workspace cwd to:', event.detail.directory);
+
             // Create the run
             const created = await createOpenFlowRun({
                 title: event.detail.title,
                 goal: event.detail.goal,
                 agent_roles: event.detail.agentConfigs.map(c => c.role)
             });
-            console.log('[OpenFlow] Created NEW run with ID:', created.run_id, 'title:', created.title);
+            console.log('[OpenFlow] Created NEW run with ID:', created.run_id, 'title:', created.title, 'directory:', event.detail.directory);
             
             // Switch to orchestration immediately
             currentRunId = created.run_id;
             view = 'orchestration';
             
             // Try to spawn agents (non-blocking)
+            console.log('[OpenFlow] Spawning agents with configs:', JSON.stringify(event.detail.agentConfigs));
             spawnOpenflowAgents(
                 workspace.workspace_id,
                 created.run_id,
+                event.detail.goal,  // Pass the goal
+                event.detail.directory,  // Pass the working directory
                 event.detail.agentConfigs.map((cfg, i) => ({
                     agent_index: i,
                     cli_tool: cfg.cliTool,
@@ -67,7 +74,9 @@
                     thinking_mode: cfg.thinkingMode ?? '',
                     role: cfg.role,
                 })),
-            ).catch(e => console.error('[OpenFlow] Spawn error:', e));
+            ).then(sessionIds => {
+                console.log('[OpenFlow] Agents spawned, session IDs:', sessionIds);
+            }).catch(e => console.error('[OpenFlow] Spawn error:', e));
             
         } catch (error) {
             console.error('[OpenFlow] Failed to start run:', error);
