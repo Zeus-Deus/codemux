@@ -35,9 +35,9 @@ OpenFlow must be designed as a **standalone, embeddable orchestration engine**, 
 │                   OpenFlow Core (Rust)                       │
 │  - Orchestration engine                                     │
 │  - Run state machine                                        │
-│  - Phase management                                         │
+│  - Phase management                                        │
 │  - Checkpoint/approval system                               │
-│  - Persistence                                              │
+│  - Persistence                                             │
 └─────────────────────────────────────────────────────────────┘
                            │
                            ▼
@@ -45,9 +45,9 @@ OpenFlow must be designed as a **standalone, embeddable orchestration engine**, 
 │                 Agent Adapters (Pluggable)                   │
 │  - OpenCodeAdapter                                          │
 │  - ClaudeAdapter                                            │
-│  - CodexAdapter                                             │
-│  - AiderAdapter                                             │
-│  - CustomAdapter                                            │
+│  - CodexAdapter                                            │
+│  - AiderAdapter                                            │
+│  - CustomAdapter                                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -63,13 +63,17 @@ OpenFlow must be designed as a **standalone, embeddable orchestration engine**, 
 - **Tester Agent**: Uses browser automation (`codemux browser open`, `snapshot`, `click`, etc.)
 - **RUN COMPLETE**: Orchestrator signals completion
 - **User Injection**: User can send messages to orchestrator
-- **Browser Pane**: Created automatically on run start (partially working)
 - **Auto-orchestration**: Loop triggers every 10 seconds
+- **Phase Transitions**: Working - Plan → Execute → Verify → Review → WaitingApproval
+- **User Messages After Completion**: Detected and triggers workflow restart (phase goes back to Planning)
+- **UI Improvements**: Timeline removed, orchestration view takes full screen
+- **Browser Toggle Button**: Toggles between Orchestration view and Browser placeholder view
 
 ### ⚠️ Known Issues (To Fix)
-1. **Browser button doesn't work** - Button to switch to browser pane not functional
-2. **User messages after completion** - Orchestrator doesn't respond to user messages after RUN COMPLETE
-3. **Working directory** - Some agents still run in wrong directory (fix in progress)
+1. **Orchestrator doesn't directly respond to user questions** - When user sends message during/after run, orchestrator restarts workflow instead of answering simple questions directly
+2. **Browser placeholder view only** - The "Browser" button toggles a placeholder view, not showing actual browser content from agents
+3. **User messages during execution ignored** - Only triggers restart after reaching "awaiting_approval" phase
+4. **Working directory** - Some agents may run in wrong directory
 
 ---
 
@@ -142,13 +146,13 @@ The UI shows:
 - **Top:** Orchestrator status and current task
 - **Visual Node Graph:** Agents as nodes connected by lines showing who is talking to whom
 - **Right Panel:** Communication log (what agents are saying to each other)
-- **Browser Pane:** Always available in background for test agents
+- **Browser Button:** Toggle between Orchestration view and Browser placeholder
 
 ### Step 5: Monitor & Intervene
 - Watch agents work in real-time via node graph
 - See communication in right panel
-- **Inject to orchestrator:** Type message in communication panel (orchestrator decides how to incorporate)
-- Click "Browser" button to switch to browser pane
+- **Inject to orchestrator:** Type message in communication panel
+- Click "Browser" button to toggle browser placeholder view
 - Pause/resume/cancel run
 
 ---
@@ -160,13 +164,11 @@ The UI shows:
 ```
 OpenFlowWorkspace/
 ├── AgentConfigPanel.svelte      # Setup: how many agents, what tools
-│                                 # (dynamically discovers available CLI tools, models, providers)
-├── OrchestrationView.svelte      # Main UI with visual node graph
+├── OrchestrationView.svelte      # Main UI with visual node graph + browser toggle
 ├── AgentNode.svelte             # Individual agent node in the graph
 ├── AgentEdge.svelte             # Connection lines between agents
 ├── CommunicationPanel.svelte    # Right panel: inter-agent chat + user input
-├── NodeGraph.svelte            # Visual representation of agent network
-└── TimelinePanel.svelte         # Run timeline and artifacts
+└── NodeGraph.svelte            # Visual representation of agent network
 ```
 
 ### Backend Structure (Modular)
@@ -177,16 +179,16 @@ src-tauri/src/
 │   ├── mod.rs                   # Main orchestration engine (CORE - extractable)
 │   ├── agent.rs                 # Agent configuration (CORE)
 │   ├── orchestrator.rs          # Orchestrator logic (CORE)
-│   ├── prompts.rs               # System prompts for each agent role
+│   ├── prompts.rs              # System prompts for each agent role
 │   ├── communication.rs         # Inter-agent message passing (CORE)
-│   ├── state.rs                 # OpenFlow run state (CORE)
+│   ├── state.rs                # OpenFlow run state (CORE)
 │   └── adapters/
-│       ├── mod.rs               # Adapter trait (CORE)
-│       └── opencode.rs          # OpenCode adapter
+│       ├── mod.rs              # Adapter trait (CORE)
+│       └── opencode.rs         # OpenCode adapter
 │
 ├── commands.rs                  # Tauri commands including spawn_openflow_agents
 └── terminal/
-    └── mod.rs                   # PTY spawning with correct working directory
+    └── mod.rs                  # PTY spawning with correct working directory
 ```
 
 ### Agent Spawning
@@ -210,15 +212,14 @@ src-tauri/src/
        ▼                                      ▼
 ┌─────────────────────────────────────────────────────┐
 │              Communication Log File                  │
-│  (all agents read/write, UI reads for display)     │
-│  Format: [TIMESTAMP] [ROLE] message                │
+│  (all agents read/write, UI reads for display)    │
+│  Format: [TIMESTAMP] [ROLE] message               │
 └─────────────────────────────────────────────────────┘
 ```
 
 **User Injections:**
 - User types message → written to communication log as `[user/inject]`
-- Orchestrator reads on next cycle → responds appropriately
-- Works even after RUN COMPLETE
+- Detected in auto-orchestration cycle → restarts workflow (goes to Planning phase)
 
 ---
 
@@ -248,7 +249,7 @@ src-tauri/src/
 - [x] CommunicationPanel.svelte polls/displays log
 - [x] Inject command feature (user → orchestrator)
 - [x] Auto-refresh communication panel
-- [x] User messages detected and logged after RUN COMPLETE
+- [x] User messages detected - restarts workflow when in awaiting_approval
 
 ### Phase 4: Visual Node Graph
 - [x] NodeGraph.svelte component (shows agent network)
@@ -275,8 +276,9 @@ src-tauri/src/
 - [x] Browser pane created automatically on run start
 - [x] Test agent captures screenshots as artifacts
 - [x] Tester prompt includes browser commands
-- [x] **BUG FIXED: Browser button now switches to browser pane** (finds terminal pane ID from workspace)
-- [x] **BUG FIXED: User messages after completion trigger response** (returns to Planning phase)
+- [x] Browser button now toggles between Orchestration view and Browser placeholder view
+- [x] Timeline removed for more visual space
+- [x] Orchestration view takes full screen height
 
 ### Phase 7: Checkpoints & Approvals
 - [ ] Define approval checkpoints (run start, major change, final apply)
@@ -303,11 +305,38 @@ src-tauri/src/
 
 ## Next Steps (For New Chat Session)
 
-1. ~~Fix Browser button~~ - DONE: Now finds terminal pane from workspace and creates browser next to it
-2. ~~Fix user messages after completion~~ - DONE: Orchestrator returns to Planning phase when user injection detected
-3. **Verify working directory** - Ensure all agents run in the user-selected directory
-4. **Improve orchestration** - Make orchestrator more responsive to user injections
-5. **Add agent coordination** - Prevent multiple agents from doing the same task
+### Priority 1: Fix Orchestrator Response to User Messages
+The key issue: When user sends a message (either during execution or after completion), the orchestrator should:
+1. **For simple questions** (e.g., "how do I run this?", "what did you build?") - Answer directly WITHOUT restarting workflow
+2. **For modification requests** (e.g., "add feature X", "fix bug Y") - Restart workflow and assign tasks
+
+Current behavior: Always restarts workflow regardless of what user asks.
+
+**Files to investigate:**
+- `src-tauri/src/openflow/orchestrator.rs` - `determine_next_phase()` function
+- `src-tauri/src/commands.rs` - `trigger_orchestrator_cycle()` function
+- The orchestrator prompt in `src-tauri/src/openflow/prompts.rs` - needs to explicitly tell orchestrator to respond to USER REQUEST messages
+
+### Priority 2: Browser View Integration
+- Current: Browser button toggles a placeholder view
+- Desired: Show actual browser iframe/content from Codemux's browser pane
+- This requires integrating the browser component into OrchestrationView
+
+### Priority 3: User Message During Execution
+- Currently only triggers restart when in `awaiting_approval` phase
+- Should work during any phase so users can intervene mid-build
+
+### Priority 4: Working Directory Verification
+- Ensure all agents run in user-selected directory
+
+---
+
+## Debug Logging
+
+To debug orchestration issues, check:
+1. Terminal logs with `[DEBUG]` prefix (Rust backend)
+2. Browser console with `[OpenFlow]` prefix (frontend)
+3. Communication log at `~/.local/share/.codemux/runs/<run_id>/communication.log`
 
 ---
 

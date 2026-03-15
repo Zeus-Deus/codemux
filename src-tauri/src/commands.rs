@@ -478,12 +478,12 @@ pub fn trigger_orchestrator_cycle(
     
     // Check for user injections and notify orchestrator
     let actions_taken = if !analysis.user_injections.is_empty() {
-        // If run is completed but there's a user injection, write a message for the orchestrator
-        if matches!(run.status, OpenFlowRunStatus::Completed) || matches!(run.status, OpenFlowRunStatus::Cancelled) || run.current_phase == "completed" {
+        // If run is completed/awaiting_approval but there's a user injection, write a message for the orchestrator
+        if matches!(run.status, OpenFlowRunStatus::Completed) || matches!(run.status, OpenFlowRunStatus::Cancelled) || matches!(run.status, OpenFlowRunStatus::AwaitingApproval) || run.current_phase == "completed" || run.current_phase == "awaiting_approval" {
             // Write a message that the orchestrator can see
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
             let inject_msg = format!(
-                "[{}] [SYSTEM] USER REQUEST: {}\nThis is a new request from the user after the run completed. Please address it.",
+                "[{}] [SYSTEM] USER REQUEST: {}\nThis is a new request from the user. Please address it directly - if it's a simple question, just respond. If it requires changes, restart the workflow.",
                 timestamp,
                 analysis.user_injections.last().map(|s| s.as_str()).unwrap_or("")
             );

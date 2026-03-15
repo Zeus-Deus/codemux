@@ -3,6 +3,7 @@
     import type { OpenFlowRunRecord, WorkspaceSnapshot, PaneNodeSnapshot } from '../../stores/appState';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
+    import BrowserPane from '../panes/BrowserPane.svelte';
     import { onMount } from 'svelte';
 
     import { onDestroy } from 'svelte';
@@ -234,11 +235,7 @@
         <div class="node-graph">
             {#if showBrowser}
                 <div class="browser-view">
-                    <div class="browser-placeholder">
-                        <p>Browser View</p>
-                        <p class="hint">Start a dev server in any agent terminal to view your app here</p>
-                        <p class="hint">e.g., <code>npm run dev</code> or <code>python -m http.server</code></p>
-                    </div>
+                    <BrowserPane browserId="default" />
                 </div>
             {:else if run && agentNodes.length > 0}
                 <NodeGraph 
@@ -385,8 +382,11 @@
 
     .node-graph {
         width: 100%;
-        min-height: 300px;
-        margin-bottom: 24px;
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
     }
 
     .no-run {
@@ -397,66 +397,12 @@
     .browser-view {
         width: 100%;
         height: 100%;
-        min-height: 500px;
+        flex: 1;
+        min-height: 0;
         display: flex;
-        align-items: center;
-        justify-content: center;
-        background: var(--ui-layer-1);
+        flex-direction: column;
+        overflow: hidden;
         border-radius: 8px;
     }
 
-    .browser-placeholder {
-        text-align: center;
-        color: var(--ui-text-muted);
-    }
-
-    .browser-placeholder p {
-        margin: 0.5rem 0;
-    }
-
-    .browser-placeholder .hint {
-        font-size: 0.85rem;
-        opacity: 0.7;
-    }
-
-    .browser-placeholder code {
-        background: var(--ui-layer-2);
-        padding: 2px 6px;
-        border-radius: 4px;
-        font-size: 0.85rem;
-    }
-
-    .timeline h3 {
-        margin: 0 0 12px;
-        font-size: 0.9rem;
-        font-weight: 600;
-        color: var(--ui-text-secondary);
-    }
-
-    .timeline-entries {
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-    }
-
-    .timeline-entry {
-        display: flex;
-        gap: 12px;
-        padding: 8px 12px;
-        background: var(--ui-layer-2);
-        border-radius: 6px;
-        font-size: 0.85rem;
-    }
-
-    .timeline-entry.warning {
-        background: color-mix(in srgb, var(--ui-attention) 10%, var(--ui-layer-2));
-    }
-
-    .timeline-entry.error {
-        background: color-mix(in srgb, var(--ui-danger) 10%, var(--ui-layer-2));
-    }
-
-    .timeline-message {
-        color: var(--ui-text-secondary);
-    }
 </style>
