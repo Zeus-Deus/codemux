@@ -141,8 +141,12 @@ impl Orchestrator {
                 if let Some(role) = OpenFlowRole::from_str(&role_lower) {
                     blocked.push(role);
                 }
-            } else if role_lower.contains("assign") {
+            } else if entry.message.to_lowercase().contains("assign ")
+                || entry.message.to_lowercase().contains("assign:")
+            {
                 assignments.push(entry.message.clone());
+            } else if entry.message.to_lowercase().contains("run complete") {
+                status_updates.push(entry.message.clone());
             } else if role_lower.contains("status") || role_lower.contains("phase") {
                 status_updates.push(entry.message.clone());
             } else if role_lower.contains("user/inject") || entry.message.starts_with("@instruct") {
@@ -199,16 +203,25 @@ impl Orchestrator {
         current_phase: &OrchestratorPhase,
         analysis: &OrchestratorAnalysis,
     ) -> Option<OrchestratorPhase> {
+        let run_complete = analysis
+            .status_updates
+            .iter()
+            .any(|s| s.to_lowercase().contains("run complete"));
+
         match current_phase {
             OrchestratorPhase::Planning => {
-                if analysis.assignments.is_empty() {
+                if run_complete {
+                    Some(OrchestratorPhase::Completed)
+                } else if analysis.assignments.is_empty() {
                     None
                 } else {
                     Some(OrchestratorPhase::Executing)
                 }
             }
             OrchestratorPhase::Executing => {
-                if !analysis.blocked_roles.is_empty() {
+                if run_complete {
+                    Some(OrchestratorPhase::Completed)
+                } else if !analysis.blocked_roles.is_empty() {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.completed_roles.contains(&OpenFlowRole::Builder) {
                     Some(OrchestratorPhase::Verifying)
@@ -217,7 +230,9 @@ impl Orchestrator {
                 }
             }
             OrchestratorPhase::Verifying => {
-                if !analysis.blocked_roles.is_empty() {
+                if run_complete {
+                    Some(OrchestratorPhase::Completed)
+                } else if !analysis.blocked_roles.is_empty() {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.completed_roles.contains(&OpenFlowRole::Tester)
                     || analysis.completed_roles.contains(&OpenFlowRole::Reviewer)
@@ -228,9 +243,22 @@ impl Orchestrator {
                 }
             }
             OrchestratorPhase::Reviewing => Some(OrchestratorPhase::WaitingApproval),
-            OrchestratorPhase::WaitingApproval => None,
+            OrchestratorPhase::WaitingApproval => {
+                if !analysis.user_injections.is_empty() {
+                    Some(OrchestratorPhase::Planning)
+                } else {
+                    None
+                }
+            }
             OrchestratorPhase::Replanning => Some(OrchestratorPhase::Planning),
-            OrchestratorPhase::Completed | OrchestratorPhase::Assigning => None,
+            OrchestratorPhase::Completed => {
+                if !analysis.user_injections.is_empty() {
+                    Some(OrchestratorPhase::Planning)
+                } else {
+                    None
+                }
+            }
+            OrchestratorPhase::Assigning => None,
         }
     }
 }

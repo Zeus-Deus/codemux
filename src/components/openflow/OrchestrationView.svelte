@@ -1,6 +1,6 @@
 <script lang="ts">
-    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, createBrowserPane, type AgentSessionState } from '../../stores/appState';
-    import type { OpenFlowRunRecord } from '../../stores/appState';
+    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, type AgentSessionState, appState } from '../../stores/appState';
+    import type { OpenFlowRunRecord, WorkspaceSnapshot, PaneNodeSnapshot } from '../../stores/appState';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
     import { onMount } from 'svelte';
@@ -8,8 +8,6 @@
     import { onDestroy } from 'svelte';
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
-
-    let browserPaneCreated = $state(false);
 
     // Find run by runId directly - this is more reliable than deriving from runtime
     const run = $derived(
@@ -20,6 +18,26 @@
 
     let agentSessions = $state<AgentSessionState[]>([]);
     let orchestratorInterval: ReturnType<typeof setInterval> | null = null;
+    let showBrowser = $state(false);
+    
+    // Resizable panel state
+    let isDragging = $state(false);
+    let commPanelWidth = $state(350);
+    let startResize = (e: MouseEvent) => {
+        isDragging = true;
+        document.addEventListener('mousemove', handleResize);
+        document.addEventListener('mouseup', stopResize);
+    };
+    let handleResize = (e: MouseEvent) => {
+        if (isDragging) {
+            commPanelWidth = Math.max(200, Math.min(600, window.innerWidth - e.clientX));
+        }
+    };
+    let stopResize = () => {
+        isDragging = false;
+        document.removeEventListener('mousemove', handleResize);
+        document.removeEventListener('mouseup', stopResize);
+    };
 
     // Auto-trigger orchestration on mount
     $effect(() => {
@@ -31,10 +49,15 @@
                 }
             }, 3000);
 
-            // Start auto-orchestration loop
+            // Start auto-orchestration loop - keep running even after completion to process user injections
             orchestratorInterval = setInterval(() => {
-                if (runId && run && run.status !== 'completed' && run.status !== 'cancelled') {
-                    triggerOrchestratorCycle(runId).catch(console.error);
+                if (runId && run) {
+                    console.log('[OpenFlow] Auto-orchestration cycle triggered, phase:', run?.current_phase, 'status:', run?.status);
+                    triggerOrchestratorCycle(runId)
+                        .then(result => {
+                            console.log('[OpenFlow] Orchestration result:', result);
+                        })
+                        .catch(e => console.error('[OpenFlow] Orchestration error:', e));
                 }
             }, 10000);
         }
@@ -170,67 +193,13 @@
         }
     }
 
-    async function handleToggleBrowser() {
-        try {
-            if (!browserPaneCreated) {
-                await createBrowserPane('openflow-browser');
-                browserPaneCreated = true;
-            }
-        } catch (e) {
-            console.error('Browser toggle error:', e);
-        }
-    }
-
-    function getStatusColor(status: string): string {
-        if (status === 'done' || status === 'passed') return 'var(--ui-success)';
-        if (status === 'active' || status === 'ready') return 'var(--ui-accent)';
-        if (status === 'pending') return 'var(--ui-text-muted)';
-        if (status === 'blocked') return 'var(--ui-danger)';
-        return 'var(--ui-text-muted)';
-    }
-
-    function getRoleIcon(role: string): string {
-        const icons: Record<string, string> = {
-            orchestrator: '⚙️',
-            planner: '📋',
-            builder: '🔨',
-            reviewer: '👀',
-            tester: '🧪',
-            debugger: '🔧',
-            researcher: '🔍'
-        };
-        return icons[role] || '🤖';
-    }
-
-    let commPanelWidth = $state(320);
-    let isDragging = $state(false);
-    let startX = $state(0);
-    let startWidth = $state(0);
-
-    function startResize(e: MouseEvent) {
-        isDragging = true;
-        startX = e.clientX;
-        startWidth = commPanelWidth;
-        window.addEventListener('mousemove', onResize);
-        window.addEventListener('mouseup', stopResize);
-    }
-
-    function onResize(e: MouseEvent) {
-        if (!isDragging) return;
-        const delta = startX - e.clientX;
-        const newWidth = Math.max(200, Math.min(600, startWidth + delta));
-        commPanelWidth = newWidth;
-    }
-
-    function stopResize() {
-        isDragging = false;
-        window.removeEventListener('mousemove', onResize);
-        window.removeEventListener('mouseup', stopResize);
-    }
-
     function shortenModel(modelId: string): string {
         const parts = modelId.split('/');
         return parts.length > 1 ? parts[parts.length - 1] : modelId;
+    }
+
+    function toggleBrowser() {
+        showBrowser = !showBrowser;
     }
 </script>
 
@@ -246,7 +215,7 @@
                 {/if}
             </div>
             <div class="orch-controls">
-                <button class="control-btn" class:active={browserPaneCreated} type="button" onclick={handleToggleBrowser}>Browser</button>
+                <button class="control-btn" type="button" onclick={toggleBrowser}>{showBrowser ? 'Orchestration' : 'Browser'}</button>
                 {#if run && run.status !== 'completed' && run.status !== 'cancelled' && run.status !== 'failed'}
                     <button class="control-btn" type="button" onclick={handleOrchestrate}>Orchestrate</button>
                     <button class="control-btn" type="button" onclick={handleLoop}>Loop</button>
@@ -263,7 +232,15 @@
         </header>
 
         <div class="node-graph">
-            {#if run && agentNodes.length > 0}
+            {#if showBrowser}
+                <div class="browser-view">
+                    <div class="browser-placeholder">
+                        <p>Browser View</p>
+                        <p class="hint">Start a dev server in any agent terminal to view your app here</p>
+                        <p class="hint">e.g., <code>npm run dev</code> or <code>python -m http.server</code></p>
+                    </div>
+                </div>
+            {:else if run && agentNodes.length > 0}
                 <NodeGraph 
                     nodes={agentNodes} 
                     activeConnections={activeConnections}
@@ -272,20 +249,6 @@
                 <p class="no-run">No active run</p>
             {/if}
         </div>
-
-        {#if run}
-            <div class="timeline">
-                <h3>Timeline</h3>
-                <div class="timeline-entries">
-                    {#each run.timeline as entry}
-                        <div class="timeline-entry" class:warning={entry.level === 'warning'} class:error={entry.level === 'error'}>
-                            <span class="timeline-time"></span>
-                            <span class="timeline-message">{entry.message}</span>
-                        </div>
-                    {/each}
-                </div>
-            </div>
-        {/if}
     </div>
 
     <!-- Resizable divider -->
@@ -429,6 +392,38 @@
     .no-run {
         color: var(--ui-text-muted);
         font-size: 0.9rem;
+    }
+
+    .browser-view {
+        width: 100%;
+        height: 100%;
+        min-height: 500px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--ui-layer-1);
+        border-radius: 8px;
+    }
+
+    .browser-placeholder {
+        text-align: center;
+        color: var(--ui-text-muted);
+    }
+
+    .browser-placeholder p {
+        margin: 0.5rem 0;
+    }
+
+    .browser-placeholder .hint {
+        font-size: 0.85rem;
+        opacity: 0.7;
+    }
+
+    .browser-placeholder code {
+        background: var(--ui-layer-2);
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 0.85rem;
     }
 
     .timeline h3 {

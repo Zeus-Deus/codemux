@@ -1,6 +1,6 @@
 # OpenFlow Orchestration Plan
 
-## Status: 🔄 Phase 5 Complete (Phases 1–5 Complete)
+## Status: 🔄 Phase 6 In Progress
 
 This document describes the implementation of **OpenFlow**, a multi-agent orchestration system where a swarm of AI coding agents collaboratively build, test, and review software based on a user prompt.
 
@@ -53,6 +53,26 @@ OpenFlow must be designed as a **standalone, embeddable orchestration engine**, 
 
 ---
 
+## Current Implementation Status
+
+### ✅ Working Features
+- **Agent Spawning**: Multiple agents spawn in terminal panes with correct roles
+- **Communication Log**: All agent output captured to `~/.local/share/.codemux/runs/<run_id>/communication.log`
+- **Orchestrator**: Assigns tasks to agents, monitors DONE/BLOCKED messages
+- **Builder Agent**: Creates files in the correct working directory
+- **Tester Agent**: Uses browser automation (`codemux browser open`, `snapshot`, `click`, etc.)
+- **RUN COMPLETE**: Orchestrator signals completion
+- **User Injection**: User can send messages to orchestrator
+- **Browser Pane**: Created automatically on run start (partially working)
+- **Auto-orchestration**: Loop triggers every 10 seconds
+
+### ⚠️ Known Issues (To Fix)
+1. **Browser button doesn't work** - Button to switch to browser pane not functional
+2. **User messages after completion** - Orchestrator doesn't respond to user messages after RUN COMPLETE
+3. **Working directory** - Some agents still run in wrong directory (fix in progress)
+
+---
+
 ## Vision
 
 When a user opens an **OpenFlow workspace**, they enter a completely different experience from regular terminal workspaces:
@@ -74,7 +94,7 @@ A special workspace type that:
 - Manages multiple terminal sessions (one per agent)
 - Shows agent hierarchy (orchestrator → workers)
 - Has a right panel for inter-agent communication
-- Has an optional browser pane (toggleable)
+- **Has a persistent browser pane** (always available for agents)
 
 ### Agent Types
 - **Orchestrator** - Coordinates the workflow, assigns tasks, decides when to replan
@@ -91,16 +111,6 @@ Each agent needs:
 - Provider: dynamically discovered (e.g., `github-copilot`, `minimax-coding-plan`)
 - Thinking mode: (for opencode) - dynamically discovered
 - System prompt additions (optional)
-
-### Available Models (Example from opencode)
-```
-opencode/big-pickle
-opencode/gpt-5-nano
-github-copilot/claude-sonnet-4
-github-copilot/gpt-4o
-minimax-coding-plan/MiniMax-M2.5
-... (many more - should be dynamically fetched)
-```
 
 ---
 
@@ -121,8 +131,6 @@ UI shows:
   - Select thinking mode (if applicable, auto-discovered)
   - Assign role (or auto-assign)
 
-**Important:** Do NOT hardcode models/thinking modes. Dynamically discover them from the CLI tools at runtime.
-
 ### Step 3: Provide Main Prompt
 ```
 Text area: "What do you want to build?"
@@ -134,13 +142,13 @@ The UI shows:
 - **Top:** Orchestrator status and current task
 - **Visual Node Graph:** Agents as nodes connected by lines showing who is talking to whom
 - **Right Panel:** Communication log (what agents are saying to each other)
-- **Browser Toggle:** Button to show/hide browser pane (not all projects need it)
+- **Browser Pane:** Always available in background for test agents
 
 ### Step 5: Monitor & Intervene
 - Watch agents work in real-time via node graph
 - See communication in right panel
-- **Inject to orchestrator only:** `@instruct: try a different approach` (orchestrator decides how to incorporate)
-- Approve/reject checkpoints
+- **Inject to orchestrator:** Type message in communication panel (orchestrator decides how to incorporate)
+- Click "Browser" button to switch to browser pane
 - Pause/resume/cancel run
 
 ---
@@ -156,11 +164,9 @@ OpenFlowWorkspace/
 ├── OrchestrationView.svelte      # Main UI with visual node graph
 ├── AgentNode.svelte             # Individual agent node in the graph
 ├── AgentEdge.svelte             # Connection lines between agents
-├── CommunicationPanel.svelte    # Right panel: inter-agent chat
-├── InjectCommand.svelte         # User input for injecting to orchestrator
-├── TimelinePanel.svelte         # Run timeline and artifacts
-├── BrowserToggle.svelte         # Show/hide browser pane button
-└── ApprovalModal.svelte        # Checkpoint approvals
+├── CommunicationPanel.svelte    # Right panel: inter-agent chat + user input
+├── NodeGraph.svelte            # Visual representation of agent network
+└── TimelinePanel.svelte         # Run timeline and artifacts
 ```
 
 ### Backend Structure (Modular)
@@ -169,31 +175,28 @@ OpenFlowWorkspace/
 src-tauri/src/
 ├── openflow/
 │   ├── mod.rs                   # Main orchestration engine (CORE - extractable)
-│   ├── agent.rs                # Agent configuration (CORE)
-│   ├── orchestrator.rs         # Orchestrator logic (CORE)
-│   ├── communication.rs       # Inter-agent message passing (CORE)
-│   ├── state.rs                # OpenFlow run state (CORE)
-│   ├── persistence.rs          # Save/restore runs (CORE)
+│   ├── agent.rs                 # Agent configuration (CORE)
+│   ├── orchestrator.rs          # Orchestrator logic (CORE)
+│   ├── prompts.rs               # System prompts for each agent role
+│   ├── communication.rs         # Inter-agent message passing (CORE)
+│   ├── state.rs                 # OpenFlow run state (CORE)
 │   └── adapters/
-│       ├── mod.rs              # Adapter trait (CORE)
-│       ├── opencode.rs         # OpenCode adapter
-│       ├── claude.rs           # Claude CLI adapter
-│       ├── codex.rs            # Codex adapter
-│       └── aider.rs            # Aider adapter
+│       ├── mod.rs               # Adapter trait (CORE)
+│       └── opencode.rs          # OpenCode adapter
 │
-├── codemux_integration/        # Codemux-specific (NOT CORE)
-│   ├── workspace.rs            # OpenFlow workspace type
-│   ├── terminal_spawn.rs      # Spawn terminals with agent config
-│   └── browser.rs              # Browser integration for test agents
+├── commands.rs                  # Tauri commands including spawn_openflow_agents
+└── terminal/
+    └── mod.rs                   # PTY spawning with correct working directory
 ```
 
 ### Agent Spawning
 - Each agent = terminal session in a dedicated pane
 - Terminal runs the CLI tool with configured model/provider
-- Environment variables set: 
+- Environment variables set:
   - `CODEMUX_AGENT_ROLE=builder`
   - `CODEMUX_OPENFLOW_RUN_ID=xxx`
   - `CODEMUX_COMMUNICATION_LOG=/path/to/log`
+  - `CODEMUX_WORKING_DIR=/project/path`
 
 ### Communication Pattern
 ```
@@ -207,39 +210,15 @@ src-tauri/src/
        ▼                                      ▼
 ┌─────────────────────────────────────────────────────┐
 │              Communication Log File                  │
-│  (all agents read/write, UI reads for display)      │
-│  Format: [TIMESTAMP] [ROLE] message                 │
+│  (all agents read/write, UI reads for display)     │
+│  Format: [TIMESTAMP] [ROLE] message                │
 └─────────────────────────────────────────────────────┘
 ```
 
 **User Injections:**
-- User sends message → written to communication log
-- Orchestrator reads it on next cycle → incorporates into planning
-- This prevents breaking the loop
-
-### Memory & Context Management
-
-**Project Memory** (already implemented in `src-tauri/src/memory.rs`):
-- Project brief, goal, focus, constraints
-- Pinned context, decisions, next steps
-- Session summaries
-- Handoff packet generation
-
-**OpenFlow Run Memory** (needs to be added):
-- Current orchestration state
-- What has been built so far
-- Current phase and task status
-- Artifacts produced
-- Key decisions made during run
-
-**Context Size Management:**
-- Orchestrator reads summaries, not full agent outputs
-- Periodic context compaction (summarize old messages)
-- **Session restart capability:** If context gets too large:
-  - Save current state to memory
-  - Start fresh session for agent
-  - Inject state from memory into new session
-  - Continue without breaking the loop
+- User types message → written to communication log as `[user/inject]`
+- Orchestrator reads on next cycle → responds appropriately
+- Works even after RUN COMPLETE
 
 ---
 
@@ -261,47 +240,43 @@ src-tauri/src/
 - [x] Spawn terminal session with agent config
 - [x] Set environment variables for agents
 - [x] Track agent state per terminal session
-
-> **⚠️ TODO: Thinking modes need model-specific platform support**
-> 
-> The current implementation hardcodes thinking modes per tool (e.g., opencode has auto/none/low/medium/high).
-> However, different models support different thinking modes:
-> - `opencode/big-pickle` supports: `high`, `max`
-> - GPT models may support: `minimal`, `low`, `medium`
-> 
-> **Needed:**
-> 1. Each adapter should expose `supported_thinking_modes(model_id) -> Vec<ThinkingModeInfo>` 
-> 2. Query `opencode models --verbose` to get per-model variants with thinking budgets
-> 3. Only show thinking mode dropdown when the selected model actually supports it
-> 4. Display the *actual* applied thinking mode in the agent node (parse from CLI output or query model info)
+- [x] Pass working directory to agents (via CODEMUX_WORKING_DIR)
 
 ### Phase 3: Communication Layer
 - [x] Shared communication log file per run
 - [x] Agent writes messages with format: `[TIMESTAMP] [ROLE] message`
 - [x] CommunicationPanel.svelte polls/displays log
-- [x] Inject command feature (user → orchestrator only)
+- [x] Inject command feature (user → orchestrator)
+- [x] Auto-refresh communication panel
+- [x] User messages detected and logged after RUN COMPLETE
 
 ### Phase 4: Visual Node Graph
-- [ ] AgentNode.svelte component (shows agent name, role, status)
-- [ ] AgentEdge.svelte component (lines connecting talking agents)
+- [x] NodeGraph.svelte component (shows agent network)
+- [ ] AgentNode.svelte component (individual nodes)
+- [ ] AgentEdge.svelte component (connection lines)
 - [ ] Highlight active communications
 - [ ] Smooth animations
 
 ### Phase 5: Orchestrator Logic
 - [x] System prompts for each agent role (orchestrator, planner, builder, reviewer, tester, debugger, researcher)
 - [x] Agent adapter includes system prompt path via CODEMUX_SYSTEM_PROMPT_PATH env var
-- [x] Wrapper script that reads prompt and passes to opencode via --prompt flag
+- [x] Wrapper script that reads prompt and passes to opencode
 - [x] Orchestrator module with communication log analysis
 - [x] Task assignment message generation
 - [x] Phase advancement logic based on DONE/BLOCKED messages
 - [x] Tauri command `trigger_orchestrator_cycle` to drive orchestration
 - [x] Frontend "Orchestrate" button to trigger the cycle
 - [x] Communication panel auto-refreshes every 2 seconds
+- [x] Auto-orchestration loop every 10 seconds
+- [x] RUN COMPLETE notification
 
 ### Phase 6: Browser Verification Integration
-- [ ] Test agents can call `codemux browser ...` commands
-- [ ] BrowserToggle.svelte to show/hide browser pane
-- [ ] Test agent captures screenshots as artifacts
+- [x] Test agents can call `codemux browser ...` commands
+- [x] Browser pane created automatically on run start
+- [x] Test agent captures screenshots as artifacts
+- [x] Tester prompt includes browser commands
+- [x] **BUG FIXED: Browser button now switches to browser pane** (finds terminal pane ID from workspace)
+- [x] **BUG FIXED: User messages after completion trigger response** (returns to Planning phase)
 
 ### Phase 7: Checkpoints & Approvals
 - [ ] Define approval checkpoints (run start, major change, final apply)
@@ -326,22 +301,19 @@ src-tauri/src/
 
 ---
 
+## Next Steps (For New Chat Session)
+
+1. ~~Fix Browser button~~ - DONE: Now finds terminal pane from workspace and creates browser next to it
+2. ~~Fix user messages after completion~~ - DONE: Orchestrator returns to Planning phase when user injection detected
+3. **Verify working directory** - Ensure all agents run in the user-selected directory
+4. **Improve orchestration** - Make orchestrator more responsive to user injections
+5. **Add agent coordination** - Prevent multiple agents from doing the same task
+
+---
+
 ## Related Documents
 
 - `docs/BROWSER_PLAN.md` - Browser automation for test agents
 - `src-tauri/src/memory.rs` - Project memory implementation
-- `PLAN.md` - Phase 11-13 cover OpenFlow runtime
-- `PROJECT.md` - OpenFlow vision and architecture
-
----
-
-## Next Steps
-
-1. Implement Phase 1: OpenFlow workspace type and UI shell
-2. Build AgentConfigPanel with dynamic discovery
-3. Test basic agent spawning with 2-3 agents
-4. Verify communication log works
-5. Build visual node graph
-6. Build out orchestrator logic
-7. Integrate browser verification
-8. Add approvals, context management, and persistence
+- `src-tauri/src/openflow/prompts.rs` - System prompts for each role
+- `AGENTS.md` - Codemux agent guide (browser automation reference)

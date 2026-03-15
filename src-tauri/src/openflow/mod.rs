@@ -623,6 +623,31 @@ impl OpenFlowRuntimeStore {
         });
         Ok(run.clone())
     }
+
+    pub fn set_run_phase(
+        &self,
+        run_id: &str,
+        phase: &str,
+        status: OpenFlowRunStatus,
+    ) -> Result<OpenFlowRunRecord, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let run = snapshot
+            .active_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+
+        let status_clone = status.clone();
+        run.current_phase = phase.into();
+        run.status = status;
+        run.timeline.push(OpenFlowTimelineEntry {
+            entry_id: format!("timeline-{}", run.timeline.len() + 1),
+            level: OpenFlowTimelineLevel::Info,
+            message: format!("Phase changed to {} (status: {:?})", phase, status_clone),
+        });
+
+        Ok(run.clone())
+    }
 }
 
 pub fn default_openflow_spec() -> OpenFlowDesignSpec {

@@ -563,7 +563,7 @@ impl AppStateStore {
         workspace_id
     }
 
-    pub fn create_browser_pane(&self, pane_id: &str) -> Result<BrowserId, String> {
+    pub fn create_browser_pane(&self, pane_id: &str) -> Result<(PaneId, BrowserId), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
             .ok_or_else(|| format!("No pane found for {pane_id}"))?;
@@ -612,10 +612,10 @@ impl AppStateStore {
         }
 
         workspace.active_surface_id = surface.surface_id.clone();
-        surface.active_pane_id = new_pane_id;
+        surface.active_pane_id = new_pane_id.clone();
         snapshot.active_workspace_id = workspace.workspace_id.clone();
 
-        Ok(browser_id)
+        Ok((new_pane_id, browser_id))
     }
 
     pub fn rename_workspace(&self, workspace_id: &str, title: String) -> bool {

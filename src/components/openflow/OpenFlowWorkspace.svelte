@@ -59,6 +59,8 @@
             currentRunId = created.run_id;
             view = 'orchestration';
             
+            // Browser pane will be created when user clicks "Browser" button in OrchestrationView
+            
             // Try to spawn agents (non-blocking)
             console.log('[OpenFlow] Spawning agents with configs:', JSON.stringify(event.detail.agentConfigs));
             spawnOpenflowAgents(

@@ -453,6 +453,8 @@ pub fn trigger_orchestrator_cycle(
     runtime: State<'_, OpenFlowRuntimeStore>,
     run_id: String,
 ) -> Result<OrchestratorTriggerResult, String> {
+    eprintln!("[DEBUG] trigger_orchestrator_cycle called for run_id: {}", run_id);
+    
     let snapshot = runtime.snapshot();
     let run = snapshot
         .active_runs
@@ -460,19 +462,68 @@ pub fn trigger_orchestrator_cycle(
         .find(|r| r.run_id == run_id)
         .ok_or_else(|| format!("No run found for {run_id}"))?;
 
+    eprintln!("[DEBUG] Found run, current_phase: {}, status: {:?}", run.current_phase, run.status);
+
+    use crate::openflow::OpenFlowRunStatus;
+
     let phase = OrchestratorPhase::from_string(&run.current_phase);
     let entries = Orchestrator::read_communication_log(&run_id)
         .map_err(|e| format!("Failed to read comm log: {e}"))?;
     
+    eprintln!("[DEBUG] Read {} entries from comm log", entries.len());
+    
     let analysis = Orchestrator::analyze_comm_log(&entries);
+    eprintln!("[DEBUG] Analysis: completed_roles={:?}, blocked_roles={:?}, assignments={}, user_injections={}",
+        analysis.completed_roles, analysis.blocked_roles, analysis.assignments.len(), analysis.user_injections.len());
     
-    let next_phase = Orchestrator::determine_next_phase(&phase, &analysis);
-    
+    // Check for user injections and notify orchestrator
     let actions_taken = if !analysis.user_injections.is_empty() {
-        vec![format!("Incorporated {} user injections", analysis.user_injections.len())]
+        // If run is completed but there's a user injection, write a message for the orchestrator
+        if matches!(run.status, OpenFlowRunStatus::Completed) || matches!(run.status, OpenFlowRunStatus::Cancelled) || run.current_phase == "completed" {
+            // Write a message that the orchestrator can see
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let inject_msg = format!(
+                "[{}] [SYSTEM] USER REQUEST: {}\nThis is a new request from the user after the run completed. Please address it.",
+                timestamp,
+                analysis.user_injections.last().map(|s| s.as_str()).unwrap_or("")
+            );
+            let _ = Orchestrator::write_to_comm_log(&run_id, &inject_msg);
+            eprintln!("[DEBUG] Wrote USER REQUEST message to comm log");
+            
+            vec![format!("User request queued - orchestrator will process on next cycle")]
+        } else {
+            vec![format!("Incorporated {} user injections", analysis.user_injections.len())]
+        }
     } else {
         vec![]
     };
+    
+    // Re-analyze the comm log to pick up any new SYSTEM messages we just wrote
+    let entries = Orchestrator::read_communication_log(&run_id)
+        .map_err(|e| format!("Failed to read comm log: {e}"))?;
+    let analysis = Orchestrator::analyze_comm_log(&entries);
+    eprintln!("[DEBUG] Re-analysis after any writes: user_injections={}", analysis.user_injections.len());
+    
+    let next_phase = Orchestrator::determine_next_phase(&phase, &analysis);
+    eprintln!("[DEBUG] determine_next_phase returned: {:?}", next_phase);
+
+    // Apply the phase change if one was determined
+    if let Some(ref new_phase) = next_phase {
+        eprintln!("[DEBUG] Applying phase change to: {:?}", new_phase);
+        let new_status = match new_phase {
+            OrchestratorPhase::Planning => OpenFlowRunStatus::Planning,
+            OrchestratorPhase::Assigning => OpenFlowRunStatus::Planning,
+            OrchestratorPhase::Executing => OpenFlowRunStatus::Executing,
+            OrchestratorPhase::Verifying => OpenFlowRunStatus::Executing,
+            OrchestratorPhase::Reviewing => OpenFlowRunStatus::Reviewing,
+            OrchestratorPhase::WaitingApproval => OpenFlowRunStatus::AwaitingApproval,
+            OrchestratorPhase::Replanning => OpenFlowRunStatus::Planning,
+            OrchestratorPhase::Completed => OpenFlowRunStatus::Completed,
+        };
+        runtime.set_run_phase(&run_id, new_phase.as_str(), new_status)?;
+    } else {
+        eprintln!("[DEBUG] No phase change to apply");
+    }
 
     Ok(OrchestratorTriggerResult {
         current_phase: phase.as_str().to_string(),
@@ -723,10 +774,13 @@ pub fn activate_pane(
     state: State<'_, AppStateStore>,
     pane_id: String,
 ) -> Result<(), String> {
+    eprintln!("[DEBUG] activate_pane called with pane_id: {}", pane_id);
     if state.activate_pane(&pane_id) {
+        eprintln!("[DEBUG] activate_pane succeeded, emitting app state");
         crate::state::emit_app_state(&app);
         Ok(())
     } else {
+        eprintln!("[DEBUG] activate_pane failed - pane not found: {}", pane_id);
         Err(format!("No pane found for {pane_id}"))
     }
 }
@@ -869,9 +923,9 @@ pub fn create_browser_pane(
     state: State<'_, AppStateStore>,
     pane_id: String,
 ) -> Result<String, String> {
-    let browser_id = state.create_browser_pane(&pane_id)?;
+    let (pane_id, _browser_id) = state.create_browser_pane(&pane_id)?;
     crate::state::emit_app_state(&app);
-    Ok(browser_id.0)
+    Ok(pane_id.0)
 }
 
 #[tauri::command]
