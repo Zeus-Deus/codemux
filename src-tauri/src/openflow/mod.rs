@@ -263,6 +263,42 @@ impl OpenFlowRuntimeStore {
         self.inner.lock().unwrap().clone()
     }
 
+    /// Read only the current phase string for a run — much cheaper than a full snapshot clone.
+    pub fn get_run_phase(&self, run_id: &str) -> Result<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .active_runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .map(|r| r.current_phase.clone())
+            .ok_or_else(|| format!("No run found for {run_id}"))
+    }
+
+    /// Read only the current phase and status for a run — used by the autonomous loop.
+    pub fn get_run_phase_and_status(
+        &self,
+        run_id: &str,
+    ) -> Result<(String, OpenFlowRunStatus), String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .active_runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .map(|r| (r.current_phase.clone(), r.status.clone()))
+            .ok_or_else(|| format!("No run found for {run_id}"))
+    }
+
+    /// Clone only the record for a single run.
+    pub fn get_run_record(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .active_runs
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .cloned()
+            .ok_or_else(|| format!("No run found for {run_id}"))
+    }
+
     pub fn create_run(&self, request: OpenFlowCreateRunRequest) -> OpenFlowRunRecord {
         let mut snapshot = self.inner.lock().unwrap();
         let run_id = format!(
@@ -531,23 +567,31 @@ impl OpenFlowRuntimeStore {
     }
 
     pub fn run_autonomous_loop(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
+        // Cap iterations to prevent infinite spin; real orchestration is driven by the
+        // frontend's 10-second cycle via `trigger_orchestrator_cycle`.
+        const MAX_ITERATIONS: u32 = 20;
+        let mut iterations = 0;
+
         loop {
-            let snapshot = self.snapshot();
-            let run = snapshot
-                .active_runs
-                .iter()
-                .find(|run| run.run_id == run_id)
-                .cloned()
-                .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+            if iterations >= MAX_ITERATIONS {
+                return Err(format!(
+                    "run_autonomous_loop exceeded {MAX_ITERATIONS} iterations for {run_id}; use trigger_orchestrator_cycle instead"
+                ));
+            }
+            iterations += 1;
+
+            // Targeted read — avoids cloning the entire runtime snapshot.
+            let (phase, status) = self.get_run_phase_and_status(run_id)?;
 
             if matches!(
-                run.status,
+                status,
                 OpenFlowRunStatus::Completed
                     | OpenFlowRunStatus::Failed
                     | OpenFlowRunStatus::Cancelled
                     | OpenFlowRunStatus::AwaitingApproval
             ) {
-                return Ok(run);
+                // Return a lightweight clone of just this run.
+                return self.get_run_record(run_id);
             }
 
             let advanced = self.advance_run_phase(run_id)?;
@@ -558,6 +602,9 @@ impl OpenFlowRuntimeStore {
                     return Ok(reviewed);
                 }
             }
+
+            // Yield between iterations to avoid starving the Tauri command thread.
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     }
 

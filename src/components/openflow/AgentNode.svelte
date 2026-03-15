@@ -1,4 +1,5 @@
 <script lang="ts">
+    import { onDestroy } from 'svelte';
     import type { Snippet } from 'svelte';
 
     interface Props {
@@ -77,6 +78,12 @@
         window.removeEventListener('mousemove', handleMouseMove);
         window.removeEventListener('mouseup', handleMouseUp);
     }
+
+    // Guarantee cleanup if the component is destroyed while a drag is in progress.
+    onDestroy(() => {
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+    });
 </script>
 
 <div 

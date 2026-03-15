@@ -375,26 +375,28 @@ pub fn spawn_openflow_agents(
         // Mark as running once PTY spawn is initiated.
         agent_store.update_status(&session_id.0, AgentSessionStatus::Running);
 
-        // Log that this agent was started
-        let role_str = config.role.as_str().to_uppercase();
-        let log_path_clone = log_path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if let Err(e) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path_clone)
-                .and_then(|mut f| {
-                    let entry = format!("[{}] [SYSTEM] Started agent: {}\n", 
-                        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-                        role_str);
-                    std::io::Write::write_all(&mut f, entry.as_bytes())
-                }) {
-                eprintln!("Failed to log agent start: {}", e);
-            }
-        });
-
         session_ids.push(session_id.0);
+    }
+
+    // Write all "agent started" entries in a single file-open after the spawn loop,
+    // avoiding one OS thread per agent that raced to append to the same file.
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            for config in &agent_configs {
+                let entry = format!(
+                    "[{}] [SYSTEM] Started agent: {}\n",
+                    ts,
+                    config.role.as_str().to_uppercase()
+                );
+                let _ = f.write_all(entry.as_bytes());
+            }
+        }
     }
 
     crate::state::emit_app_state(&app);
@@ -455,32 +457,37 @@ pub fn trigger_orchestrator_cycle(
     pty_state: State<'_, crate::terminal::PtyState>,
     run_id: String,
 ) -> Result<OrchestratorTriggerResult, String> {
-    eprintln!("[DEBUG] trigger_orchestrator_cycle called for run_id: {}", run_id);
-    
-    let snapshot = runtime.snapshot();
-    let run = snapshot
-        .active_runs
-        .iter()
-        .find(|r| r.run_id == run_id)
-        .ok_or_else(|| format!("No run found for {run_id}"))?;
+    // Targeted read: only fetch the current phase string, not a full runtime clone.
+    let current_phase_str = runtime.get_run_phase(&run_id)?;
+    let phase = OrchestratorPhase::from_string(&current_phase_str);
 
-    eprintln!("[DEBUG] Found run, current_phase: {}, status: {:?}", run.current_phase, run.status);
+    #[cfg(debug_assertions)]
+    eprintln!("[DEBUG] trigger_orchestrator_cycle run_id={} phase={}", run_id, current_phase_str);
 
-    let phase = OrchestratorPhase::from_string(&run.current_phase);
+    // Read the comm log exactly once for this entire cycle.
     let entries = Orchestrator::read_communication_log(&run_id)
         .map_err(|e| format!("Failed to read comm log: {e}"))?;
-    
+
+    #[cfg(debug_assertions)]
     eprintln!("[DEBUG] Read {} entries from comm log", entries.len());
-    
+
     let analysis = Orchestrator::analyze_comm_log(&entries);
-    eprintln!("[DEBUG] Analysis: completed_roles={:?}, blocked_roles={:?}, assignments={}, user_injections={} (total={})",
-        analysis.completed_roles, analysis.blocked_roles, analysis.assignments.len(),
-        analysis.user_injections.len(), analysis.total_injections);
-    
+
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} injections={}/{}",
+        analysis.completed_roles,
+        analysis.blocked_roles,
+        analysis.assignments.len(),
+        analysis.user_injections.len(),
+        analysis.total_injections
+    );
+
     let mut actions_taken = Vec::new();
 
-    // If there are unhandled user injections, forward them to the orchestrator's PTY.
-    if !analysis.user_injections.is_empty() {
+    // Determine phase: injection takes priority; otherwise use log-based logic.
+    // We reuse the `analysis` already computed above — no second file read.
+    let next_phase = if !analysis.user_injections.is_empty() {
         let new_total = analysis.total_injections;
         let injection_text = analysis.user_injections.join(" | ");
 
@@ -491,7 +498,6 @@ pub fn trigger_orchestrator_cycle(
             .find(|s| matches!(s.config.role, crate::openflow::OpenFlowRole::Orchestrator));
 
         if let Some(orch_session) = orchestrator_session {
-            // Build a context-aware prompt for the orchestrator.
             let goal_path = comm_log_path(&run_id)
                 .replace("communication.log", "goal.txt");
             let prompt = format!(
@@ -503,15 +509,17 @@ pub fn trigger_orchestrator_cycle(
                 goal_path
             );
 
-            // Write the command directly to the orchestrator PTY writer.
+            // Write to the PTY while holding the sessions lock for the minimum time
+            // (build the command string before locking).
             let cmd = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
             let session_id = orch_session.session_id.clone();
             let write_result = {
                 let mut sessions = pty_state.sessions.lock().unwrap();
-                if let Some(runtime) = sessions.get_mut(&session_id) {
-                    if let Some(writer) = runtime.writer.as_mut() {
+                if let Some(pty_runtime) = sessions.get_mut(&session_id) {
+                    if let Some(writer) = pty_runtime.writer.as_mut() {
                         use std::io::Write;
-                        writer.write_all(cmd.as_bytes())
+                        writer
+                            .write_all(cmd.as_bytes())
                             .and_then(|_| writer.flush())
                             .map_err(|e| format!("PTY write error: {e}"))
                     } else {
@@ -523,52 +531,44 @@ pub fn trigger_orchestrator_cycle(
             };
             match write_result {
                 Ok(()) => {
-                    eprintln!("[DEBUG] Wrote opencode run command to orchestrator PTY {}", session_id);
+                    #[cfg(debug_assertions)]
+                    eprintln!("[DEBUG] Wrote prompt to orchestrator PTY {}", session_id);
                     actions_taken.push(format!(
                         "Forwarded {} user injection(s) to orchestrator PTY",
                         analysis.user_injections.len()
                     ));
                 }
                 Err(e) => {
-                    eprintln!("[DEBUG] Failed to write to orchestrator PTY: {}", e);
                     actions_taken.push(format!("Failed to reach orchestrator PTY: {}", e));
                 }
             }
         } else {
-            eprintln!("[DEBUG] No orchestrator session found for run {}", run_id);
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
         // Acknowledge in the comm log so agents can see it.
-        let ack = {
-            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-            format!(
-                "[{}] [ORCHESTRATOR] Received user message: \"{}\". Processing...",
-                ts, injection_text
-            )
-        };
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let ack = format!(
+            "[{}] [ORCHESTRATOR] Received user message: \"{}\". Processing...",
+            ts, injection_text
+        );
         let _ = Orchestrator::write_to_comm_log(&run_id, &ack);
 
         // Mark injections as handled so they are not re-processed on the next cycle.
-        let handled_marker = {
-            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-            format!("[{}] [SYSTEM] HANDLED_INJECTIONS: {}", ts, new_total)
-        };
-        let _ = Orchestrator::write_to_comm_log(&run_id, &handled_marker);
-    }
-    
-    // Re-read after any writes so determine_next_phase sees the updated log.
-    let entries = Orchestrator::read_communication_log(&run_id)
-        .map_err(|e| format!("Failed to read comm log: {e}"))?;
-    let analysis = Orchestrator::analyze_comm_log(&entries);
-    eprintln!("[DEBUG] Re-analysis after any writes: user_injections={}", analysis.user_injections.len());
-    
-    let next_phase = Orchestrator::determine_next_phase(&phase, &analysis);
-    eprintln!("[DEBUG] determine_next_phase returned: {:?}", next_phase);
+        let marker = format!("[{}] [SYSTEM] HANDLED_INJECTIONS: {}", ts, new_total);
+        let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
 
-    // Apply the phase change if one was determined
+        Some(OrchestratorPhase::Replanning)
+    } else {
+        // No injections — use the analysis already computed above (no second read).
+        Orchestrator::determine_next_phase(&phase, &analysis)
+    };
+
+    #[cfg(debug_assertions)]
+    eprintln!("[DEBUG] next_phase={:?}", next_phase);
+
+    // Apply the phase change if one was determined.
     if let Some(ref new_phase) = next_phase {
-        eprintln!("[DEBUG] Applying phase change to: {:?}", new_phase);
         use crate::openflow::OpenFlowRunStatus;
         let new_status = match new_phase {
             OrchestratorPhase::Planning => OpenFlowRunStatus::Planning,
@@ -581,16 +581,22 @@ pub fn trigger_orchestrator_cycle(
             OrchestratorPhase::Completed => OpenFlowRunStatus::Completed,
         };
         runtime.set_run_phase(&run_id, new_phase.as_str(), new_status)?;
-    } else {
-        eprintln!("[DEBUG] No phase change to apply");
     }
 
     Ok(OrchestratorTriggerResult {
         current_phase: phase.as_str().to_string(),
         next_phase: next_phase.as_ref().map(|p| p.as_str().to_string()),
         analysis: OrchestratorAnalysisDto {
-            completed_roles: analysis.completed_roles.iter().map(|r| r.as_str().to_string()).collect(),
-            blocked_roles: analysis.blocked_roles.iter().map(|r| r.as_str().to_string()).collect(),
+            completed_roles: analysis
+                .completed_roles
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect(),
+            blocked_roles: analysis
+                .blocked_roles
+                .iter()
+                .map(|r| r.as_str().to_string())
+                .collect(),
             assignments_count: analysis.assignments.len(),
             user_injections_count: analysis.user_injections.len(),
         },

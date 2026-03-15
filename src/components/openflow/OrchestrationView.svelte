@@ -1,12 +1,10 @@
 <script lang="ts">
-    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, type AgentSessionState, appState } from '../../stores/appState';
+    import { onDestroy } from 'svelte';
+    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, type AgentSessionState, type CommLogEntry, appState } from '../../stores/appState';
     import type { OpenFlowRunRecord, WorkspaceSnapshot, PaneNodeSnapshot } from '../../stores/appState';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
     import BrowserPane from '../panes/BrowserPane.svelte';
-    import { onMount } from 'svelte';
-
-    import { onDestroy } from 'svelte';
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
 
@@ -18,7 +16,12 @@
     );
 
     let agentSessions = $state<AgentSessionState[]>([]);
+    // Subscribe to the shared store instead of maintaining local state
+    let commLogEntries = $derived($commLogStore);
+
     let orchestratorInterval: ReturnType<typeof setInterval> | null = null;
+    let commLogInterval: ReturnType<typeof setInterval> | null = null;
+    let initialTimeoutId: ReturnType<typeof setTimeout> | null = null;
     let showBrowser = $state(false);
     
     // Resizable panel state
@@ -40,11 +43,18 @@
         document.removeEventListener('mouseup', stopResize);
     };
 
+    // Guarantee resize listeners are removed even if the component is destroyed mid-drag.
+    onDestroy(() => {
+        document.removeEventListener('mousemove', handleResize);
+        document.removeEventListener('mouseup', stopResize);
+    });
+
     // Auto-trigger orchestration on mount
     $effect(() => {
         if (runId) {
-            // Trigger orchestration after a short delay to let agents initialize
-            setTimeout(() => {
+            // Store the handle so we can cancel it if runId changes before it fires.
+            initialTimeoutId = setTimeout(() => {
+                initialTimeoutId = null;
                 if (runId) {
                     triggerOrchestratorCycle(runId).catch(console.error);
                 }
@@ -53,17 +63,18 @@
             // Start auto-orchestration loop - keep running even after completion to process user injections
             orchestratorInterval = setInterval(() => {
                 if (runId && run) {
-                    console.log('[OpenFlow] Auto-orchestration cycle triggered, phase:', run?.current_phase, 'status:', run?.status);
-                    triggerOrchestratorCycle(runId)
-                        .then(result => {
-                            console.log('[OpenFlow] Orchestration result:', result);
-                        })
-                        .catch(e => console.error('[OpenFlow] Orchestration error:', e));
+                    triggerOrchestratorCycle(runId).catch(e =>
+                        console.error('[OpenFlow] Orchestration error:', e)
+                    );
                 }
             }, 10000);
         }
 
         return () => {
+            if (initialTimeoutId !== null) {
+                clearTimeout(initialTimeoutId);
+                initialTimeoutId = null;
+            }
             if (orchestratorInterval) {
                 clearInterval(orchestratorInterval);
                 orchestratorInterval = null;
@@ -73,22 +84,73 @@
 
     $effect(() => {
         if (runId) {
-            agentSessions = []; // Clear when switching runs
+            agentSessions = [];
+            commLogStore.set([]); // Clear shared store when switching runs
             getAgentSessionsForRun(runId).then(sessions => {
                 agentSessions = sessions;
             }).catch(console.error);
+            getCommunicationLog(runId).then(entries => {
+                commLogStore.set(entries);
+            }).catch(console.error);
+            
+            // Single polling interval — CommunicationPanel subscribes to the store
+            // instead of making its own parallel IPC calls.
+            commLogInterval = setInterval(() => {
+                if (runId) {
+                    getCommunicationLog(runId).then(entries => {
+                        // Skip the store update when nothing has changed to avoid
+                        // cascading reactive recalculations.
+                        commLogStore.update(prev => {
+                            if (prev.length === entries.length &&
+                                prev[prev.length - 1]?.message === entries[entries.length - 1]?.message) {
+                                return prev;
+                            }
+                            return entries;
+                        });
+                    }).catch(console.error);
+                }
+            }, 2000);
         } else {
             agentSessions = [];
+            commLogStore.set([]);
         }
+        
+        return () => {
+            if (commLogInterval) {
+                clearInterval(commLogInterval);
+                commLogInterval = null;
+            }
+        };
     });
 
     const agentNodes = $derived(
         run?.workers.map((w, index) => {
             const session = agentSessions.find(s => s.config.role === w.role);
+            const roleLower = w.role.toLowerCase();
+            
+            // Dynamically determine status based on recent comm log activity
+            let dynamicStatus = w.status;
+            const recentEntries = commLogEntries.slice(-15);
+            const roleEntries = recentEntries.filter(e => 
+                e.role.toLowerCase() === roleLower
+            );
+            
+            if (roleEntries.length > 0) {
+                const lastMsg = roleEntries[roleEntries.length - 1].message.toLowerCase();
+                
+                if (lastMsg.includes('done:') || lastMsg.includes('run complete')) {
+                    dynamicStatus = 'done';
+                } else if (lastMsg.includes('blocked:')) {
+                    dynamicStatus = 'blocked';
+                } else if (roleEntries.length >= recentEntries.length - 3) {
+                    dynamicStatus = 'active';
+                }
+            }
+            
             return {
                 id: `${w.role}-${index}`,
                 role: w.role,
-                status: w.status,
+                status: dynamicStatus,
                 model: session?.config.model ?? null,
                 thinkingMode: session?.config.thinking_mode ?? null
             };
@@ -97,34 +159,109 @@
 
     const activeConnections = $derived.by(() => {
         if (!run || run.workers.length === 0) return [];
-        const phase = run.current_phase;
+        
         const conns: Connection[] = [];
         
-        const getWorkerId = (role: string, fallbackIndex: number = 0) => {
-            const workersWithRole = run.workers
-                .map((w, i) => ({ role: w.role, index: i }))
-                .filter(w => w.role === role);
-            if (workersWithRole.length === 0) return `${role}-${fallbackIndex}`;
-            return `${role}-${workersWithRole[0].index}`;
+        // Build a position map keyed by role for O(1) lookups.
+        const workerIndexByRole = new Map<string, number[]>();
+        run.workers.forEach((w, i) => {
+            const r = w.role.toLowerCase();
+            const arr = workerIndexByRole.get(r) ?? [];
+            arr.push(i);
+            workerIndexByRole.set(r, arr);
+        });
+
+        const getWorkerId = (role: string, instanceIndex: number = 0) => {
+            const indices = workerIndexByRole.get(role.toLowerCase());
+            if (!indices || indices.length === 0) return `${role.toLowerCase()}-${instanceIndex}`;
+            const idx = instanceIndex < indices.length ? instanceIndex : 0;
+            return `${role.toLowerCase()}-${indices[idx]}`;
         };
 
-        if (phase === 'plan' || phase === 'execute') {
-            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('researcher'), label: 'research' });
-            conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('planner'), label: 'planning' });
-            conns.push({ from: getWorkerId('researcher'), to: getWorkerId('planner'), label: 'findings' });
-            conns.push({ from: getWorkerId('planner'), to: getWorkerId('builder'), label: 'tasks' });
+        const uniqueRoles = [...workerIndexByRole.keys()];
+        const recentEntries = commLogEntries.slice(-10);
+        
+        // Find the most recent non-system sender
+        let mostRecentSender: string | null = null;
+        let mostRecentTime = -1;
+        
+        for (const entry of recentEntries) {
+            const role = entry.role.toLowerCase();
+            if (role === 'system' || role === 'orchestrator') continue;
+            
+            const m = entry.timestamp.match(/(\d+)-(\d+)-(\d+)\s+(\d+):(\d+):(\d+)/);
+            if (m) {
+                const entryTime = new Date(
+                    parseInt(m[1]!, 10),
+                    parseInt(m[2]!, 10) - 1,
+                    parseInt(m[3]!, 10),
+                    parseInt(m[4]!, 10),
+                    parseInt(m[5]!, 10),
+                    parseInt(m[6]!, 10)
+                ).getTime();
+                if (entryTime > mostRecentTime) {
+                    mostRecentTime = entryTime;
+                    mostRecentSender = role;
+                }
+            }
         }
-        if (phase === 'execute') {
-            conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'building' });
+        
+        // ASSIGN messages → directed connections from orchestrator
+        for (const entry of recentEntries) {
+            if (entry.role.toLowerCase() !== 'orchestrator') continue;
+            const msg = entry.message.toLowerCase();
+            if (!msg.includes('assign ') && !msg.includes('assign:')) continue;
+            const roles = ['researcher', 'planner', 'builder', 'tester', 'debugger', 'reviewer'];
+            for (const role of roles) {
+                if (msg.includes(`assign ${role}`) || msg.includes(`assign:${role}`)) {
+                    conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId(role), label: role });
+                }
+            }
         }
-        if (phase === 'verify') {
-            conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'testing' });
-            conns.push({ from: getWorkerId('tester'), to: getWorkerId('debugger'), label: 'failures' });
-            conns.push({ from: getWorkerId('tester'), to: getWorkerId('reviewer'), label: 'results' });
+        
+        // Most-recent sender connections
+        if (mostRecentSender && uniqueRoles.includes(mostRecentSender)) {
+            const senderEntries = recentEntries.filter(e => e.role.toLowerCase() === mostRecentSender);
+            const lastMsg = senderEntries[senderEntries.length - 1]?.message.toLowerCase() ?? '';
+            
+            if (lastMsg.includes('done:') || lastMsg.includes('run complete')) {
+                const currentIndex = uniqueRoles.indexOf(mostRecentSender);
+                if (currentIndex < uniqueRoles.length - 1) {
+                    conns.push({ from: getWorkerId(mostRecentSender), to: getWorkerId(uniqueRoles[currentIndex + 1]!), label: 'done → next' });
+                } else {
+                    conns.push({ from: getWorkerId(mostRecentSender), to: getWorkerId('orchestrator'), label: 'complete' });
+                }
+            } else if (lastMsg.includes('blocked:')) {
+                conns.push({ from: getWorkerId(mostRecentSender), to: getWorkerId('debugger'), label: 'blocked' });
+            }
         }
-        if (phase === 'review') {
-            conns.push({ from: getWorkerId('builder'), to: getWorkerId('reviewer'), label: 'review' });
-            conns.push({ from: getWorkerId('reviewer'), to: getWorkerId('orchestrator'), label: 'feedback' });
+        
+        // Phase-based defaults when no log connections found
+        if (conns.length === 0) {
+            const phase = run.current_phase;
+            if (phase === 'plan' || phase === 'planning') {
+                conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('planner'), label: 'planning' });
+                if (uniqueRoles.includes('researcher')) {
+                    conns.push({ from: getWorkerId('orchestrator'), to: getWorkerId('researcher'), label: 'research' });
+                }
+            } else if (phase === 'execute' || phase === 'executing') {
+                conns.push({ from: getWorkerId('planner'), to: getWorkerId('builder'), label: 'tasks' });
+                if (uniqueRoles.includes('tester')) {
+                    conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'testing' });
+                }
+            } else if (phase === 'verify' || phase === 'verifying') {
+                if (uniqueRoles.includes('tester')) {
+                    conns.push({ from: getWorkerId('builder'), to: getWorkerId('tester'), label: 'testing' });
+                }
+                if (uniqueRoles.includes('reviewer')) {
+                    conns.push({ from: getWorkerId('tester') ?? getWorkerId('builder'), to: getWorkerId('reviewer'), label: 'results' });
+                }
+            } else if (phase === 'review' || phase === 'reviewing') {
+                if (uniqueRoles.includes('reviewer')) {
+                    conns.push({ from: getWorkerId('builder'), to: getWorkerId('reviewer'), label: 'review' });
+                    conns.push({ from: getWorkerId('reviewer'), to: getWorkerId('orchestrator'), label: 'feedback' });
+                }
+            }
         }
         
         return conns;

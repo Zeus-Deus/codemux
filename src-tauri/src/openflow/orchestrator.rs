@@ -214,6 +214,26 @@ impl Orchestrator {
             .open(&path)
             .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))?;
 
+        // Rotate after writing to keep the file bounded.  We do a best-effort
+        // rotation — if it fails we silently continue rather than failing the write.
+        let _ = Self::rotate_comm_log_if_needed(&path, 500);
+
+        Ok(())
+    }
+
+    /// If the log has grown beyond `max_lines`, drop the oldest half and rewrite the file.
+    /// This keeps recent context intact while preventing unbounded memory allocation when
+    /// the full file is read on every orchestration cycle.
+    fn rotate_comm_log_if_needed(path: &std::path::Path, max_lines: usize) -> std::io::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
+        if lines.len() <= max_lines {
+            return Ok(());
+        }
+        // Keep the newest half so the orchestrator retains recent context.
+        let keep_from = lines.len() - (max_lines / 2);
+        let trimmed = lines[keep_from..].join("\n") + "\n";
+        std::fs::write(path, trimmed)?;
         Ok(())
     }
 

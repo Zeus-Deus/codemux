@@ -1,65 +1,24 @@
 <script lang="ts">
-    import { onMount, onDestroy } from 'svelte';
-    import { getCommunicationLog, injectOrchestratorMessage, type CommLogEntry } from '../../stores/appState';
+    import { tick } from 'svelte';
+    import { commLogStore, getCommunicationLog, injectOrchestratorMessage, type CommLogEntry } from '../../stores/appState';
 
     let { runId }: { runId: string | null } = $props();
 
     let newMessage = $state('');
     let messagesContainer: HTMLDivElement;
-    let messages = $state<CommLogEntry[]>([]);
-    let pollInterval: ReturnType<typeof setInterval> | null = null;
-    let lastRunId: string | null = null;
     let injectError = $state<string | null>(null);
 
-    async function loadMessages() {
-        console.log('[CommPanel] loadMessages called, runId:', runId);
-        if (!runId) {
-            messages = [];
-            return;
-        }
-        injectError = null;
-        try {
-            const loaded = await getCommunicationLog(runId);
-            console.log('[CommPanel] Loaded', loaded.length, 'messages for runId:', runId);
-            
-            const hadMessages = messages.length;
-            messages = loaded;
-            
-            // Auto-scroll to bottom when new messages arrive
-            if (messages.length > hadMessages && messagesContainer) {
-                setTimeout(() => {
-                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                }, 50);
-            }
-        } catch (e) {
-            console.log('[CommPanel] Error loading messages:', e);
-            messages = [];
-        }
-    }
+    // Subscribe to the shared store — OrchestrationView owns the single polling interval.
+    const messages = $derived($commLogStore);
 
-    onMount(() => {
-        pollInterval = setInterval(loadMessages, 2000);
-    });
-
-    onDestroy(() => {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-        }
-    });
-
+    // Auto-scroll to bottom whenever new messages arrive.
     $effect(() => {
-        console.log('[CommPanel] runId:', runId, 'lastRunId:', lastRunId, 'messages count before:', messages.length);
-        // Clear messages when runId changes to a different value
-        if (runId !== lastRunId) {
-            console.log('[CommPanel] Switching runs, clearing messages, loading for:', runId);
-            lastRunId = runId;
-            messages = [];
-            if (runId) {
-                loadMessages().then(() => {
-                    console.log('[CommPanel] Loaded messages count:', messages.length);
-                });
+        const _len = messages.length; // reactive dependency
+        tick().then(() => {
+            if (messagesContainer) {
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
             }
-        }
+        });
     });
 
     async function handleSend() {
@@ -68,7 +27,9 @@
         try {
             await injectOrchestratorMessage(runId, newMessage.trim());
             newMessage = '';
-            await loadMessages();
+            // Eagerly refresh the shared store so the new injection is visible immediately.
+            const updated = await getCommunicationLog(runId);
+            commLogStore.set(updated);
         } catch (e) {
             console.error('Failed to inject message:', e);
             injectError = String(e);

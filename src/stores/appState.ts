@@ -701,6 +701,10 @@ export interface CommLogEntry {
     message: string;
 }
 
+/** Shared reactive store for the active run's communication log entries.
+ *  Only one component (OrchestrationView) should drive polling; all others subscribe. */
+export const commLogStore = writable<CommLogEntry[]>([]);
+
 export async function getCommunicationLog(runId: string): Promise<CommLogEntry[]> {
     return invoke<CommLogEntry[]>('get_communication_log', { runId });
 }
@@ -722,5 +726,12 @@ export interface OrchestratorTriggerResult {
 }
 
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
-    return invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
+    const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
+    // Only refresh the runtime snapshot when the phase actually changed — avoids a
+    // redundant IPC call every 10 s when nothing happened.
+    if (result.next_phase !== null) {
+        const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
+        openflowRuntime.set(snapshot);
+    }
+    return result;
 }
