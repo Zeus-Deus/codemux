@@ -965,6 +965,41 @@ impl AppStateStore {
             .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
     }
 
+    /// Bulk-remove terminal sessions by ID without the "last session" guard.
+    /// Also removes their panes from all workspace trees. Use when stopping an OpenFlow run.
+    pub fn remove_terminal_sessions(&self, session_ids: &[String]) {
+        let ids: std::collections::HashSet<&str> =
+            session_ids.iter().map(String::as_str).collect();
+        if ids.is_empty() {
+            return;
+        }
+        let mut snapshot = self.inner.lock().unwrap();
+        snapshot
+            .terminal_sessions
+            .retain(|s| !ids.contains(s.session_id.0.as_str()));
+        for workspace in &mut snapshot.workspaces {
+            for surface in &mut workspace.surfaces {
+                if let Some(new_root) = remove_terminals_from_tree(&surface.root, &ids) {
+                    surface.root = new_root;
+                } else {
+                    surface.root = PaneNodeSnapshot::Split {
+                        pane_id: PaneId(next_id("pane")),
+                        direction: SplitDirection::Vertical,
+                        child_sizes: vec![100.0],
+                        children: vec![],
+                    };
+                    surface.active_pane_id = pane_id_from_node(&surface.root);
+                }
+            }
+        }
+    }
+
+    /// Returns the workspace that contains the given terminal session, if any.
+    pub fn workspace_id_for_session(&self, session_id: &str) -> Option<WorkspaceId> {
+        let snapshot = self.inner.lock().unwrap();
+        find_workspace_id_for_session(&snapshot.workspaces, session_id)
+    }
+
     pub fn close_pane(&self, pane_id: &str) -> Result<Option<SessionId>, String> {
         let mut snapshot = self.inner.lock().unwrap();
         let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
@@ -1325,6 +1360,41 @@ pub fn load_persisted_state() -> Option<AppStateSnapshot> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Remove OpenFlow workspaces and their terminal sessions from a snapshot.
+/// Used on startup so persisted agent sessions from crashed runs are not respawned.
+pub fn strip_openflow_from_snapshot(mut snapshot: AppStateSnapshot) -> AppStateSnapshot {
+    let openflow_session_ids: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .filter(|w| w.workspace_type == WorkspaceType::OpenFlow)
+        .flat_map(|w| collect_terminal_sessions(&w.surfaces))
+        .collect();
+
+    let removed_workspace_ids: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .filter(|w| w.workspace_type == WorkspaceType::OpenFlow)
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+
+    snapshot
+        .terminal_sessions
+        .retain(|s| !openflow_session_ids.contains(s.session_id.0.as_str()));
+    snapshot
+        .workspaces
+        .retain(|w| w.workspace_type != WorkspaceType::OpenFlow);
+
+    if removed_workspace_ids.contains(&snapshot.active_workspace_id.0) {
+        snapshot.active_workspace_id = snapshot
+            .workspaces
+            .first()
+            .map(|w| w.workspace_id.clone())
+            .unwrap_or_else(|| WorkspaceId(String::new()));
+    }
+
+    snapshot
+}
+
 pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
     let max_id = snapshot
         .workspaces
@@ -1484,6 +1554,41 @@ fn remove_terminal_from_tree(
     }
 }
 
+/// Remove multiple terminal sessions from the pane tree in one pass.
+fn remove_terminals_from_tree(
+    root: &PaneNodeSnapshot,
+    session_ids: &std::collections::HashSet<&str>,
+) -> Option<PaneNodeSnapshot> {
+    match root {
+        PaneNodeSnapshot::Terminal { session_id, .. } if session_ids.contains(session_id.0.as_str()) => {
+            None
+        }
+        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => Some(root.clone()),
+        PaneNodeSnapshot::Split {
+            pane_id,
+            direction,
+            child_sizes,
+            children,
+        } => {
+            let remaining_children = children
+                .iter()
+                .filter_map(|child| remove_terminals_from_tree(child, session_ids))
+                .collect::<Vec<_>>();
+
+            match remaining_children.len() {
+                0 => None,
+                1 => remaining_children.into_iter().next(),
+                _ => Some(PaneNodeSnapshot::Split {
+                    pane_id: pane_id.clone(),
+                    direction: direction.clone(),
+                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    children: remaining_children,
+                }),
+            }
+        }
+    }
+}
+
 fn first_terminal_pane(root: &PaneNodeSnapshot) -> Option<(PaneId, SessionId)> {
     match root {
         PaneNodeSnapshot::Terminal {
@@ -1573,7 +1678,10 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
             .map_err(|error| format!("Failed to create config dir: {error}"))?;
     }
 
-    let json = serde_json::to_string_pretty(snapshot)
+    // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
+    let snapshot = strip_openflow_from_snapshot(snapshot.clone());
+
+    let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
     fs::write(path, json).map_err(|error| format!("Failed to write layout state: {error}"))
 }

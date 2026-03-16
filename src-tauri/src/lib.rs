@@ -16,6 +16,16 @@ pub mod terminal;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(debug_assertions)]
+    {
+        use std::time::SystemTime;
+        let start = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        eprintln!("[DEBUG] codemux_lib::run() started at timestamp: {}", start);
+    }
+    
     tauri::Builder::default()
         .manage(state::AppStateStore::default())
         .manage(commands::BrowserAutomationCoordinator::default())
@@ -32,8 +42,9 @@ pub fn run() {
             let handle = app.handle().clone();
             if let Some(snapshot) = state::load_persisted_state() {
                 state::restore_session_ids(&snapshot);
+                let stripped = state::strip_openflow_from_snapshot(snapshot);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
-                state.replace_snapshot(snapshot);
+                state.replace_snapshot(stripped);
             }
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");

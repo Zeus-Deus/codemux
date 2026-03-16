@@ -61,14 +61,14 @@
             }, 3000);
 
             // Start auto-orchestration loop - keep running even after completion to process user injections
-            // Using incremental log reading now, so 10s is fine
+            // Increased from 10s to 15s to reduce load with many agents
             orchestratorInterval = setInterval(() => {
                 if (runId && run) {
                     triggerOrchestratorCycle(runId).catch(e =>
                         console.error('[OpenFlow] Orchestration error:', e)
                     );
                 }
-            }, 10000);
+            }, 15000);
         }
 
         return () => {
@@ -96,10 +96,10 @@
             }).catch(console.error);
             
             // Single polling interval — CommunicationPanel subscribes to the store
-            // instead of making its own parallel IPC calls.
-            // Using incremental reading (only fetches new entries), so 3s is efficient
-            // Also limits store to max 500 entries to prevent memory bloat
+            // Increased from 3s to 5s to reduce load with many agents. When the run
+            // is completed, back off further to 30s to reduce idle overhead.
             const MAX_STORE_ENTRIES = 500;
+            const intervalMs = run && run.status === 'completed' ? 30000 : 5000;
             commLogInterval = setInterval(() => {
                 if (runId) {
                     getCommunicationLog(runId).then(entries => {
@@ -116,7 +116,7 @@
                         }
                     }).catch(console.error);
                 }
-            }, 3000);
+            }, intervalMs);
         } else {
             agentSessions = [];
             commLogStore.set([]);

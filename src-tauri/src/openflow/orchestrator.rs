@@ -312,15 +312,22 @@ impl Orchestrator {
         }
 
         let entry = format!("{}\n", message);
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))?;
+        let path_str = path.to_string_lossy().to_string();
+        // Use the same file lock used by agent PTY writers so that all
+        // communication log writes are serialized through a single mutex.
+        let log_lock = crate::terminal::get_comm_log_lock(&path_str);
+        {
+            use std::io::Write;
+            let mut file = log_lock
+                .lock()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Comm log lock poisoned"))?;
+            file.write_all(entry.as_bytes())?;
+            file.flush()?;
+        }
 
         // Rotate after writing to keep the file bounded.  We do a best-effort
         // rotation — if it fails we silently continue rather than failing the write.
-        // Increased from 500 to 5000 for better scalability with 20+ agents
+        // Increased from 500 to 5000 for better scalability with 20+ agents.
         let _ = Self::rotate_comm_log_if_needed(&path, 5000);
 
         Ok(())

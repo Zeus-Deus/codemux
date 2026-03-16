@@ -471,18 +471,11 @@ pub fn get_communication_log(run_id: String, offset: Option<usize>) -> Result<(V
 /// Inject a user message into the communication log (goes to orchestrator).
 #[tauri::command]
 pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<(), String> {
-    let path = comm_log_path(&run_id);
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let entry = format!("[{}] [user/inject] {}\n", timestamp, message);
-    
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .and_then(|mut f| std::io::Write::write_all(&mut f, entry.as_bytes()))
-        .map_err(|e| format!("Failed to write to comm log: {e}"))?;
+    let entry = format!("[{}] [user/inject] {}", timestamp, message);
 
-    Ok(())
+    crate::openflow::orchestrator::Orchestrator::write_to_comm_log(&run_id, &entry)
+        .map_err(|e| format!("Failed to write to comm log: {e}"))
 }
 
 /// Trigger the orchestrator to analyze communication log and advance the run.
@@ -499,7 +492,21 @@ pub fn trigger_orchestrator_cycle(
     let phase = OrchestratorPhase::from_string(&current_phase_str);
 
     #[cfg(debug_assertions)]
-    eprintln!("[DEBUG] trigger_orchestrator_cycle run_id={} phase={}", run_id, current_phase_str);
+    {
+        let sessions_guard = pty_state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let total_sessions = sessions_guard.len();
+        let total_pending_chunks: usize = sessions_guard
+            .values()
+            .map(|rt| rt.pending_output.len())
+            .sum();
+        eprintln!(
+            "[DEBUG] trigger_orchestrator_cycle run_id={} phase={} sessions={} pending_chunks={}",
+            run_id,
+            current_phase_str,
+            total_sessions,
+            total_pending_chunks
+        );
+    }
 
     // Read the comm log - use incremental reading if offset provided
     let (entries, new_offset) = if let Some(off) = offset {
@@ -994,6 +1001,18 @@ pub fn close_pane(
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
     let removed = state.close_pane(&pane_id)?;
+    // If this pane hosted a terminal session, clean up its PTY runtime so that the
+    // child process and associated threads do not leak after the pane is closed.
+    if let Some(ref session_id) = removed {
+        let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
+        crate::terminal::close_terminal_session(
+            app.clone(),
+            terminal_state,
+            state.clone(),
+            session_id.0.clone(),
+        )
+        .ok();
+    }
     if let Some(browser_id) = removed_browser_id {
         let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
@@ -1428,7 +1447,11 @@ pub fn apply_openflow_review_result(
 
 #[tauri::command]
 pub fn stop_openflow_run(
+    app: tauri::AppHandle,
     store: State<'_, OpenFlowRuntimeStore>,
+    agent_store: State<'_, AgentSessionStore>,
+    app_state: State<'_, AppStateStore>,
+    terminal_state: State<'_, crate::terminal::PtyState>,
     run_id: String,
     status: String,
     reason: String,
@@ -1439,7 +1462,37 @@ pub fn stop_openflow_run(
         "awaiting_approval" => OpenFlowRunStatus::AwaitingApproval,
         _ => OpenFlowRunStatus::Failed,
     };
-    store.stop_run(&run_id, status, reason)
+    let record = store.stop_run(&run_id, status, reason)?;
+
+    // Collect all agent sessions for this run so we can tear down their PTYs
+    // and remove their terminal session entries when the run is stopped.
+    let agent_sessions = agent_store.for_run(&run_id);
+    let session_ids: Vec<String> = agent_sessions.iter().map(|s| s.session_id.clone()).collect();
+    let openflow_workspace_id = session_ids
+        .first()
+        .and_then(|id| app_state.workspace_id_for_session(id));
+
+    {
+        let mut sessions_guard = terminal_state.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for session_id in &session_ids {
+            sessions_guard.remove(session_id);
+        }
+    }
+    app_state.remove_terminal_sessions(&session_ids);
+
+    if let Some(workspace_id) = openflow_workspace_id {
+        let _ = app_state.close_workspace(&workspace_id.0);
+    }
+
+    // After a run is explicitly stopped, clean up in-memory runtime and agent
+    // session state, and release any comm-log file handles for this run.
+    let _ = store.remove_run(&run_id);
+    agent_store.remove_for_run(&run_id);
+    let log_path = comm_log_path(&run_id);
+    crate::terminal::release_comm_log_lock(&log_path);
+
+    crate::state::emit_app_state(&app);
+    Ok(record)
 }
 
 #[tauri::command]

@@ -12,9 +12,9 @@ use crate::state::{self, AppStateStore, TerminalSessionState};
 static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
     std::sync::OnceLock::new();
 
-fn get_comm_log_lock(path: &str) -> Arc<Mutex<std::fs::File>> {
+pub fn get_comm_log_lock(path: &str) -> Arc<Mutex<std::fs::File>> {
     let locks = COMM_LOG_LOCKS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
-    let mut locks_guard = locks.lock().unwrap();
+    let mut locks_guard = locks.lock().unwrap_or_else(|e| e.into_inner());
     locks_guard
         .entry(path.to_string())
         .or_insert_with(|| {
@@ -26,6 +26,13 @@ fn get_comm_log_lock(path: &str) -> Arc<Mutex<std::fs::File>> {
             Arc::new(Mutex::new(file))
         })
         .clone()
+}
+
+pub fn release_comm_log_lock(path: &str) {
+    if let Some(locks) = COMM_LOG_LOCKS.get() {
+        let mut locks_guard = locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks_guard.remove(path);
+    }
 }
 
 fn strip_ansi_codes(s: &str) -> String {
@@ -64,7 +71,9 @@ fn strip_ansi_codes(s: &str) -> String {
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const OUTPUT_BUFFER_LIMIT: usize = 4096;
+const OUTPUT_BUFFER_LIMIT: usize = 1024;
+/// Safety cap so we never spawn hundreds of PTYs on startup (e.g. after corrupted or stale persisted state).
+const MAX_STARTUP_SESSIONS: usize = 50;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,7 +126,10 @@ fn remove_session_runtime(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
 ) -> Option<SessionRuntime> {
-    sessions.lock().unwrap().remove(session_id)
+    sessions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(session_id)
 }
 
 fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
@@ -135,7 +147,7 @@ fn with_session_runtime<T>(
     default: impl FnOnce() -> SessionRuntime,
     f: impl FnOnce(&mut SessionRuntime) -> T,
 ) -> T {
-    let mut guard = sessions.lock().unwrap();
+    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     let runtime = guard.entry(session_id.to_string()).or_insert_with(default);
     f(runtime)
 }
@@ -408,12 +420,21 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
 pub fn spawn_missing_ptys(app: AppHandle) {
     let app_state: State<'_, AppStateStore> = app.state();
-    let session_ids = app_state
+    let mut session_ids = app_state
         .snapshot()
         .terminal_sessions
         .into_iter()
         .map(|session| session.session_id.0)
         .collect::<Vec<_>>();
+
+    if session_ids.len() > MAX_STARTUP_SESSIONS {
+        eprintln!(
+            "[codemux::terminal] Too many persisted sessions ({}); spawning only the first {}",
+            session_ids.len(),
+            MAX_STARTUP_SESSIONS
+        );
+        session_ids.truncate(MAX_STARTUP_SESSIONS);
+    }
 
     for session_id in session_ids {
         spawn_pty_for_session(app.clone(), session_id);

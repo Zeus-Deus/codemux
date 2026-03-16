@@ -260,12 +260,15 @@ impl Default for OpenFlowRuntimeStore {
 
 impl OpenFlowRuntimeStore {
     pub fn snapshot(&self) -> OpenFlowRuntimeSnapshot {
-        self.inner.lock().unwrap().clone()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Read only the current phase string for a run — much cheaper than a full snapshot clone.
     pub fn get_run_phase(&self, run_id: &str) -> Result<String, String> {
-        let snapshot = self.inner.lock().unwrap();
+        let snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         snapshot
             .active_runs
             .iter()
@@ -279,7 +282,7 @@ impl OpenFlowRuntimeStore {
         &self,
         run_id: &str,
     ) -> Result<(String, OpenFlowRunStatus), String> {
-        let snapshot = self.inner.lock().unwrap();
+        let snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         snapshot
             .active_runs
             .iter()
@@ -290,7 +293,7 @@ impl OpenFlowRuntimeStore {
 
     /// Clone only the record for a single run.
     pub fn get_run_record(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
-        let snapshot = self.inner.lock().unwrap();
+        let snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         snapshot
             .active_runs
             .iter()
@@ -300,7 +303,7 @@ impl OpenFlowRuntimeStore {
     }
 
     pub fn create_run(&self, request: OpenFlowCreateRunRequest) -> OpenFlowRunRecord {
-        let mut snapshot = self.inner.lock().unwrap();
+        let mut snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let run_id = format!(
             "openflow-run-{}",
             uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
@@ -441,7 +444,7 @@ impl OpenFlowRuntimeStore {
     }
 
     pub fn advance_run_phase(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
-        let mut snapshot = self.inner.lock().unwrap();
+        let mut snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let run = snapshot
             .active_runs
             .iter_mut()
@@ -536,7 +539,7 @@ impl OpenFlowRuntimeStore {
     }
 
     pub fn retry_run(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
-        let mut snapshot = self.inner.lock().unwrap();
+        let mut snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let run = snapshot
             .active_runs
             .iter_mut()
@@ -615,7 +618,7 @@ impl OpenFlowRuntimeStore {
         accepted: bool,
         issue: Option<String>,
     ) -> Result<OpenFlowRunRecord, String> {
-        let mut snapshot = self.inner.lock().unwrap();
+        let mut snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let run = snapshot
             .active_runs
             .iter_mut()
@@ -705,6 +708,13 @@ impl OpenFlowRuntimeStore {
             level: OpenFlowTimelineLevel::Info,
             message: format!("Phase changed to {} (status: {:?})", phase, status_clone),
         });
+
+        // Cap timeline length to avoid unbounded memory growth for very long runs.
+        const MAX_TIMELINE_ENTRIES: usize = 200;
+        if run.timeline.len() > MAX_TIMELINE_ENTRIES {
+            let drop = run.timeline.len() - MAX_TIMELINE_ENTRIES;
+            run.timeline.drain(0..drop);
+        }
 
         Ok(run.clone())
     }
@@ -936,23 +946,35 @@ pub struct AgentSessionStore {
 
 impl AgentSessionStore {
     pub fn insert(&self, session_id: String, state: AgentSessionState) {
-        self.inner.lock().unwrap().insert(session_id, state);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id, state);
     }
 
     pub fn update_status(&self, session_id: &str, status: AgentSessionStatus) {
-        if let Some(entry) = self.inner.lock().unwrap().get_mut(session_id) {
+        if let Some(entry) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(session_id)
+        {
             entry.status = status;
         }
     }
 
     pub fn get(&self, session_id: &str) -> Option<AgentSessionState> {
-        self.inner.lock().unwrap().get(session_id).cloned()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session_id)
+            .cloned()
     }
 
     pub fn for_run(&self, run_id: &str) -> Vec<AgentSessionState> {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .filter(|s| s.run_id == run_id)
             .cloned()
@@ -960,7 +982,12 @@ impl AgentSessionStore {
     }
 
     pub fn all(&self) -> Vec<AgentSessionState> {
-        self.inner.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Remove all sessions for a given run - call this when run completes
@@ -968,7 +995,7 @@ impl AgentSessionStore {
     pub fn remove_for_run(&self, run_id: &str) {
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|_, state| state.run_id != run_id);
     }
 }

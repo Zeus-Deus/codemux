@@ -38,6 +38,24 @@ pub fn spawn_control_server(app: AppHandle) {
         return;
     };
 
+    // If a control socket already exists and responds, assume another Codemux
+    // instance is running and do NOT steal the socket or start a second server.
+    if socket_path.exists() {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
+            drop(stream);
+            eprintln!(
+                "[codemux::control] Existing control socket at {:?} is alive; skipping new control server",
+                socket_path
+            );
+            return;
+        } else {
+            eprintln!(
+                "[codemux::control] Existing control socket at {:?} appears stale; replacing it",
+                socket_path
+            );
+        }
+    }
+
     if let Some(parent) = socket_path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
             eprintln!("[codemux::control] Failed to create control dir: {error}");
