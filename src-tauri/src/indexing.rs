@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::project::current_project_root;
 
@@ -24,6 +25,33 @@ const IGNORED_DIRS: &[&str] = &[
     "build",
     ".codemux",
 ];
+
+/// Debounce period: wait this long after the last relevant file change before rebuilding the index.
+const INDEX_REBUILD_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Returns true if this path is under .codemux or any IGNORED_DIR under project_root.
+/// Events that only touch such paths are skipped to avoid feedback loops and unnecessary rebuilds.
+fn path_should_skip_for_index(path: &Path, project_root: &Path) -> bool {
+    let stripped = match path.strip_prefix(project_root) {
+        Ok(s) => s,
+        Err(_) => return true,
+    };
+    for component in stripped.components() {
+        if let std::path::Component::Normal(c) = component {
+            if let Some(name) = c.to_str() {
+                if IGNORED_DIRS.iter().any(|d| *d == name) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// True if the event contains at least one path that should trigger an index rebuild.
+fn event_has_relevant_paths(event: &notify::Event, project_root: &Path) -> bool {
+    event.paths.iter().any(|p| !path_should_skip_for_index(p, project_root))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedChunk {
@@ -153,30 +181,66 @@ pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
             return;
         }
 
-        for event in rx {
-            match event {
-                Ok(event) => {
-                    if event.paths.is_empty() {
-                        continue;
-                    }
+        loop {
+            let event = match rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => break,
+            };
+            let event = match event {
+                Ok(ev) => ev,
+                Err(error) => {
+                    eprintln!("[codemux::index] Watch error: {error}");
+                    continue;
+                }
+            };
+            if event.paths.is_empty() {
+                continue;
+            }
+            if !matches!(
+                event.kind,
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+            ) {
+                continue;
+            }
+            if !event_has_relevant_paths(&event, &project_root) {
+                continue;
+            }
 
-                    if matches!(
-                        event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
-                    ) {
-                        let current_root = project_root.clone();
-                        match build_index_for_root(&current_root) {
-                            Ok(snapshot) => {
-                                let _ = save_index(&snapshot);
-                                *store.lock().unwrap() = snapshot;
-                            }
-                            Err(error) => {
-                                eprintln!("[codemux::index] Failed to refresh index: {error}");
-                            }
+            // Debounce: wait INDEX_REBUILD_DEBOUNCE of quiet before rebuilding.
+            // If another relevant event arrives, reset the timer.
+            let mut deadline = Instant::now() + INDEX_REBUILD_DEBOUNCE;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(Ok(ev)) => {
+                        if !ev.paths.is_empty()
+                            && matches!(
+                                ev.kind,
+                                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                            )
+                            && event_has_relevant_paths(&ev, &project_root)
+                        {
+                            deadline = Instant::now() + INDEX_REBUILD_DEBOUNCE;
                         }
                     }
+                    Ok(Err(error)) => eprintln!("[codemux::index] Watch error: {error}"),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                 }
-                Err(error) => eprintln!("[codemux::index] Watch error: {error}"),
+            }
+
+            let current_root = project_root.clone();
+            match build_index_for_root(&current_root) {
+                Ok(snapshot) => {
+                    let _ = save_index(&snapshot);
+                    *store.lock().unwrap() = snapshot;
+                }
+                Err(error) => {
+                    eprintln!("[codemux::index] Failed to refresh index: {error}");
+                }
             }
         }
     });

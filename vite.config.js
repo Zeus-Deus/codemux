@@ -19,7 +19,7 @@ export default defineConfig(async () => ({
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,
-    strictPort: false,
+    strictPort: true,
     host: host || false,
     hmr: host
       ? {
@@ -29,8 +29,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      // 3. tell Vite to ignore watching `src-tauri`
-      ignored: ["**/src-tauri/**"],
+      // 3. tell Vite to ignore watching `src-tauri` and backend-written `.codemux`
+      ignored: ["**/src-tauri/**", "**/.codemux/**"],
     },
   },
 }));
