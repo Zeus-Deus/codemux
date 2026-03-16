@@ -23,8 +23,10 @@ impl AgentAdapter for OpenCodeAdapter {
         let wrapper_str = wrapper_path.to_string_lossy().to_string();
         let argv = vec![wrapper_str.clone()];
 
+        let instance_id = instance_label(config);
         let mut env = vec![
             ("CODEMUX_AGENT_ROLE".into(), role_label(config)),
+            ("CODEMUX_AGENT_INSTANCE_ID".into(), instance_id.clone()),
             ("CODEMUX_OPENFLOW_RUN_ID".into(), run_id.to_string()),
             (
                 "CODEMUX_COMMUNICATION_LOG".into(),
@@ -40,14 +42,15 @@ impl AgentAdapter for OpenCodeAdapter {
             env.push(("OPENCODE_THINKING".into(), config.thinking_mode.clone()));
         }
 
-        // Get system prompt path if available.
-        let system_prompt_path = SystemPrompts::prompt_path_for_role(&config.role);
+        // Get system prompt path — instance-specific so each parallel agent has its own file.
+        let system_prompt_path =
+            SystemPrompts::prompt_path_for_instance(&config.role, config.agent_index);
         let prompt_path_str = system_prompt_path.to_string_lossy().to_string();
         env.push(("CODEMUX_SYSTEM_PROMPT_PATH".into(), prompt_path_str.clone()));
 
         let title = format!(
             "[{}] {} — {}",
-            role_label(config),
+            instance_id,
             short_model(&config.model),
             run_id,
         );
@@ -63,6 +66,17 @@ impl AgentAdapter for OpenCodeAdapter {
 
 fn role_label(config: &AgentConfig) -> String {
     format!("{:?}", config.role).to_lowercase()
+}
+
+/// Returns a unique per-instance label like `builder-0`, `builder-1`.
+/// The orchestrator always keeps its simple role label since there's only one.
+fn instance_label(config: &AgentConfig) -> String {
+    let role = role_label(config);
+    if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+        role
+    } else {
+        format!("{}-{}", role, config.agent_index)
+    }
 }
 
 fn short_model(model: &str) -> &str {

@@ -9,14 +9,27 @@
     let injectError = $state<string | null>(null);
 
     // Subscribe to the shared store — OrchestrationView owns the single polling interval.
-    const messages = $derived($commLogStore);
+    // Limit to last 100 messages for performance with 20+ agents
+    const messages = $derived($commLogStore.slice(-100));
 
-    // Auto-scroll to bottom whenever new messages arrive.
+    // Auto-scroll to bottom when new messages arrive, but debounced to prevent thrashing
+    let lastScrollHeight = $state(0);
+    let isUserNearBottom = $state(true);
+    
     $effect(() => {
-        const _len = messages.length; // reactive dependency
+        const _len = messages.length;
+        const container = messagesContainer;
+        if (!container) return;
+        
+        // Check if user is near bottom before auto-scrolling
+        const scrollBottom = container.scrollTop + container.clientHeight;
+        const threshold = 100; // pixels from bottom
+        isUserNearBottom = scrollBottom >= container.scrollHeight - threshold;
+        
         tick().then(() => {
-            if (messagesContainer) {
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+            // Only auto-scroll if user is near bottom (or it's the first load)
+            if (isUserNearBottom || messages.length < 10) {
+                container.scrollTop = container.scrollHeight;
             }
         });
     });

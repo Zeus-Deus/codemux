@@ -599,6 +599,11 @@ export async function stopOpenFlowRun(runId: string, status: 'failed' | 'cancell
         status,
         reason
     });
+    
+    // Clean up offsets to prevent memory leak
+    clearCommLogOffset(runId);
+    orchestratorOffsets.delete(runId);
+    
     const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
     openflowRuntime.set(snapshot);
     return run;
@@ -705,8 +710,21 @@ export interface CommLogEntry {
  *  Only one component (OrchestrationView) should drive polling; all others subscribe. */
 export const commLogStore = writable<CommLogEntry[]>([]);
 
+const commLogOffsets = new Map<string, number>();
+
+export function clearCommLogOffset(runId: string) {
+    commLogOffsets.delete(runId);
+}
+
 export async function getCommunicationLog(runId: string): Promise<CommLogEntry[]> {
-    return invoke<CommLogEntry[]>('get_communication_log', { runId });
+    const offset = commLogOffsets.get(runId) ?? 0;
+    const result = await invoke<[CommLogEntry[], number]>('get_communication_log', { runId, offset });
+    const [entries, newOffset] = result;
+    
+    // Update the offset for next read
+    commLogOffsets.set(runId, newOffset);
+    
+    return entries;
 }
 
 export async function injectOrchestratorMessage(runId: string, message: string): Promise<void> {
@@ -723,10 +741,21 @@ export interface OrchestratorTriggerResult {
         user_injections_count: number;
     };
     actions_taken: string[];
+    comm_log_offset: number;
 }
 
+// Track offset per run for orchestrator cycles (separate from display offset)
+const orchestratorOffsets = new Map<string, number>();
+
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
-    const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
+    const offset = orchestratorOffsets.get(runId) ?? 0;
+    const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId, offset });
+    
+    // Update offset after each cycle for incremental reading
+    if (result.comm_log_offset > 0) {
+        orchestratorOffsets.set(runId, result.comm_log_offset);
+    }
+    
     // Only refresh the runtime snapshot when the phase actually changed — avoids a
     // redundant IPC call every 10 s when nothing happened.
     if (result.next_phase !== null) {

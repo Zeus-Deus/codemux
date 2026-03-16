@@ -581,7 +581,7 @@ impl OpenFlowRuntimeStore {
             iterations += 1;
 
             // Targeted read — avoids cloning the entire runtime snapshot.
-            let (phase, status) = self.get_run_phase_and_status(run_id)?;
+            let (_phase, status) = self.get_run_phase_and_status(run_id)?;
 
             if matches!(
                 status,
@@ -669,6 +669,19 @@ impl OpenFlowRuntimeStore {
             message: reason,
         });
         Ok(run.clone())
+    }
+
+    /// Remove a run from the store - call this when a run is fully complete
+    /// to prevent memory accumulation.
+    pub fn remove_run(&self, run_id: &str) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let initial_len = snapshot.active_runs.len();
+        snapshot.active_runs.retain(|r| r.run_id != run_id);
+
+        if snapshot.active_runs.len() == initial_len {
+            return Err(format!("No run found for {run_id}"));
+        }
+        Ok(())
     }
 
     pub fn set_run_phase(
@@ -948,5 +961,14 @@ impl AgentSessionStore {
 
     pub fn all(&self) -> Vec<AgentSessionState> {
         self.inner.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Remove all sessions for a given run - call this when run completes
+    /// to prevent memory accumulation.
+    pub fn remove_for_run(&self, run_id: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .retain(|_, state| state.run_id != run_id);
     }
 }

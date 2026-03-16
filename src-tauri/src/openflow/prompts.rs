@@ -5,6 +5,7 @@ const BASE_CONTEXT: &str = r#"You are an agent inside an OpenFlow orchestration 
 
 Environment:
 - Your role: {role}
+- Your instance ID: {instance_id}
 - Run ID: {run_id}
 - Working directory: the project folder selected by the user
 
@@ -23,55 +24,69 @@ const ORCHESTRATOR_PROMPT: &str = r#"You are the Orchestrator — the central co
 
 CRITICAL: You MUST assign all work to other agents. You should NEVER run commands yourself.
 
-Assignment format (MUST use this exact format):
-  ASSIGN BUILDER: <detailed task description>
-  ASSIGN RESEARCHER: <question to answer>
-  ASSIGN TESTER: <what to test>
-  ASSIGN REVIEWER: <what to review>
-  ASSIGN DEBUGGER: <bug to fix>
+Assignment format — always use the INSTANCE ID (role + index), NOT the bare role name:
+  ASSIGN BUILDER-0: <detailed task description>
+  ASSIGN BUILDER-1: <different task description>
+  ASSIGN RESEARCHER-0: <question to answer>
+  ASSIGN TESTER-0: <what to test>
+  ASSIGN REVIEWER-0: <what to review>
+  ASSIGN DEBUGGER-0: <bug to fix>
+  ASSIGN PLANNER-0: <planning task>
 
-Example:
-  ASSIGN RESEARCHER: What are the best React calendar libraries for 2024?
-  ASSIGN BUILDER: Create a React + Vite project and install FullCalendar
+PARALLEL EXECUTION — this is critical for speed:
+- You will be told which agent instances are available (e.g. BUILDER-0, BUILDER-1, BUILDER-2).
+- Assign DIFFERENT tasks to ALL available instances of a role simultaneously.
+- Do NOT wait for one builder to finish before assigning to another builder.
+- Only wait for a specific instance (e.g. BUILDER-0) if you need ITS output before the next step.
+- If you have 3 builders, give all 3 independent tasks at the same time.
 
-After assigning, WAIT for the agent to say DONE before assigning more tasks.
+Example of good parallel assignment:
+  ASSIGN BUILDER-0: Create the backend API routes in src/routes/
+  ASSIGN BUILDER-1: Create the database schema and migrations in src/db/
+  ASSIGN BUILDER-2: Create the frontend React components in src/components/
 
 Your responsibilities:
 - Read the user's goal and produce a plan
-- Assign ONE task at a time using the ASSIGN format above
-- Monitor for DONE and BLOCKED messages from other agents
-- When an agent is DONE, assign the next task or trigger review
-- When an agent is BLOCKED, decide: reassign, adjust scope, or replan
+- Identify which agent instances are available from the AGENTS line in the comm log
+- Assign tasks in parallel to all available instances of each role
+- Monitor for DONE <INSTANCE-ID>: and BLOCKED <INSTANCE-ID>: messages
+- When an instance is DONE, assign it the next available task immediately
+- When an instance is BLOCKED, decide: reassign, adjust scope, or replan
 - After major milestones, output STATUS update
 - When ALL tasks are complete, say: RUN COMPLETE: <summary>
 
-Phase loop: Plan → Assign → Execute → Verify → Review → RUN COMPLETE
+Phase loop: Plan → Assign (in parallel) → Execute → Verify → Review → RUN COMPLETE
 "#;
 
 const PLANNER_PROMPT: &str = r#"You are a Planner agent. Your job is to break down the user's goal into a structured task plan.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
 
 When assigned:
 - Analyze the goal and break into phases and concrete tasks
 - Output a task graph
-- Say DONE when complete
+- Say DONE: <brief summary> when complete
+- Say BLOCKED: <reason> if you cannot proceed
 "#;
 
 const REVIEWER_PROMPT: &str = r#"You are a Reviewer agent. Your job is code quality checking.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
 
 When assigned:
 - Read the diff or files mentioned
 - Check for bugs, edge cases, security issues
 - Output review report
-- Say DONE when complete
+- Say DONE: <brief summary> when complete
+- Say BLOCKED: <reason> if you cannot proceed
 "#;
 
 const TESTER_PROMPT: &str = r#"You are a Tester agent. Your job is to verify implemented features work.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
 
 You have access to Codemux browser:
 - `codemux browser open <url>` - open URL
@@ -83,40 +98,48 @@ You have access to Codemux browser:
 
 When assigned:
 - Run tests or verify in browser
-- Say DONE with summary
+- Say DONE: <brief summary> when complete
+- Say BLOCKED: <reason> if you cannot proceed
 "#;
 
 const DEBUGGER_PROMPT: &str = r#"You are a Debugger agent. Called when something is broken.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
 
 When assigned:
 - Investigate the bug
 - Implement minimal fix
-- Say FIX APPLIED: <description>
+- Say DONE: FIX APPLIED: <description> when complete
+- Say BLOCKED: <reason> if you cannot proceed
 "#;
 
 const RESEARCHER_PROMPT: &str = r#"You are a Researcher agent. You gather context and answer questions.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
 
 When assigned:
 - Research the question/topic
 - Output findings report
-- Say DONE when complete
+- Say DONE: <brief summary> when complete
+- Say BLOCKED: <reason> if you cannot proceed
 "#;
 
 const BUILDER_PROMPT: &str = r#"You are a Builder agent. Your ONLY job is to write code.
+Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN message from the Orchestrator BEFORE doing anything.
-If you receive no ASSIGN message, do nothing and wait.
+CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+If you receive no ASSIGN message addressed to your instance ID, do nothing and wait.
 
-When you receive ASSIGN BUILDER: <task>:
+When you receive ASSIGN {instance_id}: <task>:
 1. Implement exactly what is described
 2. Write clean, working code
-3. Say DONE when complete
+3. Say DONE: <brief summary of what you built> when complete
+4. Say BLOCKED: <reason> if you cannot proceed
 
 Never run commands or edit files without being assigned first.
+Never work on tasks assigned to other instance IDs.
 "#;
 
 pub struct SystemPrompts;
@@ -207,9 +230,23 @@ fi
         Ok(())
     }
 
+    /// Path to the shared role prompt (used as a fallback / base).
     pub fn prompt_path_for_role(role: &OpenFlowRole) -> PathBuf {
         let mut path = Self::prompts_dir();
         path.push(format!("{}.md", role.as_str()));
+        path
+    }
+
+    /// Path to the per-instance prompt file.  The orchestrator (always one instance) uses
+    /// the bare role name; all other roles get `{role}-{index}.md` so each parallel agent
+    /// instance starts with its own identity baked in.
+    pub fn prompt_path_for_instance(role: &OpenFlowRole, agent_index: usize) -> PathBuf {
+        let mut path = Self::prompts_dir();
+        if matches!(role, OpenFlowRole::Orchestrator) {
+            path.push(format!("{}.md", role.as_str()));
+        } else {
+            path.push(format!("{}-{}.md", role.as_str(), agent_index));
+        }
         path
     }
 
@@ -230,7 +267,7 @@ fi
         for role in roles {
             let path = Self::prompt_path_for_role(&role);
             if !path.exists() {
-                let content = Self::build_prompt_for_role(&role, "", "");
+                let content = Self::build_prompt_for_role(&role, "", "", 0);
                 std::fs::write(&path, content)?;
             }
         }
@@ -238,13 +275,15 @@ fi
         Ok(())
     }
 
+    /// Write an instance-specific prompt for the given role and agent index.
     pub fn write_prompt_for_run(
         role: &OpenFlowRole,
         run_id: &str,
         comm_log_path: &str,
+        agent_index: usize,
     ) -> std::io::Result<PathBuf> {
-        let path = Self::prompt_path_for_role(role);
-        let content = Self::build_prompt_for_role(role, run_id, comm_log_path);
+        let path = Self::prompt_path_for_instance(role, agent_index);
+        let content = Self::build_prompt_for_role(role, run_id, comm_log_path, agent_index);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -254,17 +293,31 @@ fi
         Ok(path)
     }
 
-    fn build_prompt_for_role(role: &OpenFlowRole, run_id: &str, comm_log_path: &str) -> String {
+    fn build_prompt_for_role(
+        role: &OpenFlowRole,
+        run_id: &str,
+        comm_log_path: &str,
+        agent_index: usize,
+    ) -> String {
         let role_str = role.as_str();
         let role_upper = role_str.to_uppercase();
 
+        // For non-orchestrator roles, embed the instance ID so the agent knows its own identity
+        // in the communication log (e.g. "You are BUILDER-0").
+        let instance_label = if matches!(role, OpenFlowRole::Orchestrator) {
+            role_upper.clone()
+        } else {
+            format!("{}-{}", role_upper, agent_index)
+        };
+
         let base = BASE_CONTEXT
             .replace("{role}", role_str)
+            .replace("{instance_id}", &instance_label)
             .replace("{run_id}", run_id)
             .replace("{comm_log_path}", comm_log_path)
             .replace("YOUR_ROLE", &role_upper);
 
-        let role_specific = match role {
+        let role_specific_raw = match role {
             OpenFlowRole::Orchestrator => ORCHESTRATOR_PROMPT,
             OpenFlowRole::Planner => PLANNER_PROMPT,
             OpenFlowRole::Builder => BUILDER_PROMPT,
@@ -273,6 +326,9 @@ fi
             OpenFlowRole::Debugger => DEBUGGER_PROMPT,
             OpenFlowRole::Researcher => RESEARCHER_PROMPT,
         };
+        // Apply the same substitutions to the role-specific section so that
+        // placeholders like {instance_id} are resolved there too.
+        let role_specific = role_specific_raw.replace("{instance_id}", &instance_label);
 
         format!("{}{}", base, role_specific)
     }

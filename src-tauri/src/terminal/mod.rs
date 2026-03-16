@@ -9,6 +9,25 @@ use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 use crate::project::current_project_root;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
+static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
+    std::sync::OnceLock::new();
+
+fn get_comm_log_lock(path: &str) -> Arc<Mutex<std::fs::File>> {
+    let locks = COMM_LOG_LOCKS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
+    let mut locks_guard = locks.lock().unwrap();
+    locks_guard
+        .entry(path.to_string())
+        .or_insert_with(|| {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .expect("Failed to open comm log for locking");
+            Arc::new(Mutex::new(file))
+        })
+        .clone()
+}
+
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
@@ -379,6 +398,11 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         );
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);
+
+        // Clean up the session runtime to prevent memory leak
+        remove_session_runtime(&wait_sessions, &wait_session_id);
+
+        state::emit_app_state(&wait_app);
     });
 }
 
@@ -814,9 +838,12 @@ pub fn spawn_pty_for_agent(
         .iter()
         .find(|(k, _)| k == "CODEMUX_COMMUNICATION_LOG")
         .map(|(_, v)| v.clone());
+    // Prefer instance-specific ID (e.g. "builder-0") over bare role ("builder") so that
+    // parallel agents of the same role are distinguishable in the comm log.
     let agent_role = extra_env
         .iter()
-        .find(|(k, _)| k == "CODEMUX_AGENT_ROLE")
+        .find(|(k, _)| k == "CODEMUX_AGENT_INSTANCE_ID")
+        .or_else(|| extra_env.iter().find(|(k, _)| k == "CODEMUX_AGENT_ROLE"))
         .map(|(_, v)| v.clone());
 
     let read_sessions = sessions.clone();
@@ -850,13 +877,14 @@ pub fn spawn_pty_for_agent(
                                     role.to_uppercase(),
                                     trimmed
                                 );
-                                let _ = std::fs::OpenOptions::new()
-                                    .create(true)
-                                    .append(true)
-                                    .open(comm_log)
-                                    .and_then(|mut f: std::fs::File| {
-                                        std::io::Write::write_all(&mut f, entry.as_bytes())
-                                    });
+                                // Use file locking to prevent race conditions with 20+ agents
+                                let log_lock = get_comm_log_lock(comm_log);
+                                let mut file = match log_lock.lock() {
+                                    Ok(f) => f,
+                                    Err(_) => continue,
+                                };
+                                let _ = file.write_all(entry.as_bytes());
+                                let _ = file.flush();
                             }
                         }
                     }
@@ -896,6 +924,10 @@ pub fn spawn_pty_for_agent(
         };
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);
+
+        // Clean up the session runtime to prevent memory leak
+        remove_session_runtime(&wait_sessions, &wait_session_id);
+
         state::emit_app_state(&wait_app);
     });
 }

@@ -339,13 +339,15 @@ pub fn spawn_openflow_agents(
         .map_err(|e| format!("Failed to create wrapper script: {e}"))?;
     
     for config in &agent_configs {
-        SystemPrompts::write_prompt_for_run(&config.role, &run_id, &log_path)
+        SystemPrompts::write_prompt_for_run(&config.role, &run_id, &log_path, config.agent_index)
             .map_err(|e| format!("Failed to write prompt for {:?}: {}", config.role, e))?;
     }
 
     let mut session_ids = Vec::with_capacity(agent_configs.len());
 
-    for config in &agent_configs {
+    // Spawn agents with a small delay between each to prevent resource exhaustion
+    // when launching many agents (20+). This prevents thread explosion at startup.
+    for (i, config) in agent_configs.iter().enumerate() {
         let adapter = adapter_for_tool(&config.cli_tool)?;
         let spec = adapter.spawn_spec(config, &run_id, &log_path, &goal_path_str, &working_directory);
 
@@ -376,6 +378,12 @@ pub fn spawn_openflow_agents(
         agent_store.update_status(&session_id.0, AgentSessionStatus::Running);
 
         session_ids.push(session_id.0);
+
+        // Small delay between spawns to prevent resource exhaustion with many agents
+        // 100ms per agent means 20 agents = 2 seconds total, which is reasonable
+        if i < agent_configs.len() - 1 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
     }
 
     // Write all "agent started" entries in a single file-open after the spawn loop,
@@ -413,23 +421,51 @@ pub fn get_agent_sessions_for_run(
 }
 
 /// Read communication log entries for a given OpenFlow run.
+/// Uses incremental reading when offset is provided - only reads new content since last read.
 #[tauri::command]
-pub fn get_communication_log(run_id: String) -> Result<Vec<CommLogEntry>, String> {
+pub fn get_communication_log(run_id: String, offset: Option<usize>) -> Result<(Vec<CommLogEntry>, usize), String> {
     let path = comm_log_path(&run_id);
-    let content = std::fs::read_to_string(&path).map_err(|e| {
+    
+    // Get file metadata to determine current size
+    let metadata = std::fs::metadata(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             return "No communication log yet".to_string();
         }
+        format!("Failed to read comm log metadata: {e}")
+    })?;
+    
+    let current_size = metadata.len() as usize;
+    let start_offset = offset.unwrap_or(0);
+    
+    // If no offset provided or offset is 0, read from beginning (full read)
+    // If offset >= current size, there's nothing new to read
+    if start_offset >= current_size {
+        return Ok((vec![], current_size));
+    }
+    
+    // Read only the new content from offset to end
+    let mut file = std::fs::File::open(&path).map_err(|e| {
+        format!("Failed to open comm log: {e}")
+    })?;
+    
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(start_offset as u64)).map_err(|e| {
+        format!("Failed to seek comm log: {e}")
+    })?;
+    
+    let mut new_content = String::new();
+    std::io::Read::read_to_string(&mut file, &mut new_content).map_err(|e| {
         format!("Failed to read comm log: {e}")
     })?;
-
-    let entries: Vec<CommLogEntry> = content
+    
+    // Parse the new lines
+    let entries: Vec<CommLogEntry> = new_content
         .lines()
         .filter(|line| !line.is_empty())
         .filter_map(|line| parse_comm_log_line(line))
         .collect();
 
-    Ok(entries)
+    Ok((entries, current_size))
 }
 
 /// Inject a user message into the communication log (goes to orchestrator).
@@ -456,6 +492,7 @@ pub fn trigger_orchestrator_cycle(
     agent_store: State<'_, AgentSessionStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
     run_id: String,
+    offset: Option<usize>,
 ) -> Result<OrchestratorTriggerResult, String> {
     // Targeted read: only fetch the current phase string, not a full runtime clone.
     let current_phase_str = runtime.get_run_phase(&run_id)?;
@@ -464,9 +501,16 @@ pub fn trigger_orchestrator_cycle(
     #[cfg(debug_assertions)]
     eprintln!("[DEBUG] trigger_orchestrator_cycle run_id={} phase={}", run_id, current_phase_str);
 
-    // Read the comm log exactly once for this entire cycle.
-    let entries = Orchestrator::read_communication_log(&run_id)
-        .map_err(|e| format!("Failed to read comm log: {e}"))?;
+    // Read the comm log - use incremental reading if offset provided
+    let (entries, new_offset) = if let Some(off) = offset {
+        Orchestrator::read_communication_log_incremental(&run_id, off)
+            .map_err(|e| format!("Failed to read comm log: {e}"))?
+    } else {
+        // Fallback to full read for backwards compatibility
+        let entries = Orchestrator::read_communication_log(&run_id)
+            .map_err(|e| format!("Failed to read comm log: {e}"))?;
+        (entries, 0)
+    };
 
     #[cfg(debug_assertions)]
     eprintln!("[DEBUG] Read {} entries from comm log", entries.len());
@@ -475,15 +519,75 @@ pub fn trigger_orchestrator_cycle(
 
     #[cfg(debug_assertions)]
     eprintln!(
-        "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} injections={}/{}",
+        "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} instance_assignments={} injections={}/{}",
         analysis.completed_roles,
         analysis.blocked_roles,
         analysis.assignments.len(),
+        analysis.instance_assignments.len(),
         analysis.user_injections.len(),
         analysis.total_injections
     );
 
     let mut actions_taken = Vec::new();
+
+    // Forward any new instance-level ASSIGN messages to the target agent PTYs.
+    // This is what enables true parallel execution: the orchestrator writes
+    // "ASSIGN BUILDER-0: task A" and "ASSIGN BUILDER-1: task B" in the comm log,
+    // and we deliver those tasks directly to the respective agent PTYs.
+    if !analysis.instance_assignments.is_empty() {
+        let all_sessions = agent_store.for_run(&run_id);
+        let new_total_assignments = analysis.last_handled_assignments + analysis.instance_assignments.len();
+
+        for ia in &analysis.instance_assignments {
+            // Find the session whose instance id matches (e.g. "builder-0")
+            let target_session = all_sessions.iter().find(|s| {
+                let session_instance = if matches!(s.config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+                    s.config.role.as_str().to_string()
+                } else {
+                    format!("{}-{}", s.config.role.as_str(), s.config.agent_index)
+                };
+                session_instance == ia.instance_id
+            });
+
+            if let Some(session) = target_session {
+                let cmd = format!("opencode run \"{}\"\n", ia.task.replace('"', "\\\""));
+                let session_id = session.session_id.clone();
+                let write_result = {
+                    let mut sessions = pty_state.sessions.lock().unwrap();
+                    if let Some(pty_runtime) = sessions.get_mut(&session_id) {
+                        if let Some(writer) = pty_runtime.writer.as_mut() {
+                            use std::io::Write;
+                            writer
+                                .write_all(cmd.as_bytes())
+                                .and_then(|_| writer.flush())
+                                .map_err(|e| format!("PTY write error: {e}"))
+                        } else {
+                            Err(format!("No writer for session {session_id}"))
+                        }
+                    } else {
+                        Err(format!("Session {session_id} not found"))
+                    }
+                };
+                match write_result {
+                    Ok(()) => {
+                        #[cfg(debug_assertions)]
+                        eprintln!("[DEBUG] Forwarded task to {} (session {})", ia.instance_id, session_id);
+                        actions_taken.push(format!("Forwarded task to {}", ia.instance_id));
+                    }
+                    Err(e) => {
+                        actions_taken.push(format!("Failed to reach {} PTY: {}", ia.instance_id, e));
+                    }
+                }
+            } else {
+                actions_taken.push(format!("No session found for instance {}", ia.instance_id));
+            }
+        }
+
+        // Mark assignments as handled so they are not re-forwarded on the next cycle.
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let marker = format!("[{}] [SYSTEM] HANDLED_ASSIGNMENTS: {}", ts, new_total_assignments);
+        let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
+    }
 
     // Determine phase: injection takes priority; otherwise use log-based logic.
     // We reuse the `analysis` already computed above — no second file read.
@@ -560,8 +664,20 @@ pub fn trigger_orchestrator_cycle(
 
         Some(OrchestratorPhase::Replanning)
     } else {
+        // Build per-role instance counts so the phase logic can require ALL instances
+        // of a role to complete before advancing (enables true parallel execution).
+        let instance_counts: std::collections::HashMap<String, usize> = {
+            let sessions = agent_store.for_run(&run_id);
+            let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+            for session in &sessions {
+                if !matches!(session.config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+                    *counts.entry(session.config.role.as_str().to_string()).or_insert(0) += 1;
+                }
+            }
+            counts
+        };
         // No injections — use the analysis already computed above (no second read).
-        Orchestrator::determine_next_phase(&phase, &analysis)
+        Orchestrator::determine_next_phase(&phase, &analysis, &instance_counts)
     };
 
     #[cfg(debug_assertions)]
@@ -601,6 +717,7 @@ pub fn trigger_orchestrator_cycle(
             user_injections_count: analysis.user_injections.len(),
         },
         actions_taken,
+        comm_log_offset: new_offset,
     })
 }
 
@@ -610,6 +727,7 @@ pub struct OrchestratorTriggerResult {
     pub next_phase: Option<String>,
     pub analysis: OrchestratorAnalysisDto,
     pub actions_taken: Vec<String>,
+    pub comm_log_offset: usize,
 }
 
 #[derive(serde::Serialize)]

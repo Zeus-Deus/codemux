@@ -303,6 +303,154 @@ src-tauri/src/
 
 ---
 
+## 🛠️ Performance & Scalability Fixes (Critical)
+
+### Crash Investigation: 20 Agents
+
+**Symptom:** Running 20 agents crashes the Vite/Tauri dev server. Testing confirmed:
+- ✅ 10 agents works fine
+- ❌ 20 agents crashes the dev server
+
+**Root Cause:** Multiple compounding issues when scaling agent count.
+
+---
+
+### Comprehensive Issue List
+
+#### CRITICAL (Root Causes of Crash)
+
+| # | Issue | Location | Fix Required |
+|---|-------|----------|--------------|
+| 1 | **Orchestrator reads FULL log every cycle** | `commands.rs:504` | Use incremental reading with offset |
+| 2 | **Backend state never cleaned up** | `openflow/mod.rs` | Add cleanup for completed runs |
+| 3 | **Frontend Tauri listeners never unregistered** | `appState.ts:263-292` | Store and cleanup unlisten functions |
+| 4 | **Agent sessions never removed** | `openflow/mod.rs:920-952` | Add removal method |
+
+#### HIGH (Performance Issues)
+
+| # | Issue | Location | Fix Required |
+|---|-------|----------|--------------|
+| 5 | Log rotation has TOCTOU race | `orchestrator.rs:333-341` | Add file locking |
+| 6 | commLogOffsets Map grows forever | `appState.ts:708` | Cleanup on run end |
+| 7 | Agent wait thread no cleanup | `terminal/mod.rs:898-923` | Proper resource cleanup |
+| 8 | Reader threads never joined | `terminal/mod.rs:846-896` | Store JoinHandle |
+
+#### MEDIUM (GC Pressure)
+
+| # | Issue | Location | Fix Required |
+|---|-------|----------|--------------|
+| 9 | Full snapshot fetch every mutation | `appState.ts:551-605` | Only fetch changed run |
+| 10 | Array spread in polling loop | `OrchestrationView.svelte:108` | Optimize combining |
+| 11 | Multiple toLowerCase() calls | `OrchestrationView.svelte:144-188` | Cache results |
+
+---
+
+### Implementation Plan
+
+#### Phase 1: Critical Fixes (Must Do)
+
+1. **Fix orchestrator incremental reading** ✅ DONE
+   - [x] Add offset parameter to `trigger_orchestrator_cycle`
+   - [x] Use `read_communication_log_incremental`
+   - [x] Return offset in result
+   - [x] Update frontend to track and pass offset
+
+2. **Add backend state cleanup** ✅ DONE
+   - [x] Add `remove_run` method to OpenFlowRuntimeStore
+   - [x] Add cleanup to AgentSessionStore
+   - [x] Auto-cleanup when runs complete (added terminal session cleanup on exit)
+
+3. **Fix frontend listener leaks** ⏳ TODO
+   - [ ] Store unlisten functions in singletons
+   - [ ] Add cleanup functions
+
+#### Phase 2: Performance
+
+4. **Fix log rotation race condition**
+   - [ ] Add file locking during rotation
+   - [ ] Or disable rotation, use time-based cleanup
+
+5. **Clean up commLogOffsets** ✅ DONE
+   - [x] Call cleanup when runs end
+
+#### Phase 3: Optimization
+
+6. **Reduce GC pressure**
+   - [ ] Cache toLowerCase results
+   - [ ] Optimize array operations
+
+---
+
+### Issue Categories
+
+#### 1. Frontend Issues (HIGH Priority)
+
+| Issue | Location | Impact |
+|-------|----------|--------|
+| Excessive polling (2s interval) | `OrchestrationView.svelte:98-112` | Heavy IPC overhead every 2 seconds |
+| Heavy reactive derivations | `OrchestrationView.svelte:137-179` | O(n*m) complexity per update |
+| Connection recalculation on every log | `OrchestrationView.svelte:181-276` | Full recalculation every cycle |
+| No message virtualization | `CommunicationPanel.svelte:69-80` | Renders ALL messages (hundreds/thousands) |
+| Auto-scroll thrashing | `CommunicationPanel.svelte:15-22` | Layout thrashing on rapid messages |
+| Node position recalculation | `NodeGraph.svelte:38-91` | Recomputes all positions on any change |
+| Store grows infinitely | `OrchestrationView.svelte:106-108` | Memory bloat - appends without limit |
+| Orchestration too frequent | `OrchestrationView.svelte:64-70` | Every 10s = too aggressive with 20 agents |
+
+**Frontend Fixes:**
+- [x] Increase polling interval from 2s to 5s (or adaptive)
+- [x] Limit CommunicationPanel to show only last 100 messages
+- [x] Cache connection derivations until phase change
+- [x] Memoize node positions (only recalc when node count changes)
+- [x] Debounce auto-scroll, check if user is near bottom first
+- [x] Add virtual scrolling for message list
+- [x] Limit store to max 500 entries to prevent memory bloat
+- [x] Reduce orchestration cycle from 10s to 20s
+
+#### 2. Backend Concurrency Issues (HIGH Priority)
+
+| Issue | Location | Impact |
+|-------|----------|--------|
+| Sequential blocking spawn loop | `commands.rs:348-379` | Agents spawn one-by-one, blocking |
+| No concurrency limits | Global | No semaphore, can overwhelm system |
+| 2 threads per agent | `terminal/mod.rs:827,881` | 20 agents = 40+ threads |
+| No thread pooling | `terminal/mod.rs` | Each spawn creates new threads |
+| Missing resource cleanup | `terminal/mod.rs:424-448` | Child processes not killed on close |
+| No backpressure | `terminal/mod.rs:161-164` | Silently drops data when buffer full |
+
+**Backend Fixes:**
+- [ ] Add semaphore for concurrent agent spawning (limit to 8 at a time)
+- [ ] Use tokio JoinSet for parallel agent spawn
+- [ ] Add thread count tracking with warnings
+- [ ] Implement proper Drop for SessionRuntime (kill child processes)
+- [ ] Add backpressure signaling
+- [x] Add delay between agent spawns (100ms) to prevent resource explosion
+
+#### 3. Communication Log Race Conditions (HIGH Priority)
+
+| Issue | Location | Impact |
+|-------|----------|--------|
+| No file locking | `terminal/mod.rs:856-862` | Race condition on concurrent writes |
+| Rotation race condition | `orchestrator.rs:287,295-306` | Data loss during rotation |
+| 500-line threshold too low | `orchestrator.rs:287` | Triggers too frequently with 20 agents |
+| Full file read on every poll | `commands.rs:419` | Reads entire file (blocking) |
+| No write buffering | `terminal/mod.rs:856-862` | Open/write/close on every chunk |
+
+**Log System Fixes:**
+- [x] Add file locking for concurrent writes
+- [x] Increase rotation threshold from 500 to 5000 lines
+- [x] Implement incremental reading (track offset, only read new content)
+- [ ] Fix rotation race with exclusive locking
+- [ ] Buffer writes (batch before writing)
+
+#### 4. Future-Proofing
+
+- [ ] Add agent count warnings (warn at 15+, recommend max)
+- [ ] Adaptive resource management (reduce polling when agents > 10)
+- [ ] Monitor system resources (log memory/thread warnings)
+- [ ] Make agent limits configurable
+
+---
+
 ## Next Steps (For New Chat Session)
 
 ### Priority 1: Fix Orchestrator Response to User Messages
