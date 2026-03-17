@@ -1,7 +1,8 @@
 <script lang="ts">
     import { fade } from 'svelte/transition';
-    import type { WorkspaceSnapshot } from '../../stores/appState';
-    import { openflowRuntime, createOpenFlowRun, spawnOpenflowAgents, updateWorkspaceCwd } from '../../stores/appState';
+    import { openflowRuntime, createOpenFlowRun, spawnOpenflowAgents } from '../../stores/openflow';
+    import { updateWorkspaceCwd } from '../../stores/workspace';
+    import type { WorkspaceSnapshot } from '../../stores/types';
     import AgentConfigPanel from './AgentConfigPanel.svelte';
     import OrchestrationView from './OrchestrationView.svelte';
     import type { AgentConfig } from './AgentConfigPanel.svelte';

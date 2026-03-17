@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { collectWorkspaceSessionIds, findActiveSessionId } from './paneTree';
-import type { SurfaceSnapshot } from '../stores/appState';
+import type { SurfaceSnapshot } from '../stores/types';
 
 describe('paneTree helpers', () => {
     const surface: SurfaceSnapshot = {

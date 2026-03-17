@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { PaneNodeSnapshot } from '../stores/appState';
+import type { PaneNodeSnapshot } from '../stores/types';
 
 type LeafRecord = {
     paneId: string;

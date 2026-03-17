@@ -2,20 +2,15 @@
     import { createEventDispatcher } from 'svelte';
     import {
         openflowRuntime,
-        createOpenFlowRun,
         advanceOpenFlowRunPhase,
         retryOpenFlowRun,
         runOpenFlowAutonomousLoop,
         applyOpenFlowReviewResult,
-        stopOpenFlowRun
-    } from '../../stores/appState';
-    import type { OpenFlowRunRecord } from '../../stores/appState';
+        stopOpenFlowRun,
+    } from '../../stores/openflow';
+    import type { OpenFlowRunRecord } from '../../stores/types';
 
     let expanded = $state(false);
-    let composing = $state(false);
-    let titleDraft = $state('');
-    let goalDraft = $state('');
-
     const dispatch = createEventDispatcher<{ newrun: void }>();
 
     const runs = $derived($openflowRuntime?.active_runs ?? []);
@@ -34,22 +29,6 @@
 
     function needsReview(run: OpenFlowRunRecord) {
         return run.current_phase === 'review' || run.status === 'awaiting_approval';
-    }
-
-    async function handleStart() {
-        if (!titleDraft.trim() || !goalDraft.trim()) return;
-        try {
-            await createOpenFlowRun({ 
-                title: titleDraft.trim(), 
-                goal: goalDraft.trim(),
-                agent_roles: ['orchestrator', 'builder'] // basic default
-            });
-            titleDraft = '';
-            goalDraft = '';
-            composing = false;
-        } catch (error) {
-            console.error('Failed to start run:', error);
-        }
     }
 
     async function handleAdvance(runId: string) {
@@ -111,41 +90,6 @@
 
     {#if expanded}
         <div class="section-body">
-            {#if composing}
-                <div class="compose-form">
-                    <input
-                        class="compose-input"
-                        bind:value={titleDraft}
-                        placeholder="Run title"
-                        onkeydown={(e) => { if (e.key === 'Escape') composing = false; }}
-                    />
-                    <textarea
-                        class="compose-goal"
-                        bind:value={goalDraft}
-                        rows="3"
-                        placeholder="Describe the goal…"
-                        onkeydown={(e) => { if (e.key === 'Escape') { e.stopPropagation(); composing = false; } }}
-                    ></textarea>
-                    <div class="compose-actions">
-                        <button
-                            class="start-btn"
-                            type="button"
-                            onclick={handleStart}
-                            disabled={!titleDraft.trim() || !goalDraft.trim()}
-                        >
-                            Start run
-                        </button>
-                        <button
-                            class="cancel-btn"
-                            type="button"
-                            onclick={() => (composing = false)}
-                        >
-                            Cancel
-                        </button>
-                    </div>
-                </div>
-            {/if}
-
             {#if runs.length > 0}
                 <div class="run-list">
                     {#each runs as run (run.run_id)}
@@ -175,7 +119,7 @@
                         </div>
                     {/each}
                 </div>
-            {:else if !composing}
+            {:else}
                 <p class="empty-hint">No active runs. Press <kbd>+</kbd> to start one.</p>
             {/if}
         </div>
@@ -285,91 +229,6 @@
         flex-direction: column;
         gap: 6px;
         padding: 2px 8px 8px;
-    }
-
-    .compose-form {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-        padding: 8px;
-        background: var(--ui-layer-2);
-        border-radius: 6px;
-        border: 1px solid var(--ui-border-soft);
-    }
-
-    .compose-input,
-    .compose-goal {
-        width: 100%;
-        box-sizing: border-box;
-        background: var(--ui-layer-1);
-        border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
-        color: var(--ui-text-primary);
-        font: inherit;
-        font-size: 0.8rem;
-        padding: 7px 9px;
-        transition: border-color var(--ui-motion-fast);
-        resize: none;
-        outline: none;
-    }
-
-    .compose-input:focus,
-    .compose-goal:focus {
-        border-color: color-mix(in srgb, var(--ui-accent) 40%, transparent);
-    }
-
-    .compose-goal {
-        resize: vertical;
-        min-height: 56px;
-    }
-
-    .compose-actions {
-        display: flex;
-        gap: 6px;
-    }
-
-    .start-btn {
-        flex: 1;
-        padding: 7px 12px;
-        background: color-mix(in srgb, var(--ui-accent) 16%, var(--ui-layer-2) 84%);
-        border: 1px solid color-mix(in srgb, var(--ui-accent) 30%, transparent);
-        border-radius: 5px;
-        color: var(--ui-text-primary);
-        font: inherit;
-        font-size: 0.78rem;
-        font-weight: 600;
-        cursor: pointer;
-        transition:
-            background var(--ui-motion-fast),
-            border-color var(--ui-motion-fast);
-    }
-
-    .start-btn:hover:not(:disabled) {
-        background: color-mix(in srgb, var(--ui-accent) 24%, var(--ui-layer-2) 76%);
-    }
-
-    .start-btn:disabled {
-        opacity: 0.45;
-        cursor: not-allowed;
-    }
-
-    .cancel-btn {
-        padding: 7px 10px;
-        background: transparent;
-        border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
-        color: var(--ui-text-muted);
-        font: inherit;
-        font-size: 0.78rem;
-        cursor: pointer;
-        transition:
-            background var(--ui-motion-fast),
-            color var(--ui-motion-fast);
-    }
-
-    .cancel-btn:hover {
-        background: var(--ui-layer-2);
-        color: var(--ui-text-secondary);
     }
 
     .run-list {

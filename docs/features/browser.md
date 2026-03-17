@@ -8,7 +8,7 @@
 
 ## Current Model
 
-The browser pane currently uses a screenshot-driven Chromium session backed by `agent-browser`. The visible pane and the explicit CLI browser commands share the same browser session.
+The browser pane currently uses a screenshot-driven Chromium session backed by `agent-browser`. The visible pane and the explicit CLI browser commands share the same browser session and now use the same internal execution helpers.
 
 ## What Works Today
 
@@ -24,6 +24,12 @@ The browser pane currently uses a screenshot-driven Chromium session backed by `
 - agents control the browser programmatically
 - users see the browser pane as live evidence of that work
 - this is usable now, but it is not the final browser architecture yet
+
+## Current Internal Boundary
+
+- canonical path: `agent_browser` commands plus `AgentBrowserManager`
+- CLI browser commands delegate to the same `agent-browser` execution path
+- a legacy Chromium/CDP runtime still exists in `src-tauri/src/browser.rs`, but it is not the primary pane path
 
 ## Current Constraints
 

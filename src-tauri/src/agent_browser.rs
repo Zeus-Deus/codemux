@@ -43,6 +43,103 @@ pub struct AgentBrowserManager {
     pub stream_port: u16,
 }
 
+fn session_name(browser_id: &str) -> &str {
+    if browser_id.is_empty() { "default" } else { browser_id }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
+    let command = match action {
+        "open_url" | "open" => {
+            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            format!("npx agent-browser open {} --session {}", shell_quote(url), session)
+        }
+        "screenshot" => format!("npx agent-browser screenshot --session {}", session),
+        "snapshot" | "accessibility_snapshot" => {
+            format!("npx agent-browser snapshot -i --session {}", session)
+        }
+        "click" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
+            format!("npx agent-browser click {} --session {}", shell_quote(selector), session)
+        }
+        "fill" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
+            let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+            format!(
+                "npx agent-browser fill {} {} --session {}",
+                shell_quote(selector),
+                shell_quote(value),
+                session
+            )
+        }
+        "type_text" => {
+            let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            format!("npx agent-browser type body {} --session {}", shell_quote(text), session)
+        }
+        "console_logs" | "console" => format!("npx agent-browser console --session {}", session),
+        "evaluate" | "eval" => {
+            let script = params.get("script").and_then(|v| v.as_str()).unwrap_or("");
+            format!("npx agent-browser eval {} --session {}", shell_quote(script), session)
+        }
+        "back" => format!("npx agent-browser back --session {}", session),
+        "forward" => format!("npx agent-browser forward --session {}", session),
+        "reload" => format!("npx agent-browser reload --session {}", session),
+        _ => return Err(format!("Unknown action: {}", action)),
+    };
+
+    Ok(command)
+}
+
+fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
+    let session = session_name(browser_id);
+    let shell_cmd = build_agent_browser_command(session, action, &params)?;
+    let output = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
+        .output()
+        .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
+        return Err(format!("agent-browser failed: {} {}", stdout, stderr));
+    }
+
+    let data: serde_json::Value = if stdout.contains("{") {
+        serde_json::from_str(&stdout).unwrap_or(serde_json::json!({ "raw": stdout }))
+    } else if action == "screenshot" {
+        if stdout.trim().is_empty() {
+            serde_json::json!({ "error": "No screenshot" })
+        } else {
+            serde_json::json!({ "raw": stdout })
+        }
+    } else if action == "snapshot" || action == "accessibility_snapshot" {
+        serde_json::json!({ "tree": stdout })
+    } else {
+        serde_json::json!({ "result": stdout, "success": output.status.success() })
+    };
+
+    Ok(BrowserAutomationResult {
+        request_id: format!(
+            "req-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ),
+        browser_id: browser_id.to_string(),
+        data,
+        message: None,
+    })
+}
+
+pub fn run_cli_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
+    execute_agent_browser_action(browser_id, action, params)
+}
+
 impl Default for AgentBrowserManager {
     fn default() -> Self {
         Self::new()
@@ -58,7 +155,7 @@ impl AgentBrowserManager {
     }
 
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
-        let session = if browser_id.is_empty() { "default" } else { browser_id };
+        let session = session_name(browser_id);
         
         let mut running = self.running.lock().await;
         if *running {
@@ -81,87 +178,11 @@ impl AgentBrowserManager {
     }
 
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
-        let session = if browser_id.is_empty() { "default" } else { browser_id };
-        
-        let shell_cmd = match action {
-            "open_url" | "open" => {
-                let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
-                format!("npx agent-browser open '{}' --session {}", url, session)
-            }
-            "screenshot" => {
-                format!("npx agent-browser screenshot --session {}", session)
-            }
-            "snapshot" | "accessibility_snapshot" => {
-                format!("npx agent-browser snapshot -i --session {}", session)
-            }
-            "click" => {
-                let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
-                format!("npx agent-browser click '{}' --session {}", selector, session)
-            }
-            "fill" => {
-                let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
-                let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
-                format!("npx agent-browser fill '{}' '{}' --session {}", selector, value, session)
-            }
-            "type_text" => {
-                let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                format!("npx agent-browser type body '{}' --session {}", text, session)
-            }
-            "console_logs" | "console" => {
-                format!("npx agent-browser console --session {}", session)
-            }
-            "evaluate" | "eval" => {
-                let script = params.get("script").and_then(|v| v.as_str()).unwrap_or("");
-                format!("npx agent-browser eval '{}' --session {}", script, session)
-            }
-            "back" => {
-                format!("npx agent-browser back --session {}", session)
-            }
-            "forward" => {
-                format!("npx agent-browser forward --session {}", session)
-            }
-            "reload" => {
-                format!("npx agent-browser reload --session {}", session)
-            }
-            _ => return Err(format!("Unknown action: {}", action)),
-        };
-
-        let output = std::process::Command::new("sh")
-            .args(["-c", &shell_cmd])
-            .output()
-            .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-        if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
-            return Err(format!("agent-browser failed: {} {}", stdout, stderr));
-        }
-
-        let data: serde_json::Value = if stdout.contains("{") {
-            serde_json::from_str(&stdout).unwrap_or(serde_json::json!({ "raw": stdout }))
-        } else if action == "screenshot" {
-            if stdout.trim().is_empty() {
-                serde_json::json!({ "error": "No screenshot" })
-            } else {
-                serde_json::json!({ "raw": stdout })
-            }
-        } else if action == "snapshot" || action == "accessibility_snapshot" {
-            serde_json::json!({ "tree": stdout })
-        } else {
-            serde_json::json!({ "result": stdout, "success": output.status.success() })
-        };
-
-        Ok(BrowserAutomationResult {
-            request_id: format!("req-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()),
-            browser_id: browser_id.to_string(),
-            data,
-            message: None,
-        })
+        execute_agent_browser_action(browser_id, action, params)
     }
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
-        let session = if browser_id.is_empty() { "default" } else { browser_id };
+        let session = session_name(browser_id);
         
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("npx agent-browser screenshot --session {}", session)])
@@ -198,7 +219,7 @@ impl AgentBrowserManager {
     }
 
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
-        let session = if browser_id.is_empty() { "default" } else { browser_id };
+        let session = session_name(browser_id);
         
         let mut running = self.running.lock().await;
         *running = false;

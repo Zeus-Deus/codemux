@@ -3,8 +3,8 @@
         projectMemory,
         updateProjectMemory,
         addProjectMemoryEntry,
-        generateProjectHandoff
-    } from '../../stores/appState';
+        generateProjectHandoff,
+    } from '../../stores/memory';
 
     let expanded = $state(false);
     let activeTab = $state<'brief' | 'goal' | 'notes'>('brief');

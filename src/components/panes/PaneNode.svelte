@@ -3,7 +3,7 @@
     import PaneNode from './PaneNode.svelte';
     import TerminalPane from './TerminalPane.svelte';
     import BrowserPane from './BrowserPane.svelte';
-    import type { PaneNodeSnapshot } from '../../stores/appState';
+    import type { PaneNodeSnapshot } from '../../stores/types';
     import { paneDragState } from '../../stores/paneDrag';
 
     let {

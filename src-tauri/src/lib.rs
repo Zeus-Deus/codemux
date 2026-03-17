@@ -54,7 +54,6 @@ pub fn run() {
             }
         }))
         .manage(state::AppStateStore::default())
-        .manage(commands::BrowserAutomationCoordinator::default())
         .manage(browser::BrowserManager::new())
         .manage(agent_browser::AgentBrowserManager::new())
         .manage(indexing::ProjectIndexStore::default())
@@ -170,11 +169,6 @@ pub fn run() {
             commands::browser_history_forward,
             commands::browser_reload,
             commands::browser_set_loading_state,
-            commands::browser_capture_screenshot,
-            commands::browser_automation_run,
-            commands::browser_automation_complete,
-            commands::browser_proxy_fetch,
-            commands::browser_proxy_screenshot,
             commands::browser_spawn,
             commands::browser_navigate,
             commands::browser_screenshot,

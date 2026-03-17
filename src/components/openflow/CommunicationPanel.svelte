@@ -1,6 +1,6 @@
 <script lang="ts">
     import { tick } from 'svelte';
-    import { commLogStore, getCommunicationLog, injectOrchestratorMessage, type CommLogEntry } from '../../stores/appState';
+    import { commLogStore, getCommunicationLog, injectOrchestratorMessage } from '../../stores/openflow';
 
     let { runId }: { runId: string | null } = $props();
 

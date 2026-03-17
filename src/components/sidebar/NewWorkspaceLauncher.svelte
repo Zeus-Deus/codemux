@@ -1,11 +1,8 @@
 <script lang="ts">
     import { createEventDispatcher } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import {
-        createWorkspaceWithPreset,
-        type LayoutPreset,
-        type WorkspaceTemplateKind
-    } from '../../stores/appState';
+    import { createWorkspaceWithPreset } from '../../stores/workspace';
+    import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
 
     type LauncherStep = 'kind' | 'layout' | 'details';
 

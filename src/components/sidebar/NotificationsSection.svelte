@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { appState, markWorkspaceNotificationsRead } from '../../stores/appState';
+    import { appState } from '../../stores/core';
+    import { markWorkspaceNotificationsRead } from '../../stores/workspace';
 
     let { workspaceId }: { workspaceId: string } = $props();
 

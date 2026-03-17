@@ -134,7 +134,7 @@ impl Orchestrator {
         Ok((entries, current_size))
     }
 
-    fn parse_log_line(line: &str) -> Option<CommLogEntry> {
+    pub fn parse_log_line(line: &str) -> Option<CommLogEntry> {
         let line = line.trim();
         if !line.starts_with('[') {
             return None;

@@ -216,45 +216,42 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         }
         "create_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
-            let id = state.create_workspace();
-            crate::state::emit_app_state(app);
-            Ok(serde_json::json!({ "workspace_id": id.0 }))
+            crate::commands::workspace::create_workspace_impl(app.clone(), &state, None)
+                .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
         }
         "split_pane" => {
             let state: State<'_, AppStateStore> = app.state();
             let pane_id = request.params.get("pane_id").and_then(Value::as_str).unwrap_or_default();
             let direction = request.params.get("direction").and_then(Value::as_str).unwrap_or("horizontal");
-            let direction = match direction {
-                "vertical" => crate::state::SplitDirection::Vertical,
-                _ => crate::state::SplitDirection::Horizontal,
-            };
-            state
-                .split_pane(pane_id, direction)
-                .map(|session_id| {
-                    crate::state::emit_app_state(app);
-                    serde_json::json!({ "session_id": session_id.0 })
-                })
+            crate::commands::workspace::split_pane_impl(
+                app.clone(),
+                &state,
+                pane_id.to_string(),
+                direction.to_string(),
+            )
+            .map(|session_id| serde_json::json!({ "session_id": session_id }))
         }
         "create_browser_pane" => {
             let state: State<'_, AppStateStore> = app.state();
             let pane_id = request.params.get("pane_id").and_then(Value::as_str).unwrap_or_default();
-            state
-                .create_browser_pane(pane_id)
-                .map(|browser_id| {
-                    crate::state::emit_app_state(app);
-                    serde_json::json!({ "browser_id": browser_id.0 })
-                })
+            crate::commands::browser::create_browser_pane_impl(
+                app.clone(),
+                &state,
+                pane_id.to_string(),
+            )
+            .map(|created_pane_id| serde_json::json!({ "pane_id": created_pane_id }))
         }
         "open_url" => {
             let state: State<'_, AppStateStore> = app.state();
             let browser_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or_default();
             let url = request.params.get("url").and_then(Value::as_str).unwrap_or_default();
-            state
-                .update_browser_url(browser_id, url.to_string())
-                .map(|_| {
-                    crate::state::emit_app_state(app);
-                    serde_json::json!({ "browser_id": browser_id, "url": url })
-                })
+            crate::commands::browser::browser_open_url_impl(
+                app.clone(),
+                &state,
+                browser_id.to_string(),
+                url.to_string(),
+            )
+            .map(|_| serde_json::json!({ "browser_id": browser_id, "url": url }))
         }
         "notify" => {
             let state: State<'_, AppStateStore> = app.state();

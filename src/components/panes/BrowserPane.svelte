@@ -1,6 +1,7 @@
 <script lang="ts">
     import { onMount, onDestroy, tick } from 'svelte';
     import { openUrl } from '@tauri-apps/plugin-opener';
+    import { appState } from '../../stores/core';
     import {
         browserSpawn,
         browserNavigate,
@@ -9,12 +10,10 @@
         browserSetLoadingState,
         browserScreenshot,
         browserClick,
-        browserType,
-        appState,
         agentBrowserSpawn,
         agentBrowserRun,
-        agentBrowserScreenshot
-    } from '../../stores/appState';
+        agentBrowserScreenshot,
+    } from '../../stores/browser';
 
     let { browserId }: { browserId: string } = $props();
 

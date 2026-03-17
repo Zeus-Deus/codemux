@@ -1,4 +1,4 @@
-import type { PaneNodeSnapshot, SurfaceSnapshot } from '../stores/appState';
+import type { PaneNodeSnapshot, SurfaceSnapshot } from '../stores/types';
 
 export function findActiveSessionId(surface: SurfaceSnapshot | null | undefined): string | null {
     const root = surface?.root;

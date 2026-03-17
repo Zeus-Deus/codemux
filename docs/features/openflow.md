@@ -18,6 +18,7 @@ OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a f
 - sidebar visibility and orchestration monitoring exist in prototype form
 - test agents can use Codemux browser automation
 - extra diagnostics exist for wrapper lifecycle, native launch attribution, and OpenFlow breadcrumbs
+- frontend OpenFlow state and orchestration helpers are now split into dedicated store/modules instead of one catch-all app-state file
 
 ## What Is Still Prototype-Level
 
@@ -30,3 +31,4 @@ OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a f
 
 - treat current OpenFlow as a serious prototype, not a release-ready autonomous system
 - Codemux is the primary host experience, but the runtime should stay modular
+- the OpenFlow browser view currently mounts the shared default browser session rather than a run-scoped embedded browser surface

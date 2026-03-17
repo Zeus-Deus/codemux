@@ -4,13 +4,10 @@
     import { theme, fallbackTheme, initTheme, shellAppearance, type ShellAppearance } from './stores/theme';
     import { paneDragState } from './stores/paneDrag';
     import { uiNotice, clearUiNotice, errorMessage, showUiNotice } from './stores/uiNotice';
+    import { appState, initAppState } from './stores/core';
+    import { initOpenFlowRuntime } from './stores/openflow';
+    import { initProjectMemory } from './stores/memory';
     import {
-        appState,
-        initAppState,
-        openflowRuntime,
-        initOpenFlowRuntime,
-        projectMemory,
-        initProjectMemory,
         activatePane,
         closePane,
         cyclePane,
@@ -21,9 +18,8 @@
         splitPane,
         createBrowserPane,
         swapPanes,
-        type SurfaceSnapshot,
-        type WorkspaceSnapshot
-    } from './stores/appState';
+    } from './stores/workspace';
+    import type { SurfaceSnapshot, WorkspaceSnapshot } from './stores/types';
     import PaneNode from './components/panes/PaneNode.svelte';
     import Sidebar from './components/sidebar/Sidebar.svelte';
     import NewWorkspaceLauncher from './components/sidebar/NewWorkspaceLauncher.svelte';
@@ -60,11 +56,6 @@
     function isOpenFlowWorkspace(ws: any) {
         const type = ws?.workspace_type;
         return ws && type === 'open_flow';
-    }
-
-    function currentSurface() {
-        const ws = currentWorkspace();
-        return ws?.surfaces.find((s) => s.surface_id === ws.active_surface_id) ?? null;
     }
 
     function surfaceForWorkspace(workspace: WorkspaceSnapshot | null): SurfaceSnapshot | null {

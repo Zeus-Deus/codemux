@@ -10,6 +10,12 @@
 
 Codemux is not ship-ready yet. The workspace shell and local automation foundation are real enough to keep using, but browser polish, OpenFlow reliability, and Linux release validation are still in progress.
 
+The repo structure is now cleaner than the earlier prototype shape suggested:
+
+- `src/` is the Svelte UI and IPC layer
+- `src-tauri/` is the Rust app/runtime layer
+- frontend stores and Rust commands are split by domain instead of one large integration file
+
 ## Solid Enough To Treat As Real Surface
 
 - workspace shell and sidebar
@@ -32,6 +38,7 @@ Codemux is not ship-ready yet. The workspace shell and local automation foundati
 - notification click-to-focus on Wayland and mako still needs deeper D-Bus or native handling
 - control socket is local-user only and currently unauthenticated
 - the current browser pane is a working prototype, not final Linux MVP proof
+- the legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
 
 ## Current Validation Priorities
 

@@ -1,6 +1,6 @@
 <script lang="ts">
+    import { appState } from '../../stores/core';
     import {
-        appState,
         activateWorkspace,
         closeWorkspace,
         markWorkspaceNotificationsRead,
@@ -8,10 +8,9 @@
         createTerminalSession,
         notifyAttention,
         setNotificationSoundEnabled,
-        type WorkspaceTemplateKind,
-        type LayoutPreset
-    } from '../../stores/appState';
-    import { collectWorkspaceSessionIds, findActiveSessionId } from '../../lib/paneTree';
+    } from '../../stores/workspace';
+    import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
+    import { findActiveSessionId } from '../../lib/paneTree';
     import WorkspaceRow from './WorkspaceRow.svelte';
     import NotificationsSection from './NotificationsSection.svelte';
     import OpenFlowLauncher from './OpenFlowLauncher.svelte';
@@ -45,13 +44,6 @@
 
     function activeSessionId() {
         return findActiveSessionId(activeWorkspaceSurface) ?? $appState?.terminal_sessions[0]?.session_id ?? null;
-    }
-
-    function sessionsForWorkspace(workspaceId: string) {
-        const workspace = $appState?.workspaces.find((w) => w.workspace_id === workspaceId);
-        if (!workspace || !$appState) return [];
-        const ids = collectWorkspaceSessionIds(workspace.surfaces);
-        return $appState.terminal_sessions.filter((s) => ids.has(s.session_id));
     }
 
     function compactPath(path: string) {

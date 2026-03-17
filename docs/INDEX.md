@@ -13,8 +13,9 @@
 3. `docs/core/PLAN.md`
 4. `docs/core/TESTING.md`
 5. relevant feature docs in `docs/features/`
-6. `docs/reference/CONTROL.md` if touching CLI, socket, browser automation, memory, or indexing
-7. `AGENTS.md` for Codemux-specific agent operating rules
+6. `docs/reference/ARCHITECTURE.md` if you need the repo/layer map
+7. `docs/reference/CONTROL.md` if touching CLI, socket, browser automation, memory, or indexing
+8. `AGENTS.md` for Codemux-specific agent operating rules
 
 If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_REINDEX.md`.
 
@@ -30,6 +31,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
+- Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Control and automation work: `docs/reference/CONTROL.md`
 - Docs cleanup and recovery work: `docs/reference/DOCS_REINDEX.md`
 - Agent behavior rules: `AGENTS.md`

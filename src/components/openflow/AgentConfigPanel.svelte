@@ -14,10 +14,8 @@
         listAvailableCliTools,
         listModelsForTool,
         listThinkingModesForTool,
-        type CliToolInfo,
-        type ModelInfo,
-        type ThinkingModeInfo,
-    } from '../../stores/appState';
+    } from '../../stores/openflow';
+    import type { CliToolInfo, ModelInfo, ThinkingModeInfo } from '../../stores/types';
     import { invoke } from '@tauri-apps/api/core';
 
     const dispatch = createEventDispatcher<{

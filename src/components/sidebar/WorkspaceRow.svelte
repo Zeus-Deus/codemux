@@ -1,5 +1,5 @@
 <script lang="ts">
-    import type { WorkspaceSnapshot } from '../../stores/appState';
+    import type { WorkspaceSnapshot } from '../../stores/types';
 
     let {
         workspace,

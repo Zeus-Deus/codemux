@@ -1,10 +1,17 @@
 <script lang="ts">
     import { onDestroy } from 'svelte';
-    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset, type AgentSessionState, type CommLogEntry, appState } from '../../stores/appState';
-    import type { OpenFlowRunRecord, WorkspaceSnapshot, PaneNodeSnapshot } from '../../stores/appState';
+    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset } from '../../stores/openflow';
+    import type { AgentSessionState } from '../../stores/types';
     import CommunicationPanel from './CommunicationPanel.svelte';
-    import NodeGraph, { type AgentNodeData, type Connection } from './NodeGraph.svelte';
+    import NodeGraph from './NodeGraph.svelte';
     import BrowserPane from '../panes/BrowserPane.svelte';
+    import { buildActiveConnections, buildAgentNodes } from '../../lib/openflowGraph';
+    import {
+        commLogPollInterval,
+        INITIAL_ORCHESTRATOR_DELAY_MS,
+        mergeCommLogEntries,
+        ORCHESTRATOR_INTERVAL_MS,
+    } from '../../lib/openflowPolling';
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
 
@@ -58,17 +65,15 @@
                 if (runId) {
                     triggerOrchestratorCycle(runId).catch(console.error);
                 }
-            }, 3000);
+            }, INITIAL_ORCHESTRATOR_DELAY_MS);
 
-            // Start auto-orchestration loop - keep running even after completion to process user injections
-            // Increased from 10s to 15s to reduce load with many agents
             orchestratorInterval = setInterval(() => {
                 if (runId && run) {
                     triggerOrchestratorCycle(runId).catch(e =>
                         console.error('[OpenFlow] Orchestration error:', e)
                     );
                 }
-            }, 15000);
+            }, ORCHESTRATOR_INTERVAL_MS);
         }
 
         return () => {
@@ -95,24 +100,12 @@
                 commLogStore.set(entries);
             }).catch(console.error);
             
-            // Single polling interval — CommunicationPanel subscribes to the store
-            // Increased from 3s to 5s to reduce load with many agents. When the run
-            // is completed, back off further to 30s to reduce idle overhead.
-            const MAX_STORE_ENTRIES = 500;
-            const intervalMs = run && run.status === 'completed' ? 30000 : 5000;
+            const intervalMs = commLogPollInterval(run);
             commLogInterval = setInterval(() => {
                 if (runId) {
                     getCommunicationLog(runId).then(entries => {
-                        // Only update if we got new entries (incremental read)
                         if (entries.length > 0) {
-                            commLogStore.update(prev => {
-                                const combined = [...prev, ...entries];
-                                // Keep only the most recent entries to prevent memory bloat
-                                if (combined.length > MAX_STORE_ENTRIES) {
-                                    return combined.slice(-MAX_STORE_ENTRIES);
-                                }
-                                return combined;
-                            });
+                            commLogStore.update((previous) => mergeCommLogEntries(previous, entries));
                         }
                     }).catch(console.error);
                 }
@@ -130,159 +123,12 @@
         };
     });
 
-    // Build a list of agent sessions indexed by instance ID so we can do O(1) lookups.
-    // Instance IDs are like "builder-0", "orchestrator" (bare for orchestrator).
-    const sessionByInstanceId = $derived(
-        new Map(agentSessions.map(s => {
-            const instanceId = s.config.role === 'orchestrator'
-                ? 'orchestrator'
-                : `${s.config.role}-${s.config.agent_index}`;
-            return [instanceId, s];
-        }))
-    );
-
     const agentNodes = $derived(
-        run?.workers.map((w, index) => {
-            const roleLower = w.role.toLowerCase();
-            // Instance ID: orchestrator has no index suffix; others use worker index
-            const instanceId = roleLower === 'orchestrator' ? 'orchestrator' : `${roleLower}-${index}`;
-            const session = sessionByInstanceId.get(instanceId)
-                ?? agentSessions.find(s => s.config.role === w.role);
-            
-            // Determine status from the most recent log entries for THIS specific instance.
-            // We look at all entries (not just recent ones) for the most authoritative final state,
-            // but use recent entries for the "active" signal.
-            let dynamicStatus = w.status;
-            
-            // Only check recent entries (last 10) instead of all entries for performance
-            const recentEntries = commLogEntries.slice(-50);
-            const instanceEntries = recentEntries.filter(e => 
-                e.role.toLowerCase() === instanceId || e.role.toLowerCase() === roleLower
-            );
-            const recentInstanceEntries = instanceEntries.slice(-3);
-
-            if (recentInstanceEntries.length > 0) {
-                const lastMsg = recentInstanceEntries[recentInstanceEntries.length - 1].message.toLowerCase();
-                if (lastMsg.includes('done:') || lastMsg.includes('run complete')) {
-                    dynamicStatus = 'done';
-                } else if (lastMsg.includes('blocked:')) {
-                    dynamicStatus = 'blocked';
-                } else {
-                    // Check if this instance wrote something in the last 5 overall entries
-                    const last5 = commLogEntries.slice(-5);
-                    const recentlyActive = last5.some(e =>
-                        e.role.toLowerCase() === instanceId || e.role.toLowerCase() === roleLower
-                    );
-                    if (recentlyActive) dynamicStatus = 'active';
-                }
-            }
-            
-            return {
-                id: instanceId,
-                role: w.role,
-                status: dynamicStatus,
-                model: session?.config.model ?? null,
-                thinkingMode: session?.config.thinking_mode ?? null
-            };
-        }) ?? []
+        buildAgentNodes(run, agentSessions, commLogEntries)
     );
 
     const activeConnections = $derived.by(() => {
-        if (!run || run.workers.length === 0) return [];
-        
-        const conns: Connection[] = [];
-
-        // Build a set of all valid node IDs from the current agent nodes for fast lookup.
-        const nodeIds = new Set(agentNodes.map(n => n.id));
-        const uniqueRoles = [...new Set(agentNodes.map(n => n.role.toLowerCase()))];
-
-        // Helper: resolve a node ID from a raw instance/role string.
-        // Accepts "builder-0", "builder" (bare role → picks first instance), "orchestrator".
-        const resolveNodeId = (raw: string): string | null => {
-            const lower = raw.toLowerCase().trim();
-            if (nodeIds.has(lower)) return lower;
-            // Bare role → pick the first node whose role matches
-            const match = agentNodes.find(n => n.role.toLowerCase() === lower);
-            return match ? match.id : null;
-        };
-
-        // Helper: get first node of a given role
-        const firstOfRole = (role: string): string | null => resolveNodeId(role);
-
-        // Reduced from -20 to -10 for performance with 20+ agents
-        const recentEntries = commLogEntries.slice(-10);
-
-        // ── 1. ASSIGN messages from orchestrator → directed connections ──────────
-        // Parse both instance-level "ASSIGN BUILDER-0: ..." and legacy "ASSIGN BUILDER: ..."
-        for (const entry of recentEntries) {
-            if (entry.role.toLowerCase() !== 'orchestrator') continue;
-            const msg = entry.message;
-            const assignMatch = msg.match(/ASSIGN\s+([A-Z]+-\d+|[A-Z]+)\s*:/i);
-            if (!assignMatch) continue;
-            const target = assignMatch[1]!.toLowerCase();
-            const targetId = resolveNodeId(target);
-            const orchId = resolveNodeId('orchestrator');
-            if (orchId && targetId) {
-                conns.push({ from: orchId, to: targetId, label: 'assign' });
-            }
-        }
-
-        // ── 2. DONE / BLOCKED signals — show the agent reporting back ──────────
-        for (const entry of recentEntries) {
-            const senderLower = entry.role.toLowerCase();
-            if (senderLower === 'system' || senderLower === 'orchestrator') continue;
-            const senderId = resolveNodeId(senderLower);
-            if (!senderId) continue;
-            const msgLower = entry.message.toLowerCase();
-            if (msgLower.includes('done:') || msgLower.includes('run complete')) {
-                const orchId = resolveNodeId('orchestrator');
-                if (orchId) conns.push({ from: senderId, to: orchId, label: 'done' });
-            } else if (msgLower.includes('blocked:')) {
-                const debugId = firstOfRole('debugger');
-                if (debugId) conns.push({ from: senderId, to: debugId, label: 'blocked' });
-            }
-        }
-
-        // ── 3. Phase-based defaults when no log connections found ────────────
-        if (conns.length === 0) {
-            const phase = run.current_phase;
-            const orchId = firstOfRole('orchestrator');
-            if (phase === 'plan' || phase === 'planning') {
-                if (orchId) {
-                    const plannerIds = agentNodes.filter(n => n.role.toLowerCase() === 'planner').map(n => n.id);
-                    plannerIds.forEach(pid => conns.push({ from: orchId, to: pid, label: 'planning' }));
-                    const researcherIds = agentNodes.filter(n => n.role.toLowerCase() === 'researcher').map(n => n.id);
-                    researcherIds.forEach(rid => conns.push({ from: orchId, to: rid, label: 'research' }));
-                }
-            } else if (phase === 'execute' || phase === 'executing') {
-                if (orchId) {
-                    const builderIds = agentNodes.filter(n => n.role.toLowerCase() === 'builder').map(n => n.id);
-                    builderIds.forEach(bid => conns.push({ from: orchId, to: bid, label: 'build' }));
-                }
-            } else if (phase === 'verify' || phase === 'verifying') {
-                if (orchId) {
-                    const testerIds = agentNodes.filter(n => n.role.toLowerCase() === 'tester').map(n => n.id);
-                    testerIds.forEach(tid => conns.push({ from: orchId, to: tid, label: 'test' }));
-                }
-            } else if (phase === 'review' || phase === 'reviewing') {
-                if (orchId) {
-                    const reviewerIds = agentNodes.filter(n => n.role.toLowerCase() === 'reviewer').map(n => n.id);
-                    reviewerIds.forEach(rid => {
-                        conns.push({ from: orchId, to: rid, label: 'review' });
-                        conns.push({ from: rid, to: orchId, label: 'feedback' });
-                    });
-                }
-            }
-        }
-
-        // De-duplicate connections (same from+to pair) while preserving labels
-        const seen = new Set<string>();
-        return conns.filter(c => {
-            const key = `${c.from}→${c.to}`;
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
+        return buildActiveConnections(run, agentNodes, commLogEntries);
     });
 
     async function handleLoop() {
@@ -403,7 +249,7 @@
         </div>
     </div>
 
-    <!-- Resizable divider -->
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div 
         class="panel-resizer" 
         class:active={isDragging}

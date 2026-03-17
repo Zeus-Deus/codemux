@@ -164,8 +164,6 @@ pub struct BrowserSessionSnapshot {
     pub history_index: usize,
     pub is_loading: bool,
     pub last_error: Option<String>,
-    pub reload_nonce: u32,
-    pub last_screenshot_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -529,8 +527,6 @@ impl AppStateStore {
                 history_index: 0,
                 is_loading: false,
                 last_error: None,
-                reload_nonce: 0,
-                last_screenshot_path: None,
             });
             browser = Some(browser_id);
         }
@@ -582,8 +578,6 @@ impl AppStateStore {
             history_index: 0,
             is_loading: false,
             last_error: None,
-            reload_nonce: 0,
-            last_screenshot_path: None,
         });
 
         let workspace = snapshot
@@ -1181,7 +1175,6 @@ impl AppStateStore {
             .iter_mut()
             .find(|browser| browser.browser_id.0 == browser_id)
             .ok_or_else(|| format!("No browser session found for {browser_id}"))?;
-        browser.reload_nonce = browser.reload_nonce.wrapping_add(1);
         browser.is_loading = true;
         browser.last_error = None;
         Ok(())
@@ -1201,21 +1194,6 @@ impl AppStateStore {
             .ok_or_else(|| format!("No browser session found for {browser_id}"))?;
         browser.is_loading = is_loading;
         browser.last_error = error;
-        Ok(())
-    }
-
-    pub fn set_browser_screenshot_path(
-        &self,
-        browser_id: &str,
-        screenshot_path: String,
-    ) -> Result<(), String> {
-        let mut snapshot = self.inner.lock().unwrap();
-        let browser = snapshot
-            .browser_sessions
-            .iter_mut()
-            .find(|browser| browser.browser_id.0 == browser_id)
-            .ok_or_else(|| format!("No browser session found for {browser_id}"))?;
-        browser.last_screenshot_path = Some(screenshot_path);
         Ok(())
     }
 

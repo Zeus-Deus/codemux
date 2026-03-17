@@ -45,6 +45,12 @@
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
 
+## Boundary Notes
+
+- frontend Tauri commands, socket control, and CLI are separate surfaces, but workspace and browser socket actions now reuse the same Rust helper implementations used by the Tauri command layer
+- browser automation is centered on the `agent-browser` path
+- CLI browser commands use the same internal `agent-browser` execution helpers as the runtime manager
+
 ## CLI Examples
 
 ```bash
