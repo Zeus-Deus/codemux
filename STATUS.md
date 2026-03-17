@@ -22,7 +22,7 @@ What is still prototype-level or incomplete:
 
 - browser pane now works using agent-browser (npm package via npx), shares session with CLI commands
 - browser automation: now uses agent-browser, agents can control via CLI commands
-- OpenFlow runtime/UI are scaffolding and state-machine simulation, not a full multi-agent execution system
+- OpenFlow runtime/UI now run real agent PTYs and shared communication logs, but orchestration reliability and dev-time stability are still prototype-level
 - control socket is local-user only and currently unauthenticated
 
 Because of that, the first Linux MVP should still be considered in progress.
@@ -51,7 +51,7 @@ Because of that, the first Linux MVP should still be considered in progress.
 - Browser screenshots: comes from agent-browser session, shared with CLI commands
 - Console log capture: command shape exists, but current frontend browser implementation does not populate a real log stream
 - Notification sound: config toggle exists, but actual sound playback is not implemented
-- OpenFlow runtime: run records, phases, retry, and sidebar controls exist; Phase 1 (workspace/UI shell) and Phase 2 (agent spawning system) are complete; Phase 3 (communication layer) is next
+- OpenFlow runtime: run records, phases, retry, shared communication log handling, and sidebar controls exist; real multi-agent runs now work in some cases, but 15-20 agent stability and dev-server lifecycle handling still need validation
 
 ## Major Known Gaps Before Calling It A Linux MVP
 
@@ -190,7 +190,8 @@ Current expectation note:
 
 Current expectation note:
 
-- Do not treat this section as proof of a finished autonomous agent system. Current OpenFlow behavior is stateful scaffolding, not a fully integrated worker execution runtime.
+- Do not treat this section as proof of a finished autonomous agent system. OpenFlow now runs real agent PTYs and a shared communication log, but the overall workflow is still not release-ready.
+- Recent hardening added durable debug logs for wrapper/native launch attribution and blocks bare `codemux` GUI launches from OpenFlow agent sessions, but large-run reliability still needs manual validation.
 
 ## 10. OpenFlow Workspace (NEW - Phase 1)
 
@@ -228,6 +229,6 @@ Current expectation note:
 ### Known Issues
 
 - [ ] OpenFlow workspace does not have a browser pane yet (planned for Phase 6)
-    - [ ] Agents are not actually running yet — `spawn_openflow_agents` command wires agent configs to terminal panes with opencode, but the communication layer (Phase 3) is needed before agents can exchange messages
-    - [ ] Communication is simulated (planned for Phase 3)
+- [ ] Browser view is still a placeholder toggle rather than a full persistent OpenFlow browser surface
+- [ ] 15-20 agent runs still need validation for stray helper launches and `beforeDevCommand` teardown behavior under `tauri dev`
 - Note: WorkspaceType serde was previously serializing as PascalCase ("OpenFlow"); now fixed to snake_case ("open_flow") matching frontend expectations

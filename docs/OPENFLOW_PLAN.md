@@ -68,12 +68,21 @@ OpenFlow must be designed as a **standalone, embeddable orchestration engine**, 
 - **User Messages After Completion**: Detected and triggers workflow restart (phase goes back to Planning)
 - **UI Improvements**: Timeline removed, orchestration view takes full screen
 - **Browser Toggle Button**: Toggles between Orchestration view and Browser placeholder view
+- **Run Cleanup Hardening**: OpenFlow session state is stripped on load, PTY respawn is capped, and stop flow removes agent sessions more aggressively
+- **Dev Diagnostics**: Durable logs exist for wrapper lifecycle, OpenFlow breadcrumbs, native startup/panic/signal logging, and cwd-independent native launch attribution
 
 ### ⚠️ Known Issues (To Fix)
 1. **Orchestrator doesn't directly respond to user questions** - When user sends message during/after run, orchestrator restarts workflow instead of answering simple questions directly
 2. **Browser placeholder view only** - The "Browser" button toggles a placeholder view, not showing actual browser content from agents
 3. **User messages during execution ignored** - Only triggers restart after reaching "awaiting_approval" phase
 4. **Working directory** - Some agents may run in wrong directory
+
+### 🔎 Diagnostics and Guardrails
+- `.codemux/vite-wrapper.log` records the Vite wrapper lifecycle, child PID/PGID, and inbound signals such as `TERM`
+- `.codemux/openflow-breadcrumbs.log` records run creation, agent spawning, run stop, and agent exits
+- `.codemux/native-startup.log` records native GUI startup, run return, panic, and Unix signal attribution in debug builds
+- `/run/user/$UID/codemux-native-launches.log` records every native launch even if the current working directory changes
+- Bare `codemux` launches from OpenFlow agent sessions are explicitly blocked; agent terminals must use an explicit CLI subcommand such as `codemux browser open <url>`
 
 ---
 

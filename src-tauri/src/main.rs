@@ -22,24 +22,53 @@ fn native_startup_log_path() -> Option<PathBuf> {
 }
 
 #[cfg(debug_assertions)]
+fn native_global_log_path() -> Option<PathBuf> {
+    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Some(std::env::temp_dir()))?;
+    Some(runtime_dir.join("codemux-native-launches.log"))
+}
+
+#[cfg(debug_assertions)]
+fn append_debug_log(path: &PathBuf, line: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{}", line);
+        let _ = f.flush();
+    }
+}
+
+#[cfg(debug_assertions)]
 fn native_startup_log(line: &str) {
     if let Some(path) = native_startup_log_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{}", line);
-            let _ = f.flush();
-        }
+        append_debug_log(&path, line);
+    }
+    if let Some(path) = native_global_log_path() {
+        append_debug_log(&path, line);
     }
 }
 
 #[cfg(not(debug_assertions))]
 fn native_startup_log(_line: &str) {}
+
+fn is_openflow_agent_context() -> bool {
+    env::var_os("CODEMUX_OPENFLOW_RUN_ID").is_some()
+        || env::var_os("CODEMUX_AGENT_INSTANCE_ID").is_some()
+        || env::var_os("CODEMUX_AGENT_ROLE").is_some()
+        || env::var_os("CODEMUX_COMMUNICATION_LOG").is_some()
+}
+
+fn openflow_agent_label() -> String {
+    env::var("CODEMUX_AGENT_INSTANCE_ID")
+        .or_else(|_| env::var("CODEMUX_AGENT_ROLE"))
+        .unwrap_or_else(|_| "unknown".to_string())
+}
 
 #[cfg(all(debug_assertions, unix))]
 mod native_signal_log {
@@ -111,18 +140,25 @@ fn main() {
         .as_nanos();
 
     let pid = std::process::id();
+    let cwd = env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
     let parent_pid = env::var("CODEMUX_PARENT_PID").ok();
+    let agent_instance = env::var("CODEMUX_AGENT_INSTANCE_ID").ok();
     let socket_existed = codemux_lib::control::control_socket_path()
         .map(|p| p.exists())
         .unwrap_or(false);
     #[cfg(debug_assertions)]
     native_startup_log(&format!(
-        "[{}] startup_id={} pid={} parent_pid={:?} argv={:?} socket_existed={}",
+        "[{}] startup_id={} pid={} parent_pid={:?} cwd={} argv={:?} agent_instance={:?} socket_existed={}",
         chrono_timestamp(),
         startup_id,
         pid,
         parent_pid,
+        cwd,
         env::args().collect::<Vec<_>>(),
+        agent_instance,
         socket_existed
     ));
 
@@ -176,7 +212,23 @@ fn main() {
             ));
             return;
         }
-        Ok(false) => {}
+        Ok(false) => {
+            if is_openflow_agent_context() {
+                let agent = openflow_agent_label();
+                codemux_lib::diagnostics::stderr_line(&format!(
+                    "[codemux] Refusing to launch GUI from OpenFlow agent session {} without a CLI subcommand.",
+                    agent
+                ));
+                #[cfg(debug_assertions)]
+                native_startup_log(&format!(
+                    "[{}] startup_id={} outcome=blocked_agent_gui_launch agent={}",
+                    chrono_timestamp(),
+                    startup_id,
+                    agent
+                ));
+                std::process::exit(2);
+            }
+        }
         Err(error) => {
             codemux_lib::diagnostics::stderr_line(&format!(
                 "[codemux] CLI command failed: {error}"

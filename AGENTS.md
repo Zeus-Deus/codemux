@@ -5,11 +5,13 @@ This guide explains how AI coding agents can use Codemux's browser automation wh
 ## IMPORTANT: Always Use Codemux Browser Commands
 
 **NEVER use these commands:**
+
 - `xdg-open` - opens in system browser, not Codemux
 - `open` (macOS) - opens in system browser
 - Any other command that opens the default system browser
 
 **ALWAYS use these instead:**
+
 - `codemux browser open <url>` - opens in Codemux's embedded browser pane
 
 The browser automation runs against the **embedded browser pane inside Codemux**, NOT your system browser.
@@ -17,6 +19,7 @@ The browser automation runs against the **embedded browser pane inside Codemux**
 ## Prerequisites
 
 Before using browser commands, ensure a browser pane exists in your Codemux workspace:
+
 1. Create a browser pane (via sidebar or split menu)
 2. The pane must be visible/active for commands to work
 
@@ -116,21 +119,21 @@ codemux browser console-logs
 # Get page errors
 codemux browser console-logs
 
-# Evaluate JavaScript
-codemux browser eval "document.querySelector('#app').innerHTML"
+# Re-check page structure after an error
+codemux browser snapshot
 ```
 
 ## Available Commands
 
-| Command | Description |
-|---------|-------------|
-| `codemux browser create` | Create a new browser pane in the current workspace |
-| `codemux browser open <url>` | Navigate to URL |
-| `codemux browser snapshot` | Get accessibility tree |
-| `codemux browser click <selector>` | Click element |
-| `codemux browser fill <selector> <text>` | Fill input |
-| `codemux browser screenshot` | Take screenshot |
-| `codemux browser console-logs` | Get console logs |
+| Command                                  | Description                                        |
+| ---------------------------------------- | -------------------------------------------------- |
+| `codemux browser create`                 | Create a new browser pane in the current workspace |
+| `codemux browser open <url>`             | Navigate to URL                                    |
+| `codemux browser snapshot`               | Get accessibility tree                             |
+| `codemux browser click <selector>`       | Click element                                      |
+| `codemux browser fill <selector> <text>` | Fill input                                         |
+| `codemux browser screenshot`             | Take screenshot                                    |
+| `codemux browser console-logs`           | Get console logs                                   |
 
 ## Socket API
 
@@ -149,6 +152,7 @@ echo '{"command":"browser_automation","params":{"browser_id":"default","action":
 4. **Check console logs** - When something doesn't work, look for JS errors
 5. **Take screenshots** - Useful for debugging and showing results to users
 6. **Test incrementally** - Make one change, test it, then move on
+7. **Always use explicit `codemux browser ...` subcommands** - Never invoke bare `codemux` from an agent terminal
 
 ## Browser vs Terminal
 
