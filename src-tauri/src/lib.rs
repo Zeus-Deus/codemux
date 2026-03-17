@@ -6,6 +6,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod control;
+pub mod diagnostics;
 pub mod indexing;
 pub mod memory;
 pub mod openflow;
@@ -23,7 +24,10 @@ pub fn run() {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        eprintln!("[DEBUG] codemux_lib::run() started at timestamp: {}", start);
+        crate::diagnostics::stderr_line(&format!(
+            "[DEBUG] codemux_lib::run() started at timestamp: {}",
+            start
+        ));
     }
     
     tauri::Builder::default()

@@ -27,6 +27,7 @@ use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -386,6 +387,12 @@ pub fn spawn_openflow_agents(
         }
     }
 
+    crate::diagnostics::openflow_breadcrumb(&format!(
+        "agents_spawned run_id={} count={}",
+        run_id,
+        session_ids.len()
+    ));
+
     // Write all "agent started" entries in a single file-open after the spawn loop,
     // avoiding one OS thread per agent that raced to append to the same file.
     {
@@ -499,13 +506,82 @@ pub fn trigger_orchestrator_cycle(
             .values()
             .map(|rt| rt.pending_output.len())
             .sum();
-        eprintln!(
-            "[DEBUG] trigger_orchestrator_cycle run_id={} phase={} sessions={} pending_chunks={}",
+
+        #[cfg(target_os = "linux")]
+        let rss_kb: Option<u64> = std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            });
+        #[cfg(not(target_os = "linux"))]
+        let rss_kb: Option<u64> = None;
+
+        let timeout_ms = 200u64;
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        let mut vite_port_up = false;
+        let mut probe_log = String::new();
+        for (addr, label) in &[
+            (std::net::SocketAddr::from(([127, 0, 0, 1], 1420)), "127.0.0.1:1420"),
+            (
+                std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 1420)),
+                "[::1]:1420",
+            ),
+        ] {
+            let start = std::time::Instant::now();
+            match std::net::TcpStream::connect_timeout(addr, timeout) {
+                Ok(_) => {
+                    let elapsed = start.elapsed().as_millis();
+                    vite_port_up = true;
+                    probe_log.push_str(&format!(" {} ok {}ms", label, elapsed));
+                    break;
+                }
+                Err(e) => {
+                    let elapsed = start.elapsed().as_millis();
+                    let kind = std::io::Error::kind(&e);
+                    probe_log.push_str(&format!(
+                        " {} fail {:?} {}ms",
+                        label, kind, elapsed
+                    ));
+                }
+            }
+        }
+        if let Ok(addr) = ("localhost", 1420_u16).to_socket_addrs() {
+            for a in addr {
+                if vite_port_up {
+                    break;
+                }
+                let start = std::time::Instant::now();
+                match std::net::TcpStream::connect_timeout(&a, timeout) {
+                    Ok(_) => {
+                        let elapsed = start.elapsed().as_millis();
+                        vite_port_up = true;
+                        probe_log.push_str(&format!(" localhost({}) ok {}ms", a, elapsed));
+                        break;
+                    }
+                    Err(e) => {
+                        let elapsed = start.elapsed().as_millis();
+                        let kind = std::io::Error::kind(&e);
+                        probe_log.push_str(&format!(
+                            " localhost({}) fail {:?} {}ms",
+                            a, kind, elapsed
+                        ));
+                    }
+                }
+            }
+        }
+
+        crate::diagnostics::stderr_line(&format!(
+            "[DEBUG] trigger_orchestrator_cycle run_id={} phase={} sessions={} pending_chunks={} rss_kb={:?} vite_port_1420={} probe={}",
             run_id,
             current_phase_str,
             total_sessions,
-            total_pending_chunks
-        );
+            total_pending_chunks,
+            rss_kb,
+            if vite_port_up { "up" } else { "down" },
+            probe_log.trim()
+        ));
     }
 
     // Read the comm log - use incremental reading if offset provided
@@ -520,12 +596,15 @@ pub fn trigger_orchestrator_cycle(
     };
 
     #[cfg(debug_assertions)]
-    eprintln!("[DEBUG] Read {} entries from comm log", entries.len());
+    crate::diagnostics::stderr_line(&format!(
+        "[DEBUG] Read {} entries from comm log",
+        entries.len()
+    ));
 
     let analysis = Orchestrator::analyze_comm_log(&entries);
 
     #[cfg(debug_assertions)]
-    eprintln!(
+    crate::diagnostics::stderr_line(&format!(
         "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} instance_assignments={} injections={}/{}",
         analysis.completed_roles,
         analysis.blocked_roles,
@@ -533,7 +612,7 @@ pub fn trigger_orchestrator_cycle(
         analysis.instance_assignments.len(),
         analysis.user_injections.len(),
         analysis.total_injections
-    );
+    ));
 
     let mut actions_taken = Vec::new();
 
@@ -578,7 +657,10 @@ pub fn trigger_orchestrator_cycle(
                 match write_result {
                     Ok(()) => {
                         #[cfg(debug_assertions)]
-                        eprintln!("[DEBUG] Forwarded task to {} (session {})", ia.instance_id, session_id);
+                        crate::diagnostics::stderr_line(&format!(
+                            "[DEBUG] Forwarded task to {} (session {})",
+                            ia.instance_id, session_id
+                        ));
                         actions_taken.push(format!("Forwarded task to {}", ia.instance_id));
                     }
                     Err(e) => {
@@ -643,7 +725,10 @@ pub fn trigger_orchestrator_cycle(
             match write_result {
                 Ok(()) => {
                     #[cfg(debug_assertions)]
-                    eprintln!("[DEBUG] Wrote prompt to orchestrator PTY {}", session_id);
+                    crate::diagnostics::stderr_line(&format!(
+                        "[DEBUG] Wrote prompt to orchestrator PTY {}",
+                        session_id
+                    ));
                     actions_taken.push(format!(
                         "Forwarded {} user injection(s) to orchestrator PTY",
                         analysis.user_injections.len()
@@ -688,7 +773,7 @@ pub fn trigger_orchestrator_cycle(
     };
 
     #[cfg(debug_assertions)]
-    eprintln!("[DEBUG] next_phase={:?}", next_phase);
+    crate::diagnostics::stderr_line(&format!("[DEBUG] next_phase={:?}", next_phase));
 
     // Apply the phase change if one was determined.
     if let Some(ref new_phase) = next_phase {
@@ -1407,7 +1492,9 @@ pub fn create_openflow_run(
     store: State<'_, OpenFlowRuntimeStore>,
     request: OpenFlowCreateRunRequest,
 ) -> Result<OpenFlowRunRecord, String> {
-    Ok(store.create_run(request))
+    let record = store.create_run(request);
+    crate::diagnostics::openflow_breadcrumb(&format!("run_created run_id={}", record.run_id));
+    Ok(record)
 }
 
 #[tauri::command]
@@ -1462,6 +1549,10 @@ pub fn stop_openflow_run(
         "awaiting_approval" => OpenFlowRunStatus::AwaitingApproval,
         _ => OpenFlowRunStatus::Failed,
     };
+    crate::diagnostics::openflow_breadcrumb(&format!(
+        "run_stopped run_id={} status={:?} reason={}",
+        run_id, status, reason
+    ));
     let record = store.stop_run(&run_id, status, reason)?;
 
     // Collect all agent sessions for this run so we can tear down their PTYs

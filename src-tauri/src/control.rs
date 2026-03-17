@@ -34,7 +34,9 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
 pub fn spawn_control_server(app: AppHandle) {
     let Some(socket_path) = control_socket_path() else {
-        eprintln!("[codemux::control] XDG_RUNTIME_DIR unavailable, skipping control server");
+        crate::diagnostics::stderr_line(
+            "[codemux::control] XDG_RUNTIME_DIR unavailable, skipping control server",
+        );
         return;
     };
 
@@ -43,22 +45,24 @@ pub fn spawn_control_server(app: AppHandle) {
     if socket_path.exists() {
         if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
             drop(stream);
-            eprintln!(
+            crate::diagnostics::stderr_line(&format!(
                 "[codemux::control] Existing control socket at {:?} is alive; skipping new control server",
                 socket_path
-            );
+            ));
             return;
         } else {
-            eprintln!(
+            crate::diagnostics::stderr_line(&format!(
                 "[codemux::control] Existing control socket at {:?} appears stale; replacing it",
                 socket_path
-            );
+            ));
         }
     }
 
     if let Some(parent) = socket_path.parent() {
         if let Err(error) = fs::create_dir_all(parent) {
-            eprintln!("[codemux::control] Failed to create control dir: {error}");
+            crate::diagnostics::stderr_line(&format!(
+                "[codemux::control] Failed to create control dir: {error}"
+            ));
             return;
         }
     }
@@ -69,7 +73,9 @@ pub fn spawn_control_server(app: AppHandle) {
         let listener = match UnixListener::bind(&socket_path) {
             Ok(listener) => listener,
             Err(error) => {
-                eprintln!("[codemux::control] Failed to bind control socket: {error}");
+                crate::diagnostics::stderr_line(&format!(
+                    "[codemux::control] Failed to bind control socket: {error}"
+                ));
                 return;
             }
         };
@@ -80,12 +86,16 @@ pub fn spawn_control_server(app: AppHandle) {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(error) = handle_client(app, stream).await {
-                            eprintln!("[codemux::control] Client error: {error}");
+                            crate::diagnostics::stderr_line(&format!(
+                                "[codemux::control] Client error: {error}"
+                            ));
                         }
                     });
                 }
                 Err(error) => {
-                    eprintln!("[codemux::control] Accept error: {error}");
+                    crate::diagnostics::stderr_line(&format!(
+                        "[codemux::control] Accept error: {error}"
+                    ));
                     break;
                 }
             }

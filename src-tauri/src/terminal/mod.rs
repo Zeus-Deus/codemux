@@ -4,6 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 
 use crate::project::current_project_root;
@@ -867,45 +868,61 @@ pub fn spawn_pty_for_agent(
         .or_else(|| extra_env.iter().find(|(k, _)| k == "CODEMUX_AGENT_ROLE"))
         .map(|(_, v)| v.clone());
 
+    const COMM_LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+    const COMM_LOG_FLUSH_BATCH_SIZE: usize = 50;
+
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let log_lock_opt: Option<(Arc<Mutex<std::fs::File>>, String)> =
+        match (comm_log_path.as_ref(), agent_role.as_ref()) {
+            (Some(path), Some(role)) => Some((get_comm_log_lock(path), role.clone())),
+            _ => None,
+        };
+
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
+        let mut comm_log_buffer: Vec<String> = Vec::new();
+        let mut last_flush = Instant::now();
 
         loop {
             match reader.read(&mut buf) {
                 Ok(n) if n > 0 => {
                     let chunk = buf[..n].to_vec();
 
-                    // Write agent output to communication log (cleaned)
-                    if let (Some(comm_log), Some(role)) =
-                        (comm_log_path.as_ref(), agent_role.as_ref())
-                    {
+                    // Buffer agent output for communication log (cleaned); flush periodically
+                    if let Some((ref log_lock, ref role)) = log_lock_opt {
                         if let Ok(text) = String::from_utf8(chunk.clone()) {
-                            // Strip ANSI escape codes
                             let cleaned = strip_ansi_codes(&text);
                             let trimmed = cleaned.trim();
 
-                            // Only log meaningful lines (not empty, not just prompt chars)
-                            if !trimmed.is_empty() && trimmed.len() > 2 
-                                && !trimmed.starts_with('\x1b')  // escape
-                                && !trimmed.chars().all(|c| c.is_whitespace() || c == '▀' || c == '▄' || c == '█' || c == ' ')
+                            if !trimmed.is_empty()
+                                && trimmed.len() > 2
+                                && !trimmed.starts_with('\x1b')
+                                && !trimmed.chars().all(|c| {
+                                    c.is_whitespace() || c == '▀' || c == '▄' || c == '█' || c == ' '
+                                })
                             {
-                                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                let timestamp =
+                                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                                 let entry = format!(
                                     "[{}] [{}] {}\n",
                                     timestamp,
                                     role.to_uppercase(),
                                     trimmed
                                 );
-                                // Use file locking to prevent race conditions with 20+ agents
-                                let log_lock = get_comm_log_lock(comm_log);
-                                let mut file = match log_lock.lock() {
-                                    Ok(f) => f,
-                                    Err(_) => continue,
-                                };
-                                let _ = file.write_all(entry.as_bytes());
-                                let _ = file.flush();
+                                comm_log_buffer.push(entry);
+                                if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
+                                    || last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
+                                {
+                                    if let Ok(mut file) = log_lock.lock() {
+                                        for e in &comm_log_buffer {
+                                            let _ = file.write_all(e.as_bytes());
+                                        }
+                                        let _ = file.flush();
+                                    }
+                                    comm_log_buffer.clear();
+                                    last_flush = Instant::now();
+                                }
                             }
                         }
                     }
@@ -916,6 +933,18 @@ pub fn spawn_pty_for_agent(
                 Err(error) => {
                     eprintln!("[codemux::terminal] Agent PTY read error: {error}");
                     break;
+                }
+            }
+        }
+
+        // Flush any remaining buffered entries
+        if let Some((ref log_lock, _)) = log_lock_opt {
+            if !comm_log_buffer.is_empty() {
+                if let Ok(mut file) = log_lock.lock() {
+                    for e in &comm_log_buffer {
+                        let _ = file.write_all(e.as_bytes());
+                    }
+                    let _ = file.flush();
                 }
             }
         }
@@ -943,6 +972,12 @@ pub fn spawn_pty_for_agent(
                 exit_code: None,
             },
         };
+
+        crate::diagnostics::openflow_breadcrumb(&format!(
+            "agent_exited session_id={} state={:?}",
+            wait_session_id,
+            payload.state
+        ));
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);
 
