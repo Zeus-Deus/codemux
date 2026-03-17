@@ -16,6 +16,19 @@ log_both() {
     echo "$1" | tee -a "$LOG" >&2
 }
 
+probe_port_1420() {
+    local host="127.0.0.1"
+    local port="1420"
+    local ok="false"
+    # Best-effort check using bash /dev/tcp. If it fails, we still proceed; this is diagnostics only.
+    if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then
+        ok="true"
+        exec 3>&-
+        exec 3<&-
+    fi
+    log_msg "[$(date -Iseconds)] port_probe host=${host} port=${port} open=${ok}"
+}
+
 pgid_of() {
     ps -o pgid= -p "$1" 2>/dev/null | tr -d '[:space:]'
 }
@@ -79,6 +92,7 @@ while true; do
     launch_ts=$(date +%s)
     log_msg "[$(date -Iseconds)] restart_count=$restart_count launch_ts=$launch_ts Starting Vite dev server..."
     log_both "[vite-wrapper] Starting Vite dev server... (restart $restart_count, log: $LOG)"
+    probe_port_1420
 
     vite dev >> "$LOG" 2>&1 &
     current_vite_pid=$!
@@ -102,6 +116,7 @@ while true; do
 
     # User or Tauri requested shutdown (SIGINT=130, SIGTERM=143) - do not restart
     if [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 143 ]; then
+        log_msg "[$(date -Iseconds)] classification=teardown exit_code=$EXIT_CODE"
         log_wrapper_exit "$EXIT_CODE" "vite_exit_signal"
         exit $EXIT_CODE
     fi
@@ -119,6 +134,12 @@ while true; do
         log_both "[vite-wrapper] Vite crashed $MAX_QUICK_CRASHES times in ${QUICK_CRASH_WINDOW}s, giving up."
         log_wrapper_exit 1 "rapid_crash_giveup"
         exit 1
+    fi
+
+    if [ $uptime -le 2 ]; then
+        log_msg "[$(date -Iseconds)] classification=likely_port_or_startup_failure uptime_sec=$uptime exit_code=$EXIT_CODE"
+    else
+        log_msg "[$(date -Iseconds)] classification=unexpected_vite_exit uptime_sec=$uptime exit_code=$EXIT_CODE"
     fi
 
     log_msg "[$(date -Iseconds)] restarting_in=${RESTART_DELAY}s crash=$crash_count of $MAX_QUICK_CRASHES"

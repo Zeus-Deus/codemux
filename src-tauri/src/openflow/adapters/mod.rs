@@ -11,6 +11,8 @@ pub struct AgentSpawnSpec {
     pub argv: Vec<String>,
     /// Environment variable overrides to set on the spawned process.
     pub env: Vec<(String, String)>,
+    /// Generic execution policy for this agent process.
+    pub execution_policy: crate::execution::ExecutionPolicy,
     /// Suggested terminal title for this agent's pane.
     pub title: String,
     /// Path to the system prompt file for this agent.

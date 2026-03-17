@@ -37,8 +37,32 @@ pub fn spawn_control_server(app: AppHandle) {
         crate::diagnostics::stderr_line(
             "[codemux::control] XDG_RUNTIME_DIR unavailable, skipping control server",
         );
+        #[cfg(debug_assertions)]
+        {
+            let pid = std::process::id();
+            let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+            crate::diagnostics::native_startup_breadcrumb(&format!(
+                "[{}] startup_id={} pid={} component=control outcome=skip_no_xdg_runtime_dir",
+                chrono::Local::now().format("%s"),
+                startup_id,
+                pid
+            ));
+        }
         return;
     };
+
+    #[cfg(debug_assertions)]
+    {
+        let pid = std::process::id();
+        let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+        crate::diagnostics::native_startup_breadcrumb(&format!(
+            "[{}] startup_id={} pid={} component=control event=spawn_control_server socket_path={}",
+            chrono::Local::now().format("%s"),
+            startup_id,
+            pid,
+            socket_path.display()
+        ));
+    }
 
     // If a control socket already exists and responds, assume another Codemux
     // instance is running and do NOT steal the socket or start a second server.
@@ -49,12 +73,36 @@ pub fn spawn_control_server(app: AppHandle) {
                 "[codemux::control] Existing control socket at {:?} is alive; skipping new control server",
                 socket_path
             ));
+            #[cfg(debug_assertions)]
+            {
+                let pid = std::process::id();
+                let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                crate::diagnostics::native_startup_breadcrumb(&format!(
+                    "[{}] startup_id={} pid={} component=control outcome=skip_existing_alive socket_path={}",
+                    chrono::Local::now().format("%s"),
+                    startup_id,
+                    pid,
+                    socket_path.display()
+                ));
+            }
             return;
         } else {
             crate::diagnostics::stderr_line(&format!(
                 "[codemux::control] Existing control socket at {:?} appears stale; replacing it",
                 socket_path
             ));
+            #[cfg(debug_assertions)]
+            {
+                let pid = std::process::id();
+                let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                crate::diagnostics::native_startup_breadcrumb(&format!(
+                    "[{}] startup_id={} pid={} component=control event=stale_socket_replace socket_path={}",
+                    chrono::Local::now().format("%s"),
+                    startup_id,
+                    pid,
+                    socket_path.display()
+                ));
+            }
         }
     }
 
@@ -76,9 +124,35 @@ pub fn spawn_control_server(app: AppHandle) {
                 crate::diagnostics::stderr_line(&format!(
                     "[codemux::control] Failed to bind control socket: {error}"
                 ));
+                #[cfg(debug_assertions)]
+                {
+                    let pid = std::process::id();
+                    let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                    crate::diagnostics::native_startup_breadcrumb(&format!(
+                        "[{}] startup_id={} pid={} component=control outcome=bind_failed socket_path={} error={}",
+                        chrono::Local::now().format("%s"),
+                        startup_id,
+                        pid,
+                        socket_path.display(),
+                        error
+                    ));
+                }
                 return;
             }
         };
+
+        #[cfg(debug_assertions)]
+        {
+            let pid = std::process::id();
+            let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+            crate::diagnostics::native_startup_breadcrumb(&format!(
+                "[{}] startup_id={} pid={} component=control outcome=bind_ok socket_path={}",
+                chrono::Local::now().format("%s"),
+                startup_id,
+                pid,
+                socket_path.display()
+            ));
+        }
 
         loop {
             match listener.accept().await {

@@ -2,60 +2,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::io::Write;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[cfg(debug_assertions)]
-fn native_startup_log_path() -> Option<PathBuf> {
-    let cwd = env::current_dir().ok()?;
-    let dot = cwd.join(".codemux");
-    if dot.exists() || cwd.join("package.json").exists() {
-        return Some(dot.join("native-startup.log"));
-    }
-    let dot_alt = cwd.join("..").join(".codemux");
-    if dot_alt.exists() {
-        return Some(dot_alt.join("native-startup.log"));
-    }
-    Some(dot.join("native-startup.log"))
-}
-
-#[cfg(debug_assertions)]
-fn native_global_log_path() -> Option<PathBuf> {
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .or_else(|| Some(std::env::temp_dir()))?;
-    Some(runtime_dir.join("codemux-native-launches.log"))
-}
-
-#[cfg(debug_assertions)]
-fn append_debug_log(path: &PathBuf, line: &str) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{}", line);
-        let _ = f.flush();
-    }
-}
-
-#[cfg(debug_assertions)]
-fn native_startup_log(line: &str) {
-    if let Some(path) = native_startup_log_path() {
-        append_debug_log(&path, line);
-    }
-    if let Some(path) = native_global_log_path() {
-        append_debug_log(&path, line);
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn native_startup_log(_line: &str) {}
 
 fn is_openflow_agent_context() -> bool {
     env::var_os("CODEMUX_OPENFLOW_RUN_ID").is_some()
@@ -139,6 +87,9 @@ fn main() {
         .unwrap()
         .as_nanos();
 
+    // Make the startup ID available to code that runs after tauri setup.
+    env::set_var("CODEMUX_STARTUP_ID", startup_id.to_string());
+
     let pid = std::process::id();
     let cwd = env::current_dir()
         .ok()
@@ -150,7 +101,7 @@ fn main() {
         .map(|p| p.exists())
         .unwrap_or(false);
     #[cfg(debug_assertions)]
-    native_startup_log(&format!(
+    codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
         "[{}] startup_id={} pid={} parent_pid={:?} cwd={} argv={:?} agent_instance={:?} socket_existed={}",
         chrono_timestamp(),
         startup_id,
@@ -205,7 +156,7 @@ fn main() {
     match tauri::async_runtime::block_on(codemux_lib::cli::maybe_run_cli()) {
         Ok(true) => {
             #[cfg(debug_assertions)]
-            native_startup_log(&format!(
+            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] startup_id={} outcome=cli_handled",
                 chrono_timestamp(),
                 startup_id
@@ -220,7 +171,7 @@ fn main() {
                     agent
                 ));
                 #[cfg(debug_assertions)]
-                native_startup_log(&format!(
+                codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                     "[{}] startup_id={} outcome=blocked_agent_gui_launch agent={}",
                     chrono_timestamp(),
                     startup_id,
@@ -234,7 +185,7 @@ fn main() {
                 "[codemux] CLI command failed: {error}"
             ));
             #[cfg(debug_assertions)]
-            native_startup_log(&format!(
+            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] startup_id={} outcome=cli_error error={}",
                 chrono_timestamp(),
                 startup_id,
@@ -252,7 +203,7 @@ fn main() {
                 socket_path
             ));
             #[cfg(debug_assertions)]
-            native_startup_log(&format!(
+            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] startup_id={} outcome=single_instance_exit",
                 chrono_timestamp(),
                 startup_id
@@ -262,7 +213,7 @@ fn main() {
     }
 
     #[cfg(debug_assertions)]
-    native_startup_log(&format!(
+    codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
         "[{}] startup_id={} outcome=run_gui",
         chrono_timestamp(),
         startup_id
@@ -272,7 +223,7 @@ fn main() {
     {
         let default = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            native_startup_log(&format!(
+            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] outcome=panic payload={:?}",
                 chrono_timestamp(),
                 info
@@ -287,7 +238,7 @@ fn main() {
     codemux_lib::run();
 
     #[cfg(debug_assertions)]
-    native_startup_log(&format!(
+    codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
         "[{}] startup_id={} outcome=run_returned",
         chrono_timestamp(),
         startup_id

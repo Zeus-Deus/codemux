@@ -373,6 +373,7 @@ pub fn spawn_openflow_agents(
             workspace_id.clone(),
             spec.argv,
             spec.env.clone(),
+            spec.execution_policy.clone(),
         );
 
         // Mark as running once PTY spawn is initiated.

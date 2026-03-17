@@ -388,6 +388,51 @@ Entry counts stay SMALL and don't grow - incremental reading is working!
 - Added logging to detect when app starts
 - Will log process arguments to identify what's launching
 
+**Updated diagnosis (2026-03-17):**
+- `codemux browser ...` commands are **not** expected to launch a new Codemux GUI instance:
+  - `codemux browser create` sends a control-socket request to the *running* app.
+  - `codemux browser open/snapshot/click/fill/screenshot/console-logs` shells out to `npx agent-browser`, not to `codemux` GUI.
+- The remaining plausible causes are:
+  - **extra launch attempts** (from docs/tests/agents running `npm run tauri:dev`, bare `codemux`, or `cargo run -- ...`) which may exit quickly
+  - a **race window** in the custom single-instance guard when the control socket is not bound yet (startup vs bind timing)
+  - **stale socket replacement** causing confusing attribution (a socket can exist but not be alive)
+
+**New durable logs and how to read them:**
+- `/run/user/$UID/codemux-native-launches.log` now includes correlated lines for:
+  - native process start (`startup_id`, `pid`, `cwd`, `argv`, `socket_existed`)
+  - control socket lifecycle (`stale_socket_replace`, `bind_ok`, `bind_failed`)
+  - Tauri lifecycle (`setup_enter`, `setup_exit`)
+  - main window lifecycle (`component=window ... event=...`)
+- If you see `outcome=single_instance_exit`, that process **attempted** to launch but exited before window creation.
+- If you see `component=tauri event=main_window_available`, that process **reached** window creation (a real GUI instance).
+- If you see multiple different `startup_id` values with `main_window_available` close together, that’s strong evidence of a real duplicate GUI spawn.
+
+**Concrete fix direction (cross-platform safe):**
+- **Layer 1: Codemux single-instance enforcement**
+  - Replace the custom socket-only singleton logic with Tauri's official single-instance plugin.
+  - Keep the control socket for CLI/browser IPC, but stop treating it as the source of truth for whether another GUI instance exists.
+  - This is the cross-platform fix for duplicate top-level `Codemux` windows on Linux now and macOS/Windows later.
+- **Layer 2: OpenFlow execution isolation**
+  - Add a generic `ExecutionPolicy` / backend abstraction so OpenFlow can keep full capability while agent-run commands execute in an isolated environment.
+  - Linux backend first: Bubblewrap-based sandbox with repo access, temp space, optional network, and no host desktop GUI access by default.
+  - Future backends: macOS sandbox strategy and Windows restricted-process strategy, behind the same policy interface.
+  - This is meant to be general for all future projects built in Codemux, not tied to any one framework or language.
+
+**Planned implementation phases:**
+1. **Immediate**
+   - Integrate Tauri single-instance plugin and focus the existing window on duplicate launch attempts.
+   - Keep the durable launch diagnostics while the new singleton path proves itself.
+2. **Execution policy plumbing**
+   - Add a generic execution policy to OpenFlow agent spawn specs.
+   - Thread the policy through terminal spawning without changing agent capabilities yet.
+3. **Linux backend**
+   - Introduce a Linux sandbox backend for OpenFlow-spawned agent commands.
+   - Preserve build/test/network/browser workflows while isolating them from the host desktop session.
+   - Route bare `codemux` calls through a safe shim so agent sessions resolve to the active Codemux binary instead of an arbitrary older host install.
+4. **Cross-platform follow-up**
+   - Add macOS and Windows backends behind the same abstraction.
+   - Keep OpenFlow runtime logic OS-agnostic.
+
 ---
 
 ### Comprehensive Issue List
@@ -405,7 +450,7 @@ Entry counts stay SMALL and don't grow - incremental reading is working!
 
 | # | Issue | Location | Status |
 |---|-------|----------|--------|
-| 5 | Duplicate app spawn | Investigating | 🔍 In Progress |
+| 5 | Duplicate app spawn | Single-instance + execution isolation path | 🟡 Mitigated in one manual repro; needs more validation |
 | 6 | High CPU usage (100%) | Optimization possible | 🔲 TODO |
 | 7 | No orchestration backoff when idle | 🔲 TODO |
 
@@ -441,6 +486,14 @@ Entry counts stay SMALL and don't grow - incremental reading is working!
 
 - **Duplicate app spawn** - Agents may be spawning new instances
 - **CPU optimization** - Could add backoff when idle
+
+#### Phase 3: In Progress
+
+- **Singleton hardening** - Tauri's official single-instance plugin is now wired in so duplicate launches can be redirected/focused before a second GUI window is created
+- **Linux execution isolation** - OpenFlow agent spawns now select a Bubblewrap backend on Linux that keeps repo/network tooling usable while hiding host GUI/session sockets by default
+- **Safe Codemux CLI routing** - agent sessions now prepend a `codemux` shim to PATH so bare `codemux ...` commands resolve back to the currently running Codemux binary instead of an arbitrary host install
+- **Latest manual repro result** - one post-fix OpenFlow run (`openflow-run-54766AF5`) completed without spawning extra `Codemux` windows and without the previous `beforeDevCommand` teardown error in the captured terminal output
+- **Remaining follow-up** - restart logs still show `Existing control socket ... appears stale; replacing it`, which did not break the successful repro but is still worth hardening so startup attribution stays clean
 
 ---
 

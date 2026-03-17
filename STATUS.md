@@ -191,7 +191,10 @@ Current expectation note:
 Current expectation note:
 
 - Do not treat this section as proof of a finished autonomous agent system. OpenFlow now runs real agent PTYs and a shared communication log, but the overall workflow is still not release-ready.
-- Recent hardening added durable debug logs for wrapper/native launch attribution and blocks bare `codemux` GUI launches from OpenFlow agent sessions, but large-run reliability still needs manual validation.
+- Recent hardening added durable debug logs for wrapper/native launch attribution, a safe `codemux` PATH shim for agent sessions, and blocks bare `codemux` GUI launches from OpenFlow agent sessions. One manual post-fix OpenFlow run completed without spawning duplicate windows, but large-run reliability still needs broader validation.
+- The current fix direction is two-layered:
+  - use a real cross-platform single-instance mechanism for Codemux itself
+  - run OpenFlow agent commands through a generic execution-isolation layer so Linux can sandbox first and macOS/Windows can add backends later
 
 ## 10. OpenFlow Workspace (NEW - Phase 1)
 
@@ -230,5 +233,12 @@ Current expectation note:
 
 - [ ] OpenFlow workspace does not have a browser pane yet (planned for Phase 6)
 - [ ] Browser view is still a placeholder toggle rather than a full persistent OpenFlow browser surface
-- [ ] 15-20 agent runs still need validation for stray helper launches and `beforeDevCommand` teardown behavior under `tauri dev`
+- [ ] 15-20 agent runs still need validation for stray helper launches, Bubblewrap compatibility, and `beforeDevCommand` teardown behavior under `tauri dev`
+- [ ] Duplicate app spawn hardening is partially implemented:
+  - official Tauri single-instance plugin is now wired into the app as the replacement direction for socket-only singleton logic
+  - Linux OpenFlow agent sessions now resolve bare `codemux` calls to the currently running app binary and request the `linux_bubblewrap` execution backend by default
+  - the Linux backend keeps network/build/test flows available, hides host GUI/session sockets, and preserves the Codemux control socket for CLI/browser IPC
+  - latest manual validation: one OpenFlow run (`openflow-run-54766AF5`) completed without launching duplicate `Codemux` windows or hitting the old `beforeDevCommand` shutdown symptom
+  - use `/run/user/$UID/codemux-native-launches.log` to distinguish a real second GUI instance (`component=tauri event=main_window_available`) from a short-lived launch attempt that exits (`outcome=single_instance_exit`); `.codemux/vite-wrapper.log` now includes a `port_probe` line before each Vite start to help diagnose port-1420 conflicts vs normal teardown
+- [ ] Startup still logs `Existing control socket ... appears stale; replacing it` on restart, which looks non-fatal in the latest successful run but should be cleaned up so future duplicate-launch investigations are less ambiguous
 - Note: WorkspaceType serde was previously serializing as PascalCase ("OpenFlow"); now fixed to snake_case ("open_flow") matching frontend expectations

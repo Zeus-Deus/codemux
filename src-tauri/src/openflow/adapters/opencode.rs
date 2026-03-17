@@ -58,6 +58,7 @@ impl AgentAdapter for OpenCodeAdapter {
         AgentSpawnSpec {
             argv,
             env,
+            execution_policy: crate::execution::ExecutionPolicy::openflow_agent_default(),
             title,
             system_prompt_path: Some(prompt_path_str),
         }

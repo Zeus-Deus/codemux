@@ -3,6 +3,8 @@ use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -210,6 +212,29 @@ fn default_shell() -> String {
         .ok()
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
+#[cfg(unix)]
+fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_exe = current_exe.display().to_string();
+    let shim_dir = std::env::temp_dir().join("codemux-openflow-shims");
+    std::fs::create_dir_all(&shim_dir).ok()?;
+
+    let shim_path = shim_dir.join("codemux");
+    let script = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", current_exe.replace('"', "\\\""));
+    std::fs::write(&shim_path, script).ok()?;
+
+    let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim_path, perms).ok()?;
+
+    Some((shim_dir.display().to_string(), current_exe))
+}
+
+#[cfg(not(unix))]
+fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+    None
 }
 
 fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -> String {
@@ -696,6 +721,7 @@ pub fn spawn_pty_for_agent(
     workspace_id: String,
     argv: Vec<String>,
     extra_env: Vec<(String, String)>,
+    execution_policy: crate::execution::ExecutionPolicy,
 ) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
@@ -729,13 +755,29 @@ pub fn spawn_pty_for_agent(
         }
     };
 
+    let prepared = crate::execution::prepare_agent_command(
+        executable.clone(),
+        argv.iter().skip(1).cloned().collect(),
+        &session_working_dir(&app_state, &session_id),
+        &execution_policy,
+    );
+
     emit_terminal_status(
         &app,
         &sessions,
         TerminalStatusPayload {
             session_id: session_id.clone(),
             state: TerminalLifecycleState::Starting,
-            message: Some(format!("Starting agent: {executable}")),
+            message: Some(format!(
+                "Starting agent: {} [{}]",
+                prepared.executable,
+                match prepared.backend {
+                    crate::execution::ExecutionBackendKind::HostPassthrough => "host_passthrough",
+                    crate::execution::ExecutionBackendKind::LinuxBubblewrap => "linux_bubblewrap",
+                    crate::execution::ExecutionBackendKind::MacOsSandbox => "macos_sandbox",
+                    crate::execution::ExecutionBackendKind::WindowsRestricted => "windows_restricted",
+                }
+            )),
             exit_code: None,
         },
     );
@@ -766,8 +808,8 @@ pub fn spawn_pty_for_agent(
     app_state.update_terminal_session_shell(&session_id, executable.clone());
 
     let cwd = session_working_dir(&app_state, &session_id);
-    let mut cmd = CommandBuilder::new(&executable);
-    for arg in argv.iter().skip(1) {
+    let mut cmd = CommandBuilder::new(&prepared.executable);
+    for arg in &prepared.args {
         cmd.arg(arg);
     }
     cmd.cwd(cwd);
@@ -776,10 +818,50 @@ pub fn spawn_pty_for_agent(
     cmd.env("CODEMUX_WORKSPACE_ID", &workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", &session_id);
 
+    if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
+        let current_path = env::var("PATH").unwrap_or_default();
+        let prefixed_path = if current_path.is_empty() {
+            shim_dir.clone()
+        } else {
+            format!("{shim_dir}:{current_path}")
+        };
+        cmd.env("PATH", prefixed_path);
+        cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
+    }
+
     // Agent-specific env vars from the adapter.
     for (key, val) in &extra_env {
         cmd.env(key, val);
     }
+
+    // This is wiring for the future sandbox backend selection. For now we pass
+    // the intent through env so agent-side tooling and logs can see which
+    // execution profile was selected, even before platform sandboxes are active.
+    cmd.env(
+        "CODEMUX_EXECUTION_BACKEND",
+        match prepared.backend {
+            crate::execution::ExecutionBackendKind::HostPassthrough => "host_passthrough",
+            crate::execution::ExecutionBackendKind::LinuxBubblewrap => "linux_bubblewrap",
+            crate::execution::ExecutionBackendKind::MacOsSandbox => "macos_sandbox",
+            crate::execution::ExecutionBackendKind::WindowsRestricted => "windows_restricted",
+        },
+    );
+    cmd.env(
+        "CODEMUX_ALLOW_DESKTOP_GUI",
+        if execution_policy.allow_desktop_gui { "1" } else { "0" },
+    );
+    cmd.env(
+        "CODEMUX_ALLOW_BROWSER_AUTOMATION",
+        if execution_policy.allow_browser_automation {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    cmd.env(
+        "CODEMUX_ALLOW_NETWORK",
+        if execution_policy.allow_network { "1" } else { "0" },
+    );
 
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,

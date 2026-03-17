@@ -7,6 +7,7 @@ pub mod commands;
 pub mod config;
 pub mod control;
 pub mod diagnostics;
+pub mod execution;
 pub mod indexing;
 pub mod memory;
 pub mod openflow;
@@ -31,6 +32,27 @@ pub fn run() {
     }
     
     tauri::Builder::default()
+        // This plugin should run before the rest of the app setup so duplicate
+        // launches are intercepted before a second GUI is created.
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            crate::diagnostics::stderr_line(&format!(
+                "[codemux::single-instance] Duplicate launch redirected args={args:?} cwd={}",
+                cwd
+            ));
+            #[cfg(debug_assertions)]
+            {
+                crate::diagnostics::native_startup_breadcrumb(&format!(
+                    "[{}] component=single_instance event=redirected_duplicate args={:?} cwd={}",
+                    chrono::Local::now().format("%s"),
+                    args,
+                    cwd
+                ));
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .manage(state::AppStateStore::default())
         .manage(commands::BrowserAutomationCoordinator::default())
         .manage(browser::BrowserManager::new())
@@ -43,6 +65,19 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            {
+                let pid = std::process::id();
+                let startup_id =
+                    std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                crate::diagnostics::native_startup_breadcrumb(&format!(
+                    "[{}] startup_id={} pid={} component=tauri event=setup_enter",
+                    chrono::Local::now().format("%s"),
+                    startup_id,
+                    pid
+                ));
+            }
+
             let handle = app.handle().clone();
             if let Some(snapshot) = state::load_persisted_state() {
                 state::restore_session_ids(&snapshot);
@@ -58,6 +93,53 @@ pub fn run() {
             let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
             indexing::spawn_index_watcher(index_store);
             control::spawn_control_server(app.handle().clone());
+
+            // Window lifecycle breadcrumbs: this lets us tell whether a second process
+            // actually reached window creation or if it exited early.
+            #[cfg(debug_assertions)]
+            {
+                let pid = std::process::id();
+                let startup_id =
+                    std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                if let Some(window) = app.get_webview_window("main") {
+                    crate::diagnostics::native_startup_breadcrumb(&format!(
+                        "[{}] startup_id={} pid={} component=tauri event=main_window_available",
+                        chrono::Local::now().format("%s"),
+                        startup_id,
+                        pid
+                    ));
+                    window.on_window_event(move |event: &tauri::WindowEvent| {
+                        crate::diagnostics::native_startup_breadcrumb(&format!(
+                            "[{}] startup_id={} pid={} component=window label=main event={:?}",
+                            chrono::Local::now().format("%s"),
+                            startup_id,
+                            pid,
+                            event
+                        ));
+                    });
+                } else {
+                    crate::diagnostics::native_startup_breadcrumb(&format!(
+                        "[{}] startup_id={} pid={} component=tauri event=main_window_missing",
+                        chrono::Local::now().format("%s"),
+                        startup_id,
+                        pid
+                    ));
+                }
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                let pid = std::process::id();
+                let startup_id =
+                    std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+                crate::diagnostics::native_startup_breadcrumb(&format!(
+                    "[{}] startup_id={} pid={} component=tauri event=setup_exit",
+                    chrono::Local::now().format("%s"),
+                    startup_id,
+                    pid
+                ));
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
