@@ -1,0 +1,37 @@
+# Browser Work Plan
+
+- Purpose: Track active browser implementation work and near-term next steps.
+- Audience: Anyone actively changing browser behavior or browser automation.
+- Authority: Active browser work plan, not current truth.
+- Update when: Browser priorities, unresolved questions, or likely touch points change.
+- Read next: `docs/features/browser.md`, `docs/core/STATUS.md`
+
+## Active Priorities
+
+1. Finish a focused manual pass for back, forward, reload, address-bar flow, and text entry on real sites.
+2. Harden resize, focus, redraw, and lifecycle behavior inside split layouts.
+3. Improve interaction fidelity where the current screenshot-driven pane blocks real workflows.
+4. Expose a more useful console log and error stream.
+5. Integrate the current browser runtime more cleanly into OpenFlow verification flows.
+
+## Open Questions
+
+- keep the screenshot-driven `agent-browser` model as the long-lived browser surface, or later replace only the display layer with a more native embedded surface
+- decide how much rich manual user interaction must be first-class versus agent-driven only
+
+## Likely Touch Points
+
+- `src/components/panes/BrowserPane.svelte`
+- `src/stores/appState.ts`
+- `src-tauri/src/agent_browser.rs`
+- `src-tauri/src/cli.rs`
+- `src-tauri/src/commands.rs`
+- `docs/reference/CONTROL.md`
+- `AGENTS.md`
+
+## Already Landed
+
+- `agent-browser`-backed browser session exists
+- CLI browser commands exist
+- the visible pane and CLI share session state
+- the browser pane works well enough for agent-guided validation

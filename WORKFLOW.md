@@ -1,99 +1,54 @@
 # Codemux Workflow Guide
 
-This file is for future coding sessions so work can continue consistently without re-explaining the whole process.
+This is the first file a new coding session should read.
 
-## Read These First
+## Start Here
 
-When starting a new session on Codemux, read these files in this order:
+1. `docs/INDEX.md`
+2. `docs/core/PROJECT.md`
+3. `docs/core/STATUS.md`
+4. `docs/core/PLAN.md`
+5. `docs/core/TESTING.md`
+6. feature/reference docs relevant to the active area
+7. `AGENTS.md` for Codemux-specific agent operating rules
 
-1. `PROJECT.md`
-2. `PLAN.md`
-3. `STATUS.md`
-4. `README.md`
-5. `TESTING.md`
-6. `docs/CONTROL.md`
-7. `AGENTS.md` (for agent integration docs)
+If the docs system feels stale or messy, also read `docs/reference/DOCS_REINDEX.md` before making doc changes.
+
+## Which Doc Owns What
+
+- `docs/core/PROJECT.md`: durable product intent and architecture direction
+- `docs/core/STATUS.md`: current repo reality
+- `docs/core/PLAN.md`: roadmap and build order
+- `docs/core/TESTING.md`: verification policy
+- `docs/features/*`: current subsystem capability and constraints
+- `docs/plans/*`: active implementation plans and next steps
+- `docs/reference/*`: stable command and protocol references
+- `docs/archive/*`: superseded design notes worth keeping
+
+## Handoff Discipline
+
+- Update the canonical doc that actually changed, not every doc that mentions it.
+- Update `docs/core/STATUS.md` when implementation reality changes.
+- Update `docs/core/PLAN.md` or a file in `docs/plans/` when the intended next build steps change.
+- Update feature docs when a subsystem meaningfully changes behavior or constraints.
+- Use `.codemux/project-memory.json` or `codemux handoff` for compact session memory when it helps the next agent.
+- Record concise facts, not transcript dumps.
+- If the docs have drifted badly, run the cleanup process in `docs/reference/DOCS_REINDEX.md` instead of patching the mess piecemeal.
 
 ## Working Rules
 
-- Follow `PLAN.md` in order unless there is a good reason not to.
-- Mark completed checklist items in `PLAN.md` only after the implementation exists and has been verified enough to claim the box honestly.
-- Update `README.md` when major new user-facing features or workflows land.
-- Update `PROJECT.md` when product direction or architecture decisions change.
-- Update `STATUS.md` when repo reality changes, especially if implementation, testing, and release-readiness are not aligned.
-- Update `docs/CONTROL.md` when CLI/socket protocol changes.
-- Update feature-specific docs in `docs/` when a subsystem changes meaningfully, such as browser work in `docs/BROWSER_PLAN.md`.
-- Keep `TESTING.md` aligned with the real testing strategy.
+- Prefer the docs hub over scattered root notes.
+- Use `STATUS` for truth and `PLAN` for ordering; do not mix them.
+- Keep core docs short and durable.
+- Move temporary debugging journals into `docs/plans/` or `docs/archive/`.
+- Start new feature docs from `docs/templates/FEATURE_TEMPLATE.md`.
+- Start new plan docs from `docs/templates/PLAN_TEMPLATE.md`.
 
-## Completion And Handoff Discipline
+## Verification
 
-When meaningful work is finished, leave the repo in a state that helps the next agent start fast.
+- Default to `npm run verify` after meaningful changes.
+- Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
-- Do not end a substantial task with code changes only; also update the relevant docs and handoff memory.
-- If implementation reality changed, update `STATUS.md` in the same session.
-- If roadmap expectations changed, update `PLAN.md` or the relevant feature doc in `docs/`.
-- If the next agent would benefit from the current result, update `.codemux/project-memory.json` or generate a fresh `codemux handoff` summary.
-- Record concise facts, not raw transcript dumps: what changed, what now works, what is still broken, and what should happen next.
-- If nothing important changed, do not churn docs or memory just to touch them.
+## Docs Rule
 
-## Implementation Style
-
-- Prefer finishing a phase cleanly before jumping ahead.
-- Keep the project Linux-first, but avoid locking architecture to Linux only.
-- Keep OpenFlow modular so Codemux is the flagship host, but the engine can be embedded elsewhere later.
-- Keep memory and indexing local-first.
-- Avoid over-engineering before a solid working implementation exists.
-
-## Verification Expectations
-
-After meaningful changes, run the relevant checks:
-
-- `cargo check --manifest-path src-tauri/Cargo.toml`
-- `cargo test --manifest-path src-tauri/Cargo.toml`
-- `npm run check`
-- `npm run test`
-
-Default to `npm run verify` when you want the full standard verification pass.
-
-If something new changes how the app is used, update the docs.
-
-If something new changes what the next tool session needs to know, update the project memory/handoff too.
-
-## Current Process Pattern
-
-For each new phase:
-
-1. inspect current files and architecture
-2. implement the phase
-3. verify with checks/tests
-4. mark finished items in `PLAN.md`
-5. update docs and handoff memory if needed
-
-## Important Context
-
-- `PROJECT.md` explains what Codemux and OpenFlow are supposed to become.
-- `PLAN.md` explains the exact build order.
-- `STATUS.md` explains what is actually implemented, partial, and manually validated right now.
-- `WORKFLOW.md` explains how to continue work consistently across future sessions.
-
-## Handoff Pattern
-
-For future tool sessions, prefer this order:
-
-1. read `WORKFLOW.md`
-2. read `PROJECT.md`
-3. read `PLAN.md`
-4. read `STATUS.md`
-5. read feature-specific docs relevant to the active area, for example browser work in `docs/BROWSER_PLAN.md`
-6. use `.codemux/project-memory.json` or `codemux handoff`
-7. avoid replaying full raw chat logs unless absolutely necessary
-
-The goal is to continue with structured memory plus workflow guidance, not giant transcript reuse.
-
-## Dynamic Memory Rule
-
-Treat workflow docs plus `.codemux/project-memory.json` as living project memory.
-
-- Future agents should proactively update them when they complete meaningful work, discover a blocker, or change the likely next step.
-- This should happen without waiting for the user to ask, as long as the update is factual and clearly useful.
-- This is not fully automatic background sync; it works because each new agent reads `WORKFLOW.md` first and follows the same discipline.
+Treat the files under `docs/` as the single source of truth. If a path is not in this workflow or `docs/INDEX.md`, do not assume it is still part of the maintained docs system.

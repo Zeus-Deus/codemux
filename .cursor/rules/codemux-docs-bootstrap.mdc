@@ -1,0 +1,14 @@
+---
+description: Bootstrap Codemux repo sessions through the maintained docs system
+alwaysApply: true
+---
+
+# Codemux Docs Bootstrap
+
+When working on the Codemux repository:
+
+- Read `WORKFLOW.md` and `docs/INDEX.md` at the start of the session.
+- Then read the relevant canonical docs under `docs/core/`, `docs/features/`, `docs/plans/`, and `docs/reference/` before making assumptions.
+- Treat `docs/` as the single source of truth for project documentation.
+- Use `docs/templates/FEATURE_TEMPLATE.md` and `docs/templates/PLAN_TEMPLATE.md` when creating new docs.
+- If the docs feel stale, scattered, or contradictory, read `docs/reference/DOCS_REINDEX.md` and follow that cleanup process from code evidence.
