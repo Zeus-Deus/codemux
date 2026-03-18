@@ -222,7 +222,10 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     std::fs::create_dir_all(&shim_dir).ok()?;
 
     let shim_path = shim_dir.join("codemux");
-    let script = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", current_exe.replace('"', "\\\""));
+    let script = format!(
+        "#!/bin/sh\nexec \"{}\" \"$@\"\n",
+        current_exe.replace('"', "\\\"")
+    );
     std::fs::write(&shim_path, script).ok()?;
 
     let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
@@ -725,7 +728,9 @@ pub fn spawn_pty_for_agent(
 ) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
+    let agent_store: State<'_, crate::openflow::AgentSessionStore> = app.state();
     let sessions = terminal_state.sessions.clone();
+    let agent_store_inner = agent_store.clone_inner();
 
     let already_running = sessions
         .lock()
@@ -775,7 +780,8 @@ pub fn spawn_pty_for_agent(
                     crate::execution::ExecutionBackendKind::HostPassthrough => "host_passthrough",
                     crate::execution::ExecutionBackendKind::LinuxBubblewrap => "linux_bubblewrap",
                     crate::execution::ExecutionBackendKind::MacOsSandbox => "macos_sandbox",
-                    crate::execution::ExecutionBackendKind::WindowsRestricted => "windows_restricted",
+                    crate::execution::ExecutionBackendKind::WindowsRestricted =>
+                        "windows_restricted",
                 }
             )),
             exit_code: None,
@@ -848,7 +854,11 @@ pub fn spawn_pty_for_agent(
     );
     cmd.env(
         "CODEMUX_ALLOW_DESKTOP_GUI",
-        if execution_policy.allow_desktop_gui { "1" } else { "0" },
+        if execution_policy.allow_desktop_gui {
+            "1"
+        } else {
+            "0"
+        },
     );
     cmd.env(
         "CODEMUX_ALLOW_BROWSER_AUTOMATION",
@@ -860,7 +870,11 @@ pub fn spawn_pty_for_agent(
     );
     cmd.env(
         "CODEMUX_ALLOW_NETWORK",
-        if execution_policy.allow_network { "1" } else { "0" },
+        if execution_policy.allow_network {
+            "1"
+        } else {
+            "0"
+        },
     );
 
     let mut child = match pty_pair.slave.spawn_command(cmd) {
@@ -981,11 +995,14 @@ pub fn spawn_pty_for_agent(
                                 && trimmed.len() > 2
                                 && !trimmed.starts_with('\x1b')
                                 && !trimmed.chars().all(|c| {
-                                    c.is_whitespace() || c == '▀' || c == '▄' || c == '█' || c == ' '
+                                    c.is_whitespace()
+                                        || c == '▀'
+                                        || c == '▄'
+                                        || c == '█'
+                                        || c == ' '
                                 })
                             {
-                                let timestamp =
-                                    chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                                 let entry = format!(
                                     "[{}] [{}] {}\n",
                                     timestamp,
@@ -1035,30 +1052,52 @@ pub fn spawn_pty_for_agent(
     let wait_app = app.clone();
     let wait_sessions = sessions.clone();
     let wait_session_id = session_id.clone();
+    let wait_agent_store = agent_store_inner.clone();
     std::thread::spawn(move || {
         let payload = match child.wait() {
-            Ok(status) => TerminalStatusPayload {
-                session_id: wait_session_id.clone(),
-                state: TerminalLifecycleState::Exited,
-                message: Some(if status.success() {
-                    "Agent exited successfully".into()
-                } else {
-                    format!("Agent exited with code {}", status.exit_code())
-                }),
-                exit_code: Some(status.exit_code()),
-            },
-            Err(error) => TerminalStatusPayload {
-                session_id: wait_session_id.clone(),
-                state: TerminalLifecycleState::Failed,
-                message: Some(format!("Failed to wait for agent: {error}")),
-                exit_code: None,
-            },
+            Ok(status) => {
+                if let Some(entry) = wait_agent_store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&wait_session_id)
+                {
+                    entry.status = if status.success() {
+                        crate::openflow::agent::AgentSessionStatus::Done
+                    } else {
+                        crate::openflow::agent::AgentSessionStatus::Failed
+                    };
+                }
+                TerminalStatusPayload {
+                    session_id: wait_session_id.clone(),
+                    state: TerminalLifecycleState::Exited,
+                    message: Some(if status.success() {
+                        "Agent exited successfully".into()
+                    } else {
+                        format!("Agent exited with code {}", status.exit_code())
+                    }),
+                    exit_code: Some(status.exit_code()),
+                }
+            }
+            Err(error) => {
+                if let Some(entry) = wait_agent_store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&wait_session_id)
+                {
+                    entry.status = crate::openflow::agent::AgentSessionStatus::Failed;
+                }
+                TerminalStatusPayload {
+                    session_id: wait_session_id.clone(),
+                    state: TerminalLifecycleState::Failed,
+                    message: Some(format!("Failed to wait for agent: {error}")),
+                    exit_code: None,
+                }
+            }
         };
 
         crate::diagnostics::openflow_breadcrumb(&format!(
             "agent_exited session_id={} state={:?}",
-            wait_session_id,
-            payload.state
+            wait_session_id, payload.state
         ));
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);

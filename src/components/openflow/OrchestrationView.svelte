@@ -30,6 +30,8 @@
     let commLogInterval: ReturnType<typeof setInterval> | null = null;
     let initialTimeoutId: ReturnType<typeof setTimeout> | null = null;
     let showBrowser = $state(false);
+    let commLogPollingInProgress = false;
+    let orchestratorPollingInProgress = false;
     
     // Resizable panel state
     let isDragging = $state(false);
@@ -68,10 +70,13 @@
             }, INITIAL_ORCHESTRATOR_DELAY_MS);
 
             orchestratorInterval = setInterval(() => {
-                if (runId && run) {
+                if (runId && run && !orchestratorPollingInProgress) {
+                    orchestratorPollingInProgress = true;
                     triggerOrchestratorCycle(runId).catch(e =>
                         console.error('[OpenFlow] Orchestration error:', e)
-                    );
+                    ).finally(() => {
+                        orchestratorPollingInProgress = false;
+                    });
                 }
             }, ORCHESTRATOR_INTERVAL_MS);
         }
@@ -102,12 +107,15 @@
             
             const intervalMs = commLogPollInterval(run);
             commLogInterval = setInterval(() => {
-                if (runId) {
+                if (runId && !commLogPollingInProgress) {
+                    commLogPollingInProgress = true;
                     getCommunicationLog(runId).then(entries => {
                         if (entries.length > 0) {
                             commLogStore.update((previous) => mergeCommLogEntries(previous, entries));
                         }
-                    }).catch(console.error);
+                    }).catch(console.error).finally(() => {
+                        commLogPollingInProgress = false;
+                    });
                 }
             }, intervalMs);
         } else {

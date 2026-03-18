@@ -112,15 +112,22 @@ impl Orchestrator {
         let metadata = std::fs::metadata(&path)?;
         let current_size = metadata.len() as usize;
 
+        // If offset is past end of file, file was likely rotated - reset to beginning
+        let effective_offset = if last_offset > current_size {
+            0
+        } else {
+            last_offset
+        };
+
         // No new content since last read
-        if last_offset >= current_size {
+        if effective_offset >= current_size {
             return Ok((vec![], current_size));
         }
 
         // Read only new content from last_offset to end
         let mut file = std::fs::File::open(&path)?;
         use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(last_offset as u64))?;
+        file.seek(SeekFrom::Start(effective_offset as u64))?;
 
         let mut new_content = String::new();
         std::io::Read::read_to_string(&mut file, &mut new_content)?;
@@ -336,19 +343,22 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// If the log has grown beyond `max_lines`, drop the oldest half and rewrite the file.
-    /// This keeps recent context intact while preventing unbounded memory allocation when
-    /// the full file is read on every orchestration cycle.
+    /// If the log has grown beyond `max_lines`, atomically rotate by writing to a temp file
+    /// then renaming. This prevents data loss if readers have offsets into the original file.
+    /// Keeps the newest half so the orchestrator retains recent context.
     fn rotate_comm_log_if_needed(path: &std::path::Path, max_lines: usize) -> std::io::Result<()> {
         let content = std::fs::read_to_string(path)?;
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         if lines.len() <= max_lines {
             return Ok(());
         }
-        // Keep the newest half so the orchestrator retains recent context.
+
         let keep_from = lines.len() - (max_lines / 2);
         let trimmed = lines[keep_from..].join("\n") + "\n";
-        std::fs::write(path, trimmed)?;
+
+        let temp_path = path.with_extension("tmp");
+        std::fs::write(&temp_path, trimmed)?;
+        std::fs::rename(&temp_path, path)?;
         Ok(())
     }
 
@@ -443,7 +453,7 @@ impl Orchestrator {
                 if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else {
-                    None
+                    Some(OrchestratorPhase::Completed)
                 }
             }
             OrchestratorPhase::Replanning => Some(OrchestratorPhase::Planning),

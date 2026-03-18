@@ -1,3 +1,4 @@
+use crate::browser::BrowserManager;
 use crate::openflow::adapters::opencode::OpenCodeAdapter;
 use crate::openflow::adapters::AgentAdapter;
 use crate::openflow::agent::{AgentConfig, AgentSessionState, AgentSessionStatus};
@@ -456,11 +457,12 @@ pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn trigger_orchestrator_cycle(
+pub async fn trigger_orchestrator_cycle(
     app: tauri::AppHandle,
     runtime: State<'_, OpenFlowRuntimeStore>,
     agent_store: State<'_, AgentSessionStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
+    browser_manager: State<'_, BrowserManager>,
     run_id: String,
     offset: Option<usize>,
 ) -> Result<OrchestratorTriggerResult, String> {
@@ -588,6 +590,84 @@ pub fn trigger_orchestrator_cycle(
 
     let mut actions_taken = Vec::new();
 
+    let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
+        matches!(
+            session.config.role,
+            crate::openflow::OpenFlowRole::Orchestrator
+        )
+    });
+
+    if let Some(ref orchestrator_session) = orchestrator_session {
+        let session_id = orchestrator_session.session_id.clone();
+        let orchestrator_alive = {
+            let sessions = pty_state.sessions.lock().unwrap();
+            let session_exists = sessions.get(&session_id).is_some();
+            let is_ready = sessions
+                .get(&session_id)
+                .map(|pty_runtime| {
+                    matches!(
+                        pty_runtime.last_status.state,
+                        crate::terminal::TerminalLifecycleState::Ready
+                    )
+                })
+                .unwrap_or(false);
+
+            #[cfg(debug_assertions)]
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] Orchestrator session {} exists={}, state={:?}",
+                session_id,
+                session_exists,
+                sessions
+                    .get(&session_id)
+                    .map(|r| r.last_status.state.clone())
+            ));
+
+            is_ready
+        };
+
+        if !orchestrator_alive {
+            #[cfg(debug_assertions)]
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] Orchestrator session {} is not alive, respawning...",
+                session_id
+            ));
+
+            let workspace_id = app
+                .state::<AppStateStore>()
+                .workspace_id_for_session(&session_id)
+                .map(|id| id.0)
+                .unwrap_or_else(|| "default".to_string());
+
+            let working_directory = ".".to_string();
+
+            let adapter = OpenCodeAdapter;
+            let goal_path = Orchestrator::comm_log_path(&run_id)
+                .display()
+                .to_string()
+                .replace("communication.log", "goal.txt");
+            let spec = adapter.spawn_spec(
+                &orchestrator_session.config,
+                &run_id,
+                &Orchestrator::comm_log_path(&run_id).display().to_string(),
+                &goal_path,
+                &working_directory,
+            );
+
+            crate::terminal::spawn_pty_for_agent(
+                app.clone(),
+                session_id.clone(),
+                workspace_id,
+                spec.argv,
+                spec.env.clone(),
+                spec.execution_policy.clone(),
+            );
+
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            actions_taken.push("Respawned orchestrator".to_string());
+        }
+    }
+
     if !analysis.instance_assignments.is_empty() {
         let all_sessions = agent_store.for_run(&run_id);
         let new_total_assignments =
@@ -668,14 +748,7 @@ pub fn trigger_orchestrator_cycle(
     let next_phase = if !analysis.user_injections.is_empty() {
         let injection_text = analysis.user_injections.join(" | ");
 
-        let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
-            matches!(
-                session.config.role,
-                crate::openflow::OpenFlowRole::Orchestrator
-            )
-        });
-
-        if let Some(orchestrator_session) = orchestrator_session {
+        if let Some(ref orchestrator_session) = orchestrator_session {
             let goal_path = Orchestrator::comm_log_path(&run_id)
                 .display()
                 .to_string()
@@ -693,80 +766,7 @@ pub fn trigger_orchestrator_cycle(
 
             let session_id = orchestrator_session.session_id.clone();
 
-            // Check if orchestrator PTY session is still alive
-            let orchestrator_alive = {
-                let sessions = pty_state.sessions.lock().unwrap();
-                let session_exists = sessions.get(&session_id).is_some();
-                let is_ready = sessions
-                    .get(&session_id)
-                    .map(|pty_runtime| {
-                        matches!(
-                            pty_runtime.last_status.state,
-                            crate::terminal::TerminalLifecycleState::Ready
-                        )
-                    })
-                    .unwrap_or(false);
-
-                #[cfg(debug_assertions)]
-                crate::diagnostics::stderr_line(&format!(
-                    "[DEBUG] Orchestrator session {} exists={}, state={:?}",
-                    session_id,
-                    session_exists,
-                    sessions
-                        .get(&session_id)
-                        .map(|r| r.last_status.state.clone())
-                ));
-
-                is_ready
-            };
-
-            // If orchestrator is not alive, respawn it
-            if !orchestrator_alive {
-                #[cfg(debug_assertions)]
-                crate::diagnostics::stderr_line(&format!(
-                    "[DEBUG] Orchestrator session {} is not alive, respawning...",
-                    session_id
-                ));
-
-                // Get workspace ID from app state
-                let workspace_id = app
-                    .state::<AppStateStore>()
-                    .workspace_id_for_session(&session_id)
-                    .map(|id| id.0)
-                    .unwrap_or_else(|| "default".to_string());
-
-                // Use the run's working directory if available, otherwise use default
-                // The orchestrator will use its configured working directory
-                let working_directory = ".".to_string();
-
-                // Create spawn spec for orchestrator
-                let adapter = OpenCodeAdapter;
-                let spec = adapter.spawn_spec(
-                    &orchestrator_session.config,
-                    &run_id,
-                    &Orchestrator::comm_log_path(&run_id).display().to_string(),
-                    &goal_path,
-                    &working_directory,
-                );
-
-                // Spawn new PTY for orchestrator
-                crate::terminal::spawn_pty_for_agent(
-                    app.clone(),
-                    session_id.clone(),
-                    workspace_id,
-                    spec.argv,
-                    spec.env.clone(),
-                    spec.execution_policy.clone(),
-                );
-
-                // Give the new process a moment to start
-                std::thread::sleep(std::time::Duration::from_millis(500));
-
-                actions_taken.push("Respawned orchestrator for user injection".to_string());
-            }
-
             let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
-
             #[cfg(debug_assertions)]
             crate::diagnostics::stderr_line(&format!(
                 "[DEBUG] About to write to orchestrator PTY, session_id={}",
@@ -801,6 +801,12 @@ pub fn trigger_orchestrator_cycle(
                         "Forwarded {} user injection(s) to orchestrator PTY",
                         analysis.user_injections.len()
                     ));
+
+                    let new_total = analysis.total_injections + analysis.user_injections.len();
+                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                    let handled_marker =
+                        format!("[{}] [SYSTEM] HANDLED_INJECTIONS: {}", ts, new_total);
+                    let _ = Orchestrator::write_to_comm_log(&run_id, &handled_marker);
                 }
                 Err(error) => {
                     actions_taken.push(format!("Failed to reach orchestrator PTY: {}", error));
@@ -830,7 +836,78 @@ pub fn trigger_orchestrator_cycle(
             }
             counts
         };
-        Orchestrator::determine_next_phase(&phase, &analysis, &instance_counts)
+
+        let builder_count = instance_counts.get("builder").copied().unwrap_or(0);
+        let completed_builder_instances: usize = analysis
+            .completed_instances
+            .iter()
+            .filter(|id| {
+                let lower = id.to_lowercase();
+                lower == "builder" || lower.starts_with("builder-")
+            })
+            .count();
+
+        let builder_all_done = builder_count > 0 && completed_builder_instances >= builder_count;
+
+        #[cfg(debug_assertions)]
+        crate::diagnostics::stderr_line(&format!(
+            "[DEBUG] Builder check: builder_count={}, completed_builder_instances={}, builder_all_done={}",
+            builder_count, completed_builder_instances, builder_all_done
+        ));
+
+        let builder_verified_live = if matches!(phase, OrchestratorPhase::Executing) && builder_all_done {
+            let verify_browser_id = format!("openflow-verify-{}", run_id);
+            match browser_manager.spawn_browser(verify_browser_id.clone()).await {
+                Ok(_) => {
+                    match browser_manager.navigate(&verify_browser_id, "http://localhost:1420").await {
+                        Ok(_) => {
+                            #[cfg(debug_assertions)]
+                            crate::diagnostics::stderr_line(&format!(
+                                "[DEBUG] Browser verification succeeded: app is live on localhost:1420"
+                            ));
+                            let _ = browser_manager.close_browser(&verify_browser_id).await;
+                            true
+                        }
+                        Err(e) => {
+                            #[cfg(debug_assertions)]
+                            crate::diagnostics::stderr_line(&format!(
+                                "[DEBUG] Browser verification failed: app not accessible on localhost:1420 - {}",
+                                e
+                            ));
+                            let _ = browser_manager.close_browser(&verify_browser_id).await;
+                            false
+                        }
+                    }
+                }
+                Err(e) => {
+                    #[cfg(debug_assertions)]
+                    crate::diagnostics::stderr_line(&format!(
+                        "[DEBUG] Browser verification spawn failed: {}",
+                        e
+                    ));
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        let mut potential_next_phase = Orchestrator::determine_next_phase(&phase, &analysis, &instance_counts);
+
+        if matches!(phase, OrchestratorPhase::Executing) {
+            if let Some(OrchestratorPhase::Verifying) = potential_next_phase {
+                if !builder_verified_live {
+                    #[cfg(debug_assertions)]
+                    crate::diagnostics::stderr_line(&format!(
+                        "[DEBUG] Blocking transition to Verifying - browser verification failed"
+                    ));
+                    actions_taken.push("Browser verification failed - staying in Executing".to_string());
+                    potential_next_phase = None;
+                }
+            }
+        }
+
+        potential_next_phase
     };
 
     #[cfg(debug_assertions)]

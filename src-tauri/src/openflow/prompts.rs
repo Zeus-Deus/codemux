@@ -135,8 +135,15 @@ If you receive no ASSIGN message addressed to your instance ID, do nothing and w
 When you receive ASSIGN {instance_id}: <task>:
 1. Implement exactly what is described
 2. Write clean, working code
-3. Say DONE: <brief summary of what you built> when complete
-4. Say BLOCKED: <reason> if you cannot proceed
+3. If the task involves running a dev server or web app:
+   a. Start the dev server with `setsid` to detach it from the current session:
+      - Use: `setsid npm run dev` (or the appropriate dev command)
+      - This ensures the dev server survives when the Builder agent exits
+   b. Use `codemux browser open http://localhost:1420` to verify it's accessible
+   c. If verification fails, try to fix the issue and retry
+   d. Only say DONE if the app is actually accessible in the browser
+4. Say DONE: <brief summary of what you built> when complete
+5. Say BLOCKED: <reason> if you cannot proceed
 
 Never run commands or edit files without being assigned first.
 Never work on tasks assigned to other instance IDs.

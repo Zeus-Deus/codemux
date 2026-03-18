@@ -260,10 +260,7 @@ impl Default for OpenFlowRuntimeStore {
 
 impl OpenFlowRuntimeStore {
     pub fn snapshot(&self) -> OpenFlowRuntimeSnapshot {
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Read only the current phase string for a run — much cheaper than a full snapshot clone.
@@ -997,5 +994,9 @@ impl AgentSessionStore {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, state| state.run_id != run_id);
+    }
+
+    pub fn clone_inner(&self) -> Arc<Mutex<HashMap<String, AgentSessionState>>> {
+        self.inner.clone()
     }
 }

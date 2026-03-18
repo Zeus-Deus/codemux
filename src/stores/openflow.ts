@@ -17,14 +17,13 @@ export const openflowRuntime = writable<OpenFlowRuntimeSnapshot | null>(null);
 export const commLogStore = writable<CommLogEntry[]>([]);
 
 const commLogOffsets = new Map<string, number>();
-const orchestratorOffsets = new Map<string, number>();
 
 export function clearCommLogOffset(runId: string) {
     commLogOffsets.delete(runId);
 }
 
 function clearOrchestratorOffset(runId: string) {
-    orchestratorOffsets.delete(runId);
+    commLogOffsets.delete(runId);
 }
 
 export async function syncOpenFlowRuntime() {
@@ -147,11 +146,11 @@ export async function injectOrchestratorMessage(runId: string, message: string):
 }
 
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
-    const offset = orchestratorOffsets.get(runId) ?? 0;
+    const offset = commLogOffsets.get(runId) ?? 0;
     const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId, offset });
 
     if (result.comm_log_offset > 0) {
-        orchestratorOffsets.set(runId, result.comm_log_offset);
+        commLogOffsets.set(runId, result.comm_log_offset);
     }
 
     if (result.next_phase !== null) {
