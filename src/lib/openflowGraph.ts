@@ -35,13 +35,16 @@ export function buildAgentNodes(
             ?? agentSessions.find((candidate) => candidate.config.role === worker.role);
 
         let dynamicStatus = worker.status;
+        const hasSession = session !== undefined;
         const recentEntries = commLogEntries.slice(-50);
         const instanceEntries = recentEntries.filter((entry) =>
             entry.role.toLowerCase() === instanceId || entry.role.toLowerCase() === roleLower
         );
         const recentInstanceEntries = instanceEntries.slice(-3);
 
-        if (recentInstanceEntries.length > 0) {
+        if (!hasSession && worker.status !== 'done' && worker.status !== 'completed') {
+            dynamicStatus = 'dead';
+        } else if (recentInstanceEntries.length > 0) {
             const lastMessage = recentInstanceEntries[recentInstanceEntries.length - 1].message.toLowerCase();
             if (lastMessage.includes('done:') || lastMessage.includes('run complete')) {
                 dynamicStatus = 'done';
@@ -71,8 +74,16 @@ export function buildActiveConnections(
     run: OpenFlowRunRecord | null,
     agentNodes: AgentNodeData[],
     commLogEntries: CommLogEntry[],
+    agentSessions: AgentSessionState[] = [],
 ): Connection[] {
     if (!run || agentNodes.length === 0) {
+        return [];
+    }
+
+    const isRunTerminal = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+    const hasActiveSessions = agentSessions.length > 0;
+
+    if (isRunTerminal || !hasActiveSessions) {
         return [];
     }
 

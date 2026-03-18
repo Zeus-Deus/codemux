@@ -60,6 +60,7 @@ pub enum OpenFlowRunStatus {
     Completed,
     Failed,
     Cancelled,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -232,6 +233,19 @@ pub struct OpenFlowRunRecord {
     pub stop_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct StuckState {
+    pub consecutive_no_progress_cycles: u32,
+    pub last_session_count: usize,
+    pub last_assignment_count: usize,
+    pub last_done_count: usize,
+    pub probe_injected: bool,
+    pub rescue_attempted: bool,
+    pub last_meaningful_activity: Option<chrono::DateTime<chrono::Utc>>,
+    pub replan_consecutive: u32,
+    pub replan_start_done_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenFlowRuntimeSnapshot {
     pub active_runs: Vec<OpenFlowRunRecord>,
@@ -246,6 +260,7 @@ pub struct OpenFlowCreateRunRequest {
 
 pub struct OpenFlowRuntimeStore {
     inner: Arc<Mutex<OpenFlowRuntimeSnapshot>>,
+    stuck_state: Arc<Mutex<std::collections::HashMap<String, StuckState>>>,
 }
 
 impl Default for OpenFlowRuntimeStore {
@@ -254,6 +269,7 @@ impl Default for OpenFlowRuntimeStore {
             inner: Arc::new(Mutex::new(OpenFlowRuntimeSnapshot {
                 active_runs: vec![],
             })),
+            stuck_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 }
@@ -714,6 +730,98 @@ impl OpenFlowRuntimeStore {
         }
 
         Ok(run.clone())
+    }
+
+    pub fn get_stuck_state(&self, run_id: &str) -> StuckState {
+        self.stuck_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(run_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn reset_stuck_state(&self, run_id: &str) {
+        if let Ok(mut stuck) = self.stuck_state.lock() {
+            stuck.insert(run_id.to_string(), StuckState::default());
+        }
+    }
+
+    pub fn update_stuck_state(
+        &self,
+        run_id: &str,
+        session_count: usize,
+        assignment_count: usize,
+        done_count: usize,
+        last_activity_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (StuckState, bool) {
+        let mut stuck = self.stuck_state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = stuck
+            .entry(run_id.to_string())
+            .or_insert_with(StuckState::default);
+
+        let counts_changed = session_count != state.last_session_count
+            || assignment_count != state.last_assignment_count
+            || done_count != state.last_done_count;
+
+        let activity_advanced = state
+            .last_meaningful_activity
+            .map(|last| last_activity_timestamp.map(|ts| ts > last).unwrap_or(false))
+            .unwrap_or(last_activity_timestamp.is_some());
+
+        let made_progress = counts_changed || activity_advanced;
+
+        if made_progress {
+            state.consecutive_no_progress_cycles = 0;
+            state.probe_injected = false;
+            state.rescue_attempted = false;
+        } else {
+            state.consecutive_no_progress_cycles += 1;
+        }
+
+        state.last_session_count = session_count;
+        state.last_assignment_count = assignment_count;
+        state.last_done_count = done_count;
+        state.last_meaningful_activity = last_activity_timestamp;
+
+        (state.clone(), made_progress)
+    }
+
+    pub fn mark_probe_sent(&self, run_id: &str) {
+        if let Ok(mut stuck) = self.stuck_state.lock() {
+            if let Some(state) = stuck.get_mut(run_id) {
+                state.probe_injected = true;
+            }
+        }
+    }
+
+    pub fn mark_rescue_attempted(&self, run_id: &str) {
+        if let Ok(mut stuck) = self.stuck_state.lock() {
+            if let Some(state) = stuck.get_mut(run_id) {
+                state.rescue_attempted = true;
+            }
+        }
+    }
+
+    pub fn increment_replan_consecutive(&self, run_id: &str, current_done_count: usize) {
+        if let Ok(mut stuck) = self.stuck_state.lock() {
+            let state = stuck
+                .entry(run_id.to_string())
+                .or_insert_with(StuckState::default);
+            if state.replan_consecutive == 0 {
+                state.replan_start_done_count = current_done_count;
+            }
+            state.replan_consecutive += 1;
+        }
+    }
+
+    pub fn reset_replan_tracking(&self, run_id: &str) {
+        if let Ok(mut stuck) = self.stuck_state.lock() {
+            if let Some(state) = stuck.get_mut(run_id) {
+                state.replan_consecutive = 0;
+                state.replan_start_done_count = 0;
+            }
+        }
     }
 }
 

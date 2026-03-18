@@ -47,6 +47,7 @@
         if (s === 'active' || s === 'ready') return 'var(--ui-accent)';
         if (s === 'pending') return 'var(--ui-text-muted)';
         if (s === 'blocked') return 'var(--ui-danger)';
+        if (s === 'dead' || s === 'disconnected') return 'var(--ui-danger)';
         return 'var(--ui-text-muted)';
     }
 
@@ -89,6 +90,7 @@
 <div 
     class="agent-node" 
     class:active={isActive}
+    class:dead={status === 'dead' || status === 'disconnected'}
     class:dragging={isDragging}
     style="
         --status-color: {getStatusColor(status)};
@@ -151,6 +153,16 @@
         border-color: var(--ui-accent);
         box-shadow: 0 0 20px color-mix(in srgb, var(--ui-accent) 40%, transparent);
         animation: pulse 2s ease-in-out infinite;
+    }
+
+    .agent-node.dead {
+        border-color: var(--ui-danger);
+        opacity: 0.6;
+        animation: none;
+    }
+
+    .agent-node.dead .node-icon {
+        filter: grayscale(100%);
     }
 
     @keyframes pulse {

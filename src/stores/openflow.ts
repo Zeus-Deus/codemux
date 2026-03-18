@@ -141,15 +141,17 @@ export async function getCommunicationLog(runId: string): Promise<CommLogEntry[]
     return entries;
 }
 
-export async function injectOrchestratorMessage(runId: string, message: string): Promise<void> {
-    return invoke<void>('inject_orchestrator_message', { runId, message });
+export async function injectOrchestratorMessage(runId: string, message: string): Promise<number> {
+    return invoke<number>('inject_orchestrator_message', { runId, message });
 }
 
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
     const offset = commLogOffsets.get(runId) ?? 0;
     const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId, offset });
 
-    if (result.comm_log_offset > 0) {
+    if (result.rotation_baseline > 0) {
+        commLogOffsets.set(runId, 0);
+    } else if (result.comm_log_offset > 0) {
         commLogOffsets.set(runId, result.comm_log_offset);
     }
 

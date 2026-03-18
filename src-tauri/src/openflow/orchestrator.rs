@@ -22,6 +22,7 @@ pub enum OrchestratorPhase {
     WaitingApproval,
     Completed,
     Replanning,
+    Blocked,
 }
 
 impl OrchestratorPhase {
@@ -35,6 +36,7 @@ impl OrchestratorPhase {
             "awaiting_approval" | "approval" => Self::WaitingApproval,
             "complete" | "completed" => Self::Completed,
             "replan" => Self::Replanning,
+            "blocked" => Self::Blocked,
             _ => Self::Planning,
         }
     }
@@ -49,6 +51,7 @@ impl OrchestratorPhase {
             Self::WaitingApproval => "awaiting_approval",
             Self::Completed => "complete",
             Self::Replanning => "replan",
+            Self::Blocked => "blocked",
         }
     }
 }
@@ -164,6 +167,12 @@ impl Orchestrator {
             role: role.to_string(),
             message: message.to_string(),
         })
+    }
+
+    pub fn parse_timestamp(timestamp_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
     }
 
     /// Parse an "ASSIGN ROLE-N: task" line and extract the instance id + task.
@@ -364,10 +373,14 @@ impl Orchestrator {
 
     /// `instance_counts`: number of running instances per role (excluding orchestrator).
     /// When a role has N instances, the phase only advances when all N have reported DONE.
+    /// `consecutive_replans`: number of consecutive replanning cycles without new DONE markers.
+    /// `previous_done_count`: DONE count when we entered the current Replanning cycle.
     pub fn determine_next_phase(
         current_phase: &OrchestratorPhase,
         analysis: &OrchestratorAnalysis,
         instance_counts: &HashMap<String, usize>,
+        consecutive_replans: u32,
+        previous_done_count: usize,
     ) -> Option<OrchestratorPhase> {
         let run_complete = analysis
             .status_updates
@@ -456,14 +469,24 @@ impl Orchestrator {
                     Some(OrchestratorPhase::Completed)
                 }
             }
-            OrchestratorPhase::Replanning => Some(OrchestratorPhase::Planning),
+            OrchestratorPhase::Replanning => {
+                let current_done_count = analysis.completed_instances.len();
+                let made_progress = current_done_count > previous_done_count;
+                const MAX_CONSECUTIVE_REPLANS: u32 = 3;
+                if !made_progress && consecutive_replans >= MAX_CONSECUTIVE_REPLANS {
+                    Some(OrchestratorPhase::Blocked)
+                } else {
+                    Some(OrchestratorPhase::Planning)
+                }
+            }
             OrchestratorPhase::Completed => {
-                if has_unhandled_injection {
+                if has_unhandled_injection && !analysis.instance_assignments.is_empty() {
                     Some(OrchestratorPhase::Planning)
                 } else {
                     None
                 }
             }
+            OrchestratorPhase::Blocked => None,
             OrchestratorPhase::Assigning => None,
         }
     }

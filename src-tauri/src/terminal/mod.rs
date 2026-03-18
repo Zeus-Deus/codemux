@@ -1053,28 +1053,92 @@ pub fn spawn_pty_for_agent(
     let wait_sessions = sessions.clone();
     let wait_session_id = session_id.clone();
     let wait_agent_store = agent_store_inner.clone();
+
+    fn decode_exit_status(exit_code: i32) -> (crate::openflow::agent::AgentSessionStatus, String) {
+        match exit_code {
+            0 => (
+                crate::openflow::agent::AgentSessionStatus::Done,
+                "Agent exited successfully".to_string(),
+            ),
+            1..=125 => (
+                crate::openflow::agent::AgentSessionStatus::Failed,
+                format!("Agent exited with code {}", exit_code),
+            ),
+            126 => (
+                crate::openflow::agent::AgentSessionStatus::Failed,
+                "Command not executable (permission denied or not executable)".to_string(),
+            ),
+            127 => (
+                crate::openflow::agent::AgentSessionStatus::Failed,
+                "Command not found".to_string(),
+            ),
+            128..=255 => {
+                let signal = exit_code - 128;
+                let signal_name = match signal {
+                    1 => "SIGHUP",
+                    2 => "SIGINT",
+                    3 => "SIGQUIT",
+                    4 => "SIGILL",
+                    5 => "SIGTRAP",
+                    6 => "SIGABRT",
+                    7 => "SIGBUS",
+                    8 => "SIGFPE",
+                    9 => "SIGKILL",
+                    10 => "SIGUSR1",
+                    11 => "SIGSEGV",
+                    12 => "SIGUSR2",
+                    13 => "SIGPIPE",
+                    14 => "SIGALRM",
+                    15 => "SIGTERM",
+                    16 => "SIGSTKFLT",
+                    17 => "SIGCHLD",
+                    18 => "SIGCONT",
+                    19 => "SIGSTOP",
+                    20 => "SIGTSTP",
+                    21 => "SIGTTIN",
+                    22 => "SIGTTOU",
+                    23 => "SIGURG",
+                    24 => "SIGXCPU",
+                    25 => "SIGXFSZ",
+                    26 => "SIGVTALRM",
+                    27 => "SIGPROF",
+                    28 => "SIGWINCH",
+                    29 => "SIGIO",
+                    30 => "SIGPWR",
+                    31 => "SIGSYS",
+                    _ => "UNKNOWN",
+                };
+                let reason = if signal == 9 {
+                    "SIGKILL (likely OOM or explicit kill -9)".to_string()
+                } else if signal == 15 {
+                    "SIGTERM (terminated by signal)".to_string()
+                } else {
+                    format!("killed by signal {} ({})", signal, signal_name)
+                };
+                (crate::openflow::agent::AgentSessionStatus::Killed, reason)
+            }
+            _ => (
+                crate::openflow::agent::AgentSessionStatus::Failed,
+                format!("Agent exited with unexpected code {}", exit_code),
+            ),
+        }
+    }
+
     std::thread::spawn(move || {
         let payload = match child.wait() {
             Ok(status) => {
+                let (decoded_status, decoded_msg) = decode_exit_status(status.exit_code() as i32);
                 if let Some(entry) = wait_agent_store
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get_mut(&wait_session_id)
                 {
-                    entry.status = if status.success() {
-                        crate::openflow::agent::AgentSessionStatus::Done
-                    } else {
-                        crate::openflow::agent::AgentSessionStatus::Failed
-                    };
+                    entry.status = decoded_status;
                 }
                 TerminalStatusPayload {
                     session_id: wait_session_id.clone(),
                     state: TerminalLifecycleState::Exited,
-                    message: Some(if status.success() {
-                        "Agent exited successfully".into()
-                    } else {
-                        format!("Agent exited with code {}", status.exit_code())
-                    }),
+                    message: Some(decoded_msg),
                     exit_code: Some(status.exit_code()),
                 }
             }

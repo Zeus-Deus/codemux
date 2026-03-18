@@ -69,8 +69,15 @@
                 }
             }, INITIAL_ORCHESTRATOR_DELAY_MS);
 
+            const isRunTerminal = (r: typeof run) => r && (r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled');
             orchestratorInterval = setInterval(() => {
-                if (runId && run && !orchestratorPollingInProgress) {
+                if (!runId || !run) return;
+                if (isRunTerminal(run)) {
+                    clearInterval(orchestratorInterval!);
+                    orchestratorInterval = null;
+                    return;
+                }
+                if (!orchestratorPollingInProgress) {
                     orchestratorPollingInProgress = true;
                     triggerOrchestratorCycle(runId).catch(e =>
                         console.error('[OpenFlow] Orchestration error:', e)
@@ -136,7 +143,7 @@
     );
 
     const activeConnections = $derived.by(() => {
-        return buildActiveConnections(run, agentNodes, commLogEntries);
+        return buildActiveConnections(run, agentNodes, commLogEntries, agentSessions);
     });
 
     async function handleLoop() {

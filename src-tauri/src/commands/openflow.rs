@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
 use tauri::{Manager, State};
 
+const STUCK_RESCUE_CYCLES: u32 = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
     pub id: String,
@@ -597,77 +599,6 @@ pub async fn trigger_orchestrator_cycle(
         )
     });
 
-    if let Some(ref orchestrator_session) = orchestrator_session {
-        let session_id = orchestrator_session.session_id.clone();
-        let orchestrator_alive = {
-            let sessions = pty_state.sessions.lock().unwrap();
-            let session_exists = sessions.get(&session_id).is_some();
-            let is_ready = sessions
-                .get(&session_id)
-                .map(|pty_runtime| {
-                    matches!(
-                        pty_runtime.last_status.state,
-                        crate::terminal::TerminalLifecycleState::Ready
-                    )
-                })
-                .unwrap_or(false);
-
-            #[cfg(debug_assertions)]
-            crate::diagnostics::stderr_line(&format!(
-                "[DEBUG] Orchestrator session {} exists={}, state={:?}",
-                session_id,
-                session_exists,
-                sessions
-                    .get(&session_id)
-                    .map(|r| r.last_status.state.clone())
-            ));
-
-            is_ready
-        };
-
-        if !orchestrator_alive {
-            #[cfg(debug_assertions)]
-            crate::diagnostics::stderr_line(&format!(
-                "[DEBUG] Orchestrator session {} is not alive, respawning...",
-                session_id
-            ));
-
-            let workspace_id = app
-                .state::<AppStateStore>()
-                .workspace_id_for_session(&session_id)
-                .map(|id| id.0)
-                .unwrap_or_else(|| "default".to_string());
-
-            let working_directory = ".".to_string();
-
-            let adapter = OpenCodeAdapter;
-            let goal_path = Orchestrator::comm_log_path(&run_id)
-                .display()
-                .to_string()
-                .replace("communication.log", "goal.txt");
-            let spec = adapter.spawn_spec(
-                &orchestrator_session.config,
-                &run_id,
-                &Orchestrator::comm_log_path(&run_id).display().to_string(),
-                &goal_path,
-                &working_directory,
-            );
-
-            crate::terminal::spawn_pty_for_agent(
-                app.clone(),
-                session_id.clone(),
-                workspace_id,
-                spec.argv,
-                spec.env.clone(),
-                spec.execution_policy.clone(),
-            );
-
-            std::thread::sleep(std::time::Duration::from_millis(500));
-
-            actions_taken.push("Respawned orchestrator".to_string());
-        }
-    }
-
     if !analysis.instance_assignments.is_empty() {
         let all_sessions = agent_store.for_run(&run_id);
         let new_total_assignments =
@@ -816,10 +747,11 @@ pub async fn trigger_orchestrator_cycle(
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
-        // For user messages, transition to Replanning which will go to Planning,
-        // but since the orchestrator handles the response directly in comm log,
-        // we'll detect "no new assignments" and return to Completed
-        Some(OrchestratorPhase::Replanning)
+        if !analysis.instance_assignments.is_empty() {
+            Some(OrchestratorPhase::Replanning)
+        } else {
+            None
+        }
     } else {
         let instance_counts: std::collections::HashMap<String, usize> = {
             let sessions = agent_store.for_run(&run_id);
@@ -892,7 +824,117 @@ pub async fn trigger_orchestrator_cycle(
             true
         };
 
-        let mut potential_next_phase = Orchestrator::determine_next_phase(&phase, &analysis, &instance_counts);
+        let last_activity_timestamp = entries.iter().rev().find_map(|e| {
+            Orchestrator::parse_timestamp(&e.timestamp)
+        });
+
+        let session_count = agent_store.for_run(&run_id).len();
+        let assignment_count = analysis.instance_assignments.len();
+        let done_count = analysis.completed_instances.len();
+
+        let (updated_stuck_state, made_progress) = runtime.update_stuck_state(
+            &run_id,
+            session_count,
+            assignment_count,
+            done_count,
+            last_activity_timestamp,
+        );
+
+        #[cfg(debug_assertions)]
+        crate::diagnostics::stderr_line(&format!(
+            "[DEBUG] Stuck detection: cycles={}, made_progress={}, probe_sent={}, rescue_attempted={}",
+            updated_stuck_state.consecutive_no_progress_cycles,
+            made_progress,
+            updated_stuck_state.probe_injected,
+            updated_stuck_state.rescue_attempted
+        ));
+
+        if updated_stuck_state.consecutive_no_progress_cycles >= STUCK_RESCUE_CYCLES
+            && !updated_stuck_state.rescue_attempted
+            && matches!(phase, OrchestratorPhase::Executing)
+        {
+            let all_sessions = agent_store.for_run(&run_id);
+            let mut rescued_any = false;
+
+            for session in all_sessions {
+                let session_id = &session.session_id;
+                let is_alive = {
+                    let sessions = pty_state.sessions.lock().unwrap();
+                    sessions.get(session_id).map(|pty_runtime| {
+                        matches!(
+                            pty_runtime.last_status.state,
+                            crate::terminal::TerminalLifecycleState::Ready
+                        )
+                    }).unwrap_or(false)
+                };
+
+                if !is_alive {
+                    let workspace_id = app
+                        .state::<AppStateStore>()
+                        .workspace_id_for_session(session_id)
+                        .map(|id| id.0)
+                        .unwrap_or_else(|| "default".to_string());
+
+                    let working_directory = ".".to_string();
+
+                    let adapter = OpenCodeAdapter;
+                    let goal_path = Orchestrator::comm_log_path(&run_id)
+                        .display()
+                        .to_string()
+                        .replace("communication.log", "goal.txt");
+                    let spec = adapter.spawn_spec(
+                        &session.config,
+                        &run_id,
+                        &Orchestrator::comm_log_path(&run_id).display().to_string(),
+                        &goal_path,
+                        &working_directory,
+                    );
+
+                    crate::terminal::spawn_pty_for_agent(
+                        app.clone(),
+                        session_id.clone(),
+                        workspace_id,
+                        spec.argv,
+                        spec.env.clone(),
+                        spec.execution_policy.clone(),
+                    );
+
+                    actions_taken.push(format!("Rescued dead agent session {}", session_id));
+                    #[cfg(debug_assertions)]
+                    crate::diagnostics::stderr_line(&format!(
+                        "[DEBUG] Rescued dead agent session {}",
+                        session_id
+                    ));
+                    rescued_any = true;
+                }
+            }
+
+            if rescued_any {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                runtime.mark_rescue_attempted(&run_id);
+            }
+        }
+
+        let consecutive_replans = updated_stuck_state.replan_consecutive;
+        let replan_start_done_count = updated_stuck_state.replan_start_done_count;
+
+        let mut potential_next_phase = Orchestrator::determine_next_phase(
+            &phase,
+            &analysis,
+            &instance_counts,
+            consecutive_replans,
+            replan_start_done_count,
+        );
+
+        if matches!(phase, OrchestratorPhase::Replanning) {
+            if potential_next_phase == Some(OrchestratorPhase::Planning) {
+                if !made_progress {
+                    runtime.increment_replan_consecutive(&run_id, done_count);
+                } else {
+                    runtime.reset_replan_tracking(&run_id);
+                }
+            }
+        }
 
         if matches!(phase, OrchestratorPhase::Executing) {
             if let Some(OrchestratorPhase::Verifying) = potential_next_phase {
@@ -923,6 +965,7 @@ pub async fn trigger_orchestrator_cycle(
             OrchestratorPhase::WaitingApproval => OpenFlowRunStatus::AwaitingApproval,
             OrchestratorPhase::Replanning => OpenFlowRunStatus::Planning,
             OrchestratorPhase::Completed => OpenFlowRunStatus::Completed,
+            OrchestratorPhase::Blocked => OpenFlowRunStatus::Blocked,
         };
         runtime.set_run_phase(&run_id, new_phase.as_str(), new_status)?;
     }

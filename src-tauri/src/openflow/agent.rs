@@ -53,4 +53,5 @@ pub enum AgentSessionStatus {
     Running,
     Done,
     Failed,
+    Killed,
 }
