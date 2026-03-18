@@ -16,6 +16,7 @@ impl AgentAdapter for OpenCodeAdapter {
         run_id: &str,
         comm_log_path: &str,
         goal_path: &str,
+        app_url: &str,
         working_directory: &str,
     ) -> AgentSpawnSpec {
         // Use the wrapper script that reads the system prompt and goal
@@ -33,9 +34,26 @@ impl AgentAdapter for OpenCodeAdapter {
                 comm_log_path.to_string(),
             ),
             ("CODEMUX_GOAL_PATH".into(), goal_path.to_string()),
+            ("CODEMUX_OPENFLOW_APP_URL".into(), app_url.to_string()),
             ("CODEMUX_WORKING_DIR".into(), working_directory.to_string()),
             ("OPENCODE_MODEL".into(), config.model.clone()),
+            (
+                "CODEMUX_OPENFLOW_AUTO_START".into(),
+                if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+                    "1".into()
+                } else {
+                    "0".into()
+                },
+            ),
         ];
+
+        if let Some(port) = app_url
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+        {
+            env.push(("CODEMUX_OPENFLOW_APP_PORT".into(), port.to_string()));
+        }
 
         // Inject thinking mode when configured.
         if !config.thinking_mode.is_empty() && config.thinking_mode != "auto" {

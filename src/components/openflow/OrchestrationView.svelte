@@ -146,6 +146,16 @@
         return buildActiveConnections(run, agentNodes, commLogEntries, agentSessions);
     });
 
+    const appUrl = $derived.by(() => {
+        for (const entry of [...commLogEntries].reverse()) {
+            if (entry.role.toLowerCase() === 'system' && entry.message.startsWith('APP_URL: ')) {
+                return entry.message.slice('APP_URL: '.length).trim();
+            }
+        }
+
+        return null;
+    });
+
     async function handleLoop() {
         if (!runId) return;
         try {
@@ -229,6 +239,9 @@
                     <span class="phase-badge" class:busy={run.status === 'executing' || run.status === 'planning'}>
                         {run.current_phase}
                     </span>
+                {/if}
+                {#if appUrl}
+                    <span class="app-url-badge">{appUrl}</span>
                 {/if}
             </div>
             <div class="orch-controls">
@@ -320,6 +333,19 @@
         margin-bottom: 24px;
         padding-bottom: 20px;
         border-bottom: 1px solid var(--ui-border-soft);
+    }
+
+    .app-url-badge {
+        display: inline-flex;
+        align-items: center;
+        margin-left: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--ui-accent) 12%, var(--ui-layer-1));
+        border: 1px solid color-mix(in srgb, var(--ui-accent) 30%, transparent);
+        color: var(--ui-text-primary);
+        font-size: 0.78rem;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
     .orch-info {

@@ -28,6 +28,7 @@ pub trait AgentAdapter: Send + Sync {
         run_id: &str,
         comm_log_path: &str,
         goal_path: &str,
+        app_url: &str,
         working_directory: &str,
     ) -> AgentSpawnSpec;
 }

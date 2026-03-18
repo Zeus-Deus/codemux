@@ -283,5 +283,4 @@ export interface OrchestratorTriggerResult {
     };
     actions_taken: string[];
     comm_log_offset: number;
-    rotation_baseline: number;
 }

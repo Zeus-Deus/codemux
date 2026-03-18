@@ -9,7 +9,7 @@ use crate::openflow::{
 };
 use crate::state::AppStateStore;
 use serde::{Deserialize, Serialize};
-use std::net::ToSocketAddrs;
+use std::net::{TcpListener, ToSocketAddrs};
 use tauri::{Manager, State};
 
 const STUCK_RESCUE_CYCLES: u32 = 5;
@@ -69,6 +69,97 @@ fn which_tool(name: &str) -> Option<String> {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|stdout| stdout.trim().to_string())
         .filter(|path| !path.is_empty())
+}
+
+fn openflow_instance_id(config: &AgentConfig) -> String {
+    if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+        config.role.as_str().to_string()
+    } else {
+        format!("{}-{}", config.role.as_str(), config.agent_index)
+    }
+}
+
+fn allocate_openflow_app_url() -> Result<String, String> {
+    for port in 3900_u16..=4199_u16 {
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(format!("http://localhost:{port}"));
+        }
+    }
+
+    Err("Failed to reserve an OpenFlow app port in 3900-4199".to_string())
+}
+
+fn parse_http_host_port(url: &str) -> Option<(String, u16)> {
+    let trimmed = url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let authority = without_scheme.split('/').next()?.trim();
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.trim_matches(['[', ']']).to_string(), port.parse().ok()?))
+}
+
+fn session_working_directory(app_state: &AppStateStore, session_id: &str) -> String {
+    app_state
+        .snapshot()
+        .terminal_sessions
+        .into_iter()
+        .find(|session| session.session_id.0 == session_id)
+        .map(|session| session.cwd)
+        .unwrap_or_else(|| ".".to_string())
+}
+
+fn ensure_agent_session_live(
+    app: &tauri::AppHandle,
+    app_state: &AppStateStore,
+    agent_store: &AgentSessionStore,
+    pty_state: &crate::terminal::PtyState,
+    run_id: &str,
+    session: &AgentSessionState,
+) -> Result<bool, String> {
+    let session_id = &session.session_id;
+    let is_live = {
+        let sessions = pty_state.sessions.lock().unwrap();
+        sessions
+            .get(session_id)
+            .map(|pty_runtime| pty_runtime.writer.is_some() || pty_runtime.master.is_some())
+            .unwrap_or(false)
+    };
+
+    if is_live {
+        return Ok(false);
+    }
+
+    let workspace_id = app_state
+        .workspace_id_for_session(session_id)
+        .map(|id| id.0)
+        .ok_or_else(|| format!("No workspace found for session {session_id}"))?;
+    let working_directory = session_working_directory(app_state, session_id);
+    let goal_path = Orchestrator::goal_path(run_id).display().to_string();
+    let app_url = Orchestrator::read_app_url(run_id).unwrap_or_default();
+    let adapter = adapter_for_tool(&session.config.cli_tool)?;
+    let comm_log_path = Orchestrator::comm_log_path(run_id).display().to_string();
+    let spec = adapter.spawn_spec(
+        &session.config,
+        run_id,
+        &comm_log_path,
+        &goal_path,
+        &app_url,
+        &working_directory,
+    );
+
+    crate::terminal::spawn_pty_for_agent(
+        app.clone(),
+        session_id.clone(),
+        workspace_id,
+        spec.argv,
+        spec.env.clone(),
+        spec.execution_policy.clone(),
+    );
+    agent_store.update_status(session_id, AgentSessionStatus::Running);
+
+    Ok(true)
 }
 
 fn parse_opencode_models(raw: &str) -> Vec<ModelInfo> {
@@ -285,24 +376,29 @@ pub fn spawn_openflow_agents(
             .map_err(|error| format!("Failed to create comm log directory: {error}"))?;
     }
 
-    let goal_path = log_path
-        .parent()
-        .ok_or_else(|| "Missing run directory".to_string())?
-        .join("goal.txt");
+    let goal_path = Orchestrator::goal_path(&run_id);
     std::fs::write(&goal_path, &goal)
         .map_err(|error| format!("Failed to write goal file: {error}"))?;
+    let app_url = match Orchestrator::read_app_url(&run_id) {
+        Some(existing) => existing,
+        None => allocate_openflow_app_url()?,
+    };
+    std::fs::write(Orchestrator::app_url_path(&run_id), &app_url)
+        .map_err(|error| format!("Failed to write app URL file: {error}"))?;
     let goal_path_str = goal_path.display().to_string();
     let log_path_str = log_path.display().to_string();
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let roles: Vec<String> = agent_configs
         .iter()
-        .map(|config| config.role.as_str().to_string())
+        .map(|config| openflow_instance_id(config).to_uppercase())
         .collect();
     let initial_message = format!(
-        "[{}] [SYSTEM] GOAL: {}\n[{}] [SYSTEM] AGENTS: {}\n",
+        "[{}] [SYSTEM] GOAL: {}\n[{}] [SYSTEM] APP_URL: {}\n[{}] [SYSTEM] AGENTS: {}\n",
         timestamp,
         goal,
+        timestamp,
+        app_url,
         timestamp,
         roles.join(", ")
     );
@@ -321,6 +417,7 @@ pub fn spawn_openflow_agents(
             &run_id,
             &log_path_str,
             config.agent_index,
+            &app_url,
         )
         .map_err(|error| format!("Failed to write prompt for {:?}: {}", config.role, error))?;
     }
@@ -334,6 +431,7 @@ pub fn spawn_openflow_agents(
             &run_id,
             &log_path_str,
             &goal_path_str,
+            &app_url,
             &working_directory,
         );
 
@@ -388,7 +486,7 @@ pub fn spawn_openflow_agents(
                 let entry = format!(
                     "[{}] [SYSTEM] Started agent: {}\n",
                     ts,
-                    config.role.as_str().to_uppercase()
+                    openflow_instance_id(config).to_uppercase()
                 );
                 let _ = file.write_all(entry.as_bytes());
             }
@@ -466,10 +564,11 @@ pub async fn trigger_orchestrator_cycle(
     pty_state: State<'_, crate::terminal::PtyState>,
     browser_manager: State<'_, BrowserManager>,
     run_id: String,
-    offset: Option<usize>,
+    _offset: Option<usize>,
 ) -> Result<OrchestratorTriggerResult, String> {
     let current_phase_str = runtime.get_run_phase(&run_id)?;
     let phase = OrchestratorPhase::from_string(&current_phase_str);
+    let assigned_app_url = Orchestrator::read_app_url(&run_id);
 
     #[cfg(debug_assertions)]
     {
@@ -498,78 +597,49 @@ pub async fn trigger_orchestrator_cycle(
 
         let timeout_ms = 200u64;
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        let mut vite_port_up = false;
+        let mut app_url_up = false;
         let mut probe_log = String::new();
-        for (addr, label) in &[
-            (
-                std::net::SocketAddr::from(([127, 0, 0, 1], 1420)),
-                "127.0.0.1:1420",
-            ),
-            (
-                std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 1420)),
-                "[::1]:1420",
-            ),
-        ] {
-            let start = std::time::Instant::now();
-            match std::net::TcpStream::connect_timeout(addr, timeout) {
-                Ok(_) => {
-                    let elapsed = start.elapsed().as_millis();
-                    vite_port_up = true;
-                    probe_log.push_str(&format!(" {} ok {}ms", label, elapsed));
-                    break;
-                }
-                Err(error) => {
-                    let elapsed = start.elapsed().as_millis();
-                    let kind = std::io::Error::kind(&error);
-                    probe_log.push_str(&format!(" {} fail {:?} {}ms", label, kind, elapsed));
-                }
-            }
-        }
-        if let Ok(addresses) = ("localhost", 1420_u16).to_socket_addrs() {
-            for address in addresses {
-                if vite_port_up {
-                    break;
-                }
-                let start = std::time::Instant::now();
-                match std::net::TcpStream::connect_timeout(&address, timeout) {
-                    Ok(_) => {
-                        let elapsed = start.elapsed().as_millis();
-                        vite_port_up = true;
-                        probe_log.push_str(&format!(" localhost({}) ok {}ms", address, elapsed));
-                        break;
-                    }
-                    Err(error) => {
-                        let elapsed = start.elapsed().as_millis();
-                        let kind = std::io::Error::kind(&error);
-                        probe_log.push_str(&format!(
-                            " localhost({}) fail {:?} {}ms",
-                            address, kind, elapsed
-                        ));
+        if let Some((host, port)) = assigned_app_url.as_deref().and_then(parse_http_host_port) {
+            if let Ok(addresses) = (host.as_str(), port).to_socket_addrs() {
+                for address in addresses {
+                    let start = std::time::Instant::now();
+                    match std::net::TcpStream::connect_timeout(&address, timeout) {
+                        Ok(_) => {
+                            let elapsed = start.elapsed().as_millis();
+                            app_url_up = true;
+                            probe_log.push_str(&format!(" {} ok {}ms", address, elapsed));
+                            break;
+                        }
+                        Err(error) => {
+                            let elapsed = start.elapsed().as_millis();
+                            let kind = std::io::Error::kind(&error);
+                            probe_log.push_str(&format!(" {} fail {:?} {}ms", address, kind, elapsed));
+                        }
                     }
                 }
             }
+        } else {
+            probe_log.push_str("no app url assigned");
         }
 
         crate::diagnostics::stderr_line(&format!(
-            "[DEBUG] trigger_orchestrator_cycle run_id={} phase={} sessions={} pending_chunks={} rss_kb={:?} vite_port_1420={} probe={}",
+            "[DEBUG] trigger_orchestrator_cycle run_id={} phase={} sessions={} pending_chunks={} rss_kb={:?} app_url={} reachable={} probe={}",
             run_id,
             current_phase_str,
             total_sessions,
             total_pending_chunks,
             rss_kb,
-            if vite_port_up { "up" } else { "down" },
+            assigned_app_url.as_deref().unwrap_or("unassigned"),
+            if app_url_up { "up" } else { "down" },
             probe_log.trim()
         ));
     }
 
-    let (entries, new_offset) = if let Some(off) = offset {
-        Orchestrator::read_communication_log_incremental(&run_id, off)
-            .map_err(|error| format!("Failed to read comm log: {error}"))?
-    } else {
-        let entries = Orchestrator::read_communication_log(&run_id)
-            .map_err(|error| format!("Failed to read comm log: {error}"))?;
-        (entries, 0)
-    };
+    let mut entries = Orchestrator::read_communication_log(&run_id)
+        .map_err(|error| format!("Failed to read comm log: {error}"))?;
+    let new_offset = std::fs::metadata(Orchestrator::comm_log_path(&run_id))
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
 
     #[cfg(debug_assertions)]
     crate::diagnostics::stderr_line(&format!(
@@ -577,20 +647,39 @@ pub async fn trigger_orchestrator_cycle(
         entries.len()
     ));
 
-    let analysis = Orchestrator::analyze_comm_log(&entries);
+    let mut analysis = Orchestrator::analyze_comm_log(&entries);
+    let mut actions_taken = Vec::new();
+
+    if analysis.orchestrator_responded_to_pending
+        && analysis.last_pending_injections > analysis.last_handled_injections
+    {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let handled_marker = format!(
+            "[{}] [SYSTEM] HANDLED_INJECTIONS: {}",
+            ts, analysis.last_pending_injections
+        );
+        let _ = Orchestrator::write_to_comm_log(&run_id, &handled_marker);
+        actions_taken.push("Recorded orchestrator response to pending user message".to_string());
+        entries = Orchestrator::read_communication_log(&run_id)
+            .map_err(|error| format!("Failed to refresh comm log: {error}"))?;
+        analysis = Orchestrator::analyze_comm_log(&entries);
+    }
 
     #[cfg(debug_assertions)]
     crate::diagnostics::stderr_line(&format!(
-        "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} instance_assignments={} injections={}/{}",
+        "[DEBUG] Analysis: completed={:?} blocked={:?} assignments={} instance_assignments={} injections={}/{} forward={} pending={} responded={}",
         analysis.completed_roles,
         analysis.blocked_roles,
         analysis.assignments.len(),
         analysis.instance_assignments.len(),
         analysis.user_injections.len(),
-        analysis.total_injections
+        analysis.total_injections,
+        analysis.injections_to_forward.len(),
+        analysis.last_pending_injections,
+        analysis.orchestrator_responded_to_pending
     ));
 
-    let mut actions_taken = Vec::new();
+    let app_state = app.state::<AppStateStore>();
 
     let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
         matches!(
@@ -677,81 +766,88 @@ pub async fn trigger_orchestrator_cycle(
     }
 
     let next_phase = if !analysis.user_injections.is_empty() {
-        let injection_text = analysis.user_injections.join(" | ");
+        let injection_text = analysis.injections_to_forward.join(" | ");
 
         if let Some(ref orchestrator_session) = orchestrator_session {
-            let goal_path = Orchestrator::comm_log_path(&run_id)
-                .display()
-                .to_string()
-                .replace("communication.log", "goal.txt");
-            let prompt = format!(
-                "A user message arrived. User message: \"{}\".\n\
-                Please address this message:\n\
-                - If it asks a question, answer it directly in the comm log.\n\
-                - If it requests changes, create ASSIGN messages to delegate work.\n\
-                - IMPORTANT: After answering or delegating, DO NOT exit. Wait for more user messages.\n\
-                Just respond to this message and wait. The goal file is at: {}",
-                injection_text,
-                goal_path
-            );
+            if !analysis.injections_to_forward.is_empty() {
+                if ensure_agent_session_live(
+                    &app,
+                    &app_state,
+                    &agent_store,
+                    &pty_state,
+                    &run_id,
+                    orchestrator_session,
+                )? {
+                    actions_taken.push("Respawned orchestrator session for follow-up message".to_string());
+                }
 
-            let session_id = orchestrator_session.session_id.clone();
+                let goal_path = Orchestrator::goal_path(&run_id).display().to_string();
+                let prompt = format!(
+                    "A user message arrived. User message: \"{}\".\n\
+                     Please address this message:\n\
+                     - If it asks a question, answer it directly in the comm log.\n\
+                    - If it requests changes, create ASSIGN messages to delegate work.\n\
+                    - IMPORTANT: After answering or delegating, DO NOT exit. Wait for more user messages.\n\
+                    Just respond to this message and wait. The goal file is at: {}",
+                    injection_text,
+                    goal_path
+                );
 
-            let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
-            #[cfg(debug_assertions)]
-            crate::diagnostics::stderr_line(&format!(
-                "[DEBUG] About to write to orchestrator PTY, session_id={}",
-                session_id
-            ));
+                let session_id = orchestrator_session.session_id.clone();
 
-            let write_result = {
-                let mut sessions = pty_state.sessions.lock().unwrap();
-                if let Some(pty_runtime) = sessions.get_mut(&session_id) {
-                    if let Some(writer) = pty_runtime.writer.as_mut() {
-                        use std::io::Write;
-                        writer
-                            .write_all(command.as_bytes())
-                            .and_then(|_| writer.flush())
-                            .map_err(|error| format!("PTY write error: {error}"))
+                let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
+                #[cfg(debug_assertions)]
+                crate::diagnostics::stderr_line(&format!(
+                    "[DEBUG] About to write to orchestrator PTY, session_id={}",
+                    session_id
+                ));
+
+                let write_result = {
+                    let mut sessions = pty_state.sessions.lock().unwrap();
+                    if let Some(pty_runtime) = sessions.get_mut(&session_id) {
+                        if let Some(writer) = pty_runtime.writer.as_mut() {
+                            use std::io::Write;
+                            writer
+                                .write_all(command.as_bytes())
+                                .and_then(|_| writer.flush())
+                                .map_err(|error| format!("PTY write error: {error}"))
+                        } else {
+                            Err(format!("No writer for session {session_id}"))
+                        }
                     } else {
-                        Err(format!("No writer for session {session_id}"))
+                        Err(format!("Session {session_id} not found in PtyState"))
                     }
-                } else {
-                    Err(format!("Session {session_id} not found in PtyState"))
-                }
-            };
+                };
 
-            match write_result {
-                Ok(()) => {
-                    #[cfg(debug_assertions)]
-                    crate::diagnostics::stderr_line(&format!(
-                        "[DEBUG] Wrote prompt to orchestrator PTY {}",
-                        session_id
-                    ));
-                    actions_taken.push(format!(
-                        "Forwarded {} user injection(s) to orchestrator PTY",
-                        analysis.user_injections.len()
-                    ));
+                match write_result {
+                    Ok(()) => {
+                        #[cfg(debug_assertions)]
+                        crate::diagnostics::stderr_line(&format!(
+                            "[DEBUG] Wrote prompt to orchestrator PTY {}",
+                            session_id
+                        ));
+                        actions_taken.push(format!(
+                            "Forwarded {} new user injection(s) to orchestrator PTY",
+                            analysis.injections_to_forward.len()
+                        ));
 
-                    let new_total = analysis.total_injections + analysis.user_injections.len();
-                    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                    let handled_marker =
-                        format!("[{}] [SYSTEM] HANDLED_INJECTIONS: {}", ts, new_total);
-                    let _ = Orchestrator::write_to_comm_log(&run_id, &handled_marker);
+                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                        let pending_marker =
+                            format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, analysis.total_injections);
+                        let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
+                    }
+                    Err(error) => {
+                        actions_taken.push(format!("Failed to reach orchestrator PTY: {}", error));
+                    }
                 }
-                Err(error) => {
-                    actions_taken.push(format!("Failed to reach orchestrator PTY: {}", error));
-                }
+            } else {
+                actions_taken.push("Waiting for orchestrator response to earlier user message".to_string());
             }
         } else {
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
-        if !analysis.instance_assignments.is_empty() {
-            Some(OrchestratorPhase::Replanning)
-        } else {
-            None
-        }
+        Some(OrchestratorPhase::Replanning)
     } else {
         let instance_counts: std::collections::HashMap<String, usize> = {
             let sessions = agent_store.for_run(&run_id);
@@ -788,37 +884,42 @@ pub async fn trigger_orchestrator_cycle(
         ));
 
         let builder_verified_live = if matches!(phase, OrchestratorPhase::Executing) && builder_all_done {
-            let verify_browser_id = format!("openflow-verify-{}", run_id);
-            match browser_manager.spawn_browser(verify_browser_id.clone()).await {
-                Ok(_) => {
-                    match browser_manager.navigate(&verify_browser_id, "http://localhost:1420").await {
-                        Ok(_) => {
-                            #[cfg(debug_assertions)]
-                            crate::diagnostics::stderr_line(&format!(
-                                "[DEBUG] Browser verification succeeded: app is live on localhost:1420"
-                            ));
-                            let _ = browser_manager.close_browser(&verify_browser_id).await;
-                            true
-                        }
-                        Err(e) => {
-                            #[cfg(debug_assertions)]
-                            crate::diagnostics::stderr_line(&format!(
-                                "[DEBUG] Browser verification failed: app not accessible on localhost:1420 - {}",
-                                e
-                            ));
-                            let _ = browser_manager.close_browser(&verify_browser_id).await;
-                            false
+            if let Some(app_url) = assigned_app_url.as_deref() {
+                let verify_browser_id = format!("openflow-verify-{}", run_id);
+                match browser_manager.spawn_browser(verify_browser_id.clone()).await {
+                    Ok(_) => {
+                        match browser_manager.navigate(&verify_browser_id, app_url).await {
+                            Ok(_) => {
+                                #[cfg(debug_assertions)]
+                                crate::diagnostics::stderr_line(&format!(
+                                    "[DEBUG] Browser verification succeeded: app is live at {}",
+                                    app_url
+                                ));
+                                let _ = browser_manager.close_browser(&verify_browser_id).await;
+                                true
+                            }
+                            Err(e) => {
+                                #[cfg(debug_assertions)]
+                                crate::diagnostics::stderr_line(&format!(
+                                    "[DEBUG] Browser verification failed: app not accessible at {} - {}",
+                                    app_url, e
+                                ));
+                                let _ = browser_manager.close_browser(&verify_browser_id).await;
+                                false
+                            }
                         }
                     }
+                    Err(e) => {
+                        #[cfg(debug_assertions)]
+                        crate::diagnostics::stderr_line(&format!(
+                            "[DEBUG] Browser verification spawn failed: {}",
+                            e
+                        ));
+                        false
+                    }
                 }
-                Err(e) => {
-                    #[cfg(debug_assertions)]
-                    crate::diagnostics::stderr_line(&format!(
-                        "[DEBUG] Browser verification spawn failed: {}",
-                        e
-                    ));
-                    false
-                }
+            } else {
+                true
             }
         } else {
             true
@@ -869,43 +970,22 @@ pub async fn trigger_orchestrator_cycle(
                 };
 
                 if !is_alive {
-                    let workspace_id = app
-                        .state::<AppStateStore>()
-                        .workspace_id_for_session(session_id)
-                        .map(|id| id.0)
-                        .unwrap_or_else(|| "default".to_string());
-
-                    let working_directory = ".".to_string();
-
-                    let adapter = OpenCodeAdapter;
-                    let goal_path = Orchestrator::comm_log_path(&run_id)
-                        .display()
-                        .to_string()
-                        .replace("communication.log", "goal.txt");
-                    let spec = adapter.spawn_spec(
-                        &session.config,
+                    if ensure_agent_session_live(
+                        &app,
+                        &app_state,
+                        &agent_store,
+                        &pty_state,
                         &run_id,
-                        &Orchestrator::comm_log_path(&run_id).display().to_string(),
-                        &goal_path,
-                        &working_directory,
-                    );
-
-                    crate::terminal::spawn_pty_for_agent(
-                        app.clone(),
-                        session_id.clone(),
-                        workspace_id,
-                        spec.argv,
-                        spec.env.clone(),
-                        spec.execution_policy.clone(),
-                    );
-
-                    actions_taken.push(format!("Rescued dead agent session {}", session_id));
-                    #[cfg(debug_assertions)]
-                    crate::diagnostics::stderr_line(&format!(
-                        "[DEBUG] Rescued dead agent session {}",
-                        session_id
-                    ));
-                    rescued_any = true;
+                        &session,
+                    )? {
+                        actions_taken.push(format!("Rescued dead agent session {}", session_id));
+                        #[cfg(debug_assertions)]
+                        crate::diagnostics::stderr_line(&format!(
+                            "[DEBUG] Rescued dead agent session {}",
+                            session_id
+                        ));
+                        rescued_any = true;
+                    }
                 }
             }
 
@@ -1059,6 +1139,11 @@ pub fn stop_openflow_run(
         run_id, status, reason
     ));
     let record = store.stop_run(&run_id, status, reason)?;
+
+    if matches!(record.status, OpenFlowRunStatus::AwaitingApproval) {
+        crate::state::emit_app_state(&app);
+        return Ok(record);
+    }
 
     let agent_sessions = agent_store.for_run(&run_id);
     let session_ids: Vec<String> = agent_sessions

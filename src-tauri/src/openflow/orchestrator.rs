@@ -76,13 +76,31 @@ pub enum TaskStatus {
 pub struct Orchestrator;
 
 impl Orchestrator {
-    pub fn comm_log_path(run_id: &str) -> PathBuf {
+    pub fn run_dir(run_id: &str) -> PathBuf {
         dirs::data_local_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".codemux")
             .join("runs")
             .join(run_id)
-            .join("communication.log")
+    }
+
+    pub fn comm_log_path(run_id: &str) -> PathBuf {
+        Self::run_dir(run_id).join("communication.log")
+    }
+
+    pub fn goal_path(run_id: &str) -> PathBuf {
+        Self::run_dir(run_id).join("goal.txt")
+    }
+
+    pub fn app_url_path(run_id: &str) -> PathBuf {
+        Self::run_dir(run_id).join("app_url.txt")
+    }
+
+    pub fn read_app_url(run_id: &str) -> Option<String> {
+        std::fs::read_to_string(Self::app_url_path(run_id))
+            .ok()
+            .map(|content| content.trim().to_string())
+            .filter(|value| !value.is_empty())
     }
 
     pub fn read_communication_log(run_id: &str) -> std::io::Result<Vec<CommLogEntry>> {
@@ -210,8 +228,10 @@ impl Orchestrator {
         let mut all_injections = Vec::new();
         let mut last_handled_count: usize = 0;
         let mut last_handled_assignments: usize = 0;
+        let mut last_pending_injections: usize = 0;
+        let mut last_pending_index: Option<usize> = None;
 
-        for entry in entries {
+        for (index, entry) in entries.iter().enumerate() {
             let role_lower = entry.role.to_lowercase();
 
             if entry.message.contains("DONE:") {
@@ -258,14 +278,36 @@ impl Orchestrator {
                         }
                     }
                 }
-                // Track INJECTION_PENDING - means we sent a message to orchestrator, waiting for response
-                // This is kept as a comment for historical context but the logic is now handled differently
+                if let Some(rest) = entry.message.strip_prefix("INJECTION_PENDING: ") {
+                    if let Ok(n) = rest.trim().parse::<usize>() {
+                        if n >= last_pending_injections {
+                            last_pending_injections = n;
+                            last_pending_index = Some(index);
+                        }
+                    }
+                }
             }
         }
+
+        let orchestrator_responded_to_pending = last_pending_index
+            .map(|index| {
+                entries
+                    .iter()
+                    .skip(index + 1)
+                    .any(|entry| entry.role.eq_ignore_ascii_case("orchestrator"))
+            })
+            .unwrap_or(false);
 
         // Only return injections that have not yet been handled
         let unhandled_injections = if last_handled_count < all_injections.len() {
             all_injections[last_handled_count..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let forwarded_injections = last_handled_count.max(last_pending_injections);
+        let injections_to_forward = if forwarded_injections < all_injections.len() {
+            all_injections[forwarded_injections..].to_vec()
         } else {
             vec![]
         };
@@ -286,9 +328,12 @@ impl Orchestrator {
             instance_assignments: unforwarded_assignments,
             status_updates,
             user_injections: unhandled_injections,
+            injections_to_forward,
             total_injections: all_injections.len(),
             last_handled_assignments,
+            last_pending_injections,
             last_handled_injections: last_handled_count,
+            orchestrator_responded_to_pending,
         }
     }
 
@@ -363,7 +408,30 @@ impl Orchestrator {
         }
 
         let keep_from = lines.len() - (max_lines / 2);
-        let trimmed = lines[keep_from..].join("\n") + "\n";
+        let header_lines: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| {
+                line.contains("[SYSTEM] GOAL:")
+                    || line.contains("[SYSTEM] APP_URL:")
+                    || line.contains("[SYSTEM] AGENTS:")
+                    || line.contains("[SYSTEM] Started agent:")
+            })
+            .collect();
+
+        let mut kept_lines: Vec<&str> = Vec::with_capacity(header_lines.len() + (max_lines / 2));
+        for line in header_lines {
+            if !kept_lines.contains(&line) {
+                kept_lines.push(line);
+            }
+        }
+        for line in &lines[keep_from..] {
+            if !kept_lines.contains(line) {
+                kept_lines.push(*line);
+            }
+        }
+
+        let trimmed = kept_lines.join("\n") + "\n";
 
         let temp_path = path.with_extension("tmp");
         std::fs::write(&temp_path, trimmed)?;
@@ -480,8 +548,8 @@ impl Orchestrator {
                 }
             }
             OrchestratorPhase::Completed => {
-                if has_unhandled_injection && !analysis.instance_assignments.is_empty() {
-                    Some(OrchestratorPhase::Planning)
+                if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
                 } else {
                     None
                 }
@@ -522,10 +590,93 @@ pub struct OrchestratorAnalysis {
     pub status_updates: Vec<String>,
     /// Injections that have NOT yet been handled (i.e. count > last HANDLED_INJECTIONS marker).
     pub user_injections: Vec<String>,
+    /// New injections that have not yet been forwarded to the orchestrator PTY.
+    pub injections_to_forward: Vec<String>,
     /// Total number of injections ever written to the log (including already-handled ones).
     pub total_injections: usize,
     /// Number of instance assignments already forwarded (for HANDLED_ASSIGNMENTS marker).
     pub last_handled_assignments: usize,
+    /// Number of injections currently forwarded to the orchestrator but not yet marked handled.
+    pub last_pending_injections: usize,
     /// Number of injections already handled (for HANDLED_INJECTIONS marker).
     pub last_handled_injections: usize,
+    /// True when the orchestrator has written at least one log line after the latest pending marker.
+    pub orchestrator_responded_to_pending: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(role: &str, message: &str) -> CommLogEntry {
+        CommLogEntry {
+            timestamp: "2026-03-18 00:00:00".to_string(),
+            role: role.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn analyze_comm_log_only_returns_unhandled_injections_after_marker() {
+        let entries = vec![
+            entry("user/inject", "first question"),
+            entry("system", "HANDLED_INJECTIONS: 1"),
+            entry("user/inject", "second question"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+
+        assert_eq!(analysis.total_injections, 2);
+        assert_eq!(analysis.last_handled_injections, 1);
+        assert_eq!(
+            analysis.user_injections,
+            vec!["second question".to_string()]
+        );
+    }
+
+    #[test]
+    fn analyze_comm_log_tracks_pending_injections_until_orchestrator_replies() {
+        let entries = vec![
+            entry("user/inject", "is it live?"),
+            entry("system", "INJECTION_PENDING: 1"),
+            entry("orchestrator", "STATUS: checking the app URL now"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+
+        assert_eq!(analysis.user_injections, vec!["is it live?".to_string()]);
+        assert!(analysis.injections_to_forward.is_empty());
+        assert_eq!(analysis.last_pending_injections, 1);
+        assert!(analysis.orchestrator_responded_to_pending);
+    }
+
+    #[test]
+    fn completed_phase_replans_when_new_user_message_arrives() {
+        let analysis = OrchestratorAnalysis {
+            completed_roles: vec![],
+            completed_instances: vec![],
+            blocked_roles: vec![],
+            blocked_instances: vec![],
+            assignments: vec![],
+            instance_assignments: vec![],
+            status_updates: vec![],
+            user_injections: vec!["can you keep going?".to_string()],
+            injections_to_forward: vec!["can you keep going?".to_string()],
+            total_injections: 1,
+            last_handled_assignments: 0,
+            last_pending_injections: 0,
+            last_handled_injections: 0,
+            orchestrator_responded_to_pending: false,
+        };
+
+        let next_phase = Orchestrator::determine_next_phase(
+            &OrchestratorPhase::Completed,
+            &analysis,
+            &HashMap::new(),
+            0,
+            0,
+        );
+
+        assert_eq!(next_phase, Some(OrchestratorPhase::Replanning));
+    }
 }

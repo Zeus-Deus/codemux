@@ -8,6 +8,7 @@ Environment:
 - Your instance ID: {instance_id}
 - Run ID: {run_id}
 - Working directory: the project folder selected by the user
+- Assigned app URL for this run: {app_url}
 
 Communication rules:
 - Your terminal output is automatically captured and written to the communication log.
@@ -47,11 +48,12 @@ Example of good parallel assignment:
 
 Your responsibilities:
 - Read the user's goal and produce a plan
-- Identify which agent instances are available from the AGENTS line in the comm log
+- Identify which agent instances are available from the AGENTS line in the comm log and use those exact IDs
 - Assign tasks in parallel to all available instances of each role
 - Monitor for DONE <INSTANCE-ID>: and BLOCKED <INSTANCE-ID>: messages
 - When an instance is DONE, assign it the next available task immediately
 - When an instance is BLOCKED, decide: reassign, adjust scope, or replan
+- When a live preview is needed, keep everyone on the assigned app URL from context: {app_url}
 - After major milestones, output STATUS update
 - When ALL tasks are complete, say: RUN COMPLETE: <summary>
 
@@ -97,6 +99,7 @@ You have access to Codemux browser:
 - `codemux browser console-logs` - get JS console
 
 When assigned:
+- Use the assigned app URL from context (`{app_url}`) unless the orchestrator gives an explicitly different approved URL
 - Run tests or verify in browser
 - Say DONE: <brief summary> when complete
 - Say BLOCKED: <reason> if you cannot proceed
@@ -135,15 +138,18 @@ If you receive no ASSIGN message addressed to your instance ID, do nothing and w
 When you receive ASSIGN {instance_id}: <task>:
 1. Implement exactly what is described
 2. Write clean, working code
-3. If the task involves running a dev server or web app:
-   a. Start the dev server with `setsid` to detach it from the current session:
-      - Use: `setsid npm run dev` (or the appropriate dev command)
-      - This ensures the dev server survives when the Builder agent exits
-   b. Use `codemux browser open http://localhost:1420` to verify it's accessible
-   c. If verification fails, try to fix the issue and retry
-   d. Only say DONE if the app is actually accessible in the browser
-4. Say DONE: <brief summary of what you built> when complete
-5. Say BLOCKED: <reason> if you cannot proceed
+3. Only start a dev server if your assignment actually requires a live preview or browser verification
+4. If the task involves running a dev server or web app:
+   a. Keep the preview on the assigned app URL from context: `{app_url}`
+   b. Prefer a strict fixed-port startup command. For Vite, use a command like:
+      - `setsid npm run dev -- --host 127.0.0.1 --port <assigned-port> --strictPort`
+      - adapt the command for the framework, but keep the same assigned port
+   c. If the assigned port is already busy because of an earlier process you started, reuse or replace that process; do NOT silently switch ports
+   d. Use `codemux browser open {app_url}` to verify the app is accessible there
+   e. If verification fails, fix the issue and retry the same assigned URL
+   f. Only say DONE if the app is actually accessible at the assigned app URL
+5. Say DONE: <brief summary of what you built> when complete
+6. Say BLOCKED: <reason> if you cannot proceed
 
 Never run commands or edit files without being assigned first.
 Never work on tasks assigned to other instance IDs.
@@ -169,24 +175,30 @@ impl SystemPrompts {
     /// Ensure the wrapper script exists.
     pub fn ensure_wrapper_exists() -> std::io::Result<()> {
         let path = Self::wrapper_script_path();
-        if path.exists() {
-            return Ok(());
-        }
-
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir)?;
 
         let wrapper_content = r#"#!/bin/bash
-# OpenCode wrapper - reads prompt and goal, then runs opencode with goal as first message
+# OpenCode wrapper - keeps the PTY alive and executes opencode commands on demand
+
+set -uo pipefail
 
 PROMPT_PATH="${CODEMUX_SYSTEM_PROMPT_PATH:-}"
 GOAL_PATH="${CODEMUX_GOAL_PATH:-}"
 MODEL="${OPENCODE_MODEL:-}"
 WORKING_DIR="${CODEMUX_WORKING_DIR:-}"
+ROLE="${CODEMUX_AGENT_ROLE:-}"
+INSTANCE_ID="${CODEMUX_AGENT_INSTANCE_ID:-${ROLE:-agent}}"
+AUTO_START="${CODEMUX_OPENFLOW_AUTO_START:-0}"
+APP_PORT="${CODEMUX_OPENFLOW_APP_PORT:-}"
 
 # Change to the working directory if set
 if [ -n "$WORKING_DIR" ] && [ -d "$WORKING_DIR" ]; then
     cd "$WORKING_DIR" || exit 1
+fi
+
+if [ -n "$APP_PORT" ]; then
+    export PORT="$APP_PORT"
 fi
 
 PROMPT=""
@@ -200,27 +212,61 @@ if [ -n "$GOAL_PATH" ] && [ -f "$GOAL_PATH" ]; then
     GOAL=$(cat "$GOAL_PATH")
 fi
 
-# Build the initial message with prompt + goal
-INITIAL_MSG="${PROMPT}"
+run_opencode() {
+    local message="$1"
 
-if [ -n "$GOAL" ]; then
-    INITIAL_MSG="${INITIAL_MSG}
+    if [ -n "$MODEL" ]; then
+        if [ -n "$message" ]; then
+            opencode run "$message" --model "$MODEL"
+        else
+            opencode --model "$MODEL"
+        fi
+    else
+        if [ -n "$message" ]; then
+            opencode run "$message"
+        else
+            opencode
+        fi
+    fi
+}
+
+build_initial_message() {
+    if [ "$AUTO_START" != "1" ]; then
+        return
+    fi
+
+    local initial_message="$PROMPT"
+
+    if [ -n "$GOAL" ]; then
+        initial_message="${initial_message}
 
 ---
 
-YOUR TASK:
+TOP-LEVEL GOAL:
 ${GOAL}
 
-Start working on this task NOW. Your terminal output will be automatically captured and visible in the communication panel.
+Start coordinating this run now. Delegate repo work to the other agents instead of doing it yourself.
 "
+    fi
+
+    printf '%s' "$initial_message"
+}
+
+INITIAL_MSG="$(build_initial_message || true)"
+
+if [ -n "$INITIAL_MSG" ]; then
+    run_opencode "$INITIAL_MSG"
+else
+    printf '[wrapper] %s waiting for assignment\n' "$INSTANCE_ID"
 fi
 
-# Run opencode with the initial message as a run command - this makes it start immediately
-if [ -n "$INITIAL_MSG" ]; then
-    opencode run "$INITIAL_MSG" ${MODEL:+--model "$MODEL"}
-else
-    exec opencode ${MODEL:+--model "$MODEL"}
-fi
+while IFS= read -r line; do
+    if [ -z "$line" ]; then
+        continue
+    fi
+
+    bash -lc "$line"
+done
 "#;
 
         std::fs::write(&path, wrapper_content)?;
@@ -274,7 +320,7 @@ fi
         for role in roles {
             let path = Self::prompt_path_for_role(&role);
             if !path.exists() {
-                let content = Self::build_prompt_for_role(&role, "", "", 0);
+                let content = Self::build_prompt_for_role(&role, "", "", 0, "");
                 std::fs::write(&path, content)?;
             }
         }
@@ -288,9 +334,11 @@ fi
         run_id: &str,
         comm_log_path: &str,
         agent_index: usize,
+        app_url: &str,
     ) -> std::io::Result<PathBuf> {
         let path = Self::prompt_path_for_instance(role, agent_index);
-        let content = Self::build_prompt_for_role(role, run_id, comm_log_path, agent_index);
+        let content =
+            Self::build_prompt_for_role(role, run_id, comm_log_path, agent_index, app_url);
 
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -305,6 +353,7 @@ fi
         run_id: &str,
         comm_log_path: &str,
         agent_index: usize,
+        app_url: &str,
     ) -> String {
         let role_str = role.as_str();
         let role_upper = role_str.to_uppercase();
@@ -321,6 +370,7 @@ fi
             .replace("{role}", role_str)
             .replace("{instance_id}", &instance_label)
             .replace("{run_id}", run_id)
+            .replace("{app_url}", app_url)
             .replace("{comm_log_path}", comm_log_path)
             .replace("YOUR_ROLE", &role_upper);
 
@@ -335,7 +385,9 @@ fi
         };
         // Apply the same substitutions to the role-specific section so that
         // placeholders like {instance_id} are resolved there too.
-        let role_specific = role_specific_raw.replace("{instance_id}", &instance_label);
+        let role_specific = role_specific_raw
+            .replace("{instance_id}", &instance_label)
+            .replace("{app_url}", app_url);
 
         format!("{}{}", base, role_specific)
     }

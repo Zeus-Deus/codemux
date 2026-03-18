@@ -1,7 +1,12 @@
 <script lang="ts">
     import { tick } from 'svelte';
-    import { commLogStore, getCommunicationLog, injectOrchestratorMessage } from '../../stores/openflow';
-import { mergeCommLogEntries } from '../../lib/openflowPolling';
+    import {
+        commLogStore,
+        getCommunicationLog,
+        injectOrchestratorMessage,
+        triggerOrchestratorCycle,
+    } from '../../stores/openflow';
+    import { mergeCommLogEntries } from '../../lib/openflowPolling';
 
     let { runId }: { runId: string | null } = $props();
 
@@ -42,8 +47,11 @@ import { mergeCommLogEntries } from '../../lib/openflowPolling';
         try {
             await injectOrchestratorMessage(currentRunId, newMessage.trim());
             newMessage = '';
-            const updated = await getCommunicationLog(currentRunId);
-            commLogStore.update(existing => mergeCommLogEntries(existing, updated));
+            const injectedEntries = await getCommunicationLog(currentRunId);
+            commLogStore.update(existing => mergeCommLogEntries(existing, injectedEntries));
+            await triggerOrchestratorCycle(currentRunId);
+            const followUpEntries = await getCommunicationLog(currentRunId);
+            commLogStore.update(existing => mergeCommLogEntries(existing, followUpEntries));
         } catch (e) {
             console.error('Failed to inject message:', e);
             injectError = String(e);

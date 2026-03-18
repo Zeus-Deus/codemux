@@ -19,12 +19,19 @@ OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a f
 - test agents can use Codemux browser automation
 - extra diagnostics exist for wrapper lifecycle, native launch attribution, and OpenFlow breadcrumbs
 - frontend OpenFlow state and orchestration helpers are now split into dedicated store/modules instead of one catch-all app-state file
+- new runs now get a run-scoped `APP_URL` recorded in the comm log and prompt context instead of relying on a hard-coded localhost port
+- agent wrappers stay alive after the first `opencode run`, so orchestrator and workers can accept later prompts inside the same run
+- user injections from the communication panel now wake orchestration immediately, completed runs can re-enter replanning on follow-up messages, and missing orchestrator PTYs are respawned when possible
+- injection handling now waits for an actual orchestrator response before a user message is considered handled
+- comm-log rotation now preserves the run header lines (`GOAL`, `APP_URL`, `AGENTS`) so long runs keep their core context
+- pausing a run now keeps the run and workspace alive instead of tearing them down immediately
 
 ## What Is Still Prototype-Level
 
 - large multi-agent reliability, especially 15-20 agent runs
 - browser view inside the OpenFlow workspace is still not the final integrated experience
 - user questions versus change requests are not handled as cleanly as they should be
+- pause/resume semantics are better than before but still need a cleaner explicit suspended-state model
 - dev-time lifecycle issues and single-instance hardening still need work
 
 ## Constraints

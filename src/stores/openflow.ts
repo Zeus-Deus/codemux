@@ -22,10 +22,6 @@ export function clearCommLogOffset(runId: string) {
     commLogOffsets.delete(runId);
 }
 
-function clearOrchestratorOffset(runId: string) {
-    commLogOffsets.delete(runId);
-}
-
 export async function syncOpenFlowRuntime() {
     const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
     openflowRuntime.set(snapshot);
@@ -96,7 +92,6 @@ export async function stopOpenFlowRun(
     });
 
     clearCommLogOffset(runId);
-    clearOrchestratorOffset(runId);
 
     await refreshOpenFlowRuntime();
     return run;
@@ -146,14 +141,7 @@ export async function injectOrchestratorMessage(runId: string, message: string):
 }
 
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
-    const offset = commLogOffsets.get(runId) ?? 0;
-    const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId, offset });
-
-    if (result.rotation_baseline > 0) {
-        commLogOffsets.set(runId, 0);
-    } else if (result.comm_log_offset > 0) {
-        commLogOffsets.set(runId, result.comm_log_offset);
-    }
+    const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
 
     if (result.next_phase !== null) {
         await refreshOpenFlowRuntime();
