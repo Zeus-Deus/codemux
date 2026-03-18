@@ -7,7 +7,6 @@ use crate::openflow::{
     OpenFlowRunStatus, OpenFlowRuntimeSnapshot, OpenFlowRuntimeStore,
 };
 use crate::state::AppStateStore;
-use crate::terminal::TerminalLifecycleState;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
 use tauri::{Manager, State};
@@ -667,7 +666,6 @@ pub fn trigger_orchestrator_cycle(
     }
 
     let next_phase = if !analysis.user_injections.is_empty() {
-        let new_total = analysis.total_injections;
         let injection_text = analysis.user_injections.join(" | ");
 
         let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
@@ -812,12 +810,9 @@ pub fn trigger_orchestrator_cycle(
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
-        // Write INJECTION_PENDING to track that we sent this to orchestrator
-        // This is different from HANDLED - it means "waiting for response"
-        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let pending_marker = format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, new_total);
-        let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
-
+        // For user messages, transition to Replanning which will go to Planning,
+        // but since the orchestrator handles the response directly in comm log,
+        // we'll detect "no new assignments" and return to Completed
         Some(OrchestratorPhase::Replanning)
     } else {
         let instance_counts: std::collections::HashMap<String, usize> = {

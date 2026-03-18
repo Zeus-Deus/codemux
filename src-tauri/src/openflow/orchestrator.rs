@@ -194,7 +194,6 @@ impl Orchestrator {
         let mut all_injections = Vec::new();
         let mut last_handled_count: usize = 0;
         let mut last_handled_assignments: usize = 0;
-        let mut injection_pending_response: bool = false;
 
         for entry in entries {
             let role_lower = entry.role.to_lowercase();
@@ -244,9 +243,7 @@ impl Orchestrator {
                     }
                 }
                 // Track INJECTION_PENDING - means we sent a message to orchestrator, waiting for response
-                if entry.message.contains("INJECTION_PENDING") {
-                    injection_pending_response = true;
-                }
+                // This is kept as a comment for historical context but the logic is now handled differently
             }
         }
 
@@ -276,7 +273,6 @@ impl Orchestrator {
             total_injections: all_injections.len(),
             last_handled_assignments,
             last_handled_injections: last_handled_count,
-            injection_pending_response,
         }
     }
 
@@ -399,7 +395,13 @@ impl Orchestrator {
                 } else if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.assignments.is_empty() {
-                    None
+                    if analysis.total_injections > 0
+                        && analysis.total_injections == analysis.last_handled_injections
+                    {
+                        Some(OrchestratorPhase::Completed)
+                    } else {
+                        None
+                    }
                 } else {
                     Some(OrchestratorPhase::Executing)
                 }
@@ -493,6 +495,4 @@ pub struct OrchestratorAnalysis {
     pub last_handled_assignments: usize,
     /// Number of injections already handled (for HANDLED_INJECTIONS marker).
     pub last_handled_injections: usize,
-    /// True if we've sent an injection to orchestrator but haven't seen response yet (INJECTION_PENDING marker exists)
-    pub injection_pending_response: bool,
 }
