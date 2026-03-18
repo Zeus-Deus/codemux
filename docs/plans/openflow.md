@@ -8,7 +8,10 @@
 
 ## Active Priorities
 
-1. Orchestrator response behavior:
+1. Orchestrator response behavior (IN PROGRESS):
+   - FIXED: User messages sent after orchestration completion now respawn the orchestrator if needed
+   - FIXED: Orchestrator now returns to Completed phase after answering user questions (no longer stuck in Planning)
+   - FIXED: Now waits for orchestrator to actually respond before marking injection handled
    - simple user questions should be answered directly
    - modification requests should trigger a fresh planning and build loop
 2. User intervention during any phase:

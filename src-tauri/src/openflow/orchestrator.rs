@@ -194,6 +194,7 @@ impl Orchestrator {
         let mut all_injections = Vec::new();
         let mut last_handled_count: usize = 0;
         let mut last_handled_assignments: usize = 0;
+        let mut injection_pending_response: bool = false;
 
         for entry in entries {
             let role_lower = entry.role.to_lowercase();
@@ -242,6 +243,10 @@ impl Orchestrator {
                         }
                     }
                 }
+                // Track INJECTION_PENDING - means we sent a message to orchestrator, waiting for response
+                if entry.message.contains("INJECTION_PENDING") {
+                    injection_pending_response = true;
+                }
             }
         }
 
@@ -270,6 +275,8 @@ impl Orchestrator {
             user_injections: unhandled_injections,
             total_injections: all_injections.len(),
             last_handled_assignments,
+            last_handled_injections: last_handled_count,
+            injection_pending_response,
         }
     }
 
@@ -318,9 +325,9 @@ impl Orchestrator {
         let log_lock = crate::terminal::get_comm_log_lock(&path_str);
         {
             use std::io::Write;
-            let mut file = log_lock
-                .lock()
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "Comm log lock poisoned"))?;
+            let mut file = log_lock.lock().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "Comm log lock poisoned")
+            })?;
             file.write_all(entry.as_bytes())?;
             file.flush()?;
         }
@@ -484,4 +491,8 @@ pub struct OrchestratorAnalysis {
     pub total_injections: usize,
     /// Number of instance assignments already forwarded (for HANDLED_ASSIGNMENTS marker).
     pub last_handled_assignments: usize,
+    /// Number of injections already handled (for HANDLED_INJECTIONS marker).
+    pub last_handled_injections: usize,
+    /// True if we've sent an injection to orchestrator but haven't seen response yet (INJECTION_PENDING marker exists)
+    pub injection_pending_response: bool,
 }

@@ -3,18 +3,14 @@ use crate::openflow::adapters::AgentAdapter;
 use crate::openflow::agent::{AgentConfig, AgentSessionState, AgentSessionStatus};
 use crate::openflow::orchestrator::{Orchestrator, OrchestratorAnalysis, OrchestratorPhase};
 use crate::openflow::{
-    AgentSessionStore,
-    OpenFlowCreateRunRequest,
-    OpenFlowDesignSpec,
-    OpenFlowRunRecord,
-    OpenFlowRunStatus,
-    OpenFlowRuntimeSnapshot,
-    OpenFlowRuntimeStore,
+    AgentSessionStore, OpenFlowCreateRunRequest, OpenFlowDesignSpec, OpenFlowRunRecord,
+    OpenFlowRunStatus, OpenFlowRuntimeSnapshot, OpenFlowRuntimeStore,
 };
 use crate::state::AppStateStore;
+use crate::terminal::TerminalLifecycleState;
 use serde::{Deserialize, Serialize};
 use std::net::ToSocketAddrs;
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
@@ -103,9 +99,21 @@ fn opencode_fallback_models() -> Vec<ModelInfo> {
 
 fn claude_default_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo { id: "claude-opus-4-5".into(), name: "claude-opus-4-5".into(), provider: Some("anthropic".into()) },
-        ModelInfo { id: "claude-sonnet-4-5".into(), name: "claude-sonnet-4-5".into(), provider: Some("anthropic".into()) },
-        ModelInfo { id: "claude-haiku-3-5".into(), name: "claude-haiku-3-5".into(), provider: Some("anthropic".into()) },
+        ModelInfo {
+            id: "claude-opus-4-5".into(),
+            name: "claude-opus-4-5".into(),
+            provider: Some("anthropic".into()),
+        },
+        ModelInfo {
+            id: "claude-sonnet-4-5".into(),
+            name: "claude-sonnet-4-5".into(),
+            provider: Some("anthropic".into()),
+        },
+        ModelInfo {
+            id: "claude-haiku-3-5".into(),
+            name: "claude-haiku-3-5".into(),
+            provider: Some("anthropic".into()),
+        },
     ]
 }
 
@@ -119,15 +127,31 @@ fn codex_default_models() -> Vec<ModelInfo> {
 
 fn aider_default_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo { id: "gpt-4o".into(), name: "gpt-4o".into(), provider: Some("openai".into()) },
-        ModelInfo { id: "claude-sonnet-4-5".into(), name: "claude-sonnet-4-5".into(), provider: Some("anthropic".into()) },
+        ModelInfo {
+            id: "gpt-4o".into(),
+            name: "gpt-4o".into(),
+            provider: Some("openai".into()),
+        },
+        ModelInfo {
+            id: "claude-sonnet-4-5".into(),
+            name: "claude-sonnet-4-5".into(),
+            provider: Some("anthropic".into()),
+        },
     ]
 }
 
 fn gemini_default_models() -> Vec<ModelInfo> {
     vec![
-        ModelInfo { id: "gemini-2.5-pro".into(), name: "gemini-2.5-pro".into(), provider: Some("google".into()) },
-        ModelInfo { id: "gemini-2.5-flash".into(), name: "gemini-2.5-flash".into(), provider: Some("google".into()) },
+        ModelInfo {
+            id: "gemini-2.5-pro".into(),
+            name: "gemini-2.5-pro".into(),
+            provider: Some("google".into()),
+        },
+        ModelInfo {
+            id: "gemini-2.5-flash".into(),
+            name: "gemini-2.5-flash".into(),
+            provider: Some("google".into()),
+        },
     ]
 }
 
@@ -140,8 +164,16 @@ fn adapter_for_tool(tool_id: &str) -> Result<Box<dyn AgentAdapter>, String> {
 
 fn analysis_dto(analysis: &OrchestratorAnalysis) -> OrchestratorAnalysisDto {
     OrchestratorAnalysisDto {
-        completed_roles: analysis.completed_roles.iter().map(|role| role.as_str().to_string()).collect(),
-        blocked_roles: analysis.blocked_roles.iter().map(|role| role.as_str().to_string()).collect(),
+        completed_roles: analysis
+            .completed_roles
+            .iter()
+            .map(|role| role.as_str().to_string())
+            .collect(),
+        blocked_roles: analysis
+            .blocked_roles
+            .iter()
+            .map(|role| role.as_str().to_string())
+            .collect(),
         assignments_count: analysis.assignments.len(),
         user_injections_count: analysis.user_injections.len(),
     }
@@ -175,7 +207,9 @@ pub fn list_available_cli_tools() -> Result<Vec<CliToolInfo>, String> {
 pub fn list_models_for_tool(tool_id: String) -> Result<Vec<ModelInfo>, String> {
     match tool_id.as_str() {
         "opencode" => {
-            let output = std::process::Command::new("opencode").arg("models").output();
+            let output = std::process::Command::new("opencode")
+                .arg("models")
+                .output();
             match output {
                 Ok(output) if output.status.success() => {
                     let text = String::from_utf8_lossy(&output.stdout);
@@ -201,11 +235,31 @@ pub fn list_models_for_tool(tool_id: String) -> Result<Vec<ModelInfo>, String> {
 pub fn list_thinking_modes_for_tool(tool_id: String) -> Result<Vec<ThinkingModeInfo>, String> {
     let modes = match tool_id.as_str() {
         "opencode" => vec![
-            ThinkingModeInfo { id: "auto".into(), name: "Auto".into(), description: "Let the model decide".into() },
-            ThinkingModeInfo { id: "none".into(), name: "None".into(), description: "Disable extended thinking".into() },
-            ThinkingModeInfo { id: "low".into(), name: "Low".into(), description: "Minimal thinking budget".into() },
-            ThinkingModeInfo { id: "medium".into(), name: "Medium".into(), description: "Balanced thinking budget".into() },
-            ThinkingModeInfo { id: "high".into(), name: "High".into(), description: "Deep reasoning budget".into() },
+            ThinkingModeInfo {
+                id: "auto".into(),
+                name: "Auto".into(),
+                description: "Let the model decide".into(),
+            },
+            ThinkingModeInfo {
+                id: "none".into(),
+                name: "None".into(),
+                description: "Disable extended thinking".into(),
+            },
+            ThinkingModeInfo {
+                id: "low".into(),
+                name: "Low".into(),
+                description: "Minimal thinking budget".into(),
+            },
+            ThinkingModeInfo {
+                id: "medium".into(),
+                name: "Medium".into(),
+                description: "Balanced thinking budget".into(),
+            },
+            ThinkingModeInfo {
+                id: "high".into(),
+                name: "High".into(),
+                description: "Deep reasoning budget".into(),
+            },
         ],
         _ => vec![],
     };
@@ -239,7 +293,10 @@ pub fn spawn_openflow_agents(
     let log_path_str = log_path.display().to_string();
 
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    let roles: Vec<String> = agent_configs.iter().map(|config| config.role.as_str().to_string()).collect();
+    let roles: Vec<String> = agent_configs
+        .iter()
+        .map(|config| config.role.as_str().to_string())
+        .collect();
     let initial_message = format!(
         "[{}] [SYSTEM] GOAL: {}\n[{}] [SYSTEM] AGENTS: {}\n",
         timestamp,
@@ -257,8 +314,13 @@ pub fn spawn_openflow_agents(
         .map_err(|error| format!("Failed to create wrapper script: {error}"))?;
 
     for config in &agent_configs {
-        SystemPrompts::write_prompt_for_run(&config.role, &run_id, &log_path_str, config.agent_index)
-            .map_err(|error| format!("Failed to write prompt for {:?}: {}", config.role, error))?;
+        SystemPrompts::write_prompt_for_run(
+            &config.role,
+            &run_id,
+            &log_path_str,
+            config.agent_index,
+        )
+        .map_err(|error| format!("Failed to write prompt for {:?}: {}", config.role, error))?;
     }
 
     let mut session_ids = Vec::with_capacity(agent_configs.len());
@@ -396,6 +458,7 @@ pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<()
 
 #[tauri::command]
 pub fn trigger_orchestrator_cycle(
+    app: tauri::AppHandle,
     runtime: State<'_, OpenFlowRuntimeStore>,
     agent_store: State<'_, AgentSessionStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
@@ -407,7 +470,10 @@ pub fn trigger_orchestrator_cycle(
 
     #[cfg(debug_assertions)]
     {
-        let sessions_guard = pty_state.sessions.lock().unwrap_or_else(|error| error.into_inner());
+        let sessions_guard = pty_state
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let total_sessions = sessions_guard.len();
         let total_pending_chunks: usize = sessions_guard
             .values()
@@ -415,14 +481,15 @@ pub fn trigger_orchestrator_cycle(
             .sum();
 
         #[cfg(target_os = "linux")]
-        let rss_kb: Option<u64> = std::fs::read_to_string("/proc/self/status")
-            .ok()
-            .and_then(|status| {
-                status
-                    .lines()
-                    .find(|line| line.starts_with("VmRSS:"))
-                    .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
-            });
+        let rss_kb: Option<u64> =
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status
+                        .lines()
+                        .find(|line| line.starts_with("VmRSS:"))
+                        .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+                });
         #[cfg(not(target_os = "linux"))]
         let rss_kb: Option<u64> = None;
 
@@ -431,7 +498,10 @@ pub fn trigger_orchestrator_cycle(
         let mut vite_port_up = false;
         let mut probe_log = String::new();
         for (addr, label) in &[
-            (std::net::SocketAddr::from(([127, 0, 0, 1], 1420)), "127.0.0.1:1420"),
+            (
+                std::net::SocketAddr::from(([127, 0, 0, 1], 1420)),
+                "127.0.0.1:1420",
+            ),
             (
                 std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 1420)),
                 "[::1]:1420",
@@ -448,10 +518,7 @@ pub fn trigger_orchestrator_cycle(
                 Err(error) => {
                     let elapsed = start.elapsed().as_millis();
                     let kind = std::io::Error::kind(&error);
-                    probe_log.push_str(&format!(
-                        " {} fail {:?} {}ms",
-                        label, kind, elapsed
-                    ));
+                    probe_log.push_str(&format!(" {} fail {:?} {}ms", label, kind, elapsed));
                 }
             }
         }
@@ -529,16 +596,26 @@ pub fn trigger_orchestrator_cycle(
 
         for assignment in &analysis.instance_assignments {
             let target_session = all_sessions.iter().find(|session| {
-                let session_instance = if matches!(session.config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+                let session_instance = if matches!(
+                    session.config.role,
+                    crate::openflow::OpenFlowRole::Orchestrator
+                ) {
                     session.config.role.as_str().to_string()
                 } else {
-                    format!("{}-{}", session.config.role.as_str(), session.config.agent_index)
+                    format!(
+                        "{}-{}",
+                        session.config.role.as_str(),
+                        session.config.agent_index
+                    )
                 };
                 session_instance == assignment.instance_id
             });
 
             if let Some(session) = target_session {
-                let command = format!("opencode run \"{}\"\n", assignment.task.replace('"', "\\\""));
+                let command = format!(
+                    "opencode run \"{}\"\n",
+                    assignment.task.replace('"', "\\\"")
+                );
                 let session_id = session.session_id.clone();
                 let write_result = {
                     let mut sessions = pty_state.sessions.lock().unwrap();
@@ -574,12 +651,18 @@ pub fn trigger_orchestrator_cycle(
                     }
                 }
             } else {
-                actions_taken.push(format!("No session found for instance {}", assignment.instance_id));
+                actions_taken.push(format!(
+                    "No session found for instance {}",
+                    assignment.instance_id
+                ));
             }
         }
 
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let marker = format!("[{}] [SYSTEM] HANDLED_ASSIGNMENTS: {}", ts, new_total_assignments);
+        let marker = format!(
+            "[{}] [SYSTEM] HANDLED_ASSIGNMENTS: {}",
+            ts, new_total_assignments
+        );
         let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
     }
 
@@ -587,10 +670,12 @@ pub fn trigger_orchestrator_cycle(
         let new_total = analysis.total_injections;
         let injection_text = analysis.user_injections.join(" | ");
 
-        let orchestrator_session = agent_store
-            .for_run(&run_id)
-            .into_iter()
-            .find(|session| matches!(session.config.role, crate::openflow::OpenFlowRole::Orchestrator));
+        let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
+            matches!(
+                session.config.role,
+                crate::openflow::OpenFlowRole::Orchestrator
+            )
+        });
 
         if let Some(orchestrator_session) = orchestrator_session {
             let goal_path = Orchestrator::comm_log_path(&run_id)
@@ -598,16 +683,98 @@ pub fn trigger_orchestrator_cycle(
                 .to_string()
                 .replace("communication.log", "goal.txt");
             let prompt = format!(
-                "A user message arrived during the run. Current phase: {}. User message: \"{}\". \
-                Please address this message. If it asks a question, answer it directly in the comm log. \
-                If it requests changes, replan accordingly. The goal file is at: {}",
-                phase.as_str(),
+                "A user message arrived. User message: \"{}\".\n\
+                Please address this message:\n\
+                - If it asks a question, answer it directly in the comm log.\n\
+                - If it requests changes, create ASSIGN messages to delegate work.\n\
+                - IMPORTANT: After answering or delegating, DO NOT exit. Wait for more user messages.\n\
+                Just respond to this message and wait. The goal file is at: {}",
                 injection_text,
                 goal_path
             );
 
-            let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
             let session_id = orchestrator_session.session_id.clone();
+
+            // Check if orchestrator PTY session is still alive
+            let orchestrator_alive = {
+                let sessions = pty_state.sessions.lock().unwrap();
+                let session_exists = sessions.get(&session_id).is_some();
+                let is_ready = sessions
+                    .get(&session_id)
+                    .map(|pty_runtime| {
+                        matches!(
+                            pty_runtime.last_status.state,
+                            crate::terminal::TerminalLifecycleState::Ready
+                        )
+                    })
+                    .unwrap_or(false);
+
+                #[cfg(debug_assertions)]
+                crate::diagnostics::stderr_line(&format!(
+                    "[DEBUG] Orchestrator session {} exists={}, state={:?}",
+                    session_id,
+                    session_exists,
+                    sessions
+                        .get(&session_id)
+                        .map(|r| r.last_status.state.clone())
+                ));
+
+                is_ready
+            };
+
+            // If orchestrator is not alive, respawn it
+            if !orchestrator_alive {
+                #[cfg(debug_assertions)]
+                crate::diagnostics::stderr_line(&format!(
+                    "[DEBUG] Orchestrator session {} is not alive, respawning...",
+                    session_id
+                ));
+
+                // Get workspace ID from app state
+                let workspace_id = app
+                    .state::<AppStateStore>()
+                    .workspace_id_for_session(&session_id)
+                    .map(|id| id.0)
+                    .unwrap_or_else(|| "default".to_string());
+
+                // Use the run's working directory if available, otherwise use default
+                // The orchestrator will use its configured working directory
+                let working_directory = ".".to_string();
+
+                // Create spawn spec for orchestrator
+                let adapter = OpenCodeAdapter;
+                let spec = adapter.spawn_spec(
+                    &orchestrator_session.config,
+                    &run_id,
+                    &Orchestrator::comm_log_path(&run_id).display().to_string(),
+                    &goal_path,
+                    &working_directory,
+                );
+
+                // Spawn new PTY for orchestrator
+                crate::terminal::spawn_pty_for_agent(
+                    app.clone(),
+                    session_id.clone(),
+                    workspace_id,
+                    spec.argv,
+                    spec.env.clone(),
+                    spec.execution_policy.clone(),
+                );
+
+                // Give the new process a moment to start
+                std::thread::sleep(std::time::Duration::from_millis(500));
+
+                actions_taken.push("Respawned orchestrator for user injection".to_string());
+            }
+
+            let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
+
+            #[cfg(debug_assertions)]
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] About to write to orchestrator PTY, session_id={}",
+                session_id
+            ));
+
             let write_result = {
                 let mut sessions = pty_state.sessions.lock().unwrap();
                 if let Some(pty_runtime) = sessions.get_mut(&session_id) {
@@ -645,15 +812,11 @@ pub fn trigger_orchestrator_cycle(
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
+        // Write INJECTION_PENDING to track that we sent this to orchestrator
+        // This is different from HANDLED - it means "waiting for response"
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let ack = format!(
-            "[{}] [ORCHESTRATOR] Received user message: \"{}\". Processing...",
-            ts, injection_text
-        );
-        let _ = Orchestrator::write_to_comm_log(&run_id, &ack);
-
-        let marker = format!("[{}] [SYSTEM] HANDLED_INJECTIONS: {}", ts, new_total);
-        let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
+        let pending_marker = format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, new_total);
+        let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
 
         Some(OrchestratorPhase::Replanning)
     } else {
@@ -661,8 +824,13 @@ pub fn trigger_orchestrator_cycle(
             let sessions = agent_store.for_run(&run_id);
             let mut counts = std::collections::HashMap::new();
             for session in &sessions {
-                if !matches!(session.config.role, crate::openflow::OpenFlowRole::Orchestrator) {
-                    *counts.entry(session.config.role.as_str().to_string()).or_insert(0) += 1;
+                if !matches!(
+                    session.config.role,
+                    crate::openflow::OpenFlowRole::Orchestrator
+                ) {
+                    *counts
+                        .entry(session.config.role.as_str().to_string())
+                        .or_insert(0) += 1;
                 }
             }
             counts
@@ -778,13 +946,19 @@ pub fn stop_openflow_run(
     let record = store.stop_run(&run_id, status, reason)?;
 
     let agent_sessions = agent_store.for_run(&run_id);
-    let session_ids: Vec<String> = agent_sessions.iter().map(|session| session.session_id.clone()).collect();
+    let session_ids: Vec<String> = agent_sessions
+        .iter()
+        .map(|session| session.session_id.clone())
+        .collect();
     let openflow_workspace_id = session_ids
         .first()
         .and_then(|session_id| app_state.workspace_id_for_session(session_id));
 
     {
-        let mut sessions_guard = terminal_state.sessions.lock().unwrap_or_else(|error| error.into_inner());
+        let mut sessions_guard = terminal_state
+            .sessions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for session_id in &session_ids {
             sessions_guard.remove(session_id);
         }
@@ -797,7 +971,11 @@ pub fn stop_openflow_run(
 
     let _ = store.remove_run(&run_id);
     agent_store.remove_for_run(&run_id);
-    crate::terminal::release_comm_log_lock(Orchestrator::comm_log_path(&run_id).to_string_lossy().as_ref());
+    crate::terminal::release_comm_log_lock(
+        Orchestrator::comm_log_path(&run_id)
+            .to_string_lossy()
+            .as_ref(),
+    );
 
     crate::state::emit_app_state(&app);
     Ok(record)
