@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::net::{TcpListener, ToSocketAddrs};
 use tauri::{Manager, State};
 
-const STUCK_RESCUE_CYCLES: u32 = 5;
+const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 5;
+const PLANNING_STUCK_RESCUE_CYCLES: u32 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
@@ -58,6 +59,8 @@ pub struct OrchestratorTriggerResult {
     pub analysis: OrchestratorAnalysisDto,
     pub actions_taken: Vec<String>,
     pub comm_log_offset: usize,
+    pub orchestration_state: String,
+    pub orchestration_detail: Option<String>,
 }
 
 fn which_tool(name: &str) -> Option<String> {
@@ -108,6 +111,105 @@ fn session_working_directory(app_state: &AppStateStore, session_id: &str) -> Str
         .find(|session| session.session_id.0 == session_id)
         .map(|session| session.cwd)
         .unwrap_or_else(|| ".".to_string())
+}
+
+fn write_prompt_to_session(
+    pty_state: &crate::terminal::PtyState,
+    session_id: &str,
+    prompt: &str,
+) -> Result<(), String> {
+    let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
+    let mut sessions = pty_state.sessions.lock().unwrap();
+    if let Some(pty_runtime) = sessions.get_mut(session_id) {
+        if let Some(writer) = pty_runtime.writer.as_mut() {
+            use std::io::Write;
+            writer
+                .write_all(command.as_bytes())
+                .and_then(|_| writer.flush())
+                .map_err(|error| format!("PTY write error: {error}"))
+        } else {
+            Err(format!("No writer for session {session_id}"))
+        }
+    } else {
+        Err(format!("Session {session_id} not found in PtyState"))
+    }
+}
+
+fn has_recent_invalid_delegation_pattern(
+    entries: &[crate::openflow::orchestrator::CommLogEntry],
+) -> bool {
+    entries.iter().rev().take(24).any(|entry| {
+        if !entry.role.eq_ignore_ascii_case("orchestrator") {
+            return false;
+        }
+
+        let lower = entry.message.to_lowercase();
+        lower.contains("general agent")
+            || lower.contains("schema validation failure")
+            || lower.contains("task failed")
+            || lower.contains("must start with \"ses\"")
+    })
+}
+
+fn orchestration_state_from_cycle(
+    phase: &OrchestratorPhase,
+    analysis: &OrchestratorAnalysis,
+    actions_taken: &[String],
+) -> (String, Option<String>) {
+    if actions_taken.iter().any(|action| action.contains("delegation-correction")) {
+        return (
+            "correcting_delegation".to_string(),
+            Some("Correcting invalid orchestration behavior".to_string()),
+        );
+    }
+
+    if actions_taken.iter().any(|action| action.contains("stuck-run nudge")) {
+        return (
+            "stalled".to_string(),
+            Some("Run has not advanced and was nudged".to_string()),
+        );
+    }
+
+    if !analysis.blocked_roles.is_empty() {
+        return (
+            "blocked".to_string(),
+            Some("One or more agents reported BLOCKED".to_string()),
+        );
+    }
+
+    if actions_taken
+        .iter()
+        .any(|action| action.contains("Waiting for orchestrator response"))
+        || (!analysis.user_injections.is_empty() && analysis.injections_to_forward.is_empty())
+    {
+        return (
+            "waiting_for_response".to_string(),
+            Some("Waiting for orchestrator response to user input".to_string()),
+        );
+    }
+
+    match phase {
+        OrchestratorPhase::Planning | OrchestratorPhase::Assigning => {
+            ("active".to_string(), Some("Planning orchestration".to_string()))
+        }
+        OrchestratorPhase::Executing | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing => {
+            ("active".to_string(), Some("Executing orchestration".to_string()))
+        }
+        OrchestratorPhase::WaitingApproval => {
+            ("idle".to_string(), Some("Waiting for approval".to_string()))
+        }
+        OrchestratorPhase::Completed => (
+            "idle".to_string(),
+            Some("Run completed; awaiting next user action".to_string()),
+        ),
+        OrchestratorPhase::Blocked => (
+            "error".to_string(),
+            Some("Run is blocked and needs intervention".to_string()),
+        ),
+        OrchestratorPhase::Replanning => {
+            ("active".to_string(), Some("Replanning after new information".to_string()))
+        }
+    }
 }
 
 fn ensure_agent_session_live(
@@ -765,6 +867,70 @@ pub async fn trigger_orchestrator_cycle(
         let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
     }
 
+    let stuck_state_for_probe = runtime.get_stuck_state(&run_id);
+    let invalid_delegation_detected = analysis.instance_assignments.is_empty()
+        && has_recent_invalid_delegation_pattern(entries.as_slice());
+
+    if invalid_delegation_detected && !stuck_state_for_probe.probe_injected {
+        if let Some(ref orchestrator_session) = orchestrator_session {
+            if ensure_agent_session_live(
+                &app,
+                &app_state,
+                &agent_store,
+                &pty_state,
+                &run_id,
+                orchestrator_session,
+            )? {
+                actions_taken.push("Respawned orchestrator session for delegation correction".to_string());
+            }
+
+            let correction_prompt = "Your last attempt used invalid internal delegation. Stop using General Agent / Task delegation. Coordinate only through literal standalone lines of the form `ASSIGN <INSTANCE-ID>: <task>` using the exact IDs from the AGENTS line. If you cannot delegate yet, write `STATUS:` or `BLOCKED:` with the exact reason. Do this now.";
+
+            match write_prompt_to_session(&pty_state, &orchestrator_session.session_id, correction_prompt) {
+                Ok(()) => {
+                    runtime.mark_probe_sent(&run_id);
+                    actions_taken.push("Sent delegation-correction prompt to orchestrator".to_string());
+                }
+                Err(error) => {
+                    actions_taken.push(format!("Failed to send delegation-correction prompt: {}", error));
+                }
+            }
+        }
+    }
+
+    if stuck_state_for_probe.consecutive_no_progress_cycles >= 4
+        && !stuck_state_for_probe.probe_injected
+    {
+        if let Some(ref orchestrator_session) = orchestrator_session {
+            if ensure_agent_session_live(
+                &app,
+                &app_state,
+                &agent_store,
+                &pty_state,
+                &run_id,
+                orchestrator_session,
+            )? {
+                actions_taken.push("Respawned orchestrator session for stuck-run nudge".to_string());
+            }
+
+            let probe_prompt = "OpenFlow appears stuck. Do one of these now:\n\
+                 - emit literal standalone ASSIGN lines for the real OpenFlow agent instance IDs from the AGENTS line, or\n\
+                 - write STATUS: with what you are waiting on, or\n\
+                 - write BLOCKED: with the exact reason.\n\
+                 Do NOT use internal General Agent or Task delegation. Keep this generic to the user's project type; only mention an app URL if the task actually involves a live preview.";
+
+            match write_prompt_to_session(&pty_state, &orchestrator_session.session_id, &probe_prompt) {
+                Ok(()) => {
+                    runtime.mark_probe_sent(&run_id);
+                    actions_taken.push("Sent stuck-run nudge to orchestrator".to_string());
+                }
+                Err(error) => {
+                    actions_taken.push(format!("Failed to send stuck-run nudge: {}", error));
+                }
+            }
+        }
+    }
+
     let next_phase = if !analysis.user_injections.is_empty() {
         let injection_text = analysis.injections_to_forward.join(" | ");
 
@@ -794,30 +960,13 @@ pub async fn trigger_orchestrator_cycle(
                 );
 
                 let session_id = orchestrator_session.session_id.clone();
-
-                let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
                 #[cfg(debug_assertions)]
                 crate::diagnostics::stderr_line(&format!(
                     "[DEBUG] About to write to orchestrator PTY, session_id={}",
                     session_id
                 ));
 
-                let write_result = {
-                    let mut sessions = pty_state.sessions.lock().unwrap();
-                    if let Some(pty_runtime) = sessions.get_mut(&session_id) {
-                        if let Some(writer) = pty_runtime.writer.as_mut() {
-                            use std::io::Write;
-                            writer
-                                .write_all(command.as_bytes())
-                                .and_then(|_| writer.flush())
-                                .map_err(|error| format!("PTY write error: {error}"))
-                        } else {
-                            Err(format!("No writer for session {session_id}"))
-                        }
-                    } else {
-                        Err(format!("Session {session_id} not found in PtyState"))
-                    }
-                };
+                let write_result = write_prompt_to_session(&pty_state, &session_id, &prompt);
 
                 match write_result {
                     Ok(()) => {
@@ -840,14 +989,20 @@ pub async fn trigger_orchestrator_cycle(
                         actions_taken.push(format!("Failed to reach orchestrator PTY: {}", error));
                     }
                 }
-            } else {
+            } else if analysis.last_pending_injections > analysis.last_handled_injections {
                 actions_taken.push("Waiting for orchestrator response to earlier user message".to_string());
+            } else {
+                actions_taken.push("User message is present but there was nothing new to forward".to_string());
             }
         } else {
             actions_taken.push("No orchestrator session found; injection logged only".to_string());
         }
 
-        Some(OrchestratorPhase::Replanning)
+        if !analysis.injections_to_forward.is_empty() {
+            Some(OrchestratorPhase::Replanning)
+        } else {
+            None
+        }
     } else {
         let instance_counts: std::collections::HashMap<String, usize> = {
             let sessions = agent_store.for_run(&run_id);
@@ -950,10 +1105,16 @@ pub async fn trigger_orchestrator_cycle(
             updated_stuck_state.rescue_attempted
         ));
 
-        if updated_stuck_state.consecutive_no_progress_cycles >= STUCK_RESCUE_CYCLES
-            && !updated_stuck_state.rescue_attempted
-            && matches!(phase, OrchestratorPhase::Executing)
-        {
+    let stuck_rescue_threshold = if matches!(phase, OrchestratorPhase::Planning | OrchestratorPhase::Assigning) {
+        PLANNING_STUCK_RESCUE_CYCLES
+    } else {
+        ACTIVE_STUCK_RESCUE_CYCLES
+    };
+
+    if updated_stuck_state.consecutive_no_progress_cycles >= stuck_rescue_threshold
+        && !updated_stuck_state.rescue_attempted
+        && matches!(phase, OrchestratorPhase::Executing | OrchestratorPhase::Replanning | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing)
+    {
             let all_sessions = agent_store.for_run(&run_id);
             let mut rescued_any = false;
 
@@ -1035,7 +1196,29 @@ pub async fn trigger_orchestrator_cycle(
     #[cfg(debug_assertions)]
     crate::diagnostics::stderr_line(&format!("[DEBUG] next_phase={:?}", next_phase));
 
-    if let Some(ref new_phase) = next_phase {
+    let (orchestration_state, orchestration_detail) =
+        orchestration_state_from_cycle(&phase, &analysis, &actions_taken);
+    let _ = runtime.set_orchestration_state(
+        &run_id,
+        match orchestration_state.as_str() {
+            "correcting_delegation" => crate::openflow::OpenFlowOrchestrationState::CorrectingDelegation,
+            "waiting_for_response" => crate::openflow::OpenFlowOrchestrationState::WaitingForResponse,
+            "stalled" => crate::openflow::OpenFlowOrchestrationState::Stalled,
+            "blocked" => crate::openflow::OpenFlowOrchestrationState::Blocked,
+            "idle" => crate::openflow::OpenFlowOrchestrationState::Idle,
+            "error" => crate::openflow::OpenFlowOrchestrationState::Error,
+            _ => crate::openflow::OpenFlowOrchestrationState::Active,
+        },
+        orchestration_detail.clone(),
+    );
+
+    if matches!(phase, OrchestratorPhase::Blocked) {
+        runtime.set_orchestration_state(
+            &run_id,
+            crate::openflow::OpenFlowOrchestrationState::Blocked,
+            Some("Run is blocked and requires manual intervention".to_string()),
+        )?;
+    } else if let Some(ref new_phase) = next_phase {
         let new_status = match new_phase {
             OrchestratorPhase::Planning => OpenFlowRunStatus::Planning,
             OrchestratorPhase::Assigning => OpenFlowRunStatus::Planning,
@@ -1056,6 +1239,8 @@ pub async fn trigger_orchestrator_cycle(
         analysis: analysis_dto(&analysis),
         actions_taken,
         comm_log_offset: new_offset,
+        orchestration_state,
+        orchestration_detail,
     })
 }
 

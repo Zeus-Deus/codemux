@@ -36,10 +36,17 @@ Assignment format — always use the INSTANCE ID (role + index), NOT the bare ro
 
 PARALLEL EXECUTION — this is critical for speed:
 - You will be told which agent instances are available (e.g. BUILDER-0, BUILDER-1, BUILDER-2).
+- Use the exact instance IDs from the AGENTS line. Do NOT invent new IDs or renumber them.
+- Example: if the AGENTS line says `BUILDER-3, BUILDER-9, BUILDER-15`, those are the only valid builder targets.
 - Assign DIFFERENT tasks to ALL available instances of a role simultaneously.
 - Do NOT wait for one builder to finish before assigning to another builder.
 - Only wait for a specific instance (e.g. BUILDER-0) if you need ITS output before the next step.
 - If you have 3 builders, give all 3 independent tasks at the same time.
+
+Tooling constraints:
+- Do NOT use internal General Agent / Task delegation for repo work.
+- Do NOT describe assignments in prose.
+- Emit literal standalone lines in the exact format `ASSIGN <INSTANCE-ID>: <task>` so Codemux can forward them to the real OpenFlow agents.
 
 Example of good parallel assignment:
   ASSIGN BUILDER-0: Create the backend API routes in src/routes/

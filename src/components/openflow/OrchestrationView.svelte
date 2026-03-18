@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onDestroy } from 'svelte';
-    import { openflowRuntime, advanceOpenFlowRunPhase, retryOpenFlowRun, runOpenFlowAutonomousLoop, stopOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset } from '../../stores/openflow';
-    import type { AgentSessionState } from '../../stores/types';
+    import { openflowRuntime, retryOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset } from '../../stores/openflow';
+    import type { AgentSessionState, OrchestratorTriggerResult } from '../../stores/types';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph from './NodeGraph.svelte';
     import BrowserPane from '../panes/BrowserPane.svelte';
@@ -32,6 +32,7 @@
     let showBrowser = $state(false);
     let commLogPollingInProgress = false;
     let orchestratorPollingInProgress = false;
+    let lastOrchestratorResult = $state<OrchestratorTriggerResult | null>(null);
     
     // Resizable panel state
     let isDragging = $state(false);
@@ -58,6 +59,12 @@
         document.removeEventListener('mouseup', stopResize);
     });
 
+    async function runOrchestratorCycle(currentRunId: string) {
+        const result = await triggerOrchestratorCycle(currentRunId);
+        lastOrchestratorResult = result;
+        return result;
+    }
+
     // Auto-trigger orchestration on mount
     $effect(() => {
         if (runId) {
@@ -65,7 +72,7 @@
             initialTimeoutId = setTimeout(() => {
                 initialTimeoutId = null;
                 if (runId) {
-                    triggerOrchestratorCycle(runId).catch(console.error);
+                    runOrchestratorCycle(runId).catch(console.error);
                 }
             }, INITIAL_ORCHESTRATOR_DELAY_MS);
 
@@ -79,7 +86,7 @@
                 }
                 if (!orchestratorPollingInProgress) {
                     orchestratorPollingInProgress = true;
-                    triggerOrchestratorCycle(runId).catch(e =>
+                    runOrchestratorCycle(runId).catch(e =>
                         console.error('[OpenFlow] Orchestration error:', e)
                     ).finally(() => {
                         orchestratorPollingInProgress = false;
@@ -103,6 +110,7 @@
     $effect(() => {
         if (runId) {
             agentSessions = [];
+            lastOrchestratorResult = null;
             commLogStore.set([]); // Clear shared store when switching runs
             clearCommLogOffset(runId); // Reset offset for new run
             getAgentSessionsForRun(runId).then(sessions => {
@@ -156,49 +164,49 @@
         return null;
     });
 
-    async function handleLoop() {
-        if (!runId) return;
-        try {
-            await runOpenFlowAutonomousLoop(runId);
-        } catch (e) {
-            console.error('Loop error:', e);
-        }
-    }
+    const orchestrationHealth = $derived.by(() => {
+        const state = run ? ((run as any).orchestration_state as string | null) : null;
+        const detail = run ? ((run as any).orchestration_detail as string | null) : null;
+        if (!state) return null;
 
-    async function handleNext() {
-        if (!runId) return;
-        try {
-            await advanceOpenFlowRunPhase(runId);
-        } catch (e) {
-            console.error('Advance error:', e);
+        switch (state) {
+            case 'correcting_delegation':
+                return { tone: 'warning', label: 'Correcting Orchestrator', detail: detail ?? 'Fixing invalid delegation pattern' };
+            case 'waiting_for_response':
+                return { tone: 'info', label: 'Waiting On Reply', detail: detail ?? 'The last user message is pending an orchestrator response' };
+            case 'stalled':
+                return { tone: 'warning', label: 'Orchestrator Stalled', detail: detail ?? 'The orchestrator has not made progress recently' };
+            case 'blocked':
+                return { tone: 'danger', label: 'Orchestrator Blocked', detail: detail ?? 'An agent reported a blocking issue' };
+            case 'error':
+                return { tone: 'danger', label: 'Orchestrator Error', detail: detail ?? 'The orchestrator hit an error' };
+            case 'active':
+                return { tone: 'info', label: 'OpenFlow Active', detail: detail ?? 'Orchestration is active' };
+            case 'idle':
+                return { tone: 'info', label: 'OpenFlow Idle', detail: detail ?? 'Waiting for the next action' };
+            case 'initializing':
+            default:
+                return { tone: 'info', label: 'OpenFlow Starting', detail: detail ?? 'Run is initializing' };
         }
-    }
+    });
 
     async function handleOrchestrate() {
         if (!runId) return;
         try {
-            const result = await triggerOrchestratorCycle(runId);
+            const result = await runOrchestratorCycle(runId);
             console.log('Orchestrator result:', result);
         } catch (e) {
             console.error('Orchestrator error:', e);
         }
     }
 
-    async function handlePause() {
+    async function refreshOrchestrator() {
         if (!runId) return;
         try {
-            await stopOpenFlowRun(runId, 'awaiting_approval', 'Paused by user');
+            const result = await runOrchestratorCycle(runId);
+            console.log('Refresh result:', result);
         } catch (e) {
-            console.error('Pause error:', e);
-        }
-    }
-
-    async function handleCancel() {
-        if (!runId) return;
-        try {
-            await stopOpenFlowRun(runId, 'cancelled', 'Cancelled by user');
-        } catch (e) {
-            console.error('Cancel error:', e);
+            console.error('Refresh error:', e);
         }
     }
 
@@ -220,11 +228,6 @@
         }
     }
 
-    function shortenModel(modelId: string): string {
-        const parts = modelId.split('/');
-        return parts.length > 1 ? parts[parts.length - 1] : modelId;
-    }
-
     function toggleBrowser() {
         showBrowser = !showBrowser;
     }
@@ -243,17 +246,17 @@
                 {#if appUrl}
                     <span class="app-url-badge">{appUrl}</span>
                 {/if}
+                {#if orchestrationHealth}
+                    <span class="health-badge {orchestrationHealth.tone}" title={orchestrationHealth.detail}>
+                        {orchestrationHealth.label}
+                    </span>
+                {/if}
             </div>
             <div class="orch-controls">
                 <button class="control-btn" type="button" onclick={toggleBrowser}>{showBrowser ? 'Orchestration' : 'Browser'}</button>
-                {#if run && run.status !== 'completed' && run.status !== 'cancelled' && run.status !== 'failed'}
-                    <button class="control-btn" type="button" onclick={handleOrchestrate}>Orchestrate</button>
-                    <button class="control-btn" type="button" onclick={handleLoop}>Loop</button>
-                    <button class="control-btn" type="button" onclick={handleNext}>Next</button>
-                    <button class="control-btn" type="button" onclick={handlePause}>Pause</button>
-                    <button class="control-btn danger" type="button" onclick={handleCancel}>Cancel</button>
-                {:else if run}
-                    <button class="control-btn" type="button" onclick={handleRetry}>Retry</button>
+                <button class="control-btn" type="button" onclick={refreshOrchestrator}>Refresh</button>
+                {#if run && ((run as any).orchestration_state === 'blocked' || (run as any).orchestration_state === 'stalled')}
+                    <button class="control-btn accent" type="button" onclick={handleOrchestrate}>Re-prime</button>
                 {/if}
                 {#if run && (run.status === 'awaiting_approval' || run.current_phase === 'review')}
                     <button class="control-btn accent" type="button" onclick={handleApprove}>Approve</button>
@@ -346,6 +349,32 @@
         color: var(--ui-text-primary);
         font-size: 0.78rem;
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .health-badge {
+        display: inline-flex;
+        align-items: center;
+        margin-left: 12px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        font-size: 0.78rem;
+        color: var(--ui-text-primary);
+        border: 1px solid transparent;
+    }
+
+    .health-badge.info {
+        background: color-mix(in srgb, var(--ui-accent) 12%, var(--ui-layer-1));
+        border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+    }
+
+    .health-badge.warning {
+        background: color-mix(in srgb, var(--ui-attention) 14%, var(--ui-layer-1));
+        border-color: color-mix(in srgb, var(--ui-attention) 30%, transparent);
+    }
+
+    .health-badge.danger {
+        background: color-mix(in srgb, var(--ui-danger) 14%, var(--ui-layer-1));
+        border-color: color-mix(in srgb, var(--ui-danger) 30%, transparent);
     }
 
     .orch-info {

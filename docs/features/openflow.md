@@ -10,6 +10,8 @@
 
 OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a first-class workspace or run type inside Codemux while keeping a modular runtime boundary that could be reused elsewhere later.
 
+It must remain project-agnostic: web apps are only one test case, not the product boundary. Orchestration, follow-up handling, stuck detection, and delegation rules should work for any repo and any language/toolchain.
+
 ## What Works Today
 
 - OpenFlow workspace and orchestration UI shell exist
@@ -23,6 +25,7 @@ OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a f
 - agent wrappers stay alive after the first `opencode run`, so orchestrator and workers can accept later prompts inside the same run
 - user injections from the communication panel now wake orchestration immediately, completed runs can re-enter replanning on follow-up messages, and missing orchestrator PTYs are respawned when possible
 - injection handling now waits for an actual orchestrator response before a user message is considered handled
+- orchestrator phase transitions now key off literal `ASSIGN ...` lines instead of vague prose about assigning work
 - comm-log rotation now preserves the run header lines (`GOAL`, `APP_URL`, `AGENTS`) so long runs keep their core context
 - pausing a run now keeps the run and workspace alive instead of tearing them down immediately
 
@@ -32,6 +35,8 @@ OpenFlow is Codemux's multi-agent orchestration layer. It should behave like a f
 - browser view inside the OpenFlow workspace is still not the final integrated experience
 - user questions versus change requests are not handled as cleanly as they should be
 - pause/resume semantics are better than before but still need a cleaner explicit suspended-state model
+- the top-bar controls are being simplified toward a smaller primary set for everyday use
+- planning-phase stalls now wait longer before auto-rescue, so a fresh run does not immediately look stuck
 - dev-time lifecycle issues and single-instance hardening still need work
 
 ## Constraints

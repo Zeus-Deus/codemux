@@ -197,10 +197,13 @@ impl Orchestrator {
     /// Accepts both "ASSIGN BUILDER-0: task" and legacy "ASSIGN BUILDER: task".
     /// Returns None if the message is not an ASSIGN directive.
     pub fn parse_assign_message(msg: &str) -> Option<InstanceAssignment> {
-        // Find the ASSIGN keyword (case-insensitive)
-        let upper = msg.to_uppercase();
-        let assign_pos = upper.find("ASSIGN ")?;
-        let rest = &msg[assign_pos + 7..].trim_start();
+        let trimmed = msg.trim();
+        let upper = trimmed.to_uppercase();
+        if !upper.starts_with("ASSIGN ") {
+            return None;
+        }
+
+        let rest = &trimmed[7..].trim_start();
 
         // Split on ':' to get "BUILDER-0" and "task description"
         let colon = rest.find(':')?;
@@ -215,6 +218,10 @@ impl Orchestrator {
             instance_id: raw_target.to_lowercase(),
             task,
         })
+    }
+
+    pub fn parse_assign_messages(msg: &str) -> Vec<InstanceAssignment> {
+        msg.lines().filter_map(Self::parse_assign_message).collect()
     }
 
     pub fn analyze_comm_log(entries: &[CommLogEntry]) -> OrchestratorAnalysis {
@@ -245,15 +252,21 @@ impl Orchestrator {
                     blocked.push(role);
                 }
                 blocked_instances.push(role_lower.clone());
-            } else if entry.message.to_lowercase().contains("assign ")
-                || entry.message.to_lowercase().contains("assign:")
-            {
-                assignments.push(entry.message.clone());
-                // Also parse as an instance-level assignment when it originates from orchestrator
-                if role_lower == "orchestrator" {
-                    if let Some(ia) = Self::parse_assign_message(&entry.message) {
-                        all_instance_assignments.push(ia);
-                    }
+            } else if role_lower == "orchestrator" {
+                let parsed_assignments = Self::parse_assign_messages(&entry.message);
+                if !parsed_assignments.is_empty() {
+                    assignments.extend(parsed_assignments.iter().map(|assignment| {
+                        format!(
+                            "ASSIGN {}: {}",
+                            assignment.instance_id.to_uppercase(),
+                            assignment.task
+                        )
+                    }));
+                    all_instance_assignments.extend(parsed_assignments);
+                } else if entry.message.to_lowercase().contains("run complete") {
+                    status_updates.push(entry.message.clone());
+                } else if entry.message.to_lowercase().starts_with("status:") {
+                    status_updates.push(entry.message.clone());
                 }
             } else if entry.message.to_lowercase().contains("run complete") {
                 status_updates.push(entry.message.clone());
@@ -648,6 +661,17 @@ mod tests {
         assert!(analysis.injections_to_forward.is_empty());
         assert_eq!(analysis.last_pending_injections, 1);
         assert!(analysis.orchestrator_responded_to_pending);
+    }
+
+    #[test]
+    fn parse_assign_messages_only_accepts_literal_assign_lines() {
+        let parsed = Orchestrator::parse_assign_messages(
+            "Assigning parallel tasks:\nASSIGN BUILDER-9: Create the UI\nI will assign testers next",
+        );
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].instance_id, "builder-9");
+        assert_eq!(parsed[0].task, "Create the UI");
     }
 
     #[test]

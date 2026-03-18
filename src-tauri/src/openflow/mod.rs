@@ -65,6 +65,19 @@ pub enum OpenFlowRunStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum OpenFlowOrchestrationState {
+    Initializing,
+    Active,
+    WaitingForResponse,
+    CorrectingDelegation,
+    Stalled,
+    Blocked,
+    Idle,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum OpenFlowTaskStatus {
     Pending,
     Ready,
@@ -231,6 +244,8 @@ pub struct OpenFlowRunRecord {
     pub command_validation_required: bool,
     pub reviewer_score: Option<u8>,
     pub stop_reason: Option<String>,
+    pub orchestration_state: OpenFlowOrchestrationState,
+    pub orchestration_detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -451,6 +466,8 @@ impl OpenFlowRuntimeStore {
             command_validation_required: true,
             reviewer_score: None,
             stop_reason: None,
+            orchestration_state: OpenFlowOrchestrationState::Initializing,
+            orchestration_detail: Some("Run is initializing".into()),
         };
         snapshot.active_runs.push(run.clone());
         run
@@ -579,6 +596,24 @@ impl OpenFlowRuntimeStore {
                 run.retry_policy.current_attempt, run.retry_policy.max_attempts
             ),
         });
+        Ok(run.clone())
+    }
+
+    pub fn set_orchestration_state(
+        &self,
+        run_id: &str,
+        state: OpenFlowOrchestrationState,
+        detail: Option<String>,
+    ) -> Result<OpenFlowRunRecord, String> {
+        let mut snapshot = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let run = snapshot
+            .active_runs
+            .iter_mut()
+            .find(|run| run.run_id == run_id)
+            .ok_or_else(|| format!("No OpenFlow run found for {run_id}"))?;
+
+        run.orchestration_state = state;
+        run.orchestration_detail = detail;
         Ok(run.clone())
     }
 

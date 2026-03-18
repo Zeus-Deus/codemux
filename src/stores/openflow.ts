@@ -147,5 +147,22 @@ export async function triggerOrchestratorCycle(runId: string): Promise<Orchestra
         await refreshOpenFlowRuntime();
     }
 
+    const snapshot = await syncOpenFlowRuntime();
+    const updatedRun = snapshot.active_runs.find(run => run.run_id === runId);
+    if (updatedRun) {
+        (result as OrchestratorTriggerResult & {
+            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
+            orchestration_detail?: string | null;
+        }).orchestration_state = (updatedRun as unknown as {
+            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
+        }).orchestration_state ?? 'active';
+        (result as OrchestratorTriggerResult & {
+            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
+            orchestration_detail?: string | null;
+        }).orchestration_detail = (updatedRun as unknown as {
+            orchestration_detail?: string | null;
+        }).orchestration_detail ?? null;
+    }
+
     return result;
 }

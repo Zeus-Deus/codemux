@@ -29,7 +29,7 @@ The repo structure is now cleaner than the earlier prototype shape suggested:
 
 - browser pane: screenshot-driven Chromium via `agent-browser`, shared with CLI commands, not a native embedded Tauri webview
 - browser automation: usable through explicit CLI commands, but fidelity and manual validation still need work
-- OpenFlow: real agent PTYs, shared communication logs, per-run app URLs, and orchestration UI exist; follow-up user messages, persistent agent wrappers, and non-destructive pause behavior are better than before, but large-run reliability and a cleaner suspended-state model still need hardening
+- OpenFlow: real agent PTYs, shared communication logs, per-run app URLs, and orchestration UI exist; follow-up user messages, persistent agent wrappers, non-destructive pause behavior, explicit stalled/blocked orchestration states, and slower planning-phase rescue thresholds are better than before, but large-run reliability and a cleaner suspended-state model still need hardening
 - browser console log capture is not yet a complete live stream from the displayed pane
 - notification sound toggle exists, but actual sound playback is not implemented
 

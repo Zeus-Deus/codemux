@@ -147,6 +147,8 @@ export interface OpenFlowRunRecord {
     command_validation_required: boolean;
     reviewer_score: number | null;
     stop_reason: string | null;
+    orchestration_state: 'initializing' | 'active' | 'waiting_for_response' | 'correcting_delegation' | 'stalled' | 'idle' | 'error';
+    orchestration_detail: string | null;
 }
 
 export interface OpenFlowRuntimeSnapshot {
@@ -283,4 +285,6 @@ export interface OrchestratorTriggerResult {
     };
     actions_taken: string[];
     comm_log_offset: number;
+    orchestration_state: OpenFlowRunRecord['orchestration_state'];
+    orchestration_detail: string | null;
 }

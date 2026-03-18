@@ -13,38 +13,51 @@
     let newMessage = $state('');
     let messagesContainer: HTMLDivElement;
     let injectError = $state<string | null>(null);
+    let autoFollow = $state(true);
+    let showJumpToLatest = $state(false);
 
     // Subscribe to the shared store — OrchestrationView owns the single polling interval.
     // Limit to last 100 messages for performance with 20+ agents
     const messages = $derived($commLogStore.slice(-100));
 
-    // Auto-scroll to bottom when new messages arrive, but debounced to prevent thrashing
-    let lastScrollHeight = $state(0);
-    let isUserNearBottom = $state(true);
-    
     $effect(() => {
         const _len = messages.length;
         const container = messagesContainer;
         if (!container) return;
-        
-        // Check if user is near bottom before auto-scrolling
-        const scrollBottom = container.scrollTop + container.clientHeight;
-        const threshold = 100; // pixels from bottom
-        isUserNearBottom = scrollBottom >= container.scrollHeight - threshold;
-        
+
         tick().then(() => {
-            // Only auto-scroll if user is near bottom (or it's the first load)
-            if (isUserNearBottom || messages.length < 10) {
+            if (autoFollow || messages.length < 10) {
                 container.scrollTop = container.scrollHeight;
+                showJumpToLatest = false;
             }
         });
     });
+
+    function syncScrollState() {
+        const container = messagesContainer;
+        if (!container) return;
+
+        const threshold = 100;
+        const nearBottom =
+            container.scrollTop + container.clientHeight >= container.scrollHeight - threshold;
+        autoFollow = nearBottom;
+        showJumpToLatest = !nearBottom;
+    }
+
+    function jumpToLatest() {
+        const container = messagesContainer;
+        if (!container) return;
+        container.scrollTop = container.scrollHeight;
+        autoFollow = true;
+        showJumpToLatest = false;
+    }
 
     async function handleSend() {
         if (!newMessage.trim() || !runId) return;
         injectError = null;
         const currentRunId = runId;
         try {
+            autoFollow = true;
             await injectOrchestratorMessage(currentRunId, newMessage.trim());
             newMessage = '';
             const injectedEntries = await getCommunicationLog(currentRunId);
@@ -52,6 +65,7 @@
             await triggerOrchestratorCycle(currentRunId);
             const followUpEntries = await getCommunicationLog(currentRunId);
             commLogStore.update(existing => mergeCommLogEntries(existing, followUpEntries));
+            tick().then(jumpToLatest);
         } catch (e) {
             console.error('Failed to inject message:', e);
             injectError = String(e);
@@ -85,10 +99,15 @@
 <div class="communication-panel">
     <div class="panel-header">
         <h3>Communication</h3>
-        <span class="badge">Live</span>
+        <div class="panel-header-actions">
+            {#if showJumpToLatest}
+                <button class="jump-btn" type="button" onclick={jumpToLatest}>Latest</button>
+            {/if}
+            <span class="badge">Live</span>
+        </div>
     </div>
 
-    <div class="messages" bind:this={messagesContainer}>
+    <div class="messages" bind:this={messagesContainer} onscroll={syncScrollState}>
         {#if messages.length > 0}
             {#each messages as msg}
                 <div class="message {getRoleClass(msg.role)}">
@@ -134,6 +153,12 @@
         border-bottom: 1px solid var(--ui-border-soft);
     }
 
+    .panel-header-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
     .panel-header h3 {
         margin: 0;
         font-size: 0.9rem;
@@ -150,6 +175,18 @@
         font-weight: 600;
         color: var(--ui-success);
         text-transform: uppercase;
+    }
+
+    .jump-btn {
+        padding: 6px 10px;
+        border-radius: 999px;
+        border: 1px solid color-mix(in srgb, var(--ui-accent) 30%, transparent);
+        background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.72rem;
+        font-weight: 600;
+        cursor: pointer;
     }
 
     .messages {
