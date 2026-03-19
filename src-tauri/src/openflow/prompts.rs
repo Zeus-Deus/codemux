@@ -46,7 +46,13 @@ PARALLEL EXECUTION — this is critical for speed:
 Tooling constraints:
 - Do NOT use internal General Agent / Task delegation for repo work.
 - Do NOT describe assignments in prose.
-- Emit literal standalone lines in the exact format `ASSIGN <INSTANCE-ID>: <task>` so Codemux can forward them to the real OpenFlow agents.
+- Do NOT use "echo" or any shell command to output ASSIGN lines.
+- Write ASSIGN lines DIRECTLY to your output in the exact format:
+  ASSIGN <INSTANCE-ID>: <task description>
+  Example: ASSIGN BUILDER-0: Create a hello world file
+  Example: ASSIGN TESTER-0: Write tests for the API
+  Example: ASSIGN REVIEWER-0: Review the login implementation
+- The ASSIGN line must appear as a standalone line in your response — NOT inside an echo, printf, or any other command.
 
 Example of good parallel assignment:
   ASSIGN BUILDER-0: Create the backend API routes in src/routes/
@@ -155,8 +161,15 @@ When you receive ASSIGN {instance_id}: <task>:
    d. Use `codemux browser open {app_url}` to verify the app is accessible there
    e. If verification fails, fix the issue and retry the same assigned URL
    f. Only say DONE if the app is actually accessible at the assigned app URL
-5. Say DONE: <brief summary of what you built> when complete
-6. Say BLOCKED: <reason> if you cannot proceed
+
+IMPORTANT: You MUST include the word "DONE:" in your output when finished. Format: DONE: <brief summary of what you built>
+Example: DONE: Created hello.py with print statement
+Example: DONE: Implemented user authentication in auth.js
+Example: DONE: Built REST API endpoints for /users
+
+CRITICAL: Your message must contain the word "DONE:" followed by what you completed. This is how the system knows you finished.
+
+5. Say BLOCKED: <reason> if you cannot proceed
 
 Never run commands or edit files without being assigned first.
 Never work on tasks assigned to other instance IDs.
@@ -192,6 +205,7 @@ set -uo pipefail
 
 PROMPT_PATH="${CODEMUX_SYSTEM_PROMPT_PATH:-}"
 GOAL_PATH="${CODEMUX_GOAL_PATH:-}"
+AGENTS_PATH="${CODEMUX_OPENFLOW_AGENTS_PATH:-}"
 MODEL="${OPENCODE_MODEL:-}"
 WORKING_DIR="${CODEMUX_WORKING_DIR:-}"
 ROLE="${CODEMUX_AGENT_ROLE:-}"
@@ -210,6 +224,7 @@ fi
 
 PROMPT=""
 GOAL=""
+AGENTS=""
 
 if [ -n "$PROMPT_PATH" ] && [ -f "$PROMPT_PATH" ]; then
     PROMPT=$(cat "$PROMPT_PATH")
@@ -217,6 +232,10 @@ fi
 
 if [ -n "$GOAL_PATH" ] && [ -f "$GOAL_PATH" ]; then
     GOAL=$(cat "$GOAL_PATH")
+fi
+
+if [ -n "$AGENTS_PATH" ] && [ -f "$AGENTS_PATH" ]; then
+    AGENTS=$(cat "$AGENTS_PATH")
 fi
 
 run_opencode() {
@@ -251,7 +270,19 @@ build_initial_message() {
 
 TOP-LEVEL GOAL:
 ${GOAL}
+"
+    fi
 
+    if [ -n "$AGENTS" ]; then
+        initial_message="${initial_message}
+
+AVAILABLE AGENTS (use these exact IDs when assigning work):
+${AGENTS}
+"
+    fi
+
+    if [ -n "$GOAL" ]; then
+        initial_message="${initial_message}
 Start coordinating this run now. Delegate repo work to the other agents instead of doing it yourself.
 "
     fi

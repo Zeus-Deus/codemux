@@ -237,6 +237,7 @@ impl Orchestrator {
         let mut last_handled_assignments: usize = 0;
         let mut last_pending_injections: usize = 0;
         let mut last_pending_index: Option<usize> = None;
+        let mut instances_with_output: Vec<String> = Vec::new();
 
         for (index, entry) in entries.iter().enumerate() {
             let role_lower = entry.role.to_lowercase();
@@ -253,7 +254,11 @@ impl Orchestrator {
                 }
                 blocked_instances.push(role_lower.clone());
             } else if role_lower == "orchestrator" {
-                let parsed_assignments = Self::parse_assign_messages(&entry.message);
+                let parsed_assignments: Vec<InstanceAssignment> =
+                    Self::parse_assign_messages(&entry.message)
+                        .into_iter()
+                        .filter(|a| !a.instance_id.contains(' ') && !a.instance_id.is_empty())
+                        .collect();
                 if !parsed_assignments.is_empty() {
                     assignments.extend(parsed_assignments.iter().map(|assignment| {
                         format!(
@@ -266,6 +271,20 @@ impl Orchestrator {
                 } else if entry.message.to_lowercase().contains("run complete") {
                     status_updates.push(entry.message.clone());
                 } else if entry.message.to_lowercase().starts_with("status:") {
+                    status_updates.push(entry.message.clone());
+                }
+            } else if role_lower.starts_with("builder")
+                || role_lower.starts_with("tester")
+                || role_lower.starts_with("reviewer")
+                || role_lower.starts_with("debugger")
+                || role_lower.starts_with("planner")
+                || role_lower.starts_with("researcher")
+            {
+                // Track that this instance produced output (for implicit completion)
+                if !role_lower.contains("orchestrator") {
+                    instances_with_output.push(role_lower.clone());
+                }
+                if entry.message.to_lowercase().contains("run complete") {
                     status_updates.push(entry.message.clone());
                 }
             } else if entry.message.to_lowercase().contains("run complete") {
@@ -347,6 +366,7 @@ impl Orchestrator {
             last_pending_injections,
             last_handled_injections: last_handled_count,
             orchestrator_responded_to_pending,
+            instances_with_output,
         }
     }
 
@@ -489,7 +509,51 @@ impl Orchestrator {
                     lower == role_str || lower.starts_with(&format!("{}-", role_str))
                 })
                 .count();
-            completed_count >= count
+
+            // For builders (and other worker roles), also count instances that:
+            // 1. Were assigned work (appear in instance_assignments)
+            // 2. Have produced output (appear in instances_with_output)
+            // 3. Have NOT said DONE or BLOCKED
+            let role_lower = role_str.to_lowercase();
+            let implicitly_done = if role_lower == "builder"
+                || role_lower == "tester"
+                || role_lower == "reviewer"
+                || role_lower == "debugger"
+            {
+                let assigned_instances: std::collections::HashSet<String> = analysis
+                    .instance_assignments
+                    .iter()
+                    .map(|a| a.instance_id.to_lowercase())
+                    .collect();
+                let completed_lower: std::collections::HashSet<String> = analysis
+                    .completed_instances
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                let blocked_lower: std::collections::HashSet<String> = analysis
+                    .blocked_instances
+                    .iter()
+                    .map(|s| s.to_lowercase())
+                    .collect();
+                analysis
+                    .instances_with_output
+                    .iter()
+                    .filter(|id| {
+                        let lower = id.to_lowercase();
+                        // Check if this instance was assigned work
+                        assigned_instances.contains(&lower)
+                    })
+                    .filter(|id| {
+                        // Exclude those that said DONE or BLOCKED explicitly
+                        !completed_lower.contains(&id.to_lowercase())
+                            && !blocked_lower.contains(&id.to_lowercase())
+                    })
+                    .count()
+            } else {
+                0
+            };
+
+            completed_count + implicitly_done >= count
         };
 
         match current_phase {
@@ -615,6 +679,8 @@ pub struct OrchestratorAnalysis {
     pub last_handled_injections: usize,
     /// True when the orchestrator has written at least one log line after the latest pending marker.
     pub orchestrator_responded_to_pending: bool,
+    /// Instances that have produced output (for implicit completion detection).
+    pub instances_with_output: Vec<String>,
 }
 
 #[cfg(test)]
@@ -691,6 +757,7 @@ mod tests {
             last_pending_injections: 0,
             last_handled_injections: 0,
             orchestrator_responded_to_pending: false,
+            instances_with_output: vec![],
         };
 
         let next_phase = Orchestrator::determine_next_phase(

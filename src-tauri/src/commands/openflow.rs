@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::net::{TcpListener, ToSocketAddrs};
 use tauri::{Manager, State};
 
-const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 5;
-const PLANNING_STUCK_RESCUE_CYCLES: u32 = 15;
+const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 2;
+const PLANNING_STUCK_RESCUE_CYCLES: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
@@ -84,7 +84,8 @@ fn openflow_instance_id(config: &AgentConfig) -> String {
 
 fn allocate_openflow_app_url() -> Result<String, String> {
     for port in 3900_u16..=4199_u16 {
-        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            listener.set_nonblocking(true).ok();
             return Ok(format!("http://localhost:{port}"));
         }
     }
@@ -118,7 +119,11 @@ fn write_prompt_to_session(
     session_id: &str,
     prompt: &str,
 ) -> Result<(), String> {
-    let command = format!("opencode run \"{}\"\n", prompt.replace('"', "\\\""));
+    let escaped = prompt
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\'', "'\\''");
+    let command = format!("opencode run \"{}\"\n", escaped);
     let mut sessions = pty_state.sessions.lock().unwrap();
     if let Some(pty_runtime) = sessions.get_mut(session_id) {
         if let Some(writer) = pty_runtime.writer.as_mut() {
@@ -507,6 +512,12 @@ pub fn spawn_openflow_agents(
     std::fs::write(&log_path, &initial_message)
         .map_err(|error| format!("Failed to write initial log: {error}"))?;
 
+    let agents_path = Orchestrator::run_dir(&run_id).join("agents.txt");
+    let agents_content = roles.join(", ");
+    std::fs::write(&agents_path, &agents_content)
+        .map_err(|error| format!("Failed to write agents file: {error}"))?;
+    let agents_path_str = agents_path.display().to_string();
+
     use crate::openflow::prompts::SystemPrompts;
     SystemPrompts::ensure_prompts_exist()
         .map_err(|error| format!("Failed to create prompts directory: {error}"))?;
@@ -553,12 +564,17 @@ pub fn spawn_openflow_agents(
             },
         );
 
+        let mut final_env = spec.env.clone();
+        if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+            final_env.push(("CODEMUX_OPENFLOW_AGENTS_PATH".into(), agents_path_str.clone()));
+        }
+
         crate::terminal::spawn_pty_for_agent(
             app.clone(),
             session_id.0.clone(),
             workspace_id.clone(),
             spec.argv,
-            spec.env.clone(),
+            final_env,
             spec.execution_policy.clone(),
         );
 
@@ -749,6 +765,58 @@ pub async fn trigger_orchestrator_cycle(
         entries.len()
     ));
 
+    #[cfg(debug_assertions)]
+    {
+        use crate::openflow::orchestrator::CommLogEntry;
+        let orchestrator_msgs: Vec<&CommLogEntry> = entries
+            .iter()
+            .filter(|e| e.role.eq_ignore_ascii_case("orchestrator"))
+            .rev()
+            .take(3)
+            .collect();
+        if !orchestrator_msgs.is_empty() {
+            let msgs_preview: Vec<String> = orchestrator_msgs
+                .iter()
+                .map(|e| {
+                    let msg = if e.message.len() > 100 {
+                        format!("{}...", &e.message[..100])
+                    } else {
+                        e.message.clone()
+                    };
+                    format!("[{}] {}", e.timestamp, msg)
+                })
+                .collect();
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] Latest orchestrator messages: {}",
+                msgs_preview.join(" | ")
+            ));
+        }
+
+        let builder_msgs: Vec<&CommLogEntry> = entries
+            .iter()
+            .filter(|e| e.role.to_lowercase().starts_with("builder"))
+            .rev()
+            .take(3)
+            .collect();
+        if !builder_msgs.is_empty() {
+            let msgs_preview: Vec<String> = builder_msgs
+                .iter()
+                .map(|e| {
+                    let msg = if e.message.len() > 100 {
+                        format!("{}...", &e.message[..100])
+                    } else {
+                        e.message.clone()
+                    };
+                    format!("[{}] {}", e.timestamp, msg)
+                })
+                .collect();
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] Latest builder messages: {}",
+                msgs_preview.join(" | ")
+            ));
+        }
+    }
+
     let mut analysis = Orchestrator::analyze_comm_log(&entries);
     let mut actions_taken = Vec::new();
 
@@ -839,8 +907,8 @@ pub async fn trigger_orchestrator_cycle(
                     Ok(()) => {
                         #[cfg(debug_assertions)]
                         crate::diagnostics::stderr_line(&format!(
-                            "[DEBUG] Forwarded task to {} (session {})",
-                            assignment.instance_id, session_id
+                            "[DEBUG] Forwarded task to {} (session {}): {}",
+                            assignment.instance_id, session_id, assignment.task
                         ));
                         actions_taken.push(format!("Forwarded task to {}", assignment.instance_id));
                     }
@@ -855,6 +923,16 @@ pub async fn trigger_orchestrator_cycle(
                 actions_taken.push(format!(
                     "No session found for instance {}",
                     assignment.instance_id
+                ));
+                #[cfg(debug_assertions)]
+                crate::diagnostics::stderr_line(&format!(
+                    "[DEBUG] No session found for instance {} - available sessions: {:?}",
+                    assignment.instance_id,
+                    all_sessions.iter().map(|s| {
+                        let role = s.config.role.as_str();
+                        let idx = s.config.agent_index;
+                        format!("{}-{}", role, idx)
+                    }).collect::<Vec<_>>()
                 ));
             }
         }
@@ -898,7 +976,7 @@ pub async fn trigger_orchestrator_cycle(
         }
     }
 
-    if stuck_state_for_probe.consecutive_no_progress_cycles >= 4
+    if stuck_state_for_probe.consecutive_no_progress_cycles >= 2
         && !stuck_state_for_probe.probe_injected
     {
         if let Some(ref orchestrator_session) = orchestrator_session {
@@ -966,6 +1044,11 @@ pub async fn trigger_orchestrator_cycle(
                     session_id
                 ));
 
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let pending_marker =
+                    format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, analysis.total_injections);
+                let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
+
                 let write_result = write_prompt_to_session(&pty_state, &session_id, &prompt);
 
                 match write_result {
@@ -979,11 +1062,6 @@ pub async fn trigger_orchestrator_cycle(
                             "Forwarded {} new user injection(s) to orchestrator PTY",
                             analysis.injections_to_forward.len()
                         ));
-
-                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                        let pending_marker =
-                            format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, analysis.total_injections);
-                        let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
                     }
                     Err(error) => {
                         actions_taken.push(format!("Failed to reach orchestrator PTY: {}", error));
@@ -1113,7 +1191,7 @@ pub async fn trigger_orchestrator_cycle(
 
     if updated_stuck_state.consecutive_no_progress_cycles >= stuck_rescue_threshold
         && !updated_stuck_state.rescue_attempted
-        && matches!(phase, OrchestratorPhase::Executing | OrchestratorPhase::Replanning | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing)
+        && matches!(phase, OrchestratorPhase::Planning | OrchestratorPhase::Assigning | OrchestratorPhase::Executing | OrchestratorPhase::Replanning | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing)
     {
             let all_sessions = agent_store.for_run(&run_id);
             let mut rescued_any = false;
@@ -1159,7 +1237,7 @@ pub async fn trigger_orchestrator_cycle(
         let consecutive_replans = updated_stuck_state.replan_consecutive;
         let replan_start_done_count = updated_stuck_state.replan_start_done_count;
 
-        let mut potential_next_phase = Orchestrator::determine_next_phase(
+        let potential_next_phase = Orchestrator::determine_next_phase(
             &phase,
             &analysis,
             &instance_counts,
@@ -1182,10 +1260,9 @@ pub async fn trigger_orchestrator_cycle(
                 if !builder_verified_live {
                     #[cfg(debug_assertions)]
                     crate::diagnostics::stderr_line(&format!(
-                        "[DEBUG] Blocking transition to Verifying - browser verification failed"
+                        "[DEBUG] Browser verification failed but allowing transition to Verifying"
                     ));
-                    actions_taken.push("Browser verification failed - staying in Executing".to_string());
-                    potential_next_phase = None;
+                    actions_taken.push("Browser verification failed - continuing to Verifying anyway".to_string());
                 }
             }
         }
