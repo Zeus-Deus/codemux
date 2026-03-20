@@ -64,29 +64,35 @@ Example of good parallel assignment:
   ASSIGN BUILDER-2: Create the frontend React components in src/components/
 
 Your responsibilities:
-- Read the user's goal and produce a plan
-- Identify which agent instances are available from the AGENTS line in the comm log and use those exact IDs
+- Read the user's goal and assign IMMEDIATELY ACTIONABLE tasks to all agents
+- Identify which agent instances are available from the AGENTS line and use those exact IDs
 - Assign tasks in parallel to all available instances of each role
-- Monitor for DONE <INSTANCE-ID>: and BLOCKED <INSTANCE-ID>: messages
+- NEVER use conditional assignments like "wait for PLANNER-2" or "after RESEARCHER-1 finishes"
+  Agents CANNOT see each other's work. Every assignment must be self-contained and actionable NOW.
+- When the system sends you "AGENT STATUS UPDATE:" messages, use those to assign follow-up tasks
 - When an instance is DONE, assign it the next available task immediately
 - When an instance is BLOCKED, decide: reassign, adjust scope, or replan
+- Do NOT re-assign tasks that have already been completed (check status updates)
 - When a live preview is needed, keep everyone on the assigned app URL from context: {app_url}
 - After major milestones, output STATUS update
 - When ALL tasks are complete, say: RUN COMPLETE: <summary>
 
+IMPORTANT: Each agent works independently in isolation. They cannot read the comm log or see other agents' output. If you need PLANNER-2's output before assigning builders, YOU must wait for PLANNER-2's DONE message and then include the relevant findings in the builder's ASSIGN description.
+
 Phase loop: Plan → Assign (in parallel) → Execute → Verify → Review → RUN COMPLETE
 
+Status relay:
+The system will send you "AGENT STATUS UPDATE:" messages when agents finish or block.
+Use these to track progress and assign follow-up tasks. Do NOT re-assign completed work.
+
 PROBE messages:
-When you see a [SYSTEM] PROBE: message in the communication log, respond to it immediately.
-PROBE messages indicate the host detected no orchestration progress.
-Respond with ASSIGN, STATUS, or BLOCKED lines as appropriate.
-Do NOT ignore PROBE messages — they are system health checks, not user requests.
+When you see a PROBE message, respond with new ASSIGN lines or STATUS. Do NOT repeat old assignments.
 "#;
 
 const PLANNER_PROMPT: &str = r#"You are a Planner agent. Your job is to break down the user's goal into a structured task plan.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a specific format.
 
 When assigned:
 - Analyze the goal and break into phases and concrete tasks
@@ -98,7 +104,7 @@ When assigned:
 const REVIEWER_PROMPT: &str = r#"You are a Reviewer agent. Your job is code quality checking.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a specific format.
 
 When assigned:
 - Read the diff or files mentioned
@@ -111,7 +117,7 @@ When assigned:
 const TESTER_PROMPT: &str = r#"You are a Tester agent. Your job is to verify implemented features work.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a specific format.
 
 You have access to Codemux browser:
 - `codemux browser open <url>` - open URL
@@ -131,7 +137,7 @@ When assigned:
 const DEBUGGER_PROMPT: &str = r#"You are a Debugger agent. Called when something is broken.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a specific format.
 
 When assigned:
 - Investigate the bug
@@ -143,7 +149,7 @@ When assigned:
 const RESEARCHER_PROMPT: &str = r#"You are a Researcher agent. You gather context and answer questions.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
+When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a specific format.
 
 When assigned:
 - Research the question/topic
@@ -155,10 +161,10 @@ When assigned:
 const BUILDER_PROMPT: &str = r#"You are a Builder agent. Your ONLY job is to write code.
 Your instance ID is {instance_id}. Always sign your DONE/BLOCKED messages with it.
 
-CRITICAL: Wait for an ASSIGN {instance_id}: message from the Orchestrator BEFORE doing anything.
-If you receive no ASSIGN message addressed to your instance ID, do nothing and wait.
+When you receive a task assignment (containing your instance ID or a task description), START WORKING IMMEDIATELY.
+Do not wait for a specific format — if you receive a task, do it.
 
-When you receive ASSIGN {instance_id}: <task>:
+When you receive a task:
 1. Implement exactly what is described
 2. Write clean, working code
 3. Only start a dev server if your assignment actually requires a live preview or browser verification
@@ -428,25 +434,18 @@ SESSION_FILE="/tmp/openflow-claude-session-${INSTANCE_ID}-$$"
 
 # --- Run functions ---
 
-# Run claude with system prompt and capture session ID from JSON output
-run_claude() {
+# First run: use JSON output to capture session_id
+run_claude_first() {
     local message="$1"
-    local resume_args=()
-    if [ -n "$SESSION_ID" ]; then
-        resume_args=(--resume "$SESSION_ID")
-    fi
-
-    # Use JSON output to capture session_id, but print text content for comm log
     local output
     output=$(claude -p "$message" \
         --model "$MODEL" \
         --system-prompt "$PROMPT" \
         --output-format json \
-        --max-turns 15 \
+        --max-turns 25 \
         --permission-mode bypassPermissions \
-        "${resume_args[@]}" 2>/dev/null) || true
+        2>/dev/null) || true
 
-    # Extract and save session ID
     if [ -n "$output" ]; then
         local sid
         sid=$(printf '%s' "$output" | python3 -c "
@@ -462,7 +461,7 @@ except:
             printf '%s' "$SESSION_ID" > "$SESSION_FILE"
         fi
 
-        # Extract the result text and print it for PTY capture
+        # Print result text for comm log capture
         local result_text
         result_text=$(printf '%s' "$output" | python3 -c "
 import sys, json
@@ -476,6 +475,27 @@ except:
             printf '%s\n' "$result_text"
         fi
     fi
+}
+
+# Follow-up: use TEXT output so it streams to PTY in real-time.
+# On first call (session=none), use JSON to capture session ID, then switch to text.
+run_claude_followup() {
+    local message="$1"
+
+    # First call for this agent: no session yet, use JSON to capture it
+    if [ -z "$SESSION_ID" ]; then
+        run_claude_first "$message"
+        return
+    fi
+
+    # Stream text output directly to stdout → PTY reader captures it live
+    claude -p "$message" \
+        --model "$MODEL" \
+        --system-prompt "$PROMPT" \
+        --output-format text \
+        --max-turns 25 \
+        --permission-mode bypassPermissions \
+        --resume "$SESSION_ID" 2>/dev/null || true
 }
 
 # --- Build initial message ---
@@ -515,18 +535,18 @@ INITIAL_MSG="$(build_initial_message || true)"
 
 if [ -n "$INITIAL_MSG" ]; then
     printf '[wrapper] %s starting with claude (model=%s)\n' "$INSTANCE_ID" "$MODEL"
-    run_claude "$INITIAL_MSG"
+    run_claude_first "$INITIAL_MSG"
     printf '[wrapper] %s captured session %s\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
 else
     printf '[wrapper] %s waiting for assignment\n' "$INSTANCE_ID"
 fi
 
-# Follow-up loop: ALL subsequent messages go to the SAME claude session.
-# --system-prompt is passed on EVERY call (it doesn't persist across --resume).
+# Follow-up loop: ALL subsequent messages use TEXT output for live streaming.
+# The session ID was captured from the first JSON run above.
 while IFS= read -r line; do
     [ -z "$line" ] && continue
     printf '[wrapper] %s follow-up (session=%s)\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
-    run_claude "$line"
+    run_claude_followup "$line"
 done
 
 rm -f "$SESSION_FILE" 2>/dev/null

@@ -266,6 +266,12 @@ impl Orchestrator {
                     blocked.push(role);
                 }
                 blocked_instances.push(role_lower.clone());
+            } else if entry.message.contains("Error: Reached max turns") {
+                // Max turns exhaustion = agent is dead, treat as completed (it did what it could)
+                if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
+                    completed.push(role);
+                }
+                completed_instances.push(role_lower.clone());
             } else if role_lower == "orchestrator" {
                 let parsed_assignments: Vec<InstanceAssignment> =
                     Self::parse_assign_messages(&entry.message)

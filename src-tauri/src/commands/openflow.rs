@@ -836,8 +836,8 @@ async fn run_single_cycle(
             let msgs_preview: Vec<String> = orchestrator_msgs
                 .iter()
                 .map(|e| {
-                    let msg = if e.message.len() > 100 {
-                        format!("{}...", &e.message[..100])
+                    let msg = if e.message.chars().count() > 100 {
+                        format!("{}...", e.message.chars().take(100).collect::<String>())
                     } else {
                         e.message.clone()
                     };
@@ -860,8 +860,8 @@ async fn run_single_cycle(
             let msgs_preview: Vec<String> = builder_msgs
                 .iter()
                 .map(|e| {
-                    let msg = if e.message.len() > 100 {
-                        format!("{}...", &e.message[..100])
+                    let msg = if e.message.chars().count() > 100 {
+                        format!("{}...", e.message.chars().take(100).collect::<String>())
                     } else {
                         e.message.clone()
                     };
@@ -1031,7 +1031,21 @@ async fn run_single_cycle(
         let new_total_assignments =
             analysis.last_handled_assignments + analysis.instance_assignments.len();
 
+        // Skip re-assigning to agents that already completed or hit max turns
+        let completed_set: std::collections::HashSet<String> = analysis
+            .completed_instances
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+
         for assignment in &analysis.instance_assignments {
+            if completed_set.contains(&assignment.instance_id.to_lowercase()) {
+                actions_taken.push(format!(
+                    "Skipped re-assignment to already-completed {}",
+                    assignment.instance_id
+                ));
+                continue;
+            }
             let target_session = all_sessions.iter().find(|session| {
                 let session_instance = if matches!(
                     session.config.role,
@@ -1049,11 +1063,16 @@ async fn run_single_cycle(
             });
 
             if let Some(session) = target_session {
-                // Send raw task text to the PTY. The wrapper script reads this line
-                // and calls `run_followup()` which uses `opencode run --session <id>`
-                // to continue the agent's conversation with full context.
+                // Prefix the task with "ASSIGN INSTANCE-ID:" so the worker agent
+                // recognizes it as an official assignment and starts working.
+                // Without this prefix, workers refuse to act ("waiting for ASSIGN message").
+                let prefixed_task = format!(
+                    "ASSIGN {}: {}",
+                    assignment.instance_id.to_uppercase(),
+                    assignment.task
+                );
                 let session_id = session.session_id.clone();
-                let write_result = write_raw_to_session(pty_state, &session_id, &assignment.task);
+                let write_result = write_raw_to_session(pty_state, &session_id, &prefixed_task);
 
                 match write_result {
                     Ok(()) => {
@@ -1097,7 +1116,86 @@ async fn run_single_cycle(
         let _ = Orchestrator::write_to_comm_log(&run_id, &marker);
     }
 
-    let stuck_state_for_probe = runtime.get_stuck_state(&run_id);
+    // --- Relay worker DONE/BLOCKED messages to the orchestrator ---
+    // The orchestrator can't read the comm log directly. When workers complete tasks
+    // or report blocks, the backend must relay this so it can assign follow-up work.
+    if let Some(ref orchestrator_session) = orchestrator_session {
+        // Find the last relay marker to know how many DONE/BLOCKED we already relayed
+        let last_relay_count: usize = entries
+            .iter()
+            .rev()
+            .find_map(|e| {
+                if e.role.eq_ignore_ascii_case("system") {
+                    e.message
+                        .strip_prefix("DONE_RELAY_COUNT: ")
+                        .and_then(|n| n.trim().parse().ok())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        // Count ALL current DONE/BLOCKED messages
+        let mut all_done_blocked: Vec<(String, String)> = Vec::new();
+        for entry in &entries {
+            let role_lower = entry.role.to_lowercase();
+            if role_lower == "orchestrator" || role_lower == "system" {
+                continue;
+            }
+            if entry.message.contains("DONE:") {
+                let summary = entry.message.chars().take(300).collect::<String>();
+                all_done_blocked.push((entry.role.to_uppercase(), summary));
+            } else if entry.message.starts_with("BLOCKED:") {
+                let summary = entry.message.chars().take(300).collect::<String>();
+                all_done_blocked.push((entry.role.to_uppercase(), summary));
+            } else if entry.message.contains("Error: Reached max turns") {
+                all_done_blocked.push((
+                    entry.role.to_uppercase(),
+                    format!("DONE (max turns reached, work may be partial): {}", entry.role),
+                ));
+            }
+        }
+
+        // Only relay NEW completions (ones after the last relay count)
+        if all_done_blocked.len() > last_relay_count {
+            let new_completions: Vec<String> = all_done_blocked[last_relay_count..]
+                .iter()
+                .map(|(role, msg)| format!("{}: {}", role, msg))
+                .collect();
+
+            if !new_completions.is_empty() {
+                let relay_text = format!(
+                    "AGENT STATUS UPDATE: {} NEW completion(s). {}. Assign follow-up tasks. Do NOT re-assign already completed work.",
+                    new_completions.len(),
+                    new_completions.join(" | ")
+                );
+
+                let _ = write_raw_to_session(
+                    pty_state,
+                    &orchestrator_session.session_id,
+                    &relay_text,
+                );
+
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                let _ = Orchestrator::write_to_comm_log(
+                    run_id,
+                    &format!(
+                        "[{}] [SYSTEM] DONE_RELAY_COUNT: {}",
+                        ts,
+                        all_done_blocked.len()
+                    ),
+                );
+
+                actions_taken.push(format!(
+                    "Relayed {} new DONE/BLOCKED to orchestrator (total: {})",
+                    new_completions.len(),
+                    all_done_blocked.len()
+                ));
+            }
+        }
+    }
+
+    let stuck_state_for_probe = runtime.get_stuck_state(run_id);
     let invalid_delegation_detected = analysis.instance_assignments.is_empty()
         && has_recent_invalid_delegation_pattern(entries.as_slice());
 
@@ -1371,10 +1469,10 @@ async fn run_single_cycle(
         && !updated_stuck_state.rescue_attempted
         && matches!(phase, OrchestratorPhase::Planning | OrchestratorPhase::Assigning | OrchestratorPhase::Executing | OrchestratorPhase::Replanning | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing)
     {
-            let all_sessions = agent_store.for_run(&run_id);
+            let rescue_sessions = agent_store.for_run(&run_id);
             let mut rescued_any = false;
 
-            for session in all_sessions {
+            for session in &rescue_sessions {
                 let session_id = &session.session_id;
                 let is_alive = {
                     let sessions = pty_state.sessions.lock().unwrap();
@@ -1406,7 +1504,33 @@ async fn run_single_cycle(
                 }
             }
 
+            // Notify orchestrator about dead agents so it doesn't wait for them
             if rescued_any {
+                if let Some(ref orch) = orchestrator_session {
+                    let dead_agents: Vec<String> = rescue_sessions
+                        .iter()
+                        .filter(|s| {
+                            let sid = &s.session_id;
+                            let sessions = pty_state.sessions.lock().unwrap();
+                            !sessions.get(sid).map(|r| matches!(
+                                r.last_status.state,
+                                crate::terminal::TerminalLifecycleState::Ready
+                            )).unwrap_or(false)
+                        })
+                        .filter(|s| !matches!(s.config.role, crate::openflow::OpenFlowRole::Orchestrator))
+                        .map(|s| format!("{}-{}", s.config.role.as_str(), s.config.agent_index))
+                        .collect();
+                    if !dead_agents.is_empty() {
+                        let _ = write_raw_to_session(
+                            pty_state,
+                            &orch.session_id,
+                            &format!(
+                                "AGENT TERMINATED: {} hit max turns or crashed. Do NOT wait for them. Proceed with remaining agents or declare RUN COMPLETE.",
+                                dead_agents.join(", ")
+                            ),
+                        );
+                    }
+                }
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 runtime.mark_rescue_attempted(&run_id);
             }
