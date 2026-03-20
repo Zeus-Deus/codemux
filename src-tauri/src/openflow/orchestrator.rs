@@ -110,13 +110,7 @@ impl Orchestrator {
         }
 
         let content = std::fs::read_to_string(&path)?;
-        let entries: Vec<CommLogEntry> = content
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| Self::parse_log_line(line))
-            .collect();
-
-        Ok(entries)
+        Ok(Self::parse_log_lines(&content))
     }
 
     /// Read only new entries since last read - for incremental processing.
@@ -153,13 +147,31 @@ impl Orchestrator {
         let mut new_content = String::new();
         std::io::Read::read_to_string(&mut file, &mut new_content)?;
 
-        let entries: Vec<CommLogEntry> = new_content
-            .lines()
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| Self::parse_log_line(line))
-            .collect();
-
+        let entries = Self::parse_log_lines(&new_content);
         Ok((entries, current_size))
+    }
+
+    /// Parse log content into entries, accumulating continuation lines (lines without
+    /// a `[timestamp] [role]` prefix) into the previous entry's message.
+    /// This is critical because multiline agent output (e.g., ASSIGN lines) may appear
+    /// as bare lines in the log file without their own timestamp prefix.
+    pub fn parse_log_lines(content: &str) -> Vec<CommLogEntry> {
+        let mut entries: Vec<CommLogEntry> = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(entry) = Self::parse_log_line(line) {
+                entries.push(entry);
+            } else if let Some(last) = entries.last_mut() {
+                // Continuation line — append to previous entry's message
+                last.message.push('\n');
+                last.message.push_str(line);
+            }
+            // If no previous entry exists, drop orphan continuation lines
+        }
+        entries
     }
 
     pub fn parse_log_line(line: &str) -> Option<CommLogEntry> {
@@ -237,7 +249,8 @@ impl Orchestrator {
         let mut last_handled_assignments: usize = 0;
         let mut last_pending_injections: usize = 0;
         let mut last_pending_index: Option<usize> = None;
-        let mut instances_with_output: Vec<String> = Vec::new();
+        // instances_with_output tracking removed: implicit completion was unreliable
+        // because error output and log noise could falsely mark agents as done.
 
         for (index, entry) in entries.iter().enumerate() {
             let role_lower = entry.role.to_lowercase();
@@ -280,10 +293,6 @@ impl Orchestrator {
                 || role_lower.starts_with("planner")
                 || role_lower.starts_with("researcher")
             {
-                // Track that this instance produced output (for implicit completion)
-                if !role_lower.contains("orchestrator") {
-                    instances_with_output.push(role_lower.clone());
-                }
                 if entry.message.to_lowercase().contains("run complete") {
                     status_updates.push(entry.message.clone());
                 }
@@ -366,7 +375,7 @@ impl Orchestrator {
             last_pending_injections,
             last_handled_injections: last_handled_count,
             orchestrator_responded_to_pending,
-            instances_with_output,
+            instances_with_output: vec![],
         }
     }
 
@@ -510,50 +519,10 @@ impl Orchestrator {
                 })
                 .count();
 
-            // For builders (and other worker roles), also count instances that:
-            // 1. Were assigned work (appear in instance_assignments)
-            // 2. Have produced output (appear in instances_with_output)
-            // 3. Have NOT said DONE or BLOCKED
-            let role_lower = role_str.to_lowercase();
-            let implicitly_done = if role_lower == "builder"
-                || role_lower == "tester"
-                || role_lower == "reviewer"
-                || role_lower == "debugger"
-            {
-                let assigned_instances: std::collections::HashSet<String> = analysis
-                    .instance_assignments
-                    .iter()
-                    .map(|a| a.instance_id.to_lowercase())
-                    .collect();
-                let completed_lower: std::collections::HashSet<String> = analysis
-                    .completed_instances
-                    .iter()
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                let blocked_lower: std::collections::HashSet<String> = analysis
-                    .blocked_instances
-                    .iter()
-                    .map(|s| s.to_lowercase())
-                    .collect();
-                analysis
-                    .instances_with_output
-                    .iter()
-                    .filter(|id| {
-                        let lower = id.to_lowercase();
-                        // Check if this instance was assigned work
-                        assigned_instances.contains(&lower)
-                    })
-                    .filter(|id| {
-                        // Exclude those that said DONE or BLOCKED explicitly
-                        !completed_lower.contains(&id.to_lowercase())
-                            && !blocked_lower.contains(&id.to_lowercase())
-                    })
-                    .count()
-            } else {
-                0
-            };
-
-            completed_count + implicitly_done >= count
+            // Only explicit DONE: markers count for completion.
+            // Implicit completion (output-based) was removed because error output
+            // and log noise could falsely mark agents as done.
+            completed_count >= count
         };
 
         match current_phase {
@@ -611,7 +580,7 @@ impl Orchestrator {
                 if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else {
-                    Some(OrchestratorPhase::Completed)
+                    None // Stay in WaitingApproval until user explicitly approves
                 }
             }
             OrchestratorPhase::Replanning => {
@@ -631,7 +600,13 @@ impl Orchestrator {
                     None
                 }
             }
-            OrchestratorPhase::Blocked => None,
+            OrchestratorPhase::Blocked => {
+                if has_unhandled_injection {
+                    Some(OrchestratorPhase::Replanning)
+                } else {
+                    None
+                }
+            }
             OrchestratorPhase::Assigning => None,
         }
     }

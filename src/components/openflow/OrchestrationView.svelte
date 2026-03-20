@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onDestroy } from 'svelte';
-    import { openflowRuntime, retryOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset } from '../../stores/openflow';
+    import { openflowRuntime, retryOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset, syncOpenFlowRuntime } from '../../stores/openflow';
     import type { AgentSessionState, OrchestratorTriggerResult } from '../../stores/types';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph from './NodeGraph.svelte';
@@ -8,10 +8,9 @@
     import { buildActiveConnections, buildAgentNodes } from '../../lib/openflowGraph';
     import {
         commLogPollInterval,
-        INITIAL_ORCHESTRATOR_DELAY_MS,
         mergeCommLogEntries,
-        ORCHESTRATOR_INTERVAL_MS,
     } from '../../lib/openflowPolling';
+    import { listen } from '@tauri-apps/api/event';
 
     let { workspaceTitle, runId }: { workspaceTitle: string; runId: string | null } = $props();
 
@@ -26,12 +25,10 @@
     // Subscribe to the shared store instead of maintaining local state
     let commLogEntries = $derived($commLogStore);
 
-    let orchestratorInterval: ReturnType<typeof setInterval> | null = null;
     let commLogInterval: ReturnType<typeof setInterval> | null = null;
-    let initialTimeoutId: ReturnType<typeof setTimeout> | null = null;
+    let runtimePollInterval: ReturnType<typeof setInterval> | null = null;
     let showBrowser = $state(false);
     let commLogPollingInProgress = false;
-    let orchestratorPollingInProgress = false;
     let lastOrchestratorResult = $state<OrchestratorTriggerResult | null>(null);
     
     // Resizable panel state
@@ -65,44 +62,31 @@
         return result;
     }
 
-    // Auto-trigger orchestration on mount
+    // Listen for backend-driven orchestration cycle events.
+    // The backend loop drives orchestration; the frontend just observes.
     $effect(() => {
-        if (runId) {
-            // Store the handle so we can cancel it if runId changes before it fires.
-            initialTimeoutId = setTimeout(() => {
-                initialTimeoutId = null;
-                if (runId) {
-                    runOrchestratorCycle(runId).catch(console.error);
-                }
-            }, INITIAL_ORCHESTRATOR_DELAY_MS);
+        if (!runId) return;
 
-            const isRunTerminal = (r: typeof run) => r && (r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled');
-            orchestratorInterval = setInterval(() => {
-                if (!runId || !run) return;
-                if (isRunTerminal(run)) {
-                    clearInterval(orchestratorInterval!);
-                    orchestratorInterval = null;
-                    return;
-                }
-                if (!orchestratorPollingInProgress) {
-                    orchestratorPollingInProgress = true;
-                    runOrchestratorCycle(runId).catch(e =>
-                        console.error('[OpenFlow] Orchestration error:', e)
-                    ).finally(() => {
-                        orchestratorPollingInProgress = false;
-                    });
-                }
-            }, ORCHESTRATOR_INTERVAL_MS);
-        }
+        let cancelled = false;
+        const unlistenPromise = listen<OrchestratorTriggerResult>('openflow-cycle', (event) => {
+            if (cancelled) return;
+            lastOrchestratorResult = event.payload;
+            syncOpenFlowRuntime().catch(console.error);
+        });
+
+        // Also poll runtime snapshot periodically as a fallback
+        runtimePollInterval = setInterval(() => {
+            if (!cancelled) {
+                syncOpenFlowRuntime().catch(console.error);
+            }
+        }, 10_000);
 
         return () => {
-            if (initialTimeoutId !== null) {
-                clearTimeout(initialTimeoutId);
-                initialTimeoutId = null;
-            }
-            if (orchestratorInterval) {
-                clearInterval(orchestratorInterval);
-                orchestratorInterval = null;
+            cancelled = true;
+            unlistenPromise.then(fn => fn()).catch(() => {});
+            if (runtimePollInterval) {
+                clearInterval(runtimePollInterval);
+                runtimePollInterval = null;
             }
         };
     });

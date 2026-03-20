@@ -1,9 +1,8 @@
 import type { CommLogEntry, OpenFlowRunRecord } from '../stores/types';
 
-export const INITIAL_ORCHESTRATOR_DELAY_MS = 3000;
-export const ORCHESTRATOR_INTERVAL_MS = 15000;
-export const ACTIVE_COMM_LOG_INTERVAL_MS = 5000;
-export const COMPLETED_COMM_LOG_INTERVAL_MS = 30000;
+// Orchestration is now backend-driven; these constants are for comm log display polling only.
+export const ACTIVE_COMM_LOG_INTERVAL_MS = 3000;
+export const COMPLETED_COMM_LOG_INTERVAL_MS = 10000;
 export const MAX_COMM_LOG_ENTRIES = 500;
 
 export function commLogPollInterval(run: OpenFlowRunRecord | null) {

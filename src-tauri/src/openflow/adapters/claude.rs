@@ -1,0 +1,105 @@
+/// Claude Code CLI adapter.
+///
+/// Builds a spawn spec for running `claude` (Claude Code CLI) as an agent in an OpenFlow run.
+/// Uses a dedicated wrapper script that leverages `claude -p` with `--system-prompt`,
+/// `--output-format json`, `--resume` for session continuation, and `--max-turns` for control.
+///
+/// Key advantages over opencode:
+/// - Claude models follow ASSIGN protocol near-100% of the time
+/// - No competing internal delegation system (no "General Agent" / "Explore Agent")
+/// - `--system-prompt` flag provides direct prompt injection
+/// - `--resume <session-id>` provides reliable session continuation
+/// - `--output-format json` gives structured output with session_id for capture
+/// - Works with any Claude model: haiku (cheapest), sonnet (balanced), opus (best)
+use super::{AgentAdapter, AgentSpawnSpec};
+use crate::openflow::agent::AgentConfig;
+use crate::openflow::prompts::SystemPrompts;
+
+pub struct ClaudeAdapter;
+
+impl AgentAdapter for ClaudeAdapter {
+    fn spawn_spec(
+        &self,
+        config: &AgentConfig,
+        run_id: &str,
+        comm_log_path: &str,
+        goal_path: &str,
+        app_url: &str,
+        working_directory: &str,
+    ) -> AgentSpawnSpec {
+        let wrapper_path = SystemPrompts::claude_wrapper_script_path();
+        let wrapper_str = wrapper_path.to_string_lossy().to_string();
+        let argv = vec![wrapper_str.clone()];
+
+        let instance_id = instance_label(config);
+        let mut env = vec![
+            ("CODEMUX_AGENT_ROLE".into(), role_label(config)),
+            ("CODEMUX_AGENT_INSTANCE_ID".into(), instance_id.clone()),
+            ("CODEMUX_OPENFLOW_RUN_ID".into(), run_id.to_string()),
+            (
+                "CODEMUX_COMMUNICATION_LOG".into(),
+                comm_log_path.to_string(),
+            ),
+            ("CODEMUX_GOAL_PATH".into(), goal_path.to_string()),
+            ("CODEMUX_OPENFLOW_APP_URL".into(), app_url.to_string()),
+            ("CODEMUX_WORKING_DIR".into(), working_directory.to_string()),
+            ("CODEMUX_CLI_TOOL".into(), "claude".into()),
+            // Claude model ID (e.g., "sonnet", "haiku", "opus", "claude-sonnet-4-6")
+            ("CLAUDE_MODEL".into(), config.model.clone()),
+            (
+                "CODEMUX_OPENFLOW_AUTO_START".into(),
+                if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+                    "1".into()
+                } else {
+                    "0".into()
+                },
+            ),
+        ];
+
+        if let Some(port) = app_url
+            .rsplit(':')
+            .next()
+            .and_then(|value| value.parse::<u16>().ok())
+        {
+            env.push(("CODEMUX_OPENFLOW_APP_PORT".into(), port.to_string()));
+        }
+
+        // Get system prompt path — instance-specific so each parallel agent has its own file.
+        let system_prompt_path =
+            SystemPrompts::prompt_path_for_instance(&config.role, config.agent_index);
+        let prompt_path_str = system_prompt_path.to_string_lossy().to_string();
+        env.push(("CODEMUX_SYSTEM_PROMPT_PATH".into(), prompt_path_str.clone()));
+
+        let title = format!(
+            "[{}] {} — {}",
+            instance_id,
+            short_model(&config.model),
+            run_id,
+        );
+
+        AgentSpawnSpec {
+            argv,
+            env,
+            execution_policy: crate::execution::ExecutionPolicy::openflow_agent_default(),
+            title,
+            system_prompt_path: Some(prompt_path_str),
+        }
+    }
+}
+
+fn role_label(config: &AgentConfig) -> String {
+    format!("{:?}", config.role).to_lowercase()
+}
+
+fn instance_label(config: &AgentConfig) -> String {
+    let role = role_label(config);
+    if matches!(config.role, crate::openflow::OpenFlowRole::Orchestrator) {
+        role
+    } else {
+        format!("{}-{}", role, config.agent_index)
+    }
+}
+
+fn short_model(model: &str) -> &str {
+    model.split('/').last().unwrap_or(model)
+}

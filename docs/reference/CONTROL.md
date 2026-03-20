@@ -41,7 +41,7 @@
 - app and workspace state: `status`, `get_app_state`, `create_workspace`, `split_pane`
 - terminal control: `write_terminal`
 - notifications: `notify`
-- browser control: `open_url`, `browser_automation`
+- browser control: `create_browser_pane`, `open_url`, `browser_automation`
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
 

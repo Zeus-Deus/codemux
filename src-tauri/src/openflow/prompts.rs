@@ -23,7 +23,11 @@ Communication rules:
 
 const ORCHESTRATOR_PROMPT: &str = r#"You are the Orchestrator — the central coordinator of this OpenFlow run.
 
-CRITICAL: You MUST assign all work to other agents. You should NEVER run commands yourself.
+CRITICAL RULES:
+1. You MUST assign all work to other agents using ASSIGN lines. You should NEVER run commands yourself.
+2. NEVER use "General Agent", "Explore Agent", or any internal tool delegation. Those do NOT work here.
+3. The ONLY way to delegate work is by outputting literal ASSIGN lines as shown below.
+4. If you use any delegation method other than ASSIGN lines, the system will reject it and your agents will sit idle.
 
 Assignment format — always use the INSTANCE ID (role + index), NOT the bare role name:
   ASSIGN BUILDER-0: <detailed task description>
@@ -71,6 +75,12 @@ Your responsibilities:
 - When ALL tasks are complete, say: RUN COMPLETE: <summary>
 
 Phase loop: Plan → Assign (in parallel) → Execute → Verify → Review → RUN COMPLETE
+
+PROBE messages:
+When you see a [SYSTEM] PROBE: message in the communication log, respond to it immediately.
+PROBE messages indicate the host detected no orchestration progress.
+Respond with ASSIGN, STATUS, or BLOCKED lines as appropriate.
+Do NOT ignore PROBE messages — they are system health checks, not user requests.
 "#;
 
 const PLANNER_PROMPT: &str = r#"You are a Planner agent. Your job is to break down the user's goal into a structured task plan.
@@ -192,6 +202,13 @@ impl SystemPrompts {
         path
     }
 
+    /// Path to the wrapper script for Claude Code CLI.
+    pub fn claude_wrapper_script_path() -> PathBuf {
+        let mut path = Self::prompts_dir();
+        path.push("claude-wrapper.sh");
+        path
+    }
+
     /// Ensure the wrapper script exists.
     pub fn ensure_wrapper_exists() -> std::io::Result<()> {
         let path = Self::wrapper_script_path();
@@ -199,7 +216,10 @@ impl SystemPrompts {
         std::fs::create_dir_all(dir)?;
 
         let wrapper_content = r#"#!/bin/bash
-# OpenCode wrapper - keeps the PTY alive and executes opencode commands on demand
+# OpenFlow agent wrapper — session-based architecture.
+# Uses opencode --session <id> for persistent conversation context across follow-ups.
+# This means probes, corrections, and user messages all reach the agent IN THE SAME
+# conversation where it received its initial instructions.
 
 set -uo pipefail
 
@@ -213,7 +233,6 @@ INSTANCE_ID="${CODEMUX_AGENT_INSTANCE_ID:-${ROLE:-agent}}"
 AUTO_START="${CODEMUX_OPENFLOW_AUTO_START:-0}"
 APP_PORT="${CODEMUX_OPENFLOW_APP_PORT:-}"
 
-# Change to the working directory if set
 if [ -n "$WORKING_DIR" ] && [ -d "$WORKING_DIR" ]; then
     cd "$WORKING_DIR" || exit 1
 fi
@@ -238,23 +257,51 @@ if [ -n "$AGENTS_PATH" ] && [ -f "$AGENTS_PATH" ]; then
     AGENTS=$(cat "$AGENTS_PATH")
 fi
 
-run_opencode() {
-    local message="$1"
+# --- Session tracking ---
+SESSION_ID=""
+SESSION_FILE="/tmp/openflow-session-${INSTANCE_ID}-$$"
 
-    if [ -n "$MODEL" ]; then
-        if [ -n "$message" ]; then
-            opencode run "$message" --model "$MODEL"
-        else
-            opencode --model "$MODEL"
-        fi
-    else
-        if [ -n "$message" ]; then
-            opencode run "$message"
-        else
-            opencode
-        fi
+capture_session_id() {
+    # Try to extract session ID from the session list (most recent first)
+    # The JSON output has spaces in key-value pairs: "id": "ses_..."
+    local sid
+    sid=$(opencode session list --format json 2>/dev/null \
+        | grep -oP '"id"\s*:\s*"ses_[^"]*"' | tail -1 \
+        | grep -oP 'ses_[^"]+')
+    if [ -n "$sid" ]; then
+        SESSION_ID="$sid"
+        printf '%s' "$SESSION_ID" > "$SESSION_FILE"
+        printf '[wrapper] %s captured session %s\n' "$INSTANCE_ID" "$SESSION_ID"
     fi
 }
+
+# --- Run functions ---
+
+# First run: creates a new opencode session
+run_first() {
+    local message="$1"
+    if [ -n "$MODEL" ]; then
+        opencode run "$message" --model "$MODEL"
+    else
+        opencode run "$message"
+    fi
+    # Capture the session ID after the run completes
+    capture_session_id
+}
+
+# Follow-up run: continues the SAME session (full conversation context)
+run_followup() {
+    local message="$1"
+    local args=(run)
+    if [ -n "$SESSION_ID" ]; then
+        args+=(--session "$SESSION_ID")
+    fi
+    [ -n "$MODEL" ] && args+=(--model "$MODEL")
+    args+=("$message")
+    opencode "${args[@]}"
+}
+
+# --- Build initial message (orchestrator only) ---
 
 build_initial_message() {
     if [ "$AUTO_START" != "1" ]; then
@@ -290,26 +337,203 @@ Start coordinating this run now. Delegate repo work to the other agents instead 
     printf '%s' "$initial_message"
 }
 
+# --- Main execution ---
+
 INITIAL_MSG="$(build_initial_message || true)"
 
 if [ -n "$INITIAL_MSG" ]; then
-    run_opencode "$INITIAL_MSG"
+    run_first "$INITIAL_MSG"
 else
     printf '[wrapper] %s waiting for assignment\n' "$INSTANCE_ID"
 fi
 
+# Follow-up loop: ALL subsequent messages go to the SAME opencode session.
+# For the orchestrator: probes and user injections arrive here with full context.
+# For workers: task assignments arrive here (e.g. the raw task text).
 while IFS= read -r line; do
-    if [ -z "$line" ]; then
-        continue
+    [ -z "$line" ] && continue
+    printf '[wrapper] %s follow-up (session=%s)\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
+    if ! run_followup "$line"; then
+        printf '[wrapper] %s command failed (exit %s), waiting for next\n' "$INSTANCE_ID" "$?"
     fi
-
-    bash -lc "$line"
 done
+
+rm -f "$SESSION_FILE" 2>/dev/null
 "#;
 
         std::fs::write(&path, wrapper_content)?;
 
         // Make it executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms)?;
+        }
+
+        Ok(())
+    }
+
+    /// Ensure the Claude Code CLI wrapper script exists.
+    pub fn ensure_claude_wrapper_exists() -> std::io::Result<()> {
+        let path = Self::claude_wrapper_script_path();
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir)?;
+
+        let wrapper_content = r#"#!/bin/bash
+# Claude Code CLI wrapper for OpenFlow agents.
+# Uses `claude -p` with --system-prompt, --resume, and --output-format json
+# for reliable orchestration. Claude models follow the ASSIGN protocol consistently.
+
+set -uo pipefail
+
+PROMPT_PATH="${CODEMUX_SYSTEM_PROMPT_PATH:-}"
+GOAL_PATH="${CODEMUX_GOAL_PATH:-}"
+AGENTS_PATH="${CODEMUX_OPENFLOW_AGENTS_PATH:-}"
+MODEL="${CLAUDE_MODEL:-sonnet}"
+WORKING_DIR="${CODEMUX_WORKING_DIR:-}"
+ROLE="${CODEMUX_AGENT_ROLE:-}"
+INSTANCE_ID="${CODEMUX_AGENT_INSTANCE_ID:-${ROLE:-agent}}"
+AUTO_START="${CODEMUX_OPENFLOW_AUTO_START:-0}"
+APP_PORT="${CODEMUX_OPENFLOW_APP_PORT:-}"
+
+if [ -n "$WORKING_DIR" ] && [ -d "$WORKING_DIR" ]; then
+    cd "$WORKING_DIR" || exit 1
+fi
+
+if [ -n "$APP_PORT" ]; then
+    export PORT="$APP_PORT"
+fi
+
+PROMPT=""
+GOAL=""
+AGENTS=""
+
+if [ -n "$PROMPT_PATH" ] && [ -f "$PROMPT_PATH" ]; then
+    PROMPT=$(cat "$PROMPT_PATH")
+fi
+
+if [ -n "$GOAL_PATH" ] && [ -f "$GOAL_PATH" ]; then
+    GOAL=$(cat "$GOAL_PATH")
+fi
+
+if [ -n "$AGENTS_PATH" ] && [ -f "$AGENTS_PATH" ]; then
+    AGENTS=$(cat "$AGENTS_PATH")
+fi
+
+# --- Session tracking ---
+SESSION_ID=""
+SESSION_FILE="/tmp/openflow-claude-session-${INSTANCE_ID}-$$"
+
+# --- Run functions ---
+
+# Run claude with system prompt and capture session ID from JSON output
+run_claude() {
+    local message="$1"
+    local resume_args=()
+    if [ -n "$SESSION_ID" ]; then
+        resume_args=(--resume "$SESSION_ID")
+    fi
+
+    # Use JSON output to capture session_id, but print text content for comm log
+    local output
+    output=$(claude -p "$message" \
+        --model "$MODEL" \
+        --system-prompt "$PROMPT" \
+        --output-format json \
+        --max-turns 15 \
+        --permission-mode bypassPermissions \
+        "${resume_args[@]}" 2>/dev/null) || true
+
+    # Extract and save session ID
+    if [ -n "$output" ]; then
+        local sid
+        sid=$(printf '%s' "$output" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('session_id', ''))
+except:
+    pass
+" 2>/dev/null)
+        if [ -n "$sid" ]; then
+            SESSION_ID="$sid"
+            printf '%s' "$SESSION_ID" > "$SESSION_FILE"
+        fi
+
+        # Extract the result text and print it for PTY capture
+        local result_text
+        result_text=$(printf '%s' "$output" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('result', ''))
+except:
+    pass
+" 2>/dev/null)
+        if [ -n "$result_text" ]; then
+            printf '%s\n' "$result_text"
+        fi
+    fi
+}
+
+# --- Build initial message ---
+
+build_initial_message() {
+    if [ "$AUTO_START" != "1" ]; then
+        return
+    fi
+
+    local initial_message=""
+
+    if [ -n "$GOAL" ]; then
+        initial_message="TOP-LEVEL GOAL:
+${GOAL}
+"
+    fi
+
+    if [ -n "$AGENTS" ]; then
+        initial_message="${initial_message}
+AVAILABLE AGENTS (use these exact IDs when assigning work):
+${AGENTS}
+"
+    fi
+
+    if [ -n "$GOAL" ]; then
+        initial_message="${initial_message}
+Start coordinating this run now. Delegate repo work to the other agents instead of doing it yourself.
+"
+    fi
+
+    printf '%s' "$initial_message"
+}
+
+# --- Main execution ---
+
+INITIAL_MSG="$(build_initial_message || true)"
+
+if [ -n "$INITIAL_MSG" ]; then
+    printf '[wrapper] %s starting with claude (model=%s)\n' "$INSTANCE_ID" "$MODEL"
+    run_claude "$INITIAL_MSG"
+    printf '[wrapper] %s captured session %s\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
+else
+    printf '[wrapper] %s waiting for assignment\n' "$INSTANCE_ID"
+fi
+
+# Follow-up loop: ALL subsequent messages go to the SAME claude session.
+# --system-prompt is passed on EVERY call (it doesn't persist across --resume).
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    printf '[wrapper] %s follow-up (session=%s)\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
+    run_claude "$line"
+done
+
+rm -f "$SESSION_FILE" 2>/dev/null
+"#;
+
+        std::fs::write(&path, wrapper_content)?;
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

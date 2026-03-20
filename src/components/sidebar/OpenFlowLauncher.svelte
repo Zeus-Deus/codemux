@@ -2,9 +2,7 @@
     import { createEventDispatcher } from 'svelte';
     import {
         openflowRuntime,
-        advanceOpenFlowRunPhase,
         retryOpenFlowRun,
-        runOpenFlowAutonomousLoop,
         applyOpenFlowReviewResult,
         stopOpenFlowRun,
     } from '../../stores/openflow';
@@ -31,16 +29,8 @@
         return run.current_phase === 'review' || run.status === 'awaiting_approval';
     }
 
-    async function handleAdvance(runId: string) {
-        try { await advanceOpenFlowRunPhase(runId); } catch (e) { console.error(e); }
-    }
-
     async function handleRetry(runId: string) {
         try { await retryOpenFlowRun(runId); } catch (e) { console.error(e); }
-    }
-
-    async function handleLoop(runId: string) {
-        try { await runOpenFlowAutonomousLoop(runId); } catch (e) { console.error(e); }
     }
 
     async function handleApprove(runId: string) {
@@ -104,8 +94,6 @@
                             </div>
                             <div class="run-actions">
                                 {#if run.status !== 'completed' && run.status !== 'cancelled' && run.status !== 'failed'}
-                                    <button class="run-btn" type="button" onclick={() => handleLoop(run.run_id)} title="Run loop">Loop</button>
-                                    <button class="run-btn" type="button" onclick={() => handleAdvance(run.run_id)} title="Advance phase">Next</button>
                                     <button class="run-btn" type="button" onclick={() => handlePause(run.run_id)} title="Pause">Pause</button>
                                     <button class="run-btn danger" type="button" onclick={() => handleCancel(run.run_id)} title="Cancel">Cancel</button>
                                 {:else}

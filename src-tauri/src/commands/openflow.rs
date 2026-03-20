@@ -1,4 +1,5 @@
 use crate::browser::BrowserManager;
+use crate::openflow::adapters::claude::ClaudeAdapter;
 use crate::openflow::adapters::opencode::OpenCodeAdapter;
 use crate::openflow::adapters::AgentAdapter;
 use crate::openflow::agent::{AgentConfig, AgentSessionState, AgentSessionStatus};
@@ -10,10 +11,12 @@ use crate::openflow::{
 use crate::state::AppStateStore;
 use serde::{Deserialize, Serialize};
 use std::net::{TcpListener, ToSocketAddrs};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
-const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 2;
-const PLANNING_STUCK_RESCUE_CYCLES: u32 = 3;
+const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 12; // ~60s at 5s backend loop interval
+const PLANNING_STUCK_RESCUE_CYCLES: u32 = 18; // ~90s at 5s backend loop interval
+/// Orchestrator cycles with no progress before injecting the stuck-recovery probe.
+const STUCK_PROBE_MIN_CYCLES: u32 = 10; // ~50s at 5s backend loop interval
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
@@ -83,13 +86,24 @@ fn openflow_instance_id(config: &AgentConfig) -> String {
 }
 
 fn allocate_openflow_app_url() -> Result<String, String> {
+    // Run-scoped preview URL for the **user project's** web app (orchestration target), not the
+    // Codemux shell. Default: first bindable port in 3900–4199 so the UI shows where agents
+    // should serve / you should open the preview once a dev server listens there.
+    //
+    // When dogfooding Codemux itself (`tauri dev`), set `CODEMUX_OPENFLOW_APP_URL=http://localhost:1420`
+    // so health checks match the shell's Vite port.
+    if let Ok(v) = std::env::var("CODEMUX_OPENFLOW_APP_URL") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Ok(v.to_string());
+        }
+    }
     for port in 3900_u16..=4199_u16 {
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
             listener.set_nonblocking(true).ok();
             return Ok(format!("http://localhost:{port}"));
         }
     }
-
     Err("Failed to reserve an OpenFlow app port in 3900-4199".to_string())
 }
 
@@ -114,22 +128,20 @@ fn session_working_directory(app_state: &AppStateStore, session_id: &str) -> Str
         .unwrap_or_else(|| ".".to_string())
 }
 
-fn write_prompt_to_session(
+/// Write a raw line to a PTY session. Used for the orchestrator whose wrapper
+/// reads raw messages (not `opencode run "..."` commands) and re-injects context.
+fn write_raw_to_session(
     pty_state: &crate::terminal::PtyState,
     session_id: &str,
-    prompt: &str,
+    text: &str,
 ) -> Result<(), String> {
-    let escaped = prompt
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\'', "'\\''");
-    let command = format!("opencode run \"{}\"\n", escaped);
+    let line = format!("{}\n", text);
     let mut sessions = pty_state.sessions.lock().unwrap();
     if let Some(pty_runtime) = sessions.get_mut(session_id) {
         if let Some(writer) = pty_runtime.writer.as_mut() {
             use std::io::Write;
             writer
-                .write_all(command.as_bytes())
+                .write_all(line.as_bytes())
                 .and_then(|_| writer.flush())
                 .map_err(|error| format!("PTY write error: {error}"))
         } else {
@@ -300,18 +312,28 @@ fn opencode_fallback_models() -> Vec<ModelInfo> {
 fn claude_default_models() -> Vec<ModelInfo> {
     vec![
         ModelInfo {
-            id: "claude-opus-4-5".into(),
-            name: "claude-opus-4-5".into(),
+            id: "sonnet".into(),
+            name: "Claude Sonnet (latest)".into(),
             provider: Some("anthropic".into()),
         },
         ModelInfo {
-            id: "claude-sonnet-4-5".into(),
-            name: "claude-sonnet-4-5".into(),
+            id: "haiku".into(),
+            name: "Claude Haiku (fast/cheap)".into(),
             provider: Some("anthropic".into()),
         },
         ModelInfo {
-            id: "claude-haiku-3-5".into(),
-            name: "claude-haiku-3-5".into(),
+            id: "opus".into(),
+            name: "Claude Opus (strongest)".into(),
+            provider: Some("anthropic".into()),
+        },
+        ModelInfo {
+            id: "claude-sonnet-4-6".into(),
+            name: "Claude Sonnet 4.6".into(),
+            provider: Some("anthropic".into()),
+        },
+        ModelInfo {
+            id: "claude-haiku-4-5".into(),
+            name: "Claude Haiku 4.5".into(),
             provider: Some("anthropic".into()),
         },
     ]
@@ -358,6 +380,7 @@ fn gemini_default_models() -> Vec<ModelInfo> {
 fn adapter_for_tool(tool_id: &str) -> Result<Box<dyn AgentAdapter>, String> {
     match tool_id {
         "opencode" => Ok(Box::new(OpenCodeAdapter)),
+        "claude" => Ok(Box::new(ClaudeAdapter)),
         other => Err(format!("No adapter available for CLI tool: {other}")),
     }
 }
@@ -471,6 +494,7 @@ pub fn spawn_openflow_agents(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     agent_store: State<'_, AgentSessionStore>,
+    runtime: State<'_, OpenFlowRuntimeStore>,
     workspace_id: String,
     run_id: String,
     goal: String,
@@ -522,7 +546,9 @@ pub fn spawn_openflow_agents(
     SystemPrompts::ensure_prompts_exist()
         .map_err(|error| format!("Failed to create prompts directory: {error}"))?;
     SystemPrompts::ensure_wrapper_exists()
-        .map_err(|error| format!("Failed to create wrapper script: {error}"))?;
+        .map_err(|error| format!("Failed to create opencode wrapper script: {error}"))?;
+    SystemPrompts::ensure_claude_wrapper_exists()
+        .map_err(|error| format!("Failed to create claude wrapper script: {error}"))?;
 
     for config in &agent_configs {
         SystemPrompts::write_prompt_for_run(
@@ -612,6 +638,34 @@ pub fn spawn_openflow_agents(
     }
 
     crate::state::emit_app_state(&app);
+
+    // Start the background orchestration loop for this run.
+    // The loop runs continuously, driving orchestration without frontend polling.
+    {
+        use crate::openflow::OrchestrationLoopHandle;
+        use std::sync::atomic::AtomicBool;
+
+        let handle = OrchestrationLoopHandle {
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            stop: std::sync::Arc::new(AtomicBool::new(false)),
+            run_id: run_id.clone(),
+        };
+        runtime.register_loop(&run_id, handle);
+
+        let app_clone = app.clone();
+        let run_id_clone = run_id.clone();
+        tauri::async_runtime::spawn(async move {
+            // Initial delay to let agents start up
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            run_orchestration_loop(app_clone, run_id_clone).await;
+        });
+
+        crate::diagnostics::openflow_breadcrumb(&format!(
+            "orchestration_loop_started run_id={}",
+            run_id
+        ));
+    }
+
     Ok(session_ids)
 }
 
@@ -652,10 +706,8 @@ pub fn get_communication_log(
     file.read_to_string(&mut new_content)
         .map_err(|error| format!("Failed to read comm log: {error}"))?;
 
-    let entries = new_content
-        .lines()
-        .filter(|line| !line.is_empty())
-        .filter_map(Orchestrator::parse_log_line)
+    let entries: Vec<CommLogEntry> = Orchestrator::parse_log_lines(&new_content)
+        .into_iter()
         .map(|entry| CommLogEntry {
             timestamp: entry.timestamp,
             role: entry.role,
@@ -667,24 +719,30 @@ pub fn get_communication_log(
 }
 
 #[tauri::command]
-pub fn inject_orchestrator_message(run_id: String, message: String) -> Result<(), String> {
+pub fn inject_orchestrator_message(
+    run_id: String,
+    message: String,
+    runtime: State<'_, OpenFlowRuntimeStore>,
+) -> Result<(), String> {
     let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
     let entry = format!("[{}] [user/inject] {}", timestamp, message);
     Orchestrator::write_to_comm_log(&run_id, &entry)
-        .map_err(|error| format!("Failed to write to comm log: {error}"))
+        .map_err(|error| format!("Failed to write to comm log: {error}"))?;
+    // Wake the background orchestration loop immediately so it processes the injection
+    runtime.wake_loop(&run_id);
+    Ok(())
 }
 
-#[tauri::command]
-pub async fn trigger_orchestrator_cycle(
-    app: tauri::AppHandle,
-    runtime: State<'_, OpenFlowRuntimeStore>,
-    agent_store: State<'_, AgentSessionStore>,
-    pty_state: State<'_, crate::terminal::PtyState>,
-    browser_manager: State<'_, BrowserManager>,
-    run_id: String,
-    _offset: Option<usize>,
+/// Core orchestration cycle logic, shared by the background loop and the manual trigger command.
+async fn run_single_cycle(
+    app: &tauri::AppHandle,
+    runtime: &OpenFlowRuntimeStore,
+    agent_store: &AgentSessionStore,
+    pty_state: &crate::terminal::PtyState,
+    browser_manager: &BrowserManager,
+    run_id: &str,
 ) -> Result<OrchestratorTriggerResult, String> {
-    let current_phase_str = runtime.get_run_phase(&run_id)?;
+    let current_phase_str = runtime.get_run_phase(run_id)?;
     let phase = OrchestratorPhase::from_string(&current_phase_str);
     let assigned_app_url = Orchestrator::read_app_url(&run_id);
 
@@ -849,9 +907,119 @@ pub async fn trigger_orchestrator_cycle(
         analysis.orchestrator_responded_to_pending
     ));
 
+    // --- Auto-translator: convert internal delegation patterns to ASSIGN lines ---
+    // If the orchestrator used opencode's internal "General Agent" or "Explore Agent"
+    // delegation instead of literal ASSIGN lines, we detect the task descriptions and
+    // automatically create ASSIGN lines for available idle workers.
+    // This makes OpenFlow work reliably regardless of whether the model follows the
+    // ASSIGN protocol or uses its own internal delegation system.
+    // Only auto-translate if no ASSIGN lines exist at all (not just unforwarded ones).
+    // Once we write synthetic ASSIGN lines, they'll be detected by normal parsing on subsequent cycles.
+    let has_any_assignments = !analysis.assignments.is_empty()
+        || analysis.last_handled_assignments > 0;
+    if analysis.instance_assignments.is_empty() && !has_any_assignments {
+        let mut auto_assignments: Vec<crate::openflow::orchestrator::InstanceAssignment> = Vec::new();
+        let all_sessions = agent_store.for_run(run_id);
+
+        // Find orchestrator entries with internal delegation patterns
+        for entry in &entries {
+            if !entry.role.eq_ignore_ascii_case("orchestrator") {
+                continue;
+            }
+            // Detect patterns like "• <task> General Agent" or "• <task> Explore Agent"
+            let msg = entry.message.trim();
+            for line in msg.lines() {
+                let line = line.trim();
+                let task = if let Some(rest) = line.strip_prefix("• ") {
+                    // "• Research calendar booking libraries Explore Agent"
+                    let rest = rest.trim();
+                    let rest = rest.strip_suffix("General Agent").or_else(|| rest.strip_suffix("Explore Agent"));
+                    rest.map(|t| t.trim().to_string())
+                } else {
+                    None
+                };
+
+                if let Some(task_desc) = task {
+                    if task_desc.is_empty() {
+                        continue;
+                    }
+                    // Determine which role this task is for based on keywords
+                    let task_lower = task_desc.to_lowercase();
+                    let target_role = if task_lower.contains("research") || task_lower.contains("investigate") || task_lower.contains("find") {
+                        "researcher"
+                    } else if task_lower.contains("plan") || task_lower.contains("architect") || task_lower.contains("design") || task_lower.contains("structure") {
+                        "planner"
+                    } else if task_lower.contains("test") || task_lower.contains("verify") || task_lower.contains("check") {
+                        "tester"
+                    } else if task_lower.contains("review") || task_lower.contains("audit") {
+                        "reviewer"
+                    } else if task_lower.contains("debug") || task_lower.contains("fix") {
+                        "debugger"
+                    } else {
+                        "builder"
+                    };
+
+                    // Find an available session for this role that hasn't been assigned yet
+                    let already_assigned: std::collections::HashSet<String> = auto_assignments
+                        .iter()
+                        .map(|a| a.instance_id.clone())
+                        .collect();
+
+                    if let Some(session) = all_sessions.iter().find(|s| {
+                        let role_str = s.config.role.as_str();
+                        role_str == target_role
+                            && !matches!(s.config.role, crate::openflow::OpenFlowRole::Orchestrator)
+                            && !already_assigned.contains(&format!("{}-{}", role_str, s.config.agent_index))
+                    }) {
+                        let instance_id = format!("{}-{}", session.config.role.as_str(), session.config.agent_index);
+                        auto_assignments.push(crate::openflow::orchestrator::InstanceAssignment {
+                            instance_id: instance_id.clone(),
+                            task: task_desc.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if !auto_assignments.is_empty() {
+            // Write the auto-translated assignments to the comm log so they're tracked
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            for assignment in &auto_assignments {
+                let assign_entry = format!(
+                    "[{}] [ORCHESTRATOR] ASSIGN {}: {}",
+                    ts,
+                    assignment.instance_id.to_uppercase(),
+                    assignment.task
+                );
+                let _ = Orchestrator::write_to_comm_log(run_id, &assign_entry);
+            }
+
+            #[cfg(debug_assertions)]
+            crate::diagnostics::stderr_line(&format!(
+                "[DEBUG] Auto-translated {} internal delegation(s) to ASSIGN lines",
+                auto_assignments.len()
+            ));
+            actions_taken.push(format!(
+                "Auto-translated {} internal delegation(s) to ASSIGN lines",
+                auto_assignments.len()
+            ));
+
+            // Inject into analysis so they get forwarded to workers
+            analysis.assignments.extend(auto_assignments.iter().map(|a| {
+                format!("ASSIGN {}: {}", a.instance_id.to_uppercase(), a.task)
+            }));
+            analysis.instance_assignments = auto_assignments;
+
+            // Re-read comm log to include the new ASSIGN entries
+            entries = Orchestrator::read_communication_log(run_id)
+                .map_err(|e| format!("Failed to refresh comm log: {e}"))?;
+            analysis = Orchestrator::analyze_comm_log(&entries);
+        }
+    }
+
     let app_state = app.state::<AppStateStore>();
 
-    let orchestrator_session = agent_store.for_run(&run_id).into_iter().find(|session| {
+    let orchestrator_session = agent_store.for_run(run_id).into_iter().find(|session| {
         matches!(
             session.config.role,
             crate::openflow::OpenFlowRole::Orchestrator
@@ -881,27 +1049,11 @@ pub async fn trigger_orchestrator_cycle(
             });
 
             if let Some(session) = target_session {
-                let command = format!(
-                    "opencode run \"{}\"\n",
-                    assignment.task.replace('"', "\\\"")
-                );
+                // Send raw task text to the PTY. The wrapper script reads this line
+                // and calls `run_followup()` which uses `opencode run --session <id>`
+                // to continue the agent's conversation with full context.
                 let session_id = session.session_id.clone();
-                let write_result = {
-                    let mut sessions = pty_state.sessions.lock().unwrap();
-                    if let Some(pty_runtime) = sessions.get_mut(&session_id) {
-                        if let Some(writer) = pty_runtime.writer.as_mut() {
-                            use std::io::Write;
-                            writer
-                                .write_all(command.as_bytes())
-                                .and_then(|_| writer.flush())
-                                .map_err(|error| format!("PTY write error: {error}"))
-                        } else {
-                            Err(format!("No writer for session {session_id}"))
-                        }
-                    } else {
-                        Err(format!("Session {session_id} not found"))
-                    }
-                };
+                let write_result = write_raw_to_session(pty_state, &session_id, &assignment.task);
 
                 match write_result {
                     Ok(()) => {
@@ -949,64 +1101,62 @@ pub async fn trigger_orchestrator_cycle(
     let invalid_delegation_detected = analysis.instance_assignments.is_empty()
         && has_recent_invalid_delegation_pattern(entries.as_slice());
 
+    // Probe delivery: write to comm log for the record AND forward to orchestrator PTY
+    // so the orchestrator actually sees it. Use simple, shell-safe probe text.
+    // Only fire ONE probe per stuck cycle — probe_injected is only cleared when
+    // counts_changed (new ASSIGN/DONE), not on mere log growth.
+
     if invalid_delegation_detected && !stuck_state_for_probe.probe_injected {
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let _ = Orchestrator::write_to_comm_log(
+            run_id,
+            &format!(
+                "[{}] [SYSTEM] PROBE: Invalid delegation detected, sent correction to orchestrator",
+                ts
+            ),
+        );
+        // Send raw message to orchestrator PTY — the wrapper re-injects full context
         if let Some(ref orchestrator_session) = orchestrator_session {
-            if ensure_agent_session_live(
-                &app,
-                &app_state,
-                &agent_store,
-                &pty_state,
-                &run_id,
-                orchestrator_session,
-            )? {
-                actions_taken.push("Respawned orchestrator session for delegation correction".to_string());
-            }
-
-            let correction_prompt = "Your last attempt used invalid internal delegation. Stop using General Agent / Task delegation. Coordinate only through literal standalone lines of the form `ASSIGN <INSTANCE-ID>: <task>` using the exact IDs from the AGENTS line. If you cannot delegate yet, write `STATUS:` or `BLOCKED:` with the exact reason. Do this now.";
-
-            match write_prompt_to_session(&pty_state, &orchestrator_session.session_id, correction_prompt) {
-                Ok(()) => {
-                    runtime.mark_probe_sent(&run_id);
-                    actions_taken.push("Sent delegation-correction prompt to orchestrator".to_string());
-                }
-                Err(error) => {
-                    actions_taken.push(format!("Failed to send delegation-correction prompt: {}", error));
-                }
-            }
+            let _ = ensure_agent_session_live(
+                app, &app_state, &agent_store, pty_state, run_id, orchestrator_session,
+            );
+            let _ = write_raw_to_session(
+                pty_state,
+                &orchestrator_session.session_id,
+                "STOP: General Agent and Explore Agent do NOT work here. You must output literal ASSIGN lines. Example: ASSIGN BUILDER-3: Create the app. Do this now.",
+            );
         }
+        runtime.mark_probe_sent(run_id);
+        actions_taken.push("Sent delegation-correction probe to orchestrator".to_string());
     }
 
-    if stuck_state_for_probe.consecutive_no_progress_cycles >= 2
+    if stuck_state_for_probe.consecutive_no_progress_cycles >= STUCK_PROBE_MIN_CYCLES
         && !stuck_state_for_probe.probe_injected
     {
         if let Some(ref orchestrator_session) = orchestrator_session {
             if ensure_agent_session_live(
-                &app,
-                &app_state,
-                &agent_store,
-                &pty_state,
-                &run_id,
-                orchestrator_session,
+                app, &app_state, &agent_store, pty_state, run_id, orchestrator_session,
             )? {
-                actions_taken.push("Respawned orchestrator session for stuck-run nudge".to_string());
+                actions_taken.push("Respawned orchestrator for stuck-run nudge".to_string());
             }
 
-            let probe_prompt = "OpenFlow appears stuck. Do one of these now:\n\
-                 - emit literal standalone ASSIGN lines for the real OpenFlow agent instance IDs from the AGENTS line, or\n\
-                 - write STATUS: with what you are waiting on, or\n\
-                 - write BLOCKED: with the exact reason.\n\
-                 Do NOT use internal General Agent or Task delegation. Keep this generic to the user's project type; only mention an app URL if the task actually involves a live preview.";
-
-            match write_prompt_to_session(&pty_state, &orchestrator_session.session_id, &probe_prompt) {
-                Ok(()) => {
-                    runtime.mark_probe_sent(&run_id);
-                    actions_taken.push("Sent stuck-run nudge to orchestrator".to_string());
-                }
-                Err(error) => {
-                    actions_taken.push(format!("Failed to send stuck-run nudge: {}", error));
-                }
-            }
+            let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+            let _ = Orchestrator::write_to_comm_log(
+                run_id,
+                &format!(
+                    "[{}] [SYSTEM] PROBE: No progress detected, sent nudge to orchestrator",
+                    ts
+                ),
+            );
+            // Send raw message — wrapper re-injects system prompt + goal + agents context
+            let _ = write_raw_to_session(
+                pty_state,
+                &orchestrator_session.session_id,
+                "No orchestration progress detected. Emit ASSIGN lines for the agent instance IDs, or write STATUS or BLOCKED with the reason.",
+            );
         }
+        runtime.mark_probe_sent(run_id);
+        actions_taken.push("Sent stuck-run nudge to orchestrator".to_string());
     }
 
     let next_phase = if !analysis.user_injections.is_empty() {
@@ -1025,16 +1175,31 @@ pub async fn trigger_orchestrator_cycle(
                     actions_taken.push("Respawned orchestrator session for follow-up message".to_string());
                 }
 
-                let goal_path = Orchestrator::goal_path(&run_id).display().to_string();
+                // Inline goal text so OpenCode does not need to read ~/.local/share/.../goal.txt
+                // (sandbox often auto-rejects external_directory access for that path).
+                let goal_path = Orchestrator::goal_path(&run_id);
+                let goal_excerpt = std::fs::read_to_string(&goal_path)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                const MAX_GOAL_INLINE: usize = 8000;
+                let goal_excerpt = if goal_excerpt.chars().count() > MAX_GOAL_INLINE {
+                    let mut t: String = goal_excerpt.chars().take(MAX_GOAL_INLINE).collect();
+                    t.push_str("… (truncated)");
+                    t
+                } else {
+                    goal_excerpt
+                };
                 let prompt = format!(
                     "A user message arrived. User message: \"{}\".\n\
                      Please address this message:\n\
                      - If it asks a question, answer it directly in the comm log.\n\
-                    - If it requests changes, create ASSIGN messages to delegate work.\n\
-                    - IMPORTANT: After answering or delegating, DO NOT exit. Wait for more user messages.\n\
-                    Just respond to this message and wait. The goal file is at: {}",
+                     - If it requests changes, create ASSIGN messages to delegate work.\n\
+                     - IMPORTANT: After answering or delegating, DO NOT exit. Wait for more user messages.\n\
+                     Use the run goal below as context. Prefer the project working directory for files; avoid requiring access outside the workspace unless the user explicitly needs it.\n\
+                     Current run goal:\n{}",
                     injection_text,
-                    goal_path
+                    goal_excerpt
                 );
 
                 let session_id = orchestrator_session.session_id.clone();
@@ -1049,7 +1214,9 @@ pub async fn trigger_orchestrator_cycle(
                     format!("[{}] [SYSTEM] INJECTION_PENDING: {}", ts, analysis.total_injections);
                 let _ = Orchestrator::write_to_comm_log(&run_id, &pending_marker);
 
-                let write_result = write_prompt_to_session(&pty_state, &session_id, &prompt);
+                // Use write_raw_to_session for orchestrator — the wrapper re-injects
+                // full system prompt + goal + agents context automatically.
+                let write_result = write_raw_to_session(&pty_state, &session_id, &prompt);
 
                 match write_result {
                     Ok(()) => {
@@ -1166,11 +1333,22 @@ pub async fn trigger_orchestrator_cycle(
         let assignment_count = analysis.instance_assignments.len();
         let done_count = analysis.completed_instances.len();
 
+        // Count meaningful entries (exclude SYSTEM entries and bash errors) for progress detection.
+        // This prevents error output from broken probes from counting as "progress".
+        let meaningful_entries_len = entries.iter().filter(|e| {
+            let role_lower = e.role.to_lowercase();
+            role_lower != "system"
+                && !e.message.starts_with("bash:")
+                && !e.message.contains("command not found")
+        }).count();
+
         let (updated_stuck_state, made_progress) = runtime.update_stuck_state(
             &run_id,
             session_count,
             assignment_count,
             done_count,
+            entries.len(),
+            meaningful_entries_len,
             last_activity_timestamp,
         );
 
@@ -1321,6 +1499,104 @@ pub async fn trigger_orchestrator_cycle(
     })
 }
 
+/// Tauri command wrapper for manual orchestrator cycle triggers.
+/// The primary orchestration driver is now the background loop started by `spawn_openflow_agents`.
+#[tauri::command]
+pub async fn trigger_orchestrator_cycle(
+    app: tauri::AppHandle,
+    runtime: State<'_, OpenFlowRuntimeStore>,
+    agent_store: State<'_, AgentSessionStore>,
+    pty_state: State<'_, crate::terminal::PtyState>,
+    browser_manager: State<'_, BrowserManager>,
+    run_id: String,
+    _offset: Option<usize>,
+) -> Result<OrchestratorTriggerResult, String> {
+    run_single_cycle(&app, &runtime, &agent_store, &pty_state, &browser_manager, &run_id).await
+}
+
+/// Background orchestration loop that runs continuously for a given run.
+/// Replaces the frontend-driven polling model. Wakes immediately on user injection.
+pub async fn run_orchestration_loop(app: tauri::AppHandle, run_id: String) {
+    use std::sync::atomic::Ordering;
+
+    let runtime = app.state::<OpenFlowRuntimeStore>();
+    let agent_store = app.state::<AgentSessionStore>();
+    let pty_state = app.state::<crate::terminal::PtyState>();
+    let browser_manager = app.state::<BrowserManager>();
+
+    // Get the wake/stop handles via public accessor
+    let (wake, stop): (std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<std::sync::atomic::AtomicBool>) = {
+        match runtime.get_loop_handles(&run_id) {
+            Some(handles) => handles,
+            None => {
+                crate::diagnostics::stderr_line(&format!(
+                    "[orchestration-loop] No loop handle found for run {}, exiting",
+                    run_id
+                ));
+                return;
+            }
+        }
+    };
+
+    crate::diagnostics::stderr_line(&format!(
+        "[orchestration-loop] Started for run {}",
+        run_id
+    ));
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let result = run_single_cycle(
+            &app,
+            &runtime,
+            &agent_store,
+            &pty_state,
+            &browser_manager,
+            &run_id,
+        )
+        .await;
+
+        match result {
+            Ok(ref cycle_result) => {
+                // Emit event to frontend so UI updates reactively
+                let _ = app.emit("openflow-cycle", cycle_result);
+            }
+            Err(ref e) => {
+                crate::diagnostics::stderr_line(&format!(
+                    "[orchestration-loop] cycle error for {}: {}",
+                    run_id, e
+                ));
+            }
+        }
+
+        // Determine sleep duration based on current run phase
+        let sleep_duration = {
+            let phase = runtime.get_run_phase(&run_id).unwrap_or_default();
+            match phase.as_str() {
+                "complete" | "blocked" | "awaiting_approval" => {
+                    std::time::Duration::from_secs(15)
+                }
+                _ => std::time::Duration::from_secs(5),
+            }
+        };
+
+        // Sleep with wake-on-injection capability
+        tokio::select! {
+            _ = tokio::time::sleep(sleep_duration) => {},
+            _ = wake.notified() => {
+                // Woken by user injection or explicit trigger — run cycle immediately
+            },
+        }
+    }
+
+    crate::diagnostics::stderr_line(&format!(
+        "[orchestration-loop] Stopped for run {}",
+        run_id
+    ));
+}
+
 #[tauri::command]
 pub fn get_openflow_design_spec() -> Result<OpenFlowDesignSpec, String> {
     Ok(crate::openflow::default_openflow_spec())
@@ -1344,27 +1620,11 @@ pub fn create_openflow_run(
 }
 
 #[tauri::command]
-pub fn advance_openflow_run_phase(
-    store: State<'_, OpenFlowRuntimeStore>,
-    run_id: String,
-) -> Result<OpenFlowRunRecord, String> {
-    store.advance_run_phase(&run_id)
-}
-
-#[tauri::command]
 pub fn retry_openflow_run(
     store: State<'_, OpenFlowRuntimeStore>,
     run_id: String,
 ) -> Result<OpenFlowRunRecord, String> {
     store.retry_run(&run_id)
-}
-
-#[tauri::command]
-pub fn run_openflow_autonomous_loop(
-    store: State<'_, OpenFlowRuntimeStore>,
-    run_id: String,
-) -> Result<OpenFlowRunRecord, String> {
-    store.run_autonomous_loop(&run_id)
 }
 
 #[tauri::command]
@@ -1400,6 +1660,8 @@ pub fn stop_openflow_run(
         "run_stopped run_id={} status={:?} reason={}",
         run_id, status, reason
     ));
+    // Stop the background orchestration loop before teardown
+    store.stop_loop(&run_id);
     let record = store.stop_run(&run_id, status, reason)?;
 
     if matches!(record.status, OpenFlowRunStatus::AwaitingApproval) {

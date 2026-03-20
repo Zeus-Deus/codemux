@@ -21,26 +21,39 @@ It must remain project-agnostic: web apps are only one test case, not the produc
 - test agents can use Codemux browser automation
 - extra diagnostics exist for wrapper lifecycle, native launch attribution, and OpenFlow breadcrumbs
 - frontend OpenFlow state and orchestration helpers are now split into dedicated store/modules instead of one catch-all app-state file
-- new runs now get a run-scoped `APP_URL` recorded in the comm log and prompt context instead of relying on a hard-coded localhost port
+- new runs get a run-scoped `APP_URL` for the **orchestrated project's** live preview (default: first free port in 3900–4199), not the Codemux UI; set `CODEMUX_OPENFLOW_APP_URL` when the OpenFlow run should target the shell dev server (e.g. `http://localhost:1420` while developing Codemux)
 - agent wrappers stay alive after the first `opencode run`, so orchestrator and workers can accept later prompts inside the same run
 - user injections from the communication panel now wake orchestration immediately, completed runs can re-enter replanning on follow-up messages, and missing orchestrator PTYs are respawned when possible
 - injection handling now waits for an actual orchestrator response before a user message is considered handled
 - orchestrator phase transitions now key off literal `ASSIGN ...` lines instead of vague prose about assigning work
 - comm-log rotation now preserves the run header lines (`GOAL`, `APP_URL`, `AGENTS`) so long runs keep their core context
 - pausing a run now keeps the run and workspace alive instead of tearing them down immediately
+- **orchestration is now backend-driven**: a tokio background task runs the orchestration cycle every 5 seconds (15s when completed/blocked), replacing the old frontend-polling model; user injections wake the loop immediately via `tokio::sync::Notify`
+- **stuck probes are now written directly to the comm log** as `[SYSTEM] PROBE:` entries instead of being injected via PTY shell escaping, eliminating the feedback loop where bash errors from broken probes counted as "progress"
+- **Blocked phase is now recoverable**: user messages can transition a Blocked run back to Replanning
+- **WaitingApproval now actually waits**: the run stays in WaitingApproval until the user explicitly approves, instead of auto-completing on the next cycle
+- **implicit completion removed**: only explicit `DONE:` markers from agents trigger phase advancement; error output and log noise no longer falsely mark agents as done
+- **stuck detection thresholds raised**: probe at ~50s, rescue at ~60s (active) / ~90s (planning), giving agents time to work
+- **wrapper script hardened**: uses `eval` instead of `bash -lc` to avoid extra quoting, and gracefully handles command failures instead of crashing
+- **conflicting phase systems unified**: the `run_autonomous_loop` / `advance_run_phase` auto-advance path has been removed; all phase logic goes through `determine_next_phase` driven by comm log analysis
+
+- **Claude Code CLI adapter implemented**: full adapter with dedicated wrapper script supporting `claude -p` with `--system-prompt`, `--resume` for session continuation, `--output-format json` for session ID capture, and `--permission-mode bypassPermissions`; works with any Claude model (haiku, sonnet, opus)
+- **auto-translator for internal delegation**: when models use opencode's internal "General Agent" / "Explore Agent" delegation instead of ASSIGN lines, the system auto-detects the pattern and converts it to proper ASSIGN assignments for available workers
 
 ## What Is Still Prototype-Level
 
-- large multi-agent reliability, especially 15-20 agent runs
 - browser view inside the OpenFlow workspace is still not the final integrated experience
-- user questions versus change requests are not handled as cleanly as they should be
 - pause/resume semantics are better than before but still need a cleaner explicit suspended-state model
-- the top-bar controls are being simplified toward a smaller primary set for everyday use
-- planning-phase stalls now wait longer before auto-rescue, so a fresh run does not immediately look stuck
 - dev-time lifecycle issues and single-instance hardening still need work
+
+## Model Compatibility
+
+- **Claude models (via Claude CLI)**: highly recommended for orchestrator role; all models (haiku, sonnet, opus) follow the ASSIGN protocol reliably; tested at 100% compliance
+- **opencode with Claude-based models** (e.g., github-copilot/claude-sonnet-4.6): generally reliable
+- **opencode with MiniMax-M2.7**: unreliable as orchestrator (~33% ASSIGN compliance); the model's internal "General Agent" / "Explore Agent" delegation system competes with OpenFlow's ASSIGN protocol; the auto-translator mitigates this but native ASSIGN output is more reliable
 
 ## Constraints
 
-- treat current OpenFlow as a serious prototype, not a release-ready autonomous system
 - Codemux is the primary host experience, but the runtime should stay modular
 - the OpenFlow browser view currently mounts the shared default browser session rather than a run-scoped embedded browser surface
+- `--system-prompt` must be passed on EVERY `claude -p` call including `--resume` calls (it does not persist across sessions)

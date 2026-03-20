@@ -4,7 +4,6 @@
         commLogStore,
         getCommunicationLog,
         injectOrchestratorMessage,
-        triggerOrchestratorCycle,
     } from '../../stores/openflow';
     import { mergeCommLogEntries } from '../../lib/openflowPolling';
 
@@ -60,11 +59,10 @@
             autoFollow = true;
             await injectOrchestratorMessage(currentRunId, newMessage.trim());
             newMessage = '';
-            const injectedEntries = await getCommunicationLog(currentRunId);
-            commLogStore.update(existing => mergeCommLogEntries(existing, injectedEntries));
-            await triggerOrchestratorCycle(currentRunId);
-            const followUpEntries = await getCommunicationLog(currentRunId);
-            commLogStore.update(existing => mergeCommLogEntries(existing, followUpEntries));
+            // The backend loop wakes automatically on injection — no need to trigger
+            // the orchestrator cycle from the frontend. Just fetch the latest log.
+            const entries = await getCommunicationLog(currentRunId);
+            commLogStore.update(existing => mergeCommLogEntries(existing, entries));
             tick().then(jumpToLatest);
         } catch (e) {
             console.error('Failed to inject message:', e);

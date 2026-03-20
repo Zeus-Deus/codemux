@@ -24,7 +24,14 @@ export function clearCommLogOffset(runId: string) {
 
 export async function syncOpenFlowRuntime() {
     const snapshot = await invoke<OpenFlowRuntimeSnapshot>('get_openflow_runtime_snapshot');
-    openflowRuntime.set(snapshot);
+    // Only update the store if the snapshot actually changed.
+    // This prevents unnecessary Svelte reactivity cycles that cause UI flickering.
+    openflowRuntime.update(current => {
+        if (current && JSON.stringify(current) === JSON.stringify(snapshot)) {
+            return current;
+        }
+        return snapshot;
+    });
     return snapshot;
 }
 
@@ -46,20 +53,8 @@ export async function createOpenFlowRun(request: OpenFlowCreateRunRequest) {
     return run;
 }
 
-export async function advanceOpenFlowRunPhase(runId: string) {
-    const run = await invoke<OpenFlowRunRecord>('advance_openflow_run_phase', { runId });
-    await refreshOpenFlowRuntime();
-    return run;
-}
-
 export async function retryOpenFlowRun(runId: string) {
     const run = await invoke<OpenFlowRunRecord>('retry_openflow_run', { runId });
-    await refreshOpenFlowRuntime();
-    return run;
-}
-
-export async function runOpenFlowAutonomousLoop(runId: string) {
-    const run = await invoke<OpenFlowRunRecord>('run_openflow_autonomous_loop', { runId });
     await refreshOpenFlowRuntime();
     return run;
 }
@@ -140,29 +135,9 @@ export async function injectOrchestratorMessage(runId: string, message: string):
     return invoke<number>('inject_orchestrator_message', { runId, message });
 }
 
+/// Manual trigger for one orchestration cycle. The primary driver is the backend loop.
 export async function triggerOrchestratorCycle(runId: string): Promise<OrchestratorTriggerResult> {
     const result = await invoke<OrchestratorTriggerResult>('trigger_orchestrator_cycle', { runId });
-
-    if (result.next_phase !== null) {
-        await refreshOpenFlowRuntime();
-    }
-
-    const snapshot = await syncOpenFlowRuntime();
-    const updatedRun = snapshot.active_runs.find(run => run.run_id === runId);
-    if (updatedRun) {
-        (result as OrchestratorTriggerResult & {
-            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
-            orchestration_detail?: string | null;
-        }).orchestration_state = (updatedRun as unknown as {
-            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
-        }).orchestration_state ?? 'active';
-        (result as OrchestratorTriggerResult & {
-            orchestration_state?: OpenFlowRunRecord['orchestration_state'];
-            orchestration_detail?: string | null;
-        }).orchestration_detail = (updatedRun as unknown as {
-            orchestration_detail?: string | null;
-        }).orchestration_detail ?? null;
-    }
-
+    await syncOpenFlowRuntime();
     return result;
 }

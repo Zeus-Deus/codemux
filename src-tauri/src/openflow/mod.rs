@@ -5,6 +5,7 @@ pub mod prompts;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent::{AgentSessionState, AgentSessionStatus};
@@ -254,11 +255,26 @@ pub struct StuckState {
     pub last_session_count: usize,
     pub last_assignment_count: usize,
     pub last_done_count: usize,
+    /// Last seen communication.log entry count (all entries including SYSTEM).
+    pub last_comm_log_entries_len: usize,
+    /// Last seen meaningful entry count (excludes SYSTEM entries and bash errors).
+    pub last_meaningful_entries_len: usize,
     pub probe_injected: bool,
     pub rescue_attempted: bool,
     pub last_meaningful_activity: Option<chrono::DateTime<chrono::Utc>>,
     pub replan_consecutive: u32,
     pub replan_start_done_count: usize,
+}
+
+/// Handle for a background orchestration loop task.
+/// Used to wake the loop on user injection or stop it on explicit run stop.
+pub struct OrchestrationLoopHandle {
+    /// Notify the loop to wake up immediately (e.g., on user injection).
+    pub wake: Arc<tokio::sync::Notify>,
+    /// Set to true to stop the loop.
+    pub stop: Arc<AtomicBool>,
+    /// The run ID this loop manages.
+    pub run_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +292,7 @@ pub struct OpenFlowCreateRunRequest {
 pub struct OpenFlowRuntimeStore {
     inner: Arc<Mutex<OpenFlowRuntimeSnapshot>>,
     stuck_state: Arc<Mutex<std::collections::HashMap<String, StuckState>>>,
+    orchestration_loops: Arc<Mutex<HashMap<String, OrchestrationLoopHandle>>>,
 }
 
 impl Default for OpenFlowRuntimeStore {
@@ -285,6 +302,7 @@ impl Default for OpenFlowRuntimeStore {
                 active_runs: vec![],
             })),
             stuck_state: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            orchestration_loops: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -617,48 +635,6 @@ impl OpenFlowRuntimeStore {
         Ok(run.clone())
     }
 
-    pub fn run_autonomous_loop(&self, run_id: &str) -> Result<OpenFlowRunRecord, String> {
-        // Cap iterations to prevent infinite spin; real orchestration is driven by the
-        // frontend's 10-second cycle via `trigger_orchestrator_cycle`.
-        const MAX_ITERATIONS: u32 = 20;
-        let mut iterations = 0;
-
-        loop {
-            if iterations >= MAX_ITERATIONS {
-                return Err(format!(
-                    "run_autonomous_loop exceeded {MAX_ITERATIONS} iterations for {run_id}; use trigger_orchestrator_cycle instead"
-                ));
-            }
-            iterations += 1;
-
-            // Targeted read — avoids cloning the entire runtime snapshot.
-            let (_phase, status) = self.get_run_phase_and_status(run_id)?;
-
-            if matches!(
-                status,
-                OpenFlowRunStatus::Completed
-                    | OpenFlowRunStatus::Failed
-                    | OpenFlowRunStatus::Cancelled
-                    | OpenFlowRunStatus::AwaitingApproval
-            ) {
-                // Return a lightweight clone of just this run.
-                return self.get_run_record(run_id);
-            }
-
-            let advanced = self.advance_run_phase(run_id)?;
-
-            if advanced.current_phase == "review" {
-                let reviewed = self.apply_review_result(run_id, 92, true, None)?;
-                if matches!(reviewed.status, OpenFlowRunStatus::Completed) {
-                    return Ok(reviewed);
-                }
-            }
-
-            // Yield between iterations to avoid starving the Tauri command thread.
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    }
-
     pub fn apply_review_result(
         &self,
         run_id: &str,
@@ -788,6 +764,8 @@ impl OpenFlowRuntimeStore {
         session_count: usize,
         assignment_count: usize,
         done_count: usize,
+        comm_log_entries_len: usize,
+        meaningful_entries_len: usize,
         last_activity_timestamp: Option<chrono::DateTime<chrono::Utc>>,
     ) -> (StuckState, bool) {
         let mut stuck = self.stuck_state.lock().unwrap_or_else(|e| e.into_inner());
@@ -804,12 +782,23 @@ impl OpenFlowRuntimeStore {
             .map(|last| last_activity_timestamp.map(|ts| ts > last).unwrap_or(false))
             .unwrap_or(last_activity_timestamp.is_some());
 
-        let made_progress = counts_changed || activity_advanced;
+        // Only count meaningful log entries (excludes SYSTEM entries and bash errors)
+        // for progress detection. Raw log growth from error output must not reset stuck state.
+        let meaningful_log_grew = meaningful_entries_len > state.last_meaningful_entries_len;
+
+        let made_progress = counts_changed || activity_advanced || meaningful_log_grew;
 
         if made_progress {
             state.consecutive_no_progress_cycles = 0;
-            state.probe_injected = false;
-            state.rescue_attempted = false;
+            // Only clear probe/rescue flags when analysis counts change
+            // (new ASSIGN, DONE, or session changes). Mere log growth (even from
+            // non-SYSTEM sources) must NOT re-arm probes, because the orchestrator's
+            // invalid delegation output (e.g. "• Build... General Agent") counts as
+            // meaningful log growth but is NOT real progress.
+            if counts_changed {
+                state.probe_injected = false;
+                state.rescue_attempted = false;
+            }
         } else {
             state.consecutive_no_progress_cycles += 1;
         }
@@ -817,6 +806,8 @@ impl OpenFlowRuntimeStore {
         state.last_session_count = session_count;
         state.last_assignment_count = assignment_count;
         state.last_done_count = done_count;
+        state.last_comm_log_entries_len = comm_log_entries_len;
+        state.last_meaningful_entries_len = meaningful_entries_len;
         state.last_meaningful_activity = last_activity_timestamp;
 
         (state.clone(), made_progress)
@@ -856,6 +847,49 @@ impl OpenFlowRuntimeStore {
                 state.replan_consecutive = 0;
                 state.replan_start_done_count = 0;
             }
+        }
+    }
+
+    // --- Orchestration loop management ---
+
+    /// Register a background orchestration loop for a run.
+    pub fn register_loop(&self, run_id: &str, handle: OrchestrationLoopHandle) {
+        if let Ok(mut loops) = self.orchestration_loops.lock() {
+            loops.insert(run_id.to_string(), handle);
+        }
+    }
+
+    /// Wake the background orchestration loop for a run (e.g., on user injection).
+    pub fn wake_loop(&self, run_id: &str) {
+        if let Ok(loops) = self.orchestration_loops.lock() {
+            if let Some(handle) = loops.get(run_id) {
+                handle.wake.notify_one();
+            }
+        }
+    }
+
+    /// Stop the background orchestration loop for a run.
+    pub fn stop_loop(&self, run_id: &str) {
+        if let Ok(mut loops) = self.orchestration_loops.lock() {
+            if let Some(handle) = loops.remove(run_id) {
+                handle.stop.store(true, Ordering::Relaxed);
+                handle.wake.notify_one(); // unblock the sleep so it exits
+            }
+        }
+    }
+
+    /// Get the wake + stop handles for a run's orchestration loop.
+    pub fn get_loop_handles(&self, run_id: &str) -> Option<(Arc<tokio::sync::Notify>, Arc<AtomicBool>)> {
+        let loops = self.orchestration_loops.lock().ok()?;
+        loops.get(run_id).map(|h| (h.wake.clone(), h.stop.clone()))
+    }
+
+    /// Check if a run has an active background orchestration loop.
+    pub fn has_active_loop(&self, run_id: &str) -> bool {
+        if let Ok(loops) = self.orchestration_loops.lock() {
+            loops.contains_key(run_id)
+        } else {
+            false
         }
     }
 }

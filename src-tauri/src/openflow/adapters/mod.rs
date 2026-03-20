@@ -33,4 +33,5 @@ pub trait AgentAdapter: Send + Sync {
     ) -> AgentSpawnSpec;
 }
 
+pub mod claude;
 pub mod opencode;
