@@ -16,7 +16,7 @@ use tauri::{Emitter, Manager, State};
 const ACTIVE_STUCK_RESCUE_CYCLES: u32 = 12; // ~60s at 5s backend loop interval
 const PLANNING_STUCK_RESCUE_CYCLES: u32 = 18; // ~90s at 5s backend loop interval
 /// Orchestrator cycles with no progress before injecting the stuck-recovery probe.
-const STUCK_PROBE_MIN_CYCLES: u32 = 10; // ~50s at 5s backend loop interval
+const STUCK_PROBE_MIN_CYCLES: u32 = 24; // ~120s at 5s backend loop interval
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliToolInfo {
@@ -210,7 +210,12 @@ fn orchestration_state_from_cycle(
             ("active".to_string(), Some("Planning orchestration".to_string()))
         }
         OrchestratorPhase::Executing | OrchestratorPhase::Verifying | OrchestratorPhase::Reviewing => {
-            ("active".to_string(), Some("Executing orchestration".to_string()))
+            let waiting_count = analysis.assignments.len().saturating_sub(analysis.completed_instances.len());
+            if waiting_count > 0 {
+                ("active".to_string(), Some(format!("Waiting for {} agent(s) to complete", waiting_count)))
+            } else {
+                ("active".to_string(), Some("Executing orchestration".to_string()))
+            }
         }
         OrchestratorPhase::WaitingApproval => {
             ("idle".to_string(), Some("Waiting for approval".to_string()))
@@ -1164,11 +1169,37 @@ async fn run_single_cycle(
                 .collect();
 
             if !new_completions.is_empty() {
-                let relay_text = format!(
-                    "AGENT STATUS UPDATE: {} NEW completion(s). {}. Assign follow-up tasks. Do NOT re-assign already completed work.",
-                    new_completions.len(),
-                    new_completions.join(" | ")
-                );
+                // Check if all workers are now done (completed or exhausted)
+                let total_workers: usize = {
+                    let sessions = agent_store.for_run(run_id);
+                    sessions.iter().filter(|s| !matches!(s.config.role, crate::openflow::OpenFlowRole::Orchestrator)).count()
+                };
+                let all_workers_done = total_workers > 0 && analysis.completed_instances.len() >= total_workers;
+                let exhausted_count = analysis.exhausted_instances.len();
+
+                let relay_text = if all_workers_done {
+                    if exhausted_count > 0 {
+                        format!(
+                            "ALL AGENTS COMPLETED ({}/{}). NOTE: {} agent(s) hit max turns without finishing — their work may be partial. Output RUN COMPLETE: <summary of what was accomplished and what still needs fixing> now.",
+                            analysis.completed_instances.len(),
+                            total_workers,
+                            exhausted_count
+                        )
+                    } else {
+                        format!(
+                            "ALL AGENTS COMPLETED ({}/{}). {}. Output RUN COMPLETE: <summary> now.",
+                            analysis.completed_instances.len(),
+                            total_workers,
+                            new_completions.join(" | ")
+                        )
+                    }
+                } else {
+                    format!(
+                        "AGENT STATUS UPDATE: {} NEW completion(s). {}. Assign follow-up tasks to available agents. Do NOT re-assign already completed work.",
+                        new_completions.len(),
+                        new_completions.join(" | ")
+                    )
+                };
 
                 let _ = write_raw_to_session(
                     pty_state,
@@ -1402,6 +1433,19 @@ async fn run_single_cycle(
                                     "[DEBUG] Browser verification failed: app not accessible at {} - {}",
                                     app_url, e
                                 ));
+                                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                                let _ = Orchestrator::write_to_comm_log(
+                                    run_id,
+                                    &format!("[{}] [SYSTEM] BROWSER_CHECK_FAILED: App not accessible at {} - {}", ts, app_url, e),
+                                );
+                                // Relay failure to orchestrator so it doesn't declare RUN COMPLETE
+                                if let Some(ref orch) = orchestrator_session {
+                                    let _ = write_raw_to_session(
+                                        pty_state,
+                                        &orch.session_id,
+                                        &format!("WARNING: Browser check failed — app is NOT accessible at {}. Assign a builder or debugger to fix the dev server before declaring RUN COMPLETE.", app_url),
+                                    );
+                                }
                                 let _ = browser_manager.close_browser(&verify_browser_id).await;
                                 false
                             }
@@ -1566,6 +1610,20 @@ async fn run_single_cycle(
                     ));
                     actions_taken.push("Browser verification failed - continuing to Verifying anyway".to_string());
                 }
+
+                // Auto-nudge orchestrator to assign testers if none have been assigned yet
+                let tester_assignments = analysis.assignments.iter()
+                    .any(|a| a.to_lowercase().contains("tester"));
+                if !tester_assignments {
+                    if let Some(ref orch) = orchestrator_session {
+                        let _ = write_raw_to_session(
+                            pty_state,
+                            &orch.session_id,
+                            "All builders are DONE. You MUST now ASSIGN testers to verify the app is working at the assigned URL. Use: ASSIGN TESTER-0: Verify the app loads and works correctly at the app URL.",
+                        );
+                        actions_taken.push("Auto-nudged orchestrator to assign testers".to_string());
+                    }
+                }
             }
         }
 
@@ -1699,9 +1757,7 @@ pub async fn run_orchestration_loop(app: tauri::AppHandle, run_id: String) {
         let sleep_duration = {
             let phase = runtime.get_run_phase(&run_id).unwrap_or_default();
             match phase.as_str() {
-                "complete" | "blocked" | "awaiting_approval" => {
-                    std::time::Duration::from_secs(15)
-                }
+                "complete" | "blocked" => std::time::Duration::from_secs(15),
                 _ => std::time::Duration::from_secs(5),
             }
         };

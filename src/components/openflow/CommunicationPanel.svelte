@@ -16,8 +16,38 @@
     let showJumpToLatest = $state(false);
 
     // Subscribe to the shared store — OrchestrationView owns the single polling interval.
-    // Limit to last 100 messages for performance with 20+ agents
-    const messages = $derived($commLogStore.slice(-100));
+    // Limit to last 100 messages for performance with 20+ agents.
+    // Two-pass: track delivery state for user injections, then filter system markers.
+    const messages = $derived.by(() => {
+        const raw = $commLogStore.slice(-100);
+
+        // Pass 1: Find which injection counts have been handled
+        const handledCounts = new Set<number>();
+        for (const msg of raw) {
+            if (msg.role.toLowerCase() === 'system' && msg.message.startsWith('HANDLED_INJECTIONS: ')) {
+                const n = parseInt(msg.message.slice('HANDLED_INJECTIONS: '.length));
+                if (!isNaN(n)) handledCounts.add(n);
+            }
+        }
+
+        // Pass 2: Tag user injections with delivery status, filter system markers
+        let injectionIndex = 0;
+        return raw.map((msg) => {
+            const roleLower = msg.role.toLowerCase();
+            if (roleLower.startsWith('user')) injectionIndex++;
+            const delivered = roleLower.startsWith('user') && handledCounts.has(injectionIndex);
+            return { ...msg, delivered };
+        }).filter((msg) => {
+            const roleLower = msg.role.toLowerCase();
+            if (roleLower === 'system') {
+                return !msg.message.startsWith('HANDLED_INJECTIONS:')
+                    && !msg.message.startsWith('HANDLED_ASSIGNMENTS:')
+                    && !msg.message.startsWith('DONE_RELAY_COUNT:')
+                    && !msg.message.startsWith('INJECTION_PENDING:');
+            }
+            return true;
+        });
+    });
 
     $effect(() => {
         const _len = messages.length;
@@ -109,7 +139,12 @@
         {#if messages.length > 0}
             {#each messages as msg}
                 <div class="message {getRoleClass(msg.role)}">
-                    <span class="message-role">{formatRole(msg.role)}</span>
+                    <span class="message-role">
+                        {formatRole(msg.role)}
+                        {#if msg.delivered}
+                            <span class="delivered-badge">Delivered</span>
+                        {/if}
+                    </span>
                     <span class="message-text">{msg.message}</span>
                 </div>
             {/each}
@@ -230,6 +265,18 @@
 
     .message.tester .message-role {
         color: #34d399;
+    }
+
+    .delivered-badge {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 1px 6px;
+        background: color-mix(in srgb, var(--ui-success) 20%, transparent);
+        border-radius: 4px;
+        font-size: 0.6rem;
+        font-weight: 600;
+        color: var(--ui-success);
+        text-transform: uppercase;
     }
 
     .message.warning {

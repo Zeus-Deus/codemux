@@ -46,6 +46,7 @@
         if (s === 'done' || s === 'passed') return 'var(--ui-success)';
         if (s === 'active' || s === 'ready') return 'var(--ui-accent)';
         if (s === 'pending') return 'var(--ui-text-muted)';
+        if (s === 'idle') return 'color-mix(in srgb, var(--ui-accent) 40%, var(--ui-text-muted))';
         if (s === 'blocked') return 'var(--ui-danger)';
         if (s === 'dead' || s === 'disconnected') return 'var(--ui-danger)';
         return 'var(--ui-text-muted)';

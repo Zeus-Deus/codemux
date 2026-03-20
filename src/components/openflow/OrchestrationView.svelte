@@ -1,6 +1,6 @@
 <script lang="ts">
     import { onDestroy } from 'svelte';
-    import { openflowRuntime, retryOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset, syncOpenFlowRuntime } from '../../stores/openflow';
+    import { openflowRuntime, retryOpenFlowRun, applyOpenFlowReviewResult, getAgentSessionsForRun, triggerOrchestratorCycle, getCommunicationLog, commLogStore, clearCommLogOffset, syncOpenFlowRuntime, injectOrchestratorMessage } from '../../stores/openflow';
     import type { AgentSessionState, OrchestratorTriggerResult } from '../../stores/types';
     import CommunicationPanel from './CommunicationPanel.svelte';
     import NodeGraph from './NodeGraph.svelte';
@@ -212,6 +212,15 @@
         }
     }
 
+    async function handleReject() {
+        if (!runId) return;
+        try {
+            await injectOrchestratorMessage(runId, '@instruct Reject: The current output does not meet requirements. Please reassign agents to fix the issues identified by reviewers.');
+        } catch (e) {
+            console.error('Reject error:', e);
+        }
+    }
+
     function toggleBrowser() {
         showBrowser = !showBrowser;
     }
@@ -240,10 +249,11 @@
                 <button class="control-btn" type="button" onclick={toggleBrowser}>{showBrowser ? 'Orchestration' : 'Browser'}</button>
                 <button class="control-btn" type="button" onclick={refreshOrchestrator}>Refresh</button>
                 {#if run && ((run as any).orchestration_state === 'blocked' || (run as any).orchestration_state === 'stalled')}
-                    <button class="control-btn accent" type="button" onclick={handleOrchestrate}>Re-prime</button>
+                    <button class="control-btn accent" type="button" onclick={handleOrchestrate} title="Nudge the orchestrator to continue when stuck or stalled">Re-prime</button>
                 {/if}
                 {#if run && (run.status === 'awaiting_approval' || run.current_phase === 'review')}
-                    <button class="control-btn accent" type="button" onclick={handleApprove}>Approve</button>
+                    <button class="control-btn accent" type="button" onclick={handleApprove} title="Approve the current state and mark the run as complete">Approve</button>
+                    <button class="control-btn danger" type="button" onclick={handleReject} title="Reject and send agents back to fix issues">Reject</button>
                 {/if}
             </div>
         </header>

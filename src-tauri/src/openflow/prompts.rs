@@ -81,6 +81,17 @@ IMPORTANT: Each agent works independently in isolation. They cannot read the com
 
 Phase loop: Plan → Assign (in parallel) → Execute → Verify → Review → RUN COMPLETE
 
+VERIFICATION RULES:
+- After all builders report DONE, you MUST assign at least one TESTER to verify the work.
+- Testers will use the browser to check if the app is actually working at the assigned app URL.
+- Do NOT declare RUN COMPLETE until at least one tester has reported DONE confirming the app works.
+- If no testers are available, assign a builder to verify with: `codemux browser open {app_url}` and `codemux browser screenshot`.
+
+COMPLETION GATE:
+- If reviewers/testers report CRITICAL findings, the system may reject your RUN COMPLETE and send you back to Replanning. Address the critical issues before declaring completion again.
+- If all agents have hit max turns and cannot do more work, declare RUN COMPLETE with a summary of what was accomplished and what still needs fixing.
+- In your RUN COMPLETE summary, always include both accomplishments and known remaining issues.
+
 Status relay:
 The system will send you "AGENT STATUS UPDATE:" messages when agents finish or block.
 Use these to track progress and assign follow-up tasks. Do NOT re-assign completed work.
@@ -109,8 +120,12 @@ When you receive a task assignment, START WORKING IMMEDIATELY. Do not wait for a
 When assigned:
 - Read the diff or files mentioned
 - Check for bugs, edge cases, security issues
-- Output review report
-- Say DONE: <brief summary> when complete
+- Classify findings by severity:
+  - CRITICAL: Bugs that will cause crashes, data loss, security vulnerabilities
+  - WARNING: Code quality issues, missing error handling, potential edge cases
+  - NOTE: Style suggestions, minor improvements, non-blocking observations
+- Output review report with severity-classified findings
+- Say DONE: <brief summary with count of CRITICAL/WARNING/NOTE findings> when complete
 - Say BLOCKED: <reason> if you cannot proceed
 "#;
 
@@ -128,9 +143,13 @@ You have access to Codemux browser:
 - `codemux browser console-logs` - get JS console
 
 When assigned:
-- Use the assigned app URL from context (`{app_url}`) unless the orchestrator gives an explicitly different approved URL
-- Run tests or verify in browser
-- Say DONE: <brief summary> when complete
+- ALWAYS start by opening the assigned app URL in the browser: `codemux browser open {app_url}`
+- Take a screenshot to verify the page loads: `codemux browser screenshot`
+- Test the specific features mentioned in your assignment
+- Report specific failures with reproduction steps
+- If the app fails to load, report: FAIL: App not accessible at {app_url}
+- If tests pass: DONE: <brief summary of what was verified>
+- If tests fail: DONE: <summary>. FAIL: <specific failures found>
 - Say BLOCKED: <reason> if you cannot proceed
 "#;
 
@@ -168,15 +187,15 @@ When you receive a task:
 1. Implement exactly what is described
 2. Write clean, working code
 3. Only start a dev server if your assignment actually requires a live preview or browser verification
-4. If the task involves running a dev server or web app:
-   a. Keep the preview on the assigned app URL from context: `{app_url}`
-   b. Prefer a strict fixed-port startup command. For Vite, use a command like:
+4. If the task involves changes visible in the browser (UI, styling, pages):
+   a. Verify the dev server is running at the assigned app URL: `codemux browser open {app_url}`
+   b. If no dev server is running, start one on the assigned port.
+      Prefer a strict fixed-port startup command. For Vite, use a command like:
       - `setsid npm run dev -- --host 127.0.0.1 --port <assigned-port> --strictPort`
       - adapt the command for the framework, but keep the same assigned port
    c. If the assigned port is already busy because of an earlier process you started, reuse or replace that process; do NOT silently switch ports
-   d. Use `codemux browser open {app_url}` to verify the app is accessible there
-   e. If verification fails, fix the issue and retry the same assigned URL
-   f. Only say DONE if the app is actually accessible at the assigned app URL
+   d. Take a screenshot to confirm your changes: `codemux browser screenshot`
+   e. Only say DONE if you can see your changes in the screenshot
 
 IMPORTANT: You MUST include the word "DONE:" in your output when finished. Format: DONE: <brief summary of what you built>
 Example: DONE: Created hello.py with print statement
@@ -347,6 +366,9 @@ Start coordinating this run now. Delegate repo work to the other agents instead 
 
 INITIAL_MSG="$(build_initial_message || true)"
 
+# Suppress PTY echo to prevent probe text echoing as fake agent output
+stty -echo 2>/dev/null || true
+
 if [ -n "$INITIAL_MSG" ]; then
     run_first "$INITIAL_MSG"
 else
@@ -442,7 +464,7 @@ run_claude_first() {
         --model "$MODEL" \
         --system-prompt "$PROMPT" \
         --output-format json \
-        --max-turns 25 \
+        --max-turns 50 \
         --permission-mode bypassPermissions \
         2>/dev/null) || true
 
@@ -493,7 +515,7 @@ run_claude_followup() {
         --model "$MODEL" \
         --system-prompt "$PROMPT" \
         --output-format text \
-        --max-turns 25 \
+        --max-turns 50 \
         --permission-mode bypassPermissions \
         --resume "$SESSION_ID" 2>/dev/null || true
 }
@@ -532,6 +554,9 @@ Start coordinating this run now. Delegate repo work to the other agents instead 
 # --- Main execution ---
 
 INITIAL_MSG="$(build_initial_message || true)"
+
+# Suppress PTY echo to prevent probe text echoing as fake agent output
+stty -echo 2>/dev/null || true
 
 if [ -n "$INITIAL_MSG" ]; then
     printf '[wrapper] %s starting with claude (model=%s)\n' "$INSTANCE_ID" "$MODEL"

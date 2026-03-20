@@ -1,5 +1,5 @@
 use crate::openflow::OpenFlowRole;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -239,8 +239,11 @@ impl Orchestrator {
     pub fn analyze_comm_log(entries: &[CommLogEntry]) -> OrchestratorAnalysis {
         let mut completed = Vec::new();
         let mut completed_instances: Vec<String> = Vec::new();
+        let mut seen_completed: HashSet<String> = HashSet::new();
         let mut blocked = Vec::new();
         let mut blocked_instances: Vec<String> = Vec::new();
+        let mut exhausted_instances: Vec<String> = Vec::new();
+        let mut seen_exhausted: HashSet<String> = HashSet::new();
         let mut assignments = Vec::new();
         let mut all_instance_assignments: Vec<InstanceAssignment> = Vec::new();
         let mut status_updates = Vec::new();
@@ -256,22 +259,33 @@ impl Orchestrator {
             let role_lower = entry.role.to_lowercase();
 
             if entry.message.contains("DONE:") {
-                // Track both the bare role (for phase transitions) and the full instance id
-                if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
-                    completed.push(role);
+                // De-duplicate: only the first DONE per instance counts
+                if !seen_completed.contains(&role_lower) {
+                    seen_completed.insert(role_lower.clone());
+                    if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
+                        completed.push(role);
+                    }
+                    completed_instances.push(role_lower.clone());
                 }
-                completed_instances.push(role_lower.clone());
             } else if entry.message.contains("BLOCKED:") {
                 if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
                     blocked.push(role);
                 }
                 blocked_instances.push(role_lower.clone());
             } else if entry.message.contains("Error: Reached max turns") {
-                // Max turns exhaustion = agent is dead, treat as completed (it did what it could)
-                if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
-                    completed.push(role);
+                // Max turns exhaustion = agent is dead, treat as completed
+                if !seen_completed.contains(&role_lower) {
+                    seen_completed.insert(role_lower.clone());
+                    if let Some(role) = OpenFlowRole::from_str(Self::base_role(&role_lower)) {
+                        completed.push(role);
+                    }
+                    completed_instances.push(role_lower.clone());
                 }
-                completed_instances.push(role_lower.clone());
+                // Track exhaustion separately for relay and gate logic
+                if !seen_exhausted.contains(&role_lower) {
+                    seen_exhausted.insert(role_lower.clone());
+                    exhausted_instances.push(role_lower.clone());
+                }
             } else if role_lower == "orchestrator" {
                 let parsed_assignments: Vec<InstanceAssignment> =
                     Self::parse_assign_messages(&entry.message)
@@ -366,11 +380,29 @@ impl Orchestrator {
             vec![]
         };
 
+        // Remove blocked entries for instances that subsequently completed
+        let active_blocked_instances: Vec<String> = blocked_instances
+            .iter()
+            .filter(|id| !seen_completed.contains(id.as_str()))
+            .cloned()
+            .collect();
+        let active_blocked_roles: Vec<OpenFlowRole> = active_blocked_instances
+            .iter()
+            .filter_map(|id| OpenFlowRole::from_str(Self::base_role(id)))
+            .collect();
+
+        // Detect critical reviewer/tester findings
+        let has_critical_reviewer_findings = entries.iter().any(|e| {
+            let role_lower = e.role.to_lowercase();
+            (role_lower.starts_with("reviewer") || role_lower.starts_with("tester"))
+                && (e.message.contains("CRITICAL:") || e.message.contains("FAIL"))
+        });
+
         OrchestratorAnalysis {
             completed_roles: completed,
             completed_instances,
-            blocked_roles: blocked,
-            blocked_instances,
+            blocked_roles: active_blocked_roles,
+            blocked_instances: active_blocked_instances,
             assignments,
             instance_assignments: unforwarded_assignments,
             status_updates,
@@ -382,6 +414,8 @@ impl Orchestrator {
             last_handled_injections: last_handled_count,
             orchestrator_responded_to_pending,
             instances_with_output: vec![],
+            exhausted_instances,
+            has_critical_reviewer_findings,
         }
     }
 
@@ -531,10 +565,20 @@ impl Orchestrator {
             completed_count >= count
         };
 
+        // Completion gate: if critical findings exist but agents can still work, replan.
+        // If all agents are exhausted, allow completion with a warning instead of looping.
+        let total_workers: usize = instance_counts.values().sum();
+        let all_agents_exhausted =
+            total_workers > 0 && analysis.completed_instances.len() >= total_workers;
+
         match current_phase {
             OrchestratorPhase::Planning => {
                 if run_complete {
-                    Some(OrchestratorPhase::Completed)
+                    if analysis.has_critical_reviewer_findings && !all_agents_exhausted {
+                        Some(OrchestratorPhase::Replanning)
+                    } else {
+                        Some(OrchestratorPhase::Completed)
+                    }
                 } else if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else if analysis.assignments.is_empty() {
@@ -551,7 +595,11 @@ impl Orchestrator {
             }
             OrchestratorPhase::Executing => {
                 if run_complete {
-                    Some(OrchestratorPhase::Completed)
+                    if analysis.has_critical_reviewer_findings && !all_agents_exhausted {
+                        Some(OrchestratorPhase::Replanning)
+                    } else {
+                        Some(OrchestratorPhase::Completed)
+                    }
                 } else if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else if !analysis.blocked_roles.is_empty() {
@@ -564,7 +612,11 @@ impl Orchestrator {
             }
             OrchestratorPhase::Verifying => {
                 if run_complete {
-                    Some(OrchestratorPhase::Completed)
+                    if analysis.has_critical_reviewer_findings && !all_agents_exhausted {
+                        Some(OrchestratorPhase::Replanning)
+                    } else {
+                        Some(OrchestratorPhase::Completed)
+                    }
                 } else if has_unhandled_injection {
                     Some(OrchestratorPhase::Replanning)
                 } else if !analysis.blocked_roles.is_empty() {
@@ -662,6 +714,10 @@ pub struct OrchestratorAnalysis {
     pub orchestrator_responded_to_pending: bool,
     /// Instances that have produced output (for implicit completion detection).
     pub instances_with_output: Vec<String>,
+    /// Instances that hit max turns (exhausted) — subset of completed_instances.
+    pub exhausted_instances: Vec<String>,
+    /// True if any reviewer or tester reported CRITICAL or FAIL findings.
+    pub has_critical_reviewer_findings: bool,
 }
 
 #[cfg(test)]
@@ -739,6 +795,8 @@ mod tests {
             last_handled_injections: 0,
             orchestrator_responded_to_pending: false,
             instances_with_output: vec![],
+            exhausted_instances: vec![],
+            has_critical_reviewer_findings: false,
         };
 
         let next_phase = Orchestrator::determine_next_phase(
@@ -750,5 +808,92 @@ mod tests {
         );
 
         assert_eq!(next_phase, Some(OrchestratorPhase::Replanning));
+    }
+
+    #[test]
+    fn blocked_roles_clear_when_agent_subsequently_completes() {
+        let entries = vec![
+            entry("researcher-0", "BLOCKED: Cannot access external API"),
+            entry("researcher-0", "DONE: Found the answer another way"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+
+        assert!(analysis.blocked_roles.is_empty(), "blocked_roles should be empty after DONE");
+        assert!(analysis.blocked_instances.is_empty(), "blocked_instances should be empty after DONE");
+        assert_eq!(analysis.completed_instances.len(), 1);
+    }
+
+    #[test]
+    fn completed_instances_deduplicated_per_instance_id() {
+        let entries = vec![
+            entry("builder-3", "DONE: Built the API"),
+            entry("builder-3", "DONE: Also finished the cleanup"),
+            entry("builder-3", "Error: Reached max turns (25 turns)"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+
+        assert_eq!(analysis.completed_instances.len(), 1, "should be deduplicated");
+        assert_eq!(analysis.completed_instances[0], "builder-3");
+        assert_eq!(analysis.exhausted_instances.len(), 1);
+    }
+
+    #[test]
+    fn critical_findings_plus_all_exhausted_completes() {
+        let entries = vec![
+            entry("orchestrator", "ASSIGN BUILDER-0: Build the app"),
+            entry("builder-0", "Error: Reached max turns (25 turns)"),
+            entry("reviewer-0", "CRITICAL: Missing error handling in auth.rs"),
+            entry("reviewer-0", "DONE: Review complete"),
+            entry("orchestrator", "RUN COMPLETE: Built app with remaining issues"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+        assert!(analysis.has_critical_reviewer_findings);
+
+        let mut counts = HashMap::new();
+        counts.insert("builder".to_string(), 1);
+        counts.insert("reviewer".to_string(), 1);
+
+        let next = Orchestrator::determine_next_phase(
+            &OrchestratorPhase::Executing,
+            &analysis,
+            &counts,
+            0,
+            0,
+        );
+
+        // All agents exhausted/completed → should complete despite critical findings
+        assert_eq!(next, Some(OrchestratorPhase::Completed));
+    }
+
+    #[test]
+    fn critical_findings_with_available_agents_replans() {
+        let entries = vec![
+            entry("orchestrator", "ASSIGN BUILDER-0: Build the app"),
+            entry("builder-0", "DONE: Built the app"),
+            entry("reviewer-0", "CRITICAL: SQL injection in login.rs"),
+            entry("reviewer-0", "DONE: Review complete"),
+            entry("orchestrator", "RUN COMPLETE: App built"),
+        ];
+
+        let analysis = Orchestrator::analyze_comm_log(&entries);
+        assert!(analysis.has_critical_reviewer_findings);
+
+        let mut counts = HashMap::new();
+        counts.insert("builder".to_string(), 2); // 2 builders, only 1 completed
+        counts.insert("reviewer".to_string(), 1);
+
+        let next = Orchestrator::determine_next_phase(
+            &OrchestratorPhase::Executing,
+            &analysis,
+            &counts,
+            0,
+            0,
+        );
+
+        // Agents still available → should replan to fix critical findings
+        assert_eq!(next, Some(OrchestratorPhase::Replanning));
     }
 }

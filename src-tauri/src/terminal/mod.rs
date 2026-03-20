@@ -994,6 +994,8 @@ pub fn spawn_pty_for_agent(
                             if !trimmed.is_empty()
                                 && trimmed.len() > 2
                                 && !trimmed.starts_with('\x1b')
+                                && !trimmed.starts_with("No orchestration progress detected")
+                                && !trimmed.starts_with("STOP: General Agent")
                                 && !trimmed.chars().all(|c| {
                                     c.is_whitespace()
                                         || c == '▀'

@@ -36,26 +36,33 @@ export function buildAgentNodes(
 
         let dynamicStatus = worker.status;
         const hasSession = session !== undefined;
-        const recentEntries = commLogEntries.slice(-50);
-        const instanceEntries = recentEntries.filter((entry) =>
-            entry.role.toLowerCase() === instanceId || entry.role.toLowerCase() === roleLower
-        );
-        const recentInstanceEntries = instanceEntries.slice(-3);
 
-        if (!hasSession && worker.status !== 'done' && worker.status !== 'completed') {
-            dynamicStatus = 'dead';
-        } else if (recentInstanceEntries.length > 0) {
-            const lastMessage = recentInstanceEntries[recentInstanceEntries.length - 1].message.toLowerCase();
-            if (lastMessage.includes('done:') || lastMessage.includes('run complete')) {
-                dynamicStatus = 'done';
-            } else if (lastMessage.includes('blocked:')) {
-                dynamicStatus = 'blocked';
-            } else {
-                const recentlyActive = commLogEntries.slice(-5).some((entry) =>
-                    entry.role.toLowerCase() === instanceId || entry.role.toLowerCase() === roleLower
-                );
-                if (recentlyActive) {
-                    dynamicStatus = 'active';
+        // Skip dynamic status detection for terminal runs
+        const isRunTerminal = run.status === 'completed' || run.status === 'failed' || run.status === 'cancelled';
+
+        if (!isRunTerminal) {
+            const instanceEntries = commLogEntries.filter((entry) =>
+                entry.role.toLowerCase() === instanceId || entry.role.toLowerCase() === roleLower
+            );
+            const lastEntry = instanceEntries.length > 0 ? instanceEntries[instanceEntries.length - 1] : null;
+
+            if (!hasSession && worker.status !== 'done' && worker.status !== 'completed') {
+                dynamicStatus = 'dead';
+            } else if (lastEntry) {
+                const lastMessage = lastEntry.message.toLowerCase();
+                if (lastMessage.includes('done:') || lastMessage.includes('run complete')) {
+                    dynamicStatus = 'done';
+                } else if (lastMessage.includes('blocked:')) {
+                    dynamicStatus = 'blocked';
+                } else {
+                    // Timestamp-based active/idle detection (15s threshold)
+                    const entryTime = new Date(lastEntry.timestamp).getTime();
+                    const ageMs = Date.now() - entryTime;
+                    if (ageMs < 15_000) {
+                        dynamicStatus = 'active';
+                    } else {
+                        dynamicStatus = 'idle';
+                    }
                 }
             }
         }
@@ -88,7 +95,15 @@ export function buildActiveConnections(
     }
 
     const connections: Connection[] = [];
-    const recentEntries = commLogEntries.slice(-10);
+    // 30s staleness window for connections
+    const now = Date.now();
+    const stalenessMs = 30_000;
+    const recentEntries = commLogEntries
+        .filter((entry) => {
+            const t = new Date(entry.timestamp).getTime();
+            return !isNaN(t) && now - t < stalenessMs;
+        })
+        .slice(-10);
 
     for (const entry of recentEntries) {
         if (entry.role.toLowerCase() !== 'orchestrator') {
