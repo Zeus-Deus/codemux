@@ -53,7 +53,7 @@
     function terminalTheme(): ITheme {
         const css = getComputedStyle(document.documentElement);
         return {
-            background: css.getPropertyValue('--theme-background').trim() || fallbackTheme.background,
+            background: css.getPropertyValue('--ui-layer-0').trim() || '#0d0f11',
             foreground: css.getPropertyValue('--theme-foreground').trim() || fallbackTheme.foreground,
             cursor: css.getPropertyValue('--theme-cursor').trim() || fallbackTheme.cursor,
             selectionBackground:
@@ -498,7 +498,7 @@
         height: 100%;
         min-width: 0;
         min-height: 0;
-        background: color-mix(in srgb, var(--theme-background, #1a1b26) 98%, black 2%);
+        background: var(--ui-layer-0, #0d0f11);
     }
 
     .terminal-wrapper {
