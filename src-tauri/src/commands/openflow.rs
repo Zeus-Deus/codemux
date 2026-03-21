@@ -1049,6 +1049,17 @@ async fn run_single_cycle(
                     "Skipped re-assignment to already-completed {}",
                     assignment.instance_id
                 ));
+                // Notify orchestrator that this agent can't take new work
+                if let Some(ref orch) = orchestrator_session {
+                    let _ = write_raw_to_session(
+                        pty_state,
+                        &orch.session_id,
+                        &format!(
+                            "WARNING: {} already reported DONE and cannot accept new assignments. Assign this task to a different available agent.",
+                            assignment.instance_id.to_uppercase()
+                        ),
+                    );
+                }
                 continue;
             }
             let target_session = all_sessions.iter().find(|session| {
@@ -1195,7 +1206,7 @@ async fn run_single_cycle(
                     }
                 } else {
                     format!(
-                        "AGENT STATUS UPDATE: {} NEW completion(s). {}. Assign follow-up tasks to available agents. Do NOT re-assign already completed work.",
+                        "AGENT STATUS UPDATE: {} NEW completion(s). {}. If the original goal is now fulfilled, declare RUN COMPLETE. Otherwise assign ONLY remaining work from the original goal — do NOT invent new tasks.",
                         new_completions.len(),
                         new_completions.join(" | ")
                     )

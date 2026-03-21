@@ -81,6 +81,12 @@ IMPORTANT: Each agent works independently in isolation. They cannot read the com
 
 Phase loop: Plan → Assign (in parallel) → Execute → Verify → Review → RUN COMPLETE
 
+SCOPE DISCIPLINE:
+- When the original goal (from TOP-LEVEL GOAL) AND any user-injected requests have been fulfilled, declare RUN COMPLETE immediately.
+- Do NOT invent new improvement tasks (polish, refactoring, animations, additional features) beyond what was explicitly requested.
+- "Working and correct" is the standard — do not pursue perfection unless the user asks for it.
+- If a user injection requested a feature and an agent reports DONE for it, verify it works and then move toward RUN COMPLETE.
+
 VERIFICATION RULES:
 - After all builders report DONE, you MUST assign at least one TESTER to verify the work.
 - Testers will use the browser to check if the app is actually working at the assigned app URL.
@@ -378,10 +384,18 @@ fi
 # Follow-up loop: ALL subsequent messages go to the SAME opencode session.
 # For the orchestrator: probes and user injections arrive here with full context.
 # For workers: task assignments arrive here (e.g. the raw task text).
+# Batching: drain any lines that arrive within 1s to coalesce rapid-fire messages
+# (e.g. multiple DONE relays in the same orchestration cycle) into a single CLI call.
 while IFS= read -r line; do
     [ -z "$line" ] && continue
+    batch="$line"
+    while IFS= read -r -t 1 extra; do
+        [ -z "$extra" ] && continue
+        batch="${batch}
+${extra}"
+    done
     printf '[wrapper] %s follow-up (session=%s)\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
-    if ! run_followup "$line"; then
+    if ! run_followup "$batch"; then
         printf '[wrapper] %s command failed (exit %s), waiting for next\n' "$INSTANCE_ID" "$?"
     fi
 done
@@ -568,10 +582,18 @@ fi
 
 # Follow-up loop: ALL subsequent messages use TEXT output for live streaming.
 # The session ID was captured from the first JSON run above.
+# Batching: drain any lines that arrive within 1s to coalesce rapid-fire messages
+# (e.g. multiple DONE relays in the same orchestration cycle) into a single CLI call.
 while IFS= read -r line; do
     [ -z "$line" ] && continue
+    batch="$line"
+    while IFS= read -r -t 1 extra; do
+        [ -z "$extra" ] && continue
+        batch="${batch}
+${extra}"
+    done
     printf '[wrapper] %s follow-up (session=%s)\n' "$INSTANCE_ID" "${SESSION_ID:-none}"
-    run_claude_followup "$line"
+    run_claude_followup "$batch"
 done
 
 rm -f "$SESSION_FILE" 2>/dev/null

@@ -258,6 +258,18 @@ impl Orchestrator {
         for (index, entry) in entries.iter().enumerate() {
             let role_lower = entry.role.to_lowercase();
 
+            // User injection = new scope. Reset completion tracking so agents
+            // that already finished their initial work can be re-assigned.
+            if role_lower.contains("user/inject") || entry.message.starts_with("@instruct") {
+                seen_completed.clear();
+                completed_instances.clear();
+                completed.clear();
+                seen_exhausted.clear();
+                exhausted_instances.clear();
+                all_injections.push(entry.message.clone());
+                continue;
+            }
+
             if entry.message.contains("DONE:") {
                 // De-duplicate: only the first DONE per instance counts
                 if !seen_completed.contains(&role_lower) {
@@ -320,8 +332,6 @@ impl Orchestrator {
                 status_updates.push(entry.message.clone());
             } else if role_lower.contains("status") || role_lower.contains("phase") {
                 status_updates.push(entry.message.clone());
-            } else if role_lower.contains("user/inject") || entry.message.starts_with("@instruct") {
-                all_injections.push(entry.message.clone());
             } else if role_lower == "system" {
                 // Track the highest HANDLED_INJECTIONS marker seen so far
                 if let Some(rest) = entry.message.strip_prefix("HANDLED_INJECTIONS: ") {
