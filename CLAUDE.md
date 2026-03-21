@@ -21,6 +21,12 @@
 
 - The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.
 
+## Skills
+
+- `/codemux-ui` auto-loads for visual and component work.
+- `/codemux-features` auto-loads for new ADE feature implementation.
+- `/codemux-openflow` auto-loads for orchestration runtime work.
+
 ## Browser Automation
 
 - **Never** use `xdg-open` or `open` — always use `codemux browser open <url>`.
