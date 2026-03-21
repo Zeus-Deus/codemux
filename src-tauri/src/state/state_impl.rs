@@ -20,6 +20,23 @@ impl Default for WorkspaceType {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TabKind {
+    Terminal,
+    Browser,
+    Diff,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabSnapshot {
+    pub tab_id: String,
+    pub kind: TabKind,
+    pub title: String,
+    pub surface_id: Option<SurfaceId>,
+    pub browser_id: Option<BrowserId>,
+}
+
 /// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
 /// multiple resize events) only result in a single write after a quiet period.
 struct PersistDebouncer {
@@ -223,6 +240,10 @@ pub struct WorkspaceSnapshot {
     pub git_branch: Option<String>,
     pub notification_count: u32,
     pub latest_agent_state: Option<String>,
+    #[serde(default)]
+    pub tabs: Vec<TabSnapshot>,
+    #[serde(default)]
+    pub active_tab_id: String,
     pub active_surface_id: SurfaceId,
     pub surfaces: Vec<SurfaceSnapshot>,
 }
@@ -391,6 +412,8 @@ impl AppStateStore {
             git_branch: None,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
             active_surface_id: surface_id.clone(),
             surfaces: vec![SurfaceSnapshot {
                 surface_id,
@@ -535,6 +558,7 @@ impl AppStateStore {
         let active_pane_id =
             rightmost_leaf_pane_id(&root).unwrap_or_else(|| PaneId(next_id("pane")));
 
+        let default_tab_id = next_id("tab");
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
             title: format!("Workspace {workspace_index}"),
@@ -543,6 +567,14 @@ impl AppStateStore {
             git_branch: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
+            tabs: vec![TabSnapshot {
+                tab_id: default_tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id.clone()),
+                browser_id: None,
+            }],
+            active_tab_id: default_tab_id,
             active_surface_id: surface_id.clone(),
             surfaces: vec![SurfaceSnapshot {
                 surface_id,
@@ -1319,6 +1351,279 @@ impl AppStateStore {
 
         false
     }
+
+    // ---- Tab management ----
+
+    pub fn create_tab(
+        &self,
+        workspace_id: &str,
+        kind: TabKind,
+    ) -> Result<(String, Option<SessionId>), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        if workspace.workspace_type == WorkspaceType::OpenFlow {
+            return Err("Cannot create tabs in OpenFlow workspaces".into());
+        }
+
+        let tab_id = next_id("tab");
+        let mut new_session_id: Option<SessionId> = None;
+
+        match kind {
+            TabKind::Terminal => {
+                let count = workspace
+                    .tabs
+                    .iter()
+                    .filter(|t| t.kind == TabKind::Terminal)
+                    .count();
+                let surface_id = SurfaceId(next_id("surface"));
+                let pane_id = PaneId(next_id("pane"));
+                let session_id = SessionId(next_id("session"));
+                let cwd = workspace.cwd.clone();
+                let shell = env::var("SHELL").ok();
+
+                workspace.surfaces.push(SurfaceSnapshot {
+                    surface_id: surface_id.clone(),
+                    title: "Surface".into(),
+                    active_pane_id: pane_id.clone(),
+                    root: PaneNodeSnapshot::Terminal {
+                        pane_id,
+                        session_id: session_id.clone(),
+                        title: "Terminal".into(),
+                    },
+                });
+
+                snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+                    session_id: session_id.clone(),
+                    title: "Terminal".into(),
+                    shell,
+                    cwd,
+                    cols: 80,
+                    rows: 24,
+                    state: TerminalSessionState::Starting,
+                    last_message: None,
+                    exit_code: None,
+                });
+
+                new_session_id = Some(session_id);
+
+                // Re-borrow workspace after snapshot mutation
+                let workspace = snapshot
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace_id.0 == workspace_id)
+                    .unwrap();
+
+                workspace.tabs.push(TabSnapshot {
+                    tab_id: tab_id.clone(),
+                    kind: TabKind::Terminal,
+                    title: format!("Terminal {}", count + 1),
+                    surface_id: Some(surface_id.clone()),
+                    browser_id: None,
+                });
+                workspace.active_tab_id = tab_id.clone();
+                workspace.active_surface_id = surface_id;
+
+                return Ok((tab_id, new_session_id));
+            }
+            TabKind::Browser => {
+                let browser_id = BrowserId(next_id("browser"));
+                snapshot.browser_sessions.push(BrowserSessionSnapshot {
+                    browser_id: browser_id.clone(),
+                    title: "Browser".into(),
+                    current_url: Some(DEFAULT_BROWSER_URL.into()),
+                    history: vec![DEFAULT_BROWSER_URL.into()],
+                    history_index: 0,
+                    is_loading: false,
+                    last_error: None,
+                });
+
+                let workspace = snapshot
+                    .workspaces
+                    .iter_mut()
+                    .find(|w| w.workspace_id.0 == workspace_id)
+                    .unwrap();
+
+                workspace.tabs.push(TabSnapshot {
+                    tab_id: tab_id.clone(),
+                    kind: TabKind::Browser,
+                    title: "Browser".into(),
+                    surface_id: None,
+                    browser_id: Some(browser_id),
+                });
+                workspace.active_tab_id = tab_id.clone();
+            }
+            TabKind::Diff => {
+                workspace.tabs.push(TabSnapshot {
+                    tab_id: tab_id.clone(),
+                    kind: TabKind::Diff,
+                    title: "Changes".into(),
+                    surface_id: None,
+                    browser_id: None,
+                });
+                workspace.active_tab_id = tab_id.clone();
+            }
+        }
+
+        Ok((tab_id, new_session_id))
+    }
+
+    pub fn close_tab(&self, workspace_id: &str, tab_id: &str) -> Result<CloseTabResult, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        if workspace.tabs.len() <= 1 {
+            return Err("Cannot close the last tab".into());
+        }
+
+        let tab_index = workspace
+            .tabs
+            .iter()
+            .position(|t| t.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+
+        let tab = workspace.tabs.remove(tab_index);
+
+        // Collect resources to clean up
+        let mut removed_sessions: Vec<SessionId> = vec![];
+        let removed_browser_id = tab.browser_id.clone();
+
+        // If terminal tab, remove its surface and collect session IDs
+        if let Some(ref surface_id) = tab.surface_id {
+            if let Some(surface_index) = workspace
+                .surfaces
+                .iter()
+                .position(|s| s.surface_id == *surface_id)
+            {
+                let surface = workspace.surfaces.remove(surface_index);
+                collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
+            }
+        }
+
+        // If closed tab was active, activate adjacent tab
+        if workspace.active_tab_id == tab_id {
+            let new_index = if tab_index > 0 {
+                tab_index - 1
+            } else {
+                0
+            };
+            let new_tab = &workspace.tabs[new_index];
+            workspace.active_tab_id = new_tab.tab_id.clone();
+            if let Some(ref sid) = new_tab.surface_id {
+                workspace.active_surface_id = sid.clone();
+            }
+        }
+
+        // Remove terminal sessions from snapshot
+        for session_id in &removed_sessions {
+            snapshot
+                .terminal_sessions
+                .retain(|s| s.session_id != *session_id);
+        }
+
+        // Remove browser session from snapshot
+        if let Some(ref browser_id) = removed_browser_id {
+            snapshot
+                .browser_sessions
+                .retain(|b| b.browser_id != *browser_id);
+        }
+
+        Ok(CloseTabResult {
+            removed_sessions,
+            removed_browser_id,
+        })
+    }
+
+    pub fn activate_tab(&self, workspace_id: &str, tab_id: &str) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        let tab = workspace
+            .tabs
+            .iter()
+            .find(|t| t.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+
+        workspace.active_tab_id = tab_id.to_string();
+        if let Some(ref surface_id) = tab.surface_id {
+            workspace.active_surface_id = surface_id.clone();
+        }
+        Ok(())
+    }
+
+    pub fn rename_tab(
+        &self,
+        workspace_id: &str,
+        tab_id: &str,
+        title: String,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        let tab = workspace
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+
+        tab.title = title;
+        Ok(())
+    }
+
+    /// Migrate workspaces loaded from disk that predate the tab system.
+    pub fn migrate_tabs_if_needed(&self) {
+        let mut snapshot = self.inner.lock().unwrap();
+        for workspace in &mut snapshot.workspaces {
+            if workspace.workspace_type == WorkspaceType::Standard && workspace.tabs.is_empty() {
+                let tab_id = next_id("tab");
+                let surface_id = workspace
+                    .surfaces
+                    .first()
+                    .map(|s| s.surface_id.clone());
+                workspace.tabs.push(TabSnapshot {
+                    tab_id: tab_id.clone(),
+                    kind: TabKind::Terminal,
+                    title: "Terminal".into(),
+                    surface_id,
+                    browser_id: None,
+                });
+                workspace.active_tab_id = tab_id;
+            }
+        }
+    }
+}
+
+pub struct CloseTabResult {
+    pub removed_sessions: Vec<SessionId>,
+    pub removed_browser_id: Option<BrowserId>,
+}
+
+fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
+    match node {
+        PaneNodeSnapshot::Terminal { session_id, .. } => out.push(session_id.clone()),
+        PaneNodeSnapshot::Browser { .. } => {}
+        PaneNodeSnapshot::Split { children, .. } => {
+            for child in children {
+                collect_session_ids_from_tree(child, out);
+            }
+        }
+    }
 }
 
 pub fn emit_app_state(app: &AppHandle) {
@@ -1387,6 +1692,16 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
                 surface_ids.extend(collect_numeric_ids_from_node(&surface.root));
                 surface_ids
             }));
+            ids.extend(workspace.tabs.iter().flat_map(|tab| {
+                let mut tab_ids = vec![extract_numeric_suffix(&tab.tab_id)];
+                if let Some(ref sid) = tab.surface_id {
+                    tab_ids.push(extract_numeric_suffix(&sid.0));
+                }
+                if let Some(ref bid) = tab.browser_id {
+                    tab_ids.push(extract_numeric_suffix(&bid.0));
+                }
+                tab_ids
+            }));
             ids
         })
         .chain(
@@ -1394,6 +1709,12 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
                 .terminal_sessions
                 .iter()
                 .map(|session| extract_numeric_suffix(&session.session_id.0)),
+        )
+        .chain(
+            snapshot
+                .browser_sessions
+                .iter()
+                .map(|session| extract_numeric_suffix(&session.browser_id.0)),
         )
         .flatten()
         .max()
@@ -1407,6 +1728,7 @@ fn default_app_state() -> AppStateSnapshot {
     let surface_id = SurfaceId(next_id("surface"));
     let pane_id = PaneId(next_id("pane"));
     let session_id = SessionId(next_id("session"));
+    let default_tab_id = next_id("tab");
     let cwd = current_project_root().display().to_string();
     let shell = env::var("SHELL").ok();
 
@@ -1421,6 +1743,14 @@ fn default_app_state() -> AppStateSnapshot {
             git_branch: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
+            tabs: vec![TabSnapshot {
+                tab_id: default_tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id.clone()),
+                browser_id: None,
+            }],
+            active_tab_id: default_tab_id,
             active_surface_id: surface_id.clone(),
             surfaces: vec![SurfaceSnapshot {
                 surface_id,

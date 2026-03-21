@@ -314,6 +314,20 @@
                 ev.preventDefault?.();
                 return false;
             }
+            // Tab management shortcuts — let these bubble to the window handler
+            // instead of being consumed by xterm. Return false without
+            // preventDefault so App.svelte's handleWindowKeydown picks them up.
+            if (ev.ctrlKey && !ev.altKey) {
+                const key = ev.key.toLowerCase();
+                // Ctrl+T (new terminal tab), Ctrl+W (close tab)
+                if (!ev.shiftKey && (key === 't' || key === 'w')) return false;
+                // Ctrl+1 through Ctrl+9 (switch tab by index)
+                if (!ev.shiftKey && ev.key >= '1' && ev.key <= '9') return false;
+                // Ctrl+Shift+B (new browser tab), Ctrl+Shift+D (new diff tab)
+                if (ev.shiftKey && (key === 'b' || key === 'd')) return false;
+                // Ctrl+] and Ctrl+[ (workspace cycling)
+                if (ev.key === ']' || ev.key === '[') return false;
+            }
             return true;
         });
 

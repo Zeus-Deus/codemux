@@ -165,6 +165,16 @@ export interface OpenFlowCreateRunRequest {
 export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
 export type LayoutPreset = 'single' | 'pair' | 'quad' | 'six' | 'eight' | 'shell_browser';
 
+export type TabKind = 'terminal' | 'browser' | 'diff';
+
+export interface TabSnapshot {
+    tab_id: string;
+    kind: TabKind;
+    title: string;
+    surface_id: string | null;
+    browser_id: string | null;
+}
+
 export type PaneNodeSnapshot =
     | {
             kind: 'terminal';
@@ -203,6 +213,8 @@ export interface WorkspaceSnapshot {
     git_branch: string | null;
     notification_count: number;
     latest_agent_state: string | null;
+    tabs: TabSnapshot[];
+    active_tab_id: string;
     active_surface_id: string;
     surfaces: SurfaceSnapshot[];
 }

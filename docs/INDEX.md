@@ -32,6 +32,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
+- Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
+- Feature inventory: `docs/reference/FEATURES.md`
 - Control and automation work: `docs/reference/CONTROL.md`
 - Docs cleanup and recovery work: `docs/reference/DOCS_REINDEX.md`
 - Agent behavior rules: `AGENTS.md`

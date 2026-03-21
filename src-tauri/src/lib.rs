@@ -83,6 +83,7 @@ pub fn run() {
                 let stripped = state::strip_openflow_from_snapshot(snapshot);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
+                state.migrate_tabs_if_needed();
             }
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
@@ -163,6 +164,10 @@ pub fn run() {
             commands::notify_attention,
             commands::mark_workspace_notifications_read,
             commands::set_notification_sound_enabled,
+            commands::create_tab,
+            commands::close_tab,
+            commands::activate_tab,
+            commands::rename_tab,
             commands::create_browser_pane,
             commands::browser_open_url,
             commands::browser_history_back,

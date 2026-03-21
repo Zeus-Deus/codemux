@@ -3,6 +3,7 @@ import { appState, syncAppState } from './core';
 import type {
     AppStateSnapshot,
     LayoutPreset,
+    TabKind,
     WorkspaceTemplateKind,
 } from './types';
 
@@ -124,6 +125,22 @@ export async function setNotificationSoundEnabled(enabled: boolean) {
 
 export async function createBrowserPane(paneId: string) {
     return invoke<string>('create_browser_pane', { paneId });
+}
+
+export async function createTab(workspaceId: string, kind: TabKind) {
+    return invoke<string>('create_tab', { workspaceId, kind });
+}
+
+export async function closeTab(workspaceId: string, tabId: string) {
+    return invoke('close_tab', { workspaceId, tabId });
+}
+
+export async function activateTab(workspaceId: string, tabId: string) {
+    return invoke('activate_tab', { workspaceId, tabId });
+}
+
+export async function renameTab(workspaceId: string, tabId: string, title: string) {
+    return invoke('rename_tab', { workspaceId, tabId, title });
 }
 
 export async function refreshWorkspaceState() {

@@ -18,12 +18,17 @@
         splitPane,
         createBrowserPane,
         swapPanes,
+        createTab,
+        closeTab,
+        activateTab,
     } from './stores/workspace';
-    import type { SurfaceSnapshot, WorkspaceSnapshot } from './stores/types';
+    import type { SurfaceSnapshot, WorkspaceSnapshot, TabKind } from './stores/types';
     import PaneNode from './components/panes/PaneNode.svelte';
     import Sidebar from './components/sidebar/Sidebar.svelte';
     import NewWorkspaceLauncher from './components/sidebar/NewWorkspaceLauncher.svelte';
     import OpenFlowWorkspace from './components/openflow/OpenFlowWorkspace.svelte';
+    import TabBar from './components/tabs/TabBar.svelte';
+    import BrowserPane from './components/panes/BrowserPane.svelte';
     import { findActiveSessionId } from './lib/paneTree';
 
     const themeKeys = [
@@ -86,11 +91,61 @@
         try { await swapPanes(sourcePaneId, targetPaneId); } catch (e) { console.error('swap panes:', e); }
     }
 
+    async function handleActivateTab(workspaceId: string, tabId: string) {
+        try { await activateTab(workspaceId, tabId); } catch (e) { console.error('activate tab:', e); }
+    }
+
+    async function handleCloseTab(workspaceId: string, tabId: string) {
+        try { await closeTab(workspaceId, tabId); } catch (e) { console.error('close tab:', e); }
+    }
+
+    async function handleCreateTab(workspaceId: string, kind: string) {
+        try { await createTab(workspaceId, kind as TabKind); } catch (e) { console.error('create tab:', e); showUiNotice(errorMessage(e), 'error'); }
+    }
+
+    function activeWorkspaceForTabs(): WorkspaceSnapshot | null {
+        if (!$appState) return null;
+        const ws = $appState.workspaces.find((w) => w.workspace_id === $appState!.active_workspace_id);
+        if (!ws || ws.workspace_type === 'open_flow') return null;
+        return ws;
+    }
+
+    function surfaceForTab(workspace: WorkspaceSnapshot, surfaceId: string | null): SurfaceSnapshot | null {
+        if (!surfaceId) return null;
+        return workspace.surfaces.find((s) => s.surface_id === surfaceId) ?? null;
+    }
+
     function handleWindowKeydown(event: KeyboardEvent) {
         if (!(event.metaKey || event.ctrlKey)) return;
 
         if (event.key === ']') { event.preventDefault(); void cycleWorkspace(1); return; }
         if (event.key === '[') { event.preventDefault(); void cycleWorkspace(-1); return; }
+
+        // Tab shortcuts (Ctrl+T, Ctrl+W, Ctrl+1-9, Ctrl+Shift+B, Ctrl+Shift+D)
+        const ws = activeWorkspaceForTabs();
+        if (ws) {
+            if (event.key.toLowerCase() === 't' && !event.shiftKey && !event.altKey) {
+                event.preventDefault(); void handleCreateTab(ws.workspace_id, 'terminal'); return;
+            }
+            if (event.key.toLowerCase() === 'w' && !event.shiftKey && !event.altKey) {
+                if (ws.tabs.length > 1) { event.preventDefault(); void handleCloseTab(ws.workspace_id, ws.active_tab_id); }
+                return;
+            }
+            if (event.shiftKey && event.key.toLowerCase() === 'b' && !event.altKey) {
+                event.preventDefault(); void handleCreateTab(ws.workspace_id, 'browser'); return;
+            }
+            if (event.shiftKey && event.key.toLowerCase() === 'd' && !event.altKey) {
+                event.preventDefault(); void handleCreateTab(ws.workspace_id, 'diff'); return;
+            }
+            const numKey = parseInt(event.key);
+            if (numKey >= 1 && numKey <= 9 && !event.shiftKey && !event.altKey) {
+                const tabIndex = numKey - 1;
+                if (tabIndex < ws.tabs.length) {
+                    event.preventDefault(); void handleActivateTab(ws.workspace_id, ws.tabs[tabIndex].tab_id);
+                }
+                return;
+            }
+        }
 
         if (event.shiftKey && event.key.toLowerCase() === 'j') { event.preventDefault(); void cyclePane(1); return; }
         if (event.shiftKey && event.key.toLowerCase() === 'k') { event.preventDefault(); void cyclePane(-1); return; }
@@ -145,8 +200,8 @@
                 <div class="workspace-stage">
                     {#each $appState.workspaces as workspace (workspace.workspace_id)}
                         {@const isOf = isOpenFlowWorkspace(workspace)}
-                        {@const surface = isOf ? null : surfaceForWorkspace(workspace)}
-                        {#if isOf || (surface && surface.root)}
+                        {@const activeTab = workspace.tabs.find(t => t.tab_id === workspace.active_tab_id)}
+                        {#if isOf || workspace.tabs.length > 0 || workspace.surfaces.length > 0}
                             <div
                                 class="workspace-surface-layer"
                                 class:active={workspace.workspace_id === $appState.active_workspace_id}
@@ -154,17 +209,50 @@
                             >
                                 {#if isOf}
                                     <OpenFlowWorkspace {workspace} />
-                                {:else if surface}
-                                    <PaneNode
-                                        node={surface.root}
-                                        activePaneId={surface.active_pane_id}
-                                        on:activate={(e) => handleActivatePane(e.detail.paneId)}
-                                        on:split={(e) => handleSplitPane(e.detail.paneId, e.detail.direction)}
-                                        on:close={(e) => handleClosePane(e.detail.paneId)}
-                                        on:resize={(e) => handleResizeSplit(e.detail.paneId, e.detail.childSizes)}
-                                        on:browser={(e) => handleCreateBrowserPane(e.detail.paneId)}
-                                        on:swap={(e) => handleSwapPanes(e.detail.sourcePaneId, e.detail.targetPaneId)}
-                                    />
+                                {:else}
+                                    <div class="workspace-tabbed-layout">
+                                        {#if workspace.tabs.length > 0}
+                                            <TabBar
+                                                tabs={workspace.tabs}
+                                                activeTabId={workspace.active_tab_id}
+                                                workspaceId={workspace.workspace_id}
+                                                on:activate={(e) => handleActivateTab(workspace.workspace_id, e.detail.tabId)}
+                                                on:close={(e) => handleCloseTab(workspace.workspace_id, e.detail.tabId)}
+                                                on:create={(e) => handleCreateTab(workspace.workspace_id, e.detail.kind)}
+                                            />
+                                        {/if}
+                                        <div class="tab-content">
+                                            {#if !activeTab || activeTab.kind === 'terminal'}
+                                                {@const surface = (activeTab?.surface_id
+                                                    ? surfaceForTab(workspace, activeTab.surface_id)
+                                                    : null) ?? surfaceForWorkspace(workspace)}
+                                                {#if surface && surface.root}
+                                                    <PaneNode
+                                                        node={surface.root}
+                                                        activePaneId={surface.active_pane_id}
+                                                        on:activate={(e) => handleActivatePane(e.detail.paneId)}
+                                                        on:split={(e) => handleSplitPane(e.detail.paneId, e.detail.direction)}
+                                                        on:close={(e) => handleClosePane(e.detail.paneId)}
+                                                        on:resize={(e) => handleResizeSplit(e.detail.paneId, e.detail.childSizes)}
+                                                        on:browser={(e) => handleCreateBrowserPane(e.detail.paneId)}
+                                                        on:swap={(e) => handleSwapPanes(e.detail.sourcePaneId, e.detail.targetPaneId)}
+                                                    />
+                                                {/if}
+                                            {:else if activeTab.kind === 'browser' && activeTab.browser_id}
+                                                <BrowserPane browserId={activeTab.browser_id} />
+                                            {:else if activeTab.kind === 'diff'}
+                                                <div class="diff-placeholder">
+                                                    <div class="diff-placeholder-icon">
+                                                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                                            <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                                                        </svg>
+                                                    </div>
+                                                    <h2>Changes view coming soon</h2>
+                                                    <p>Diff viewer will appear here</p>
+                                                </div>
+                                            {/if}
+                                        </div>
+                                    </div>
                                 {/if}
                             </div>
                         {/if}
@@ -340,6 +428,58 @@
         opacity: 1;
         pointer-events: auto;
         z-index: 1;
+    }
+
+    .workspace-tabbed-layout {
+        display: flex;
+        flex-direction: column;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+    }
+
+    .tab-content {
+        flex: 1;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+    }
+
+    .diff-placeholder {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        gap: 12px;
+        text-align: center;
+    }
+
+    .diff-placeholder-icon {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        background: var(--ui-layer-2);
+        border: 1px solid var(--ui-border-soft);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--ui-text-muted);
+    }
+
+    .diff-placeholder h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+        color: var(--ui-text-secondary);
+    }
+
+    .diff-placeholder p {
+        margin: 0;
+        font-size: 0.82rem;
+        color: var(--ui-text-muted);
     }
 
     .global-notice-wrap {

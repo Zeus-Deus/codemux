@@ -10,6 +10,7 @@ use crate::state::{
     AppStateStore,
     NotificationLevel,
     SplitDirection,
+    TabKind,
     WorkspacePresetLayout,
 };
 use crate::terminal;
@@ -372,6 +373,89 @@ pub fn set_notification_sound_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     state.set_notification_sound_enabled(enabled);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn create_tab(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    kind: String,
+) -> Result<String, String> {
+    let kind = match kind.as_str() {
+        "terminal" => TabKind::Terminal,
+        "browser" => TabKind::Browser,
+        "diff" => TabKind::Diff,
+        _ => return Err(format!("Unsupported tab kind: {kind}")),
+    };
+
+    let (tab_id, session_id) = state.create_tab(&workspace_id, kind)?;
+
+    if let Some(session_id) = session_id {
+        terminal::spawn_pty_for_session(app.clone(), session_id.0);
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(tab_id)
+}
+
+#[tauri::command]
+pub fn close_tab(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    tab_id: String,
+) -> Result<(), String> {
+    let result = state.close_tab(&workspace_id, &tab_id)?;
+
+    for session_id in result.removed_sessions {
+        let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
+        crate::terminal::close_terminal_session(
+            app.clone(),
+            terminal_state.clone(),
+            state.clone(),
+            session_id.0,
+        )
+        .ok();
+    }
+
+    if let Some(browser_id) = result.removed_browser_id {
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager: State<'_, BrowserManager> = app_handle.state();
+            if let Err(error) = manager.close_browser(&browser_id.0).await {
+                eprintln!("[BROWSER] Failed to close browser {}: {error}", browser_id.0);
+            }
+        });
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn activate_tab(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    tab_id: String,
+) -> Result<(), String> {
+    state.activate_tab(&workspace_id, &tab_id)?;
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn rename_tab(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    tab_id: String,
+    title: String,
+) -> Result<(), String> {
+    state.rename_tab(&workspace_id, &tab_id, title)?;
     crate::state::emit_app_state(&app);
     Ok(())
 }
