@@ -1,8 +1,10 @@
 pub mod browser;
+pub mod git;
 pub mod openflow;
 pub mod workspace;
 
 pub use browser::*;
+pub use git::*;
 pub use openflow::*;
 pub use workspace::*;
 

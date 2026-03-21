@@ -165,6 +165,26 @@ export interface OpenFlowCreateRunRequest {
 export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
 export type LayoutPreset = 'single' | 'pair' | 'quad' | 'six' | 'eight' | 'shell_browser';
 
+export type FileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked' | 'copied';
+
+export interface GitFileStatus {
+    path: string;
+    status: FileStatus;
+}
+
+export interface GitDiffStat {
+    staged_additions: number;
+    staged_deletions: number;
+    unstaged_additions: number;
+    unstaged_deletions: number;
+}
+
+export interface GitBranchInfo {
+    branch: string | null;
+    ahead: number;
+    behind: number;
+}
+
 export type TabKind = 'terminal' | 'browser' | 'diff';
 
 export interface TabSnapshot {

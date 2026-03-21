@@ -5,6 +5,7 @@ pub mod browser;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod git;
 pub mod control;
 pub mod diagnostics;
 pub mod execution;
@@ -222,7 +223,15 @@ pub fn run() {
             terminal::attach_pty_output,
             terminal::detach_pty_output,
             terminal::write_to_pty,
-            terminal::resize_pty
+            terminal::resize_pty,
+            commands::get_git_status,
+            commands::get_git_diff,
+            commands::get_git_diff_stat,
+            commands::git_stage_files,
+            commands::git_unstage_files,
+            commands::git_commit_changes,
+            commands::git_push_changes,
+            commands::get_git_branch_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

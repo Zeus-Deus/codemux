@@ -657,6 +657,17 @@ impl AppStateStore {
         false
     }
 
+    pub fn update_workspace_git_branch(&self, workspace_id: &str, branch: Option<String>) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.git_branch = branch;
+        }
+    }
+
     pub fn update_workspace_cwd(&self, workspace_id: &str, cwd: String) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot

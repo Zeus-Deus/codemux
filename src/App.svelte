@@ -29,6 +29,7 @@
     import OpenFlowWorkspace from './components/openflow/OpenFlowWorkspace.svelte';
     import TabBar from './components/tabs/TabBar.svelte';
     import BrowserPane from './components/panes/BrowserPane.svelte';
+    import DiffView from './components/diff/DiffView.svelte';
     import { findActiveSessionId } from './lib/paneTree';
 
     const themeKeys = [
@@ -241,15 +242,7 @@
                                             {:else if activeTab.kind === 'browser' && activeTab.browser_id}
                                                 <BrowserPane browserId={activeTab.browser_id} />
                                             {:else if activeTab.kind === 'diff'}
-                                                <div class="diff-placeholder">
-                                                    <div class="diff-placeholder-icon">
-                                                        <svg width="32" height="32" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                                                            <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                                                        </svg>
-                                                    </div>
-                                                    <h2>Changes view coming soon</h2>
-                                                    <p>Diff viewer will appear here</p>
-                                                </div>
+                                                <DiffView workspaceCwd={workspace.cwd} />
                                             {/if}
                                         </div>
                                     </div>
@@ -444,42 +437,6 @@
         min-width: 0;
         min-height: 0;
         overflow: hidden;
-    }
-
-    .diff-placeholder {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-        gap: 12px;
-        text-align: center;
-    }
-
-    .diff-placeholder-icon {
-        width: 56px;
-        height: 56px;
-        border-radius: 14px;
-        background: var(--ui-layer-2);
-        border: 1px solid var(--ui-border-soft);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: var(--ui-text-muted);
-    }
-
-    .diff-placeholder h2 {
-        margin: 0;
-        font-size: 1rem;
-        font-weight: 600;
-        color: var(--ui-text-secondary);
-    }
-
-    .diff-placeholder p {
-        margin: 0;
-        font-size: 0.82rem;
-        color: var(--ui-text-muted);
     }
 
     .global-notice-wrap {

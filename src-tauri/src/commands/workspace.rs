@@ -23,10 +23,18 @@ pub(crate) fn create_workspace_impl(
     state: &AppStateStore,
     cwd: Option<String>,
 ) -> Result<String, String> {
-    let workspace_id = match cwd {
+    let workspace_id = match &cwd {
         Some(path) => state.create_workspace_at_path(PathBuf::from(path)),
         None => state.create_workspace(),
     };
+
+    // Populate git branch info
+    let repo_path = cwd
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::project::current_project_root);
+    if let Ok(info) = crate::git::git_branch_info(&repo_path) {
+        state.update_workspace_git_branch(&workspace_id.0, info.branch);
+    }
 
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
@@ -111,10 +119,18 @@ pub fn create_workspace_with_preset(
         _ => return Err(format!("Unsupported workspace preset layout: {layout}")),
     };
 
+    let repo_path = cwd
+        .as_ref()
+        .map(|p| PathBuf::from(p))
+        .unwrap_or_else(crate::project::current_project_root);
     let workspace_id = match cwd {
         Some(path) => state.create_workspace_with_layout(PathBuf::from(path), layout),
         None => state.create_workspace_with_layout(crate::project::current_project_root(), layout),
     };
+
+    if let Ok(info) = crate::git::git_branch_info(&repo_path) {
+        state.update_workspace_git_branch(&workspace_id.0, info.branch);
+    }
 
     let snapshot = state.snapshot();
     let session_ids = snapshot
