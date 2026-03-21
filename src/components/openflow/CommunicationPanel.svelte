@@ -290,6 +290,7 @@
     .message-text {
         color: var(--ui-text-secondary);
         word-break: break-word;
+        font-family: var(--ui-font-mono);
     }
 
     .no-messages {

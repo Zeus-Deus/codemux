@@ -342,7 +342,7 @@
         border: 1px solid color-mix(in srgb, var(--ui-accent) 30%, transparent);
         color: var(--ui-text-primary);
         font-size: 0.78rem;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-family: var(--ui-font-mono);
     }
 
     .health-badge {

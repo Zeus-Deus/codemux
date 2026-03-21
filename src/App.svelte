@@ -225,6 +225,10 @@
 <style>
     :global(html),
     :global(body) {
+        /* ---- Typography ---- */
+        --ui-font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', system-ui, sans-serif;
+        --ui-font-mono: 'JetBrainsMono Nerd Font', 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+
         /* ---- Shell palette (fixed neutral dark — never changes with theme) ---- */
         --ui-layer-0: #0d0f11;
         --ui-layer-1: #151719;
@@ -270,7 +274,7 @@
         background-color: var(--ui-layer-0);
         background: var(--ui-layer-0);
         color: var(--ui-text-primary);
-        font-family: var(--shell-font-family, 'JetBrainsMono Nerd Font'), 'JetBrains Mono', 'SFMono-Regular', Menlo, Consolas, monospace;
+        font-family: var(--ui-font-sans);
         font-size: 13px;
         overflow: hidden;
     }

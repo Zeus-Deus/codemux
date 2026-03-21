@@ -482,7 +482,7 @@
         background: transparent;
         border: none;
         color: var(--ui-text-primary);
-        font: inherit;
+        font-family: var(--ui-font-mono);
         font-size: 0.78rem;
         padding: 0;
         outline: none;

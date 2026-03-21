@@ -133,6 +133,6 @@
         border-left: 3px solid rgb(220, 53, 69);
         color: rgb(220, 53, 69);
         font-size: 13px;
-        font-family: monospace;
+        font-family: var(--ui-font-mono);
     }
 </style>

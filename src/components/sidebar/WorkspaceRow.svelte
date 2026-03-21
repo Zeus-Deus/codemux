@@ -207,6 +207,7 @@
         gap: 5px;
         padding-left: 13px;
         min-width: 0;
+        font-family: var(--ui-font-mono);
     }
 
     .meta-branch {
