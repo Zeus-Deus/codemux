@@ -17,6 +17,10 @@
 - Default to `npm run verify` after meaningful changes.
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
+## UI & Feature Work
+
+- The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.
+
 ## Browser Automation
 
 - **Never** use `xdg-open` or `open` — always use `codemux browser open <url>`.
