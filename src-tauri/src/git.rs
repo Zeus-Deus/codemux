@@ -109,7 +109,12 @@ pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<(), String> {
     }
     let mut args: Vec<&str> = vec!["restore", "--staged", "--"];
     args.extend(files.iter().map(|f| f.as_str()));
-    run_git(repo_path, &args)?;
+    if run_git(repo_path, &args).is_err() {
+        // Fallback for newly added files on older git versions
+        let mut rm_args: Vec<&str> = vec!["rm", "--cached", "--"];
+        rm_args.extend(files.iter().map(|f| f.as_str()));
+        run_git(repo_path, &rm_args)?;
+    }
     Ok(())
 }
 
@@ -329,5 +334,38 @@ C  source.txt -> copy.txt";
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "path with spaces/file name.txt");
         assert_eq!(results[1].path, "another file.txt");
+    }
+
+    #[test]
+    fn staged_vs_unstaged_parsing() {
+        let input = " M unstaged-only.rs\nM  staged-only.rs\nMM both-staged-and-unstaged.rs\n?? untracked-file.txt\nA  staged-added.rs";
+
+        let results = parse_porcelain_status(input);
+        assert_eq!(results.len(), 5);
+
+        // " M" = unstaged only
+        assert_eq!(results[0].path, "unstaged-only.rs");
+        assert!(!results[0].is_staged, "' M' should NOT be staged");
+        assert!(results[0].is_unstaged, "' M' should be unstaged");
+
+        // "M " = staged only
+        assert_eq!(results[1].path, "staged-only.rs");
+        assert!(results[1].is_staged, "'M ' should be staged");
+        assert!(!results[1].is_unstaged, "'M ' should NOT be unstaged");
+
+        // "MM" = both
+        assert_eq!(results[2].path, "both-staged-and-unstaged.rs");
+        assert!(results[2].is_staged, "'MM' should be staged");
+        assert!(results[2].is_unstaged, "'MM' should be unstaged");
+
+        // "??" = untracked (unstaged only)
+        assert_eq!(results[3].path, "untracked-file.txt");
+        assert!(!results[3].is_staged, "'??' should NOT be staged");
+        assert!(results[3].is_unstaged, "'??' should be unstaged");
+
+        // "A " = staged added
+        assert_eq!(results[4].path, "staged-added.rs");
+        assert!(results[4].is_staged, "'A ' should be staged");
+        assert!(!results[4].is_unstaged, "'A ' should NOT be unstaged");
     }
 }

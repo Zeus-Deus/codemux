@@ -13,8 +13,9 @@
         unstage: { files: string[] };
     }>();
 
-    const stagedFiles = $derived(files.filter(f => f.is_staged));
-    const unstagedFiles = $derived(files.filter(f => f.is_unstaged));
+    // Defensive: treat undefined is_staged as false, undefined is_unstaged as true
+    const stagedFiles = $derived(files.filter(f => f.is_staged === true));
+    const unstagedFiles = $derived(files.filter(f => f.is_unstaged !== false));
 
     function statusLetter(status: string): string {
         switch (status) {

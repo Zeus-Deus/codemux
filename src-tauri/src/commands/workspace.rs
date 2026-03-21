@@ -15,8 +15,27 @@ use crate::state::{
 };
 use crate::terminal;
 use notify_rust::Notification;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{Manager, State};
+
+fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
+    let branch_info = crate::git::git_branch_info(repo_path).ok();
+    let diff_stat = crate::git::git_diff_stat(repo_path).ok();
+
+    let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
+    let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);
+    let behind = branch_info.as_ref().map(|i| i.behind).unwrap_or(0);
+    let additions = diff_stat
+        .as_ref()
+        .map(|s| s.staged_additions + s.unstaged_additions)
+        .unwrap_or(0);
+    let deletions = diff_stat
+        .as_ref()
+        .map(|s| s.staged_deletions + s.unstaged_deletions)
+        .unwrap_or(0);
+
+    state.update_workspace_git_info(workspace_id, branch, ahead, behind, additions, deletions);
+}
 
 pub(crate) fn create_workspace_impl(
     app: tauri::AppHandle,
@@ -28,13 +47,11 @@ pub(crate) fn create_workspace_impl(
         None => state.create_workspace(),
     };
 
-    // Populate git branch info
+    // Populate git info
     let repo_path = cwd
         .map(PathBuf::from)
         .unwrap_or_else(crate::project::current_project_root);
-    if let Ok(info) = crate::git::git_branch_info(&repo_path) {
-        state.update_workspace_git_branch(&workspace_id.0, info.branch);
-    }
+    populate_git_info(state, &workspace_id.0, &repo_path);
 
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
@@ -128,9 +145,7 @@ pub fn create_workspace_with_preset(
         None => state.create_workspace_with_layout(crate::project::current_project_root(), layout),
     };
 
-    if let Ok(info) = crate::git::git_branch_info(&repo_path) {
-        state.update_workspace_git_branch(&workspace_id.0, info.branch);
-    }
+    populate_git_info(&state, &workspace_id.0, &repo_path);
 
     let snapshot = state.snapshot();
     let session_ids = snapshot
@@ -472,6 +487,24 @@ pub fn rename_tab(
     title: String,
 ) -> Result<(), String> {
     state.rename_tab(&workspace_id, &tab_id, title)?;
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn refresh_workspace_git_info(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let snapshot = state.snapshot();
+    let workspace = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+    let cwd = workspace.cwd.clone();
+    populate_git_info(&state, &workspace_id, Path::new(&cwd));
     crate::state::emit_app_state(&app);
     Ok(())
 }

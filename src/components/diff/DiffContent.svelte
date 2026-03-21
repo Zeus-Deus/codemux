@@ -18,7 +18,15 @@
         let newLine = 0;
 
         for (const raw of text.split('\n')) {
-            if (raw.startsWith('@@')) {
+            // Skip diff metadata headers (must check before +/- content lines)
+            if (raw.startsWith('diff ') || raw.startsWith('index ') ||
+                raw.startsWith('--- ') || raw.startsWith('+++ ') ||
+                raw.startsWith('new file') || raw.startsWith('deleted file') ||
+                raw.startsWith('old mode') || raw.startsWith('new mode') ||
+                raw.startsWith('similarity') || raw.startsWith('rename ') ||
+                raw.startsWith('\\ No newline')) {
+                // Skip
+            } else if (raw.startsWith('@@')) {
                 const match = raw.match(/@@ -(\d+)/);
                 if (match) {
                     oldLine = parseInt(match[1], 10);
@@ -32,14 +40,14 @@
             } else if (raw.startsWith('-')) {
                 lines.push({ type: 'del', content: raw.slice(1), oldLine, newLine: null });
                 oldLine++;
-            } else if (raw.startsWith('diff ') || raw.startsWith('index ') || raw.startsWith('---') || raw.startsWith('+++')) {
-                // Skip diff headers
             } else {
                 // Context line (starts with space or is empty)
                 const content = raw.startsWith(' ') ? raw.slice(1) : raw;
-                lines.push({ type: 'context', content, oldLine, newLine });
-                oldLine++;
-                newLine++;
+                if (content || lines.length > 0) {
+                    lines.push({ type: 'context', content, oldLine, newLine });
+                    oldLine++;
+                    newLine++;
+                }
             }
         }
         return lines;
