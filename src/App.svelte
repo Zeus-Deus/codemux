@@ -225,36 +225,32 @@
 <style>
     :global(html),
     :global(body) {
-        /* ---- Accent & attention ---- */
+        /* ---- Shell palette (fixed neutral dark — never changes with theme) ---- */
+        --ui-layer-0: #0d0f11;
+        --ui-layer-1: #151719;
+        --ui-layer-2: #1c1e22;
+        --ui-layer-3: #252830;
+        --ui-border-soft: rgba(255, 255, 255, 0.08);
+        --ui-border-strong: rgba(255, 255, 255, 0.14);
+        --ui-text-primary: #e0e0e0;
+        --ui-text-secondary: #9a9a9a;
+        --ui-text-muted: #636363;
+
+        /* ---- Accent tokens (theme-reactive — only theme color in the shell) ---- */
         --ui-accent: var(--theme-accent, #7aa2f7);
-        --ui-accent-soft: rgba(122, 162, 247, 0.18);
-        --ui-attention: var(--theme-color11, #e0af68);
-        --ui-attention-soft: rgba(224, 175, 104, 0.14);
-        --ui-success: var(--theme-color10, #9ece6a);
+        --ui-accent-soft: color-mix(in srgb, var(--theme-accent, #7aa2f7) 18%, transparent 82%);
+        --ui-success: var(--theme-color2, #9ece6a);
         --ui-danger: var(--theme-color1, #f7768e);
+        --ui-attention: var(--theme-color3, #e0af68);
+        --ui-attention-soft: color-mix(in srgb, var(--theme-color3, #e0af68) 14%, transparent 86%);
 
-        /* ---- Layer system ---- */
-        --ui-layer-0: var(--theme-background, #1a1b26);
-        --ui-layer-1: #161925;
-        --ui-layer-2: #1d2231;
-        --ui-layer-3: #252c3f;
-
-        /* Legacy aliases used by pane components */
+        /* ---- Legacy aliases used by pane components ---- */
         --ui-app-bg: var(--ui-layer-0);
         --ui-sidebar-bg: var(--ui-layer-1);
         --ui-surface: var(--ui-layer-2);
         --ui-surface-strong: var(--ui-layer-3);
         --ui-pane-bg: var(--ui-layer-0);
         --ui-pane-bg-strong: var(--ui-layer-1);
-
-        /* ---- Borders ---- */
-        --ui-border-soft: rgba(192, 202, 245, 0.1);
-        --ui-border-strong: rgba(192, 202, 245, 0.18);
-
-        /* ---- Text hierarchy ---- */
-        --ui-text-primary: var(--theme-foreground, #c0caf5);
-        --ui-text-secondary: #9aa4c2;
-        --ui-text-muted: #6f7893;
 
         /* ---- Geometry ---- */
         --ui-radius-sm: 6px;
