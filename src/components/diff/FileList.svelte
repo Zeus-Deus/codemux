@@ -8,10 +8,13 @@
     } = $props();
 
     const dispatch = createEventDispatcher<{
-        select: { path: string };
+        select: { path: string; staged: boolean };
         stage: { files: string[] };
         unstage: { files: string[] };
     }>();
+
+    const stagedFiles = $derived(files.filter(f => f.is_staged));
+    const unstagedFiles = $derived(files.filter(f => f.is_unstaged));
 
     function statusLetter(status: string): string {
         switch (status) {
@@ -31,7 +34,6 @@
             case 'modified': return 'status-modified';
             case 'deleted': return 'status-deleted';
             case 'renamed': return 'status-renamed';
-            case 'untracked': case 'copied': return 'status-muted';
             default: return 'status-muted';
         }
     }
@@ -41,38 +43,67 @@
         return parts[parts.length - 1];
     }
 
-    function handleStage(event: MouseEvent, path: string) {
+    function handleAction(event: MouseEvent, action: 'stage' | 'unstage', path: string) {
         event.stopPropagation();
-        dispatch('stage', { files: [path] });
-    }
-
-    function handleStageAll() {
-        dispatch('stage', { files: files.map(f => f.path) });
+        dispatch(action, { files: [path] });
     }
 </script>
 
 <div class="file-list">
-    <div class="file-list-header">
-        <span class="section-label">Changes</span>
-        <span class="file-count">{files.length}</span>
-        {#if files.length > 0}
-            <button class="stage-all-btn" onclick={handleStageAll} title="Stage all">
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M6 2v8M2 6h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
-                </svg>
-                Stage All
-            </button>
-        {/if}
-    </div>
-
     <div class="file-entries">
-        {#each files as file (file.path)}
+        <!-- Staged section -->
+        {#if stagedFiles.length > 0}
+            <div class="section-header">
+                <span class="section-label">Staged</span>
+                <span class="file-count">{stagedFiles.length}</span>
+                <button class="section-action" onclick={() => dispatch('unstage', { files: stagedFiles.map(f => f.path) })}>
+                    Unstage All
+                </button>
+            </div>
+            {#each stagedFiles as file (file.path + ':staged')}
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div
+                    class="file-row"
+                    class:active={selectedFile === file.path}
+                    onclick={() => dispatch('select', { path: file.path, staged: true })}
+                    onkeydown={(e) => { if (e.key === 'Enter') dispatch('select', { path: file.path, staged: true }); }}
+                    role="option"
+                    tabindex="0"
+                    aria-selected={selectedFile === file.path}
+                    title={file.path}
+                >
+                    <span class="status-badge {statusClass(file.status)}">{statusLetter(file.status)}</span>
+                    <span class="file-name">{fileName(file.path)}</span>
+                    <button
+                        class="action-btn unstage-btn"
+                        onclick={(e) => handleAction(e, 'unstage', file.path)}
+                        title="Unstage"
+                    >
+                        <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                            <path d="M1.5 5h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+            {/each}
+        {/if}
+
+        <!-- Changes (unstaged) section -->
+        <div class="section-header">
+            <span class="section-label">Changes</span>
+            <span class="file-count">{unstagedFiles.length}</span>
+            {#if unstagedFiles.length > 0}
+                <button class="section-action" onclick={() => dispatch('stage', { files: unstagedFiles.map(f => f.path) })}>
+                    Stage All
+                </button>
+            {/if}
+        </div>
+        {#each unstagedFiles as file (file.path + ':unstaged')}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
                 class="file-row"
                 class:active={selectedFile === file.path}
-                onclick={() => dispatch('select', { path: file.path })}
-                onkeydown={(e) => { if (e.key === 'Enter') dispatch('select', { path: file.path }); }}
+                onclick={() => dispatch('select', { path: file.path, staged: false })}
+                onkeydown={(e) => { if (e.key === 'Enter') dispatch('select', { path: file.path, staged: false }); }}
                 role="option"
                 tabindex="0"
                 aria-selected={selectedFile === file.path}
@@ -81,9 +112,9 @@
                 <span class="status-badge {statusClass(file.status)}">{statusLetter(file.status)}</span>
                 <span class="file-name">{fileName(file.path)}</span>
                 <button
-                    class="stage-btn"
-                    onclick={(e) => handleStage(e, file.path)}
-                    title="Stage file"
+                    class="action-btn stage-btn"
+                    onclick={(e) => handleAction(e, 'stage', file.path)}
+                    title="Stage"
                 >
                     <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
                         <path d="M5 1.5v7M1.5 5h7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
@@ -92,7 +123,7 @@
             </div>
         {/each}
 
-        {#if files.length === 0}
+        {#if stagedFiles.length === 0 && unstagedFiles.length === 0}
             <div class="empty-state">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                     <path d="M20 6L9 17l-5-5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -112,12 +143,17 @@
         overflow: hidden;
     }
 
-    .file-list-header {
+    .file-entries {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+    }
+
+    .section-header {
         display: flex;
         align-items: center;
         gap: 6px;
-        padding: 8px 12px;
-        border-bottom: 1px solid var(--ui-border-soft);
+        padding: 8px 12px 4px;
         flex-shrink: 0;
     }
 
@@ -138,11 +174,8 @@
         border-radius: 8px;
     }
 
-    .stage-all-btn {
+    .section-action {
         margin-left: auto;
-        display: flex;
-        align-items: center;
-        gap: 4px;
         padding: 2px 8px;
         border: 1px solid var(--ui-border-soft);
         border-radius: 4px;
@@ -153,15 +186,9 @@
         transition: all var(--ui-motion-fast);
     }
 
-    .stage-all-btn:hover {
+    .section-action:hover {
         background: var(--ui-layer-2);
         color: var(--ui-text-secondary);
-    }
-
-    .file-entries {
-        flex: 1;
-        overflow-y: auto;
-        overflow-x: hidden;
     }
 
     .file-row {
@@ -212,7 +239,7 @@
         text-overflow: ellipsis;
     }
 
-    .stage-btn {
+    .action-btn {
         display: flex;
         align-items: center;
         justify-content: center;
@@ -229,13 +256,18 @@
         transition: all var(--ui-motion-fast);
     }
 
-    .file-row:hover .stage-btn {
+    .file-row:hover .action-btn {
         opacity: 1;
     }
 
     .stage-btn:hover {
         background: color-mix(in srgb, var(--ui-success) 15%, transparent);
         color: var(--ui-success);
+    }
+
+    .unstage-btn:hover {
+        background: color-mix(in srgb, var(--ui-danger) 15%, transparent);
+        color: var(--ui-danger);
     }
 
     .empty-state {

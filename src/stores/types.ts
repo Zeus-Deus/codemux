@@ -170,6 +170,8 @@ export type FileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'untrack
 export interface GitFileStatus {
     path: string;
     status: FileStatus;
+    is_staged: boolean;
+    is_unstaged: boolean;
 }
 
 export interface GitDiffStat {
@@ -231,6 +233,10 @@ export interface WorkspaceSnapshot {
     workspace_type: WorkspaceType;
     cwd: string;
     git_branch: string | null;
+    git_ahead: number;
+    git_behind: number;
+    git_additions: number;
+    git_deletions: number;
     notification_count: number;
     latest_agent_state: string | null;
     tabs: TabSnapshot[];

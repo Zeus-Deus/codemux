@@ -95,6 +95,27 @@ pub fn run() {
             indexing::spawn_index_watcher(index_store);
             control::spawn_control_server(app.handle().clone());
 
+            // Periodically refresh git info for the active workspace
+            let git_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let state: tauri::State<'_, state::AppStateStore> = git_handle.state();
+                    if let Some((workspace_id, cwd)) = state.active_workspace_cwd() {
+                        let path = std::path::PathBuf::from(&cwd);
+                        let branch_info = git::git_branch_info(&path).ok();
+                        let diff_stat = git::git_diff_stat(&path).ok();
+                        let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
+                        let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);
+                        let behind = branch_info.as_ref().map(|i| i.behind).unwrap_or(0);
+                        let additions = diff_stat.as_ref().map(|s| s.staged_additions + s.unstaged_additions).unwrap_or(0);
+                        let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
+                        state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions);
+                        state::emit_app_state(&git_handle);
+                    }
+                }
+            });
+
             // Window lifecycle breadcrumbs: this lets us tell whether a second process
             // actually reached window creation or if it exited early.
             #[cfg(debug_assertions)]
@@ -169,6 +190,7 @@ pub fn run() {
             commands::close_tab,
             commands::activate_tab,
             commands::rename_tab,
+            commands::refresh_workspace_git_info,
             commands::create_browser_pane,
             commands::browser_open_url,
             commands::browser_history_back,

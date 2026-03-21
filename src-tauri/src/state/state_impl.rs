@@ -238,6 +238,14 @@ pub struct WorkspaceSnapshot {
     pub workspace_type: WorkspaceType,
     pub cwd: String,
     pub git_branch: Option<String>,
+    #[serde(default)]
+    pub git_ahead: u32,
+    #[serde(default)]
+    pub git_behind: u32,
+    #[serde(default)]
+    pub git_additions: u32,
+    #[serde(default)]
+    pub git_deletions: u32,
     pub notification_count: u32,
     pub latest_agent_state: Option<String>,
     #[serde(default)]
@@ -410,6 +418,10 @@ impl AppStateStore {
             workspace_type: WorkspaceType::OpenFlow,
             cwd,
             git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -565,6 +577,10 @@ impl AppStateStore {
             workspace_type: WorkspaceType::Standard,
             cwd,
             git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -657,7 +673,15 @@ impl AppStateStore {
         false
     }
 
-    pub fn update_workspace_git_branch(&self, workspace_id: &str, branch: Option<String>) {
+    pub fn update_workspace_git_info(
+        &self,
+        workspace_id: &str,
+        branch: Option<String>,
+        ahead: u32,
+        behind: u32,
+        additions: u32,
+        deletions: u32,
+    ) {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
             .workspaces
@@ -665,7 +689,20 @@ impl AppStateStore {
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
             workspace.git_branch = branch;
+            workspace.git_ahead = ahead;
+            workspace.git_behind = behind;
+            workspace.git_additions = additions;
+            workspace.git_deletions = deletions;
         }
+    }
+
+    pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == snapshot.active_workspace_id)?;
+        Some((workspace.workspace_id.0.clone(), workspace.cwd.clone()))
     }
 
     pub fn update_workspace_cwd(&self, workspace_id: &str, cwd: String) -> bool {
@@ -1752,6 +1789,10 @@ fn default_app_state() -> AppStateSnapshot {
             workspace_type: WorkspaceType::Standard,
             cwd: cwd.clone(),
             git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {

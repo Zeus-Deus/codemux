@@ -15,11 +15,6 @@
         onMarkRead: () => void;
     } = $props();
 
-    function compactPath(path: string) {
-        const parts = path.split(/[\\/]/).filter(Boolean);
-        if (parts.length <= 2) return `/${parts.join('/')}`;
-        return `~/${parts.slice(-2).join('/')}`;
-    }
 </script>
 
 <div
@@ -38,7 +33,7 @@
 >
     <div class="row-accent"></div>
 
-    <div class="row-body">
+    <div class="row-body" title={workspace.cwd}>
         <div class="row-top">
             <span
                 class="row-dot"
@@ -46,6 +41,12 @@
                 class:dot-attention={workspace.notification_count > 0}
             ></span>
             <span class="row-name">{workspace.title}</span>
+            {#if workspace.git_ahead > 0}
+                <span class="git-badge git-ahead">↑{workspace.git_ahead}</span>
+            {/if}
+            {#if workspace.git_behind > 0}
+                <span class="git-badge git-behind">↓{workspace.git_behind}</span>
+            {/if}
             {#if workspace.notification_count > 0}
                 <button
                     class="attention-badge"
@@ -58,13 +59,23 @@
             {/if}
         </div>
 
-        <div class="row-meta">
-            {#if workspace.git_branch}
+        {#if workspace.git_branch}
+            <div class="row-meta">
+                <svg class="branch-icon" width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                    <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
                 <span class="meta-branch">{workspace.git_branch}</span>
-                <span class="meta-sep">·</span>
-            {/if}
-            <span class="meta-path">{compactPath(workspace.cwd)}</span>
-        </div>
+                {#if workspace.git_additions > 0 || workspace.git_deletions > 0}
+                    <span class="meta-sep">·</span>
+                    {#if workspace.git_additions > 0}
+                        <span class="diff-stat diff-add">+{workspace.git_additions}</span>
+                    {/if}
+                    {#if workspace.git_deletions > 0}
+                        <span class="diff-stat diff-del">-{workspace.git_deletions}</span>
+                    {/if}
+                {/if}
+            </div>
+        {/if}
     </div>
 
     <button
@@ -92,7 +103,7 @@
             background var(--ui-motion-fast),
             box-shadow var(--ui-motion-fast);
         outline: none;
-        min-height: 50px;
+        min-height: 44px;
         user-select: none;
     }
 
@@ -131,10 +142,10 @@
     .row-body {
         flex: 1;
         min-width: 0;
-        padding: 10px 6px 10px 10px;
+        padding: 8px 6px 8px 10px;
         display: flex;
         flex-direction: column;
-        gap: 3px;
+        gap: 2px;
     }
 
     .row-top {
@@ -143,6 +154,16 @@
         gap: 7px;
         min-width: 0;
     }
+
+    .git-badge {
+        font-family: var(--ui-font-mono);
+        font-size: 0.65rem;
+        font-weight: 600;
+        flex-shrink: 0;
+    }
+
+    .git-ahead { color: var(--ui-success); }
+    .git-behind { color: var(--ui-attention); }
 
     .row-dot {
         width: 6px;
@@ -210,11 +231,18 @@
         font-family: var(--ui-font-mono);
     }
 
+    .branch-icon {
+        flex-shrink: 0;
+        color: var(--ui-text-muted);
+    }
+
     .meta-branch {
         font-size: 0.72rem;
-        color: var(--ui-text-secondary);
+        color: var(--ui-text-muted);
         white-space: nowrap;
-        flex-shrink: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
     }
 
     .meta-sep {
@@ -223,14 +251,14 @@
         flex-shrink: 0;
     }
 
-    .meta-path {
-        font-size: 0.72rem;
-        color: var(--ui-text-muted);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        min-width: 0;
+    .diff-stat {
+        font-size: 0.7rem;
+        font-weight: 600;
+        flex-shrink: 0;
     }
+
+    .diff-add { color: var(--ui-success); }
+    .diff-del { color: var(--ui-danger); }
 
     .row-close {
         display: flex;

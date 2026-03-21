@@ -193,6 +193,20 @@
                     </button>
                 {/if}
                 <span class="active-workspace-path">{compactPath(activeWorkspace.cwd)}</span>
+                {#if activeWorkspace.git_branch}
+                    <span class="active-git-info">
+                        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                            <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                        </svg>
+                        {activeWorkspace.git_branch}
+                        {#if activeWorkspace.git_additions > 0}
+                            <span class="head-diff-add">+{activeWorkspace.git_additions}</span>
+                        {/if}
+                        {#if activeWorkspace.git_deletions > 0}
+                            <span class="head-diff-del">-{activeWorkspace.git_deletions}</span>
+                        {/if}
+                    </span>
+                {/if}
             </div>
         {/if}
 
@@ -412,6 +426,18 @@
         overflow: hidden;
         text-overflow: ellipsis;
     }
+
+    .active-git-info {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        font-family: var(--ui-font-mono);
+        font-size: 0.72rem;
+        color: var(--ui-text-muted);
+    }
+
+    .head-diff-add { color: var(--ui-success); font-weight: 600; }
+    .head-diff-del { color: var(--ui-danger); font-weight: 600; }
 
     .head-actions {
         display: flex;

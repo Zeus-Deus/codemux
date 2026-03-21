@@ -2,7 +2,7 @@
     import { onMount } from 'svelte';
     import FileList from './FileList.svelte';
     import DiffContent from './DiffContent.svelte';
-    import { getGitStatus, getGitDiff, getGitBranchInfo, stageFiles, commitChanges, pushChanges } from '../../stores/git';
+    import { getGitStatus, getGitDiff, getGitBranchInfo, stageFiles, unstageFiles, commitChanges, pushChanges } from '../../stores/git';
     import type { GitFileStatus, GitBranchInfo } from '../../stores/types';
 
     let { workspaceCwd }: { workspaceCwd: string } = $props();
@@ -10,6 +10,7 @@
     let files = $state<GitFileStatus[]>([]);
     let branchInfo = $state<GitBranchInfo>({ branch: null, ahead: 0, behind: 0 });
     let selectedFile = $state<string | null>(null);
+    let selectedStaged = $state(false);
     let diffText = $state('');
     let commitMessage = $state('');
     let isNotGitRepo = $state(false);
@@ -39,22 +40,30 @@
         }
     }
 
-    async function loadDiff(path: string) {
+    async function loadDiff(path: string, staged: boolean) {
         try {
-            diffText = await getGitDiff(workspaceCwd, path, false);
+            diffText = await getGitDiff(workspaceCwd, path, staged);
         } catch {
             diffText = '';
         }
     }
 
-    async function handleSelectFile(path: string) {
+    async function handleSelectFile(path: string, staged: boolean) {
         selectedFile = path;
-        await loadDiff(path);
+        selectedStaged = staged;
+        await loadDiff(path, staged);
     }
 
     async function handleStage(filePaths: string[]) {
         await stageFiles(workspaceCwd, filePaths);
         await refresh();
+        if (selectedFile) await loadDiff(selectedFile, selectedStaged);
+    }
+
+    async function handleUnstage(filePaths: string[]) {
+        await unstageFiles(workspaceCwd, filePaths);
+        await refresh();
+        if (selectedFile) await loadDiff(selectedFile, selectedStaged);
     }
 
     async function handleCommit() {
@@ -153,7 +162,7 @@
             <button
                 class="commit-btn"
                 onclick={() => void handleCommit()}
-                disabled={!commitMessage.trim() || files.length === 0 || isLoading}
+                disabled={!commitMessage.trim() || !files.some(f => f.is_staged) || isLoading}
             >
                 Commit
             </button>
@@ -173,8 +182,9 @@
                 <FileList
                     {files}
                     {selectedFile}
-                    on:select={(e) => void handleSelectFile(e.detail.path)}
+                    on:select={(e) => void handleSelectFile(e.detail.path, e.detail.staged)}
                     on:stage={(e) => void handleStage(e.detail.files)}
+                    on:unstage={(e) => void handleUnstage(e.detail.files)}
                 />
             </div>
 

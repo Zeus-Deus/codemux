@@ -17,6 +17,8 @@ pub enum FileStatus {
 pub struct GitFileStatus {
     pub path: String,
     pub status: FileStatus,
+    pub is_staged: bool,
+    pub is_unstaged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,7 +173,12 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
             _ => FileStatus::Modified,
         };
 
-        results.push(GitFileStatus { path, status });
+        // X column: staged status (anything except ' ' and '?' means staged)
+        let is_staged = index_status != b' ' && index_status != b'?';
+        // Y column: unstaged status (anything except ' ' means unstaged; '?' = untracked = unstaged)
+        let is_unstaged = worktree_status != b' ';
+
+        results.push(GitFileStatus { path, status, is_staged, is_unstaged });
     }
     results
 }
@@ -221,32 +228,59 @@ C  source.txt -> copy.txt";
         let results = parse_porcelain_status(input);
         assert_eq!(results.len(), 9);
 
+        // ?? untracked.txt → unstaged only
         assert_eq!(results[0].path, "untracked.txt");
         assert_eq!(results[0].status, FileStatus::Untracked);
+        assert!(!results[0].is_staged);
+        assert!(results[0].is_unstaged);
 
+        // A  staged-new.txt → staged only
         assert_eq!(results[1].path, "staged-new.txt");
         assert_eq!(results[1].status, FileStatus::Added);
+        assert!(results[1].is_staged);
+        assert!(!results[1].is_unstaged);
 
+        // M  modified-staged.txt → staged only
         assert_eq!(results[2].path, "modified-staged.txt");
         assert_eq!(results[2].status, FileStatus::Modified);
+        assert!(results[2].is_staged);
+        assert!(!results[2].is_unstaged);
 
+        // ' M' modified-unstaged.txt → unstaged only
         assert_eq!(results[3].path, "modified-unstaged.txt");
         assert_eq!(results[3].status, FileStatus::Modified);
+        assert!(!results[3].is_staged);
+        assert!(results[3].is_unstaged);
 
+        // MM modified-both.txt → both staged and unstaged
         assert_eq!(results[4].path, "modified-both.txt");
         assert_eq!(results[4].status, FileStatus::Modified);
+        assert!(results[4].is_staged);
+        assert!(results[4].is_unstaged);
 
+        // D  deleted.txt → staged only
         assert_eq!(results[5].path, "deleted.txt");
         assert_eq!(results[5].status, FileStatus::Deleted);
+        assert!(results[5].is_staged);
+        assert!(!results[5].is_unstaged);
 
+        // ' D' deleted-unstaged.txt → unstaged only
         assert_eq!(results[6].path, "deleted-unstaged.txt");
         assert_eq!(results[6].status, FileStatus::Deleted);
+        assert!(!results[6].is_staged);
+        assert!(results[6].is_unstaged);
 
+        // R  old-name.txt -> new-name.txt → staged only
         assert_eq!(results[7].path, "new-name.txt");
         assert_eq!(results[7].status, FileStatus::Renamed);
+        assert!(results[7].is_staged);
+        assert!(!results[7].is_unstaged);
 
+        // C  source.txt -> copy.txt → staged only
         assert_eq!(results[8].path, "copy.txt");
         assert_eq!(results[8].status, FileStatus::Copied);
+        assert!(results[8].is_staged);
+        assert!(!results[8].is_unstaged);
     }
 
     #[test]
