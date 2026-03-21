@@ -28,59 +28,44 @@ Principles:
 
 ## Theming Rules
 
-### Token Derivation
+### Shell vs Terminal Color Model
 
-ALL `--ui-*` tokens must derive from `--theme-*` values. Never hardcode hex or rgba values for any color that should respond to theme changes.
+The shell uses a FIXED neutral dark palette. Omarchy theme colors only affect terminal content and accent tokens.
 
-#### Layer System
-
-Layers are surface/background colors. Derive ALL layers from `--theme-background` using `color-mix`:
+#### Fixed Shell Palette (never changes with theme)
 
 ```
---ui-layer-0:  var(--theme-background)
-               Base app background. Direct from theme.
+--ui-layer-0: #0d0f11          Near-black base (app bg, terminal bg)
+--ui-layer-1: #151719          Sidebar, pane headers
+--ui-layer-2: #1c1e22          Elevated surfaces, cards, inputs
+--ui-layer-3: #252830          Hover states, strong surfaces
 
---ui-layer-1:  color-mix(in srgb, var(--theme-background) 92%, black 8%)
-               Sidebar bg, pane headers, comm panel bg.
+--ui-border-soft:   rgba(255, 255, 255, 0.08)
+--ui-border-strong: rgba(255, 255, 255, 0.14)
 
---ui-layer-2:  color-mix(in srgb, var(--theme-background) 88%, white 12%)
-               Elevated surfaces, cards, inputs, message bubbles.
-
---ui-layer-3:  color-mix(in srgb, var(--theme-background) 82%, white 18%)
-               Hover states on layer-2, strong surface emphasis.
+--ui-text-primary:   #e0e0e0
+--ui-text-secondary: #9a9a9a
+--ui-text-muted:     #636363
 ```
 
-This ensures any Omarchy theme produces a coherent layer stack. A blue theme gets subtle cool-tinted layers. A green theme gets subtle warm-tinted layers. The tinting is always subtle because we mix with black/white.
+Three text levels max. Do not invent intermediate shades.
 
-#### Borders
-
-```
---ui-border-soft:    color-mix(in srgb, var(--theme-foreground) 10%, transparent 90%)
---ui-border-strong:  color-mix(in srgb, var(--theme-foreground) 18%, transparent 82%)
-```
-
-Derive from foreground so borders stay visible against any background.
-
-#### Text
-
-```
---ui-text-primary:    var(--theme-foreground)
---ui-text-secondary:  color-mix(in srgb, var(--theme-foreground) 68%, transparent 32%)
---ui-text-muted:      color-mix(in srgb, var(--theme-foreground) 42%, transparent 58%)
-```
-
-Three levels max. Do not invent intermediate shades.
-
-#### Accents
+#### Theme-Reactive Accents (from Omarchy)
 
 ```
 --ui-accent:         var(--theme-accent)
 --ui-accent-soft:    color-mix(in srgb, var(--theme-accent) 18%, transparent 82%)
---ui-success:        var(--theme-color10)
+--ui-success:        var(--theme-color2)
 --ui-danger:         var(--theme-color1)
---ui-attention:      var(--theme-color11)
---ui-attention-soft: color-mix(in srgb, var(--theme-color11) 14%, transparent 86%)
+--ui-attention:      var(--theme-color3)
+--ui-attention-soft: color-mix(in srgb, var(--theme-color3) 14%, transparent 86%)
 ```
+
+These are the ONLY theme-reactive tokens in the shell chrome.
+
+#### Terminal Colors (from Omarchy)
+
+Terminal text, cursor, selection, and ANSI palette (color0-color15) come from `--theme-*` vars via the `terminalTheme()` function in TerminalPane.svelte. Terminal background uses `--ui-layer-0` (fixed neutral), NOT `--theme-background`. This keeps all panes visually calm while terminal content is fully colorful.
 
 ### Where Accent Colors Appear
 
@@ -96,7 +81,7 @@ For Omarchy-specific integration questions, use the `omarchy-kb` MCP server whic
 
 ### The Golden Rule
 
-If you are writing a color value and it does not start with `var(--` or `color-mix(`, you are probably doing it wrong. The only exceptions are: `transparent`, `black`, `white`, `currentColor`, and the `white` background on browser viewport content areas.
+Shell tokens (`--ui-layer-*`, `--ui-border-*`, `--ui-text-*`) are fixed hex values — they never reference `--theme-*`. Accent tokens (`--ui-accent`, `--ui-success`, `--ui-danger`, `--ui-attention`) use `var(--theme-*)`. Terminal colors use `var(--theme-*)`. Never use `--theme-background` or `--theme-foreground` for shell chrome.
 
 ---
 
@@ -215,30 +200,22 @@ Unique to Codemux. Instead of manual agent assignment, analyze the task and sugg
 
 ## CSS Rules
 
-### Always derive from theme
-
-```css
-/* Correct */
-background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
-border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
-
-/* Wrong — hardcoded values that assume a specific theme */
-background: rgba(122, 162, 247, 0.1);
-border-color: rgba(122, 162, 247, 0.3);
-```
-
 ### Always use tokens
 
 ```css
-/* Correct */
+/* Correct — use --ui-* tokens for shell chrome */
 background: var(--ui-layer-2);
 color: var(--ui-text-secondary);
 border-radius: var(--ui-radius-md);
 transition: all var(--ui-motion-fast);
 
-/* Wrong — raw values */
+/* Correct — use color-mix with accent tokens for tinted surfaces */
+background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+
+/* Wrong — raw hex/rgba instead of tokens */
 background: #1d2231;
-color: #9aa4c2;
+color: rgba(122, 162, 247, 0.1);
 ```
 
 ### Scoped styles only
@@ -275,5 +252,5 @@ Before considering a component done:
 - Import component libraries — keep it custom and lightweight
 - Use `px` font sizes in shell chrome — use `rem`
 - Add attention-seeking animations to the chrome
-- Assume a specific Omarchy theme — all UI must work with any palette
-- Hardcode `rgba()` for theme-dependent colors — use `color-mix()` with `var()`
+- Use `--theme-background` or `--theme-foreground` in shell chrome — use `--ui-*` tokens
+- Hardcode `rgba()` for accent-derived colors — use `color-mix()` with `var(--ui-accent)` etc.
