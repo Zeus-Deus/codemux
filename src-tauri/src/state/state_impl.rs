@@ -1888,7 +1888,7 @@ fn default_app_state() -> AppStateSnapshot {
     }
 }
 
-fn session_id_for_pane(root: &PaneNodeSnapshot, target_pane_id: &PaneId) -> Option<SessionId> {
+pub fn session_id_for_pane(root: &PaneNodeSnapshot, target_pane_id: &PaneId) -> Option<SessionId> {
     match root {
         PaneNodeSnapshot::Terminal {
             pane_id,

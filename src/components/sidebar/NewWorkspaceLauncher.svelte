@@ -2,6 +2,7 @@
     import { createEventDispatcher } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
     import { createWorkspaceWithPreset } from '../../stores/workspace';
+    import { presetStore, applyPreset } from '../../stores/presets';
     import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
 
     type LauncherStep = 'kind' | 'layout' | 'details';
@@ -64,6 +65,7 @@
     let openflowGoal = $state('');
     let selectedFolder = $state('');
     let creating = $state(false);
+    let selectedPresetId = $state('');
 
     const stepMeta = $derived.by(() => {
         if (step === 'kind') {
@@ -158,13 +160,16 @@
 
         creating = true;
         try {
-            await createWorkspaceWithPreset({
+            const result = await createWorkspaceWithPreset({
                 kind: selectedKind,
                 layout: selectedLayout,
                 cwd: selectedKind === 'folder' ? selectedFolder : undefined,
                 openflowTitle,
                 openflowGoal
             });
+            if (selectedPresetId && result.workspaceId) {
+                await applyPreset(result.workspaceId, selectedPresetId);
+            }
             dispatch('close');
         } catch (error) {
             console.error('Failed to create workspace preset:', error);
@@ -289,6 +294,19 @@
                         <strong>Shell-first by default</strong>
                         <p>This creates plain shell slots. Provider assignment can be added later as an advanced setup layer.</p>
                     </div>
+                    {#if $presetStore && $presetStore.presets.length > 0}
+                        <div class="field-stack">
+                            <label>
+                                <span>Start with preset <span class="optional-hint">(optional)</span></span>
+                                <select class="preset-select" bind:value={selectedPresetId}>
+                                    <option value="">None</option>
+                                    {#each $presetStore.presets.filter(p => p.pinned) as preset (preset.id)}
+                                        <option value={preset.id}>{preset.name}</option>
+                                    {/each}
+                                </select>
+                            </label>
+                        </div>
+                    {/if}
                 {/if}
 
                 <div class="footer-actions">
@@ -557,7 +575,8 @@
     }
 
     input,
-    textarea {
+    textarea,
+    select {
         width: 100%;
         box-sizing: border-box;
         border: 1px solid var(--ui-border-soft);
@@ -565,6 +584,11 @@
         background: var(--ui-layer-0);
         color: var(--ui-text-primary);
         padding: 10px;
+    }
+
+    .optional-hint {
+        font-weight: 400;
+        color: var(--ui-text-muted);
     }
 
     .folder-row {

@@ -7,6 +7,7 @@
     import { appState, initAppState } from './stores/core';
     import { initOpenFlowRuntime } from './stores/openflow';
     import { initProjectMemory } from './stores/memory';
+    import { presetStore, initPresets } from './stores/presets';
     import {
         activatePane,
         closePane,
@@ -30,7 +31,10 @@
     import TabBar from './components/tabs/TabBar.svelte';
     import BrowserPane from './components/panes/BrowserPane.svelte';
     import DiffView from './components/diff/DiffView.svelte';
+    import PresetBar from './components/presets/PresetBar.svelte';
+    import PresetEditor from './components/presets/PresetEditor.svelte';
     import { findActiveSessionId } from './lib/paneTree';
+    import type { TerminalPreset } from './stores/types';
 
     const themeKeys = [
         'accent', 'cursor', 'foreground', 'background',
@@ -42,6 +46,8 @@
 
     let windowFocused = $state(true);
     let showNewWorkspaceLauncher = $state(false);
+    let editingPreset = $state<TerminalPreset | null | undefined>(undefined);
+    // undefined = editor closed, null = create mode, TerminalPreset = edit mode
 
     function applyThemeVars(nextTheme = fallbackTheme) {
         const root = document.documentElement;
@@ -165,6 +171,7 @@
         initAppState();
         initProjectMemory();
         initOpenFlowRuntime();
+        initPresets();
 
         const themeUnsub = theme.subscribe((t) => applyThemeVars(t ?? fallbackTheme));
         const shellAppearanceUnsub = shellAppearance.subscribe((appearance: ShellAppearance | null) => {
@@ -220,6 +227,13 @@
                                                 on:activate={(e) => handleActivateTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:close={(e) => handleCloseTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:create={(e) => handleCreateTab(workspace.workspace_id, e.detail.kind)}
+                                            />
+                                        {/if}
+                                        {#if $presetStore && (!activeTab || activeTab.kind === 'terminal')}
+                                            <PresetBar
+                                                workspaceId={workspace.workspace_id}
+                                                presets={$presetStore.presets}
+                                                onEditPreset={(p) => { editingPreset = p; }}
                                             />
                                         {/if}
                                         <div class="tab-content">
@@ -301,6 +315,10 @@
 
 {#if showNewWorkspaceLauncher}
     <NewWorkspaceLauncher on:close={() => showNewWorkspaceLauncher = false} />
+{/if}
+
+{#if editingPreset !== undefined}
+    <PresetEditor preset={editingPreset} on:close={() => { editingPreset = undefined; }} />
 {/if}
 
 <style>

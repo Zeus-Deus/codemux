@@ -14,6 +14,7 @@ pub mod memory;
 pub mod openflow;
 pub mod observability;
 pub mod ports;
+pub mod presets;
 pub mod project;
 pub mod state;
 pub mod terminal;
@@ -63,6 +64,7 @@ pub fn run() {
         .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
+        .manage(presets::PresetStoreState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -286,7 +288,14 @@ pub fn run() {
             commands::git_push_changes,
             commands::get_git_branch_info,
             commands::get_detected_ports,
-            commands::kill_port
+            commands::kill_port,
+            commands::get_presets,
+            commands::create_preset,
+            commands::update_preset,
+            commands::delete_preset,
+            commands::set_preset_pinned,
+            commands::set_preset_bar_visible,
+            commands::apply_preset
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

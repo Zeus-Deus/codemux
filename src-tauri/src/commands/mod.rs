@@ -1,11 +1,13 @@
 pub mod browser;
 pub mod git;
 pub mod openflow;
+pub mod presets;
 pub mod workspace;
 
 pub use browser::*;
 pub use git::*;
 pub use openflow::*;
+pub use presets::*;
 pub use workspace::*;
 
 use crate::indexing::{

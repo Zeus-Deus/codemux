@@ -335,3 +335,23 @@ export interface OrchestratorTriggerResult {
     orchestration_state: OpenFlowRunRecord['orchestration_state'];
     orchestration_detail: string | null;
 }
+
+export type LaunchMode = 'split_pane' | 'new_tab';
+
+export interface TerminalPreset {
+    id: string;
+    name: string;
+    description: string | null;
+    commands: string[];
+    working_directory: string | null;
+    launch_mode: LaunchMode;
+    icon: string | null;
+    pinned: boolean;
+    is_builtin: boolean;
+}
+
+export interface PresetStoreSnapshot {
+    presets: TerminalPreset[];
+    bar_visible: boolean;
+    default_preset_id: string | null;
+}
