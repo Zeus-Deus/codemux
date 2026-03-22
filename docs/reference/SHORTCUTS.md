@@ -14,6 +14,8 @@ Defined in `src/App.svelte` — `handleWindowKeydown()`.
 
 | Shortcut | Action | Notes |
 |----------|--------|-------|
+| Ctrl+K | Command palette | Fuzzy search for any action |
+| Ctrl+Shift+P | Command palette (alt) | Alternative binding |
 | Ctrl+] | Next workspace | Cycles through sidebar workspace list |
 | Ctrl+[ | Previous workspace | |
 | Ctrl+T | New terminal tab | Standard workspaces only (not OpenFlow) |

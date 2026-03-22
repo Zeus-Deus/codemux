@@ -35,6 +35,7 @@
     import ChangesPanel from './components/changes/ChangesPanel.svelte';
     import PresetBar from './components/presets/PresetBar.svelte';
     import PresetEditor from './components/presets/PresetEditor.svelte';
+    import CommandPalette from './components/CommandPalette.svelte';
     import { findActiveSessionId } from './lib/paneTree';
     import type { TerminalPreset } from './stores/types';
 
@@ -48,6 +49,7 @@
 
     let windowFocused = $state(true);
     let showNewWorkspaceLauncher = $state(false);
+    let showCommandPalette = $state(false);
     let editingPreset = $state<TerminalPreset | null | undefined>(undefined);
     // undefined = editor closed, null = create mode, TerminalPreset = edit mode
 
@@ -160,6 +162,14 @@
 
     function handleWindowKeydown(event: KeyboardEvent) {
         if (!(event.metaKey || event.ctrlKey)) return;
+
+        // Command palette
+        if (event.key.toLowerCase() === 'k' && !event.shiftKey && !event.altKey) {
+            event.preventDefault(); showCommandPalette = !showCommandPalette; return;
+        }
+        if (event.shiftKey && event.key.toLowerCase() === 'p' && !event.altKey) {
+            event.preventDefault(); showCommandPalette = !showCommandPalette; return;
+        }
 
         if (event.key === ']') { event.preventDefault(); void cycleWorkspace(1); return; }
         if (event.key === '[') { event.preventDefault(); void cycleWorkspace(-1); return; }
@@ -381,6 +391,10 @@
 
 {#if editingPreset !== undefined}
     <PresetEditor preset={editingPreset} on:close={() => { editingPreset = undefined; }} />
+{/if}
+
+{#if showCommandPalette}
+    <CommandPalette onClose={() => { showCommandPalette = false; }} />
 {/if}
 
 <style>
