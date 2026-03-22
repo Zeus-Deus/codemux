@@ -97,11 +97,18 @@
 
         // Panels
         actions.push({
+            id: 'toggle-file-tree',
+            group: 'Panels',
+            label: 'Toggle File Tree',
+            shortcut: 'Ctrl+B',
+            execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'b', ctrlKey: true, bubbles: true })); }
+        });
+        actions.push({
             id: 'toggle-changes',
             group: 'Panels',
             label: 'Toggle Changes Panel',
             shortcut: 'Ctrl+Shift+G',
-            execute: () => { /* dispatched via keyboard simulation */ document.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', ctrlKey: true, shiftKey: true, bubbles: true })); }
+            execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', ctrlKey: true, shiftKey: true, bubbles: true })); }
         });
 
         // Git
@@ -126,6 +133,22 @@
                 execute: () => { void pushChanges(ws.cwd); }
             });
         }
+
+        // Search
+        actions.push({
+            id: 'search-in-files',
+            group: 'Search',
+            label: 'Search in Files',
+            shortcut: 'Ctrl+Shift+F',
+            execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'f', ctrlKey: true, shiftKey: true, bubbles: true })); }
+        });
+        actions.push({
+            id: 'find-file',
+            group: 'Search',
+            label: 'Find File by Name',
+            shortcut: 'Ctrl+P',
+            execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true })); }
+        });
 
         // Tools
         if (editors.length > 0 && ws) {

@@ -23,6 +23,7 @@ Principles:
 - **keyboard-first** — every action reachable by keybind; mouse supported but not required
 - **progressive disclosure** — hide secondary actions behind hover or expand; show primary state at a glance
 - **the terminal is the star** — everything around the terminal serves it, not the other way around
+- **right panel for auxiliary views** — file tree, changes/diff, and other secondary views live in the collapsible right sidebar panel. The main workspace area is reserved for terminals and browser panes. New auxiliary views should be added as tabs in the right panel, not as separate panels.
 
 ---
 
@@ -162,6 +163,23 @@ Subtle always. No bounces, springs, or attention-seeking motion. `ease-out` for 
 - Shell chrome: system UI font stack, 0.7-0.9rem.
 - Terminal: `--shell-font-family` or monospace fallback, 13px.
 - Nothing larger than 1.1rem in the app shell except OpenFlow config panel headers.
+
+---
+
+## Overlay and Modal Rules
+
+Codemux uses a global overlay manager (src/stores/overlay.ts) that ensures only ONE overlay is visible at a time. Any full-screen or centered overlay (command palette, search dialogs, modals, confirmation dialogs) MUST use this system.
+
+Rules for adding new overlays:
+- Register the overlay kind in the OverlayKind type in src/stores/overlay.ts
+- Open/close via toggleOverlay(kind) and closeOverlay() — never manage visibility in the component itself
+- Render the overlay conditionally in App.svelte based on $activeOverlay
+- All overlays: centered, same z-index (100), same backdrop (rgba(0,0,0,0.4)), same border-radius and shadow
+- Escape always closes the active overlay
+- Opening a new overlay auto-closes the previous one
+- Overlays do NOT stack — there is never more than one visible
+
+This prevents: overlapping dialogs, z-index wars, inconsistent positioning, and escape key conflicts.
 
 ---
 

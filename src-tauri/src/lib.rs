@@ -308,7 +308,10 @@ pub fn run() {
             commands::set_preset_bar_visible,
             commands::apply_preset,
             commands::get_workspace_config,
-            commands::run_workspace_setup
+            commands::run_workspace_setup,
+            commands::list_directory,
+            commands::search_in_files,
+            commands::search_file_names
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

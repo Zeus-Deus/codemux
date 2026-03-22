@@ -2,11 +2,11 @@
     import { createEventDispatcher } from 'svelte';
     import type { TabSnapshot } from '../../stores/types';
 
-    let { tabs, activeTabId, workspaceId, changesOpen, changesCount }: {
+    let { tabs, activeTabId, workspaceId, rightPanelTab, changesCount }: {
         tabs: TabSnapshot[];
         activeTabId: string;
         workspaceId: string;
-        changesOpen?: boolean;
+        rightPanelTab?: 'changes' | 'files' | null;
         changesCount?: number;
     } = $props();
 
@@ -14,7 +14,7 @@
         activate: { tabId: string };
         close: { tabId: string };
         create: { kind: string };
-        toggleChanges: void;
+        setRightPanel: { tab: 'changes' | 'files' };
     }>();
 
     let showDropdown = $state(false);
@@ -106,19 +106,27 @@
             </button>
         </div>
     </div>
-    <button
-        class="changes-toggle"
-        class:active={changesOpen}
-        onclick={() => dispatch('toggleChanges')}
-        title="Toggle Changes Panel (Ctrl+Shift+G)"
-    >
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-        </svg>
-        {#if changesCount && changesCount > 0}
-            <span class="changes-count">{changesCount}</span>
-        {/if}
-    </button>
+    <div class="panel-tabs">
+        <button
+            class="panel-tab"
+            class:active={rightPanelTab === 'changes'}
+            onclick={() => dispatch('setRightPanel', { tab: 'changes' })}
+            title="Changes (Ctrl+Shift+G)"
+        >
+            Changes
+            {#if changesCount && changesCount > 0}
+                <span class="panel-tab-count">{changesCount}</span>
+            {/if}
+        </button>
+        <button
+            class="panel-tab"
+            class:active={rightPanelTab === 'files'}
+            onclick={() => dispatch('setRightPanel', { tab: 'files' })}
+            title="Files (Ctrl+B)"
+        >
+            Files
+        </button>
+    </div>
 </div>
 
 {#if showDropdown}
@@ -301,35 +309,42 @@
         color: var(--ui-text-primary);
     }
 
-    .changes-toggle {
+    .panel-tabs {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        margin: 4px 6px 4px 0;
+        flex-shrink: 0;
+    }
+
+    .panel-tab {
         display: flex;
         align-items: center;
         gap: 4px;
         height: 28px;
-        padding: 0 8px;
-        margin: 4px 6px 4px 0;
+        padding: 0 10px;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
         font-size: 0.72rem;
+        font-weight: 500;
         cursor: pointer;
-        flex-shrink: 0;
         transition: all var(--ui-motion-fast);
     }
 
-    .changes-toggle:hover {
+    .panel-tab:hover {
         background: var(--ui-layer-2);
         color: var(--ui-text-secondary);
     }
 
-    .changes-toggle.active {
+    .panel-tab.active {
         background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
         color: var(--ui-accent);
         border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
     }
 
-    .changes-count {
+    .panel-tab-count {
         font-family: var(--ui-font-mono);
         font-size: 0.68rem;
         font-weight: 600;
@@ -338,7 +353,7 @@
         background: var(--ui-layer-2);
     }
 
-    .changes-toggle.active .changes-count {
+    .panel-tab.active .panel-tab-count {
         background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     }
 </style>

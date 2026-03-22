@@ -33,10 +33,14 @@
     import TabBar from './components/tabs/TabBar.svelte';
     import BrowserPane from './components/panes/BrowserPane.svelte';
     import ChangesPanel from './components/changes/ChangesPanel.svelte';
+    import FileTreePanel from './components/files/FileTreePanel.svelte';
+    import SearchPanel from './components/search/SearchPanel.svelte';
+    import FileSearch from './components/search/FileSearch.svelte';
     import PresetBar from './components/presets/PresetBar.svelte';
     import PresetEditor from './components/presets/PresetEditor.svelte';
     import CommandPalette from './components/CommandPalette.svelte';
     import WorkspaceSetupOverlay from './components/panes/WorkspaceSetupOverlay.svelte';
+    import { activeOverlay, toggleOverlay, closeOverlay } from './stores/overlay';
     import { findActiveSessionId } from './lib/paneTree';
     import type { TerminalPreset } from './stores/types';
 
@@ -50,22 +54,27 @@
 
     let windowFocused = $state(true);
     let showNewWorkspaceLauncher = $state(false);
-    let showCommandPalette = $state(false);
     let editingPreset = $state<TerminalPreset | null | undefined>(undefined);
     // undefined = editor closed, null = create mode, TerminalPreset = edit mode
 
-    let changesPanelOpen = $state(new Map<string, boolean>());
-    let changesPanelWidth = $state(320);
+    type RightPanelTab = 'changes' | 'files';
+    let rightPanelTab = $state(new Map<string, RightPanelTab | null>());
+    let rightPanelWidth = $state(320);
     let isPanelDragging = $state(false);
 
-    function isChangesPanelOpen(workspaceId: string): boolean {
-        return changesPanelOpen.get(workspaceId) ?? false;
+    function getRightPanelTab(workspaceId: string): RightPanelTab | null {
+        return rightPanelTab.get(workspaceId) ?? null;
     }
 
-    function toggleChangesPanel(workspaceId: string) {
-        const next = new Map(changesPanelOpen);
-        next.set(workspaceId, !(next.get(workspaceId) ?? false));
-        changesPanelOpen = next;
+    function setRightPanelTab(workspaceId: string, tab: RightPanelTab | null) {
+        const next = new Map(rightPanelTab);
+        next.set(workspaceId, tab);
+        rightPanelTab = next;
+    }
+
+    function toggleRightPanel(workspaceId: string, tab: RightPanelTab) {
+        const current = getRightPanelTab(workspaceId);
+        setRightPanelTab(workspaceId, current === tab ? null : tab);
     }
 
     function startPanelResize(e: MouseEvent) {
@@ -73,10 +82,9 @@
         const sidebarWidth = 240;
         const onMove = (ev: MouseEvent) => {
             const available = window.innerWidth - sidebarWidth;
-            changesPanelWidth = Math.max(240, Math.min(500, window.innerWidth - ev.clientX));
-            // clamp so main content keeps at least 200px
-            if (available - changesPanelWidth < 200) {
-                changesPanelWidth = available - 200;
+            rightPanelWidth = Math.max(240, Math.min(500, window.innerWidth - ev.clientX));
+            if (available - rightPanelWidth < 200) {
+                rightPanelWidth = available - 200;
             }
         };
         const onUp = () => {
@@ -166,10 +174,10 @@
 
         // Command palette
         if (event.key.toLowerCase() === 'k' && !event.shiftKey && !event.altKey) {
-            event.preventDefault(); showCommandPalette = !showCommandPalette; return;
+            event.preventDefault(); toggleOverlay('command-palette'); return;
         }
         if (event.shiftKey && event.key.toLowerCase() === 'p' && !event.altKey) {
-            event.preventDefault(); showCommandPalette = !showCommandPalette; return;
+            event.preventDefault(); toggleOverlay('command-palette'); return;
         }
 
         if (event.key === ']') { event.preventDefault(); void cycleWorkspace(1); return; }
@@ -189,7 +197,16 @@
                 event.preventDefault(); void handleCreateTab(ws.workspace_id, 'browser'); return;
             }
             if (event.shiftKey && event.key.toLowerCase() === 'g' && !event.altKey) {
-                event.preventDefault(); toggleChangesPanel(ws.workspace_id); return;
+                event.preventDefault(); toggleRightPanel(ws.workspace_id, 'changes'); return;
+            }
+            if (event.key.toLowerCase() === 'b' && !event.shiftKey && !event.altKey) {
+                event.preventDefault(); toggleRightPanel(ws.workspace_id, 'files'); return;
+            }
+            if (event.shiftKey && event.key.toLowerCase() === 'f' && !event.altKey) {
+                event.preventDefault(); toggleOverlay('keyword-search'); return;
+            }
+            if (event.key.toLowerCase() === 'p' && !event.shiftKey && !event.altKey) {
+                event.preventDefault(); toggleOverlay('file-search'); return;
             }
             const numKey = parseInt(event.key);
             if (numKey >= 1 && numKey <= 9 && !event.shiftKey && !event.altKey) {
@@ -278,12 +295,12 @@
                                                 tabs={workspace.tabs}
                                                 activeTabId={workspace.active_tab_id}
                                                 workspaceId={workspace.workspace_id}
-                                                changesOpen={isChangesPanelOpen(workspace.workspace_id)}
+                                                rightPanelTab={getRightPanelTab(workspace.workspace_id)}
                                                 changesCount={workspace.git_changed_files}
                                                 on:activate={(e) => handleActivateTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:close={(e) => handleCloseTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:create={(e) => handleCreateTab(workspace.workspace_id, e.detail.kind)}
-                                                on:toggleChanges={() => toggleChangesPanel(workspace.workspace_id)}
+                                                on:setRightPanel={(e) => toggleRightPanel(workspace.workspace_id, e.detail.tab)}
                                             />
                                         {/if}
                                         {#if $presetStore && (!activeTab || activeTab.kind === 'terminal')}
@@ -315,20 +332,55 @@
                                                     <BrowserPane browserId={activeTab.browser_id} />
                                                 {/if}
                                             </div>
-                                            {#if isChangesPanelOpen(workspace.workspace_id)}
+                                            {#if getRightPanelTab(workspace.workspace_id)}
                                                 <!-- svelte-ignore a11y_no_static_element_interactions -->
                                                 <div
-                                                    class="changes-panel-resizer"
+                                                    class="right-panel-resizer"
                                                     class:active={isPanelDragging}
                                                     onmousedown={startPanelResize}
                                                     role="separator"
                                                     aria-orientation="vertical"
                                                 ></div>
-                                                <div class="changes-panel-wrapper" style="width: {changesPanelWidth}px">
-                                                    <ChangesPanel
-                                                        workspaceCwd={workspace.cwd}
-                                                        onClose={() => toggleChangesPanel(workspace.workspace_id)}
-                                                    />
+                                                <div class="right-panel-wrapper" style="width: {rightPanelWidth}px">
+                                                    <div class="right-panel-tabs">
+                                                        <button
+                                                            class="rp-tab"
+                                                            class:active={getRightPanelTab(workspace.workspace_id) === 'changes'}
+                                                            onclick={() => setRightPanelTab(workspace.workspace_id, 'changes')}
+                                                        >
+                                                            Changes
+                                                            {#if workspace.git_changed_files > 0}
+                                                                <span class="rp-tab-count">{workspace.git_changed_files}</span>
+                                                            {/if}
+                                                        </button>
+                                                        <button
+                                                            class="rp-tab"
+                                                            class:active={getRightPanelTab(workspace.workspace_id) === 'files'}
+                                                            onclick={() => setRightPanelTab(workspace.workspace_id, 'files')}
+                                                        >
+                                                            Files
+                                                        </button>
+                                                        <div class="rp-tab-spacer"></div>
+                                                        <button
+                                                            class="rp-tab-close"
+                                                            onclick={() => setRightPanelTab(workspace.workspace_id, null)}
+                                                            title="Close panel"
+                                                        >
+                                                            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                                                                <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                                                            </svg>
+                                                        </button>
+                                                    </div>
+                                                    <div class="right-panel-content">
+                                                        {#if getRightPanelTab(workspace.workspace_id) === 'changes'}
+                                                            <ChangesPanel
+                                                                workspaceCwd={workspace.cwd}
+                                                                onClose={() => setRightPanelTab(workspace.workspace_id, null)}
+                                                            />
+                                                        {:else}
+                                                            <FileTreePanel workspaceCwd={workspace.cwd} />
+                                                        {/if}
+                                                    </div>
                                                 </div>
                                             {/if}
                                         </div>
@@ -395,8 +447,22 @@
     <PresetEditor preset={editingPreset} on:close={() => { editingPreset = undefined; }} />
 {/if}
 
-{#if showCommandPalette}
-    <CommandPalette onClose={() => { showCommandPalette = false; }} />
+{#if $activeOverlay === 'command-palette'}
+    <CommandPalette onClose={closeOverlay} />
+{/if}
+
+{#if $activeOverlay === 'keyword-search'}
+    {@const cws = currentWorkspace()}
+    {#if cws}
+        <SearchPanel workspaceCwd={cws.cwd} onClose={closeOverlay} />
+    {/if}
+{/if}
+
+{#if $activeOverlay === 'file-search'}
+    {@const cws = currentWorkspace()}
+    {#if cws}
+        <FileSearch workspaceCwd={cws.cwd} onClose={closeOverlay} />
+    {/if}
 {/if}
 
 <style>
@@ -544,7 +610,7 @@
         overflow: hidden;
     }
 
-    .changes-panel-resizer {
+    .right-panel-resizer {
         width: 4px;
         background: var(--ui-border-soft);
         cursor: col-resize;
@@ -552,15 +618,99 @@
         flex-shrink: 0;
     }
 
-    .changes-panel-resizer:hover,
-    .changes-panel-resizer.active {
+    .right-panel-resizer:hover,
+    .right-panel-resizer.active {
         background: var(--ui-accent);
     }
 
-    .changes-panel-wrapper {
+    .right-panel-wrapper {
+        display: flex;
+        flex-direction: column;
         flex-shrink: 0;
         overflow: hidden;
         height: 100%;
+    }
+
+    .right-panel-tabs {
+        display: flex;
+        align-items: center;
+        height: 34px;
+        min-height: 34px;
+        padding: 0 4px;
+        background: var(--ui-layer-1);
+        border-bottom: 1px solid var(--ui-border-soft);
+        border-left: 1px solid var(--ui-border-soft);
+        flex-shrink: 0;
+        gap: 2px;
+    }
+
+    .rp-tab {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 26px;
+        padding: 0 10px;
+        border: none;
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
+        font-size: 0.75rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: all var(--ui-motion-fast);
+    }
+
+    .rp-tab:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-secondary);
+    }
+
+    .rp-tab.active {
+        background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+        color: var(--ui-accent);
+    }
+
+    .rp-tab-count {
+        font-family: var(--ui-font-mono);
+        font-size: 0.65rem;
+        font-weight: 600;
+        padding: 0 4px;
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-2);
+    }
+
+    .rp-tab.active .rp-tab-count {
+        background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
+    }
+
+    .rp-tab-spacer {
+        flex: 1;
+    }
+
+    .rp-tab-close {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border: none;
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
+        cursor: pointer;
+        transition: background var(--ui-motion-fast), color var(--ui-motion-fast);
+    }
+
+    .rp-tab-close:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-primary);
+    }
+
+    .right-panel-content {
+        flex: 1;
+        min-height: 0;
+        overflow: hidden;
     }
 
     .global-notice-wrap {
