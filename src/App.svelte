@@ -306,7 +306,10 @@
                                                 on:activate={(e) => handleActivateTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:close={(e) => handleCloseTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:create={(e) => handleCreateTab(workspace.workspace_id, e.detail.kind)}
-                                                on:setRightPanel={(e) => toggleRightPanel(workspace.workspace_id, e.detail.tab)}
+                                                on:toggleRightPanel={() => {
+                                                    const cur = getRightPanelTab(workspace.workspace_id);
+                                                    setRightPanelTab(workspace.workspace_id, cur ? null : 'changes');
+                                                }}
                                             />
                                         {/if}
                                         {#if $presetStore && (!activeTab || activeTab.kind === 'terminal')}

@@ -14,7 +14,7 @@
         activate: { tabId: string };
         close: { tabId: string };
         create: { kind: string };
-        setRightPanel: { tab: 'changes' | 'files' };
+        toggleRightPanel: void;
     }>();
 
     let showDropdown = $state(false);
@@ -106,27 +106,17 @@
             </button>
         </div>
     </div>
-    <div class="panel-tabs">
-        <button
-            class="panel-tab"
-            class:active={rightPanelTab === 'changes'}
-            onclick={() => dispatch('setRightPanel', { tab: 'changes' })}
-            title="Changes (Ctrl+Shift+G)"
-        >
-            Changes
-            {#if changesCount && changesCount > 0}
-                <span class="panel-tab-count">{changesCount}</span>
-            {/if}
-        </button>
-        <button
-            class="panel-tab"
-            class:active={rightPanelTab === 'files'}
-            onclick={() => dispatch('setRightPanel', { tab: 'files' })}
-            title="Files (Ctrl+B)"
-        >
-            Files
-        </button>
-    </div>
+    <button
+        class="panel-toggle"
+        class:active={rightPanelTab != null}
+        onclick={() => dispatch('toggleRightPanel')}
+        title="Toggle Panel (Ctrl+B)"
+    >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="3" stroke="currentColor" stroke-width="1.5"/>
+            <path d="M15 3v18" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+    </button>
 </div>
 
 {#if showDropdown}
@@ -309,51 +299,31 @@
         color: var(--ui-text-primary);
     }
 
-    .panel-tabs {
+    .panel-toggle {
         display: flex;
         align-items: center;
-        gap: 2px;
-        margin: 4px 6px 4px 0;
-        flex-shrink: 0;
-    }
-
-    .panel-tab {
-        display: flex;
-        align-items: center;
-        gap: 4px;
+        justify-content: center;
+        width: 28px;
         height: 28px;
-        padding: 0 10px;
+        margin: 4px 6px 4px 0;
+        padding: 0;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
-        font-size: 0.72rem;
-        font-weight: 500;
         cursor: pointer;
-        transition: all var(--ui-motion-fast);
+        flex-shrink: 0;
+        transition: background var(--ui-motion-fast), color var(--ui-motion-fast);
     }
 
-    .panel-tab:hover {
+    .panel-toggle:hover {
         background: var(--ui-layer-2);
         color: var(--ui-text-secondary);
     }
 
-    .panel-tab.active {
+    .panel-toggle.active {
         background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
         color: var(--ui-accent);
         border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
-    }
-
-    .panel-tab-count {
-        font-family: var(--ui-font-mono);
-        font-size: 0.68rem;
-        font-weight: 600;
-        padding: 0 4px;
-        border-radius: var(--ui-radius-sm);
-        background: var(--ui-layer-2);
-    }
-
-    .panel-tab.active .panel-tab-count {
-        background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     }
 </style>
