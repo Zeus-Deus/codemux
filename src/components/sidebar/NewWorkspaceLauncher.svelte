@@ -1,11 +1,12 @@
 <script lang="ts">
+    import { onMount } from 'svelte';
     import { createEventDispatcher } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import { createWorkspaceWithPreset } from '../../stores/workspace';
+    import { appState } from '../../stores/core';
+    import { createWorkspaceWithPreset, createWorktreeWorkspace } from '../../stores/workspace';
     import { presetStore, applyPreset } from '../../stores/presets';
+    import { listBranches, getGitBranchInfo } from '../../stores/git';
     import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
-
-    type LauncherStep = 'kind' | 'layout' | 'details';
 
     let {
         initialKind = 'codemux',
@@ -17,306 +18,283 @@
 
     const dispatch = createEventDispatcher<{ close: void }>();
 
-    const kindOptions: Array<{
-        kind: WorkspaceTemplateKind;
-        title: string;
-        summary: string;
-        detail: string;
-    }> = [
-        {
-            kind: 'codemux',
-            title: 'Codemux workspace',
-            summary: 'Start with shells in the current project',
-            detail: 'Best for focused terminal work with optional browser panes later.'
-        },
-        {
-            kind: 'folder',
-            title: 'Open folder',
-            summary: 'Use the current repo as a shell workspace',
-            detail: 'Folder picking can be added later; for now this mirrors the current project root.'
-        },
-        {
-            kind: 'openflow',
-            title: 'OpenFlow run',
-            summary: 'Create a shell workspace and attach a run goal',
-            detail: 'Starts with the same pane layout, then creates a compact OpenFlow run on top.'
-        }
-    ];
+    type WorkspaceSource = 'new_branch' | 'existing_branch' | 'folder' | 'openflow';
 
-    const layoutOptions: Array<{
-        layout: LayoutPreset;
-        title: string;
-        subtitle: string;
-        slots: number;
-    }> = [
-        { layout: 'single', title: '1 slot', subtitle: 'Single shell', slots: 1 },
-        { layout: 'pair', title: '2 slots', subtitle: 'Side-by-side shells', slots: 2 },
-        { layout: 'quad', title: '4 slots', subtitle: 'Balanced split grid', slots: 4 },
-        { layout: 'six', title: '6 slots', subtitle: 'Two rows of three shells', slots: 6 },
-        { layout: 'eight', title: '8 slots', subtitle: 'Two rows of four shells', slots: 8 },
-        { layout: 'shell_browser', title: 'Shell + browser', subtitle: 'One shell with a browser companion', slots: 2 }
-    ];
-
-    let launcherEl = $state<HTMLDivElement | null>(null);
-    let step = $state<LauncherStep>('kind');
-    let selectedKind = $state<WorkspaceTemplateKind>('codemux');
+    let source = $state<WorkspaceSource>('new_branch');
     let selectedLayout = $state<LayoutPreset>('single');
+    let selectedPresetId = $state('');
+    let creating = $state(false);
+
+    // Git state
+    let isGitRepo = $state(true);
+    let currentBranch = $state('main');
+    let localBranches = $state<string[]>([]);
+    let remoteBranches = $state<string[]>([]);
+    let branchSearch = $state('');
+    let selectedBranch = $state('');
+
+    // New branch
+    let newBranchName = $state('');
+    let baseBranch = $state('');
+
+    // Folder
+    let selectedFolder = $state('');
+
+    // OpenFlow
     let openflowTitle = $state('');
     let openflowGoal = $state('');
-    let selectedFolder = $state('');
-    let creating = $state(false);
-    let selectedPresetId = $state('');
 
-    const stepMeta = $derived.by(() => {
-        if (step === 'kind') {
-            return {
-                index: 1,
-                total: 3,
-                label: 'Step 1',
-                title: 'Choose workspace type',
-                description: 'Start by choosing what kind of workspace you want to create.'
-            };
-        }
+    // Get project cwd
+    let projectCwd = $state('');
 
-        if (step === 'layout') {
-            return {
-                index: 2,
-                total: 3,
-                label: 'Step 2',
-                title: 'Choose layout preset',
-                description: 'Pick the initial shell layout. You can always add more manually later.'
-            };
-        }
+    const layoutOptions: Array<{ layout: LayoutPreset; label: string; slots: number }> = [
+        { layout: 'single', label: '1', slots: 1 },
+        { layout: 'pair', label: '2', slots: 2 },
+        { layout: 'quad', label: '4', slots: 4 },
+        { layout: 'six', label: '6', slots: 6 },
+        { layout: 'eight', label: '8', slots: 8 },
+        { layout: 'shell_browser', label: 'S+B', slots: 2 },
+    ];
 
+    const filteredBranches = $derived.by(() => {
+        const q = branchSearch.toLowerCase();
+        if (!q) return { local: localBranches, remote: remoteBranches };
         return {
-            index: 3,
-            total: 3,
-            label: 'Step 3',
-            title: selectedKind === 'openflow' ? 'Add run details' : selectedKind === 'folder' ? 'Choose working folder' : 'Review setup',
-            description: selectedKind === 'openflow'
-                ? 'Add the run title and goal before creating the workspace.'
-                : selectedKind === 'folder'
-                    ? 'Pick the folder this workspace should open in.'
-                    : 'Review the selection and create the workspace.'
+            local: localBranches.filter(b => b.toLowerCase().includes(q)),
+            remote: remoteBranches.filter(b => b.toLowerCase().includes(q) && !localBranches.includes(b)),
         };
     });
 
-    $effect(() => {
-        selectedKind = initialKind;
-        selectedLayout = initialLayout;
-        step = 'kind';
-        selectedFolder = '';
-    });
-
-    function goToLayout() {
-        if (step === 'kind') {
-            // OpenFlow skips layout selection - goes straight to details
-            if (selectedKind === 'openflow') {
-                step = 'details';
-            } else {
-                step = 'layout';
-            }
-        }
-    }
-
-    function goToDetails() {
-        if (step === 'layout') {
-            step = 'details';
-        }
-    }
-
-    function chooseKind(kind: WorkspaceTemplateKind) {
-        selectedKind = kind;
-        selectedFolder = '';
-        // OpenFlow skips layout and goes to details directly
-        if (kind === 'openflow') {
-            step = 'details';
-        } else {
-            step = 'layout';
-        }
-    }
-
-    function chooseLayout(layout: LayoutPreset) {
-        selectedLayout = layout;
-        goToDetails();
-    }
-
-    function canCreate() {
-        if (selectedKind === 'folder' && !selectedFolder.trim()) {
-            return false;
-        }
-
-        if (selectedKind !== 'openflow') {
-            return true;
-        }
-
-        return openflowTitle.trim().length > 0 && openflowGoal.trim().length > 0;
+    function canCreate(): boolean {
+        if (source === 'new_branch') return newBranchName.trim().length > 0;
+        if (source === 'existing_branch') return selectedBranch.length > 0;
+        if (source === 'folder') return selectedFolder.trim().length > 0;
+        if (source === 'openflow') return openflowTitle.trim().length > 0 && openflowGoal.trim().length > 0;
+        return false;
     }
 
     async function handleCreate() {
-        if (!canCreate() || creating) {
-            return;
-        }
-
+        if (!canCreate() || creating) return;
         creating = true;
         try {
-            const result = await createWorkspaceWithPreset({
-                kind: selectedKind,
-                layout: selectedLayout,
-                cwd: selectedKind === 'folder' ? selectedFolder : undefined,
-                openflowTitle,
-                openflowGoal
-            });
-            if (selectedPresetId && result.workspaceId) {
-                await applyPreset(result.workspaceId, selectedPresetId);
+            if (source === 'new_branch') {
+                const wsId = await createWorktreeWorkspace(projectCwd, newBranchName.trim(), true, selectedLayout, baseBranch || null);
+                if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
+            } else if (source === 'existing_branch') {
+                const wsId = await createWorktreeWorkspace(projectCwd, selectedBranch, false, selectedLayout);
+                if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
+            } else if (source === 'folder') {
+                const result = await createWorkspaceWithPreset({
+                    kind: 'folder' as WorkspaceTemplateKind,
+                    layout: selectedLayout,
+                    cwd: selectedFolder,
+                });
+                if (selectedPresetId && result.workspaceId) await applyPreset(result.workspaceId, selectedPresetId, 'existing_panes');
+            } else if (source === 'openflow') {
+                await createWorkspaceWithPreset({
+                    kind: 'openflow' as WorkspaceTemplateKind,
+                    layout: selectedLayout,
+                    openflowTitle,
+                    openflowGoal,
+                });
             }
             dispatch('close');
         } catch (error) {
-            console.error('Failed to create workspace preset:', error);
+            console.error('Failed to create workspace:', error);
         } finally {
             creating = false;
         }
     }
 
-    function slotPreview(layout: LayoutPreset) {
-        if (layout === 'shell_browser') {
-            return ['shell', 'browser'];
-        }
-
-        return Array.from({ length: layoutOptions.find((option) => option.layout === layout)?.slots ?? 1 }, () => 'shell');
-    }
-
     async function chooseFolder() {
-        const selection = await invoke<string | null>('pick_folder_dialog', {
-            title: 'Choose workspace folder'
-        });
-
-        if (typeof selection === 'string') {
-            selectedFolder = selection;
-        }
+        const selection = await invoke<string | null>('pick_folder_dialog', { title: 'Choose workspace folder' });
+        if (typeof selection === 'string') selectedFolder = selection;
     }
+
+    onMount(async () => {
+        // Get cwd from the active workspace
+        const activeWs = $appState?.workspaces.find(w => w.workspace_id === $appState?.active_workspace_id);
+        projectCwd = activeWs?.cwd ?? '';
+
+        if (projectCwd) {
+            try {
+                const branchInfo = await getGitBranchInfo(projectCwd);
+                currentBranch = branchInfo.branch ?? 'main';
+                baseBranch = currentBranch;
+                const [local, remote] = await Promise.all([
+                    listBranches(projectCwd, false),
+                    listBranches(projectCwd, true),
+                ]);
+                localBranches = local;
+                remoteBranches = remote.filter(b => !local.includes(b));
+                isGitRepo = true;
+            } catch {
+                isGitRepo = false;
+                source = 'folder';
+            }
+        } else {
+            isGitRepo = false;
+            source = 'folder';
+        }
+
+        if (initialKind === 'openflow') source = 'openflow';
+    });
 </script>
 
 <div class="launcher-backdrop" role="presentation" onclick={() => dispatch('close')}>
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
-        bind:this={launcherEl}
         class="launcher-shell"
         role="dialog"
         aria-modal="true"
         aria-label="New workspace"
         tabindex="-1"
-        onclick={(event) => event.stopPropagation()}
-        onkeydown={(event) => {
-            if (event.key === 'Escape') {
-                dispatch('close');
-            }
-        }}
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => { if (e.key === 'Escape') dispatch('close'); }}
     >
         <header class="launcher-header">
-            <div>
-                <p class="eyebrow">New workspace</p>
-                <h2>{stepMeta.title}</h2>
-                <p class="subcopy">{stepMeta.description}</p>
-            </div>
-            <button class="close-button" type="button" onclick={() => dispatch('close')} aria-label="Close launcher">Close</button>
+            <h2>New Workspace</h2>
+            <button class="close-btn" type="button" onclick={() => dispatch('close')} aria-label="Close">
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                    <path d="M1.5 1.5l7 7M8.5 1.5l-7 7" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+                </svg>
+            </button>
         </header>
 
-        <div class="step-strip" aria-live="polite">
-            <span class="step-chip">{stepMeta.label}</span>
-            <div class="step-track" aria-hidden="true">
-                {#each Array.from({ length: stepMeta.total }) as _, index}
-                    <span class:active={index < stepMeta.index}></span>
-                {/each}
-            </div>
-            <span class="step-count">{stepMeta.index} / {stepMeta.total}</span>
+        <!-- Source selection -->
+        <div class="source-row">
+            {#if isGitRepo}
+                <button class="source-btn" class:active={source === 'new_branch'} onclick={() => { source = 'new_branch'; }}>
+                    New branch
+                </button>
+                <button class="source-btn" class:active={source === 'existing_branch'} onclick={() => { source = 'existing_branch'; }}>
+                    Existing branch
+                </button>
+            {/if}
+            <button class="source-btn" class:active={source === 'folder'} onclick={() => { source = 'folder'; }}>
+                Local folder
+            </button>
+            <button class="source-btn" class:active={source === 'openflow'} onclick={() => { source = 'openflow'; }}>
+                OpenFlow
+            </button>
         </div>
 
-        {#if step === 'kind'}
-            <div class="card-grid kind-grid">
-                {#each kindOptions as option}
-                    <button class="option-card" type="button" onclick={() => chooseKind(option.kind)}>
-                        <strong>{option.title}</strong>
-                        <span>{option.summary}</span>
-                        <small>{option.detail}</small>
-                    </button>
-                {/each}
-            </div>
-        {:else if step === 'layout'}
-            <div class="card-grid layout-grid">
-                {#each layoutOptions as option}
-                    <button class="layout-card" type="button" onclick={() => chooseLayout(option.layout)}>
-                        <div class={`layout-preview layout-${option.layout}`} class:browser-mix={option.layout === 'shell_browser'}>
-                            {#each slotPreview(option.layout) as slot}
-                                <span class:browser={slot === 'browser'}></span>
-                            {/each}
-                        </div>
-                        <strong>{option.title}</strong>
-                        <span>{option.subtitle}</span>
-                    </button>
-                {/each}
-            </div>
-        {:else}
-            <div class="details-view">
-                <div class="selection-summary">
-                    <div>
-                        <p class="eyebrow">Workspace type</p>
-                        <strong>{kindOptions.find((option) => option.kind === selectedKind)?.title}</strong>
-                    </div>
-                    <div>
-                        <p class="eyebrow">Layout preset</p>
-                        <strong>{layoutOptions.find((option) => option.layout === selectedLayout)?.title}</strong>
-                    </div>
+        <div class="launcher-body">
+            <!-- Branch config -->
+            {#if source === 'new_branch'}
+                <div class="field-group">
+                    <label class="field-label">Branch name</label>
+                    <input
+                        class="field-input"
+                        type="text"
+                        placeholder="feature/my-feature"
+                        bind:value={newBranchName}
+                    />
                 </div>
-
-                {#if selectedKind === 'openflow'}
-                    <div class="field-stack">
-                        <label>
-                            <span>Run title</span>
-                            <input bind:value={openflowTitle} placeholder="Release polish" />
-                        </label>
-                        <label>
-                            <span>Run goal</span>
-                            <textarea bind:value={openflowGoal} rows="4" placeholder="Describe the mission for this workspace"></textarea>
-                        </label>
-                    </div>
-                {:else if selectedKind === 'folder'}
-                    <div class="field-stack">
-                        <label>
-                            <span>Folder</span>
-                            <div class="folder-row">
-                                <input bind:value={selectedFolder} placeholder="Choose a working directory" readonly />
-                                <button class="secondary-button" type="button" onclick={chooseFolder}>Browse</button>
-                            </div>
-                        </label>
-                    </div>
-                {:else}
-                    <div class="details-note">
-                        <strong>Shell-first by default</strong>
-                        <p>This creates plain shell slots. Provider assignment can be added later as an advanced setup layer.</p>
-                    </div>
-                    {#if $presetStore && $presetStore.presets.length > 0}
-                        <div class="field-stack">
-                            <label>
-                                <span>Start with preset <span class="optional-hint">(optional)</span></span>
-                                <select class="preset-select" bind:value={selectedPresetId}>
-                                    <option value="">None</option>
-                                    {#each $presetStore.presets.filter(p => p.pinned) as preset (preset.id)}
-                                        <option value={preset.id}>{preset.name}</option>
-                                    {/each}
-                                </select>
-                            </label>
-                        </div>
+                <div class="field-group">
+                    <label class="field-label">Base branch</label>
+                    <select class="field-select" bind:value={baseBranch}>
+                        {#each localBranches as branch}
+                            <option value={branch}>{branch}</option>
+                        {/each}
+                    </select>
+                </div>
+            {:else if source === 'existing_branch'}
+                <div class="field-group">
+                    <label class="field-label">Search branches</label>
+                    <input
+                        class="field-input"
+                        type="text"
+                        placeholder="Filter branches..."
+                        bind:value={branchSearch}
+                    />
+                </div>
+                <div class="branch-list">
+                    {#if filteredBranches.local.length > 0}
+                        <div class="branch-section-label">Local</div>
+                        {#each filteredBranches.local as branch}
+                            <button
+                                class="branch-row"
+                                class:selected={selectedBranch === branch}
+                                onclick={() => { selectedBranch = branch; }}
+                            >
+                                {branch}
+                            </button>
+                        {/each}
                     {/if}
-                {/if}
-
-                <div class="footer-actions">
-                    <button class="secondary-button" type="button" onclick={() => (step = 'layout')}>Back</button>
-                    <button class="primary-button" type="button" onclick={handleCreate} disabled={!canCreate() || creating}>
-                        {creating ? 'Creating...' : 'Create workspace'}
-                    </button>
+                    {#if filteredBranches.remote.length > 0}
+                        <div class="branch-section-label">Remote</div>
+                        {#each filteredBranches.remote as branch}
+                            <button
+                                class="branch-row"
+                                class:selected={selectedBranch === branch}
+                                onclick={() => { selectedBranch = branch; }}
+                            >
+                                {branch}
+                            </button>
+                        {/each}
+                    {/if}
+                    {#if filteredBranches.local.length === 0 && filteredBranches.remote.length === 0}
+                        <div class="branch-empty">No matching branches</div>
+                    {/if}
                 </div>
-            </div>
-        {/if}
+            {:else if source === 'folder'}
+                <div class="field-group">
+                    <label class="field-label">Folder</label>
+                    <div class="folder-row">
+                        <input class="field-input" type="text" bind:value={selectedFolder} placeholder="Choose a directory" readonly />
+                        <button class="secondary-btn" type="button" onclick={chooseFolder}>Browse</button>
+                    </div>
+                </div>
+            {:else if source === 'openflow'}
+                <div class="field-group">
+                    <label class="field-label">Run title</label>
+                    <input class="field-input" type="text" bind:value={openflowTitle} placeholder="Release polish" />
+                </div>
+                <div class="field-group">
+                    <label class="field-label">Run goal</label>
+                    <textarea class="field-textarea" bind:value={openflowGoal} rows="3" placeholder="Describe the mission..."></textarea>
+                </div>
+            {/if}
+
+            <!-- Layout strip -->
+            {#if source !== 'openflow'}
+                <div class="field-group">
+                    <label class="field-label">Layout</label>
+                    <div class="layout-strip">
+                        {#each layoutOptions as opt}
+                            <button
+                                class="layout-chip"
+                                class:active={selectedLayout === opt.layout}
+                                onclick={() => { selectedLayout = opt.layout; }}
+                            >
+                                {opt.label}
+                            </button>
+                        {/each}
+                    </div>
+                </div>
+            {/if}
+
+            <!-- Preset -->
+            {#if source !== 'openflow' && $presetStore && $presetStore.presets.length > 0}
+                <div class="field-group">
+                    <label class="field-label">Preset <span class="optional">(optional)</span></label>
+                    <select class="field-select" bind:value={selectedPresetId}>
+                        <option value="">None</option>
+                        {#each $presetStore.presets.filter(p => p.pinned) as preset (preset.id)}
+                            <option value={preset.id}>{preset.name}</option>
+                        {/each}
+                    </select>
+                </div>
+            {/if}
+        </div>
+
+        <footer class="launcher-footer">
+            <button class="secondary-btn" type="button" onclick={() => dispatch('close')}>Cancel</button>
+            <button class="primary-btn" type="button" onclick={handleCreate} disabled={!canCreate() || creating}>
+                {creating ? 'Creating...' : 'Create workspace'}
+            </button>
+        </footer>
     </div>
 </div>
 
@@ -333,284 +311,260 @@
     }
 
     .launcher-shell {
-        width: min(860px, 100%);
-        max-height: min(760px, calc(100dvh - 48px));
-        overflow: auto;
+        width: min(500px, 100%);
+        max-height: min(640px, calc(100dvh - 48px));
+        display: flex;
+        flex-direction: column;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-1);
         color: var(--ui-text-primary);
         box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+        overflow: hidden;
     }
 
     .launcher-header {
         display: flex;
+        align-items: center;
         justify-content: space-between;
-        gap: 20px;
-        padding: 18px 18px 14px;
+        padding: 14px 16px;
         border-bottom: 1px solid var(--ui-border-soft);
     }
 
-    .eyebrow {
-        margin: 0 0 4px;
-        font-size: 0.72rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--ui-accent);
-    }
-
-    .launcher-header h2,
-    .selection-summary strong,
-    .option-card strong,
-    .layout-card strong,
-    .details-note strong {
+    .launcher-header h2 {
         margin: 0;
-        font-size: 0.98rem;
+        font-size: 0.92rem;
         font-weight: 600;
     }
 
-    .subcopy,
-    .option-card span,
-    .option-card small,
-    .layout-card span,
-    .details-note p,
-    .selection-summary p {
-        margin: 0;
-        color: var(--ui-text-secondary);
-        line-height: 1.45;
-    }
-
-    .close-button,
-    .option-card,
-    .layout-card,
-    .primary-button,
-    .secondary-button,
-    input,
-    textarea {
-        font: inherit;
-    }
-
-    .close-button,
-    .primary-button,
-    .secondary-button {
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-md);
-        background: var(--ui-layer-2);
-        color: var(--ui-text-primary);
-        padding: 8px 10px;
-        cursor: pointer;
-    }
-
-    .close-button:hover,
-    .option-card:hover,
-    .layout-card:hover,
-    .primary-button:hover,
-    .secondary-button:hover {
-        border-color: var(--ui-border-strong);
-    }
-
-    .primary-button {
-        background: color-mix(in srgb, var(--ui-accent) 14%, var(--ui-layer-2) 86%);
-        border-color: color-mix(in srgb, var(--ui-accent) 24%, transparent);
-    }
-
-    .primary-button:disabled {
-        opacity: 0.55;
-        cursor: not-allowed;
-    }
-
-    .step-strip {
+    .close-btn {
         display: flex;
         align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-        padding: 14px 18px 0;
-    }
-
-    .step-chip,
-    .step-count {
-        font-size: 0.74rem;
-        color: var(--ui-text-secondary);
-        white-space: nowrap;
-    }
-
-    .step-chip {
-        color: var(--ui-accent);
-        font-weight: 600;
-        letter-spacing: 0.04em;
-        text-transform: uppercase;
-    }
-
-    .step-track {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 6px;
-        flex: 1;
-    }
-
-    .step-track span {
-        display: block;
-        height: 4px;
-        border-radius: 999px;
-        background: var(--ui-border-soft);
-    }
-
-    .step-track span.active {
-        background: var(--ui-accent);
-    }
-
-    .card-grid,
-    .details-view {
-        padding: 18px;
-    }
-
-    .kind-grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
-    }
-
-    .layout-grid {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 12px;
-    }
-
-    .option-card,
-    .layout-card {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 8px;
-        min-width: 0;
-        padding: 14px;
-        text-align: left;
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-lg);
-        background: var(--ui-layer-2);
-        color: inherit;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border: none;
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
         cursor: pointer;
     }
 
-    .option-card small {
-        color: var(--ui-text-muted);
-    }
-
-    .layout-preview {
-        display: grid;
-        gap: 4px;
-        width: 100%;
-        min-height: 54px;
-        align-content: start;
-    }
-
-    .layout-preview.layout-single {
-        grid-template-columns: 54px;
-    }
-
-    .layout-preview.layout-pair,
-    .layout-preview.layout-shell_browser {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .layout-preview.layout-quad {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-
-    .layout-preview.layout-six {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-    }
-
-    .layout-preview.layout-eight {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
-    }
-
-    .layout-preview span {
-        min-height: 22px;
-        border-radius: var(--ui-radius-sm);
-        border: 1px solid var(--ui-border-soft);
-        background: var(--ui-layer-0);
-    }
-
-    .layout-preview.browser-mix span.browser {
-        background: color-mix(in srgb, var(--ui-accent) 10%, var(--ui-layer-0) 90%);
-    }
-
-    .details-view {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-    }
-
-    .selection-summary {
-        display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 12px;
-    }
-
-    .selection-summary > div,
-    .details-note {
-        padding: 12px;
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-lg);
+    .close-btn:hover {
         background: var(--ui-layer-2);
+        color: var(--ui-text-secondary);
     }
 
-    .field-stack {
+    /* Source tabs */
+    .source-row {
+        display: flex;
+        gap: 4px;
+        padding: 8px 16px;
+        border-bottom: 1px solid var(--ui-border-soft);
+    }
+
+    .source-btn {
+        padding: 4px 10px;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
+        font-size: 0.78rem;
+        cursor: pointer;
+        transition: all 120ms ease-out;
+    }
+
+    .source-btn:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-secondary);
+    }
+
+    .source-btn.active {
+        background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+        color: var(--ui-accent);
+        border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+    }
+
+    /* Body */
+    .launcher-body {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px 16px;
         display: flex;
         flex-direction: column;
         gap: 12px;
+        min-height: 0;
     }
 
-    .field-stack label {
+    .field-group {
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 6px;
     }
 
-    .field-stack span {
-        color: var(--ui-text-secondary);
-        font-size: 0.8rem;
+    .field-label {
+        font-size: 0.75rem;
         font-weight: 600;
+        color: var(--ui-text-secondary);
     }
 
-    input,
-    textarea,
-    select {
-        width: 100%;
-        box-sizing: border-box;
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-md);
-        background: var(--ui-layer-0);
-        color: var(--ui-text-primary);
-        padding: 10px;
-    }
-
-    .optional-hint {
+    .optional {
         font-weight: 400;
         color: var(--ui-text-muted);
     }
 
-    .folder-row {
-        display: flex;
-        gap: 10px;
+    .field-input,
+    .field-textarea,
+    .field-select {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 8px 10px;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-0);
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.82rem;
+        outline: none;
+        transition: border-color 120ms ease-out;
     }
 
-    .folder-row input {
+    .field-input:focus,
+    .field-textarea:focus {
+        border-color: color-mix(in srgb, var(--ui-accent) 36%, transparent);
+    }
+
+    .field-input::placeholder,
+    .field-textarea::placeholder {
+        color: var(--ui-text-muted);
+    }
+
+    .field-select {
+        appearance: auto;
+    }
+
+    .folder-row {
+        display: flex;
+        gap: 8px;
+    }
+
+    .folder-row .field-input {
         flex: 1;
     }
 
-    .footer-actions {
-        display: flex;
-        justify-content: flex-end;
-        gap: 10px;
+    /* Branch list */
+    .branch-list {
+        max-height: 200px;
+        overflow-y: auto;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-0);
     }
 
-    @media (max-width: 820px) {
-        .kind-grid,
-        .layout-grid,
-        .selection-summary {
-            grid-template-columns: 1fr;
-        }
+    .branch-section-label {
+        padding: 6px 10px 2px;
+        font-size: 0.68rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ui-text-muted);
+        user-select: none;
+    }
+
+    .branch-row {
+        display: block;
+        width: 100%;
+        padding: 6px 10px;
+        border: none;
+        background: transparent;
+        color: var(--ui-text-primary);
+        font-family: var(--ui-font-mono);
+        font-size: 0.78rem;
+        text-align: left;
+        cursor: pointer;
+        transition: background 120ms ease-out;
+    }
+
+    .branch-row:hover {
+        background: color-mix(in srgb, var(--ui-layer-2) 50%, transparent);
+    }
+
+    .branch-row.selected {
+        background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+        color: var(--ui-accent);
+    }
+
+    .branch-empty {
+        padding: 16px;
+        text-align: center;
+        color: var(--ui-text-muted);
+        font-size: 0.78rem;
+    }
+
+    /* Layout strip */
+    .layout-strip {
+        display: flex;
+        gap: 4px;
+    }
+
+    .layout-chip {
+        padding: 4px 10px;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
+        font-family: var(--ui-font-mono);
+        font-size: 0.75rem;
+        cursor: pointer;
+        transition: all 120ms ease-out;
+    }
+
+    .layout-chip:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-secondary);
+    }
+
+    .layout-chip.active {
+        background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+        color: var(--ui-accent);
+        border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+    }
+
+    /* Footer */
+    .launcher-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 12px 16px;
+        border-top: 1px solid var(--ui-border-soft);
+    }
+
+    .secondary-btn,
+    .primary-btn {
+        padding: 6px 14px;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-2);
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.8rem;
+        cursor: pointer;
+        transition: all 120ms ease-out;
+    }
+
+    .secondary-btn:hover,
+    .primary-btn:hover {
+        border-color: var(--ui-border-strong);
+    }
+
+    .primary-btn {
+        background: color-mix(in srgb, var(--ui-accent) 14%, var(--ui-layer-2) 86%);
+        border-color: color-mix(in srgb, var(--ui-accent) 24%, transparent);
+    }
+
+    .primary-btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
     }
 </style>

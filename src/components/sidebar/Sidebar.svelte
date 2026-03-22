@@ -4,6 +4,7 @@
     import {
         activateWorkspace,
         closeWorkspace,
+        closeWorkspaceWithWorktree,
         markWorkspaceNotificationsRead,
         renameWorkspace,
         createTerminalSession,
@@ -38,6 +39,8 @@
             void openInEditor(editors[0].id, cwd);
         }
     }
+
+    let confirmingDelete = $state<{ workspaceId: string; worktreePath: string } | null>(null);
 
     let renamingWorkspaceId = $state<string | null>(null);
     let renameDraft = $state('');
@@ -92,11 +95,27 @@
     }
 
     async function handleCloseWorkspace(workspaceId: string) {
+        // Check if workspace has a worktree
+        const ws = $appState?.workspaces.find(w => w.workspace_id === workspaceId);
+        if (ws?.worktree_path) {
+            confirmingDelete = { workspaceId, worktreePath: ws.worktree_path };
+            return;
+        }
         try {
             await closeWorkspace(workspaceId);
         } catch (error) {
             console.error('Failed to close workspace:', error);
         }
+    }
+
+    async function handleConfirmDelete(removeWorktree: boolean) {
+        if (!confirmingDelete) return;
+        try {
+            await closeWorkspaceWithWorktree(confirmingDelete.workspaceId, removeWorktree);
+        } catch (error) {
+            console.error('Failed to close workspace:', error);
+        }
+        confirmingDelete = null;
     }
 
     async function handleMarkRead(workspaceId: string) {
@@ -161,6 +180,21 @@
             initialLayout={launcherLayout}
             on:close={() => (showingLauncher = false)}
         />
+    {/if}
+
+    {#if confirmingDelete}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="confirm-backdrop" onclick={() => { confirmingDelete = null; }} onkeydown={() => {}}>
+            <div class="confirm-dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+                <p class="confirm-title">Delete worktree?</p>
+                <p class="confirm-text">This workspace uses a git worktree. Delete the worktree and branch too?</p>
+                <div class="confirm-actions">
+                    <button class="confirm-btn" onclick={() => { confirmingDelete = null; }}>Cancel</button>
+                    <button class="confirm-btn" onclick={() => handleConfirmDelete(false)}>Keep worktree</button>
+                    <button class="confirm-btn confirm-danger" onclick={() => handleConfirmDelete(true)}>Delete worktree</button>
+                </div>
+            </div>
+        </div>
     {/if}
 
     <!-- Brand + active workspace header -->
@@ -636,5 +670,71 @@
     .footer-debug-btn:hover {
         background: var(--ui-layer-2);
         color: var(--ui-text-secondary);
+    }
+
+    /* Worktree delete confirmation */
+    .confirm-backdrop {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.4);
+        z-index: 200;
+    }
+
+    .confirm-dialog {
+        max-width: 360px;
+        padding: 16px;
+        background: var(--ui-layer-2);
+        border: 1px solid var(--ui-border-strong);
+        border-radius: var(--ui-radius-md);
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+    }
+
+    .confirm-title {
+        margin: 0 0 8px;
+        font-size: 0.88rem;
+        font-weight: 600;
+        color: var(--ui-text-primary);
+    }
+
+    .confirm-text {
+        margin: 0 0 12px;
+        font-size: 0.8rem;
+        color: var(--ui-text-secondary);
+        line-height: 1.4;
+    }
+
+    .confirm-actions {
+        display: flex;
+        gap: 6px;
+        justify-content: flex-end;
+    }
+
+    .confirm-btn {
+        padding: 5px 12px;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-3);
+        color: var(--ui-text-primary);
+        font: inherit;
+        font-size: 0.78rem;
+        cursor: pointer;
+        transition: all 120ms ease-out;
+    }
+
+    .confirm-btn:hover {
+        border-color: var(--ui-border-strong);
+    }
+
+    .confirm-danger {
+        background: color-mix(in srgb, var(--ui-danger) 14%, var(--ui-layer-3) 86%);
+        border-color: color-mix(in srgb, var(--ui-danger) 24%, transparent);
+        color: var(--ui-danger);
+    }
+
+    .confirm-danger:hover {
+        background: color-mix(in srgb, var(--ui-danger) 20%, var(--ui-layer-3) 80%);
     }
 </style>

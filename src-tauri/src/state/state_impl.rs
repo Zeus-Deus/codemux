@@ -251,6 +251,8 @@ pub struct WorkspaceSnapshot {
     pub notification_count: u32,
     pub latest_agent_state: Option<String>,
     #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab_id: String,
@@ -436,6 +438,7 @@ impl AppStateStore {
             git_additions: 0,
             git_deletions: 0,
             git_changed_files: 0,
+            worktree_path: None,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -596,6 +599,7 @@ impl AppStateStore {
             git_additions: 0,
             git_deletions: 0,
             git_changed_files: 0,
+            worktree_path: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -710,6 +714,23 @@ impl AppStateStore {
             workspace.git_additions = additions;
             workspace.git_deletions = deletions;
             workspace.git_changed_files = changed_files;
+        }
+    }
+
+    pub fn set_workspace_worktree(
+        &self,
+        workspace_id: &str,
+        worktree_path: String,
+        title: String,
+    ) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.worktree_path = Some(worktree_path);
+            workspace.title = title;
         }
     }
 
@@ -1843,6 +1864,7 @@ fn default_app_state() -> AppStateSnapshot {
             git_additions: 0,
             git_deletions: 0,
             git_changed_files: 0,
+            worktree_path: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {

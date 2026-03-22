@@ -193,6 +193,12 @@ export interface EditorInfo {
     command: string;
 }
 
+export interface WorktreeInfo {
+    path: string;
+    branch: string | null;
+    is_bare: boolean;
+}
+
 export type TabKind = 'terminal' | 'browser' | 'diff';
 
 export interface TabSnapshot {
@@ -246,6 +252,7 @@ export interface WorkspaceSnapshot {
     git_changed_files: number;
     notification_count: number;
     latest_agent_state: string | null;
+    worktree_path: string | null;
     tabs: TabSnapshot[];
     active_tab_id: string;
     active_surface_id: string;

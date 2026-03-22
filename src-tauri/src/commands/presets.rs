@@ -212,6 +212,7 @@ pub fn apply_preset(
         Some("new_tab") => "new_tab",
         Some("split_pane") => "split_pane",
         Some("current_terminal") => "current_terminal",
+        Some("existing_panes") => "existing_panes",
         _ => match preset.launch_mode {
             LaunchMode::NewTab => "new_tab",
             LaunchMode::SplitPane => "split_pane",
@@ -271,6 +272,31 @@ pub fn apply_preset(
                     let sessions = sessions_arc.clone();
                     let sid = session_id.0.clone();
                     let cmd = command.clone();
+                    write_command_when_ready(sessions, sid, cmd);
+                }
+            }
+        }
+        "existing_panes" => {
+            // Write commands to all existing terminal sessions without creating new panes
+            let snapshot = state.snapshot();
+            let ws = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+                .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+            let session_ids = crate::state::collect_terminal_sessions(&ws.surfaces);
+
+            let combined = commands
+                .iter()
+                .filter(|c| !c.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" && ");
+
+            if !combined.is_empty() {
+                for sid in session_ids {
+                    let sessions = sessions_arc.clone();
+                    let cmd = combined.clone();
                     write_command_when_ready(sessions, sid, cmd);
                 }
             }

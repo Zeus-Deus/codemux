@@ -78,7 +78,7 @@ export async function setPresetPinned(id: string, pinned: boolean) {
 export async function applyPreset(
     workspaceId: string,
     presetId: string,
-    overrideMode?: 'new_tab' | 'split_pane' | 'current_terminal',
+    overrideMode?: 'new_tab' | 'split_pane' | 'current_terminal' | 'existing_panes',
 ) {
     await invoke('apply_preset', {
         workspaceId,

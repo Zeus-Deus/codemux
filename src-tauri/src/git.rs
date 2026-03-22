@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,7 +52,7 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
         ));
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
 }
 
 /// Run git and return stdout even on non-zero exit (for commands where failure is expected).
@@ -63,7 +63,7 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
         .unwrap_or_default()
 }
 
@@ -202,6 +202,155 @@ fn parse_numstat(output: &str) -> (u32, u32) {
     (total_add, total_del)
 }
 
+// ---- Worktree operations ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: Option<String>,
+    pub is_bare: bool,
+}
+
+pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, String> {
+    let output = if remote {
+        run_git(repo_path, &["branch", "-r", "--format=%(refname:short)"])?
+    } else {
+        run_git(repo_path, &["branch", "--format=%(refname:short)"])?
+    };
+    let branches: Vec<String> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.contains("HEAD"))
+        .map(|l| {
+            if remote {
+                l.strip_prefix("origin/").unwrap_or(l).to_string()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    Ok(branches)
+}
+
+pub fn git_create_worktree(
+    repo_path: &Path,
+    branch: &str,
+    new_branch: bool,
+    base: Option<&str>,
+) -> Result<String, String> {
+    let repo_name = repo_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "repo".to_string());
+    let sanitized_branch = branch.replace('/', "-");
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let worktree_path = PathBuf::from(&home)
+        .join(".codemux")
+        .join("worktrees")
+        .join(&repo_name)
+        .join(&sanitized_branch);
+
+    // Ensure parent directory exists
+    if let Some(parent) = worktree_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create worktree directory: {e}"))?;
+    }
+
+    let path_str = worktree_path.to_string_lossy().to_string();
+
+    if new_branch {
+        let mut args = vec!["worktree", "add", "-b", branch, &path_str];
+        if let Some(b) = base {
+            args.push(b);
+        }
+        run_git(repo_path, &args)?;
+    } else {
+        run_git(repo_path, &["worktree", "add", &path_str, branch])?;
+    }
+
+    Ok(path_str)
+}
+
+pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>) -> Result<(), String> {
+    // Find the main repo by reading .git file in worktree
+    let git_file = worktree_path.join(".git");
+    let repo_path = if git_file.is_file() {
+        let content = std::fs::read_to_string(&git_file)
+            .map_err(|e| format!("Failed to read .git file: {e}"))?;
+        // Content is "gitdir: /path/to/main/.git/worktrees/<name>"
+        let gitdir = content
+            .strip_prefix("gitdir: ")
+            .unwrap_or(&content)
+            .trim();
+        // Go up from .git/worktrees/<name> to the repo root
+        PathBuf::from(gitdir)
+            .parent() // worktrees/
+            .and_then(|p| p.parent()) // .git/
+            .and_then(|p| p.parent()) // repo root
+            .unwrap_or(worktree_path)
+            .to_path_buf()
+    } else {
+        worktree_path.to_path_buf()
+    };
+
+    run_git(
+        &repo_path,
+        &["worktree", "remove", &worktree_path.to_string_lossy(), "--force"],
+    )?;
+
+    // Delete the branch if requested (skip main/master and the repo's current branch)
+    if let Some(branch_name) = branch {
+        let protected = ["main", "master"];
+        if !protected.contains(&branch_name) {
+            let current = run_git_permissive(&repo_path, &["branch", "--show-current"]);
+            if current != branch_name {
+                // Best-effort: don't fail the whole operation if branch deletion fails
+                let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn git_list_worktrees(repo_path: &Path) -> Result<Vec<WorktreeInfo>, String> {
+    let output = run_git(repo_path, &["worktree", "list", "--porcelain"])?;
+    let mut worktrees = Vec::new();
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    let mut is_bare = false;
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            // Save previous entry
+            if let Some(p) = current_path.take() {
+                worktrees.push(WorktreeInfo {
+                    path: p,
+                    branch: current_branch.take(),
+                    is_bare,
+                });
+            }
+            current_path = Some(path.to_string());
+            current_branch = None;
+            is_bare = false;
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = Some(branch.to_string());
+        } else if line == "bare" {
+            is_bare = true;
+        }
+    }
+    // Save last entry
+    if let Some(p) = current_path {
+        worktrees.push(WorktreeInfo {
+            path: p,
+            branch: current_branch,
+            is_bare,
+        });
+    }
+
+    Ok(worktrees)
+}
+
 fn parse_ahead_behind(output: &str) -> (u32, u32) {
     let parts: Vec<&str> = output.split_whitespace().collect();
     if parts.len() == 2 {
@@ -334,6 +483,161 @@ C  source.txt -> copy.txt";
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "path with spaces/file name.txt");
         assert_eq!(results[1].path, "another file.txt");
+    }
+
+    // ---- Integration tests (real git repos) ----
+
+    use tempfile::TempDir;
+
+    fn setup_test_repo() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().to_path_buf();
+        run_git(&path, &["init"]).expect("git init");
+        run_git(&path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("initial commit");
+        (dir, path)
+    }
+
+    #[test]
+    fn test_create_and_remove_worktree() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "feature-test", true, None).expect("create worktree");
+        assert!(PathBuf::from(&wt_path).exists(), "worktree dir should exist");
+
+        let branches = git_list_branches(&repo, false).expect("list branches");
+        assert!(branches.contains(&"feature-test".to_string()), "branch should exist");
+
+        git_remove_worktree(Path::new(&wt_path), Some("feature-test")).expect("remove worktree");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+
+        let branches_after = git_list_branches(&repo, false).expect("list branches after");
+        assert!(!branches_after.contains(&"feature-test".to_string()), "branch should be deleted");
+    }
+
+    #[test]
+    fn test_create_worktree_existing_branch() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["branch", "existing-branch"]).expect("create branch");
+
+        let wt_path = git_create_worktree(&repo, "existing-branch", false, None).expect("create worktree");
+        assert!(PathBuf::from(&wt_path).exists());
+
+        let info = git_branch_info(Path::new(&wt_path)).expect("branch info");
+        assert_eq!(info.branch.as_deref(), Some("existing-branch"));
+
+        git_remove_worktree(Path::new(&wt_path), Some("existing-branch")).expect("cleanup");
+    }
+
+    #[test]
+    fn test_create_worktree_with_base_branch() {
+        let (_dir, repo) = setup_test_repo();
+        // Create develop branch with an extra commit
+        run_git(&repo, &["checkout", "-b", "develop"]).expect("create develop");
+        std::fs::write(repo.join("dev.txt"), "dev content").expect("write file");
+        run_git(&repo, &["add", "dev.txt"]).expect("stage");
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "dev commit"]).expect("commit");
+        let _ = run_git(&repo, &["checkout", "master"])
+            .or_else(|_| run_git(&repo, &["checkout", "main"]));
+
+        // Create worktree based on develop
+        let wt_path = git_create_worktree(&repo, "feature-from-dev", true, Some("develop")).expect("create worktree");
+        // The worktree should have dev.txt (inherited from develop)
+        assert!(PathBuf::from(&wt_path).join("dev.txt").exists(), "should have develop's file");
+
+        git_remove_worktree(Path::new(&wt_path), Some("feature-from-dev")).expect("cleanup");
+    }
+
+    #[test]
+    fn test_list_worktrees() {
+        let (_dir, repo) = setup_test_repo();
+        let wt1 = git_create_worktree(&repo, "wt-one", true, None).expect("create wt1");
+        let wt2 = git_create_worktree(&repo, "wt-two", true, None).expect("create wt2");
+
+        let worktrees = git_list_worktrees(&repo).expect("list worktrees");
+        assert!(worktrees.len() >= 3, "should have main + 2 worktrees, got {}", worktrees.len());
+
+        let branches: Vec<Option<&str>> = worktrees.iter().map(|w| w.branch.as_deref()).collect();
+        assert!(branches.iter().any(|b| *b == Some("wt-one")), "should include wt-one");
+        assert!(branches.iter().any(|b| *b == Some("wt-two")), "should include wt-two");
+
+        git_remove_worktree(Path::new(&wt1), Some("wt-one")).expect("cleanup wt1");
+        git_remove_worktree(Path::new(&wt2), Some("wt-two")).expect("cleanup wt2");
+    }
+
+    #[test]
+    fn test_list_branches_local() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["branch", "alpha"]).expect("create alpha");
+        run_git(&repo, &["branch", "beta"]).expect("create beta");
+
+        let branches = git_list_branches(&repo, false).expect("list local");
+        assert!(branches.contains(&"alpha".to_string()));
+        assert!(branches.contains(&"beta".to_string()));
+    }
+
+    #[test]
+    fn test_git_status_staged_vs_unstaged() {
+        let (_dir, repo) = setup_test_repo();
+        // Create a tracked file first
+        std::fs::write(repo.join("file.txt"), "original").expect("write");
+        run_git(&repo, &["add", "file.txt"]).expect("add");
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "add file"]).expect("commit");
+
+        // Modify (unstaged)
+        std::fs::write(repo.join("file.txt"), "modified").expect("modify");
+        let status = git_status(&repo).expect("status");
+        let f = status.iter().find(|s| s.path == "file.txt").expect("file in status");
+        assert!(!f.is_staged, "should not be staged");
+        assert!(f.is_unstaged, "should be unstaged");
+
+        // Stage it
+        git_stage(&repo, &["file.txt".to_string()]).expect("stage");
+        let status = git_status(&repo).expect("status");
+        let f = status.iter().find(|s| s.path == "file.txt").expect("file in status");
+        assert!(f.is_staged, "should be staged");
+        assert!(!f.is_unstaged, "should not be unstaged");
+
+        // Modify again (both staged and unstaged)
+        std::fs::write(repo.join("file.txt"), "modified again").expect("modify again");
+        let status = git_status(&repo).expect("status");
+        let f = status.iter().find(|s| s.path == "file.txt").expect("file in status");
+        assert!(f.is_staged, "should be staged");
+        assert!(f.is_unstaged, "should also be unstaged");
+    }
+
+    #[test]
+    fn test_git_stage_unstage_commit() {
+        let (_dir, repo) = setup_test_repo();
+        std::fs::write(repo.join("new.txt"), "content").expect("write");
+        git_stage(&repo, &["new.txt".to_string()]).expect("stage");
+
+        let status = git_status(&repo).expect("status");
+        assert!(status.iter().any(|s| s.path == "new.txt" && s.is_staged));
+
+        git_commit(&repo, "add new file").expect("commit");
+        let status = git_status(&repo).expect("status after commit");
+        assert!(status.is_empty(), "should be clean after commit");
+
+        // Verify commit exists in log
+        let log = run_git(&repo, &["log", "--oneline", "-1"]).expect("log");
+        assert!(log.contains("add new file"));
+    }
+
+    #[test]
+    fn test_remove_worktree_preserves_main() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "temp-branch", true, None).expect("create worktree");
+        git_remove_worktree(Path::new(&wt_path), Some("main")).expect("remove with main as branch arg");
+
+        // main should still exist (it was the branch arg but is protected)
+        let branches = git_list_branches(&repo, false).expect("list branches");
+        // The default branch (main or master) should still be there
+        assert!(
+            branches.iter().any(|b| b == "main" || b == "master"),
+            "main/master should not be deleted"
+        );
+        // But temp-branch was not requested for deletion, and the worktree is gone
+        // The branch temp-branch still exists because we passed "main" as the branch to delete
+        assert!(branches.contains(&"temp-branch".to_string()), "temp-branch should remain since we tried to delete 'main' not 'temp-branch'");
     }
 
     #[test]

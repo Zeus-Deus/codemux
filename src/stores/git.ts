@@ -32,3 +32,7 @@ export async function pushChanges(path: string): Promise<void> {
 export async function getGitBranchInfo(path: string): Promise<GitBranchInfo> {
     return invoke<GitBranchInfo>('get_git_branch_info', { path });
 }
+
+export async function listBranches(path: string, remote: boolean): Promise<string[]> {
+    return invoke<string[]>('list_branches', { path, remote });
+}

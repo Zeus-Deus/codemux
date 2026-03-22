@@ -161,3 +161,26 @@ export async function detectEditors() {
 export async function openInEditor(editorId: string, path: string) {
     return invoke<void>('open_in_editor', { editorId, path });
 }
+
+export async function createWorktreeWorkspace(
+    repoPath: string,
+    branch: string,
+    newBranch: boolean,
+    layout: string,
+    base?: string | null,
+) {
+    const workspaceId = await invoke<string>('create_worktree_workspace', {
+        repoPath,
+        branch,
+        newBranch,
+        base: base ?? null,
+        layout,
+    });
+    await activateWorkspace(workspaceId);
+    await syncAppState();
+    return workspaceId;
+}
+
+export async function closeWorkspaceWithWorktree(workspaceId: string, removeWorktree: boolean) {
+    return invoke<void>('close_workspace_with_worktree', { workspaceId, removeWorktree });
+}

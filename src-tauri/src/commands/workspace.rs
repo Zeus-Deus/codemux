@@ -167,6 +167,85 @@ pub fn create_workspace_with_preset(
 }
 
 #[tauri::command]
+pub fn create_worktree_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    repo_path: String,
+    branch: String,
+    new_branch: bool,
+    base: Option<String>,
+    layout: String,
+) -> Result<String, String> {
+    let layout = match layout.as_str() {
+        "single" => WorkspacePresetLayout::Single,
+        "pair" => WorkspacePresetLayout::Pair,
+        "quad" => WorkspacePresetLayout::Quad,
+        "six" => WorkspacePresetLayout::Six,
+        "eight" => WorkspacePresetLayout::Eight,
+        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
+        _ => return Err(format!("Unsupported layout: {layout}")),
+    };
+
+    let worktree_path =
+        crate::git::git_create_worktree(Path::new(&repo_path), &branch, new_branch, base.as_deref())?;
+    let wt_path_buf = PathBuf::from(&worktree_path);
+    let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
+
+    state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch.clone());
+
+    populate_git_info(&state, &workspace_id.0, &wt_path_buf);
+
+    let snapshot = state.snapshot();
+    let session_ids = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id.0)
+        .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
+        .unwrap_or_default();
+
+    for session_id in session_ids {
+        terminal::spawn_pty_for_session(app.clone(), session_id);
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+#[tauri::command]
+pub fn close_workspace_with_worktree(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    remove_worktree: bool,
+) -> Result<(), String> {
+    // Get worktree path and branch before closing
+    let (worktree_path, branch) = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id);
+        (
+            ws.and_then(|w| w.worktree_path.clone()),
+            ws.and_then(|w| w.git_branch.clone()),
+        )
+    };
+
+    state
+        .close_workspace(&workspace_id)
+        .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    if remove_worktree {
+        if let Some(wt_path) = worktree_path {
+            crate::git::git_remove_worktree(Path::new(&wt_path), branch.as_deref())?;
+        }
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn activate_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
