@@ -44,8 +44,12 @@
 
 ## Immediate Priority Order
 
-1. Validate Linux daily-driver workflows end to end.
-2. Harden browser pane interaction, lifecycle, and manual verification.
-3. Harden OpenFlow reliability, intervention handling, browser integration, and scaling.
-4. Finish release-readiness work such as docs, packaging plan, performance budgets, safety, and polish.
-5. Revisit broader cross-platform work only after the Linux MVP feels real.
+1. Harden OpenFlow reliability and intervention flow
+2. Add tasks system (Linear/GitHub issue integration)
+3. Add MCP server for agent self-orchestration
+4. Add settings panel (editor preference, fonts, keybinds, terminal options)
+5. Improve browser pane fidelity (wait conditions, DOM inspection, DevTools)
+6. Add notification sounds
+7. Add custom keybind editor
+8. Linux release packaging and polish
+9. Cross-platform preparation (macOS, Windows)

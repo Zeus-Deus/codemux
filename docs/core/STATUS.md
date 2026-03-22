@@ -2,51 +2,58 @@
 
 - Purpose: Canonical reality snapshot for the repo.
 - Audience: Anyone deciding what is actually true today.
-- Authority: Current implementation truth and near-term validation priorities.
+- Authority: Current implementation truth.
 - Update when: Behavior, constraints, or known gaps change.
 - Read next: `docs/core/PLAN.md`, `docs/core/TESTING.md`
 
 ## Current Headline
 
-Codemux is not ship-ready yet. The workspace shell and local automation foundation are real enough to keep using, but browser polish, OpenFlow reliability, and Linux release validation are still in progress.
+Codemux is approaching Linux MVP. The workspace shell, terminal management, git integration, and ADE features are real and daily-drivable. OpenFlow and browser pane are still being hardened.
 
-The repo structure is now cleaner than the earlier prototype shape suggested:
+The repo structure is clean and domain-split:
 
 - `src/` is the Svelte UI and IPC layer
 - `src-tauri/` is the Rust app/runtime layer
-- frontend stores and Rust commands are split by domain instead of one large integration file
+- Frontend stores and Rust commands are split by domain
 
-## Solid Enough To Treat As Real Surface
+## Solid — Daily-Drivable Features
 
-- workspace shell and sidebar
-- multi-session terminals
-- pane splits, resizing, close, swap, and restore
-- notifications and attention badges
-- local project memory and lexical indexing
-- local CLI and socket control basics
-- setup/teardown scripts on workspace create/delete (`.codemux/config.json`)
+- Workspace shell, sidebar, workspace sections with color coding and drag-drop
+- Multi-session terminals with xterm.js, WebGL rendering, kitty protocol
+- Tab bar with terminal/browser tab types
+- Pane splits, resize, drag-swap, close
+- Git worktree-based workspaces (create from new/existing branch, import orphans)
+- Built-in diff viewer / Changes panel (right sidebar, stage/unstage/commit/push)
+- File tree panel (right sidebar, lazy-loaded, opens in external editor)
+- Search: keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+P via fd)
+- Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge)
+- Port detection (auto-scan, sidebar display, open in browser)
+- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini)
+- IDE integration (detect editors, open workspace, Ctrl+Shift+E)
+- Command palette (Ctrl+K, fuzzy search across all actions)
+- PR integration (create, view, checks, merge via gh CLI, auth status check)
+- Setup/teardown scripts (.codemux/config.json)
+- Workspace creation from branch with layout + preset selection
+- Notifications with D-Bus, Hyprland focus, attention badges
+- Local project memory and lexical indexing
+- CLI and socket control
+- Global overlay manager (single overlay at a time)
+- Neutral dark shell theming with Omarchy accent sync
+- Sans-serif shell chrome, monospace terminals
 
-## Partial Or Prototype-Level
+## Partial / Being Hardened
 
-- browser pane: screenshot-driven Chromium via `agent-browser`, shared with CLI commands, not a native embedded Tauri webview
-- browser automation: usable through explicit CLI commands, but fidelity and manual validation still need work
-- OpenFlow: real agent PTYs, shared communication logs, per-run app URLs, and orchestration UI exist; follow-up user messages, persistent agent wrappers, non-destructive pause behavior, explicit stalled/blocked orchestration states, and slower planning-phase rescue thresholds are better than before, but large-run reliability and a cleaner suspended-state model still need hardening
-- browser console log capture is not yet a complete live stream from the displayed pane
-- notification sound toggle exists, but actual sound playback is not implemented
+- Browser pane: screenshot-driven, functional but lower fidelity than native
+- OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
+- Session persistence: layout persists, scrollback lost on restart
+- Browser automation depth: basic commands work, missing wait conditions and DOM inspection
 
 ## Known Constraints
 
-- notification click-to-focus on Wayland and mako still needs deeper D-Bus or native handling
-- control socket is local-user only and currently unauthenticated
-- the current browser pane is a working prototype, not final Linux MVP proof
-- the legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
-
-## Current Validation Priorities
-
-- core Linux daily-driver workflows end to end
-- browser toolbar, input, and manual interaction passes
-- CLI and socket, memory, and index flows
-- OpenFlow run creation, visibility, control actions, and 15-20 agent reliability
+- Notification click-to-focus on Wayland and mako still needs deeper D-Bus or native handling
+- Control socket is local-user only and currently unauthenticated
+- Notification sound toggle exists in state, but actual audio playback is not implemented
+- The legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
 
 ## Read This With
 
