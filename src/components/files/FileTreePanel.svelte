@@ -211,15 +211,6 @@
         padding: 4px 0;
     }
 
-    .tree-content::-webkit-scrollbar {
-        width: 4px;
-    }
-
-    .tree-content::-webkit-scrollbar-thumb {
-        background: var(--ui-border-soft);
-        border-radius: 2px;
-    }
-
     .tree-row {
         display: flex;
         align-items: center;

@@ -7,6 +7,7 @@
     import { presetStore, applyPreset } from '../../stores/presets';
     import { listBranches, getGitBranchInfo, listWorktrees } from '../../stores/git';
     import { showUiNotice } from '../../stores/uiNotice';
+    import CustomSelect from '../ui/CustomSelect.svelte';
     import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
 
     let {
@@ -263,11 +264,10 @@
                     </div>
                     <div class="field-group">
                         <label class="field-label">Base branch</label>
-                        <select class="field-select" bind:value={baseBranch}>
-                            {#each localBranches as branch}
-                                <option value={branch}>{branch}</option>
-                            {/each}
-                        </select>
+                        <CustomSelect
+                            options={localBranches.map(b => ({ value: b, label: b }))}
+                            bind:value={baseBranch}
+                        />
                     </div>
                 {:else if !repoError}
                     <div class="repo-placeholder">Select a repository to configure branches</div>
@@ -366,12 +366,13 @@
             {#if source !== 'openflow' && $presetStore && $presetStore.presets.length > 0}
                 <div class="field-group">
                     <label class="field-label">Preset <span class="optional">(optional)</span></label>
-                    <select class="field-select" bind:value={selectedPresetId}>
-                        <option value="">None</option>
-                        {#each $presetStore.presets.filter(p => p.pinned) as preset (preset.id)}
-                            <option value={preset.id}>{preset.name}</option>
-                        {/each}
-                    </select>
+                    <CustomSelect
+                        options={[
+                            { value: '', label: 'None' },
+                            ...$presetStore.presets.filter(p => p.pinned).map(p => ({ value: p.id, label: p.name })),
+                        ]}
+                        bind:value={selectedPresetId}
+                    />
                 </div>
             {/if}
         </div>
@@ -398,7 +399,7 @@
     }
 
     .launcher-shell {
-        width: min(500px, 100%);
+        width: min(540px, 100%);
         max-height: min(640px, calc(100dvh - 48px));
         display: flex;
         flex-direction: column;
@@ -406,7 +407,7 @@
         border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-1);
         color: var(--ui-text-primary);
-        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+        box-shadow: var(--ui-shadow-lg);
         overflow: hidden;
     }
 
@@ -414,13 +415,13 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 14px 16px;
+        padding: 18px 24px;
         border-bottom: 1px solid var(--ui-border-soft);
     }
 
     .launcher-header h2 {
         margin: 0;
-        font-size: 0.92rem;
+        font-size: 1rem;
         font-weight: 600;
     }
 
@@ -447,17 +448,17 @@
     .source-row {
         display: flex;
         gap: 4px;
-        padding: 8px 16px;
+        padding: 10px 24px;
         border-bottom: 1px solid var(--ui-border-soft);
     }
 
     .source-btn {
-        padding: 4px 10px;
+        padding: 6px 12px;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
-        font-size: 0.78rem;
+        font-size: 0.8rem;
         cursor: pointer;
         transition: all 120ms ease-out;
     }
@@ -477,10 +478,10 @@
     .launcher-body {
         flex: 1;
         overflow-y: auto;
-        padding: 12px 16px;
+        padding: 16px 24px;
         display: flex;
         flex-direction: column;
-        gap: 12px;
+        gap: 16px;
         min-height: 0;
     }
 
@@ -491,7 +492,7 @@
     }
 
     .field-label {
-        font-size: 0.75rem;
+        font-size: 0.78rem;
         font-weight: 600;
         color: var(--ui-text-secondary);
     }
@@ -502,33 +503,31 @@
     }
 
     .field-input,
-    .field-textarea,
-    .field-select {
+    .field-textarea {
         width: 100%;
         box-sizing: border-box;
-        padding: 8px 10px;
+        min-height: 36px;
+        padding: 8px 12px;
         border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-sm);
+        border-radius: var(--ui-radius-md);
         background: var(--ui-layer-0);
         color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.82rem;
+        font-size: 0.85rem;
         outline: none;
-        transition: border-color 120ms ease-out;
+        box-shadow: var(--ui-shadow-xs);
+        transition: border-color 120ms ease-out, box-shadow 120ms ease-out;
     }
 
     .field-input:focus,
     .field-textarea:focus {
-        border-color: color-mix(in srgb, var(--ui-accent) 36%, transparent);
+        border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .field-input::placeholder,
     .field-textarea::placeholder {
         color: var(--ui-text-muted);
-    }
-
-    .field-select {
-        appearance: auto;
     }
 
     .folder-row {
@@ -551,7 +550,7 @@
 
     .branch-section-label {
         padding: 6px 10px 2px;
-        font-size: 0.68rem;
+        font-size: 0.72rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
@@ -605,7 +604,7 @@
     }
 
     .layout-chip {
-        padding: 4px 10px;
+        padding: 6px 12px;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
         background: transparent;
@@ -632,26 +631,34 @@
         display: flex;
         justify-content: flex-end;
         gap: 8px;
-        padding: 12px 16px;
+        padding: 16px 24px;
         border-top: 1px solid var(--ui-border-soft);
     }
 
     .secondary-btn,
     .primary-btn {
-        padding: 6px 14px;
+        padding: 8px 16px;
+        min-height: 36px;
         border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-sm);
+        border-radius: var(--ui-radius-md);
         background: var(--ui-layer-2);
         color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.8rem;
+        font-size: 0.82rem;
         cursor: pointer;
+        box-shadow: var(--ui-shadow-xs);
         transition: all 120ms ease-out;
     }
 
     .secondary-btn:hover,
     .primary-btn:hover {
         border-color: var(--ui-border-strong);
+    }
+
+    .secondary-btn:focus-visible,
+    .primary-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .primary-btn {

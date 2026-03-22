@@ -173,7 +173,7 @@
     }
 
     .section-name {
-        font-size: 0.72rem;
+        font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
@@ -188,17 +188,22 @@
         width: 100%;
         box-sizing: border-box;
         background: var(--ui-layer-2);
-        border: 1px solid color-mix(in srgb, var(--ui-accent) 36%, transparent);
+        border: 1px solid color-mix(in srgb, var(--ui-accent) 50%, transparent);
         border-radius: var(--ui-radius-sm);
         color: var(--ui-text-primary);
         font: inherit;
-        font-size: 0.72rem;
+        font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
         padding: 2px 6px;
         outline: none;
         min-width: 0;
+        transition: box-shadow var(--ui-motion-fast);
+    }
+
+    .rename-input:focus {
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .ws-count {
@@ -228,11 +233,11 @@
         position: fixed;
         z-index: 100;
         min-width: 160px;
-        padding: 4px 0;
+        padding: 4px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-strong);
         border-radius: var(--ui-radius-md);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        box-shadow: var(--ui-shadow-md);
     }
 
     .ctx-item {
@@ -241,6 +246,7 @@
         padding: 6px 12px;
         background: transparent;
         border: none;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-secondary);
         font: inherit;
         font-size: 0.78rem;

@@ -437,11 +437,11 @@
         position: fixed;
         z-index: 100;
         min-width: 180px;
-        padding: 4px 0;
+        padding: 4px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-strong);
         border-radius: var(--ui-radius-md);
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        box-shadow: var(--ui-shadow-md);
     }
 
     .ctx-label {
@@ -460,6 +460,7 @@
         padding: 6px 12px;
         background: transparent;
         border: none;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-secondary);
         font: inherit;
         font-size: 0.78rem;

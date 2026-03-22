@@ -524,10 +524,20 @@
         --ui-pane-bg-strong: var(--ui-layer-1);
 
         /* ---- Geometry ---- */
-        --ui-radius-sm: 4px;
-        --ui-radius-md: 6px;
-        --ui-radius-lg: 8px;
+        --ui-radius-sm: 6px;
+        --ui-radius-md: 8px;
+        --ui-radius-lg: 10px;
         --ui-sidebar-width: 240px;
+
+        /* ---- Shadows ---- */
+        --ui-shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.15);
+        --ui-shadow-sm: 0 2px 6px rgba(0, 0, 0, 0.2);
+        --ui-shadow-md: 0 8px 24px rgba(0, 0, 0, 0.3);
+        --ui-shadow-lg: 0 24px 60px rgba(0, 0, 0, 0.35);
+
+        /* ---- Focus ring ---- */
+        --ui-ring-width: 3px;
+        --ui-ring-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
 
         /* ---- Motion ---- */
         --ui-motion-fast: 120ms ease-out;
@@ -556,6 +566,63 @@
         height: 100%;
         background: var(--ui-layer-0);
         background-color: var(--ui-layer-0);
+    }
+
+    /* ---- Global scrollbars ---- */
+    :global(*) {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
+    }
+
+    :global(*::-webkit-scrollbar) {
+        width: 12px;
+        height: 12px;
+    }
+
+    :global(*::-webkit-scrollbar-track) {
+        background: transparent;
+    }
+
+    :global(*::-webkit-scrollbar-thumb) {
+        background: rgba(255, 255, 255, 0.12);
+        background-clip: padding-box;
+        border: 3px solid transparent;
+        border-radius: 6px;
+    }
+
+    :global(*::-webkit-scrollbar-thumb:hover) {
+        background: rgba(255, 255, 255, 0.18);
+        background-clip: padding-box;
+        border: 3px solid transparent;
+    }
+
+    :global(*::-webkit-scrollbar-thumb:active) {
+        background: rgba(255, 255, 255, 0.24);
+        background-clip: padding-box;
+        border: 3px solid transparent;
+    }
+
+    :global(*::-webkit-scrollbar-corner) {
+        background: transparent;
+    }
+
+    :global(.scrollbar-thin::-webkit-scrollbar) {
+        width: 8px;
+        height: 8px;
+    }
+
+    :global(.scrollbar-thin::-webkit-scrollbar-thumb) {
+        border: 2px solid transparent;
+        border-radius: 4px;
+    }
+
+    :global(.hide-scrollbar) {
+        scrollbar-width: none;
+        -ms-overflow-style: none;
+    }
+
+    :global(.hide-scrollbar::-webkit-scrollbar) {
+        display: none;
     }
 
     .app-shell {
@@ -754,7 +821,7 @@
         border-radius: var(--ui-radius-lg);
         border: 1px solid color-mix(in srgb, var(--ui-accent) 26%, transparent);
         background: color-mix(in srgb, var(--ui-layer-2) 92%, black 8%);
-        box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+        box-shadow: var(--ui-shadow-md);
         color: var(--ui-text-primary);
         pointer-events: auto;
     }

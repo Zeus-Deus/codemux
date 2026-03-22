@@ -1054,19 +1054,6 @@
         max-height: 60vh;
     }
 
-    .sidebar-sections::-webkit-scrollbar {
-        width: 4px;
-    }
-
-    .sidebar-sections::-webkit-scrollbar-track {
-        background: transparent;
-    }
-
-    .sidebar-sections::-webkit-scrollbar-thumb {
-        background: var(--ui-border-soft);
-        border-radius: var(--ui-radius-sm);
-    }
-
     /* ---- Footer ---- */
 
     .sidebar-footer {

@@ -157,11 +157,11 @@
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-strong);
         border-radius: var(--ui-radius-lg);
-        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
+        box-shadow: var(--ui-shadow-lg);
     }
 
     .editor-header {
-        padding: 16px 20px 8px;
+        padding: 20px 24px 12px;
     }
 
     .editor-header h2 {
@@ -175,8 +175,8 @@
     .editor-body {
         display: flex;
         flex-direction: column;
-        gap: 12px;
-        padding: 8px 20px 16px;
+        gap: 16px;
+        padding: 12px 24px 20px;
     }
 
     .field {
@@ -202,19 +202,21 @@
     }
 
     .field-input, .field-textarea {
-        padding: 6px 10px;
+        padding: 8px 12px;
         background: var(--ui-layer-1);
         border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-sm);
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
-        font-size: 0.82rem;
+        font-size: 0.85rem;
         font-family: var(--ui-font-mono);
         outline: none;
-        transition: border-color var(--ui-motion-fast);
+        box-shadow: var(--ui-shadow-xs);
+        transition: border-color var(--ui-motion-fast), box-shadow var(--ui-motion-fast);
     }
 
     .field-input:focus, .field-textarea:focus {
-        border-color: var(--ui-accent);
+        border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .field-input:disabled, .field-textarea:disabled {
@@ -265,7 +267,7 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        padding: 12px 20px;
+        padding: 16px 24px;
         border-top: 1px solid var(--ui-border-soft);
     }
 
@@ -274,18 +276,25 @@
     }
 
     .btn {
-        padding: 6px 16px;
+        padding: 8px 18px;
+        min-height: 36px;
         border: none;
-        border-radius: var(--ui-radius-sm);
+        border-radius: var(--ui-radius-md);
         font-size: 0.82rem;
         font-family: var(--ui-font-sans);
         cursor: pointer;
-        transition: background var(--ui-motion-fast), opacity var(--ui-motion-fast);
+        box-shadow: var(--ui-shadow-xs);
+        transition: background var(--ui-motion-fast), opacity var(--ui-motion-fast), box-shadow var(--ui-motion-fast);
     }
 
     .btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+    }
+
+    .btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .btn-primary {

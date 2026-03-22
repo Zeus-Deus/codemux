@@ -17,6 +17,7 @@
     } from '../../stores/openflow';
     import type { CliToolInfo, ModelInfo, ThinkingModeInfo } from '../../stores/types';
     import { invoke } from '@tauri-apps/api/core';
+    import CustomSelect from '../ui/CustomSelect.svelte';
 
     const dispatch = createEventDispatcher<{
         start: { title: string; goal: string; directory: string; agentConfigs: AgentConfig[] };
@@ -228,49 +229,50 @@
                         <span class="agent-number">#{i + 1}</span>
 
                         <!-- CLI Tool -->
-                        <select
+                        <CustomSelect
                             value={agent.cliTool}
-                            onchange={(e) => onToolChange(i, (e.target as HTMLSelectElement).value)}
-                        >
-                            {#each availableTools as tool}
-                                <option value={tool.id} disabled={!tool.available}>
-                                    {tool.name}{tool.available ? '' : ' (not installed)'}
-                                </option>
-                            {/each}
-                            {#if availableTools.length === 0}
-                                <option value="opencode">OpenCode</option>
-                            {/if}
-                        </select>
+                            onchange={(v) => onToolChange(i, v)}
+                            options={[
+                                ...availableTools.map(t => ({
+                                    value: t.id,
+                                    label: t.name + (t.available ? '' : ' (not installed)'),
+                                    disabled: !t.available,
+                                })),
+                                ...(availableTools.length === 0 ? [{ value: 'opencode', label: 'OpenCode' }] : []),
+                            ]}
+                        />
 
                         <!-- Model -->
-                        <select bind:value={agent.model}>
-                            {#each modelsByTool[agent.cliTool] ?? [] as model}
-                                <option value={model.id}>{model.name}{model.provider ? ` (${model.provider})` : ''}</option>
-                            {/each}
-                            {#if (modelsByTool[agent.cliTool]?.length ?? 0) === 0}
-                                <option value="">Loading…</option>
-                            {/if}
-                        </select>
+                        <CustomSelect
+                            bind:value={agent.model}
+                            options={[
+                                ...(modelsByTool[agent.cliTool] ?? []).map(m => ({
+                                    value: m.id,
+                                    label: m.name + (m.provider ? ` (${m.provider})` : ''),
+                                })),
+                                ...((modelsByTool[agent.cliTool]?.length ?? 0) === 0 ? [{ value: '', label: 'Loading…' }] : []),
+                            ]}
+                        />
 
                         <!-- Role -->
-                        <select bind:value={agent.role}>
-                            {#each availableRoles as role}
-                                <option
-                                    value={role.id}
-                                    disabled={role.id === 'orchestrator' && orchestratorTaken(i)}
-                                >
-                                    {role.name}{role.id === 'orchestrator' && orchestratorTaken(i) ? ' (taken)' : ''}
-                                </option>
-                            {/each}
-                        </select>
+                        <CustomSelect
+                            bind:value={agent.role}
+                            options={availableRoles.map(r => ({
+                                value: r.id,
+                                label: r.name + (r.id === 'orchestrator' && orchestratorTaken(i) ? ' (taken)' : ''),
+                                disabled: r.id === 'orchestrator' && orchestratorTaken(i),
+                            }))}
+                        />
 
                         <!-- Thinking mode (only for tools that support it) -->
                         {#if hasThinkingModes(agent.cliTool)}
-                            <select bind:value={agent.thinkingMode}>
-                                {#each thinkingModesByTool[agent.cliTool] as mode}
-                                    <option value={mode.id} title={mode.description}>{mode.name}</option>
-                                {/each}
-                            </select>
+                            <CustomSelect
+                                bind:value={agent.thinkingMode}
+                                options={(thinkingModesByTool[agent.cliTool] ?? []).map(m => ({
+                                    value: m.id,
+                                    label: m.name,
+                                }))}
+                            />
                         {:else}
                             <span class="no-thinking">—</span>
                         {/if}
@@ -469,25 +471,8 @@
         font-size: 0.85rem;
     }
 
-    .agent-row select {
-        padding: 8px 12px;
-        background: var(--ui-layer-0);
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-md);
-        color: var(--ui-text-primary);
-        font: inherit;
-        font-size: 0.95rem;
-        font-weight: 500;
-        cursor: pointer;
+    .agent-row :global(.select-wrapper) {
         min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        transition: border-color 0.2s ease;
-    }
-
-    .agent-row select:focus {
-        outline: none;
-        border-color: var(--ui-accent);
     }
 
     .no-thinking {

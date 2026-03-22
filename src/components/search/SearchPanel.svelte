@@ -221,7 +221,7 @@
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-strong);
         border-radius: var(--ui-radius-lg);
-        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.5);
+        box-shadow: var(--ui-shadow-lg);
         overflow: hidden;
     }
 

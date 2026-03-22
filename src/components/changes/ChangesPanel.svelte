@@ -334,7 +334,7 @@
     }
 
     .file-count-badge {
-        font-size: 0.68rem;
+        font-size: 0.72rem;
         font-weight: 600;
         color: var(--ui-text-muted);
         background: var(--ui-layer-2);
@@ -384,8 +384,8 @@
 
     .commit-input {
         width: 100%;
-        height: 28px;
-        padding: 0 8px;
+        height: 32px;
+        padding: 0 10px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
@@ -394,11 +394,13 @@
         font-size: 0.75rem;
         outline: none;
         box-sizing: border-box;
-        transition: border-color var(--ui-motion-fast);
+        box-shadow: var(--ui-shadow-xs);
+        transition: border-color var(--ui-motion-fast), box-shadow var(--ui-motion-fast);
     }
 
     .commit-input:focus {
-        border-color: color-mix(in srgb, var(--ui-accent) 36%, transparent);
+        border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
     }
 
     .commit-input::placeholder {
@@ -412,7 +414,7 @@
 
     .commit-btn {
         flex: 1;
-        height: 28px;
+        height: 32px;
         padding: 0 12px;
         background: var(--ui-accent);
         border: none;
@@ -421,7 +423,8 @@
         font-size: 0.75rem;
         font-weight: 600;
         cursor: pointer;
-        transition: opacity var(--ui-motion-fast);
+        box-shadow: var(--ui-shadow-xs);
+        transition: opacity var(--ui-motion-fast), box-shadow var(--ui-motion-fast);
     }
 
     .commit-btn:disabled {
@@ -433,8 +436,13 @@
         opacity: 0.9;
     }
 
+    .commit-btn:focus-visible {
+        outline: none;
+        box-shadow: 0 0 0 3px var(--ui-ring-color);
+    }
+
     .push-btn {
-        height: 28px;
+        height: 32px;
         padding: 0 10px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
@@ -478,7 +486,7 @@
     }
 
     .section-label {
-        font-size: 0.72rem;
+        font-size: 0.75rem;
         font-weight: 600;
         text-transform: uppercase;
         letter-spacing: 0.04em;
@@ -501,7 +509,7 @@
         border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
-        font-size: 0.68rem;
+        font-size: 0.72rem;
         cursor: pointer;
         transition: all var(--ui-motion-fast);
     }

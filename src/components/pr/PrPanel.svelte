@@ -2,6 +2,7 @@
     import { onMount } from 'svelte';
     import { ghStatus, refreshGhStatus, checkGithubRepo, getBranchPr, createPr, mergePr, getPrChecks } from '../../stores/github';
     import { listBranches } from '../../stores/git';
+    import CustomSelect from '../ui/CustomSelect.svelte';
     import type { PullRequestInfo, CheckInfo } from '../../stores/types';
 
     let { workspaceCwd, onClose }: { workspaceCwd: string; onClose: () => void } = $props();
@@ -250,11 +251,15 @@
                 <div class="merge-section">
                     <div class="section-label">Merge</div>
                     <div class="merge-controls">
-                        <select class="merge-method" bind:value={mergeMethod}>
-                            <option value="squash">Squash and merge</option>
-                            <option value="merge">Create merge commit</option>
-                            <option value="rebase">Rebase and merge</option>
-                        </select>
+                        <CustomSelect
+                            compact
+                            options={[
+                                { value: 'squash', label: 'Squash and merge' },
+                                { value: 'merge', label: 'Create merge commit' },
+                                { value: 'rebase', label: 'Rebase and merge' },
+                            ]}
+                            bind:value={mergeMethod}
+                        />
                         <button
                             class="merge-btn"
                             class:safe={allChecksPassing}
@@ -327,14 +332,15 @@
                 <div class="form-row">
                     <div class="form-group form-group-inline">
                         <label class="form-label" for="pr-base">Base</label>
-                        <select id="pr-base" class="form-select" bind:value={baseBranch}>
-                            {#each branches as branch}
-                                <option value={branch}>{branch}</option>
-                            {/each}
-                            {#if !branches.includes(baseBranch)}
-                                <option value={baseBranch}>{baseBranch}</option>
-                            {/if}
-                        </select>
+                        <CustomSelect
+                            compact
+                            id="pr-base"
+                            options={[
+                                ...branches.map(b => ({ value: b, label: b })),
+                                ...(!branches.includes(baseBranch) ? [{ value: baseBranch, label: baseBranch }] : []),
+                            ]}
+                            bind:value={baseBranch}
+                        />
                     </div>
 
                     <label class="form-checkbox">
@@ -650,8 +656,8 @@
 
     .merge-method {
         width: 100%;
-        height: 28px;
-        padding: 0 8px;
+        height: 32px;
+        padding: 0 10px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
@@ -659,6 +665,7 @@
         font-size: 0.75rem;
         outline: none;
         cursor: pointer;
+        box-shadow: var(--ui-shadow-xs);
     }
 
     .merge-btn {
@@ -824,8 +831,8 @@
 
     .form-select {
         width: 100%;
-        height: 30px;
-        padding: 0 8px;
+        height: 32px;
+        padding: 0 10px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
@@ -833,6 +840,7 @@
         font-size: 0.75rem;
         outline: none;
         cursor: pointer;
+        box-shadow: var(--ui-shadow-xs);
     }
 
     .form-checkbox {
