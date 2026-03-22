@@ -8,7 +8,9 @@
         closeTab,
         detectEditors,
         openInEditor,
+        createSection,
     } from '../stores/workspace';
+    import { SECTION_PRESET_COLORS } from '../stores/types';
     import { getGitStatus, stageFiles, pushChanges } from '../stores/git';
     import type { EditorInfo } from '../stores/types';
 
@@ -55,6 +57,17 @@
             group: 'Workspaces',
             label: 'New Workspace',
             execute: () => { /* handled by dispatching event — App.svelte opens the launcher */ }
+        });
+        actions.push({
+            id: 'new-section',
+            group: 'Workspaces',
+            label: 'New Section',
+            execute: () => {
+                const color = SECTION_PRESET_COLORS[
+                    ($appState?.sections.length ?? 0) % SECTION_PRESET_COLORS.length
+                ];
+                void createSection('New Section', color);
+            }
         });
         if ($appState) {
             for (const w of $appState.workspaces) {

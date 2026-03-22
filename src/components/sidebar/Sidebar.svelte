@@ -13,10 +13,20 @@
         detectEditors,
         openInEditor,
         getWorkspaceConfig,
+        createSection,
+        renameSection,
+        deleteSection,
+        setSectionColor,
+        toggleSectionCollapsed,
+        moveWorkspaceToSection,
+        reorderWorkspaces,
+        reorderSections,
     } from '../../stores/workspace';
     import type { EditorInfo, LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
+    import { SECTION_PRESET_COLORS } from '../../stores/types';
     import { findActiveSessionId } from '../../lib/paneTree';
     import WorkspaceRow from './WorkspaceRow.svelte';
+    import SectionHeader from './SectionHeader.svelte';
     import NotificationsSection from './NotificationsSection.svelte';
     import PortsSection from './PortsSection.svelte';
     import OpenFlowLauncher from './OpenFlowLauncher.svelte';
@@ -207,6 +217,279 @@
             console.error('Failed to set notification sound:', error);
         }
     }
+
+    // ---- Workspace sections ----
+
+    const sectionedWorkspaces = $derived.by(() => {
+        if (!$appState) return { sectionGroups: [], unsorted: [] };
+
+        const sections = [...$appState.sections].sort((a, b) => a.position - b.position);
+        const assignedIds = new Set(sections.flatMap(s => s.workspace_ids));
+        const unsorted = $appState.workspaces.filter(w => !assignedIds.has(w.workspace_id));
+
+        const sectionGroups = sections.map(section => ({
+            section,
+            workspaces: section.workspace_ids
+                .map(id => $appState!.workspaces.find(w => w.workspace_id === id))
+                .filter((w): w is NonNullable<typeof w> => w != null),
+        }));
+
+        return { sectionGroups, unsorted };
+    });
+
+    async function handleCreateSection() {
+        const color = SECTION_PRESET_COLORS[
+            ($appState?.sections.length ?? 0) % SECTION_PRESET_COLORS.length
+        ];
+        try {
+            await createSection('New Section', color);
+        } catch (error) {
+            console.error('Failed to create section:', error);
+        }
+    }
+
+    async function handleToggleSectionCollapse(sectionId: string) {
+        try { await toggleSectionCollapsed(sectionId); } catch (e) { console.error(e); }
+    }
+
+    async function handleRenameSection(sectionId: string, name: string) {
+        try { await renameSection(sectionId, name); } catch (e) { console.error(e); }
+    }
+
+    async function handleSetSectionColor(sectionId: string, color: string) {
+        try { await setSectionColor(sectionId, color); } catch (e) { console.error(e); }
+    }
+
+    async function handleDeleteSection(sectionId: string) {
+        try { await deleteSection(sectionId); } catch (e) { console.error(e); }
+    }
+
+    async function handleMoveWorkspaceToSection(workspaceId: string, sectionId: string | null) {
+        try { await moveWorkspaceToSection(workspaceId, sectionId); } catch (e) { console.error(e); }
+    }
+
+    // ---- Drag and drop ----
+
+    let dragState = $state<{
+        type: 'workspace' | 'section';
+        id: string;
+        sourceSectionId: string | null;
+    } | null>(null);
+
+    let dropIndicatorY = $state<number | null>(null);
+    let dropTarget = $state<{
+        sectionId: string | null;
+        index: number;
+    } | null>(null);
+
+    let workspaceListEl = $state<HTMLDivElement | null>(null);
+
+    function handleWorkspaceDragStart(workspaceId: string, sectionId: string | null) {
+        return (e: DragEvent) => {
+            dragState = { type: 'workspace', id: workspaceId, sourceSectionId: sectionId };
+            e.dataTransfer!.effectAllowed = 'move';
+            e.dataTransfer!.setData('text/plain', workspaceId);
+        };
+    }
+
+    function handleSectionDragStart(sectionId: string) {
+        return (e: DragEvent) => {
+            dragState = { type: 'section', id: sectionId, sourceSectionId: null };
+            e.dataTransfer!.effectAllowed = 'move';
+            e.dataTransfer!.setData('text/plain', sectionId);
+        };
+    }
+
+    function handleDragOver(e: DragEvent) {
+        if (!dragState || !workspaceListEl) return;
+        e.preventDefault();
+        e.dataTransfer!.dropEffect = 'move';
+
+        if (dragState.type === 'workspace') {
+            computeWorkspaceDropTarget(e.clientY);
+        } else {
+            computeSectionDropTarget(e.clientY);
+        }
+    }
+
+    function computeWorkspaceDropTarget(clientY: number) {
+        if (!workspaceListEl) return;
+        const listRect = workspaceListEl.getBoundingClientRect();
+
+        // Step 1: Find which zone the cursor is in
+        let targetZone: { el: HTMLElement; sectionId: string | null } | null = null;
+
+        const unsortedZone = workspaceListEl.querySelector<HTMLElement>('[data-drop-zone="unsorted"]');
+        if (unsortedZone) {
+            const rect = unsortedZone.getBoundingClientRect();
+            if (clientY >= rect.top && clientY <= rect.bottom) {
+                targetZone = { el: unsortedZone, sectionId: null };
+            }
+        }
+
+        if (!targetZone) {
+            const sectionZones = workspaceListEl.querySelectorAll<HTMLElement>('[data-drop-zone-section]');
+            for (const zone of sectionZones) {
+                const rect = zone.getBoundingClientRect();
+                if (clientY >= rect.top && clientY <= rect.bottom) {
+                    targetZone = { el: zone, sectionId: zone.dataset.dropZoneSection || null };
+                    break;
+                }
+            }
+        }
+
+        // Fallback: find the closest zone if cursor is between zones
+        if (!targetZone) {
+            const allZones: Array<{ el: HTMLElement; sectionId: string | null }> = [];
+            if (unsortedZone) allZones.push({ el: unsortedZone, sectionId: null });
+            const sectionZones = workspaceListEl.querySelectorAll<HTMLElement>('[data-drop-zone-section]');
+            for (const zone of sectionZones) {
+                allZones.push({ el: zone, sectionId: zone.dataset.dropZoneSection || null });
+            }
+            let closestDist = Infinity;
+            for (const zone of allZones) {
+                const rect = zone.el.getBoundingClientRect();
+                const dist = Math.min(Math.abs(clientY - rect.top), Math.abs(clientY - rect.bottom));
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    targetZone = zone;
+                }
+            }
+        }
+
+        if (!targetZone) return;
+
+        // Step 2: Find insertion position within the target zone
+        const rows = targetZone.el.querySelectorAll<HTMLElement>('[data-ws-id]');
+
+        if (rows.length === 0) {
+            // Empty/collapsed section — drop at index 0
+            dropTarget = { sectionId: targetZone.sectionId, index: 0 };
+            const zoneRect = targetZone.el.getBoundingClientRect();
+            dropIndicatorY = zoneRect.bottom - listRect.top;
+            return;
+        }
+
+        let closestEl: HTMLElement | null = null;
+        let closestDist = Infinity;
+        let insertBefore = true;
+
+        for (const row of rows) {
+            const rect = row.getBoundingClientRect();
+            const midY = rect.top + rect.height / 2;
+            const dist = Math.abs(clientY - midY);
+            if (dist < closestDist) {
+                closestDist = dist;
+                closestEl = row;
+                insertBefore = clientY < midY;
+            }
+        }
+
+        if (!closestEl) return;
+
+        const indexInZone = parseInt(closestEl.dataset.wsIndex ?? '0', 10);
+        const targetIndex = insertBefore ? indexInZone : indexInZone + 1;
+
+        dropTarget = { sectionId: targetZone.sectionId, index: targetIndex };
+
+        const elRect = closestEl.getBoundingClientRect();
+        dropIndicatorY = (insertBefore ? elRect.top : elRect.bottom) - listRect.top;
+    }
+
+    function computeSectionDropTarget(clientY: number) {
+        if (!workspaceListEl) return;
+        const headers = workspaceListEl.querySelectorAll<HTMLElement>('[data-section-header-id]');
+        if (headers.length === 0) return;
+
+        let closestEl: HTMLElement | null = null;
+        let closestDist = Infinity;
+        let insertBefore = true;
+
+        for (const header of headers) {
+            const rect = header.getBoundingClientRect();
+            const midY = rect.top + rect.height / 2;
+            const dist = Math.abs(clientY - midY);
+            if (dist < closestDist) {
+                closestDist = dist;
+                closestEl = header;
+                insertBefore = clientY < midY;
+            }
+        }
+
+        if (!closestEl) return;
+        const headerIdx = parseInt(closestEl.dataset.sectionIdx ?? '0', 10);
+        const targetIndex = insertBefore ? headerIdx : headerIdx + 1;
+        dropTarget = { sectionId: null, index: targetIndex };
+
+        const listRect = workspaceListEl.getBoundingClientRect();
+        const elRect = closestEl.getBoundingClientRect();
+        dropIndicatorY = (insertBefore ? elRect.top : elRect.bottom) - listRect.top;
+    }
+
+    async function handleDrop(e: DragEvent) {
+        e.preventDefault();
+        if (!dragState || !dropTarget) {
+            clearDrag();
+            return;
+        }
+
+        try {
+            if (dragState.type === 'workspace') {
+                if (dropTarget.sectionId !== null) {
+                    // Dropping into a named section — use move with position
+                    await moveWorkspaceToSection(dragState.id, dropTarget.sectionId, dropTarget.index);
+                } else {
+                    // Dropping into unsorted zone
+                    // First remove from any section if needed
+                    if (dragState.sourceSectionId !== null) {
+                        await moveWorkspaceToSection(dragState.id, null);
+                    }
+                    // Reorder the main workspaces array to place at desired position among unsorted
+                    if ($appState) {
+                        const sections = $appState.sections;
+                        const assignedIds = new Set(sections.flatMap(s => s.workspace_ids));
+                        // After moving, the dragged workspace is unsorted — remove it from assigned
+                        assignedIds.delete(dragState.id);
+                        const unsortedIds = $appState.workspaces
+                            .map(w => w.workspace_id)
+                            .filter(id => !assignedIds.has(id) && id !== dragState!.id);
+                        // Insert at desired position among unsorted
+                        const idx = Math.min(dropTarget.index, unsortedIds.length);
+                        unsortedIds.splice(idx, 0, dragState.id);
+                        // Build full order: unsorted in new order + sectioned in original order
+                        const sectionedIds = $appState.workspaces
+                            .map(w => w.workspace_id)
+                            .filter(id => assignedIds.has(id));
+                        await reorderWorkspaces([...unsortedIds, ...sectionedIds]);
+                    }
+                }
+            } else if (dragState.type === 'section') {
+                const currentOrder = sectionedWorkspaces.sectionGroups.map(g => g.section.section_id);
+                const dragIdx = currentOrder.indexOf(dragState.id);
+                if (dragIdx >= 0) {
+                    const newOrder = [...currentOrder];
+                    newOrder.splice(dragIdx, 1);
+                    const insertIdx = Math.min(dropTarget.index, newOrder.length);
+                    newOrder.splice(insertIdx > dragIdx ? insertIdx - 1 : insertIdx, 0, dragState.id);
+                    await reorderSections(newOrder);
+                }
+            }
+        } catch (e) {
+            console.error('Drop failed:', e);
+        }
+
+        clearDrag();
+    }
+
+    function handleDragEnd() {
+        clearDrag();
+    }
+
+    function clearDrag() {
+        dragState = null;
+        dropTarget = null;
+        dropIndicatorY = null;
+    }
 </script>
 
 <aside class="sidebar">
@@ -257,17 +540,30 @@
                 <span class="brand-diamond"></span>
                 <span class="brand-name">Codemux</span>
             </div>
-            <button
-                class="icon-btn"
-                type="button"
-                title="New workspace"
-                onclick={handleCreateWorkspace}
-                aria-label="New workspace"
-            >
-                <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                    <path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-                </svg>
-            </button>
+            <div class="brand-actions">
+                <button
+                    class="icon-btn"
+                    type="button"
+                    title="New section"
+                    onclick={handleCreateSection}
+                    aria-label="New section"
+                >
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                        <path d="M1 3h10M1 6h7M1 9h10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                    </svg>
+                </button>
+                <button
+                    class="icon-btn"
+                    type="button"
+                    title="New workspace"
+                    onclick={handleCreateWorkspace}
+                    aria-label="New workspace"
+                >
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                        <path d="M6 1v10M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
         </div>
 
         {#if activeWorkspace}
@@ -334,18 +630,83 @@
     <div class="sidebar-divider"></div>
 
     <!-- Workspace list -->
-    <div class="workspace-list">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+        class="workspace-list"
+        bind:this={workspaceListEl}
+        ondragover={handleDragOver}
+        ondrop={handleDrop}
+        ondragend={handleDragEnd}
+    >
         {#if $appState?.workspaces.length}
-            {#each $appState.workspaces as workspace (workspace.workspace_id)}
-                <WorkspaceRow
-                    {workspace}
-                    isActive={workspace.workspace_id === $appState.active_workspace_id}
-                    onActivate={() => handleActivateWorkspace(workspace.workspace_id)}
-                    onClose={() => handleCloseWorkspace(workspace.workspace_id)}
-                    onMarkRead={() => handleMarkRead(workspace.workspace_id)}
-                    onOpenInEditor={editors.length > 0 ? () => handleOpenInEditor(workspace.cwd) : undefined}
-                />
+            <!-- Unsorted workspaces (not in any section) -->
+            <div data-drop-zone="unsorted">
+                {#if sectionedWorkspaces.unsorted.length > 0}
+                    {#if sectionedWorkspaces.sectionGroups.length > 0}
+                        <div class="unsorted-label">Unsorted</div>
+                    {/if}
+                    {#each sectionedWorkspaces.unsorted as workspace, idx (workspace.workspace_id)}
+                        <div data-ws-id={workspace.workspace_id} data-ws-index={idx}>
+                            <WorkspaceRow
+                                {workspace}
+                                isActive={workspace.workspace_id === $appState.active_workspace_id}
+                                sections={$appState.sections}
+                                currentSectionId={null}
+                                isDragging={dragState?.type === 'workspace' && dragState.id === workspace.workspace_id}
+                                onDragStart={handleWorkspaceDragStart(workspace.workspace_id, null)}
+                                onActivate={() => handleActivateWorkspace(workspace.workspace_id)}
+                                onClose={() => handleCloseWorkspace(workspace.workspace_id)}
+                                onMarkRead={() => handleMarkRead(workspace.workspace_id)}
+                                onOpenInEditor={editors.length > 0 ? () => handleOpenInEditor(workspace.cwd) : undefined}
+                                onMoveToSection={(sectionId) => handleMoveWorkspaceToSection(workspace.workspace_id, sectionId)}
+                            />
+                        </div>
+                    {/each}
+                {/if}
+            </div>
+
+            <!-- Named sections -->
+            {#each sectionedWorkspaces.sectionGroups as group, sIdx (group.section.section_id)}
+                <div class="section-group" style="border-left-color: {group.section.color};" data-drop-zone-section={group.section.section_id}>
+                    <div data-section-header-id={group.section.section_id} data-section-idx={sIdx}>
+                        <SectionHeader
+                            section={group.section}
+                            workspaceCount={group.workspaces.length}
+                            isDragging={dragState?.type === 'section' && dragState.id === group.section.section_id}
+                            onDragStart={handleSectionDragStart(group.section.section_id)}
+                            onToggleCollapse={() => handleToggleSectionCollapse(group.section.section_id)}
+                            onRename={(name) => handleRenameSection(group.section.section_id, name)}
+                            onChangeColor={(color) => handleSetSectionColor(group.section.section_id, color)}
+                            onDelete={() => handleDeleteSection(group.section.section_id)}
+                        />
+                    </div>
+                    {#if !group.section.collapsed}
+                        {#each group.workspaces as workspace, idx (workspace.workspace_id)}
+                            <div data-ws-id={workspace.workspace_id} data-ws-index={idx}>
+                                <WorkspaceRow
+                                    {workspace}
+                                    isActive={workspace.workspace_id === $appState.active_workspace_id}
+                                    sections={$appState.sections}
+                                    currentSectionId={group.section.section_id}
+                                    isDragging={dragState?.type === 'workspace' && dragState.id === workspace.workspace_id}
+                                    onDragStart={handleWorkspaceDragStart(workspace.workspace_id, group.section.section_id)}
+                                    onActivate={() => handleActivateWorkspace(workspace.workspace_id)}
+                                    onClose={() => handleCloseWorkspace(workspace.workspace_id)}
+                                    onMarkRead={() => handleMarkRead(workspace.workspace_id)}
+                                    onOpenInEditor={editors.length > 0 ? () => handleOpenInEditor(workspace.cwd) : undefined}
+                                    onMoveToSection={(sectionId) => handleMoveWorkspaceToSection(workspace.workspace_id, sectionId)}
+                                />
+                            </div>
+                        {/each}
+                    {/if}
+                </div>
             {/each}
+
+            <!-- Drop indicator -->
+            {#if dropIndicatorY !== null && dragState}
+                <div class="drop-indicator" style="top: {dropIndicatorY}px;"></div>
+            {/if}
+
         {:else}
             <div class="empty-workspace-hint">
                 <button class="create-first-btn" type="button" onclick={handleCreateWorkspace}>
@@ -422,6 +783,12 @@
         align-items: center;
         justify-content: space-between;
         gap: 8px;
+    }
+
+    .brand-actions {
+        display: flex;
+        align-items: center;
+        gap: 4px;
     }
 
     .brand-mark {
@@ -613,6 +980,34 @@
         gap: 1px;
         padding: 6px 6px;
         flex-shrink: 0;
+        position: relative;
+    }
+
+    .drop-indicator {
+        position: absolute;
+        left: 8px;
+        right: 8px;
+        height: 2px;
+        background: var(--ui-accent);
+        border-radius: 1px;
+        pointer-events: none;
+        z-index: 10;
+    }
+
+    .unsorted-label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ui-text-muted);
+        padding: 8px 12px 4px;
+    }
+
+    .section-group {
+        display: flex;
+        flex-direction: column;
+        border-left: 2px solid transparent;
+        border-radius: var(--ui-radius-sm);
+        margin-top: 2px;
     }
 
     .empty-workspace-hint {

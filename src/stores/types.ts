@@ -282,6 +282,20 @@ export interface PortInfoSnapshot {
     label: string | null;
 }
 
+export interface WorkspaceSectionSnapshot {
+    section_id: string;
+    name: string;
+    color: string;
+    collapsed: boolean;
+    workspace_ids: string[];
+    position: number;
+}
+
+export const SECTION_PRESET_COLORS = [
+    '#e07850', '#50a878', '#d4a84b', '#7b68ee',
+    '#dc6b6b', '#4a9ece', '#ce6aab', '#8fbc5a',
+] as const;
+
 export interface AppStateSnapshot {
     schema_version: number;
     active_workspace_id: string;
@@ -290,6 +304,7 @@ export interface AppStateSnapshot {
     browser_sessions: BrowserSessionSnapshot[];
     notifications: NotificationSnapshot[];
     detected_ports: PortInfoSnapshot[];
+    sections: WorkspaceSectionSnapshot[];
     persistence: PersistenceSchema;
     config: CodemuxConfigSnapshot;
 }

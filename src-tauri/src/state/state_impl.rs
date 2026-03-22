@@ -287,6 +287,16 @@ pub struct PortInfoSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSectionSnapshot {
+    pub section_id: String,
+    pub name: String,
+    pub color: String,
+    pub collapsed: bool,
+    pub workspace_ids: Vec<String>,
+    pub position: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateSnapshot {
     pub schema_version: u32,
     pub active_workspace_id: WorkspaceId,
@@ -296,6 +306,8 @@ pub struct AppStateSnapshot {
     pub notifications: Vec<NotificationSnapshot>,
     #[serde(default)]
     pub detected_ports: Vec<PortInfoSnapshot>,
+    #[serde(default)]
+    pub sections: Vec<WorkspaceSectionSnapshot>,
     pub persistence: PersistenceSchema,
     pub config: CodemuxConfigSnapshot,
 }
@@ -808,6 +820,9 @@ impl AppStateStore {
                     .iter()
                     .any(|id| id == &session.session_id.0)
             });
+            for section in &mut snapshot.sections {
+                section.workspace_ids.retain(|id| id != workspace_id);
+            }
             snapshot.active_workspace_id = WorkspaceId("".into());
             return Ok(WorkspaceId("".into()));
         }
@@ -828,6 +843,9 @@ impl AppStateStore {
                 .iter()
                 .any(|id| id == &session.session_id.0)
         });
+        for section in &mut snapshot.sections {
+            section.workspace_ids.retain(|id| id != workspace_id);
+        }
 
         let fallback_workspace = snapshot
             .workspaces
@@ -837,6 +855,117 @@ impl AppStateStore {
         snapshot.active_workspace_id = fallback_workspace.clone();
 
         Ok(fallback_workspace)
+    }
+
+    // ---- Workspace sections ----
+
+    pub fn create_section(&self, name: String, color: String) -> String {
+        let mut snapshot = self.inner.lock().unwrap();
+        let section_id = next_id("section");
+        let position = snapshot.sections.len() as u32;
+        snapshot.sections.push(WorkspaceSectionSnapshot {
+            section_id: section_id.clone(),
+            name,
+            color,
+            collapsed: false,
+            workspace_ids: vec![],
+            position,
+        });
+        section_id
+    }
+
+    pub fn rename_section(&self, section_id: &str, name: String) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(section) = snapshot.sections.iter_mut().find(|s| s.section_id == section_id) {
+            section.name = name;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn delete_section(&self, section_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let before = snapshot.sections.len();
+        snapshot.sections.retain(|s| s.section_id != section_id);
+        for (i, section) in snapshot.sections.iter_mut().enumerate() {
+            section.position = i as u32;
+        }
+        snapshot.sections.len() < before
+    }
+
+    pub fn set_section_color(&self, section_id: &str, color: String) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(section) = snapshot.sections.iter_mut().find(|s| s.section_id == section_id) {
+            section.color = color;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_section_collapsed(&self, section_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(section) = snapshot.sections.iter_mut().find(|s| s.section_id == section_id) {
+            section.collapsed = !section.collapsed;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn move_workspace_to_section(&self, workspace_id: &str, section_id: Option<&str>, position: Option<usize>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        // Remove from all sections first
+        for section in &mut snapshot.sections {
+            section.workspace_ids.retain(|id| id != workspace_id);
+        }
+        // Add to target section if specified
+        if let Some(sid) = section_id {
+            if let Some(section) = snapshot.sections.iter_mut().find(|s| s.section_id == sid) {
+                let idx = position.unwrap_or(section.workspace_ids.len())
+                    .min(section.workspace_ids.len());
+                section.workspace_ids.insert(idx, workspace_id.to_string());
+                return true;
+            }
+            return false;
+        }
+        true
+    }
+
+    pub fn reorder_workspaces(&self, workspace_ids: Vec<String>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if workspace_ids.len() != snapshot.workspaces.len() {
+            return false;
+        }
+        let mut reordered = Vec::with_capacity(workspace_ids.len());
+        for wid in &workspace_ids {
+            if let Some(ws) = snapshot.workspaces.iter().find(|w| w.workspace_id.0 == *wid).cloned() {
+                reordered.push(ws);
+            } else {
+                return false;
+            }
+        }
+        snapshot.workspaces = reordered;
+        true
+    }
+
+    pub fn reorder_sections(&self, section_ids: Vec<String>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if section_ids.len() != snapshot.sections.len() {
+            return false;
+        }
+        let mut reordered = Vec::with_capacity(section_ids.len());
+        for (i, sid) in section_ids.iter().enumerate() {
+            if let Some(mut section) = snapshot.sections.iter().find(|s| s.section_id == *sid).cloned() {
+                section.position = i as u32;
+                reordered.push(section);
+            } else {
+                return false;
+            }
+        }
+        snapshot.sections = reordered;
+        true
     }
 
     pub fn workspace_navigation_target(&self, step: isize) -> Option<WorkspaceId> {
@@ -1834,6 +1963,12 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
                 .iter()
                 .map(|session| extract_numeric_suffix(&session.browser_id.0)),
         )
+        .chain(
+            snapshot
+                .sections
+                .iter()
+                .map(|section| extract_numeric_suffix(&section.section_id)),
+        )
         .flatten()
         .max()
         .unwrap_or(0);
@@ -1901,6 +2036,7 @@ fn default_app_state() -> AppStateSnapshot {
         browser_sessions: vec![],
         notifications: vec![],
         detected_ports: vec![],
+        sections: vec![],
         persistence: PersistenceSchema {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             stores_layout_metadata: true,

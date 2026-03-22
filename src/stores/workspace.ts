@@ -208,3 +208,37 @@ export async function getWorkspaceConfig(path: string) {
 export async function runWorkspaceSetup(workspaceId: string) {
     return invoke<void>('run_workspace_setup', { workspaceId });
 }
+
+// ---- Workspace sections ----
+
+export async function createSection(name: string, color: string) {
+    return invoke<string>('create_section', { name, color });
+}
+
+export async function renameSection(sectionId: string, name: string) {
+    return invoke('rename_section', { sectionId, name });
+}
+
+export async function deleteSection(sectionId: string) {
+    return invoke('delete_section', { sectionId });
+}
+
+export async function setSectionColor(sectionId: string, color: string) {
+    return invoke('set_section_color', { sectionId, color });
+}
+
+export async function toggleSectionCollapsed(sectionId: string) {
+    return invoke('toggle_section_collapsed', { sectionId });
+}
+
+export async function moveWorkspaceToSection(workspaceId: string, sectionId: string | null, position?: number) {
+    return invoke('move_workspace_to_section', { workspaceId, sectionId, position: position ?? null });
+}
+
+export async function reorderWorkspaces(workspaceIds: string[]) {
+    return invoke('reorder_workspaces', { workspaceIds });
+}
+
+export async function reorderSections(sectionIds: string[]) {
+    return invoke('reorder_sections', { sectionIds });
+}

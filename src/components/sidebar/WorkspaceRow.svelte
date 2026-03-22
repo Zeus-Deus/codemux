@@ -1,5 +1,6 @@
 <script lang="ts">
-    import type { WorkspaceSnapshot } from '../../stores/types';
+    import type { WorkspaceSnapshot, WorkspaceSectionSnapshot } from '../../stores/types';
+    import { onMount } from 'svelte';
 
     let {
         workspace,
@@ -7,7 +8,12 @@
         onActivate,
         onClose,
         onMarkRead,
-        onOpenInEditor
+        onOpenInEditor,
+        sections = [],
+        currentSectionId = null,
+        onMoveToSection,
+        onDragStart,
+        isDragging = false,
     }: {
         workspace: WorkspaceSnapshot;
         isActive: boolean;
@@ -15,16 +21,42 @@
         onClose: () => void;
         onMarkRead: () => void;
         onOpenInEditor?: () => void;
+        sections?: WorkspaceSectionSnapshot[];
+        currentSectionId?: string | null;
+        onMoveToSection?: (sectionId: string | null) => void;
+        onDragStart?: (e: DragEvent) => void;
+        isDragging?: boolean;
     } = $props();
+
+    let contextMenu = $state<{ x: number; y: number } | null>(null);
+
+    function handleContextMenu(e: MouseEvent) {
+        if (!onMoveToSection) return;
+        e.preventDefault();
+        e.stopPropagation();
+        contextMenu = { x: e.clientX, y: e.clientY };
+    }
+
+    onMount(() => {
+        function dismiss() {
+            if (contextMenu) contextMenu = null;
+        }
+        window.addEventListener('mousedown', dismiss);
+        return () => window.removeEventListener('mousedown', dismiss);
+    });
 </script>
 
 <div
     class="workspace-row"
     class:active={isActive}
     class:has-attention={workspace.notification_count > 0}
+    class:dragging={isDragging}
     role="button"
     tabindex="0"
+    draggable={onDragStart ? 'true' : undefined}
     onclick={onActivate}
+    oncontextmenu={handleContextMenu}
+    ondragstart={onDragStart}
     onkeydown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
@@ -106,6 +138,43 @@
     </button>
 </div>
 
+{#if contextMenu && onMoveToSection}
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+        class="ctx-menu"
+        style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
+        onclick={(e) => e.stopPropagation()}
+        onmousedown={(e) => e.stopPropagation()}
+    >
+        <div class="ctx-label">Move to section</div>
+        {#if currentSectionId !== null}
+            <button
+                class="ctx-item"
+                type="button"
+                onclick={() => { onMoveToSection(null); contextMenu = null; }}
+            >Unsorted</button>
+        {/if}
+        {#each sections as s (s.section_id)}
+            {#if s.section_id !== currentSectionId}
+                <button
+                    class="ctx-item"
+                    type="button"
+                    onclick={() => { onMoveToSection(s.section_id); contextMenu = null; }}
+                >
+                    <span class="ctx-color-dot" style="background: {s.color};"></span>
+                    {s.name}
+                </button>
+            {/if}
+        {/each}
+        <div class="ctx-divider"></div>
+        <button
+            class="ctx-item ctx-danger"
+            type="button"
+            onclick={(e) => { e.stopPropagation(); contextMenu = null; onClose(); }}
+        >Close</button>
+    </div>
+{/if}
+
 <style>
     .workspace-row {
         position: relative;
@@ -120,6 +189,10 @@
         outline: none;
         min-height: 38px;
         user-select: none;
+    }
+
+    .workspace-row.dragging {
+        opacity: 0.4;
     }
 
     .workspace-row:hover {
@@ -331,5 +404,63 @@
     .row-close:hover {
         color: var(--ui-danger);
         background: color-mix(in srgb, var(--ui-danger) 10%, transparent);
+    }
+
+    /* Context menu */
+    .ctx-menu {
+        position: fixed;
+        z-index: 100;
+        min-width: 180px;
+        padding: 4px 0;
+        background: var(--ui-layer-2);
+        border: 1px solid var(--ui-border-strong);
+        border-radius: var(--ui-radius-md);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    }
+
+    .ctx-label {
+        padding: 4px 12px 2px;
+        font-size: 0.68rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--ui-text-muted);
+    }
+
+    .ctx-item {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        width: 100%;
+        padding: 6px 12px;
+        background: transparent;
+        border: none;
+        color: var(--ui-text-secondary);
+        font: inherit;
+        font-size: 0.78rem;
+        text-align: left;
+        cursor: pointer;
+        transition: background var(--ui-motion-fast), color var(--ui-motion-fast);
+    }
+
+    .ctx-item:hover {
+        background: var(--ui-layer-3);
+        color: var(--ui-text-primary);
+    }
+
+    .ctx-danger:hover {
+        color: var(--ui-danger);
+    }
+
+    .ctx-color-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        flex-shrink: 0;
+    }
+
+    .ctx-divider {
+        height: 1px;
+        margin: 4px 0;
+        background: var(--ui-border-soft);
     }
 </style>
