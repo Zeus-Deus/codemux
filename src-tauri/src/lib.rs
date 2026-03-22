@@ -108,12 +108,13 @@ pub fn run() {
                         let path = std::path::PathBuf::from(&cwd);
                         let branch_info = git::git_branch_info(&path).ok();
                         let diff_stat = git::git_diff_stat(&path).ok();
+                        let changed_files = git::git_status(&path).map(|f| f.len() as u32).unwrap_or(0);
                         let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
                         let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);
                         let behind = branch_info.as_ref().map(|i| i.behind).unwrap_or(0);
                         let additions = diff_stat.as_ref().map(|s| s.staged_additions + s.unstaged_additions).unwrap_or(0);
                         let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
-                        state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions);
+                        state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions, changed_files);
                         state::emit_app_state(&git_handle);
                     }
                 }

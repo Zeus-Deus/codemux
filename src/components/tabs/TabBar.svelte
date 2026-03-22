@@ -2,16 +2,19 @@
     import { createEventDispatcher } from 'svelte';
     import type { TabSnapshot } from '../../stores/types';
 
-    let { tabs, activeTabId, workspaceId }: {
+    let { tabs, activeTabId, workspaceId, changesOpen, changesCount }: {
         tabs: TabSnapshot[];
         activeTabId: string;
         workspaceId: string;
+        changesOpen?: boolean;
+        changesCount?: number;
     } = $props();
 
     const dispatch = createEventDispatcher<{
         activate: { tabId: string };
         close: { tabId: string };
         create: { kind: string };
+        toggleChanges: void;
     }>();
 
     let showDropdown = $state(false);
@@ -57,6 +60,7 @@
 
 <div class="tab-bar">
     <div class="tab-list">
+
         {#each tabs as tab (tab.tab_id)}
             <!-- svelte-ignore a11y_no_static_element_interactions -->
             <div
@@ -102,6 +106,19 @@
             </button>
         </div>
     </div>
+    <button
+        class="changes-toggle"
+        class:active={changesOpen}
+        onclick={() => dispatch('toggleChanges')}
+        title="Toggle Changes Panel (Ctrl+Shift+G)"
+    >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        {#if changesCount && changesCount > 0}
+            <span class="changes-count">{changesCount}</span>
+        {/if}
+    </button>
 </div>
 
 {#if showDropdown}
@@ -125,12 +142,6 @@
                 <path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" stroke="currentColor" stroke-width="1.5"/>
             </svg>
             Browser
-        </button>
-        <button class="dropdown-item" onclick={() => handleCreateTab('diff')}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            </svg>
-            Changes
         </button>
     </div>
 {/if}
@@ -288,5 +299,46 @@
     .dropdown-item:hover {
         background: var(--ui-layer-3);
         color: var(--ui-text-primary);
+    }
+
+    .changes-toggle {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        height: 28px;
+        padding: 0 8px;
+        margin: 4px 6px 4px 0;
+        border: 1px solid var(--ui-border-soft);
+        border-radius: var(--ui-radius-sm);
+        background: transparent;
+        color: var(--ui-text-muted);
+        font-size: 0.72rem;
+        cursor: pointer;
+        flex-shrink: 0;
+        transition: all var(--ui-motion-fast);
+    }
+
+    .changes-toggle:hover {
+        background: var(--ui-layer-2);
+        color: var(--ui-text-secondary);
+    }
+
+    .changes-toggle.active {
+        background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
+        color: var(--ui-accent);
+        border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+    }
+
+    .changes-count {
+        font-family: var(--ui-font-mono);
+        font-size: 0.68rem;
+        font-weight: 600;
+        padding: 0 4px;
+        border-radius: var(--ui-radius-sm);
+        background: var(--ui-layer-2);
+    }
+
+    .changes-toggle.active .changes-count {
+        background: color-mix(in srgb, var(--ui-accent) 20%, transparent);
     }
 </style>

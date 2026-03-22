@@ -20,7 +20,7 @@ Defined in `src/App.svelte` — `handleWindowKeydown()`.
 | Ctrl+W | Close active tab | Only when workspace has more than one tab |
 | Ctrl+1 through Ctrl+9 | Jump to tab by position | Tab 1 = leftmost |
 | Ctrl+Shift+B | New browser tab | |
-| Ctrl+Shift+D | New diff/changes tab | |
+| Ctrl+Shift+G | Toggle Changes panel | Standard workspaces only |
 | Ctrl+Shift+J | Next pane | |
 | Ctrl+Shift+K | Previous pane | |
 | Ctrl+L | Next pane | Vim-style alternative |

@@ -237,6 +237,7 @@ export interface WorkspaceSnapshot {
     git_behind: number;
     git_additions: number;
     git_deletions: number;
+    git_changed_files: number;
     notification_count: number;
     latest_agent_state: string | null;
     tabs: TabSnapshot[];

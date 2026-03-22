@@ -21,6 +21,7 @@ use tauri::{Manager, State};
 fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
+    let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
 
     let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
     let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);
@@ -34,7 +35,7 @@ fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path
         .map(|s| s.staged_deletions + s.unstaged_deletions)
         .unwrap_or(0);
 
-    state.update_workspace_git_info(workspace_id, branch, ahead, behind, additions, deletions);
+    state.update_workspace_git_info(workspace_id, branch, ahead, behind, additions, deletions, changed_files);
 }
 
 pub(crate) fn create_workspace_impl(

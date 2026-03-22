@@ -30,7 +30,7 @@
     import OpenFlowWorkspace from './components/openflow/OpenFlowWorkspace.svelte';
     import TabBar from './components/tabs/TabBar.svelte';
     import BrowserPane from './components/panes/BrowserPane.svelte';
-    import DiffView from './components/diff/DiffView.svelte';
+    import ChangesPanel from './components/changes/ChangesPanel.svelte';
     import PresetBar from './components/presets/PresetBar.svelte';
     import PresetEditor from './components/presets/PresetEditor.svelte';
     import { findActiveSessionId } from './lib/paneTree';
@@ -48,6 +48,40 @@
     let showNewWorkspaceLauncher = $state(false);
     let editingPreset = $state<TerminalPreset | null | undefined>(undefined);
     // undefined = editor closed, null = create mode, TerminalPreset = edit mode
+
+    let changesPanelOpen = $state(new Map<string, boolean>());
+    let changesPanelWidth = $state(320);
+    let isPanelDragging = $state(false);
+
+    function isChangesPanelOpen(workspaceId: string): boolean {
+        return changesPanelOpen.get(workspaceId) ?? false;
+    }
+
+    function toggleChangesPanel(workspaceId: string) {
+        const next = new Map(changesPanelOpen);
+        next.set(workspaceId, !(next.get(workspaceId) ?? false));
+        changesPanelOpen = next;
+    }
+
+    function startPanelResize(e: MouseEvent) {
+        isPanelDragging = true;
+        const sidebarWidth = 240;
+        const onMove = (ev: MouseEvent) => {
+            const available = window.innerWidth - sidebarWidth;
+            changesPanelWidth = Math.max(240, Math.min(500, window.innerWidth - ev.clientX));
+            // clamp so main content keeps at least 200px
+            if (available - changesPanelWidth < 200) {
+                changesPanelWidth = available - 200;
+            }
+        };
+        const onUp = () => {
+            isPanelDragging = false;
+            window.removeEventListener('pointermove', onMove);
+            window.removeEventListener('pointerup', onUp);
+        };
+        window.addEventListener('pointermove', onMove);
+        window.addEventListener('pointerup', onUp);
+    }
 
     function applyThemeVars(nextTheme = fallbackTheme) {
         const root = document.documentElement;
@@ -141,8 +175,8 @@
             if (event.shiftKey && event.key.toLowerCase() === 'b' && !event.altKey) {
                 event.preventDefault(); void handleCreateTab(ws.workspace_id, 'browser'); return;
             }
-            if (event.shiftKey && event.key.toLowerCase() === 'd' && !event.altKey) {
-                event.preventDefault(); void handleCreateTab(ws.workspace_id, 'diff'); return;
+            if (event.shiftKey && event.key.toLowerCase() === 'g' && !event.altKey) {
+                event.preventDefault(); toggleChangesPanel(ws.workspace_id); return;
             }
             const numKey = parseInt(event.key);
             if (numKey >= 1 && numKey <= 9 && !event.shiftKey && !event.altKey) {
@@ -224,9 +258,12 @@
                                                 tabs={workspace.tabs}
                                                 activeTabId={workspace.active_tab_id}
                                                 workspaceId={workspace.workspace_id}
+                                                changesOpen={isChangesPanelOpen(workspace.workspace_id)}
+                                                changesCount={workspace.git_changed_files}
                                                 on:activate={(e) => handleActivateTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:close={(e) => handleCloseTab(workspace.workspace_id, e.detail.tabId)}
                                                 on:create={(e) => handleCreateTab(workspace.workspace_id, e.detail.kind)}
+                                                on:toggleChanges={() => toggleChangesPanel(workspace.workspace_id)}
                                             />
                                         {/if}
                                         {#if $presetStore && (!activeTab || activeTab.kind === 'terminal')}
@@ -236,27 +273,43 @@
                                                 onEditPreset={(p) => { editingPreset = p; }}
                                             />
                                         {/if}
-                                        <div class="tab-content">
-                                            {#if !activeTab || activeTab.kind === 'terminal'}
-                                                {@const surface = (activeTab?.surface_id
-                                                    ? surfaceForTab(workspace, activeTab.surface_id)
-                                                    : null) ?? surfaceForWorkspace(workspace)}
-                                                {#if surface && surface.root}
-                                                    <PaneNode
-                                                        node={surface.root}
-                                                        activePaneId={surface.active_pane_id}
-                                                        on:activate={(e) => handleActivatePane(e.detail.paneId)}
-                                                        on:split={(e) => handleSplitPane(e.detail.paneId, e.detail.direction)}
-                                                        on:close={(e) => handleClosePane(e.detail.paneId)}
-                                                        on:resize={(e) => handleResizeSplit(e.detail.paneId, e.detail.childSizes)}
-                                                        on:browser={(e) => handleCreateBrowserPane(e.detail.paneId)}
-                                                        on:swap={(e) => handleSwapPanes(e.detail.sourcePaneId, e.detail.targetPaneId)}
-                                                    />
+                                        <div class="workspace-content-row">
+                                            <div class="tab-content">
+                                                {#if !activeTab || activeTab.kind === 'terminal'}
+                                                    {@const surface = (activeTab?.surface_id
+                                                        ? surfaceForTab(workspace, activeTab.surface_id)
+                                                        : null) ?? surfaceForWorkspace(workspace)}
+                                                    {#if surface && surface.root}
+                                                        <PaneNode
+                                                            node={surface.root}
+                                                            activePaneId={surface.active_pane_id}
+                                                            on:activate={(e) => handleActivatePane(e.detail.paneId)}
+                                                            on:split={(e) => handleSplitPane(e.detail.paneId, e.detail.direction)}
+                                                            on:close={(e) => handleClosePane(e.detail.paneId)}
+                                                            on:resize={(e) => handleResizeSplit(e.detail.paneId, e.detail.childSizes)}
+                                                            on:browser={(e) => handleCreateBrowserPane(e.detail.paneId)}
+                                                            on:swap={(e) => handleSwapPanes(e.detail.sourcePaneId, e.detail.targetPaneId)}
+                                                        />
+                                                    {/if}
+                                                {:else if activeTab.kind === 'browser' && activeTab.browser_id}
+                                                    <BrowserPane browserId={activeTab.browser_id} />
                                                 {/if}
-                                            {:else if activeTab.kind === 'browser' && activeTab.browser_id}
-                                                <BrowserPane browserId={activeTab.browser_id} />
-                                            {:else if activeTab.kind === 'diff'}
-                                                <DiffView workspaceCwd={workspace.cwd} />
+                                            </div>
+                                            {#if isChangesPanelOpen(workspace.workspace_id)}
+                                                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                                                <div
+                                                    class="changes-panel-resizer"
+                                                    class:active={isPanelDragging}
+                                                    onmousedown={startPanelResize}
+                                                    role="separator"
+                                                    aria-orientation="vertical"
+                                                ></div>
+                                                <div class="changes-panel-wrapper" style="width: {changesPanelWidth}px">
+                                                    <ChangesPanel
+                                                        workspaceCwd={workspace.cwd}
+                                                        onClose={() => toggleChangesPanel(workspace.workspace_id)}
+                                                    />
+                                                </div>
                                             {/if}
                                         </div>
                                     </div>
@@ -450,11 +503,39 @@
         min-height: 0;
     }
 
+    .workspace-content-row {
+        display: flex;
+        flex-direction: row;
+        flex: 1;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+    }
+
     .tab-content {
         flex: 1;
         min-width: 0;
         min-height: 0;
         overflow: hidden;
+    }
+
+    .changes-panel-resizer {
+        width: 4px;
+        background: var(--ui-border-soft);
+        cursor: col-resize;
+        transition: background var(--ui-motion-fast);
+        flex-shrink: 0;
+    }
+
+    .changes-panel-resizer:hover,
+    .changes-panel-resizer.active {
+        background: var(--ui-accent);
+    }
+
+    .changes-panel-wrapper {
+        flex-shrink: 0;
+        overflow: hidden;
+        height: 100%;
     }
 
     .global-notice-wrap {

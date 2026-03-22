@@ -246,6 +246,8 @@ pub struct WorkspaceSnapshot {
     pub git_additions: u32,
     #[serde(default)]
     pub git_deletions: u32,
+    #[serde(default)]
+    pub git_changed_files: u32,
     pub notification_count: u32,
     pub latest_agent_state: Option<String>,
     #[serde(default)]
@@ -433,6 +435,7 @@ impl AppStateStore {
             git_behind: 0,
             git_additions: 0,
             git_deletions: 0,
+            git_changed_files: 0,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -592,6 +595,7 @@ impl AppStateStore {
             git_behind: 0,
             git_additions: 0,
             git_deletions: 0,
+            git_changed_files: 0,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -692,6 +696,7 @@ impl AppStateStore {
         behind: u32,
         additions: u32,
         deletions: u32,
+        changed_files: u32,
     ) {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -704,6 +709,7 @@ impl AppStateStore {
             workspace.git_behind = behind;
             workspace.git_additions = additions;
             workspace.git_deletions = deletions;
+            workspace.git_changed_files = changed_files;
         }
     }
 
@@ -1836,6 +1842,7 @@ fn default_app_state() -> AppStateSnapshot {
             git_behind: 0,
             git_additions: 0,
             git_deletions: 0,
+            git_changed_files: 0,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
