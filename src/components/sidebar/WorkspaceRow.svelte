@@ -6,13 +6,15 @@
         isActive,
         onActivate,
         onClose,
-        onMarkRead
+        onMarkRead,
+        onOpenInEditor
     }: {
         workspace: WorkspaceSnapshot;
         isActive: boolean;
         onActivate: () => void;
         onClose: () => void;
         onMarkRead: () => void;
+        onOpenInEditor?: () => void;
     } = $props();
 
 </script>
@@ -77,6 +79,20 @@
             </div>
         {/if}
     </div>
+
+    {#if onOpenInEditor}
+        <button
+            class="row-action row-editor"
+            type="button"
+            aria-label="Open in editor"
+            title="Open in editor"
+            onclick={(e) => { e.stopPropagation(); onOpenInEditor(); }}
+        >
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6M15 3h6v6M10 14L21 3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+        </button>
+    {/if}
 
     <button
         class="row-close"
@@ -259,6 +275,35 @@
 
     .diff-add { color: var(--ui-success); }
     .diff-del { color: var(--ui-danger); }
+
+    .row-action {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        flex: 0 0 24px;
+        background: transparent;
+        border: none;
+        color: var(--ui-text-muted);
+        cursor: pointer;
+        opacity: 0;
+        pointer-events: none;
+        transition:
+            opacity var(--ui-motion-fast),
+            color var(--ui-motion-fast);
+        padding: 0;
+        border-radius: var(--ui-radius-sm);
+    }
+
+    .workspace-row:hover .row-action {
+        opacity: 1;
+        pointer-events: auto;
+    }
+
+    .row-editor:hover {
+        color: var(--ui-accent);
+        background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
+    }
 
     .row-close {
         display: flex;

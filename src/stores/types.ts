@@ -187,6 +187,12 @@ export interface GitBranchInfo {
     behind: number;
 }
 
+export interface EditorInfo {
+    id: string;
+    name: string;
+    command: string;
+}
+
 export type TabKind = 'terminal' | 'browser' | 'diff';
 
 export interface TabSnapshot {

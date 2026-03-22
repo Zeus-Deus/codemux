@@ -22,6 +22,8 @@
         createTab,
         closeTab,
         activateTab,
+        detectEditors,
+        openInEditor,
     } from './stores/workspace';
     import type { SurfaceSnapshot, WorkspaceSnapshot, TabKind } from './stores/types';
     import PaneNode from './components/panes/PaneNode.svelte';
@@ -186,6 +188,13 @@
                 }
                 return;
             }
+        }
+
+        if (event.shiftKey && event.key.toLowerCase() === 'e' && !event.altKey) {
+            event.preventDefault();
+            const cws = currentWorkspace();
+            if (cws) void detectEditors().then((eds) => { if (eds.length > 0) void openInEditor(eds[0].id, cws.cwd); });
+            return;
         }
 
         if (event.shiftKey && event.key.toLowerCase() === 'j') { event.preventDefault(); void cyclePane(1); return; }

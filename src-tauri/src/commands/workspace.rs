@@ -15,7 +15,9 @@ use crate::state::{
 };
 use crate::terminal;
 use notify_rust::Notification;
+use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tauri::{Manager, State};
 
 fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
@@ -507,5 +509,66 @@ pub fn refresh_workspace_git_info(
     let cwd = workspace.cwd.clone();
     populate_git_info(&state, &workspace_id, Path::new(&cwd));
     crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+// ---- Editor integration ----
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EditorInfo {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+}
+
+static DETECTED_EDITORS: OnceLock<Vec<EditorInfo>> = OnceLock::new();
+
+const EDITOR_CANDIDATES: &[(&str, &str)] = &[
+    ("code", "VS Code"),
+    ("cursor", "Cursor"),
+    ("codium", "VSCodium"),
+    ("zed", "Zed"),
+    ("idea", "IntelliJ IDEA"),
+    ("goland", "GoLand"),
+    ("webstorm", "WebStorm"),
+    ("sublime_text", "Sublime Text"),
+];
+
+fn find_editors() -> Vec<EditorInfo> {
+    EDITOR_CANDIDATES
+        .iter()
+        .filter(|(cmd, _)| {
+            std::process::Command::new("which")
+                .arg(cmd)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        .map(|(cmd, name)| EditorInfo {
+            id: cmd.to_string(),
+            name: name.to_string(),
+            command: cmd.to_string(),
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn detect_editors() -> Vec<EditorInfo> {
+    DETECTED_EDITORS.get_or_init(find_editors).clone()
+}
+
+#[tauri::command]
+pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
+    let editors = DETECTED_EDITORS.get_or_init(find_editors);
+    let editor = editors
+        .iter()
+        .find(|e| e.id == editor_id)
+        .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
+    std::process::Command::new(&editor.command)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())
 }

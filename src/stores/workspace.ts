@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { appState, syncAppState } from './core';
 import type {
     AppStateSnapshot,
+    EditorInfo,
     LayoutPreset,
     TabKind,
     WorkspaceTemplateKind,
@@ -151,4 +152,12 @@ export async function refreshWorkspaceState() {
 
 export async function killPort(port: number) {
     return invoke('kill_port', { port });
+}
+
+export async function detectEditors() {
+    return invoke<EditorInfo[]>('detect_editors');
+}
+
+export async function openInEditor(editorId: string, path: string) {
+    return invoke<void>('open_in_editor', { editorId, path });
 }

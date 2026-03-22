@@ -1,5 +1,6 @@
 <script lang="ts">
     import { appState } from '../../stores/core';
+    import { onMount } from 'svelte';
     import {
         activateWorkspace,
         closeWorkspace,
@@ -8,8 +9,10 @@
         createTerminalSession,
         notifyAttention,
         setNotificationSoundEnabled,
+        detectEditors,
+        openInEditor,
     } from '../../stores/workspace';
-    import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
+    import type { EditorInfo, LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
     import { findActiveSessionId } from '../../lib/paneTree';
     import WorkspaceRow from './WorkspaceRow.svelte';
     import NotificationsSection from './NotificationsSection.svelte';
@@ -20,6 +23,21 @@
     import { errorMessage, showUiNotice } from '../../stores/uiNotice';
 
     let { windowFocused }: { windowFocused: boolean } = $props();
+
+    let editors = $state<EditorInfo[]>([]);
+
+    onMount(() => {
+        detectEditors().then((result) => { editors = result; }).catch(() => {});
+    });
+
+    function handleOpenInEditor(cwd: string) {
+        if (editors.length === 1) {
+            void openInEditor(editors[0].id, cwd);
+        } else if (editors.length > 1) {
+            // Default to first editor; multi-editor dropdown can be added later
+            void openInEditor(editors[0].id, cwd);
+        }
+    }
 
     let renamingWorkspaceId = $state<string | null>(null);
     let renameDraft = $state('');
@@ -238,6 +256,7 @@
                     onActivate={() => handleActivateWorkspace(workspace.workspace_id)}
                     onClose={() => handleCloseWorkspace(workspace.workspace_id)}
                     onMarkRead={() => handleMarkRead(workspace.workspace_id)}
+                    onOpenInEditor={editors.length > 0 ? () => handleOpenInEditor(workspace.cwd) : undefined}
                 />
             {/each}
         {:else}

@@ -210,6 +210,8 @@ pub fn run() {
             commands::update_workspace_cwd,
             commands::close_workspace,
             commands::cycle_workspace,
+            commands::detect_editors,
+            commands::open_in_editor,
             commands::split_pane,
             commands::activate_pane,
             commands::cycle_pane,
