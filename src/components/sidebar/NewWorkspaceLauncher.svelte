@@ -27,7 +27,9 @@
     let creating = $state(false);
 
     // Git state
-    let isGitRepo = $state(true);
+    let isGitRepo = $state(false);
+    let repoLoading = $state(false);
+    let repoError = $state('');
     let currentBranch = $state('main');
     let localBranches = $state<string[]>([]);
     let remoteBranches = $state<string[]>([]);
@@ -71,8 +73,8 @@
     });
 
     function canCreate(): boolean {
-        if (source === 'new_branch') return newBranchName.trim().length > 0;
-        if (source === 'existing_branch') return selectedBranch.length > 0;
+        if (source === 'new_branch') return isGitRepo && projectCwd.length > 0 && newBranchName.trim().length > 0;
+        if (source === 'existing_branch') return isGitRepo && projectCwd.length > 0 && selectedBranch.length > 0;
         if (source === 'folder') return selectedFolder.trim().length > 0;
         if (source === 'openflow') return openflowTitle.trim().length > 0 && openflowGoal.trim().length > 0;
         return false;
@@ -127,51 +129,67 @@
         if (typeof selection === 'string') selectedFolder = selection;
     }
 
+    async function chooseRepo() {
+        const selection = await invoke<string | null>('pick_folder_dialog', { title: 'Choose repository' });
+        if (typeof selection === 'string') {
+            projectCwd = selection;
+            selectedBranch = '';
+            newBranchName = '';
+            await loadRepoBranches(selection);
+        }
+    }
+
+    async function loadRepoBranches(path: string) {
+        repoLoading = true;
+        repoError = '';
+        localBranches = [];
+        remoteBranches = [];
+        branchStatusMap = new Map();
+
+        try {
+            const info = await getGitBranchInfo(path);
+            currentBranch = info.branch ?? 'main';
+            baseBranch = currentBranch;
+            const [local, remote] = await Promise.all([
+                listBranches(path, false),
+                listBranches(path, true),
+            ]);
+            localBranches = local;
+            remoteBranches = remote.filter(b => !local.includes(b));
+            isGitRepo = true;
+
+            // Build branch status map
+            const worktrees = await listWorktrees(path).catch(() => []);
+            const workspaces = $appState?.workspaces ?? [];
+            const statusMap = new Map<string, { status: BranchStatus; workspaceId?: string; worktreePath?: string }>();
+
+            for (const ws of workspaces) {
+                if (ws.git_branch) {
+                    statusMap.set(ws.git_branch, { status: 'has_workspace', workspaceId: ws.workspace_id });
+                }
+            }
+
+            for (const wt of worktrees) {
+                if (wt.branch && !statusMap.has(wt.branch)) {
+                    statusMap.set(wt.branch, { status: 'has_orphan_worktree', worktreePath: wt.path });
+                }
+            }
+
+            branchStatusMap = statusMap;
+        } catch {
+            isGitRepo = false;
+            repoError = 'Not a git repository';
+        } finally {
+            repoLoading = false;
+        }
+    }
+
     onMount(async () => {
-        // Get cwd from the active workspace
         const activeWs = $appState?.workspaces.find(w => w.workspace_id === $appState?.active_workspace_id);
         projectCwd = activeWs?.cwd ?? '';
 
         if (projectCwd) {
-            try {
-                const branchInfo = await getGitBranchInfo(projectCwd);
-                currentBranch = branchInfo.branch ?? 'main';
-                baseBranch = currentBranch;
-                const [local, remote] = await Promise.all([
-                    listBranches(projectCwd, false),
-                    listBranches(projectCwd, true),
-                ]);
-                localBranches = local;
-                remoteBranches = remote.filter(b => !local.includes(b));
-                isGitRepo = true;
-
-                // Build branch status map
-                const worktrees = await listWorktrees(projectCwd).catch(() => []);
-                const workspaces = $appState?.workspaces ?? [];
-                const statusMap = new Map<string, { status: BranchStatus; workspaceId?: string; worktreePath?: string }>();
-
-                // Map workspace branches
-                for (const ws of workspaces) {
-                    if (ws.git_branch) {
-                        statusMap.set(ws.git_branch, { status: 'has_workspace', workspaceId: ws.workspace_id });
-                    }
-                }
-
-                // Map worktree branches (only if not already a workspace)
-                for (const wt of worktrees) {
-                    if (wt.branch && !statusMap.has(wt.branch)) {
-                        statusMap.set(wt.branch, { status: 'has_orphan_worktree', worktreePath: wt.path });
-                    }
-                }
-
-                branchStatusMap = statusMap;
-            } catch {
-                isGitRepo = false;
-                source = 'folder';
-            }
-        } else {
-            isGitRepo = false;
-            source = 'folder';
+            await loadRepoBranches(projectCwd);
         }
 
         if (initialKind === 'openflow') source = 'openflow';
@@ -200,14 +218,12 @@
 
         <!-- Source selection -->
         <div class="source-row">
-            {#if isGitRepo}
-                <button class="source-btn" class:active={source === 'new_branch'} onclick={() => { source = 'new_branch'; }}>
-                    New branch
-                </button>
-                <button class="source-btn" class:active={source === 'existing_branch'} onclick={() => { source = 'existing_branch'; }}>
-                    Existing branch
-                </button>
-            {/if}
+            <button class="source-btn" class:active={source === 'new_branch'} onclick={() => { source = 'new_branch'; }}>
+                New branch
+            </button>
+            <button class="source-btn" class:active={source === 'existing_branch'} onclick={() => { source = 'existing_branch'; }}>
+                Existing branch
+            </button>
             <button class="source-btn" class:active={source === 'folder'} onclick={() => { source = 'folder'; }}>
                 Local folder
             </button>
@@ -217,26 +233,49 @@
         </div>
 
         <div class="launcher-body">
+            <!-- Repo picker for branch modes -->
+            {#if source === 'new_branch' || source === 'existing_branch'}
+                <div class="field-group">
+                    <label class="field-label">Repository</label>
+                    <div class="folder-row">
+                        <input class="field-input" type="text" value={projectCwd} placeholder="Select a git repository" readonly />
+                        <button class="secondary-btn" type="button" onclick={chooseRepo}>
+                            {projectCwd ? 'Change' : 'Browse'}
+                        </button>
+                    </div>
+                    {#if repoError}
+                        <span class="repo-error">{repoError}</span>
+                    {/if}
+                </div>
+            {/if}
+
             <!-- Branch config -->
             {#if source === 'new_branch'}
-                <div class="field-group">
-                    <label class="field-label">Branch name</label>
-                    <input
-                        class="field-input"
-                        type="text"
-                        placeholder="feature/my-feature"
-                        bind:value={newBranchName}
-                    />
-                </div>
-                <div class="field-group">
-                    <label class="field-label">Base branch</label>
-                    <select class="field-select" bind:value={baseBranch}>
-                        {#each localBranches as branch}
-                            <option value={branch}>{branch}</option>
-                        {/each}
-                    </select>
-                </div>
+                {#if isGitRepo}
+                    <div class="field-group">
+                        <label class="field-label">Branch name</label>
+                        <input
+                            class="field-input"
+                            type="text"
+                            placeholder="feature/my-feature"
+                            bind:value={newBranchName}
+                        />
+                    </div>
+                    <div class="field-group">
+                        <label class="field-label">Base branch</label>
+                        <select class="field-select" bind:value={baseBranch}>
+                            {#each localBranches as branch}
+                                <option value={branch}>{branch}</option>
+                            {/each}
+                        </select>
+                    </div>
+                {:else if !repoError}
+                    <div class="repo-placeholder">Select a repository to configure branches</div>
+                {/if}
             {:else if source === 'existing_branch'}
+                {#if !isGitRepo && !repoError}
+                    <div class="repo-placeholder">Select a repository to see branches</div>
+                {:else if isGitRepo}
                 <div class="field-group">
                     <label class="field-label">Search branches</label>
                     <input
@@ -285,6 +324,7 @@
                         <div class="branch-empty">No matching branches</div>
                     {/if}
                 </div>
+                {/if}
             {:else if source === 'folder'}
                 <div class="field-group">
                     <label class="field-label">Folder</label>
@@ -622,5 +662,17 @@
     .primary-btn:disabled {
         opacity: 0.5;
         cursor: not-allowed;
+    }
+
+    .repo-error {
+        font-size: 0.74rem;
+        color: var(--ui-danger);
+    }
+
+    .repo-placeholder {
+        padding: 16px;
+        text-align: center;
+        color: var(--ui-text-muted);
+        font-size: 0.8rem;
     }
 </style>
