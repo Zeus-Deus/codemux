@@ -253,6 +253,12 @@ pub struct WorkspaceSnapshot {
     #[serde(default)]
     pub worktree_path: Option<String>,
     #[serde(default)]
+    pub pr_number: Option<u32>,
+    #[serde(default)]
+    pub pr_state: Option<String>,
+    #[serde(default)]
+    pub pr_url: Option<String>,
+    #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab_id: String,
@@ -451,6 +457,9 @@ impl AppStateStore {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -612,6 +621,9 @@ impl AppStateStore {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -726,6 +738,25 @@ impl AppStateStore {
             workspace.git_additions = additions;
             workspace.git_deletions = deletions;
             workspace.git_changed_files = changed_files;
+        }
+    }
+
+    pub fn update_workspace_pr_info(
+        &self,
+        workspace_id: &str,
+        pr_number: Option<u32>,
+        pr_state: Option<String>,
+        pr_url: Option<String>,
+    ) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.pr_number = pr_number;
+            workspace.pr_state = pr_state;
+            workspace.pr_url = pr_url;
         }
     }
 
@@ -2000,6 +2031,9 @@ fn default_app_state() -> AppStateSnapshot {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {

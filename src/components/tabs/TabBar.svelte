@@ -6,7 +6,7 @@
         tabs: TabSnapshot[];
         activeTabId: string;
         workspaceId: string;
-        rightPanelTab?: 'changes' | 'files' | null;
+        rightPanelTab?: 'changes' | 'files' | 'pr' | null;
         changesCount?: number;
     } = $props();
 

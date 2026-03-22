@@ -6,6 +6,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod git;
+pub mod github;
 pub mod control;
 pub mod diagnostics;
 pub mod execution;
@@ -117,6 +118,16 @@ pub fn run() {
                         let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
                         state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions, changed_files);
                         state::emit_app_state(&git_handle);
+
+                        // Only fetch PR info if gh CLI is available
+                        if github::gh_available() {
+                            let pr_info = github::get_branch_pr(&path).ok().flatten();
+                            let pr_number = pr_info.as_ref().map(|p| p.number);
+                            let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+                            let pr_url = pr_info.as_ref().map(|p| p.url.clone());
+                            state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+                            state::emit_app_state(&git_handle);
+                        }
                     }
                 }
             });
@@ -306,6 +317,14 @@ pub fn run() {
             commands::create_worktree,
             commands::remove_worktree,
             commands::list_worktrees,
+            commands::check_gh_available,
+            commands::check_gh_status,
+            commands::check_github_repo,
+            commands::get_branch_pull_request,
+            commands::create_pull_request,
+            commands::list_pull_requests,
+            commands::merge_pull_request,
+            commands::get_pull_request_checks,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,

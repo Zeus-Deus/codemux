@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod files;
 pub mod git;
+pub mod github;
 pub mod openflow;
 pub mod presets;
 pub mod workspace;
@@ -8,6 +9,7 @@ pub mod workspace;
 pub use browser::*;
 pub use files::*;
 pub use git::*;
+pub use github::*;
 pub use openflow::*;
 pub use presets::*;
 pub use workspace::*;

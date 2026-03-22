@@ -34,6 +34,8 @@
     import BrowserPane from './components/panes/BrowserPane.svelte';
     import ChangesPanel from './components/changes/ChangesPanel.svelte';
     import FileTreePanel from './components/files/FileTreePanel.svelte';
+    import PrPanel from './components/pr/PrPanel.svelte';
+    import { initGhStatus } from './stores/github';
     import SearchPanel from './components/search/SearchPanel.svelte';
     import FileSearch from './components/search/FileSearch.svelte';
     import PresetBar from './components/presets/PresetBar.svelte';
@@ -57,7 +59,7 @@
     let editingPreset = $state<TerminalPreset | null | undefined>(undefined);
     // undefined = editor closed, null = create mode, TerminalPreset = edit mode
 
-    type RightPanelTab = 'changes' | 'files';
+    type RightPanelTab = 'changes' | 'files' | 'pr';
     let rightPanelTab = $state(new Map<string, RightPanelTab | null>());
     let rightPanelWidth = $state(320);
     let isPanelDragging = $state(false);
@@ -199,6 +201,9 @@
             if (event.shiftKey && event.key.toLowerCase() === 'g' && !event.altKey) {
                 event.preventDefault(); toggleRightPanel(ws.workspace_id, 'changes'); return;
             }
+            if (event.shiftKey && event.key.toLowerCase() === 'r' && !event.altKey) {
+                event.preventDefault(); toggleRightPanel(ws.workspace_id, 'pr'); return;
+            }
             if (event.key.toLowerCase() === 'b' && !event.shiftKey && !event.altKey) {
                 event.preventDefault(); toggleRightPanel(ws.workspace_id, 'files'); return;
             }
@@ -243,6 +248,7 @@
         initProjectMemory();
         initOpenFlowRuntime();
         initPresets();
+        initGhStatus();
 
         const themeUnsub = theme.subscribe((t) => applyThemeVars(t ?? fallbackTheme));
         const shellAppearanceUnsub = shellAppearance.subscribe((appearance: ShellAppearance | null) => {
@@ -360,6 +366,16 @@
                                                         >
                                                             Files
                                                         </button>
+                                                        <button
+                                                            class="rp-tab"
+                                                            class:active={getRightPanelTab(workspace.workspace_id) === 'pr'}
+                                                            onclick={() => setRightPanelTab(workspace.workspace_id, 'pr')}
+                                                        >
+                                                            PR
+                                                            {#if workspace.pr_number}
+                                                                <span class="rp-tab-count">#{workspace.pr_number}</span>
+                                                            {/if}
+                                                        </button>
                                                         <div class="rp-tab-spacer"></div>
                                                         <button
                                                             class="rp-tab-close"
@@ -374,6 +390,11 @@
                                                     <div class="right-panel-content">
                                                         {#if getRightPanelTab(workspace.workspace_id) === 'changes'}
                                                             <ChangesPanel
+                                                                workspaceCwd={workspace.cwd}
+                                                                onClose={() => setRightPanelTab(workspace.workspace_id, null)}
+                                                            />
+                                                        {:else if getRightPanelTab(workspace.workspace_id) === 'pr'}
+                                                            <PrPanel
                                                                 workspaceCwd={workspace.cwd}
                                                                 onClose={() => setRightPanelTab(workspace.workspace_id, null)}
                                                             />

@@ -199,6 +199,32 @@ export interface WorktreeInfo {
     is_bare: boolean;
 }
 
+export interface PullRequestInfo {
+    number: number;
+    url: string;
+    state: string;
+    title: string;
+    head_branch: string | null;
+    base_branch: string | null;
+    is_draft: boolean;
+    mergeable: string | null;
+    additions: number | null;
+    deletions: number | null;
+    review_decision: string | null;
+    checks_passing: boolean | null;
+}
+
+export interface CheckInfo {
+    name: string;
+    status: string;
+    conclusion: string | null;
+}
+
+export type GhStatus =
+    | { status: 'NotInstalled' }
+    | { status: 'NotAuthenticated' }
+    | { status: 'Authenticated'; username: string };
+
 export type TabKind = 'terminal' | 'browser' | 'diff';
 
 export interface TabSnapshot {
@@ -253,6 +279,9 @@ export interface WorkspaceSnapshot {
     notification_count: number;
     latest_agent_state: string | null;
     worktree_path: string | null;
+    pr_number: number | null;
+    pr_state: string | null;
+    pr_url: string | null;
     tabs: TabSnapshot[];
     active_tab_id: string;
     active_surface_id: string;

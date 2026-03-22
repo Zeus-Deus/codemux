@@ -1,5 +1,6 @@
 <script lang="ts">
     import type { WorkspaceSnapshot, WorkspaceSectionSnapshot } from '../../stores/types';
+    import { ghStatus } from '../../stores/github';
     import { onMount } from 'svelte';
 
     let {
@@ -98,6 +99,9 @@
                     <path d="M6 3v12M18 9v12M6 3C6 3 6 9 12 9s6-6 6-6M6 15c0 0 0 6 6 6s6-6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 </svg>
                 <span class="meta-branch">{workspace.git_branch}</span>
+                {#if workspace.pr_number && $ghStatus.status === 'Authenticated'}
+                    <span class="pr-badge" class:open={workspace.pr_state === 'OPEN'} class:merged={workspace.pr_state === 'MERGED'} class:closed={workspace.pr_state === 'CLOSED'}>#{workspace.pr_number}</span>
+                {/if}
                 {#if workspace.git_additions > 0 || workspace.git_deletions > 0}
                     <span class="meta-sep">·</span>
                     {#if workspace.git_additions > 0}
@@ -331,6 +335,28 @@
         overflow: hidden;
         text-overflow: ellipsis;
         min-width: 0;
+    }
+
+    .pr-badge {
+        font-family: var(--ui-font-mono);
+        font-size: 0.68rem;
+        font-weight: 600;
+        padding: 0 5px;
+        border-radius: 3px;
+        background: color-mix(in srgb, var(--ui-accent) 15%, transparent);
+        color: var(--ui-accent);
+        flex-shrink: 0;
+        white-space: nowrap;
+    }
+
+    .pr-badge.merged {
+        color: #a371f7;
+        background: color-mix(in srgb, #a371f7 15%, transparent);
+    }
+
+    .pr-badge.closed {
+        color: var(--ui-danger);
+        background: color-mix(in srgb, var(--ui-danger) 15%, transparent);
     }
 
     .meta-sep {

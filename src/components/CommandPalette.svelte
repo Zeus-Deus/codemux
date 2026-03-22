@@ -12,6 +12,7 @@
     } from '../stores/workspace';
     import { SECTION_PRESET_COLORS } from '../stores/types';
     import { getGitStatus, stageFiles, pushChanges } from '../stores/git';
+    import { ghStatus } from '../stores/github';
     import type { EditorInfo } from '../stores/types';
 
     let { onClose }: { onClose: () => void } = $props();
@@ -145,6 +146,25 @@
                 label: 'Push',
                 execute: () => { void pushChanges(ws.cwd); }
             });
+        }
+
+        // Pull Request (only when gh is authenticated)
+        if ($ghStatus.status === 'Authenticated') {
+            actions.push({
+                id: 'pr-panel',
+                group: 'Pull Request',
+                label: ws?.pr_number ? 'View Pull Request' : 'Create Pull Request',
+                shortcut: 'Ctrl+Shift+R',
+                execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', ctrlKey: true, shiftKey: true, bubbles: true })); }
+            });
+            if (ws?.pr_number && ws?.pr_state === 'OPEN') {
+                actions.push({
+                    id: 'merge-pr',
+                    group: 'Pull Request',
+                    label: 'Merge Pull Request',
+                    execute: () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', ctrlKey: true, shiftKey: true, bubbles: true })); }
+                });
+            }
         }
 
         // Search
