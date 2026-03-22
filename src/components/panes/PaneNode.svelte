@@ -511,12 +511,12 @@
 
     .split-pane {
         display: grid;
-        gap: 4px;
+        gap: 2px;
         width: 100%;
         height: 100%;
         min-width: 0;
         min-height: 0;
-        padding: 4px;
+        padding: 2px;
         box-sizing: border-box;
         background: var(--ui-layer-0);
     }
@@ -549,8 +549,8 @@
         width: 100%;
         height: 100%;
         overflow: hidden;
-        border: 1px solid var(--ui-border-soft);
-        border-radius: var(--ui-radius-lg, 10px);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 2px;
         background: var(--ui-layer-0);
         transition:
             border-color var(--ui-motion-fast),
@@ -558,10 +558,7 @@
     }
 
     .pane-shell.active {
-        border-color: color-mix(in srgb, var(--ui-accent) 32%, transparent);
-        box-shadow:
-            0 0 0 1px color-mix(in srgb, var(--ui-accent) 14%, transparent),
-            inset 0 0 0 1px color-mix(in srgb, var(--ui-accent) 8%, transparent);
+        border-color: color-mix(in srgb, var(--ui-accent) 50%, transparent);
     }
 
     .pane-shell.dragging {
@@ -600,7 +597,7 @@
         align-items: center;
         justify-content: center;
         gap: 8px;
-        border-radius: 12px;
+        border-radius: 2px;
         pointer-events: none;
         text-align: center;
         backdrop-filter: blur(4px);
@@ -645,11 +642,11 @@
         align-items: center;
         justify-content: space-between;
         gap: 8px;
-        padding: 6px 8px 6px 10px;
+        padding: 4px 8px;
         border-bottom: 1px solid var(--ui-border-soft);
         background: color-mix(in srgb, var(--ui-layer-1) 80%, transparent 20%);
         flex: 0 0 auto;
-        min-height: 34px;
+        min-height: 28px;
         cursor: grab;
         transition: background var(--ui-motion-fast);
     }
@@ -677,7 +674,7 @@
     }
 
     .pane-title {
-        font-size: 0.8rem;
+        font-size: 0.75rem;
         font-weight: 600;
         color: var(--ui-text-primary);
         white-space: nowrap;
@@ -686,7 +683,7 @@
     }
 
     .pane-subtitle {
-        font-size: 0.7rem;
+        font-size: 0.68rem;
         color: var(--ui-text-muted);
         white-space: nowrap;
     }
@@ -718,10 +715,10 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 24px;
-        height: 24px;
+        width: 20px;
+        height: 20px;
         border: 1px solid transparent;
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
         cursor: pointer;
@@ -768,7 +765,7 @@
         position: absolute;
         z-index: 20;
         border: 0;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         transition: background var(--ui-motion-fast);
         padding: 0;

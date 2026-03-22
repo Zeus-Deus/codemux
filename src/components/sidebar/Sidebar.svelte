@@ -307,7 +307,7 @@
         display: flex;
         flex-direction: column;
         gap: 6px;
-        padding: 14px 12px 10px;
+        padding: 10px 12px 8px;
         flex-shrink: 0;
     }
 
@@ -330,7 +330,7 @@
         height: 10px;
         background: var(--ui-accent);
         transform: rotate(45deg);
-        border-radius: 2px;
+        border-radius: var(--ui-radius-sm);
         flex-shrink: 0;
         box-shadow: 0 0 8px color-mix(in srgb, var(--ui-accent) 60%, transparent);
     }
@@ -350,7 +350,7 @@
         height: 26px;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-muted);
         cursor: pointer;
         transition:
@@ -416,7 +416,7 @@
         box-sizing: border-box;
         background: var(--ui-layer-2);
         border: 1px solid color-mix(in srgb, var(--ui-accent) 36%, transparent);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.9rem;
@@ -455,7 +455,7 @@
         padding: 4px 9px;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         font: inherit;
         font-size: 0.72rem;
@@ -519,7 +519,7 @@
         padding: 7px 14px;
         background: color-mix(in srgb, var(--ui-accent) 12%, transparent);
         border: 1px solid color-mix(in srgb, var(--ui-accent) 28%, transparent);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-accent);
         font: inherit;
         font-size: 0.8rem;
@@ -563,7 +563,7 @@
 
     .sidebar-sections::-webkit-scrollbar-thumb {
         background: var(--ui-border-soft);
-        border-radius: 2px;
+        border-radius: var(--ui-radius-sm);
     }
 
     /* ---- Footer ---- */
@@ -603,7 +603,7 @@
         padding: 3px 7px;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         font: inherit;
         font-size: 0.68rem;

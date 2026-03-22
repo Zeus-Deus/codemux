@@ -389,7 +389,7 @@
         padding: 6px 12px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 20px;
+        border-radius: var(--ui-radius-lg);
         font-size: 0.75rem;
         font-weight: 700;
         color: var(--ui-text-muted);
@@ -415,7 +415,7 @@
         padding: 10px 20px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.9rem;
@@ -467,7 +467,7 @@
         display: flex;
         flex-direction: column;
         overflow: hidden;
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
     }
 
 </style>

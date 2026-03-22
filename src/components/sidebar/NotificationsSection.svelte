@@ -91,7 +91,7 @@
         letter-spacing: 0.04em;
         text-transform: uppercase;
         cursor: pointer;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         transition:
             background var(--ui-motion-fast),
             color var(--ui-motion-fast);
@@ -115,7 +115,7 @@
         min-width: 18px;
         height: 18px;
         padding: 0 5px;
-        border-radius: 9px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-attention);
         color: #0d1117;
         font-size: 0.66rem;
@@ -158,7 +158,7 @@
         align-items: baseline;
         gap: 7px;
         padding: 6px 8px;
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         transition: background var(--ui-motion-fast);
     }
@@ -213,7 +213,7 @@
         align-self: flex-start;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         font: inherit;
         font-size: 0.74rem;

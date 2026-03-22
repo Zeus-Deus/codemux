@@ -337,7 +337,7 @@
         max-height: min(760px, calc(100dvh - 48px));
         overflow: auto;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 12px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-1);
         color: var(--ui-text-primary);
         box-shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
@@ -394,7 +394,7 @@
     .primary-button,
     .secondary-button {
         border: 1px solid var(--ui-border-soft);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         background: var(--ui-layer-2);
         color: var(--ui-text-primary);
         padding: 8px 10px;
@@ -486,7 +486,7 @@
         padding: 14px;
         text-align: left;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-2);
         color: inherit;
         cursor: pointer;
@@ -527,7 +527,7 @@
 
     .layout-preview span {
         min-height: 22px;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         border: 1px solid var(--ui-border-soft);
         background: var(--ui-layer-0);
     }
@@ -552,7 +552,7 @@
     .details-note {
         padding: 12px;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-2);
     }
 
@@ -580,7 +580,7 @@
         width: 100%;
         box-sizing: border-box;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         background: var(--ui-layer-0);
         color: var(--ui-text-primary);
         padding: 10px;

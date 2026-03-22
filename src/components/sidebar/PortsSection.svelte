@@ -163,7 +163,7 @@
         letter-spacing: 0.04em;
         text-transform: uppercase;
         cursor: pointer;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         transition:
             background var(--ui-motion-fast),
             color var(--ui-motion-fast);
@@ -187,7 +187,7 @@
         min-width: 18px;
         height: 18px;
         padding: 0 5px;
-        border-radius: 9px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-accent);
         color: #0d1117;
         font-size: 0.66rem;
@@ -238,7 +238,7 @@
         align-items: center;
         gap: 4px;
         background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         padding: 2px 4px 2px 8px;
         transition: background var(--ui-motion-fast);
     }
@@ -285,7 +285,7 @@
         height: 20px;
         background: transparent;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         cursor: pointer;
         padding: 0;

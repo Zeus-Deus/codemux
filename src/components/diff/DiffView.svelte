@@ -227,7 +227,7 @@
     .diff-view-empty .empty-icon {
         width: 56px;
         height: 56px;
-        border-radius: 14px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
         display: flex;

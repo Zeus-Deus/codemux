@@ -253,7 +253,7 @@
         min-height: 300px;
         height: 100%;
         background: var(--ui-layer-1, #161616);
-        border-radius: 12px;
+        border-radius: var(--ui-radius-lg);
         border: 1px solid var(--ui-border-soft, #333);
         overflow: auto;
     }

@@ -151,9 +151,10 @@ Subtle always. No bounces, springs, or attention-seeking motion. `ease-out` for 
 ### Spacing
 
 - Base unit: 4px. All spacings multiples of 4: 4, 8, 12, 16, 20, 24, 32.
-- Pane gap: 4px (CSS Grid gap).
-- Pane container padding: 4px.
-- Pane border-radius: `var(--ui-radius-lg)` (10px).
+- Pane gap: 2px (CSS Grid gap).
+- Pane container padding: 2px.
+- Pane border-radius: `var(--ui-radius-lg)` (8px).
+- Radius tokens: `--ui-radius-sm: 4px`, `--ui-radius-md: 6px`, `--ui-radius-lg: 8px`.
 - Compact elements: 8-12px padding. Spacious sections: 16-24px.
 
 ### Typography

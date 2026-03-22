@@ -96,14 +96,14 @@
         position: relative;
         display: flex;
         align-items: stretch;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         cursor: pointer;
         overflow: hidden;
         transition:
             background var(--ui-motion-fast),
             box-shadow var(--ui-motion-fast);
         outline: none;
-        min-height: 44px;
+        min-height: 38px;
         user-select: none;
     }
 
@@ -128,7 +128,7 @@
         flex: 0 0 2px;
         background: transparent;
         transition: background var(--ui-motion-fast);
-        border-radius: 2px 0 0 2px;
+        border-radius: var(--ui-radius-sm) 0 0 var(--ui-radius-sm);
     }
 
     .workspace-row.active .row-accent {
@@ -206,7 +206,7 @@
         min-width: 18px;
         height: 18px;
         padding: 0 5px;
-        border-radius: 9px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-attention);
         color: #0d1117;
         font-size: 0.66rem;
@@ -276,7 +276,7 @@
             opacity var(--ui-motion-fast),
             color var(--ui-motion-fast);
         padding: 0;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
     }
 
     .workspace-row:hover .row-close {

@@ -130,7 +130,7 @@
         padding: 14px 18px;
         background: var(--ui-layer-1, #1a1a1a);
         border: 2px solid var(--status-color, var(--ui-border-soft));
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         min-width: 140px;
         cursor: grab;
         transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;

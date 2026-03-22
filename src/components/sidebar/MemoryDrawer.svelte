@@ -187,7 +187,7 @@
         letter-spacing: 0.04em;
         text-transform: uppercase;
         cursor: pointer;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         transition:
             background var(--ui-motion-fast),
             color var(--ui-motion-fast);
@@ -248,7 +248,7 @@
         padding: 5px 6px;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         font: inherit;
         font-size: 0.74rem;
@@ -281,7 +281,7 @@
         box-sizing: border-box;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.78rem;
@@ -307,7 +307,7 @@
         padding: 6px 12px;
         background: color-mix(in srgb, var(--ui-accent) 14%, var(--ui-layer-2) 86%);
         border: 1px solid color-mix(in srgb, var(--ui-accent) 28%, transparent);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.76rem;
@@ -332,7 +332,7 @@
         padding: 5px 10px;
         background: transparent;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         font: inherit;
         font-size: 0.74rem;

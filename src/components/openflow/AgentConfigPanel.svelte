@@ -384,7 +384,7 @@
         padding: 10px 14px;
         background: color-mix(in srgb, var(--ui-accent-error, #e55) 12%, transparent);
         border: 1px solid var(--ui-accent-error, #e55);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         font-size: 0.85rem;
         color: var(--ui-text-secondary);
     }
@@ -395,7 +395,7 @@
         gap: 16px;
         background: var(--ui-layer-2);
         padding: 24px;
-        border-radius: 12px;
+        border-radius: var(--ui-radius-lg);
         border: 1px solid var(--ui-border-soft);
     }
 
@@ -453,7 +453,7 @@
         align-items: center;
         padding: 12px 16px;
         background: var(--ui-layer-1);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         border: 1px solid var(--ui-border-soft);
         transition: border-color 0.2s ease, background 0.2s ease;
     }
@@ -473,7 +473,7 @@
         padding: 8px 12px;
         background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.95rem;
@@ -510,7 +510,7 @@
         padding: 16px;
         background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
     }
 
     .selected-directory {
@@ -532,7 +532,7 @@
         padding: 10px 20px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.9rem;
@@ -557,7 +557,7 @@
         padding: 16px;
         background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 1rem;
@@ -588,7 +588,7 @@
         padding: 16px 40px;
         background: var(--ui-accent);
         border: none;
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         color: #fff;
         font: inherit;
         font-size: 1.1rem;

@@ -203,7 +203,7 @@
         padding: 2px 8px;
         background: color-mix(in srgb, var(--ui-success) 15%, transparent);
         border: 1px solid color-mix(in srgb, var(--ui-success) 30%, transparent);
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         font-size: 0.65rem;
         font-weight: 600;
         color: var(--ui-success);
@@ -234,7 +234,7 @@
     .message {
         padding: 10px 12px;
         background: var(--ui-layer-2);
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
         font-size: 0.85rem;
     }
 
@@ -272,7 +272,7 @@
         margin-left: 6px;
         padding: 1px 6px;
         background: color-mix(in srgb, var(--ui-success) 20%, transparent);
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         font-size: 0.6rem;
         font-weight: 600;
         color: var(--ui-success);
@@ -312,7 +312,7 @@
         padding: 8px;
         background: color-mix(in srgb, var(--ui-danger) 15%, transparent);
         border: 1px solid var(--ui-danger);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-danger);
         font-size: 0.8rem;
     }
@@ -322,7 +322,7 @@
         padding: 10px 12px;
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: var(--ui-text-primary);
         font: inherit;
         font-size: 0.85rem;
@@ -337,7 +337,7 @@
         padding: 10px 16px;
         background: var(--ui-accent);
         border: none;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         color: #fff;
         font: inherit;
         font-size: 0.85rem;

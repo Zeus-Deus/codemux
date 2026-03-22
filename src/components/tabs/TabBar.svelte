@@ -181,7 +181,6 @@
     }
 
     .tab-item.active {
-        background: var(--ui-layer-2);
         color: var(--ui-text-primary);
         border-bottom: 2px solid var(--ui-accent);
     }
@@ -213,7 +212,7 @@
         height: 20px;
         padding: 0;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
         cursor: pointer;
@@ -277,7 +276,7 @@
         width: 100%;
         padding: 6px 10px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-secondary);
         font-size: 0.8rem;

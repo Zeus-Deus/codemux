@@ -541,7 +541,7 @@
         width: min(440px, 100%);
         padding: 16px;
         border: 1px solid color-mix(in srgb, var(--theme-foreground, #c0caf5) 12%, transparent);
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         background: color-mix(in srgb, var(--theme-background, #1a1b26) 90%, white 10%);
     }
 

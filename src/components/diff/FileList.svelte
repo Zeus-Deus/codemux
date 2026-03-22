@@ -172,14 +172,14 @@
         color: var(--ui-text-muted);
         background: var(--ui-layer-2);
         padding: 1px 6px;
-        border-radius: 8px;
+        border-radius: var(--ui-radius-md);
     }
 
     .section-action {
         margin-left: auto;
         padding: 2px 8px;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
         font-size: 0.68rem;
@@ -216,7 +216,7 @@
         justify-content: center;
         width: 16px;
         height: 16px;
-        border-radius: 3px;
+        border-radius: var(--ui-radius-sm);
         font-family: var(--ui-font-mono);
         font-size: 0.65rem;
         font-weight: 700;
@@ -248,7 +248,7 @@
         height: 20px;
         padding: 0;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-muted);
         cursor: pointer;

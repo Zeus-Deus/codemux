@@ -166,8 +166,8 @@
     .preset-bar {
         display: flex;
         align-items: center;
-        height: 32px;
-        min-height: 32px;
+        height: 28px;
+        min-height: 28px;
         background: var(--ui-layer-1);
         border-bottom: 1px solid var(--ui-border-soft);
         padding: 0 4px;
@@ -186,8 +186,8 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        width: 26px;
-        height: 26px;
+        width: 24px;
+        height: 24px;
         padding: 0;
         border: none;
         border-radius: var(--ui-radius-sm);
@@ -237,12 +237,12 @@
         display: flex;
         align-items: center;
         gap: 5px;
-        padding: 3px 10px;
+        padding: 2px 8px;
         border: 1px solid var(--ui-border-soft);
         border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-secondary);
-        font-size: 0.75rem;
+        font-size: 0.72rem;
         font-family: var(--ui-font-sans);
         cursor: pointer;
         white-space: nowrap;
@@ -288,7 +288,7 @@
         width: 100%;
         padding: 6px 10px;
         border: none;
-        border-radius: 4px;
+        border-radius: var(--ui-radius-sm);
         background: transparent;
         color: var(--ui-text-secondary);
         font-size: 0.8rem;

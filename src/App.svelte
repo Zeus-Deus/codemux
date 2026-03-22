@@ -356,9 +356,9 @@
         --ui-pane-bg-strong: var(--ui-layer-1);
 
         /* ---- Geometry ---- */
-        --ui-radius-sm: 6px;
-        --ui-radius-md: 8px;
-        --ui-radius-lg: 10px;
+        --ui-radius-sm: 4px;
+        --ui-radius-md: 6px;
+        --ui-radius-lg: 8px;
         --ui-sidebar-width: 240px;
 
         /* ---- Motion ---- */
@@ -471,7 +471,7 @@
         gap: 10px;
         max-width: min(520px, calc(100vw - 36px));
         padding: 10px 12px;
-        border-radius: 10px;
+        border-radius: var(--ui-radius-lg);
         border: 1px solid color-mix(in srgb, var(--ui-accent) 26%, transparent);
         background: color-mix(in srgb, var(--ui-layer-2) 92%, black 8%);
         box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
@@ -533,7 +533,7 @@
     .empty-stage-icon {
         width: 48px;
         height: 48px;
-        border-radius: 12px;
+        border-radius: var(--ui-radius-lg);
         background: var(--ui-layer-2);
         border: 1px solid var(--ui-border-soft);
         display: flex;
@@ -601,7 +601,7 @@
         color: var(--ui-layer-0);
         background: var(--ui-accent);
         border: none;
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         cursor: pointer;
         transition: opacity 0.15s;
     }

@@ -421,7 +421,7 @@
         height: 26px;
         background: transparent;
         border: 1px solid transparent;
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         color: var(--ui-text-muted);
         cursor: pointer;
         font: inherit;
@@ -448,7 +448,7 @@
         height: 26px;
         background: var(--ui-layer-0);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 5px;
+        border-radius: var(--ui-radius-sm);
         transition: border-color var(--ui-motion-fast), background var(--ui-motion-fast);
     }
 
@@ -554,7 +554,7 @@
         max-width: min(640px, calc(100% - 24px));
         padding: 8px 10px;
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         background: color-mix(in srgb, var(--ui-layer-1) 90%, transparent 10%);
         box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
         pointer-events: none;
@@ -607,7 +607,7 @@
         padding: 8px 10px;
         background: color-mix(in srgb, var(--ui-layer-2) 80%, transparent 20%);
         border: 1px solid var(--ui-border-soft);
-        border-radius: 6px;
+        border-radius: var(--ui-radius-md);
         opacity: 0.7;
     }
 
