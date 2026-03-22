@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onMount, tick } from 'svelte';
     import { Terminal } from '@xterm/xterm';
     import type { ITheme } from '@xterm/xterm';
     import { FitAddon } from '@xterm/addon-fit';
@@ -13,7 +13,7 @@
 
     type DisposeHandle = { dispose: () => void };
 
-    let { sessionId }: { sessionId: string } = $props();
+    let { sessionId, focused = false, visible = true, title = '' }: { sessionId: string; focused: boolean; visible: boolean; title: string } = $props();
 
     interface TerminalStatusPayload {
         session_id: string;
@@ -22,11 +22,16 @@
         exit_code: number | null;
     }
 
+    let shellContainer: HTMLDivElement;
     let terminalContainer: HTMLDivElement;
     let term: Terminal | null = null;
     let fitAddon: FitAddon | null = null;
     let resizeObserver: ResizeObserver | null = null;
     let resizeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let windowResizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let webglAddon: WebglAddon | null = null;
+    let pendingPtyWrites: Uint8Array[] = [];
+    let ptyWriteFrameId: number | null = null;
     let dataDisposable: DisposeHandle | null = null;
     let resizeHandler: (() => void) | null = null;
     let themeUnsubscribe: (() => void) | null = null;
@@ -44,6 +49,22 @@
         state: 'starting',
         message: 'Starting shell...',
         exit_code: null
+    });
+
+    // Dimension tracking for smart placeholder.
+    // Start large so normal-sized panes mount immediately without flash.
+    let paneWidth = $state(9999);
+    let paneHeight = $state(9999);
+    let showPlaceholder = $state(false);
+
+    // Hysteresis: unmount at <200x100, remount at >220x110 to prevent flickering
+    // when dragging a resize handle near the boundary.
+    $effect(() => {
+        if (paneWidth < 200 || paneHeight < 100) {
+            showPlaceholder = true;
+        } else if (paneWidth > 220 && paneHeight > 110) {
+            showPlaceholder = false;
+        }
     });
 
     $effect(() => {
@@ -125,39 +146,51 @@
         kittyProtocolLevel = Math.max(0, kittyProtocolLevel + pushes - pops);
     }
 
+    function extractBytes(payload: unknown): Uint8Array | null {
+        if (payload instanceof Uint8Array) return payload;
+        if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
+        if (Array.isArray(payload)) return new Uint8Array(payload as number[]);
+        if (typeof payload === 'string') return new TextEncoder().encode(payload);
+        return null;
+    }
+
+    function flushPtyWrites() {
+        ptyWriteFrameId = null;
+        if (!term || pendingPtyWrites.length === 0) return;
+
+        if (pendingPtyWrites.length === 1) {
+            term.write(pendingPtyWrites[0]);
+        } else {
+            let totalLen = 0;
+            for (const chunk of pendingPtyWrites) totalLen += chunk.length;
+            const combined = new Uint8Array(totalLen);
+            let offset = 0;
+            for (const chunk of pendingPtyWrites) {
+                combined.set(chunk, offset);
+                offset += chunk.length;
+            }
+            term.write(combined);
+        }
+        pendingPtyWrites = [];
+    }
+
     function writePtyChunk(payload: unknown) {
-        if (!term) {
-            return;
-        }
+        if (!term) return;
 
-        if (payload instanceof Uint8Array) {
-            scanKittyProtocol(payload);
-            term.write(payload);
-            return;
-        }
+        const bytes = extractBytes(payload);
+        if (!bytes) return;
 
-        if (payload instanceof ArrayBuffer) {
-            const data = new Uint8Array(payload);
-            scanKittyProtocol(data);
-            term.write(data);
-            return;
-        }
+        // Scan protocol immediately — must not be deferred
+        scanKittyProtocol(bytes);
 
-        if (Array.isArray(payload)) {
-            const data = new Uint8Array(payload as number[]);
-            scanKittyProtocol(data);
-            term.write(data);
-            return;
-        }
-
-        if (typeof payload === 'string') {
-            scanKittyProtocol(payload);
-            term.write(payload);
+        pendingPtyWrites.push(bytes);
+        if (ptyWriteFrameId === null) {
+            ptyWriteFrameId = requestAnimationFrame(flushPtyWrites);
         }
     }
 
     async function syncTerminalSize() {
-        if (!term || !fitAddon) {
+        if (!term || !fitAddon || !visible) {
             return;
         }
 
@@ -243,7 +276,11 @@
         await syncTerminalSize();
     }
 
-    onMount(async () => {
+    // Create xterm.js Terminal, load addons, open in container, attach PTY session.
+    // Called on initial mount and when transitioning out of placeholder state.
+    async function mountTerminal() {
+        if (term || !terminalContainer) return;
+
         term = new Terminal({
             fontFamily: getComputedStyle(document.documentElement).getPropertyValue('--shell-font-family').trim() || 'monospace',
             theme: terminalTheme(),
@@ -333,13 +370,13 @@
 
         fitAddon = new FitAddon();
         term.loadAddon(fitAddon);
-        
+
         const clipboardAddon = new ClipboardAddon();
         term.loadAddon(clipboardAddon);
-        
+
         const searchAddon = new SearchAddon();
         term.loadAddon(searchAddon);
-        
+
         term.open(terminalContainer);
 
         // WKWebView (Tauri) does not reliably suppress `input` events on the
@@ -372,33 +409,6 @@
         };
         terminalContainer.addEventListener('input', blockNewlineInput, true);
 
-        try {
-            const webglAddon = new WebglAddon();
-            term.loadAddon(webglAddon);
-        } catch (error) {
-            console.warn('WebGL addon could not be loaded, falling back to canvas/dom renderer', error);
-        }
-
-        themeUnsubscribe = theme.subscribe(() => {
-            applyTerminalTheme();
-        });
-
-        shellAppearanceUnsubscribe = shellAppearance.subscribe((appearance: ShellAppearance | null) => {
-            if (!term) {
-                return;
-            }
-
-            term.options.fontFamily = appearance?.font_family?.trim() || 'monospace';
-            fitAddon?.fit();
-        });
-
-        statusUnlisten = await listen<TerminalStatusPayload>('terminal-status', (event) => {
-            if (event.payload.session_id !== sessionId) {
-                return;
-            }
-            terminalStatus = event.payload;
-        });
-
         let pendingInput = '';
         let inputQueued = false;
 
@@ -424,13 +434,75 @@
         });
 
         await attachSession();
+    }
 
+    // Dispose xterm.js Terminal and terminal-specific resources.
+    // PTY session keeps running — only rendering is affected.
+    function disposeTerminal() {
+        if (attachedSessionId) {
+            void invoke('detach_pty_output', { sessionId: attachedSessionId }).catch((error) => {
+                console.error(`Failed to detach terminal output for ${attachedSessionId}:`, error);
+            });
+            attachedSessionId = null;
+        }
+        if (dataDisposable) {
+            dataDisposable.dispose();
+            dataDisposable = null;
+        }
+        if (ptyWriteFrameId !== null) {
+            cancelAnimationFrame(ptyWriteFrameId);
+            ptyWriteFrameId = null;
+        }
+        pendingPtyWrites = [];
+        webglAddon?.dispose();
+        webglAddon = null;
+        if (blockNewlineInput && terminalContainer) {
+            terminalContainer.removeEventListener('input', blockNewlineInput, true);
+        }
+        blockNewlineInput = null;
+        fitAddon = null;
+        term?.dispose();
+        term = null;
+        kittyProtocolLevel = 0;
+    }
+
+    // Mount/unmount terminal based on placeholder state.
+    // When pane is too small, dispose xterm.js to save rendering resources.
+    // When pane grows back, recreate terminal and reattach (PTY replays buffered output).
+    $effect(() => {
+        if (showPlaceholder) {
+            if (term) disposeTerminal();
+        } else if (!term) {
+            // Use tick() to ensure the {:else} block has rendered and bind:this is set
+            tick().then(() => {
+                if (terminalContainer && !term) {
+                    void mountTerminal();
+                }
+            });
+        }
+    });
+
+    // Always-alive setup: subscriptions, listeners, and ResizeObserver that persist
+    // across placeholder transitions. Terminal-specific setup is in mountTerminal().
+    onMount(async () => {
         resizeHandler = () => {
-            void syncTerminalSize();
+            if (!visible) return;
+            if (windowResizeTimer) clearTimeout(windowResizeTimer);
+            windowResizeTimer = setTimeout(() => {
+                windowResizeTimer = null;
+                void syncTerminalSize();
+            }, 100);
         };
         window.addEventListener('resize', resizeHandler);
 
-        resizeObserver = new ResizeObserver(() => {
+        // Observe the always-present shell container (not terminal-wrapper which is
+        // conditionally rendered) to track pane dimensions and sync terminal size.
+        resizeObserver = new ResizeObserver((entries) => {
+            for (const entry of entries) {
+                paneWidth = entry.contentRect.width;
+                paneHeight = entry.contentRect.height;
+            }
+            if (!visible || showPlaceholder) return;
             if (resizeDebounceTimer !== null) {
                 clearTimeout(resizeDebounceTimer);
             }
@@ -439,7 +511,33 @@
                 void syncTerminalSize();
             }, 150);
         });
-        resizeObserver.observe(terminalContainer);
+        resizeObserver.observe(shellContainer);
+
+        themeUnsubscribe = theme.subscribe(() => {
+            if (!visible) return;
+            applyTerminalTheme();
+        });
+
+        shellAppearanceUnsubscribe = shellAppearance.subscribe((appearance: ShellAppearance | null) => {
+            if (!term || !visible) {
+                return;
+            }
+
+            term.options.fontFamily = appearance?.font_family?.trim() || 'monospace';
+            fitAddon?.fit();
+        });
+
+        statusUnlisten = await listen<TerminalStatusPayload>('terminal-status', (event) => {
+            if (event.payload.session_id !== sessionId) {
+                return;
+            }
+            terminalStatus = event.payload;
+        });
+
+        // Initial terminal mount (placeholder starts false for normal-sized panes)
+        if (!showPlaceholder && terminalContainer && !term) {
+            await mountTerminal();
+        }
     });
 
     $effect(() => {
@@ -451,18 +549,34 @@
         void attachSession();
     });
 
+    $effect(() => {
+        if (!term) return;
+        if (focused && visible) {
+            if (!webglAddon) {
+                try {
+                    webglAddon = new WebglAddon();
+                    webglAddon.onContextLoss(() => {
+                        webglAddon?.dispose();
+                        webglAddon = null;
+                    });
+                    term.loadAddon(webglAddon);
+                } catch {
+                    webglAddon = null;
+                }
+            }
+        } else {
+            if (webglAddon) {
+                webglAddon.dispose();
+                webglAddon = null;
+            }
+        }
+    });
+
     onMount(() => {
         return () => {
-            if (attachedSessionId) {
-                void invoke('detach_pty_output', { sessionId: attachedSessionId }).catch((error) => {
-                    console.error(`Failed to detach terminal output for ${attachedSessionId}:`, error);
-                });
-            }
+            if (term) disposeTerminal();
             if (resizeHandler) {
                 window.removeEventListener('resize', resizeHandler);
-            }
-            if (dataDisposable) {
-                dataDisposable.dispose();
             }
             if (statusUnlisten) {
                 statusUnlisten();
@@ -477,18 +591,23 @@
                 clearTimeout(resizeDebounceTimer);
                 resizeDebounceTimer = null;
             }
-            term?.dispose();
-            resizeObserver?.disconnect();
-            if (blockNewlineInput) {
-                terminalContainer.removeEventListener('input', blockNewlineInput, true);
-                blockNewlineInput = null;
+            if (windowResizeTimer !== null) {
+                clearTimeout(windowResizeTimer);
+                windowResizeTimer = null;
             }
+            resizeObserver?.disconnect();
         };
     });
 </script>
 
-<div class="terminal-shell">
-    <div class="terminal-wrapper" bind:this={terminalContainer}></div>
+<div class="terminal-shell" bind:this={shellContainer}>
+    {#if showPlaceholder}
+        <div class="terminal-placeholder">
+            <span class="placeholder-title">{title || 'shell'}</span>
+        </div>
+    {:else}
+        <div class="terminal-wrapper" bind:this={terminalContainer}></div>
+    {/if}
 
     {#if terminalStatus.state !== 'ready'}
         <div class={`terminal-overlay ${terminalStatus.state}`}>
@@ -525,6 +644,30 @@
         overflow: hidden;
         padding: 6px 8px 8px;
         box-sizing: border-box;
+    }
+
+    .terminal-placeholder {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1;
+        width: 100%;
+        height: 100%;
+        min-width: 0;
+        min-height: 0;
+        background: var(--ui-layer-0, #0d0f11);
+        color: var(--text-muted, #555);
+        font-size: 11px;
+        font-family: var(--shell-font-family, monospace);
+        user-select: none;
+        opacity: 0.7;
+    }
+
+    .placeholder-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        max-width: 90%;
     }
 
     .terminal-overlay {

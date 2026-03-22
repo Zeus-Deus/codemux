@@ -678,7 +678,7 @@ pub fn write_to_pty(
 
 #[tauri::command]
 pub fn resize_pty(
-    app: AppHandle,
+    _app: AppHandle,
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     rows: u16,
@@ -719,7 +719,6 @@ pub fn resize_pty(
     )?;
 
     app_state.update_terminal_session_size(&session_id, cols, rows);
-    state::emit_app_state(&app);
 
     Ok(())
 }

@@ -60,7 +60,7 @@
         { layout: 'pair', label: '2', slots: 2 },
         { layout: 'quad', label: '4', slots: 4 },
         { layout: 'six', label: '6', slots: 6 },
-        { layout: 'eight', label: '8', slots: 8 },
+
         { layout: 'shell_browser', label: 'S+B', slots: 2 },
     ];
 

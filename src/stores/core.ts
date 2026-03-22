@@ -18,7 +18,16 @@ export async function initAppState() {
         console.error('Failed to fetch app state:', error);
     }
 
+    let lastStateJson = '';
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
     await listen<AppStateSnapshot>('app-state-changed', (event) => {
-        appState.set(event.payload);
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            const json = JSON.stringify(event.payload);
+            if (json === lastStateJson) return;
+            lastStateJson = json;
+            appState.set(event.payload);
+        }, 16);
     });
 }

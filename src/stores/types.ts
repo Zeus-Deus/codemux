@@ -163,7 +163,7 @@ export interface OpenFlowCreateRunRequest {
 }
 
 export type WorkspaceTemplateKind = 'codemux' | 'folder' | 'openflow';
-export type LayoutPreset = 'single' | 'pair' | 'quad' | 'six' | 'eight' | 'shell_browser';
+export type LayoutPreset = 'single' | 'pair' | 'quad' | 'six' | 'shell_browser';
 
 export type FileStatus = 'added' | 'modified' | 'deleted' | 'renamed' | 'untracked' | 'copied';
 

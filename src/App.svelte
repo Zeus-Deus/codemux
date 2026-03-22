@@ -25,7 +25,7 @@
         detectEditors,
         openInEditor,
     } from './stores/workspace';
-    import type { SurfaceSnapshot, WorkspaceSnapshot, TabKind } from './stores/types';
+    import type { SurfaceSnapshot, WorkspaceSnapshot, TabKind, PaneNodeSnapshot } from './stores/types';
     import PaneNode from './components/panes/PaneNode.svelte';
     import Sidebar from './components/sidebar/Sidebar.svelte';
     import NewWorkspaceLauncher from './components/sidebar/NewWorkspaceLauncher.svelte';
@@ -127,8 +127,26 @@
         try { await activatePane(paneId); } catch (e) { console.error('activate pane:', e); }
     }
 
+    function countTerminalPanes(node: PaneNodeSnapshot): number {
+        if (node.kind === 'terminal') return 1;
+        if (node.kind === 'browser') return 0;
+        return node.children.reduce((sum, c) => sum + countTerminalPanes(c), 0);
+    }
+
     async function handleSplitPane(paneId: string, direction: 'horizontal' | 'vertical') {
-        try { await splitPane(paneId, direction); } catch (e) { console.error('split pane:', e); showUiNotice(errorMessage(e), 'error'); }
+        try {
+            await splitPane(paneId, direction);
+            const ws = currentWorkspace();
+            if (ws) {
+                const termCount = ws.surfaces.reduce((sum, s) => sum + countTerminalPanes(s.root), 0);
+                if (termCount + 1 >= 7) {
+                    showUiNotice('Performance may be reduced with many terminal panes. Consider using tabs instead.', 'info', 6000);
+                }
+            }
+        } catch (e) {
+            console.error('split pane:', e);
+            showUiNotice(errorMessage(e), 'error');
+        }
     }
 
     async function handleClosePane(paneId: string) {
@@ -329,6 +347,7 @@
                                                         <PaneNode
                                                             node={surface.root}
                                                             activePaneId={surface.active_pane_id}
+                                                            visible={workspace.workspace_id === $appState.active_workspace_id}
                                                             on:activate={(e) => handleActivatePane(e.detail.paneId)}
                                                             on:split={(e) => handleSplitPane(e.detail.paneId, e.detail.direction)}
                                                             on:close={(e) => handleClosePane(e.detail.paneId)}

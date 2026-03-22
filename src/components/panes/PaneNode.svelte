@@ -8,10 +8,12 @@
 
     let {
         node,
-        activePaneId
+        activePaneId,
+        visible = true
     }: {
         node: PaneNodeSnapshot;
         activePaneId: string;
+        visible: boolean;
     } = $props();
 
     const dispatch = createEventDispatcher<{
@@ -387,7 +389,7 @@
             data-pane-title={node.title}
             onclick={() => dispatch('activate', { paneId: node.pane_id })}
         >
-            <TerminalPane sessionId={node.session_id} />
+            <TerminalPane sessionId={node.session_id} focused={isActive(node.pane_id)} {visible} title={node.title} />
         </div>
 
         {#if draggingSelf && activePointerDrag?.sourcePaneId === node.pane_id}
@@ -484,6 +486,7 @@
                 <PaneNode
                     node={child}
                     {activePaneId}
+                    {visible}
                     on:activate={(e) => dispatch('activate', e.detail)}
                     on:split={(e) => dispatch('split', e.detail)}
                     on:close={(e) => dispatch('close', e.detail)}

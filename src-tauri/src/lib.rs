@@ -117,7 +117,6 @@ pub fn run() {
                         let additions = diff_stat.as_ref().map(|s| s.staged_additions + s.unstaged_additions).unwrap_or(0);
                         let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
                         state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions, changed_files);
-                        state::emit_app_state(&git_handle);
 
                         // Only fetch PR info if gh CLI is available
                         if github::gh_available() {
@@ -126,8 +125,10 @@ pub fn run() {
                             let pr_state = pr_info.as_ref().map(|p| p.state.clone());
                             let pr_url = pr_info.as_ref().map(|p| p.url.clone());
                             state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
-                            state::emit_app_state(&git_handle);
                         }
+
+                        // Single emit after both git and PR info are updated
+                        state::emit_app_state(&git_handle);
                     }
                 }
             });
