@@ -16,7 +16,6 @@
         onMarkRead: () => void;
         onOpenInEditor?: () => void;
     } = $props();
-
 </script>
 
 <div

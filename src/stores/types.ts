@@ -369,3 +369,8 @@ export interface PresetStoreSnapshot {
     bar_visible: boolean;
     default_preset_id: string | null;
 }
+
+export interface WorkspaceConfig {
+    setup: string[];
+    teardown: string[];
+}

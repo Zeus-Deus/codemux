@@ -2,10 +2,11 @@
     import { onMount } from 'svelte';
     import { createEventDispatcher } from 'svelte';
     import { invoke } from '@tauri-apps/api/core';
-    import { appState } from '../../stores/core';
-    import { createWorkspaceWithPreset, createWorktreeWorkspace } from '../../stores/workspace';
+    import { appState, syncAppState } from '../../stores/core';
+    import { createWorkspaceWithPreset, createWorktreeWorkspace, activateWorkspace, importWorktreeWorkspace } from '../../stores/workspace';
     import { presetStore, applyPreset } from '../../stores/presets';
-    import { listBranches, getGitBranchInfo } from '../../stores/git';
+    import { listBranches, getGitBranchInfo, listWorktrees } from '../../stores/git';
+    import { showUiNotice } from '../../stores/uiNotice';
     import type { LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
 
     let {
@@ -32,6 +33,10 @@
     let remoteBranches = $state<string[]>([]);
     let branchSearch = $state('');
     let selectedBranch = $state('');
+
+    // Branch status: tracks which branches have workspaces or worktrees
+    type BranchStatus = 'free' | 'has_workspace' | 'has_orphan_worktree';
+    let branchStatusMap = $state<Map<string, { status: BranchStatus; workspaceId?: string; worktreePath?: string }>>(new Map());
 
     // New branch
     let newBranchName = $state('');
@@ -81,8 +86,19 @@
                 const wsId = await createWorktreeWorkspace(projectCwd, newBranchName.trim(), true, selectedLayout, baseBranch || null);
                 if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
             } else if (source === 'existing_branch') {
-                const wsId = await createWorktreeWorkspace(projectCwd, selectedBranch, false, selectedLayout);
-                if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
+                const info = branchStatusMap.get(selectedBranch);
+
+                if (info?.status === 'has_workspace' && info.workspaceId) {
+                    await activateWorkspace(info.workspaceId);
+                    await syncAppState();
+                    showUiNotice(`Switched to existing workspace for ${selectedBranch}`, 'info');
+                } else if (info?.status === 'has_orphan_worktree' && info.worktreePath) {
+                    const wsId = await importWorktreeWorkspace(info.worktreePath, selectedBranch, selectedLayout);
+                    if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
+                } else {
+                    const wsId = await createWorktreeWorkspace(projectCwd, selectedBranch, false, selectedLayout);
+                    if (selectedPresetId) await applyPreset(wsId, selectedPresetId, 'existing_panes');
+                }
             } else if (source === 'folder') {
                 const result = await createWorkspaceWithPreset({
                     kind: 'folder' as WorkspaceTemplateKind,
@@ -128,6 +144,27 @@
                 localBranches = local;
                 remoteBranches = remote.filter(b => !local.includes(b));
                 isGitRepo = true;
+
+                // Build branch status map
+                const worktrees = await listWorktrees(projectCwd).catch(() => []);
+                const workspaces = $appState?.workspaces ?? [];
+                const statusMap = new Map<string, { status: BranchStatus; workspaceId?: string; worktreePath?: string }>();
+
+                // Map workspace branches
+                for (const ws of workspaces) {
+                    if (ws.git_branch) {
+                        statusMap.set(ws.git_branch, { status: 'has_workspace', workspaceId: ws.workspace_id });
+                    }
+                }
+
+                // Map worktree branches (only if not already a workspace)
+                for (const wt of worktrees) {
+                    if (wt.branch && !statusMap.has(wt.branch)) {
+                        statusMap.set(wt.branch, { status: 'has_orphan_worktree', worktreePath: wt.path });
+                    }
+                }
+
+                branchStatusMap = statusMap;
             } catch {
                 isGitRepo = false;
                 source = 'folder';
@@ -219,6 +256,11 @@
                                 onclick={() => { selectedBranch = branch; }}
                             >
                                 {branch}
+                                {#if branchStatusMap.get(branch)?.status === 'has_workspace'}
+                                    <span class="branch-badge">open</span>
+                                {:else if branchStatusMap.get(branch)?.status === 'has_orphan_worktree'}
+                                    <span class="branch-badge">worktree</span>
+                                {/if}
                             </button>
                         {/each}
                     {/if}
@@ -231,6 +273,11 @@
                                 onclick={() => { selectedBranch = branch; }}
                             >
                                 {branch}
+                                {#if branchStatusMap.get(branch)?.status === 'has_workspace'}
+                                    <span class="branch-badge">open</span>
+                                {:else if branchStatusMap.get(branch)?.status === 'has_orphan_worktree'}
+                                    <span class="branch-badge">worktree</span>
+                                {/if}
                             </button>
                         {/each}
                     {/if}
@@ -473,7 +520,8 @@
     }
 
     .branch-row {
-        display: block;
+        display: flex;
+        align-items: center;
         width: 100%;
         padding: 6px 10px;
         border: none;
@@ -484,6 +532,14 @@
         text-align: left;
         cursor: pointer;
         transition: background 120ms ease-out;
+    }
+
+    .branch-badge {
+        margin-left: auto;
+        font-size: 0.66rem;
+        font-family: inherit;
+        color: var(--ui-text-muted);
+        flex-shrink: 0;
     }
 
     .branch-row:hover {

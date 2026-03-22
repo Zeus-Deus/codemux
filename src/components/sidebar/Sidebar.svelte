@@ -12,6 +12,7 @@
         setNotificationSoundEnabled,
         detectEditors,
         openInEditor,
+        getWorkspaceConfig,
     } from '../../stores/workspace';
     import type { EditorInfo, LayoutPreset, WorkspaceTemplateKind } from '../../stores/types';
     import { findActiveSessionId } from '../../lib/paneTree';
@@ -40,7 +41,8 @@
         }
     }
 
-    let confirmingDelete = $state<{ workspaceId: string; worktreePath: string } | null>(null);
+    let confirmingDelete = $state<{ workspaceId: string; worktreePath: string; hasTeardown: boolean } | null>(null);
+    let teardownError = $state<{ workspaceId: string; message: string; removeWorktree: boolean } | null>(null);
 
     let renamingWorkspaceId = $state<string | null>(null);
     let renameDraft = $state('');
@@ -95,27 +97,61 @@
     }
 
     async function handleCloseWorkspace(workspaceId: string) {
-        // Check if workspace has a worktree
         const ws = $appState?.workspaces.find(w => w.workspace_id === workspaceId);
         if (ws?.worktree_path) {
-            confirmingDelete = { workspaceId, worktreePath: ws.worktree_path };
+            const config = await getWorkspaceConfig(ws.worktree_path).catch(() => null);
+            confirmingDelete = {
+                workspaceId,
+                worktreePath: ws.worktree_path,
+                hasTeardown: (config?.teardown?.length ?? 0) > 0,
+            };
             return;
         }
         try {
             await closeWorkspace(workspaceId);
         } catch (error) {
-            console.error('Failed to close workspace:', error);
+            const msg = errorMessage(error);
+            if (msg.includes('Teardown failed')) {
+                teardownError = { workspaceId, message: msg, removeWorktree: false };
+            } else {
+                console.error('Failed to close workspace:', error);
+                showUiNotice(msg, 'error');
+            }
         }
     }
 
     async function handleConfirmDelete(removeWorktree: boolean) {
         if (!confirmingDelete) return;
-        try {
-            await closeWorkspaceWithWorktree(confirmingDelete.workspaceId, removeWorktree);
-        } catch (error) {
-            console.error('Failed to close workspace:', error);
-        }
+        const { workspaceId } = confirmingDelete;
         confirmingDelete = null;
+        try {
+            await closeWorkspaceWithWorktree(workspaceId, removeWorktree);
+        } catch (error) {
+            const msg = errorMessage(error);
+            if (msg.includes('Teardown failed')) {
+                teardownError = { workspaceId, message: msg, removeWorktree };
+            } else {
+                console.error('Failed to close workspace:', error);
+                showUiNotice(msg, 'error');
+            }
+        }
+    }
+
+    async function handleForceDelete() {
+        if (!teardownError) return;
+        const { workspaceId, removeWorktree } = teardownError;
+        teardownError = null;
+        try {
+            const ws = $appState?.workspaces.find(w => w.workspace_id === workspaceId);
+            if (ws?.worktree_path) {
+                await closeWorkspaceWithWorktree(workspaceId, removeWorktree, true);
+            } else {
+                await closeWorkspace(workspaceId, true);
+            }
+        } catch (error) {
+            console.error('Force delete failed:', error);
+            showUiNotice(errorMessage(error), 'error');
+        }
     }
 
     async function handleMarkRead(workspaceId: string) {
@@ -188,10 +224,27 @@
             <div class="confirm-dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
                 <p class="confirm-title">Delete worktree?</p>
                 <p class="confirm-text">This workspace uses a git worktree. Delete the worktree and branch too?</p>
+                {#if confirmingDelete.hasTeardown}
+                    <p class="confirm-hint">Teardown scripts will run before deletion.</p>
+                {/if}
                 <div class="confirm-actions">
                     <button class="confirm-btn" onclick={() => { confirmingDelete = null; }}>Cancel</button>
                     <button class="confirm-btn" onclick={() => handleConfirmDelete(false)}>Keep worktree</button>
                     <button class="confirm-btn confirm-danger" onclick={() => handleConfirmDelete(true)}>Delete worktree</button>
+                </div>
+            </div>
+        </div>
+    {/if}
+
+    {#if teardownError}
+        <!-- svelte-ignore a11y_no_static_element_interactions -->
+        <div class="confirm-backdrop" onclick={() => { teardownError = null; }} onkeydown={() => {}}>
+            <div class="confirm-dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+                <p class="confirm-title">Teardown failed</p>
+                <p class="confirm-text teardown-error-text">{teardownError.message}</p>
+                <div class="confirm-actions">
+                    <button class="confirm-btn" onclick={() => { teardownError = null; }}>Cancel</button>
+                    <button class="confirm-btn confirm-danger" onclick={handleForceDelete}>Force delete</button>
                 </div>
             </div>
         </div>
@@ -736,5 +789,21 @@
 
     .confirm-danger:hover {
         background: color-mix(in srgb, var(--ui-danger) 20%, var(--ui-layer-3) 80%);
+    }
+
+    .confirm-hint {
+        margin: 0 0 12px;
+        font-size: 0.74rem;
+        color: var(--ui-text-muted);
+        font-style: italic;
+    }
+
+    .teardown-error-text {
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 200px;
+        overflow-y: auto;
+        font-family: var(--ui-font-mono);
+        font-size: 0.74rem;
     }
 </style>

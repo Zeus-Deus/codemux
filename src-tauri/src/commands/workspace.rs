@@ -2,6 +2,7 @@ use crate::browser::BrowserManager;
 use crate::config::{
     read_shell_appearance_or_default,
     read_theme_colors_or_default,
+    workspace_config::WorkspaceConfig,
     ShellAppearance,
     ThemeColors,
 };
@@ -59,6 +60,9 @@ pub(crate) fn create_workspace_impl(
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
     }
+
+    // Run setup scripts in background thread
+    spawn_setup_scripts(&app, state, &workspace_id.0, &repo_path);
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -162,6 +166,9 @@ pub fn create_workspace_with_preset(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
+    // Run setup scripts in background thread
+    spawn_setup_scripts(&app, &state, &workspace_id.0, &repo_path);
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -207,6 +214,52 @@ pub fn create_worktree_workspace(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
+    // Run setup scripts in background thread
+    spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
+
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+#[tauri::command]
+pub fn import_worktree_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    worktree_path: String,
+    branch: String,
+    layout: String,
+) -> Result<String, String> {
+    let layout = match layout.as_str() {
+        "single" => WorkspacePresetLayout::Single,
+        "pair" => WorkspacePresetLayout::Pair,
+        "quad" => WorkspacePresetLayout::Quad,
+        "six" => WorkspacePresetLayout::Six,
+        "eight" => WorkspacePresetLayout::Eight,
+        "shell_browser" => WorkspacePresetLayout::ShellBrowser,
+        _ => return Err(format!("Unsupported layout: {layout}")),
+    };
+
+    let wt_path_buf = PathBuf::from(&worktree_path);
+    let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
+
+    state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch);
+
+    populate_git_info(&state, &workspace_id.0, &wt_path_buf);
+
+    let snapshot = state.snapshot();
+    let session_ids = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id.0)
+        .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
+        .unwrap_or_default();
+
+    for session_id in session_ids {
+        terminal::spawn_pty_for_session(app.clone(), session_id);
+    }
+
+    spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -217,9 +270,12 @@ pub fn close_workspace_with_worktree(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     remove_worktree: bool,
+    force_delete: Option<bool>,
 ) -> Result<(), String> {
-    // Get worktree path and branch before closing
-    let (worktree_path, branch) = {
+    let force = force_delete.unwrap_or(false);
+
+    // Get worktree path, branch, and title before closing
+    let (worktree_path, branch, ws_title) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
@@ -228,8 +284,22 @@ pub fn close_workspace_with_worktree(
         (
             ws.and_then(|w| w.worktree_path.clone()),
             ws.and_then(|w| w.git_branch.clone()),
+            ws.map(|w| w.title.clone()).unwrap_or_default(),
         )
     };
+
+    // Run teardown scripts before closing
+    if !force {
+        if let Some(ref wt_path) = worktree_path {
+            if let Err(e) = crate::scripts::run_teardown_scripts(
+                Path::new(wt_path),
+                &ws_title,
+                &workspace_id,
+            ) {
+                return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
+            }
+        }
+    }
 
     state
         .close_workspace(&workspace_id)
@@ -294,7 +364,31 @@ pub fn close_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
+    force_delete: Option<bool>,
 ) -> Result<String, String> {
+    let force = force_delete.unwrap_or(false);
+
+    // Run teardown scripts before closing
+    if !force {
+        let cwd = {
+            let snapshot = state.snapshot();
+            let ws = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id);
+            ws.map(|w| (w.cwd.clone(), w.title.clone()))
+        };
+        if let Some((cwd, title)) = cwd {
+            if let Err(e) = crate::scripts::run_teardown_scripts(
+                Path::new(&cwd),
+                &title,
+                &workspace_id,
+            ) {
+                return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
+            }
+        }
+    }
+
     let fallback = state.close_workspace(&workspace_id)?;
     crate::state::emit_app_state(&app);
     Ok(fallback.0)
@@ -650,4 +744,58 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())
+}
+
+// ---- Setup/teardown scripts ----
+
+/// Spawn setup scripts in a background thread so workspace creation isn't blocked.
+fn spawn_setup_scripts(
+    app: &tauri::AppHandle,
+    state: &AppStateStore,
+    workspace_id: &str,
+    workspace_path: &Path,
+) {
+    let ws_title = {
+        let snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.title.clone())
+            .unwrap_or_default()
+    };
+    let ws_path = workspace_path.to_path_buf();
+    let ws_id = workspace_id.to_string();
+    let app2 = app.clone();
+
+    std::thread::spawn(move || {
+        // Wait for frontend to mount the overlay and register event listeners
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Err(e) = crate::scripts::run_setup_scripts(&ws_path, &ws_title, &ws_id, &app2) {
+            eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
+        }
+    });
+}
+
+#[tauri::command]
+pub fn get_workspace_config(path: String) -> Option<WorkspaceConfig> {
+    crate::config::workspace_config::read_workspace_config(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn run_workspace_setup(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let (cwd, title) = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+        (ws.cwd.clone(), ws.title.clone())
+    };
+    crate::scripts::run_setup_scripts(Path::new(&cwd), &title, &workspace_id, &app)
 }

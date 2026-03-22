@@ -36,6 +36,7 @@
     import PresetBar from './components/presets/PresetBar.svelte';
     import PresetEditor from './components/presets/PresetEditor.svelte';
     import CommandPalette from './components/CommandPalette.svelte';
+    import WorkspaceSetupOverlay from './components/panes/WorkspaceSetupOverlay.svelte';
     import { findActiveSessionId } from './lib/paneTree';
     import type { TerminalPreset } from './stores/types';
 
@@ -332,6 +333,7 @@
                                             {/if}
                                         </div>
                                     </div>
+                                    <WorkspaceSetupOverlay workspaceId={workspace.workspace_id} />
                                 {/if}
                             </div>
                         {/if}

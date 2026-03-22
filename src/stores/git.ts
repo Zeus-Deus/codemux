@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { GitFileStatus, GitDiffStat, GitBranchInfo } from './types';
+import type { GitFileStatus, GitDiffStat, GitBranchInfo, WorktreeInfo } from './types';
 
 export async function getGitStatus(path: string): Promise<GitFileStatus[]> {
     return invoke<GitFileStatus[]>('get_git_status', { path });
@@ -35,4 +35,8 @@ export async function getGitBranchInfo(path: string): Promise<GitBranchInfo> {
 
 export async function listBranches(path: string, remote: boolean): Promise<string[]> {
     return invoke<string[]>('list_branches', { path, remote });
+}
+
+export async function listWorktrees(path: string): Promise<WorktreeInfo[]> {
+    return invoke<WorktreeInfo[]>('list_worktrees', { path });
 }

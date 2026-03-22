@@ -29,6 +29,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 
 ## Current Entry Points
 
+- Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`

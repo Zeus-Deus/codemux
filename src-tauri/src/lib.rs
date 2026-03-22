@@ -16,6 +16,7 @@ pub mod observability;
 pub mod ports;
 pub mod presets;
 pub mod project;
+pub mod scripts;
 pub mod state;
 pub mod terminal;
 
@@ -213,6 +214,7 @@ pub fn run() {
             commands::detect_editors,
             commands::open_in_editor,
             commands::create_worktree_workspace,
+            commands::import_worktree_workspace,
             commands::close_workspace_with_worktree,
             commands::split_pane,
             commands::activate_pane,
@@ -304,7 +306,9 @@ pub fn run() {
             commands::delete_preset,
             commands::set_preset_pinned,
             commands::set_preset_bar_visible,
-            commands::apply_preset
+            commands::apply_preset,
+            commands::get_workspace_config,
+            commands::run_workspace_setup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

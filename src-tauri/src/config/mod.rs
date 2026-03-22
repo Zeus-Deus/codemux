@@ -1,3 +1,5 @@
+pub mod workspace_config;
+
 use notify::{Config, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::fs;

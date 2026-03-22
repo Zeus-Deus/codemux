@@ -1,0 +1,4 @@
+{
+    "setup": ["echo SETUP_RUNNING && sleep 3 && echo SETUP_DONE"],
+    "teardown": ["echo TEARDOWN"]
+}

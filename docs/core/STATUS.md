@@ -24,6 +24,7 @@ The repo structure is now cleaner than the earlier prototype shape suggested:
 - notifications and attention badges
 - local project memory and lexical indexing
 - local CLI and socket control basics
+- setup/teardown scripts on workspace create/delete (`.codemux/config.json`)
 
 ## Partial Or Prototype-Level
 

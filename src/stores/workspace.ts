@@ -5,6 +5,7 @@ import type {
     EditorInfo,
     LayoutPreset,
     TabKind,
+    WorkspaceConfig,
     WorkspaceTemplateKind,
 } from './types';
 
@@ -76,8 +77,8 @@ export async function renameWorkspace(workspaceId: string, title: string) {
     return invoke('rename_workspace', { workspaceId, title });
 }
 
-export async function closeWorkspace(workspaceId: string) {
-    return invoke<string>('close_workspace', { workspaceId });
+export async function closeWorkspace(workspaceId: string, forceDelete = false) {
+    return invoke<string>('close_workspace', { workspaceId, forceDelete });
 }
 
 export async function cycleWorkspace(step: number) {
@@ -181,6 +182,29 @@ export async function createWorktreeWorkspace(
     return workspaceId;
 }
 
-export async function closeWorkspaceWithWorktree(workspaceId: string, removeWorktree: boolean) {
-    return invoke<void>('close_workspace_with_worktree', { workspaceId, removeWorktree });
+export async function importWorktreeWorkspace(
+    worktreePath: string,
+    branch: string,
+    layout: string,
+) {
+    const workspaceId = await invoke<string>('import_worktree_workspace', {
+        worktreePath,
+        branch,
+        layout,
+    });
+    await activateWorkspace(workspaceId);
+    await syncAppState();
+    return workspaceId;
+}
+
+export async function closeWorkspaceWithWorktree(workspaceId: string, removeWorktree: boolean, forceDelete = false) {
+    return invoke<void>('close_workspace_with_worktree', { workspaceId, removeWorktree, forceDelete });
+}
+
+export async function getWorkspaceConfig(path: string) {
+    return invoke<WorkspaceConfig | null>('get_workspace_config', { path });
+}
+
+export async function runWorkspaceSetup(workspaceId: string) {
+    return invoke<void>('run_workspace_setup', { workspaceId });
 }
