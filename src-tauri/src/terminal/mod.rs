@@ -101,6 +101,7 @@ pub struct SessionRuntime {
     pub output_channel: Option<Channel<Vec<u8>>>,
     pub pending_output: VecDeque<Vec<u8>>,
     pub last_status: TerminalStatusPayload,
+    pub child_pid: Option<u32>,
 }
 
 impl SessionRuntime {
@@ -116,6 +117,7 @@ impl SessionRuntime {
                 message: Some("Starting shell...".into()),
                 exit_code: None,
             },
+            child_pid: None,
         }
     }
 }
@@ -123,6 +125,17 @@ impl SessionRuntime {
 #[derive(Default)]
 pub struct PtyState {
     pub sessions: Arc<Mutex<HashMap<String, SessionRuntime>>>,
+}
+
+impl PtyState {
+    /// Returns a snapshot of session_id -> child PID for all active sessions.
+    pub fn get_session_pids(&self) -> HashMap<String, u32> {
+        let guard = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .iter()
+            .filter_map(|(id, runtime)| runtime.child_pid.map(|pid| (id.clone(), pid)))
+            .collect()
+    }
 }
 
 fn remove_session_runtime(
@@ -329,6 +342,8 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         }
     };
 
+    let child_pid = child.process_id();
+
     drop(pty_pair.slave);
 
     let mut reader = match pty_pair.master.try_clone_reader() {
@@ -372,6 +387,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         |runtime| {
             runtime.writer = Some(writer);
             runtime.master = Some(pty_pair.master);
+            runtime.child_pid = child_pid;
         },
     );
 
@@ -894,6 +910,8 @@ pub fn spawn_pty_for_agent(
         }
     };
 
+    let child_pid = child.process_id();
+
     drop(pty_pair.slave);
 
     let mut reader = match pty_pair.master.try_clone_reader() {
@@ -937,6 +955,7 @@ pub fn spawn_pty_for_agent(
         |runtime| {
             runtime.writer = Some(writer);
             runtime.master = Some(pty_pair.master);
+            runtime.child_pid = child_pid;
         },
     );
 

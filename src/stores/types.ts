@@ -260,6 +260,14 @@ export interface CodemuxConfigSnapshot {
     notification_sound_enabled: boolean;
 }
 
+export interface PortInfoSnapshot {
+    port: number;
+    pid: number;
+    process_name: string;
+    workspace_id: string | null;
+    label: string | null;
+}
+
 export interface AppStateSnapshot {
     schema_version: number;
     active_workspace_id: string;
@@ -267,6 +275,7 @@ export interface AppStateSnapshot {
     terminal_sessions: TerminalSessionSnapshot[];
     browser_sessions: BrowserSessionSnapshot[];
     notifications: NotificationSnapshot[];
+    detected_ports: PortInfoSnapshot[];
     persistence: PersistenceSchema;
     config: CodemuxConfigSnapshot;
 }

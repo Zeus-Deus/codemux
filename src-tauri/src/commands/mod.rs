@@ -192,3 +192,34 @@ pub async fn pick_folder_dialog<R: Runtime>(
 
     rx.await.map_err(|error| error.to_string())
 }
+
+// ---- Port management ----
+
+#[tauri::command]
+pub fn get_detected_ports(
+    state: State<'_, crate::state::AppStateStore>,
+) -> Vec<crate::state::PortInfoSnapshot> {
+    state.snapshot().detected_ports
+}
+
+#[tauri::command]
+pub fn kill_port(port: u16) -> Result<(), String> {
+    let ports = crate::ports::detect_listening_ports();
+    let target = ports
+        .iter()
+        .find(|p| p.port == port)
+        .ok_or_else(|| format!("No process found listening on port {port}"))?;
+
+    let pid = target.pid;
+    let output = std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Failed to kill PID {pid}: {stderr}"))
+    }
+}

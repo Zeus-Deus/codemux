@@ -148,3 +148,7 @@ export async function refreshWorkspaceState() {
     appState.set(snapshot);
     return snapshot;
 }
+
+export async function killPort(port: number) {
+    return invoke('kill_port', { port });
+}

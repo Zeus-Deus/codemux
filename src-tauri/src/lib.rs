@@ -13,6 +13,7 @@ pub mod indexing;
 pub mod memory;
 pub mod openflow;
 pub mod observability;
+pub mod ports;
 pub mod project;
 pub mod state;
 pub mod terminal;
@@ -112,6 +113,36 @@ pub fn run() {
                         let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
                         state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions);
                         state::emit_app_state(&git_handle);
+                    }
+                }
+            });
+
+            // Periodically scan for listening TCP ports and associate with workspaces
+            let port_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let app_state: tauri::State<'_, state::AppStateStore> = port_handle.state();
+                    let pty_state: tauri::State<'_, terminal::PtyState> = port_handle.state();
+
+                    let session_pids = pty_state.get_session_pids();
+                    let session_workspaces = app_state.all_session_workspaces();
+                    let workspace_cwds = app_state.all_workspace_cwds();
+
+                    let ports = ports::scan_ports(&session_pids, &session_workspaces, &workspace_cwds);
+                    let port_snapshots: Vec<state::PortInfoSnapshot> = ports
+                        .into_iter()
+                        .map(|p| state::PortInfoSnapshot {
+                            port: p.port,
+                            pid: p.pid,
+                            process_name: p.process_name,
+                            workspace_id: p.workspace_id,
+                            label: p.label,
+                        })
+                        .collect();
+
+                    if app_state.update_detected_ports(port_snapshots) {
+                        state::emit_app_state(&port_handle);
                     }
                 }
             });
@@ -253,7 +284,9 @@ pub fn run() {
             commands::git_unstage_files,
             commands::git_commit_changes,
             commands::git_push_changes,
-            commands::get_git_branch_info
+            commands::get_git_branch_info,
+            commands::get_detected_ports,
+            commands::kill_port
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

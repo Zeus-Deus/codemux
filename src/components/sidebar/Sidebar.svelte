@@ -13,6 +13,7 @@
     import { findActiveSessionId } from '../../lib/paneTree';
     import WorkspaceRow from './WorkspaceRow.svelte';
     import NotificationsSection from './NotificationsSection.svelte';
+    import PortsSection from './PortsSection.svelte';
     import OpenFlowLauncher from './OpenFlowLauncher.svelte';
     import MemoryDrawer from './MemoryDrawer.svelte';
     import NewWorkspaceLauncher from './NewWorkspaceLauncher.svelte';
@@ -251,6 +252,11 @@
     <div class="sidebar-bottom">
         <!-- Secondary sections -->
         <div class="sidebar-sections">
+            {#if ($appState?.detected_ports?.length ?? 0) > 0}
+                <div class="sidebar-divider"></div>
+                <PortsSection />
+            {/if}
+
             {#if activeWorkspace}
                 <div class="sidebar-divider"></div>
                 <NotificationsSection workspaceId={activeWorkspace.workspace_id} />

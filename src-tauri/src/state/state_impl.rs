@@ -273,6 +273,15 @@ pub struct CodemuxConfigSnapshot {
     pub notification_sound_enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortInfoSnapshot {
+    pub port: u16,
+    pub pid: u32,
+    pub process_name: String,
+    pub workspace_id: Option<String>,
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateSnapshot {
     pub schema_version: u32,
@@ -281,6 +290,8 @@ pub struct AppStateSnapshot {
     pub terminal_sessions: Vec<TerminalSessionSnapshot>,
     pub browser_sessions: Vec<BrowserSessionSnapshot>,
     pub notifications: Vec<NotificationSnapshot>,
+    #[serde(default)]
+    pub detected_ports: Vec<PortInfoSnapshot>,
     pub persistence: PersistenceSchema,
     pub config: CodemuxConfigSnapshot,
 }
@@ -694,6 +705,38 @@ impl AppStateStore {
             workspace.git_additions = additions;
             workspace.git_deletions = deletions;
         }
+    }
+
+    /// Update detected ports. Returns true if the port list actually changed.
+    pub fn update_detected_ports(&self, ports: Vec<PortInfoSnapshot>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if snapshot.detected_ports == ports {
+            return false;
+        }
+        snapshot.detected_ports = ports;
+        true
+    }
+
+    /// Returns workspace_id -> cwd for all workspaces.
+    pub fn all_workspace_cwds(&self) -> std::collections::HashMap<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
+            .collect()
+    }
+
+    /// Returns session_id -> workspace_id for all terminal sessions across all workspaces.
+    pub fn all_session_workspaces(&self) -> std::collections::HashMap<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut map = std::collections::HashMap::new();
+        for workspace in &snapshot.workspaces {
+            for session_id in collect_terminal_sessions(&workspace.surfaces) {
+                map.insert(session_id, workspace.workspace_id.0.clone());
+            }
+        }
+        map
     }
 
     pub fn active_workspace_cwd(&self) -> Option<(String, String)> {
@@ -1828,6 +1871,7 @@ fn default_app_state() -> AppStateSnapshot {
         }],
         browser_sessions: vec![],
         notifications: vec![],
+        detected_ports: vec![],
         persistence: PersistenceSchema {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             stores_layout_metadata: true,
@@ -2039,7 +2083,9 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
     }
 
     // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
-    let snapshot = strip_openflow_from_snapshot(snapshot.clone());
+    let mut snapshot = strip_openflow_from_snapshot(snapshot.clone());
+    // Detected ports are runtime-only state — never persist them.
+    snapshot.detected_ports.clear();
 
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
