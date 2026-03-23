@@ -2,6 +2,8 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { X } from "lucide-react";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
+import { ChangesPanel } from "@/components/workspace/changes-panel";
+import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -40,14 +42,6 @@ export function RightPanel({ workspace, activeTab }: Props) {
             <TabsTrigger value="files" className="px-2 text-xs">
               Files
             </TabsTrigger>
-            <TabsTrigger value="pr" className="px-2 text-xs">
-              PR
-              {workspace.pr_number && (
-                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
-                  #{workspace.pr_number}
-                </span>
-              )}
-            </TabsTrigger>
           </TabsList>
           <Button
             variant="ghost"
@@ -59,14 +53,11 @@ export function RightPanel({ workspace, activeTab }: Props) {
             <X className="h-3 w-3" />
           </Button>
         </div>
-        <TabsContent value="changes" className="flex-1 overflow-auto p-3">
-          <p className="text-xs text-muted-foreground">Changes panel — coming soon</p>
+        <TabsContent value="changes" className="flex-1 overflow-hidden">
+          <ChangesPanel workspace={workspace} />
         </TabsContent>
-        <TabsContent value="files" className="flex-1 overflow-auto p-3">
-          <p className="text-xs text-muted-foreground">File tree — coming soon</p>
-        </TabsContent>
-        <TabsContent value="pr" className="flex-1 overflow-auto p-3">
-          <p className="text-xs text-muted-foreground">PR panel — coming soon</p>
+        <TabsContent value="files" className="flex-1 overflow-hidden">
+          <FileTreePanel workspace={workspace} />
         </TabsContent>
       </Tabs>
     </div>
