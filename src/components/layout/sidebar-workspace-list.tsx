@@ -6,9 +6,10 @@ import {
   SidebarMenu,
 } from "@/components/ui/sidebar";
 import { useSectionedWorkspaces, useAppStore } from "@/stores/app-store";
-import { createWorkspace } from "@/tauri/commands";
+import { useUIStore } from "@/stores/ui-store";
 import { SidebarSectionGroup } from "./sidebar-section-group";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
+import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { Plus } from "lucide-react";
 
 export function SidebarWorkspaceList() {
@@ -16,11 +17,16 @@ export function SidebarWorkspaceList() {
   const activeWorkspaceId = useAppStore(
     (s) => s.appState?.active_workspace_id ?? "",
   );
+  const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
+  const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
 
   return (
     <SidebarGroup>
       <SidebarGroupLabel>Workspaces</SidebarGroupLabel>
-      <SidebarGroupAction title="New workspace" onClick={() => createWorkspace().catch(console.error)}>
+      <SidebarGroupAction
+        title="New workspace"
+        onClick={() => setShowDialog(true)}
+      >
         <Plus className="h-3.5 w-3.5" />
       </SidebarGroupAction>
       <SidebarGroupContent>
@@ -42,6 +48,7 @@ export function SidebarWorkspaceList() {
           ))}
         </SidebarMenu>
       </SidebarGroupContent>
+      <NewWorkspaceDialog open={showDialog} onOpenChange={setShowDialog} />
     </SidebarGroup>
   );
 }

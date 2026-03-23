@@ -13,7 +13,6 @@ import { useUIStore } from "@/stores/ui-store";
 import { useSidebar } from "@/components/ui/sidebar";
 import {
   activateWorkspace,
-  createWorkspace,
   splitPane,
   closePane,
   createTab,
@@ -29,6 +28,7 @@ interface Props {
 export function CommandPalette({ open, onOpenChange }: Props) {
   const appState = useAppStore((s) => s.appState);
   const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
+  const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const { toggleSidebar } = useSidebar();
 
   const run = (fn: () => void) => {
@@ -70,9 +70,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             </CommandItem>
           ))}
           <CommandItem
-            onSelect={() =>
-              run(() => createWorkspace().catch(console.error))
-            }
+            onSelect={() => run(() => setShowNewWorkspaceDialog(true))}
           >
             Create New Workspace
           </CommandItem>
