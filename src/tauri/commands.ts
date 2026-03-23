@@ -1,4 +1,6 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, Channel } from "@tauri-apps/api/core";
+
+export { Channel };
 import type {
   AgentConfig,
   AgentSessionState,
@@ -443,10 +445,10 @@ export const detachPtyOutput = (sessionId: string) =>
 
 export const attachPtyOutput = (
   sessionId: string,
-  channel: string,
-  scrollbackLines?: number,
+  channel: Channel<unknown>,
+  skipPending?: boolean,
 ) =>
-  invoke("attach_pty_output", { channel, sessionId, scrollbackLines });
+  invoke("attach_pty_output", { channel, sessionId, skipPending });
 
 export const getTerminalStatus = (sessionId: string) =>
   invoke<TerminalStatusPayload>("get_terminal_status", { sessionId });

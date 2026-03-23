@@ -1,4 +1,5 @@
 import { Terminal } from "lucide-react";
+import { PaneNode } from "./PaneNode";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -10,19 +11,24 @@ export function PaneContainer({ workspace }: Props) {
     (s) => s.surface_id === workspace.active_surface_id,
   );
 
-  return (
-    <div className="flex h-full items-center justify-center bg-background text-muted-foreground">
-      <div className="text-center space-y-3">
-        <Terminal className="h-12 w-12 mx-auto opacity-30" />
-        <p className="text-sm">
-          {activeSurface
-            ? `Surface: ${activeSurface.title}`
-            : "No active surface"}
-        </p>
-        <p className="text-xs text-muted-foreground/60">
-          Pane rendering coming next
-        </p>
+  if (!activeSurface) {
+    return (
+      <div className="flex h-full items-center justify-center bg-background text-muted-foreground">
+        <div className="text-center space-y-3">
+          <Terminal className="h-12 w-12 mx-auto opacity-30" />
+          <p className="text-sm">No active surface</p>
+        </div>
       </div>
+    );
+  }
+
+  return (
+    <div className="h-full w-full overflow-hidden p-0.5">
+      <PaneNode
+        node={activeSurface.root}
+        activePaneId={activeSurface.active_pane_id}
+        visible
+      />
     </div>
   );
 }
