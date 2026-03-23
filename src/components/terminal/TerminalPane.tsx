@@ -308,7 +308,7 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
       // Tab management shortcuts — bubble to window
       if (ev.ctrlKey && !ev.altKey) {
         const key = ev.key.toLowerCase();
-        if (!ev.shiftKey && (key === "t" || key === "w")) return false;
+        if (!ev.shiftKey && (key === "t" || key === "w" || key === "k")) return false;
         if (!ev.shiftKey && ev.key >= "1" && ev.key <= "9") return false;
         if (ev.shiftKey && (key === "b" || key === "d")) return false;
         if (ev.key === "]" || ev.key === "[") return false;
