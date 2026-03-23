@@ -12,6 +12,13 @@ import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   GitBranch,
   GitPullRequest,
   Plus,
@@ -58,17 +65,16 @@ function PresetSelector({
       <label className="text-xs text-muted-foreground">Preset</label>
       <div className="flex flex-wrap gap-1.5">
         {presets.map((p) => (
-          <button
+          <Button
             key={p.id}
-            className={`px-2.5 py-1 text-xs rounded-md border transition-colors ${
-              selected === p.id
-                ? "border-primary bg-primary/10 text-foreground"
-                : "border-border bg-card text-muted-foreground hover:border-muted-foreground"
-            }`}
+            variant={selected === p.id ? "secondary" : "outline"}
+            size="sm"
+            className={selected === p.id ? "border-primary bg-primary/10" : ""}
             onClick={() => onSelect(selected === p.id ? null : p.id)}
+            aria-pressed={selected === p.id}
           >
             {p.name}
-          </button>
+          </Button>
         ))}
       </div>
     </div>
@@ -255,18 +261,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               <label className="text-xs text-muted-foreground">
                 Base branch
               </label>
-              <select
-                className="flex h-8 w-full rounded-md border border-input bg-background px-2 text-sm"
-                value={baseBranch}
-                onChange={(e) => setBaseBranch(e.target.value)}
-              >
-                {localBranches.map((b) => (
-                  <option key={b} value={b}>
-                    {b}
-                    {b === currentBranch ? " (current)" : ""}
-                  </option>
-                ))}
-              </select>
+              <Select value={baseBranch} onValueChange={setBaseBranch}>
+                <SelectTrigger className="h-8 text-sm">
+                  <SelectValue placeholder="Select base branch" />
+                </SelectTrigger>
+                <SelectContent>
+                  {localBranches.map((b) => (
+                    <SelectItem key={b} value={b}>
+                      {b}{b === currentBranch ? " (current)" : ""}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <PresetSelector
               presets={presets}

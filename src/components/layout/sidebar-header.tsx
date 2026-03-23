@@ -1,4 +1,5 @@
 import { SidebarHeader as ShadcnSidebarHeader } from "@/components/ui/sidebar";
+import { Button } from "@/components/ui/button";
 import { useActiveWorkspace } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { GitBranch, Plus, FolderPlus, Settings } from "lucide-react";
@@ -17,25 +18,15 @@ export function SidebarHeader() {
           </span>
         </div>
         <div className="flex items-center gap-1">
-          <button
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            title="New section"
-          >
+          <Button variant="ghost" size="icon-xs" aria-label="New section" title="New section">
             <FolderPlus className="h-3.5 w-3.5" />
-          </button>
-          <button
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            title="New workspace"
-          >
+          </Button>
+          <Button variant="ghost" size="icon-xs" aria-label="New workspace" title="New workspace">
             <Plus className="h-3.5 w-3.5" />
-          </button>
-          <button
-            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-            title="Settings"
-            onClick={() => setShowSettings(true)}
-          >
+          </Button>
+          <Button variant="ghost" size="icon-xs" aria-label="Settings" title="Settings" onClick={() => setShowSettings(true)}>
             <Settings className="h-3.5 w-3.5" />
-          </button>
+          </Button>
         </div>
       </div>
       {activeWorkspace && (

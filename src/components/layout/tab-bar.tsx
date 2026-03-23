@@ -54,8 +54,9 @@ export function TabBar({ workspace }: Props) {
               <span className="truncate max-w-[100px]">{tab.title}</span>
               {workspace.tabs.length > 1 && (
                 <button
-                  className="ml-1 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100"
+                  className="ml-1 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   onClick={(e) => handleCloseTab(e, tab.tab_id)}
+                  aria-label="Close tab"
                   title="Close tab"
                 >
                   <X className="h-2.5 w-2.5" />

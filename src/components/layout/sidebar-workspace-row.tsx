@@ -6,6 +6,7 @@ import {
   SidebarMenuSubButton,
 } from "@/components/ui/sidebar";
 import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { X, GitBranch } from "lucide-react";
 import { activateWorkspace, closeWorkspace } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -76,7 +77,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
         }
       >
         <span
-          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${statusDotColor}`}
+          className={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", statusDotColor)}
         />
         <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuSubButton>
@@ -97,7 +98,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
         }
       >
         <span
-          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${statusDotColor}`}
+          className={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", statusDotColor)}
         />
         <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuButton>

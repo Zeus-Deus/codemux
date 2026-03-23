@@ -309,7 +309,7 @@ export function SettingsView() {
                 label="Desktop notifications"
                 description="Show system notifications via D-Bus when events occur."
               >
-                <Switch defaultChecked />
+                <Switch checked disabled aria-label="Desktop notifications (not yet implemented)" />
               </SettingRow>
             </div>
           </div>

@@ -6,6 +6,8 @@ import { useUIStore } from "@/stores/ui-store";
 export function useKeyboardShortcuts() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      if (e.repeat) return;
+
       // Escape closes settings
       if (e.key === "Escape" && useUIStore.getState().showSettings) {
         e.preventDefault();

@@ -1,5 +1,7 @@
 import React from "react";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
 import { Globe, SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot } from "@/tauri/types";
@@ -213,9 +215,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "terminal") {
     return (
       <div
-        className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
-          isActive ? "border-primary/50" : "border-border/50"
-        }`}
+        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/50" : "border-border/50")}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
@@ -228,27 +228,15 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/pane:opacity-100">
-            <button
-              className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
-              onClick={() => handleSplit("horizontal")}
-              title="Split right"
-            >
+            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
               <SplitSquareHorizontal className="h-3 w-3" />
-            </button>
-            <button
-              className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
-              onClick={() => handleSplit("vertical")}
-              title="Split down"
-            >
+            </Button>
+            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
               <SplitSquareVertical className="h-3 w-3" />
-            </button>
-            <button
-              className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-destructive/80 hover:text-foreground"
-              onClick={handleClose}
-              title="Close pane"
-            >
+            </Button>
+            <Button variant="ghost" size="icon-xs" className="hover:bg-destructive/80" onClick={handleClose} aria-label="Close pane" title="Close pane">
               <X className="h-3 w-3" />
-            </button>
+            </Button>
           </div>
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
@@ -266,9 +254,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "browser") {
     return (
       <div
-        className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
-          isActive ? "border-primary/50" : "border-border/50"
-        }`}
+        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/50" : "border-border/50")}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
