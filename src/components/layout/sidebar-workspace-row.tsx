@@ -32,10 +32,10 @@ function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
           {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
             <span className="ml-auto flex items-center gap-1 shrink-0 tabular-nums">
               {workspace.git_additions > 0 && (
-                <span className="text-green-500">+{workspace.git_additions}</span>
+                <span className="text-success">+{workspace.git_additions}</span>
               )}
               {workspace.git_deletions > 0 && (
-                <span className="text-red-400">-{workspace.git_deletions}</span>
+                <span className="text-danger">-{workspace.git_deletions}</span>
               )}
             </span>
           )}
@@ -57,7 +57,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
 
   const statusDotColor =
     workspace.notification_count > 0
-      ? "bg-yellow-500"
+      ? "bg-warning"
       : isActive
         ? "bg-primary"
         : "bg-muted-foreground/40";
@@ -102,7 +102,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
         <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuButton>
       {workspace.notification_count > 0 && (
-        <SidebarMenuBadge className="bg-yellow-500/20 text-yellow-500">
+        <SidebarMenuBadge className="bg-warning/20 text-warning">
           {workspace.notification_count}
         </SidebarMenuBadge>
       )}

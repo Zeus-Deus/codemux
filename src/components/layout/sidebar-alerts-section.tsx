@@ -26,7 +26,7 @@ export function SidebarAlertsSection() {
       <SidebarGroupLabel>
         Alerts
         {unreadCount > 0 && (
-          <span className="ml-auto text-[10px] font-semibold tabular-nums text-yellow-500">
+          <span className="ml-auto text-[10px] font-semibold tabular-nums text-warning">
             {unreadCount}
           </span>
         )}
@@ -44,7 +44,7 @@ export function SidebarAlertsSection() {
             notifications.slice(0, 5).map((n) => (
               <SidebarMenuItem key={n.notification_id}>
                 <SidebarMenuButton size="sm">
-                  <Bell className={`h-4 w-4 ${!n.read ? "text-yellow-500" : ""}`} />
+                  <Bell className={`h-4 w-4 ${!n.read ? "text-warning" : ""}`} />
                   <span className="truncate">{n.message}</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>

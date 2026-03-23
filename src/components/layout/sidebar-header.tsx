@@ -39,10 +39,10 @@ export function SidebarHeader() {
               <GitBranch className="h-3 w-3" />
               <span className="truncate">{activeWorkspace.git_branch}</span>
               {activeWorkspace.git_additions > 0 && (
-                <span className="text-green-500">+{activeWorkspace.git_additions}</span>
+                <span className="text-success">+{activeWorkspace.git_additions}</span>
               )}
               {activeWorkspace.git_deletions > 0 && (
-                <span className="text-red-400">-{activeWorkspace.git_deletions}</span>
+                <span className="text-danger">-{activeWorkspace.git_deletions}</span>
               )}
             </div>
           )}
