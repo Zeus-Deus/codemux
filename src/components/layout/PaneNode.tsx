@@ -65,14 +65,14 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
               onClick={() => handleSplit("horizontal")}
               title="Split right"
             >
-              <SplitSquareVertical className="h-3 w-3" />
+              <SplitSquareHorizontal className="h-3 w-3" />
             </button>
             <button
               className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-accent hover:text-foreground"
               onClick={() => handleSplit("vertical")}
               title="Split down"
             >
-              <SplitSquareHorizontal className="h-3 w-3" />
+              <SplitSquareVertical className="h-3 w-3" />
             </button>
             <button
               className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-destructive/80 hover:text-foreground"
