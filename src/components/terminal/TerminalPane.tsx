@@ -66,8 +66,8 @@ function buildThemeFromCSS(): ITheme {
     foreground: getCSSVar("--foreground"),
     cursor: getCSSVar("--foreground"),
     cursorAccent: getCSSVar("--background"),
-    selectionBackground: getCSSVar("--accent"),
-    selectionForeground: getCSSVar("--accent-foreground"),
+    selectionBackground: getCSSVar("--secondary"),
+    selectionForeground: getCSSVar("--secondary-foreground"),
     ...ANSI_COLORS,
   };
 }
