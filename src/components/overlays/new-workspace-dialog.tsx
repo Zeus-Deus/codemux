@@ -168,7 +168,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   }, [appState]);
 
   const handleCreate = useCallback(
-    async (branch: string, createBranch: boolean) => {
+    async (branch: string, isNewBranch: boolean) => {
       if (!cwd || creating) return;
       setCreating(true);
       setError(null);
@@ -189,13 +189,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         let wsId: string;
         if (orphan) {
-          wsId = await importWorktreeWorkspace(orphan.path, cwd);
+          wsId = await importWorktreeWorkspace(orphan.path, branch, "single");
         } else {
           wsId = await createWorktreeWorkspace(
-            branch,
-            "", // path - let backend decide
             cwd,
-            createBranch,
+            branch,
+            isNewBranch,
+            "single",
+            isNewBranch ? baseBranch || null : null,
           );
         }
 
@@ -213,7 +214,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         setCreating(false);
       }
     },
-    [cwd, creating, selectedPreset, branchWorkspaceMap, worktrees, onOpenChange],
+    [cwd, creating, selectedPreset, baseBranch, branchWorkspaceMap, worktrees, onOpenChange],
   );
 
   return (

@@ -133,15 +133,20 @@ export const openInEditor = (editorId: string, path: string) =>
   invoke<void>("open_in_editor", { editorId, path });
 
 export const createWorktreeWorkspace = (
+  repoPath: string,
   branch: string,
-  path: string,
-  cwd: string,
-  createBranch: boolean,
+  newBranch: boolean,
+  layout: string,
+  base?: string | null,
 ) =>
-  invoke<string>("create_worktree_workspace", { branch, path, cwd, createBranch });
+  invoke<string>("create_worktree_workspace", { repoPath, branch, newBranch, base: base ?? null, layout });
 
-export const importWorktreeWorkspace = (path: string, cwd: string) =>
-  invoke<string>("import_worktree_workspace", { path, cwd });
+export const importWorktreeWorkspace = (
+  worktreePath: string,
+  branch: string,
+  layout: string,
+) =>
+  invoke<string>("import_worktree_workspace", { worktreePath, branch, layout });
 
 export const closeWorkspaceWithWorktree = (
   workspaceId: string,
