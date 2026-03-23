@@ -23,14 +23,8 @@ interface Props {
   title: string;
 }
 
-// Static zinc dark theme matching the shadcn UI
-const ZINC_DARK_THEME: ITheme = {
-  background: "#09090b",
-  foreground: "#fafafa",
-  cursor: "#fafafa",
-  cursorAccent: "#09090b",
-  selectionBackground: "#27272a80",
-  selectionForeground: "#fafafa",
+// Static ANSI palette — doesn't change with presets
+const ANSI_COLORS = {
   black: "#09090b",
   red: "#ef4444",
   green: "#22c55e",
@@ -48,6 +42,35 @@ const ZINC_DARK_THEME: ITheme = {
   brightCyan: "#22d3ee",
   brightWhite: "#ffffff",
 };
+
+function resolveOklch(value: string): string {
+  const el = document.createElement("div");
+  el.style.color = value;
+  document.body.appendChild(el);
+  const rgb = getComputedStyle(el).color;
+  document.body.removeChild(el);
+  return rgb;
+}
+
+function getCSSVar(name: string): string {
+  const raw = getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+  if (!raw) return "";
+  return resolveOklch(raw);
+}
+
+function buildThemeFromCSS(): ITheme {
+  return {
+    background: getCSSVar("--background"),
+    foreground: getCSSVar("--foreground"),
+    cursor: getCSSVar("--foreground"),
+    cursorAccent: getCSSVar("--background"),
+    selectionBackground: getCSSVar("--accent"),
+    selectionForeground: getCSSVar("--accent-foreground"),
+    ...ANSI_COLORS,
+  };
+}
 
 // TODO: re-enable as "system theme" option in settings
 // function buildXtermTheme(t: ThemeColors): ITheme {
@@ -222,7 +245,7 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
     // ── Create terminal ──
     const term = new Terminal({
       fontFamily: "'JetBrains Mono Variable', monospace",
-      theme: ZINC_DARK_THEME,
+      theme: buildThemeFromCSS(),
       convertEol: true,
       cursorBlink: true,
       cursorWidth: 2,
@@ -455,6 +478,20 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
   //     fitAddonRef.current?.fit();
   //   }
   // }, [shellAppearance]);
+
+  // ── Re-read CSS variables when theme class/style changes ──
+  useEffect(() => {
+    const observer = new MutationObserver(() => {
+      if (termRef.current) {
+        termRef.current.options.theme = buildThemeFromCSS();
+      }
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style"],
+    });
+    return () => observer.disconnect();
+  }, []);
 
   // ── Focus management ──
   useEffect(() => {
