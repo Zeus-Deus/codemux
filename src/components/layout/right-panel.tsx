@@ -42,6 +42,14 @@ export function RightPanel({ workspace, activeTab }: Props) {
             <TabsTrigger value="files" className="px-2 text-xs">
               Files
             </TabsTrigger>
+            <TabsTrigger value="pr" className="px-2 text-xs">
+              PR
+              {workspace.pr_number && (
+                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
+                  #{workspace.pr_number}
+                </span>
+              )}
+            </TabsTrigger>
           </TabsList>
           <Button
             variant="ghost"
@@ -58,6 +66,9 @@ export function RightPanel({ workspace, activeTab }: Props) {
         </TabsContent>
         <TabsContent value="files" className="flex-1 overflow-hidden">
           <FileTreePanel workspace={workspace} />
+        </TabsContent>
+        <TabsContent value="pr" className="flex-1 overflow-auto p-3">
+          <p className="text-xs text-muted-foreground">PR panel — coming soon</p>
         </TabsContent>
       </Tabs>
     </div>
