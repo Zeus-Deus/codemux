@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   SidebarGroup,
   SidebarGroupLabel,
@@ -10,8 +11,15 @@ import { useAppStore } from "@/stores/app-store";
 import { Bell } from "lucide-react";
 
 export function SidebarAlertsSection() {
-  const notifications = useAppStore((s) => s.appState?.notifications ?? []);
-  const unreadCount = notifications.filter((n) => !n.read).length;
+  const appState = useAppStore((s) => s.appState);
+  const notifications = useMemo(
+    () => appState?.notifications ?? [],
+    [appState],
+  );
+  const unreadCount = useMemo(
+    () => notifications.filter((n) => !n.read).length,
+    [notifications],
+  );
 
   return (
     <SidebarGroup>

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import {
   SidebarGroup,
   SidebarGroupLabel,
@@ -10,8 +11,10 @@ import { useAppStore } from "@/stores/app-store";
 import { Workflow } from "lucide-react";
 
 export function SidebarOpenflowSection() {
-  const openflowWorkspaces = useAppStore(
-    (s) => s.appState?.workspaces.filter((w) => w.workspace_type === "open_flow") ?? [],
+  const appState = useAppStore((s) => s.appState);
+  const openflowWorkspaces = useMemo(
+    () => appState?.workspaces.filter((w) => w.workspace_type === "open_flow") ?? [],
+    [appState],
   );
 
   return (
