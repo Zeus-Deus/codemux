@@ -35,19 +35,16 @@ export function AppShell() {
     );
   }
 
-  const content = showSettings ? (
-    <SettingsView />
-  ) : hasWorkspaces ? (
-    <WorkspaceMain />
-  ) : (
-    <EmptyState />
-  );
+  // Full-screen settings — replaces entire app including sidebar
+  if (showSettings) {
+    return <SettingsView />;
+  }
 
   return (
     <SidebarProvider defaultOpen className="h-screen max-h-screen">
       <AppSidebar />
       <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
-        {content}
+        {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
       </SidebarInset>
       <CommandPalette
         open={commandPaletteOpen}
