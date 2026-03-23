@@ -76,7 +76,7 @@
     --chart-3: oklch(0.646 0.222 41.116);
     --chart-4: oklch(0.553 0.195 38.402);
     --chart-5: oklch(0.47 0.157 37.304);
-    --radius: 0;
+    --radius: 0.45rem;
     --success: oklch(0.723 0.191 142.5);
     --danger: oklch(0.707 0.165 19.57);
     --warning: oklch(0.795 0.184 86.047);

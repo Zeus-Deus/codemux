@@ -31,7 +31,7 @@ Principles:
 
 ### shadcn Preset Color Model
 
-The frontend uses shadcn with preset `b3kIbNYUU` (zinc base, oklch color space, zero radius). All colors are defined as CSS variables in `src/globals.css` with `:root` (light) and `.dark` selectors. The app defaults to dark mode via `class="dark"` on `<html>`.
+The frontend uses shadcn with preset `b3kIbNYVW` (zinc base, oklch color space, 0.45rem radius). All colors are defined as CSS variables in `src/globals.css` with `:root` (light) and `.dark` selectors. The app defaults to dark mode via `class="dark"` on `<html>`.
 
 #### Core shadcn tokens (from globals.css)
 

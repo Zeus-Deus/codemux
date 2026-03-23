@@ -16,7 +16,7 @@ Codemux is one Tauri desktop app repo, not a separate web frontend plus network 
 
 ## Frontend Layer
 
-The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYUU). State management is zustand. All Tauri IPC goes through typed wrappers in `src/tauri/`.
+The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYVW). State management is zustand. All Tauri IPC goes through typed wrappers in `src/tauri/`.
 
 - shadcn primitives: `src/components/ui/` (button, tabs, sidebar, resizable, badge, tooltip, etc.)
 - app shell layout: `src/components/layout/` (AppSidebar, PaneNode, TabBar, WorkspaceMain, RightPanel)
