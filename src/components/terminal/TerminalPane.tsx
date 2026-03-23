@@ -11,9 +11,10 @@ import {
   Channel,
 } from "@/tauri/commands";
 import { onTerminalStatus } from "@/tauri/events";
-import { useThemeColors } from "@/hooks/use-theme-colors";
+// TODO: re-enable as "system theme" option in settings
+// import { useThemeColors } from "@/hooks/use-theme-colors";
 import { useTauriEvent } from "@/hooks/use-tauri-event";
-import type { ThemeColors, TerminalStatusPayload } from "@/tauri/types";
+import type { TerminalStatusPayload } from "@/tauri/types";
 
 interface Props {
   sessionId: string;
@@ -22,31 +23,43 @@ interface Props {
   title: string;
 }
 
-function buildXtermTheme(t: ThemeColors): ITheme {
-  return {
-    background: t.background,
-    foreground: t.foreground,
-    cursor: t.cursor,
-    selectionBackground: t.selection_background,
-    selectionForeground: t.selection_foreground,
-    black: t.color0,
-    red: t.color1,
-    green: t.color2,
-    yellow: t.color3,
-    blue: t.color4,
-    magenta: t.color5,
-    cyan: t.color6,
-    white: t.color7,
-    brightBlack: t.color8,
-    brightRed: t.color9,
-    brightGreen: t.color10,
-    brightYellow: t.color11,
-    brightBlue: t.color12,
-    brightMagenta: t.color13,
-    brightCyan: t.color14,
-    brightWhite: t.color15,
-  };
-}
+// Static zinc dark theme matching the shadcn UI
+const ZINC_DARK_THEME: ITheme = {
+  background: "#09090b",
+  foreground: "#fafafa",
+  cursor: "#fafafa",
+  cursorAccent: "#09090b",
+  selectionBackground: "#27272a80",
+  selectionForeground: "#fafafa",
+  black: "#09090b",
+  red: "#ef4444",
+  green: "#22c55e",
+  yellow: "#eab308",
+  blue: "#3b82f6",
+  magenta: "#a855f7",
+  cyan: "#06b6d4",
+  white: "#fafafa",
+  brightBlack: "#52525b",
+  brightRed: "#f87171",
+  brightGreen: "#4ade80",
+  brightYellow: "#facc15",
+  brightBlue: "#60a5fa",
+  brightMagenta: "#c084fc",
+  brightCyan: "#22d3ee",
+  brightWhite: "#ffffff",
+};
+
+// TODO: re-enable as "system theme" option in settings
+// function buildXtermTheme(t: ThemeColors): ITheme {
+//   return {
+//     background: t.background, foreground: t.foreground, cursor: t.cursor,
+//     selectionBackground: t.selection_background, selectionForeground: t.selection_foreground,
+//     black: t.color0, red: t.color1, green: t.color2, yellow: t.color3,
+//     blue: t.color4, magenta: t.color5, cyan: t.color6, white: t.color7,
+//     brightBlack: t.color8, brightRed: t.color9, brightGreen: t.color10, brightYellow: t.color11,
+//     brightBlue: t.color12, brightMagenta: t.color13, brightCyan: t.color14, brightWhite: t.color15,
+//   };
+// }
 
 function extractBytes(payload: unknown): Uint8Array | null {
   if (payload instanceof Uint8Array) return payload;
@@ -57,7 +70,8 @@ function extractBytes(payload: unknown): Uint8Array | null {
 }
 
 export function TerminalPane({ sessionId, focused, visible }: Props) {
-  const { theme, shellAppearance } = useThemeColors();
+  // TODO: re-enable as "system theme" option in settings
+  // const { theme, shellAppearance } = useThemeColors();
 
   // Refs for mutable state that persists across renders
   const shellRef = useRef<HTMLDivElement>(null);
@@ -87,8 +101,6 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
   // Track props for closures
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
-  const themeRef = useRef(theme);
-  themeRef.current = theme;
 
   // ── Kitty protocol scanning ──
   const scanKittyProtocol = useCallback((data: Uint8Array | string) => {
@@ -209,8 +221,8 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
 
     // ── Create terminal ──
     const term = new Terminal({
-      fontFamily: shellAppearance.font_family || "monospace",
-      theme: buildXtermTheme(theme),
+      fontFamily: "'JetBrains Mono Variable', monospace",
+      theme: ZINC_DARK_THEME,
       convertEol: true,
       cursorBlink: true,
       cursorWidth: 2,
@@ -430,21 +442,19 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // ── Theme update (no terminal rebuild) ──
-  useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.theme = buildXtermTheme(theme);
-    }
-  }, [theme]);
-
-  // ── Shell appearance update ──
-  useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.fontFamily =
-        shellAppearance.font_family || "monospace";
-      fitAddonRef.current?.fit();
-    }
-  }, [shellAppearance]);
+  // TODO: re-enable as "system theme" option in settings
+  // useEffect(() => {
+  //   if (termRef.current) {
+  //     termRef.current.options.theme = buildXtermTheme(theme);
+  //   }
+  // }, [theme]);
+  //
+  // useEffect(() => {
+  //   if (termRef.current) {
+  //     termRef.current.options.fontFamily = shellAppearance.font_family || "monospace";
+  //     fitAddonRef.current?.fit();
+  //   }
+  // }, [shellAppearance]);
 
   // ── Focus management ──
   useEffect(() => {
