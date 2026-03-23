@@ -1,4 +1,5 @@
 import {
+  Command,
   CommandDialog,
   CommandInput,
   CommandList,
@@ -45,6 +46,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
 
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
+      <Command>
       <CommandInput placeholder="Type a command..." />
       <CommandList>
         <CommandEmpty>No results found.</CommandEmpty>
@@ -172,6 +174,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           </CommandItem>
         </CommandGroup>
       </CommandList>
+      </Command>
     </CommandDialog>
   );
 }
