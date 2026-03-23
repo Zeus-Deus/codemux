@@ -3,6 +3,7 @@ import {
   SidebarMenuButton,
   SidebarMenuBadge,
   SidebarMenuAction,
+  SidebarMenuSubButton,
 } from "@/components/ui/sidebar";
 import { Badge } from "@/components/ui/badge";
 import { X, GitBranch } from "lucide-react";
@@ -12,9 +13,39 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 interface Props {
   workspace: WorkspaceSnapshot;
   isActive: boolean;
+  nested?: boolean;
 }
 
-export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
+function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
+  return (
+    <div className="flex flex-col gap-0.5 min-w-0">
+      <span className="truncate font-medium">{workspace.title}</span>
+      {workspace.git_branch && (
+        <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
+          <GitBranch className="h-2.5 w-2.5 shrink-0" />
+          <span className="truncate">{workspace.git_branch}</span>
+          {workspace.pr_number && (
+            <Badge variant="outline" className="h-4 px-1 text-[10px]">
+              #{workspace.pr_number}
+            </Badge>
+          )}
+          {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
+            <span className="ml-auto flex items-center gap-1 shrink-0 tabular-nums">
+              {workspace.git_additions > 0 && (
+                <span className="text-green-500">+{workspace.git_additions}</span>
+              )}
+              {workspace.git_deletions > 0 && (
+                <span className="text-red-400">-{workspace.git_deletions}</span>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
   };
@@ -31,6 +62,27 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
         ? "bg-primary"
         : "bg-muted-foreground/40";
 
+  // Nested rows are already inside SidebarMenuSubItem (<li>),
+  // so use SidebarMenuSubButton instead of SidebarMenuItem + SidebarMenuButton.
+  if (nested) {
+    return (
+      <SidebarMenuSubButton
+        isActive={isActive}
+        onClick={handleActivate}
+        className={
+          isActive
+            ? "border-l-2 border-l-primary bg-sidebar-accent"
+            : "border-l-2 border-l-transparent"
+        }
+      >
+        <span
+          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${statusDotColor}`}
+        />
+        <WorkspaceRowContent workspace={workspace} />
+      </SidebarMenuSubButton>
+    );
+  }
+
   return (
     <SidebarMenuItem>
       <SidebarMenuButton
@@ -44,35 +96,10 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
             : "border-l-2 border-l-transparent"
         }
       >
-        <div className="flex flex-col gap-0.5 min-w-0">
-          <div className="flex items-center gap-1.5">
-            <span
-              className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${statusDotColor}`}
-            />
-            <span className="truncate font-medium">{workspace.title}</span>
-          </div>
-          {workspace.git_branch && (
-            <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-              <GitBranch className="h-2.5 w-2.5 shrink-0" />
-              <span className="truncate">{workspace.git_branch}</span>
-              {workspace.pr_number && (
-                <Badge variant="outline" className="h-4 px-1 text-[10px]">
-                  #{workspace.pr_number}
-                </Badge>
-              )}
-              {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
-                <span className="ml-auto flex items-center gap-1 shrink-0 tabular-nums">
-                  {workspace.git_additions > 0 && (
-                    <span className="text-green-500">+{workspace.git_additions}</span>
-                  )}
-                  {workspace.git_deletions > 0 && (
-                    <span className="text-red-400">-{workspace.git_deletions}</span>
-                  )}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
+        <span
+          className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full ${statusDotColor}`}
+        />
+        <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuButton>
       {workspace.notification_count > 0 && (
         <SidebarMenuBadge className="bg-yellow-500/20 text-yellow-500">

@@ -1,5 +1,5 @@
+import { useMemo } from "react";
 import { create } from "zustand";
-import { useShallow } from "zustand/react/shallow";
 import type {
   AppStateSnapshot,
   WorkspaceSnapshot,
@@ -47,24 +47,24 @@ export interface SectionGroup {
 }
 
 export function useSectionedWorkspaces() {
-  return useAppStore(
-    useShallow((s) => {
-      if (!s.appState)
-        return { sectionGroups: [] as SectionGroup[], unsorted: [] as WorkspaceSnapshot[] };
+  const appState = useAppStore((s) => s.appState);
 
-      const sections = [...s.appState.sections].sort((a, b) => a.position - b.position);
-      const assignedIds = new Set(sections.flatMap((sec) => sec.workspace_ids));
-      const unsorted = s.appState.workspaces.filter(
-        (w) => !assignedIds.has(w.workspace_id),
-      );
-      const sectionGroups: SectionGroup[] = sections.map((section) => ({
-        section,
-        workspaces: section.workspace_ids
-          .map((id) => s.appState!.workspaces.find((w) => w.workspace_id === id))
-          .filter((w): w is WorkspaceSnapshot => w != null),
-      }));
+  return useMemo(() => {
+    if (!appState)
+      return { sectionGroups: [] as SectionGroup[], unsorted: [] as WorkspaceSnapshot[] };
 
-      return { sectionGroups, unsorted };
-    }),
-  );
+    const sections = [...appState.sections].sort((a, b) => a.position - b.position);
+    const assignedIds = new Set(sections.flatMap((sec) => sec.workspace_ids));
+    const unsorted = appState.workspaces.filter(
+      (w) => !assignedIds.has(w.workspace_id),
+    );
+    const sectionGroups: SectionGroup[] = sections.map((section) => ({
+      section,
+      workspaces: section.workspace_ids
+        .map((id) => appState.workspaces.find((w) => w.workspace_id === id))
+        .filter((w): w is WorkspaceSnapshot => w != null),
+    }));
+
+    return { sectionGroups, unsorted };
+  }, [appState]);
 }

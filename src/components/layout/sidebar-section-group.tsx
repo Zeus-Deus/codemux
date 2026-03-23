@@ -46,6 +46,7 @@ export function SidebarSectionGroup({ section, workspaces, activeWorkspaceId }: 
               <SidebarWorkspaceRow
                 workspace={ws}
                 isActive={ws.workspace_id === activeWorkspaceId}
+                nested
               />
             </SidebarMenuSubItem>
           ))}
