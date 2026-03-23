@@ -1,9 +1,11 @@
 import { SidebarHeader as ShadcnSidebarHeader } from "@/components/ui/sidebar";
 import { useActiveWorkspace } from "@/stores/app-store";
-import { GitBranch, Plus, FolderPlus } from "lucide-react";
+import { useUIStore } from "@/stores/ui-store";
+import { GitBranch, Plus, FolderPlus, Settings } from "lucide-react";
 
 export function SidebarHeader() {
   const activeWorkspace = useActiveWorkspace();
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
 
   return (
     <ShadcnSidebarHeader className="gap-1 p-3">
@@ -26,6 +28,13 @@ export function SidebarHeader() {
             title="New workspace"
           >
             <Plus className="h-3.5 w-3.5" />
+          </button>
+          <button
+            className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+            title="Settings"
+            onClick={() => setShowSettings(true)}
+          >
+            <Settings className="h-3.5 w-3.5" />
           </button>
         </div>
       </div>

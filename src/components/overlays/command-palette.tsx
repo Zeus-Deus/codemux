@@ -29,6 +29,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
   const appState = useAppStore((s) => s.appState);
   const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
   const { toggleSidebar } = useSidebar();
 
   const run = (fn: () => void) => {
@@ -152,6 +153,9 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           <CommandItem onSelect={() => run(toggleSidebar)}>
             Toggle Sidebar
             <CommandShortcut>Ctrl+B</CommandShortcut>
+          </CommandItem>
+          <CommandItem onSelect={() => run(() => setShowSettings(true))}>
+            Open Settings
           </CommandItem>
         </CommandGroup>
 

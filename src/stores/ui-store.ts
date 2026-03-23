@@ -6,18 +6,21 @@ interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;
   rightPanelWidth: number;
   showNewWorkspaceDialog: boolean;
+  showSettings: boolean;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
   toggleRightPanel: (workspaceId: string, tab: RightPanelTab) => void;
   setRightPanelWidth: (width: number) => void;
   setShowNewWorkspaceDialog: (show: boolean) => void;
+  setShowSettings: (show: boolean) => void;
 }
 
 export const useUIStore = create<UIStore>((set, get) => ({
   rightPanelTabs: {},
   rightPanelWidth: 320,
   showNewWorkspaceDialog: false,
+  showSettings: false,
 
   getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -41,4 +44,6 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ rightPanelWidth: Math.max(240, Math.min(500, width)) }),
 
   setShowNewWorkspaceDialog: (show) => set({ showNewWorkspaceDialog: show }),
+
+  setShowSettings: (show) => set({ showSettings: show }),
 }));

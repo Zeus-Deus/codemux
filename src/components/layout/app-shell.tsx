@@ -1,9 +1,11 @@
 import { useState, useEffect } from "react";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
+import { SettingsView } from "@/components/settings/settings-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
 
 export function AppShell() {
@@ -11,6 +13,7 @@ export function AppShell() {
   const hasWorkspaces = useAppStore(
     (s) => (s.appState?.workspaces.length ?? 0) > 0,
   );
+  const showSettings = useUIStore((s) => s.showSettings);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
 
   useEffect(() => {
@@ -32,11 +35,19 @@ export function AppShell() {
     );
   }
 
+  const content = showSettings ? (
+    <SettingsView />
+  ) : hasWorkspaces ? (
+    <WorkspaceMain />
+  ) : (
+    <EmptyState />
+  );
+
   return (
     <SidebarProvider defaultOpen className="h-screen max-h-screen">
       <AppSidebar />
       <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
-        {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
+        {content}
       </SidebarInset>
       <CommandPalette
         open={commandPaletteOpen}

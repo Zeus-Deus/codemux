@@ -1,10 +1,18 @@
 import { useEffect } from "react";
 import { splitPane, closePane, createTab, closeTab } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 
 export function useKeyboardShortcuts() {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      // Escape closes settings
+      if (e.key === "Escape" && useUIStore.getState().showSettings) {
+        e.preventDefault();
+        useUIStore.getState().setShowSettings(false);
+        return;
+      }
+
       const appState = useAppStore.getState().appState;
       if (!appState) return;
 
