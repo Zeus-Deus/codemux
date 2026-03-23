@@ -85,10 +85,17 @@ function handleDragStart(
 
   const clearHighlight = () => {
     if (highlighted) {
-      highlighted.removeAttribute("data-pane-drop-target");
+      highlighted.querySelector(".pane-drop-overlay")?.remove();
       highlighted = null;
     }
     targetPaneId = null;
+  };
+
+  const showOverlay = (target: HTMLElement) => {
+    const overlay = document.createElement("div");
+    overlay.className = "pane-drop-overlay";
+    overlay.innerHTML = "<span>Drop to swap</span>";
+    target.appendChild(overlay);
   };
 
   const findDropTarget = (cx: number, cy: number): HTMLElement | null => {
@@ -123,7 +130,7 @@ function handleDragStart(
     clearHighlight();
     const target = findDropTarget(ev.clientX, ev.clientY);
     if (target) {
-      target.setAttribute("data-pane-drop-target", "true");
+      showOverlay(target);
       highlighted = target;
       targetPaneId = target.dataset.paneDropId ?? null;
     }
@@ -196,7 +203,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
       <div
         className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
           isActive ? "border-primary/50" : "border-border/50"
-        } data-[pane-drop-target]:outline data-[pane-drop-target]:outline-2 data-[pane-drop-target]:outline-primary/60 data-[pane-drop-target]:outline-offset-[-2px]`}
+        }`}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
@@ -249,7 +256,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
       <div
         className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
           isActive ? "border-primary/50" : "border-border/50"
-        } data-[pane-drop-target]:outline data-[pane-drop-target]:outline-2 data-[pane-drop-target]:outline-primary/60 data-[pane-drop-target]:outline-offset-[-2px]`}
+        }`}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >

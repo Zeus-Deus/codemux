@@ -127,6 +127,30 @@
     --sidebar-ring: oklch(0.552 0.016 285.938);
 }
 
+.pane-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in oklch, var(--primary) 8%, transparent);
+  border: 2px solid color-mix(in oklch, var(--primary) 40%, transparent);
+  backdrop-filter: blur(1px);
+  pointer-events: none;
+  transition: opacity 0.1s ease;
+}
+
+.pane-drop-overlay span {
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--primary);
+  background: var(--card);
+  padding: 0.25rem 0.75rem;
+  border-radius: var(--radius-md, 4px);
+  border: 1px solid color-mix(in oklch, var(--primary) 20%, transparent);
+}
+
 @layer base {
   * {
     @apply border-border outline-ring/50;
