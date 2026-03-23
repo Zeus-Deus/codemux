@@ -1,6 +1,6 @@
 ---
 name: codemux-ui
-description: Use when building, modifying, or improving any user-visible part of Codemux — Svelte components, CSS, theming, pane layouts, sidebar, notifications, OpenFlow UI, or implementing new ADE features. Also use when the task involves visual design decisions, component patterns, or color/theme work.
+description: Use when building, modifying, or improving any user-visible part of Codemux — React components, Tailwind, shadcn, theming, pane layouts, sidebar, notifications, OpenFlow UI, or implementing new ADE features. Also use when the task involves visual design decisions, component patterns, or color/theme work.
 ---
 
 # Codemux UI & ADE Feature Standards
@@ -29,60 +29,49 @@ Principles:
 
 ## Theming Rules
 
-### Shell vs Terminal Color Model
+### shadcn Preset Color Model
 
-The shell uses a FIXED neutral dark palette. Omarchy theme colors only affect terminal content and accent tokens.
+The frontend uses shadcn with preset `b3kIbNYUU` (zinc base, oklch color space, zero radius). All colors are defined as CSS variables in `src/globals.css` with `:root` (light) and `.dark` selectors. The app defaults to dark mode via `class="dark"` on `<html>`.
 
-#### Fixed Shell Palette (never changes with theme)
-
-```
---ui-layer-0: #0d0f11          Near-black base (app bg, terminal bg)
---ui-layer-1: #151719          Sidebar, pane headers
---ui-layer-2: #1c1e22          Elevated surfaces, cards, inputs
---ui-layer-3: #252830          Hover states, strong surfaces
-
---ui-border-soft:   rgba(255, 255, 255, 0.08)
---ui-border-strong: rgba(255, 255, 255, 0.14)
-
---ui-text-primary:   #e0e0e0
---ui-text-secondary: #9a9a9a
---ui-text-muted:     #636363
-```
-
-Three text levels max. Do not invent intermediate shades.
-
-#### Theme-Reactive Accents (from Omarchy)
+#### Core shadcn tokens (from globals.css)
 
 ```
---ui-accent:         var(--theme-accent)
---ui-accent-soft:    color-mix(in srgb, var(--theme-accent) 18%, transparent 82%)
---ui-success:        var(--theme-color2)
---ui-danger:         var(--theme-color1)
---ui-attention:      var(--theme-color3)
---ui-attention-soft: color-mix(in srgb, var(--theme-color3) 14%, transparent 86%)
+--background    App background (oklch dark)
+--foreground    Primary text
+--card          Elevated surface
+--muted         Muted surface
+--muted-foreground  Secondary text
+--accent        Interactive surface
+--primary       Accent color (blue)
+--destructive   Error/delete
+--border        Border color
 ```
 
-These are the ONLY theme-reactive tokens in the shell chrome.
+#### Custom semantic tokens (added for Codemux)
 
-#### Terminal Colors (from Omarchy)
+```
+--success       Git additions, agent done (green)
+--danger        Git deletions, errors (red)
+--warning       Notifications, attention (amber)
+```
 
-Terminal text, cursor, selection, and ANSI palette (color0-color15) come from `--theme-*` vars via the `terminalTheme()` function in TerminalPane.svelte. Terminal background uses `--ui-layer-0` (fixed neutral), NOT `--theme-background`. This keeps all panes visually calm while terminal content is fully colorful.
+Use Tailwind classes: `text-success`, `text-danger`, `text-warning`, `bg-success`, etc.
+
+#### Terminal Colors
+
+Terminal bg/fg/cursor/selection read dynamically from shadcn CSS variables via `buildThemeFromCSS()` in `TerminalPane.tsx`. ANSI colors (color0-color15) use a static palette. A MutationObserver on `<html>` re-applies the theme when the preset changes.
+
+Omarchy theme integration is commented out but preserved for future "system theme" setting.
 
 ### Where Accent Colors Appear
 
-USE accent for: focused pane border glow, active workspace left bar, active workspace row background (~10% opacity), status badges (12-15% opacity bg), interactive hover states (~6% opacity), notification badges, focused input borders, OpenFlow active edge animations.
+USE `primary` for: focused pane border, active workspace left bar, active workspace row bg, status badges, interactive hover states, notification badges, focused input borders.
 
-NEVER use accent for: sidebar background, pane header background, large surface areas, body text, borders in resting state.
-
-### Omarchy Integration
-
-When Omarchy is available, all colors come from `~/.config/omarchy/current/theme/colors.toml`. When unavailable, fall back to `ThemeColors::default()`. The derived layer system means even the fallback looks correct.
-
-For Omarchy-specific integration questions, use the `omarchy-kb` MCP server which has complete Omarchy, Hyprland, and Arch Linux documentation.
+NEVER use `primary` for: sidebar background, pane header background, large surface areas, body text, borders in resting state.
 
 ### The Golden Rule
 
-Shell tokens (`--ui-layer-*`, `--ui-border-*`, `--ui-text-*`) are fixed hex values — they never reference `--theme-*`. Accent tokens (`--ui-accent`, `--ui-success`, `--ui-danger`, `--ui-attention`) use `var(--theme-*)`. Terminal colors use `var(--theme-*)`. Never use `--theme-background` or `--theme-foreground` for shell chrome.
+All colors come from shadcn CSS variables. Never hardcode hex values in components. Use Tailwind semantic classes (`bg-background`, `text-foreground`, `border-border`, `text-success`, `text-danger`, `text-warning`). The only hardcoded colors allowed are in `src/tauri/types.ts` (data constants from Rust) and the ANSI palette in `TerminalPane.tsx`.
 
 ---
 
@@ -173,7 +162,7 @@ Codemux uses a global overlay manager (src/stores/overlay.ts) that ensures only 
 Rules for adding new overlays:
 - Register the overlay kind in the OverlayKind type in src/stores/overlay.ts
 - Open/close via toggleOverlay(kind) and closeOverlay() — never manage visibility in the component itself
-- Render the overlay conditionally in App.svelte based on $activeOverlay
+- Render the overlay conditionally in App.tsx based on active overlay state
 - All overlays: centered, same z-index (100), same backdrop (rgba(0,0,0,0.4)), same border-radius and shadow
 - Escape always closes the active overlay
 - Opening a new overlay auto-closes the previous one
@@ -219,31 +208,32 @@ Unique to Codemux. Instead of manual agent assignment, analyze the task and sugg
 
 ## CSS Rules
 
-### Always use tokens
+### Use Tailwind + shadcn tokens
 
-```css
-/* Correct — use --ui-* tokens for shell chrome */
-background: var(--ui-layer-2);
-color: var(--ui-text-secondary);
-border-radius: var(--ui-radius-md);
-transition: all var(--ui-motion-fast);
+```tsx
+{/* Correct — use Tailwind semantic classes */}
+<div className="bg-card text-muted-foreground border-border rounded-md" />
 
-/* Correct — use color-mix with accent tokens for tinted surfaces */
-background: color-mix(in srgb, var(--ui-accent) 10%, transparent);
-border-color: color-mix(in srgb, var(--ui-accent) 30%, transparent);
+{/* Correct — use custom semantic tokens */}
+<span className="text-success">+42</span>
+<span className="text-danger">-17</span>
 
-/* Wrong — raw hex/rgba instead of tokens */
-background: #1d2231;
-color: rgba(122, 162, 247, 0.1);
+{/* Wrong — hardcoded Tailwind palette colors */}
+<span className="text-green-500">+42</span>
+<span className="bg-gray-800" />
 ```
 
-### Scoped styles only
+### No separate CSS files per component
 
-Every component uses `<style>` with Svelte scoping. No `:global()` except in App.svelte for token definitions. Pass parent styles to children via CSS custom properties or props.
+All styling via Tailwind classes. The only CSS file is `src/globals.css` which defines shadcn tokens, the `@theme inline` block, and a few global styles (`.pane-drop-overlay`). No CSS modules, no styled-components.
+
+### Use `cn()` for conditional classes
+
+Import from `@/lib/utils`. Combines `clsx` + `tailwind-merge`.
 
 ### Flex/grid overflow prevention
 
-Always set `min-width: 0` and `min-height: 0` on flex and grid children to prevent content overflow.
+Always set `min-w-0` and `min-h-0` on flex and grid children to prevent content overflow.
 
 ---
 
@@ -266,9 +256,9 @@ Before considering a component done:
 
 ## Do Not
 
-- Add Tailwind, SCSS, or CSS modules — plain CSS with custom properties only
-- Add global CSS files — tokens live in App.svelte `:root`
-- Import component libraries — keep it custom and lightweight
+- Add separate CSS files per component — use Tailwind classes only
+- Hardcode hex/rgba colors in components — use shadcn tokens via Tailwind
+- Import UI libraries besides shadcn — use shadcn primitives from `src/components/ui/`
 - Use `px` font sizes in shell chrome — use `rem`
 - Add attention-seeking animations to the chrome
 - Use `--theme-background` or `--theme-foreground` in shell chrome — use `--ui-*` tokens

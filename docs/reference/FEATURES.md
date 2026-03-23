@@ -127,13 +127,13 @@
 
 ## Important Touch Points
 
-- `src/App.svelte` — App shell, global shortcuts, tab/workspace rendering
-- `src/components/tabs/TabBar.svelte` — Tab bar UI
-- `src/components/panes/PaneNode.svelte` — Pane tree rendering, splits, drag-swap
-- `src/components/panes/TerminalPane.svelte` — Terminal integration
-- `src/components/panes/BrowserPane.svelte` — Browser pane
-- `src/components/sidebar/Sidebar.svelte` — Sidebar shell
-- `src/components/openflow/` — OpenFlow orchestration UI
+- `src/App.tsx` — App root, state init, keyboard shortcuts
+- `src/components/layout/` — App shell (AppSidebar, WorkspaceMain, TabBar, PaneNode, RightPanel)
+- `src/components/terminal/TerminalPane.tsx` — xterm.js terminal with PTY connection
+- `src/components/ui/` — shadcn primitives (sidebar, tabs, resizable, etc.)
+- `src/stores/app-store.ts` — zustand global state from Tauri backend
+- `src/tauri/commands.ts` — typed Tauri invoke wrappers (80+ commands)
+- `src/hooks/use-keyboard-shortcuts.ts` — global keyboard shortcuts
 - `src-tauri/src/state/state_impl.rs` — Backend state management
 - `src-tauri/src/commands/workspace.rs` — Tauri command handlers
 - `src-tauri/src/control.rs` — Unix socket control server

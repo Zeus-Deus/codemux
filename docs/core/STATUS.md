@@ -12,9 +12,9 @@ Codemux is approaching Linux MVP. The workspace shell, terminal management, git 
 
 The repo structure is clean and domain-split:
 
-- `src/` is the Svelte UI and IPC layer
+- `src/` is the React + Tailwind + shadcn UI and Tauri IPC layer
 - `src-tauri/` is the Rust app/runtime layer
-- Frontend stores and Rust commands are split by domain
+- `src-old/` preserves the previous Svelte frontend for reference
 
 ## Solid — Daily-Drivable Features
 
@@ -54,6 +54,37 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - The legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
+
+## React Frontend Rebuild Status
+
+The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn (branch `feature/react-frontend-rebuild`). The Rust backend is unchanged.
+
+### Working in React frontend
+
+- App shell: shadcn Sidebar with collapsible workspace sections, tab bar, right panel
+- Workspace list from real Tauri backend data (zustand + app-state-changed events)
+- Terminal panes with xterm.js + canvas renderer + PTY via Tauri Channel
+- Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
+- Right panel: flexbox layout with pointer-based resize (320px default, 240-500px range)
+- Keyboard shortcuts: Ctrl+Shift+D split, Ctrl+Shift+W close pane, Ctrl+T new tab, Ctrl+W close tab
+- Semantic theming: shadcn oklch dark mode + custom --success/--danger/--warning tokens
+- Terminal theme reads dynamically from CSS variables via MutationObserver
+- New workspace creation from sidebar "+" button
+- Tauri bridge: 80+ typed command wrappers, 8 event helpers, all types ported
+
+### TODO — Not yet ported from old Svelte frontend
+
+- Right panel content: Changes panel, File tree, PR panel
+- OpenFlow UI (orchestration view, agent config, communication panel)
+- Command palette (Ctrl+K)
+- Search panels (file search, content search)
+- Browser pane rendering
+- Workspace drag-and-drop reordering in sidebar
+- Context menus (workspace, section, pane)
+- Terminal presets bar
+- Notification sounds
+- Settings panel
+- Memory drawer
 
 ## Read This With
 

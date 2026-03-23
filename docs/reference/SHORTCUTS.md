@@ -10,7 +10,7 @@
 
 These work anywhere in the app. All require **Ctrl** (Linux) or **Cmd** (macOS).
 
-Defined in `src/App.svelte` — `handleWindowKeydown()`.
+Defined in `src/hooks/use-keyboard-shortcuts.ts` and `src/components/terminal/TerminalPane.tsx`.
 
 | Shortcut | Action | Notes |
 |----------|--------|-------|
@@ -42,7 +42,7 @@ Defined in `src/App.svelte` — `handleWindowKeydown()`.
 
 ## Terminal Shortcuts
 
-These work inside terminal panes. Handled by xterm.js `customKeyEventHandler` in `src/components/panes/TerminalPane.svelte`.
+These work inside terminal panes. Handled by xterm.js `customKeyEventHandler` in `src/components/terminal/TerminalPane.tsx`.
 
 | Shortcut | Action | Notes |
 |----------|--------|-------|
@@ -57,14 +57,10 @@ These work in specific UI contexts.
 
 | Shortcut | Action | Context | Source |
 |----------|--------|---------|--------|
-| Enter | Navigate to URL | Browser address bar focused | `BrowserPane.svelte` |
-| Enter | Save rename | Sidebar workspace rename input | `Sidebar.svelte` |
-| Escape | Cancel rename | Sidebar workspace rename input | `Sidebar.svelte` |
-| Escape | Close modal | New Workspace Launcher open | `NewWorkspaceLauncher.svelte` |
-| Enter | Send message | OpenFlow comm panel input | `CommunicationPanel.svelte` |
-| Enter / Space | Activate workspace | Workspace row focused | `WorkspaceRow.svelte` |
-| Enter / Space | Activate pane | Pane header focused | `PaneNode.svelte` |
-| Enter | Activate tab | Tab focused via keyboard | `TabBar.svelte` |
+| Enter | Navigate to URL | Browser address bar focused | Browser pane (TODO) |
+| Enter / Space | Activate workspace | Workspace row focused | `sidebar-workspace-row.tsx` |
+| Enter / Space | Activate pane | Pane header focused | `PaneNode.tsx` |
+| Enter | Activate tab | Tab focused via keyboard | `tab-bar.tsx` |
 
 ## Known Conflicts
 
@@ -76,8 +72,7 @@ These work in specific UI contexts.
 
 ## Important Touch Points
 
-- `src/App.svelte` — `handleWindowKeydown()` (global shortcuts)
-- `src/components/panes/TerminalPane.svelte` — `customKeyEventHandler()` (terminal shortcuts)
-- `src/components/panes/BrowserPane.svelte` — `handleKeydown()` (address bar)
-- `src/components/openflow/CommunicationPanel.svelte` — `handleKeydown()` (message input)
-- `src/components/tabs/TabBar.svelte` — tab keyboard navigation
+- `src/hooks/use-keyboard-shortcuts.ts` — global shortcuts (Ctrl+Shift+D, Ctrl+T, Ctrl+W, etc.)
+- `src/components/terminal/TerminalPane.tsx` — `customKeyEventHandler()` (terminal shortcuts)
+- `src/components/layout/tab-bar.tsx` — tab keyboard navigation
+- `src/components/layout/PaneNode.tsx` — pane split/close buttons

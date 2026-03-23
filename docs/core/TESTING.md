@@ -11,7 +11,7 @@
 - `npm run verify`: full default verification pass
 - `cargo check --manifest-path src-tauri/Cargo.toml`: Rust compile check
 - `cargo test --manifest-path src-tauri/Cargo.toml`: Rust backend and state tests
-- `npm run check`: Svelte and type checks
+- `npm run check`: TypeScript type checks (`tsc --noEmit`)
 - `npm run test`: frontend tests
 
 Default to `npm run verify` after meaningful work. Use the narrower commands when iterating on one layer.

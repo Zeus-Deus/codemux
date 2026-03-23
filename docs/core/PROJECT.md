@@ -30,7 +30,7 @@ Codemux is a Linux-first AI coding workspace that keeps terminal work, browser t
 ## Architecture Direction
 
 - Rust owns the domain: workspaces, panes, sessions, automation, persistence, and the OpenFlow runtime
-- Svelte and Tauri own presentation and desktop-shell concerns
+- React (Tailwind + shadcn) and Tauri own presentation and desktop-shell concerns
 - browser support must work inside pane layouts and remain scriptable
 - OpenFlow should feel integrated inside Codemux while keeping a clean runtime boundary
 

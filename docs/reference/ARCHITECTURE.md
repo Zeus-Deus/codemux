@@ -10,24 +10,23 @@
 
 Codemux is one Tauri desktop app repo, not a separate web frontend plus network backend.
 
-- `src/`: Svelte UI, view models, and Tauri IPC callers
+- `src/`: React + Tailwind + shadcn UI and Tauri IPC callers
 - `src-tauri/`: Rust domain/runtime, Tauri command surface, CLI, socket control, PTY and browser runtime integration
 - `docs/`: canonical project docs
 
 ## Frontend Layer
 
-The frontend is organized around domain stores and UI surfaces.
+The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYUU). State management is zustand. All Tauri IPC goes through typed wrappers in `src/tauri/`.
 
-- app shell and workspace layout: `src/App.svelte`, `src/components/panes/*`, `src/components/sidebar/*`
-- OpenFlow UI: `src/components/openflow/*`
-- shared app-state store: `src/stores/core.ts`
-- workspace and pane commands: `src/stores/workspace.ts`
-- browser commands: `src/stores/browser.ts`
-- memory commands: `src/stores/memory.ts`
-- OpenFlow runtime and comm-log state: `src/stores/openflow.ts`
-- shared frontend types: `src/stores/types.ts`
+- shadcn primitives: `src/components/ui/` (button, tabs, sidebar, resizable, badge, tooltip, etc.)
+- app shell layout: `src/components/layout/` (AppSidebar, PaneNode, TabBar, WorkspaceMain, RightPanel)
+- terminal integration: `src/components/terminal/TerminalPane.tsx` (xterm.js + PTY via Tauri Channel)
+- React hooks: `src/hooks/` (useTauriEvent, useAppStateInit, useKeyboardShortcuts, useThemeColors)
+- zustand stores: `src/stores/` (app-store.ts for AppStateSnapshot, ui-store.ts for local UI state)
+- Tauri bridge: `src/tauri/commands.ts` (80+ typed invoke wrappers), `src/tauri/events.ts` (8 event helpers), `src/tauri/types.ts` (all shared types)
+- CSS variables: `src/globals.css` (oklch color tokens in :root and .dark, custom --success/--danger/--warning)
 
-The frontend talks to Rust through `invoke(...)` plus the `app-state-changed` event stream.
+The frontend talks to Rust through typed wrappers in `src/tauri/commands.ts` plus the `app-state-changed` event stream. Components never import from `@tauri-apps/api` directly.
 
 ## Rust Layer
 

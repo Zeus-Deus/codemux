@@ -20,9 +20,9 @@ For OpenFlow orchestration patterns, read `docs/features/openflow.md` and `docs/
 3. **Reference open source competitors.** Superset and cmux are open source. When implementing a feature they have, you MAY clone their repo to `/tmp` for reference:
    - `gh repo clone superset-sh/superset /tmp/superset-ref` (Electron + TypeScript)
    - `gh repo clone manaflow-ai/cmux /tmp/cmux-ref` (Swift + libghostty)
-   Inspect their implementation for ideas, then adapt to Codemux's Tauri + Rust + Svelte architecture. Do not copy code directly — understand the approach and reimplement it.
+   Inspect their implementation for ideas, then adapt to Codemux's Tauri + Rust + React + Tailwind + shadcn architecture. Do not copy code directly — understand the approach and reimplement it.
 
-4. **Backend-first.** Codemux's architecture is backend-state-driven. Implement features in Rust first (state, commands, persistence), then expose via Tauri commands, then build the Svelte UI. The frontend is a view of backend truth.
+4. **Backend-first.** Codemux's architecture is backend-state-driven. Implement features in Rust first (state, commands, persistence), then expose via Tauri commands, then build the React UI. The frontend is a view of backend truth.
 
 5. **Run verification.** After implementing, run `npm run verify`. For Rust changes, also run `cargo test --manifest-path src-tauri/Cargo.toml`.
 
@@ -49,7 +49,7 @@ Backend (Rust):
 - Task status tracking and sync (update issue status from Codemux)
 - Expose as Tauri commands and socket API
 
-Frontend (Svelte):
+Frontend (React):
 - Tasks section in sidebar (per project)
 - Task detail view with linked workspace, issue body, comments
 - Quick action: create workspace from task
@@ -89,7 +89,7 @@ Configuration:
 
 **What to build:**
 
-Frontend (Svelte):
+Frontend (React):
 - Full settings screen (left nav + right content, or modal)
 - Sections:
   - **Appearance**: shell font, terminal font size
@@ -121,7 +121,7 @@ Backend (Rust):
 - Configurable per notification level (attention vs info)
 - Respect the existing sound toggle state
 
-Frontend (Svelte):
+Frontend (React):
 - Sound selection in settings panel (Priority 3)
 - Volume control (optional)
 
@@ -131,7 +131,7 @@ Frontend (Svelte):
 
 **Why fifth:** Power users need to rebind shortcuts. The command palette (Ctrl+K) already lists all actions with their current keybinds.
 
-**What exists:** 20+ hardcoded keybinds in `src/App.svelte` (lines 174-241). Command palette shows keybind hints. No user customization.
+**What exists:** Keyboard shortcuts in `src/hooks/use-keyboard-shortcuts.ts` and `src/components/terminal/TerminalPane.tsx`. No user customization yet.
 
 **What to build:**
 
@@ -140,7 +140,7 @@ Backend (Rust):
 - Default keybinds as fallback
 - Import/export keybind config
 
-Frontend (Svelte):
+Frontend (React):
 - Keybind editor in settings panel (extends Priority 3)
 - Click-to-rebind UI: select action, press new key combo, save
 - Conflict detection (warn if key combo already assigned)
@@ -173,7 +173,7 @@ find /tmp/superset-ref -name "*.ts" | xargs grep -l "diff" | head -20
 rm -rf /tmp/superset-ref
 ```
 
-Always adapt patterns to Codemux's architecture (Tauri + Rust backend + Svelte frontend), never transplant code from a different framework.
+Always adapt patterns to Codemux's architecture (Tauri + Rust backend + React frontend), never transplant code from a different framework.
 
 ---
 
