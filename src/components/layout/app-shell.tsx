@@ -21,7 +21,7 @@ export function AppShell() {
   return (
     <SidebarProvider defaultOpen className="h-screen max-h-screen">
       <AppSidebar />
-      <SidebarInset className="flex flex-col overflow-hidden h-full">
+      <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
         {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
       </SidebarInset>
     </SidebarProvider>
