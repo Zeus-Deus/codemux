@@ -43,18 +43,20 @@ export function WorkspaceMain() {
 
   if (!activeWorkspace) return null;
 
+  const showRightPanel = rightPanelTab !== null;
+
   return (
     <>
       <TabBar workspace={activeWorkspace} />
-      <div className="flex-1 overflow-hidden">
-        <ResizablePanelGroup orientation="horizontal">
-          <ResizablePanel defaultSize={75} minSize={30}>
+      <div className="flex-1 min-h-0 h-full overflow-hidden">
+        <ResizablePanelGroup orientation="horizontal" className="h-full">
+          <ResizablePanel defaultSize={showRightPanel ? 75 : 100} minSize={30}>
             <PaneContainer workspace={activeWorkspace} />
           </ResizablePanel>
           <ResizableHandle withHandle />
           <ResizablePanel
             panelRef={rightPanelRef}
-            defaultSize={25}
+            defaultSize={showRightPanel ? 25 : 0}
             minSize={15}
             maxSize={40}
             collapsible
