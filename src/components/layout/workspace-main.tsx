@@ -1,15 +1,46 @@
-import { useRef, useEffect, useCallback } from "react";
+import { useCallback, useRef } from "react";
 import { useActiveWorkspace } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
-import type { PanelImperativeHandle } from "react-resizable-panels";
-import {
-  ResizablePanelGroup,
-  ResizablePanel,
-  ResizableHandle,
-} from "@/components/ui/resizable";
 import { TabBar } from "./tab-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
+
+function RightPanelResizer() {
+  const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
+  const handleRef = useRef<HTMLDivElement>(null);
+
+  const startResize = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      const handle = handleRef.current;
+      if (handle) handle.dataset.dragging = "true";
+
+      const onMove = (ev: PointerEvent) => {
+        setRightPanelWidth(window.innerWidth - ev.clientX);
+      };
+
+      const onUp = () => {
+        if (handle) handle.dataset.dragging = "false";
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    },
+    [setRightPanelWidth],
+  );
+
+  return (
+    <div
+      ref={handleRef}
+      className="w-1 shrink-0 cursor-col-resize bg-border hover:bg-primary/40 data-[dragging=true]:bg-primary/40 transition-colors"
+      onPointerDown={startResize}
+      role="separator"
+      aria-orientation="vertical"
+    />
+  );
+}
 
 export function WorkspaceMain() {
   const activeWorkspace = useActiveWorkspace();
@@ -18,28 +49,7 @@ export function WorkspaceMain() {
       ? s.rightPanelTabs[activeWorkspace.workspace_id] ?? null
       : null,
   );
-  const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
-  const rightPanelRef = useRef<PanelImperativeHandle>(null);
-
-  // Sync collapse/expand with UI store state
-  useEffect(() => {
-    if (rightPanelTab !== null) {
-      rightPanelRef.current?.expand();
-    } else {
-      rightPanelRef.current?.collapse();
-    }
-  }, [rightPanelTab]);
-
-  // Detect user dragging panel to collapsed size
-  const handleRightPanelResize = useCallback(
-    (size: { asPercentage: number; inPixels: number }) => {
-      if (!activeWorkspace) return;
-      if (size.asPercentage === 0 && rightPanelTab !== null) {
-        setRightPanelTab(activeWorkspace.workspace_id, null);
-      }
-    },
-    [activeWorkspace, rightPanelTab, setRightPanelTab],
-  );
+  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 
   if (!activeWorkspace) return null;
 
@@ -48,27 +58,24 @@ export function WorkspaceMain() {
   return (
     <>
       <TabBar workspace={activeWorkspace} />
-      <div className="flex-1 min-h-0 h-full overflow-hidden">
-        <ResizablePanelGroup orientation="horizontal" className="h-full">
-          <ResizablePanel defaultSize={showRightPanel ? 75 : 100} minSize={30}>
-            <PaneContainer workspace={activeWorkspace} />
-          </ResizablePanel>
-          <ResizableHandle withHandle />
-          <ResizablePanel
-            panelRef={rightPanelRef}
-            defaultSize={showRightPanel ? 25 : 0}
-            minSize={15}
-            maxSize={40}
-            collapsible
-            collapsedSize={0}
-            onResize={handleRightPanelResize}
-          >
-            <RightPanel
-              workspace={activeWorkspace}
-              activeTab={rightPanelTab ?? "changes"}
-            />
-          </ResizablePanel>
-        </ResizablePanelGroup>
+      <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
+        <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
+          <PaneContainer workspace={activeWorkspace} />
+        </div>
+        {showRightPanel && (
+          <>
+            <RightPanelResizer />
+            <div
+              className="shrink-0 h-full overflow-hidden"
+              style={{ width: rightPanelWidth }}
+            >
+              <RightPanel
+                workspace={activeWorkspace}
+                activeTab={rightPanelTab}
+              />
+            </div>
+          </>
+        )}
       </div>
     </>
   );

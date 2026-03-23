@@ -4,14 +4,17 @@ export type RightPanelTab = "changes" | "files" | "pr";
 
 interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;
+  rightPanelWidth: number;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
   toggleRightPanel: (workspaceId: string, tab: RightPanelTab) => void;
+  setRightPanelWidth: (width: number) => void;
 }
 
 export const useUIStore = create<UIStore>((set, get) => ({
   rightPanelTabs: {},
+  rightPanelWidth: 320,
 
   getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -30,4 +33,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
         },
       };
     }),
+
+  setRightPanelWidth: (width) =>
+    set({ rightPanelWidth: Math.max(240, Math.min(500, width)) }),
 }));
