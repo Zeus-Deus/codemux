@@ -21,7 +21,7 @@ export function RightPanel({ workspace, activeTab }: Props) {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col border-l border-border bg-card overflow-hidden">
+    <div className="flex h-full min-h-0 flex-col border-l border-border bg-background overflow-hidden">
       <Tabs
         value={activeTab}
         onValueChange={handleTabChange}
