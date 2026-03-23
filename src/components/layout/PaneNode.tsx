@@ -33,6 +33,7 @@ function startResize(
   const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
   const handle = e.currentTarget as HTMLElement;
   handle.dataset.dragging = "true";
+  let lastSizes: number[] | null = null;
 
   const onMove = (ev: PointerEvent) => {
     const axisSize = node.direction === "horizontal" ? rect.width : rect.height;
@@ -42,7 +43,6 @@ function startResize(
         ? ev.clientX - rect.left
         : ev.clientY - rect.top;
 
-    // Calculate cumulative size up to this index
     let cumBefore = 0;
     for (let i = 0; i < index; i++) cumBefore += sizes[i];
     const pair = sizes[index] + sizes[index + 1];
@@ -53,12 +53,24 @@ function startResize(
     const next = [...sizes];
     next[index] = first;
     next[index + 1] = second;
+    lastSizes = next;
 
-    resizeSplit(node.pane_id, next).catch(console.error);
+    // Optimistic: update grid CSS directly for instant feedback (skip Tauri IPC)
+    const template = next.map((s) => `${Math.max(s, 0.05)}fr`).join(" ");
+    const el = container as HTMLElement;
+    if (node.direction === "horizontal") {
+      el.style.gridTemplateColumns = template;
+    } else {
+      el.style.gridTemplateRows = template;
+    }
   };
 
   const onUp = () => {
     handle.dataset.dragging = "false";
+    // Persist final sizes to backend once on release
+    if (lastSizes) {
+      resizeSplit(node.pane_id, lastSizes).catch(console.error);
+    }
     window.removeEventListener("pointermove", onMove);
     window.removeEventListener("pointerup", onUp);
   };
