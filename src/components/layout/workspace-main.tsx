@@ -19,23 +19,31 @@ export function WorkspaceMain() {
 
   if (!activeWorkspace) return null;
 
+  const showRightPanel = rightPanelTab !== null;
+
   return (
     <>
       <TabBar workspace={activeWorkspace} />
       <div className="flex-1 overflow-hidden">
-        {rightPanelTab !== null ? (
-          <ResizablePanelGroup orientation="horizontal">
-            <ResizablePanel defaultSize={75} minSize={30}>
-              <PaneContainer workspace={activeWorkspace} />
-            </ResizablePanel>
-            <ResizableHandle />
-            <ResizablePanel defaultSize={25} minSize={15} maxSize={40}>
-              <RightPanel workspace={activeWorkspace} activeTab={rightPanelTab} />
-            </ResizablePanel>
-          </ResizablePanelGroup>
-        ) : (
-          <PaneContainer workspace={activeWorkspace} />
-        )}
+        <ResizablePanelGroup
+          orientation="horizontal"
+          key={showRightPanel ? "with-panel" : "no-panel"}
+        >
+          <ResizablePanel defaultSize={showRightPanel ? 75 : 100} minSize={30}>
+            <PaneContainer workspace={activeWorkspace} />
+          </ResizablePanel>
+          {showRightPanel && (
+            <>
+              <ResizableHandle withHandle />
+              <ResizablePanel defaultSize={25} minSize={15} maxSize={40}>
+                <RightPanel
+                  workspace={activeWorkspace}
+                  activeTab={rightPanelTab}
+                />
+              </ResizablePanel>
+            </>
+          )}
+        </ResizablePanelGroup>
       </div>
     </>
   );

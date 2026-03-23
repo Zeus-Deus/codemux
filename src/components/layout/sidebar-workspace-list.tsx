@@ -6,6 +6,7 @@ import {
   SidebarMenu,
 } from "@/components/ui/sidebar";
 import { useSectionedWorkspaces, useAppStore } from "@/stores/app-store";
+import { createWorkspace } from "@/tauri/commands";
 import { SidebarSectionGroup } from "./sidebar-section-group";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
 import { Plus } from "lucide-react";
@@ -19,7 +20,7 @@ export function SidebarWorkspaceList() {
   return (
     <SidebarGroup>
       <SidebarGroupLabel>Workspaces</SidebarGroupLabel>
-      <SidebarGroupAction title="New workspace">
+      <SidebarGroupAction title="New workspace" onClick={() => createWorkspace().catch(console.error)}>
         <Plus className="h-3.5 w-3.5" />
       </SidebarGroupAction>
       <SidebarGroupContent>

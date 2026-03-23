@@ -48,7 +48,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "terminal") {
     return (
       <div
-        className={`flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
+        className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
           isActive ? "border-primary/50" : "border-border/50"
         }`}
         data-pane-drop-id={node.pane_id}
@@ -99,7 +99,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "browser") {
     return (
       <div
-        className={`flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
+        className={`group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border ${
           isActive ? "border-primary/50" : "border-border/50"
         }`}
         data-pane-drop-id={node.pane_id}
