@@ -1,15 +1,9 @@
-import { Button } from "@/components/ui/button";
+import { useAppStateInit } from "@/hooks/use-app-state";
+import { AppShell } from "@/components/layout/app-shell";
 
 function App() {
-  return (
-    <div className="flex h-screen items-center justify-center bg-background text-foreground">
-      <div className="text-center space-y-4">
-        <h1 className="text-4xl font-bold">Codemux</h1>
-        <p className="text-muted-foreground">React + Tailwind + shadcn scaffold</p>
-        <Button variant="outline">Ready</Button>
-      </div>
-    </div>
-  );
+  useAppStateInit();
+  return <AppShell />;
 }
 
 export default App;

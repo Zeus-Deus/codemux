@@ -1,4 +1,6 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+
+export type { UnlistenFn };
 import type {
   AppStateSnapshot,
   OrchestratorTriggerResult,

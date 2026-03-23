@@ -1,0 +1,74 @@
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { Button } from "@/components/ui/button";
+import { X } from "lucide-react";
+import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
+import type { WorkspaceSnapshot } from "@/tauri/types";
+
+interface Props {
+  workspace: WorkspaceSnapshot;
+  activeTab: RightPanelTab;
+}
+
+export function RightPanel({ workspace, activeTab }: Props) {
+  const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+
+  const handleTabChange = (value: string) => {
+    setRightPanelTab(workspace.workspace_id, value as RightPanelTab);
+  };
+
+  const handleClose = () => {
+    setRightPanelTab(workspace.workspace_id, null);
+  };
+
+  return (
+    <div className="flex h-full flex-col border-l border-border bg-background">
+      <Tabs
+        value={activeTab}
+        onValueChange={handleTabChange}
+        className="flex h-full flex-col"
+      >
+        <div className="flex items-center border-b border-border px-1">
+          <TabsList variant="line" className="h-8 flex-1">
+            <TabsTrigger value="changes" className="px-2 text-xs">
+              Changes
+              {workspace.git_changed_files > 0 && (
+                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
+                  {workspace.git_changed_files}
+                </span>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="files" className="px-2 text-xs">
+              Files
+            </TabsTrigger>
+            <TabsTrigger value="pr" className="px-2 text-xs">
+              PR
+              {workspace.pr_number && (
+                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
+                  #{workspace.pr_number}
+                </span>
+              )}
+            </TabsTrigger>
+          </TabsList>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="shrink-0"
+            onClick={handleClose}
+            title="Close panel"
+          >
+            <X className="h-3 w-3" />
+          </Button>
+        </div>
+        <TabsContent value="changes" className="flex-1 overflow-auto p-3">
+          <p className="text-xs text-muted-foreground">Changes panel — coming soon</p>
+        </TabsContent>
+        <TabsContent value="files" className="flex-1 overflow-auto p-3">
+          <p className="text-xs text-muted-foreground">File tree — coming soon</p>
+        </TabsContent>
+        <TabsContent value="pr" className="flex-1 overflow-auto p-3">
+          <p className="text-xs text-muted-foreground">PR panel — coming soon</p>
+        </TabsContent>
+      </Tabs>
+    </div>
+  );
+}
