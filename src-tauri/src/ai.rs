@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process::Command;
+use tokio::process::Command as AsyncCommand;
 
 pub fn claude_available() -> bool {
     Command::new("which")
@@ -9,12 +10,16 @@ pub fn claude_available() -> bool {
         .unwrap_or(false)
 }
 
-pub fn generate_commit_message(repo_path: &Path, model: Option<&str>) -> Result<String, String> {
+pub async fn generate_commit_message(
+    repo_path: &Path,
+    model: Option<&str>,
+) -> Result<String, String> {
     let diff = {
-        let output = Command::new("git")
+        let output = AsyncCommand::new("git")
             .args(["diff", "--cached"])
             .current_dir(repo_path)
             .output()
+            .await
             .map_err(|e| format!("Failed to run git diff: {e}"))?;
         if !output.status.success() {
             return Err("Failed to get staged diff".into());
@@ -41,10 +46,11 @@ pub fn generate_commit_message(repo_path: &Path, model: Option<&str>) -> Result<
         args.push(m.to_string());
     }
 
-    let output = Command::new("claude")
+    let output = AsyncCommand::new("claude")
         .args(&args)
         .current_dir(repo_path)
         .output()
+        .await
         .map_err(|e| format!("Failed to run claude: {e}"))?;
 
     if !output.status.success() {

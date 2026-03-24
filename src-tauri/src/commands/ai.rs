@@ -6,6 +6,9 @@ pub fn check_claude_available() -> bool {
 }
 
 #[tauri::command]
-pub fn generate_ai_commit_message(path: String, model: Option<String>) -> Result<String, String> {
-    crate::ai::generate_commit_message(Path::new(&path), model.as_deref())
+pub async fn generate_ai_commit_message(
+    path: String,
+    model: Option<String>,
+) -> Result<String, String> {
+    crate::ai::generate_commit_message(Path::new(&path), model.as_deref()).await
 }

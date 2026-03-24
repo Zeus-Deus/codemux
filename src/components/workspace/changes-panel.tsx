@@ -37,10 +37,10 @@ import {
   createTab,
   activateTab,
   checkClaudeAvailable,
-  generateAiCommitMessage,
 } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
+import { useAiCommitStore } from "@/stores/ai-commit-store";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -426,12 +426,17 @@ export function ChangesPanel({ workspace }: Props) {
   const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
-  const [isGenerating, setIsGenerating] = useState(false);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const config = useAppStore((s) => s.appState?.config);
   const aiEnabled = config?.ai_commit_message_enabled ?? true;
+
+  const generation = useAiCommitStore((s) => s.getGeneration(workspace.workspace_id));
+  const requestGeneration = useAiCommitStore((s) => s.requestGeneration);
+  const consumeMessage = useAiCommitStore((s) => s.consumeMessage);
+  const clearGeneration = useAiCommitStore((s) => s.clearGeneration);
+  const isGenerating = generation?.status === "generating";
 
   const refresh = useCallback(() => {
     if (!cwd) return;
@@ -468,24 +473,26 @@ export function ChangesPanel({ workspace }: Props) {
     }
   }, [aiEnabled]);
 
+  useEffect(() => {
+    if (generation?.status === "done") {
+      const msg = consumeMessage(workspace.workspace_id);
+      if (msg) setCommitMsg(msg);
+    } else if (generation?.status === "error") {
+      setGitError(generation.error ?? "Generation failed");
+      clearGeneration(workspace.workspace_id);
+    }
+  }, [generation?.status, workspace.workspace_id, consumeMessage, clearGeneration]);
+
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
 
   const busy = busyAction !== null;
 
-  const handleGenerateCommitMsg = async () => {
+  const handleGenerateCommitMsg = () => {
     if (isGenerating || staged.length === 0) return;
-    setIsGenerating(true);
     setGitError(null);
-    try {
-      const model = config?.ai_commit_message_model ?? null;
-      const msg = await generateAiCommitMessage(cwd, model);
-      setCommitMsg(msg);
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setIsGenerating(false);
-    }
+    const model = config?.ai_commit_message_model ?? null;
+    requestGeneration(workspace.workspace_id, cwd, model);
   };
 
   const handleCommit = async () => {
@@ -597,22 +604,24 @@ export function ChangesPanel({ workspace }: Props) {
               value={commitMsg}
               onChange={(e) => setCommitMsg(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleCommit()}
+              disabled={isGenerating}
               className="h-7 text-xs flex-1"
             />
             {aiEnabled && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    className="shrink-0"
-                    disabled={staged.length === 0 || isGenerating || claudeReady === false}
-                    onClick={handleGenerateCommitMsg}
-                  >
-                    {isGenerating
-                      ? <Loader2 className="h-3 w-3 animate-spin" />
-                      : <Sparkles className="h-3 w-3" />}
-                  </Button>
+                  <span className="shrink-0" tabIndex={0}>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      disabled={staged.length === 0 || isGenerating || claudeReady === false}
+                      onClick={handleGenerateCommitMsg}
+                    >
+                      {isGenerating
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <Sparkles className="h-3 w-3" />}
+                    </Button>
+                  </span>
                 </TooltipTrigger>
                 <TooltipContent side="top" className="text-xs">
                   {claudeReady === false
@@ -636,24 +645,40 @@ export function ChangesPanel({ workspace }: Props) {
                 : <GitCommit className="h-3 w-3 mr-1" />}
               Commit
             </Button>
-            {branchInfo && branchInfo.branch && (
-              <Button
-                size="xs"
-                variant="secondary"
-                className={`text-xs h-6${branchInfo.has_upstream && branchInfo.ahead === 0 ? " opacity-50" : ""}`}
-                disabled={busy || (branchInfo.has_upstream && branchInfo.ahead === 0)}
-                onClick={handlePush}
-              >
-                {busyAction === "push"
-                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                  : <ArrowUp className="h-3 w-3 mr-1" />}
-                {!branchInfo.has_upstream
-                  ? "Publish"
-                  : branchInfo.ahead > 0
-                    ? `Push ${branchInfo.ahead}`
-                    : "Push"}
-              </Button>
-            )}
+            {branchInfo && branchInfo.branch && (() => {
+              const pushDisabled = busy || (branchInfo.has_upstream && branchInfo.ahead === 0);
+              return (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span>
+                      <Button
+                        size="xs"
+                        variant="secondary"
+                        className={`text-xs h-6${pushDisabled ? " opacity-50" : ""}`}
+                        disabled={pushDisabled}
+                        onClick={handlePush}
+                      >
+                        {busyAction === "push"
+                          ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                          : <ArrowUp className="h-3 w-3 mr-1" />}
+                        {!branchInfo.has_upstream
+                          ? "Publish"
+                          : branchInfo.ahead > 0
+                            ? `Push ${branchInfo.ahead}`
+                            : "Push"}
+                      </Button>
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="text-xs">
+                    {branchInfo.has_upstream && branchInfo.ahead === 0
+                      ? "Nothing to push"
+                      : !branchInfo.has_upstream
+                        ? "Publish branch to remote"
+                        : `Push ${branchInfo.ahead} commit${branchInfo.ahead !== 1 ? "s" : ""} to remote`}
+                  </TooltipContent>
+                </Tooltip>
+              );
+            })()}
             {branchInfo && branchInfo.has_upstream && branchInfo.behind > 0 && (
               <Button
                 size="xs"
