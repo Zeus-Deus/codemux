@@ -39,7 +39,7 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading }: 
   };
 
   return (
-    <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border bg-card px-1.5">
+    <div className="flex h-7 shrink-0 items-center gap-0.5 border-b border-border/50 bg-card px-1">
       <Button
         variant="ghost"
         size="icon-xs"

@@ -80,7 +80,7 @@ function FileRow({
   return (
     <div>
       <button
-        className="group flex w-full items-center gap-1.5 rounded-sm px-1.5 py-1 text-left hover:bg-accent"
+        className="group flex w-full items-center gap-1 rounded-sm px-1.5 py-0.5 text-left hover:bg-accent transition-colors"
         onClick={onToggleExpand}
       >
         <span
@@ -107,7 +107,7 @@ function FileRow({
         </button>
       </button>
       {expanded && diff !== null && (
-        <pre className="mx-1.5 mb-1 max-h-48 overflow-auto rounded-sm bg-card p-2 text-[10px] leading-relaxed font-mono text-muted-foreground">
+        <pre className="mx-1.5 mb-1 max-h-48 overflow-auto rounded-sm bg-card p-1.5 text-[10px] leading-normal font-mono text-muted-foreground">
           {diff || "(empty diff)"}
         </pre>
       )}
@@ -193,7 +193,7 @@ export function ChangesPanel({ workspace }: Props) {
   return (
     <div className="flex h-full flex-col">
       {/* Commit bar */}
-      <div className="p-2 space-y-1.5 border-b border-border">
+      <div className="p-1.5 space-y-1 border-b border-border">
         <Input
           placeholder="Commit message"
           value={commitMsg}
@@ -201,7 +201,7 @@ export function ChangesPanel({ workspace }: Props) {
           onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleCommit()}
           className="h-7 text-xs"
         />
-        <div className="flex gap-1.5">
+        <div className="flex gap-1">
           <Button
             size="xs"
             className="flex-1 text-xs h-6"
@@ -239,7 +239,7 @@ export function ChangesPanel({ workspace }: Props) {
         {/* Staged */}
         {staged.length > 0 && (
           <div className="p-1.5">
-            <div className="flex items-center justify-between px-1.5 py-1">
+            <div className="flex items-center justify-between px-1.5 py-0.5">
               <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                 Staged
               </span>
@@ -271,7 +271,7 @@ export function ChangesPanel({ workspace }: Props) {
         {/* Unstaged */}
         {unstaged.length > 0 && (
           <div className="p-1.5">
-            <div className="flex items-center justify-between px-1.5 py-1">
+            <div className="flex items-center justify-between px-1.5 py-0.5">
               <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                 Changes
               </span>

@@ -355,7 +355,7 @@ export function SettingsView() {
         </nav>
 
         {/* Content */}
-        <ScrollArea className="flex-1">
+        <ScrollArea className="flex-1 bg-card">
           <div className="max-w-2xl p-8">
             {renderSection()}
           </div>

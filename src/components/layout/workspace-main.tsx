@@ -34,7 +34,7 @@ function RightPanelResizer() {
   return (
     <div
       ref={handleRef}
-      className="w-1 shrink-0 cursor-col-resize bg-border hover:bg-primary/40 data-[dragging=true]:bg-primary/40 transition-colors"
+      className="w-px shrink-0 cursor-col-resize bg-border/50 hover:bg-primary/30 data-[dragging=true]:bg-primary/30 transition-colors relative before:absolute before:inset-y-0 before:-inset-x-1 before:content-['']"
       onPointerDown={startResize}
       role="separator"
       aria-orientation="vertical"

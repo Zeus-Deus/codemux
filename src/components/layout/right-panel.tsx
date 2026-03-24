@@ -23,15 +23,15 @@ export function RightPanel({ workspace, activeTab }: Props) {
   };
 
   return (
-    <div className="flex h-full min-h-0 flex-col border-l border-border bg-background overflow-hidden">
+    <div className="flex h-full min-h-0 flex-col border-l border-border/50 bg-card overflow-hidden">
       <Tabs
         value={activeTab}
         onValueChange={handleTabChange}
         className="flex h-full flex-col"
       >
-        <div className="flex items-center border-b border-border px-1">
-          <TabsList variant="line" className="h-8 flex-1">
-            <TabsTrigger value="changes" className="px-2 text-xs">
+        <div className="flex items-center border-b border-border/50 px-1">
+          <TabsList variant="line" className="h-9 flex-1">
+            <TabsTrigger value="changes" className="px-3 py-1.5 text-sm after:!hidden data-active:!bg-sidebar-accent data-active:!text-sidebar-accent-foreground data-active:!font-medium hover:bg-sidebar-accent/50 rounded-md">
               Changes
               {workspace.git_changed_files > 0 && (
                 <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
@@ -39,10 +39,10 @@ export function RightPanel({ workspace, activeTab }: Props) {
                 </span>
               )}
             </TabsTrigger>
-            <TabsTrigger value="files" className="px-2 text-xs">
+            <TabsTrigger value="files" className="px-3 py-1.5 text-sm after:!hidden data-active:!bg-sidebar-accent data-active:!text-sidebar-accent-foreground data-active:!font-medium hover:bg-sidebar-accent/50 rounded-md">
               Files
             </TabsTrigger>
-            <TabsTrigger value="pr" className="px-2 text-xs">
+            <TabsTrigger value="pr" className="px-3 py-1.5 text-sm after:!hidden data-active:!bg-sidebar-accent data-active:!text-sidebar-accent-foreground data-active:!font-medium hover:bg-sidebar-accent/50 rounded-md">
               PR
               {workspace.pr_number && (
                 <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">

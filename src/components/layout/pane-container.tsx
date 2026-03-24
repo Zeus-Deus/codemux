@@ -23,7 +23,7 @@ export function PaneContainer({ workspace }: Props) {
   }
 
   return (
-    <div className="h-full w-full overflow-hidden p-0.5">
+    <div className="h-full w-full overflow-hidden p-px">
       <PaneNode
         node={activeSurface.root}
         activePaneId={activeSurface.active_pane_id}

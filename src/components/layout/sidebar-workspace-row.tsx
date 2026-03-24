@@ -6,8 +6,7 @@ import {
   SidebarMenuSubButton,
 } from "@/components/ui/sidebar";
 import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
-import { X, GitBranch } from "lucide-react";
+import { X, TerminalSquare, Workflow } from "lucide-react";
 import { activateWorkspace, closeWorkspace } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
@@ -19,26 +18,27 @@ interface Props {
 
 function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
   return (
-    <div className="flex flex-col gap-0.5 min-w-0">
-      <span className="truncate font-medium">{workspace.title}</span>
+    <div className="flex flex-col gap-0 min-w-0 flex-1">
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate text-sm font-medium leading-tight">{workspace.title}</span>
+        {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
+          <span className="flex items-center gap-1 shrink-0 text-[10px] tabular-nums">
+            {workspace.git_additions > 0 && (
+              <span className="text-success">+{workspace.git_additions}</span>
+            )}
+            {workspace.git_deletions > 0 && (
+              <span className="text-danger">-{workspace.git_deletions}</span>
+            )}
+          </span>
+        )}
+      </div>
       {workspace.git_branch && (
-        <div className="flex items-center gap-1 text-[11px] text-muted-foreground">
-          <GitBranch className="h-2.5 w-2.5 shrink-0" />
+        <div className="flex items-center gap-1 text-[10px] text-muted-foreground leading-tight">
           <span className="truncate">{workspace.git_branch}</span>
           {workspace.pr_number && (
-            <Badge variant="outline" className="h-4 px-1 text-[10px]">
+            <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
               #{workspace.pr_number}
             </Badge>
-          )}
-          {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
-            <span className="ml-auto flex items-center gap-1 shrink-0 tabular-nums">
-              {workspace.git_additions > 0 && (
-                <span className="text-success">+{workspace.git_additions}</span>
-              )}
-              {workspace.git_deletions > 0 && (
-                <span className="text-danger">-{workspace.git_deletions}</span>
-              )}
-            </span>
           )}
         </div>
       )}
@@ -56,12 +56,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
     closeWorkspace(workspace.workspace_id, false).catch(console.error);
   };
 
-  const statusDotColor =
-    workspace.notification_count > 0
-      ? "bg-warning"
-      : isActive
-        ? "bg-primary"
-        : "bg-muted-foreground/40";
+  const icon =
+    workspace.workspace_type === "open_flow" ? (
+      <Workflow className="h-4 w-4 shrink-0 text-muted-foreground" />
+    ) : (
+      <TerminalSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
+    );
 
   // Nested rows are already inside SidebarMenuSubItem (<li>),
   // so use SidebarMenuSubButton instead of SidebarMenuItem + SidebarMenuButton.
@@ -70,15 +70,8 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
       <SidebarMenuSubButton
         isActive={isActive}
         onClick={handleActivate}
-        className={
-          isActive
-            ? "border-l-2 border-l-primary bg-sidebar-accent"
-            : "border-l-2 border-l-transparent"
-        }
       >
-        <span
-          className={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", statusDotColor)}
-        />
+        {icon}
         <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuSubButton>
     );
@@ -90,16 +83,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
         isActive={isActive}
         onClick={handleActivate}
         tooltip={workspace.title}
-        size="default"
-        className={
-          isActive
-            ? "border-l-2 border-l-primary bg-sidebar-accent"
-            : "border-l-2 border-l-transparent"
-        }
+        size="lg"
       >
-        <span
-          className={cn("inline-block h-1.5 w-1.5 shrink-0 rounded-full", statusDotColor)}
-        />
+        {icon}
         <WorkspaceRowContent workspace={workspace} />
       </SidebarMenuButton>
       {workspace.notification_count > 0 && (

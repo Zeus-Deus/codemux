@@ -1,53 +1,64 @@
 import { SidebarHeader as ShadcnSidebarHeader } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
-import { GitBranch, Plus, FolderPlus, Settings } from "lucide-react";
+import { Plus, ChevronDown } from "lucide-react";
 
 export function SidebarHeader() {
-  const activeWorkspace = useActiveWorkspace();
+  const workspaceCount = useAppStore((s) => s.appState?.workspaces.length ?? 0);
+  const activeWorkspace = useAppStore(
+    (s) => s.appState?.workspaces.find((w) => w.workspace_id === s.appState?.active_workspace_id),
+  );
+  const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
+  // Derive repo name from active workspace cwd, fallback to "Workspaces"
+  const repoName = activeWorkspace?.cwd
+    ? activeWorkspace.cwd.split("/").filter(Boolean).pop() ?? "Workspaces"
+    : "Workspaces";
+
   return (
-    <ShadcnSidebarHeader className="gap-1 p-3">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="inline-block h-2.5 w-2.5 rotate-45 rounded-sm bg-primary shadow-[0_0_8px_var(--primary)]" />
-          <span className="text-sm font-bold tracking-wide text-foreground">
-            Codemux
+    <ShadcnSidebarHeader className="gap-0 p-2">
+      {/* + New Workspace row */}
+      <button
+        className="flex w-full items-center gap-2 rounded-md px-2 py-3 text-sm text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors"
+        onClick={() => setShowDialog(true)}
+      >
+        <Plus className="h-3.5 w-3.5" />
+        <span>New Workspace</span>
+      </button>
+
+      {/* Repo name + count + actions */}
+      <div className="flex items-center justify-between px-2 py-1">
+        <div className="flex items-center gap-1.5 min-w-0">
+          <span className="truncate text-sm font-semibold text-foreground">
+            {repoName}
+          </span>
+          <span className="text-xs text-muted-foreground/60 tabular-nums shrink-0">
+            ({workspaceCount})
           </span>
         </div>
-        <div className="flex items-center gap-1">
-          <Button variant="ghost" size="icon-xs" aria-label="New section" title="New section">
-            <FolderPlus className="h-3.5 w-3.5" />
+        <div className="flex items-center gap-0.5 shrink-0">
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="New workspace"
+            title="New workspace"
+            onClick={() => setShowDialog(true)}
+          >
+            <Plus className="h-3 w-3" />
           </Button>
-          <Button variant="ghost" size="icon-xs" aria-label="New workspace" title="New workspace">
-            <Plus className="h-3.5 w-3.5" />
-          </Button>
-          <Button variant="ghost" size="icon-xs" aria-label="Settings" title="Settings" onClick={() => setShowSettings(true)}>
-            <Settings className="h-3.5 w-3.5" />
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Settings"
+            title="Settings"
+            onClick={() => setShowSettings(true)}
+          >
+            <ChevronDown className="h-3 w-3" />
           </Button>
         </div>
       </div>
-      {activeWorkspace && (
-        <div className="mt-1 space-y-0.5">
-          <p className="truncate text-sm font-medium text-foreground">
-            {activeWorkspace.title}
-          </p>
-          {activeWorkspace.git_branch && (
-            <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-              <GitBranch className="h-3 w-3" />
-              <span className="truncate">{activeWorkspace.git_branch}</span>
-              {activeWorkspace.git_additions > 0 && (
-                <span className="text-success">+{activeWorkspace.git_additions}</span>
-              )}
-              {activeWorkspace.git_deletions > 0 && (
-                <span className="text-danger">-{activeWorkspace.git_deletions}</span>
-              )}
-            </div>
-          )}
-        </div>
-      )}
     </ShadcnSidebarHeader>
   );
 }

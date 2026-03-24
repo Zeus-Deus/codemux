@@ -175,8 +175,8 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
     const sizesFr = sizes.map((s) => `${Math.max(s, 0.05)}fr`);
     const gridStyle: React.CSSProperties =
       node.direction === "horizontal"
-        ? { display: "grid", gridTemplateColumns: sizesFr.join(" "), gap: "2px", height: "100%", width: "100%" }
-        : { display: "grid", gridTemplateRows: sizesFr.join(" "), gap: "2px", height: "100%", width: "100%" };
+        ? { display: "grid", gridTemplateColumns: sizesFr.join(" "), gap: "1px", height: "100%", width: "100%" }
+        : { display: "grid", gridTemplateRows: sizesFr.join(" "), gap: "1px", height: "100%", width: "100%" };
 
     return (
       <div style={gridStyle} data-split-container data-split-pane-id={node.pane_id}>
@@ -185,11 +185,11 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
             <PaneNode node={child} activePaneId={activePaneId} visible={visible} />
             {i < node.children.length - 1 && (
               <div
-                className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity ${
+                className={`absolute z-20 opacity-0 hover:opacity-100 data-[dragging=true]:opacity-100 transition-opacity duration-100 ${
                   node.direction === "horizontal"
                     ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
                     : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize"
-                } bg-primary/40 rounded-full`}
+                } bg-primary/30 rounded-full`}
                 onPointerDown={(e) => startResize(e, node as PaneNodeSnapshot & { kind: "split" }, i)}
               />
             )}
@@ -216,19 +216,19 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "terminal") {
     return (
       <div
-        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/50" : "border-border/50")}
+        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/30" : "border-border/30")}
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
       >
         <header
-          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-card px-2 cursor-grab active:cursor-grabbing"
+          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2 cursor-grab active:cursor-grabbing"
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex-1 truncate text-xs text-muted-foreground">
             {node.title}
           </span>
-          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/pane:opacity-100">
+          <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
             <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
               <SplitSquareHorizontal className="h-3 w-3" />
             </Button>
@@ -255,18 +255,18 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "browser") {
     return (
       <div
-        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/50" : "border-border/50")}
+        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/30" : "border-border/30")}
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
         <header
-          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-card px-2 cursor-grab active:cursor-grabbing"
+          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2 cursor-grab active:cursor-grabbing"
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex-1 truncate text-xs text-muted-foreground">
             {node.title}
           </span>
-          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/pane:opacity-100">
+          <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
             <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
               <SplitSquareHorizontal className="h-3 w-3" />
             </Button>

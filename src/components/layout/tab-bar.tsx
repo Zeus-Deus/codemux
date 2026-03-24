@@ -10,9 +10,9 @@ interface Props {
 }
 
 const tabIcon: Record<TabKind, React.ReactNode> = {
-  terminal: <Terminal className="h-3.5 w-3.5" />,
-  browser: <Globe className="h-3.5 w-3.5" />,
-  diff: <GitCompare className="h-3.5 w-3.5" />,
+  terminal: <Terminal className="h-3 w-3" />,
+  browser: <Globe className="h-3 w-3" />,
+  diff: <GitCompare className="h-3 w-3" />,
 };
 
 export function TabBar({ workspace }: Props) {
@@ -37,7 +37,7 @@ export function TabBar({ workspace }: Props) {
   };
 
   return (
-    <div className="flex h-9 shrink-0 items-center border-b border-border bg-background px-2">
+    <div className="flex h-8 shrink-0 items-center border-b border-border bg-card px-1.5">
       <Tabs
         value={workspace.active_tab_id}
         onValueChange={handleTabChange}
@@ -48,13 +48,13 @@ export function TabBar({ workspace }: Props) {
             <TabsTrigger
               key={tab.tab_id}
               value={tab.tab_id}
-              className="group relative gap-1.5 px-2.5 py-1 text-xs"
+              className="group relative gap-1 px-2 py-0.5 text-xs"
             >
               {tabIcon[tab.kind]}
-              <span className="truncate max-w-[100px]">{tab.title}</span>
+              <span className="truncate max-w-[120px]">{tab.title}</span>
               {workspace.tabs.length > 1 && (
                 <button
-                  className="ml-1 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   onClick={(e) => handleCloseTab(e, tab.tab_id)}
                   aria-label="Close tab"
                   title="Close tab"

@@ -62,10 +62,10 @@ function getCSSVar(name: string): string {
 
 function buildThemeFromCSS(): ITheme {
   return {
-    background: getCSSVar("--card"),
+    background: getCSSVar("--background"),
     foreground: getCSSVar("--foreground"),
     cursor: getCSSVar("--foreground"),
-    cursorAccent: getCSSVar("--card"),
+    cursorAccent: getCSSVar("--background"),
     selectionBackground: getCSSVar("--accent"),
     selectionForeground: getCSSVar("--accent-foreground"),
     ...ANSI_COLORS,
@@ -501,7 +501,7 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
   }, [focused]);
 
   return (
-    <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-card">
+    <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background">
       <div
         ref={containerRef}
         className="block flex-1 w-full h-full min-w-0 min-h-0 overflow-hidden px-2 py-1.5 box-border [&_.xterm]:h-full [&_.xterm]:w-full [&_.xterm-viewport]:!bg-transparent"
