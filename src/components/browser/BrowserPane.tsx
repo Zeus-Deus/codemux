@@ -36,6 +36,7 @@ function mapCoordinates(
 
 export function BrowserPane({ browserId, focused, visible }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
@@ -99,22 +100,29 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
             if (msg.type === "frame") {
               if (statusRef.current !== "live") setStatus("live");
-              retries = 0; // Reset retries on success
+              retries = 0;
               const canvas = canvasRef.current;
-              if (!canvas) return;
+              const container = containerRef.current;
+              if (!canvas || !container) return;
               const ctx = canvas.getContext("2d");
               if (!ctx) return;
+
+              // Size canvas to container (fills the pane)
+              const rect = container.getBoundingClientRect();
+              const cw = Math.round(rect.width);
+              const ch = Math.round(rect.height);
+              if (canvas.width !== cw || canvas.height !== ch) {
+                canvas.width = cw;
+                canvas.height = ch;
+              }
 
               if (!imgRef.current) {
                 imgRef.current = new Image();
               }
               const img = imgRef.current;
               img.onload = () => {
-                if (canvas.width !== img.width || canvas.height !== img.height) {
-                  canvas.width = img.width;
-                  canvas.height = img.height;
-                }
-                ctx.drawImage(img, 0, 0);
+                // Draw frame SCALED to fill the entire canvas
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
               };
               img.src = `data:image/jpeg;base64,${msg.data}`;
 
@@ -279,6 +287,24 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
+  // ResizeObserver: update canvas dimensions when pane resizes
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+    const observer = new ResizeObserver(() => {
+      const rect = container.getBoundingClientRect();
+      const cw = Math.round(rect.width);
+      const ch = Math.round(rect.height);
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width = cw;
+        canvas.height = ch;
+      }
+    });
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, []);
+
   useEffect(() => {
     if (focused && canvasRef.current) {
       canvasRef.current.focus();
@@ -293,7 +319,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         onUrlChange={setCurrentUrl}
         loading={status === "starting" || status === "connecting"}
       />
-      <div className="flex-1 min-h-0 overflow-hidden relative flex items-center justify-center bg-background">
+      <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden relative">
         {status !== "live" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (
@@ -316,8 +342,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          className="outline-none cursor-default"
-          style={{ maxWidth: "100%", maxHeight: "100%" }}
+          className="absolute inset-0 w-full h-full outline-none cursor-default"
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
           onMouseMove={handleMouseMove}
