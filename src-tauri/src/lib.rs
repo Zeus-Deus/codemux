@@ -269,6 +269,7 @@ pub fn run() {
             commands::agent_browser_close,
             commands::agent_browser_get_stream_url,
             commands::agent_browser_screenshot,
+            commands::start_browser_stream,
             commands::get_project_memory_snapshot,
             commands::update_project_memory_snapshot,
             commands::add_project_memory_entry,

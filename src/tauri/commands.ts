@@ -312,6 +312,9 @@ export const agentBrowserGetStreamUrl = () =>
 export const agentBrowserScreenshot = (browserId: string) =>
   invoke<string>("agent_browser_screenshot", { browserId });
 
+export const startBrowserStream = (browserId: string) =>
+  invoke<string>("start_browser_stream", { browserId });
+
 // ── OpenFlow ──
 
 export const getOpenflowRuntimeSnapshot = () =>

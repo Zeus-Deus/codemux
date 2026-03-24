@@ -1,9 +1,10 @@
 import React from "react";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
+import { BrowserPane } from "@/components/browser/BrowserPane";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
-import { Globe, SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
+import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -258,17 +259,8 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
-        <header
-          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-card px-2 cursor-grab active:cursor-grabbing"
-          onPointerDown={(e) => handleDragStart(e, node.pane_id)}
-        >
-          <Globe className="h-3 w-3 text-muted-foreground" />
-          <span className="flex-1 truncate text-xs text-muted-foreground">
-            {node.title}
-          </span>
-        </header>
-        <div className="flex flex-1 items-center justify-center text-xs text-muted-foreground">
-          Browser pane — coming soon
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <BrowserPane browserId={node.browser_id} focused={isActive} visible={visible} />
         </div>
       </div>
     );

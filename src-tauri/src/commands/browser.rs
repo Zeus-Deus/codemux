@@ -186,6 +186,14 @@ pub fn agent_browser_get_stream_url(
 }
 
 #[tauri::command]
+pub async fn start_browser_stream(
+    manager: State<'_, AgentBrowserManager>,
+    browser_id: String,
+) -> Result<String, String> {
+    manager.start_stream(&browser_id).await
+}
+
+#[tauri::command]
 pub async fn agent_browser_screenshot(
     manager: State<'_, AgentBrowserManager>,
     browser_id: String,

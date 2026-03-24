@@ -18,6 +18,7 @@ import {
   createTab,
   closeTab,
   cyclePane,
+  createBrowserPane,
 } from "@/tauri/commands";
 
 interface Props {
@@ -137,6 +138,16 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           >
             Close Tab
             <CommandShortcut>Ctrl+W</CommandShortcut>
+          </CommandItem>
+          <CommandItem
+            onSelect={() =>
+              run(() =>
+                activePaneId &&
+                createBrowserPane(activePaneId).catch(console.error),
+              )
+            }
+          >
+            Open Browser
           </CommandItem>
         </CommandGroup>
 

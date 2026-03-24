@@ -231,6 +231,36 @@ impl AgentBrowserManager {
     }
 
     pub fn get_stream_url(&self) -> String {
-        format!("http://localhost:{}", self.stream_port)
+        format!("ws://localhost:{}", self.stream_port)
+    }
+
+    pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
+        let session = session_name(browser_id);
+        let port = self.stream_port;
+
+        let mut running = self.running.lock().await;
+        if *running {
+            return Ok(format!("ws://localhost:{}", port));
+        }
+
+        // Start agent-browser daemon with stream server enabled
+        let script = format!(
+            "const d = require('agent-browser/dist/daemon'); d.startDaemon({{ streamPort: {}, session: '{}' }}).catch(e => {{ console.error(e); process.exit(1); }})",
+            port, session
+        );
+
+        std::process::Command::new("node")
+            .args(["-e", &script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start browser stream: {}", e))?;
+
+        // Wait for stream server to be ready
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+        *running = true;
+
+        Ok(format!("ws://localhost:{}", port))
     }
 }

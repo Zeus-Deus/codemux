@@ -1,7 +1,7 @@
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Plus, X, Terminal, Globe, GitCompare, PanelRight } from "lucide-react";
-import { activateTab, closeTab, createTab } from "@/tauri/commands";
+import { activateTab, closeTab, createTab, createBrowserPane } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind } from "@/tauri/types";
 
@@ -72,9 +72,23 @@ export function TabBar({ workspace }: Props) {
         size="icon-sm"
         className="ml-1 shrink-0"
         onClick={handleCreateTab}
-        title="New tab"
+        title="New terminal tab"
+        aria-label="New terminal tab"
       >
         <Plus className="h-3.5 w-3.5" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className="shrink-0"
+        onClick={() => {
+          const surface = workspace.surfaces.find((s) => s.surface_id === workspace.active_surface_id);
+          if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
+        }}
+        title="Open browser"
+        aria-label="Open browser"
+      >
+        <Globe className="h-3.5 w-3.5" />
       </Button>
 
       <Button
