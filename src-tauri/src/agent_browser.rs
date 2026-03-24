@@ -250,11 +250,15 @@ impl AgentBrowserManager {
             "import('agent-browser').then(m => m.startDaemon({{ streamPort: {} }})).catch(e => {{ console.error(e.message); process.exit(1); }})",
             port
         );
-        std::process::Command::new("node")
-            .args(["--input-type=module", "-e", &script])
+        // Redirect to /dev/null via shell to avoid Node.js crashing when
+        // Stdio::null() closes the file descriptors (Node expects writable stdout/stderr)
+        let daemon_cmd = format!(
+            "node --input-type=module -e {} >/dev/null 2>/dev/null",
+            shell_quote(&script)
+        );
+        std::process::Command::new("sh")
+            .args(["-c", &daemon_cmd])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;
 
@@ -264,13 +268,21 @@ impl AgentBrowserManager {
         // Step 2: Open a page via CLI to trigger the daemon's browser auto-launch.
         // The daemon only launches a browser when it receives a command through its
         // socket — without this, the stream server has no page to screencast.
-        std::process::Command::new("sh")
-            .args(["-c", &format!("npx agent-browser open about:blank --headless --session {}", session)])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map_err(|e| format!("Failed to open browser page: {}", e))?;
+        // Retry up to 3 times in case the daemon socket isn't ready yet.
+        let open_cmd = format!("npx agent-browser open about:blank --headless --session {}", session);
+        for attempt in 0..3 {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &open_cmd])
+                .output()
+                .map_err(|e| format!("Failed to open browser page: {}", e))?;
+            if output.status.success() {
+                break;
+            }
+            if attempt < 2 {
+                eprintln!("[codemux::browser] page open attempt {} failed, retrying...", attempt + 1);
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+            }
+        }
 
         // Give the browser a moment to launch and start screencast
         std::thread::sleep(std::time::Duration::from_millis(2000));
