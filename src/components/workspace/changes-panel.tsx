@@ -536,14 +536,14 @@ export function ChangesPanel({ workspace }: Props) {
 
         {/* File list */}
         <ScrollArea className="flex-1">
-          <div className="px-1">
-            {files.length === 0 && (
-              <div className="flex flex-col items-center justify-center min-h-[120px] text-muted-foreground">
-                <Check className="h-5 w-5 mb-1.5 opacity-40" />
-                <p className="text-xs">No changes</p>
-              </div>
-            )}
+          {files.length === 0 && (
+            <div className="flex flex-col items-center justify-center min-h-[120px] text-muted-foreground">
+              <Check className="h-5 w-5 mb-1.5 opacity-40" />
+              <p className="text-xs">No changes</p>
+            </div>
+          )}
 
+          <div className="px-1">
             {staged.length > 0 && (
               <FileSection
                 label="Staged"
