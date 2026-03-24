@@ -29,9 +29,15 @@ function mapCoordinates(
   viewport: ViewportInfo,
 ): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
-  const x = ((e.clientX - rect.left) / rect.width) * viewport.width;
-  const y = ((e.clientY - rect.top) / rect.height) * viewport.height;
-  return { x: Math.round(x), y: Math.round(y) };
+  // Account for aspect-ratio letterboxing
+  const scale = Math.min(rect.width / viewport.width, rect.height / viewport.height);
+  const dw = viewport.width * scale;
+  const dh = viewport.height * scale;
+  const dx = (rect.width - dw) / 2;
+  const dy = (rect.height - dh) / 2;
+  const x = ((e.clientX - rect.left - dx) / dw) * viewport.width;
+  const y = ((e.clientY - rect.top - dy) / dh) * viewport.height;
+  return { x: Math.max(0, Math.min(Math.round(x), viewport.width)), y: Math.max(0, Math.min(Math.round(y), viewport.height)) };
 }
 
 export function BrowserPane({ browserId, focused, visible }: Props) {
@@ -107,7 +113,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               const ctx = canvas.getContext("2d");
               if (!ctx) return;
 
-              // Size canvas to container (fills the pane)
+              // Size canvas to container
               const rect = container.getBoundingClientRect();
               const cw = Math.round(rect.width);
               const ch = Math.round(rect.height);
@@ -121,8 +127,15 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               }
               const img = imgRef.current;
               img.onload = () => {
-                // Draw frame SCALED to fill the entire canvas
-                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                // Draw frame preserving aspect ratio (letterbox if needed)
+                const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
+                const dw = img.width * scale;
+                const dh = img.height * scale;
+                const dx = (canvas.width - dw) / 2;
+                const dy = (canvas.height - dh) / 2;
+                ctx.fillStyle = "#09090b"; // background color for letterbox bars
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, dx, dy, dw, dh);
               };
               img.src = `data:image/jpeg;base64,${msg.data}`;
 
@@ -241,10 +254,10 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
-  // Keyboard handlers — CDP needs "rawKeyDown" for non-printable keys (Backspace, Enter, etc.)
-  // and "keyDown" + "char" for printable characters. Also needs windowsVirtualKeyCode.
+  // Keyboard handlers — CDP "keyDown" with text inserts the character.
+  // "rawKeyDown" for non-printable keys (Backspace, Enter, etc.).
+  // Do NOT send a separate "char" event — CDP handles text insertion from "keyDown".
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Let app shortcuts through
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
     e.preventDefault();
     e.stopPropagation();
@@ -260,18 +273,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       windowsVirtualKeyCode: e.keyCode,
       modifiers: getModifiers(e),
     });
-
-    if (isPrintable) {
-      sendInput({
-        type: "input_keyboard",
-        eventType: "char",
-        text: e.key,
-        key: e.key,
-        code: e.code,
-        windowsVirtualKeyCode: e.keyCode,
-        modifiers: getModifiers(e),
-      });
-    }
   };
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
