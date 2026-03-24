@@ -250,6 +250,7 @@ pub fn run() {
             commands::close_tab,
             commands::activate_tab,
             commands::rename_tab,
+            commands::reorder_tabs,
             commands::refresh_workspace_git_info,
             commands::create_browser_pane,
             commands::browser_open_url,

@@ -149,6 +149,43 @@ export function SidebarWorkspaceList() {
     [],
   );
 
+  const computeSectionDropTarget = useCallback(
+    (clientY: number, draggedId: string) => {
+      const listEl = listRef.current;
+      if (!listEl) return;
+      const listRect = listEl.getBoundingClientRect();
+      const headers = listEl.querySelectorAll<HTMLElement>("[data-section-header-id]");
+      if (headers.length === 0) return;
+
+      let closestHeader: HTMLElement | null = null;
+      let closestDist = Infinity;
+      let insertBefore = true;
+
+      for (const header of headers) {
+        if (header.getAttribute("data-section-header-id") === draggedId) continue;
+        const rect = header.getBoundingClientRect();
+        const midY = rect.top + rect.height / 2;
+        const dist = Math.abs(clientY - midY);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestHeader = header;
+          insertBefore = clientY < midY;
+        }
+      }
+
+      if (!closestHeader) return;
+      const sectionId = closestHeader.getAttribute("data-section-header-id") ?? "";
+      const sectionIdx = sectionGroups.findIndex((g) => g.section.section_id === sectionId);
+      if (sectionIdx < 0) return;
+
+      const targetIndex = insertBefore ? sectionIdx : sectionIdx + 1;
+      dropTargetRef.current = { sectionId: null, index: targetIndex };
+      const elRect = closestHeader.getBoundingClientRect();
+      setDropIndicatorY((insertBefore ? elRect.top : elRect.bottom) - listRect.top);
+    },
+    [sectionGroups],
+  );
+
   const handleDragOver = useCallback(
     (e: React.DragEvent) => {
       if (!dragState || !listRef.current) return;
@@ -157,10 +194,11 @@ export function SidebarWorkspaceList() {
 
       if (dragState.type === "workspace") {
         computeWorkspaceDropTarget(e.clientY);
+      } else if (dragState.type === "section") {
+        computeSectionDropTarget(e.clientY, dragState.id);
       }
-      // Section drag target computation could be added later
     },
-    [dragState, computeWorkspaceDropTarget],
+    [dragState, computeWorkspaceDropTarget, computeSectionDropTarget],
   );
 
   const handleDrop = useCallback(
@@ -207,8 +245,8 @@ export function SidebarWorkspaceList() {
           if (dragIdx >= 0 && dt.index !== undefined) {
             const newOrder = [...currentOrder];
             newOrder.splice(dragIdx, 1);
-            const insertIdx = Math.min(dt.index, newOrder.length);
-            newOrder.splice(insertIdx > dragIdx ? insertIdx - 1 : insertIdx, 0, ds.id);
+            const adjusted = dt.index > dragIdx ? dt.index - 1 : dt.index;
+            newOrder.splice(Math.min(adjusted, newOrder.length), 0, ds.id);
             await reorderSections(newOrder);
           }
         }
@@ -267,6 +305,7 @@ export function SidebarWorkspaceList() {
             <div
               key={group.section.section_id}
               data-drop-zone-section={group.section.section_id}
+              className={dragState?.type === "section" && dragState.id === group.section.section_id ? "opacity-40" : ""}
             >
               <SidebarMenu>
                 <SidebarSectionGroup

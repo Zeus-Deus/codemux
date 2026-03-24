@@ -1,7 +1,23 @@
+import { useState, useRef, useCallback } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from "@/components/ui/context-menu";
 import { Plus, X, Terminal, Globe, GitCompare, PanelRight } from "lucide-react";
-import { activateTab, closeTab, createTab, createBrowserPane } from "@/tauri/commands";
+import {
+  activateTab,
+  closeTab,
+  createTab,
+  createBrowserPane,
+  reorderTabs,
+  renameTab,
+  splitPane,
+} from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind } from "@/tauri/types";
 
@@ -21,6 +37,11 @@ export function TabBar({ workspace }: Props) {
     (s) => s.rightPanelTabs[workspace.workspace_id] ?? null,
   );
 
+  // Drag state
+  const [dragTabId, setDragTabId] = useState<string | null>(null);
+  const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const tabListRef = useRef<HTMLDivElement>(null);
+
   const handleTabChange = (tabId: string) => {
     if (tabId !== workspace.active_tab_id) {
       activateTab(workspace.workspace_id, tabId).catch(console.error);
@@ -36,6 +57,138 @@ export function TabBar({ workspace }: Props) {
     createTab(workspace.workspace_id, "terminal").catch(console.error);
   };
 
+  // --- Drag-and-drop handlers ---
+  const handleDragStart = useCallback(
+    (tabId: string) => (e: React.DragEvent) => {
+      setDragTabId(tabId);
+      e.dataTransfer.effectAllowed = "move";
+      e.dataTransfer.setData("text/plain", tabId);
+    },
+    [],
+  );
+
+  const computeDropIndex = useCallback(
+    (clientX: number) => {
+      const listEl = tabListRef.current;
+      if (!listEl) return;
+      const tabEls = listEl.querySelectorAll<HTMLElement>("[data-tab-id]");
+      if (tabEls.length === 0) return;
+
+      let closestIdx = 0;
+      let closestDist = Infinity;
+      let insertBefore = true;
+
+      tabEls.forEach((el, i) => {
+        const rect = el.getBoundingClientRect();
+        const midX = rect.left + rect.width / 2;
+        const dist = Math.abs(clientX - midX);
+        if (dist < closestDist) {
+          closestDist = dist;
+          closestIdx = i;
+          insertBefore = clientX < midX;
+        }
+      });
+
+      setDropIndex(insertBefore ? closestIdx : closestIdx + 1);
+    },
+    [],
+  );
+
+  const handleDragOver = useCallback(
+    (e: React.DragEvent) => {
+      if (!dragTabId) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "move";
+      computeDropIndex(e.clientX);
+    },
+    [dragTabId, computeDropIndex],
+  );
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      e.preventDefault();
+      if (!dragTabId || dropIndex === null) {
+        setDragTabId(null);
+        setDropIndex(null);
+        return;
+      }
+
+      const currentIds = workspace.tabs.map((t) => t.tab_id);
+      const dragIdx = currentIds.indexOf(dragTabId);
+      if (dragIdx < 0) {
+        setDragTabId(null);
+        setDropIndex(null);
+        return;
+      }
+
+      const newIds = [...currentIds];
+      newIds.splice(dragIdx, 1);
+      const insertAt = dropIndex > dragIdx ? dropIndex - 1 : dropIndex;
+      newIds.splice(Math.min(insertAt, newIds.length), 0, dragTabId);
+
+      if (newIds.join(",") !== currentIds.join(",")) {
+        await reorderTabs(workspace.workspace_id, newIds).catch(console.error);
+      }
+
+      setDragTabId(null);
+      setDropIndex(null);
+    },
+    [dragTabId, dropIndex, workspace],
+  );
+
+  const handleDragEnd = useCallback(() => {
+    setDragTabId(null);
+    setDropIndex(null);
+  }, []);
+
+  // --- Context menu handlers ---
+  const handleCloseOtherTabs = async (keepTabId: string) => {
+    for (const tab of workspace.tabs) {
+      if (tab.tab_id !== keepTabId) {
+        await closeTab(workspace.workspace_id, tab.tab_id).catch(console.error);
+      }
+    }
+  };
+
+  const handleCloseTabsToRight = async (tabId: string) => {
+    const idx = workspace.tabs.findIndex((t) => t.tab_id === tabId);
+    for (let i = workspace.tabs.length - 1; i > idx; i--) {
+      await closeTab(workspace.workspace_id, workspace.tabs[i].tab_id).catch(console.error);
+    }
+  };
+
+  const handleSplit = (direction: "horizontal" | "vertical") => {
+    const surface = workspace.surfaces.find(
+      (s) => s.surface_id === workspace.active_surface_id,
+    );
+    if (surface) {
+      splitPane(surface.active_pane_id, direction).catch(console.error);
+    }
+  };
+
+  const handleRenameTab = (tabId: string, currentTitle: string) => {
+    const newTitle = window.prompt("Rename tab", currentTitle);
+    if (newTitle && newTitle !== currentTitle) {
+      renameTab(workspace.workspace_id, tabId, newTitle).catch(console.error);
+    }
+  };
+
+  // Compute drop indicator position
+  let dropIndicatorLeft: number | null = null;
+  if (dropIndex !== null && tabListRef.current) {
+    const tabEls = tabListRef.current.querySelectorAll<HTMLElement>("[data-tab-id]");
+    const listRect = tabListRef.current.getBoundingClientRect();
+    if (tabEls.length > 0) {
+      if (dropIndex >= tabEls.length) {
+        const lastRect = tabEls[tabEls.length - 1].getBoundingClientRect();
+        dropIndicatorLeft = lastRect.right - listRect.left;
+      } else {
+        const targetRect = tabEls[dropIndex].getBoundingClientRect();
+        dropIndicatorLeft = targetRect.left - listRect.left;
+      }
+    }
+  }
+
   return (
     <div className="flex h-8 shrink-0 items-center border-b border-border bg-card px-1.5">
       <Tabs
@@ -43,40 +196,97 @@ export function TabBar({ workspace }: Props) {
         onValueChange={handleTabChange}
         className="flex-1 min-w-0"
       >
-        <TabsList variant="line" className="h-full gap-0">
-          {workspace.tabs.map((tab) => (
-            <TabsTrigger
-              key={tab.tab_id}
-              value={tab.tab_id}
-              className="group relative gap-1 px-2 py-0.5 text-xs"
-            >
-              {tabIcon[tab.kind]}
-              <span className="truncate max-w-[120px]">{tab.title}</span>
-              {workspace.tabs.length > 1 && (
-                <button
-                  className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  onClick={(e) => handleCloseTab(e, tab.tab_id)}
-                  aria-label="Close tab"
-                  title="Close tab"
-                >
-                  <X className="h-2.5 w-2.5" />
-                </button>
-              )}
-            </TabsTrigger>
-          ))}
-        </TabsList>
+        <div
+          ref={tabListRef}
+          className="relative flex items-center"
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
+          onDragEnd={handleDragEnd}
+        >
+          {/* Drop indicator */}
+          {dragTabId && dropIndicatorLeft !== null && (
+            <div
+              className="absolute top-1 bottom-1 w-0.5 bg-primary rounded-full z-30 pointer-events-none"
+              style={{ left: dropIndicatorLeft }}
+            />
+          )}
+          <TabsList variant="line" className="h-full gap-0">
+            {workspace.tabs.map((tab, idx) => (
+              <ContextMenu key={tab.tab_id}>
+                <ContextMenuTrigger asChild>
+                  <div
+                    data-tab-id={tab.tab_id}
+                    data-tab-index={idx}
+                    draggable
+                    onDragStart={handleDragStart(tab.tab_id)}
+                    className={dragTabId === tab.tab_id ? "opacity-40" : ""}
+                  >
+                    <TabsTrigger
+                      value={tab.tab_id}
+                      className="group relative gap-1 px-2 py-0.5 text-xs"
+                    >
+                      {tabIcon[tab.kind]}
+                      <span className="truncate max-w-[120px]">{tab.title}</span>
+                      {workspace.tabs.length > 1 && (
+                        <button
+                          className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          onClick={(e) => handleCloseTab(e, tab.tab_id)}
+                          aria-label="Close tab"
+                          title="Close tab"
+                        >
+                          <X className="h-2.5 w-2.5" />
+                        </button>
+                      )}
+                    </TabsTrigger>
+                  </div>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuItem
+                    onClick={() => closeTab(workspace.workspace_id, tab.tab_id).catch(console.error)}
+                    disabled={workspace.tabs.length <= 1}
+                  >
+                    Close tab
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    onClick={() => handleCloseOtherTabs(tab.tab_id)}
+                    disabled={workspace.tabs.length <= 1}
+                  >
+                    Close other tabs
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    onClick={() => handleCloseTabsToRight(tab.tab_id)}
+                    disabled={idx >= workspace.tabs.length - 1}
+                  >
+                    Close tabs to the right
+                  </ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem onClick={() => handleSplit("horizontal")}>
+                    Split right
+                  </ContextMenuItem>
+                  <ContextMenuItem onClick={() => handleSplit("vertical")}>
+                    Split down
+                  </ContextMenuItem>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem onClick={() => handleRenameTab(tab.tab_id, tab.title)}>
+                    Rename tab
+                  </ContextMenuItem>
+                </ContextMenuContent>
+              </ContextMenu>
+            ))}
+          </TabsList>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="ml-0.5 shrink-0"
+            onClick={handleCreateTab}
+            title="New terminal tab"
+            aria-label="New terminal tab"
+          >
+            <Plus className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       </Tabs>
 
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        className="ml-1 shrink-0"
-        onClick={handleCreateTab}
-        title="New terminal tab"
-        aria-label="New terminal tab"
-      >
-        <Plus className="h-3.5 w-3.5" />
-      </Button>
       <Button
         variant="ghost"
         size="icon-sm"

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   SidebarMenuItem,
   SidebarMenuButton,
@@ -5,10 +6,26 @@ import {
   SidebarMenuAction,
   SidebarMenuSubButton,
 } from "@/components/ui/sidebar";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
+} from "@/components/ui/context-menu";
 import { Badge } from "@/components/ui/badge";
 import { X, TerminalSquare, Workflow } from "lucide-react";
-import { activateWorkspace, closeWorkspace } from "@/tauri/commands";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import {
+  activateWorkspace,
+  closeWorkspace,
+  renameWorkspace,
+  detectEditors,
+  openInEditor,
+} from "@/tauri/commands";
+import type { WorkspaceSnapshot, EditorInfo } from "@/tauri/types";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -46,6 +63,73 @@ function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
   );
 }
 
+function WorkspaceContextMenuItems({ workspace }: { workspace: WorkspaceSnapshot }) {
+  const [editors, setEditors] = useState<EditorInfo[]>([]);
+
+  useEffect(() => {
+    detectEditors().then(setEditors).catch(console.error);
+  }, []);
+
+  const handleRename = () => {
+    const newTitle = window.prompt("Rename workspace", workspace.title);
+    if (newTitle && newTitle !== workspace.title) {
+      renameWorkspace(workspace.workspace_id, newTitle).catch(console.error);
+    }
+  };
+
+  const handleCopyBranch = () => {
+    if (workspace.git_branch) {
+      navigator.clipboard.writeText(workspace.git_branch).catch(console.error);
+    }
+  };
+
+  const handleOpenInEditor = (editorId: string) => {
+    openInEditor(editorId, workspace.cwd).catch(console.error);
+  };
+
+  return (
+    <ContextMenuContent>
+      <ContextMenuItem onClick={handleRename}>
+        Rename workspace
+      </ContextMenuItem>
+      {editors.length === 1 ? (
+        <ContextMenuItem onClick={() => handleOpenInEditor(editors[0].id)}>
+          Open in {editors[0].name}
+        </ContextMenuItem>
+      ) : editors.length > 1 ? (
+        <ContextMenuSub>
+          <ContextMenuSubTrigger>Open in editor</ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            {editors.map((editor) => (
+              <ContextMenuItem key={editor.id} onClick={() => handleOpenInEditor(editor.id)}>
+                {editor.name}
+              </ContextMenuItem>
+            ))}
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+      ) : null}
+      <ContextMenuItem
+        onClick={handleCopyBranch}
+        disabled={!workspace.git_branch}
+      >
+        Copy branch name
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={() => closeWorkspace(workspace.workspace_id, false).catch(console.error)}
+      >
+        Close workspace
+      </ContextMenuItem>
+      <ContextMenuItem
+        className="text-destructive focus:text-destructive"
+        onClick={() => closeWorkspace(workspace.workspace_id, true).catch(console.error)}
+      >
+        Delete workspace
+      </ContextMenuItem>
+    </ContextMenuContent>
+  );
+}
+
 export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
@@ -63,31 +147,39 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
       <TerminalSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
     );
 
-  // Nested rows are already inside SidebarMenuSubItem (<li>),
-  // so use SidebarMenuSubButton instead of SidebarMenuItem + SidebarMenuButton.
   if (nested) {
     return (
-      <SidebarMenuSubButton
-        isActive={isActive}
-        onClick={handleActivate}
-      >
-        {icon}
-        <WorkspaceRowContent workspace={workspace} />
-      </SidebarMenuSubButton>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <SidebarMenuSubButton
+            isActive={isActive}
+            onClick={handleActivate}
+          >
+            {icon}
+            <WorkspaceRowContent workspace={workspace} />
+          </SidebarMenuSubButton>
+        </ContextMenuTrigger>
+        <WorkspaceContextMenuItems workspace={workspace} />
+      </ContextMenu>
     );
   }
 
   return (
     <SidebarMenuItem>
-      <SidebarMenuButton
-        isActive={isActive}
-        onClick={handleActivate}
-        tooltip={workspace.title}
-        size="lg"
-      >
-        {icon}
-        <WorkspaceRowContent workspace={workspace} />
-      </SidebarMenuButton>
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <SidebarMenuButton
+            isActive={isActive}
+            onClick={handleActivate}
+            tooltip={workspace.title}
+            size="lg"
+          >
+            {icon}
+            <WorkspaceRowContent workspace={workspace} />
+          </SidebarMenuButton>
+        </ContextMenuTrigger>
+        <WorkspaceContextMenuItems workspace={workspace} />
+      </ContextMenu>
       {workspace.notification_count > 0 && (
         <SidebarMenuBadge className="bg-warning/20 text-warning">
           {workspace.notification_count}

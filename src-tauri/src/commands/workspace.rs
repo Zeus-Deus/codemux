@@ -903,6 +903,21 @@ pub fn reorder_workspaces(
 }
 
 #[tauri::command]
+pub fn reorder_tabs(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    tab_ids: Vec<String>,
+) -> Result<(), String> {
+    if state.reorder_tabs(&workspace_id, tab_ids) {
+        crate::state::emit_app_state(&app);
+        Ok(())
+    } else {
+        Err("Failed to reorder tabs".to_string())
+    }
+}
+
+#[tauri::command]
 pub fn reorder_sections(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,

@@ -981,6 +981,27 @@ impl AppStateStore {
         true
     }
 
+    pub fn reorder_tabs(&self, workspace_id: &str, tab_ids: Vec<String>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = match snapshot.workspaces.iter_mut().find(|w| w.workspace_id.0 == workspace_id) {
+            Some(ws) => ws,
+            None => return false,
+        };
+        if tab_ids.len() != workspace.tabs.len() {
+            return false;
+        }
+        let mut reordered = Vec::with_capacity(tab_ids.len());
+        for tid in &tab_ids {
+            if let Some(tab) = workspace.tabs.iter().find(|t| t.tab_id == *tid).cloned() {
+                reordered.push(tab);
+            } else {
+                return false;
+            }
+        }
+        workspace.tabs = reordered;
+        true
+    }
+
     pub fn reorder_sections(&self, section_ids: Vec<String>) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if section_ids.len() != snapshot.sections.len() {

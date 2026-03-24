@@ -123,6 +123,9 @@ export const activateTab = (workspaceId: string, tabId: string) =>
 export const renameTab = (workspaceId: string, tabId: string, title: string) =>
   invoke("rename_tab", { workspaceId, tabId, title });
 
+export const reorderTabs = (workspaceId: string, tabIds: string[]) =>
+  invoke("reorder_tabs", { workspaceId, tabIds });
+
 export const killPort = (port: number) =>
   invoke("kill_port", { port });
 
