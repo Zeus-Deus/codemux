@@ -251,6 +251,7 @@ export interface GitBranchInfo {
   branch: string | null;
   ahead: number;
   behind: number;
+  has_upstream: boolean;
 }
 
 export interface GitLogEntry {

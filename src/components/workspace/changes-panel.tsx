@@ -15,6 +15,7 @@ import {
   ArrowUp,
   ArrowDown,
   RefreshCw,
+  Loader2,
   Check,
   Trash2,
   Folder,
@@ -418,7 +419,8 @@ export function ChangesPanel({ workspace }: Props) {
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [expandedStaged, setExpandedStaged] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
-  const [busy, setBusy] = useState(false);
+  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | null>(null);
+  const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -444,47 +446,60 @@ export function ChangesPanel({ workspace }: Props) {
     };
   }, [refresh]);
 
+  useEffect(() => {
+    if (gitError) {
+      const t = setTimeout(() => setGitError(null), 8000);
+      return () => clearTimeout(t);
+    }
+  }, [gitError]);
+
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
 
+  const busy = busyAction !== null;
+
   const handleCommit = async () => {
     if (!commitMsg.trim() || staged.length === 0 || busy) return;
-    setBusy(true);
+    setBusyAction("commit");
+    setGitError(null);
     try {
       await gitCommitChanges(cwd, commitMsg.trim());
       setCommitMsg("");
       setExpandedFile(null);
       refresh();
     } catch (err) {
-      console.error("Commit failed:", err);
+      setGitError(String(err));
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   };
 
   const handlePush = async () => {
     if (busy) return;
-    setBusy(true);
+    setBusyAction("push");
+    setGitError(null);
     try {
-      await gitPushChanges(cwd);
+      const needsPublish = branchInfo && !branchInfo.has_upstream;
+      await gitPushChanges(cwd, !!needsPublish);
       refresh();
     } catch (err) {
-      console.error("Push failed:", err);
+      setGitError(String(err));
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   };
 
   const handlePull = async () => {
     if (busy) return;
-    setBusy(true);
+    setBusyAction("pull");
+    setGitError(null);
     try {
       await gitPullChanges(cwd);
       refresh();
     } catch (err) {
-      console.error("Pull failed:", err);
+      setGitError(String(err));
     } finally {
-      setBusy(false);
+      setBusyAction(null);
     }
   };
 
@@ -560,22 +575,12 @@ export function ChangesPanel({ workspace }: Props) {
               disabled={!commitMsg.trim() || staged.length === 0 || busy}
               onClick={handleCommit}
             >
-              <GitCommit className="h-3 w-3 mr-1" />
+              {busyAction === "commit"
+                ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                : <GitCommit className="h-3 w-3 mr-1" />}
               Commit
             </Button>
-            {branchInfo && branchInfo.behind > 0 && (
-              <Button
-                size="xs"
-                variant="secondary"
-                className="text-xs h-6"
-                disabled={busy}
-                onClick={handlePull}
-              >
-                <ArrowDown className="h-3 w-3 mr-1" />
-                Pull {branchInfo.behind}
-              </Button>
-            )}
-            {branchInfo && branchInfo.ahead > 0 && (
+            {branchInfo && branchInfo.branch && !branchInfo.has_upstream && (
               <Button
                 size="xs"
                 variant="secondary"
@@ -583,8 +588,38 @@ export function ChangesPanel({ workspace }: Props) {
                 disabled={busy}
                 onClick={handlePush}
               >
-                <ArrowUp className="h-3 w-3 mr-1" />
+                {busyAction === "push"
+                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                  : <ArrowUp className="h-3 w-3 mr-1" />}
+                Publish
+              </Button>
+            )}
+            {branchInfo && branchInfo.has_upstream && branchInfo.ahead > 0 && (
+              <Button
+                size="xs"
+                variant="secondary"
+                className="text-xs h-6"
+                disabled={busy}
+                onClick={handlePush}
+              >
+                {busyAction === "push"
+                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                  : <ArrowUp className="h-3 w-3 mr-1" />}
                 Push {branchInfo.ahead}
+              </Button>
+            )}
+            {branchInfo && branchInfo.has_upstream && branchInfo.behind > 0 && (
+              <Button
+                size="xs"
+                variant="secondary"
+                className="text-xs h-6"
+                disabled={busy}
+                onClick={handlePull}
+              >
+                {busyAction === "pull"
+                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                  : <ArrowDown className="h-3 w-3 mr-1" />}
+                Pull {branchInfo.behind}
               </Button>
             )}
             <Button
@@ -597,6 +632,9 @@ export function ChangesPanel({ workspace }: Props) {
               <RefreshCw className="h-3 w-3" />
             </Button>
           </div>
+          {gitError && (
+            <p className="text-[10px] text-destructive break-words px-0.5">{gitError}</p>
+          )}
         </div>
 
         {/* No changes message — outside ScrollArea to avoid scrollbar shift */}

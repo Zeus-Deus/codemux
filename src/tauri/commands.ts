@@ -251,8 +251,8 @@ export const gitUnstageFiles = (path: string, files: string[]) =>
 export const gitCommitChanges = (path: string, message: string) =>
   invoke("git_commit_changes", { path, message });
 
-export const gitPushChanges = (path: string) =>
-  invoke("git_push_changes", { path });
+export const gitPushChanges = (path: string, setUpstream: boolean = false) =>
+  invoke("git_push_changes", { path, setUpstream });
 
 export const getGitBranchInfo = (path: string) =>
   invoke<GitBranchInfo>("get_git_branch_info", { path });

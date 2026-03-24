@@ -39,8 +39,8 @@ pub fn git_commit_changes(path: String, message: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_push_changes(path: String) -> Result<(), String> {
-    crate::git::git_push(Path::new(&path))
+pub fn git_push_changes(path: String, set_upstream: bool) -> Result<(), String> {
+    crate::git::git_push(Path::new(&path), set_upstream)
 }
 
 #[tauri::command]

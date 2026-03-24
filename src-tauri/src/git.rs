@@ -38,6 +38,7 @@ pub struct GitBranchInfo {
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    pub has_upstream: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,8 +149,16 @@ pub fn git_commit(repo_path: &Path, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn git_push(repo_path: &Path) -> Result<(), String> {
-    run_git(repo_path, &["push"])?;
+pub fn git_push(repo_path: &Path, set_upstream: bool) -> Result<(), String> {
+    if set_upstream {
+        let branch_name = run_git_permissive(repo_path, &["branch", "--show-current"]);
+        if branch_name.is_empty() {
+            return Err("Cannot publish: no branch name".to_string());
+        }
+        run_git(repo_path, &["push", "-u", "origin", &branch_name])?;
+    } else {
+        run_git(repo_path, &["push"])?;
+    }
     Ok(())
 }
 
@@ -200,16 +209,27 @@ pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
         Some(branch_name)
     };
 
-    let rev_list = run_git_permissive(
+    let upstream = run_git_permissive(
         repo_path,
-        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
     );
-    let (ahead, behind) = parse_ahead_behind(&rev_list);
+    let has_upstream = !upstream.is_empty();
+
+    let (ahead, behind) = if has_upstream {
+        let rev_list = run_git_permissive(
+            repo_path,
+            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        );
+        parse_ahead_behind(&rev_list)
+    } else {
+        (0, 0)
+    };
 
     Ok(GitBranchInfo {
         branch,
         ahead,
         behind,
+        has_upstream,
     })
 }
 
