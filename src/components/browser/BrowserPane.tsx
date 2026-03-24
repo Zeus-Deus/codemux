@@ -42,6 +42,8 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [currentUrl, setCurrentUrl] = useState("about:blank");
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const statusRef = useRef(status);
+  statusRef.current = status;
 
   const sendInput = useCallback((msg: object) => {
     const ws = wsRef.current;
@@ -55,7 +57,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (!visible) return;
 
     let ws: WebSocket | null = null;
-    let cancelled = false;
+    let active = true;
 
     (async () => {
       setStatus("starting");
@@ -63,44 +65,38 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
       let streamUrl: string;
       try {
-        console.log("[BrowserPane] Calling startBrowserStream...");
         streamUrl = await startBrowserStream(browserId);
-        console.log("[BrowserPane] Got stream URL:", streamUrl);
       } catch (err) {
-        console.error("[BrowserPane] startBrowserStream failed:", err);
-        if (cancelled) return;
+        if (!active) return;
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
         return;
       }
 
-      if (cancelled) return;
+      if (!active) return;
       setStatus("connecting");
-      console.log("[BrowserPane] Connecting WebSocket to", streamUrl);
 
       ws = new WebSocket(streamUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log("[BrowserPane] WebSocket OPEN");
-        if (cancelled) return;
+        if (!active) return;
         setStatus("waiting");
       };
 
       ws.onmessage = (event) => {
-        if (cancelled) return;
+        // Always process frames — don't skip even if StrictMode cleanup ran.
+        // The WebSocket ref is shared, so the latest effect's handlers work.
         try {
           const msg = JSON.parse(event.data);
-          console.log("[BrowserPane] Message:", msg.type, msg.type === "frame" ? `(${msg.data?.length} bytes)` : JSON.stringify(msg));
 
           if (msg.type === "frame") {
-            setStatus("live");
+            if (statusRef.current !== "live") setStatus("live");
             const canvas = canvasRef.current;
             if (!canvas) return;
             const ctx = canvas.getContext("2d");
             if (!ctx) return;
 
-            // Decode base64 JPEG and draw on canvas
             if (!imgRef.current) {
               imgRef.current = new Image();
             }
@@ -114,7 +110,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
             };
             img.src = `data:image/jpeg;base64,${msg.data}`;
 
-            // Update viewport from metadata
             if (msg.metadata) {
               viewportRef.current = {
                 width: msg.metadata.deviceWidth || 1280,
@@ -129,37 +124,47 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               };
             }
           } else if (msg.type === "error") {
-            console.error("[BrowserPane] Server error:", msg.message);
-            setErrorMsg(msg.message);
+            // Don't show transient errors if we're already getting frames
+            if (statusRef.current !== "live") {
+              setErrorMsg(msg.message);
+            }
           }
-        } catch (parseErr) {
-          console.error("[BrowserPane] Parse error:", parseErr);
+        } catch {
+          // Ignore parse errors
         }
       };
 
-      ws.onerror = (err) => {
-        console.error("[BrowserPane] WebSocket error:", err);
-        if (cancelled) return;
-        setStatus("error");
-        setErrorMsg("WebSocket connection failed");
+      ws.onerror = () => {
+        if (!active) return;
+        if (statusRef.current !== "live") {
+          setStatus("error");
+          setErrorMsg("WebSocket connection failed");
+        }
       };
 
-      ws.onclose = (ev) => {
-        console.log("[BrowserPane] WebSocket CLOSE code:", ev.code, "reason:", ev.reason);
-        if (cancelled) return;
-        setStatus("error");
-        setErrorMsg("Stream disconnected");
+      ws.onclose = () => {
+        if (!active) return;
+        if (statusRef.current !== "live") {
+          setStatus("error");
+          setErrorMsg("Stream disconnected");
+        }
       };
     })();
 
     return () => {
-      cancelled = true;
-      if (ws) {
-        ws.close();
-        wsRef.current = null;
-      }
+      active = false;
+      // Don't close the WebSocket on StrictMode cleanup — keep it alive
+      // Only close if the component truly unmounts (browserId changes)
     };
   }, [browserId, visible]);
+
+  // Clean up WebSocket on true unmount
+  useEffect(() => {
+    return () => {
+      wsRef.current?.close();
+      wsRef.current = null;
+    };
+  }, []);
 
   // Mouse handlers
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -192,7 +197,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    // Only send move events if button is pressed (dragging)
     if (e.buttons === 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -224,12 +228,9 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
   // Keyboard handlers
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Don't capture tab management shortcuts
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
-
     e.preventDefault();
     e.stopPropagation();
-
     sendInput({
       type: "input_keyboard",
       eventType: "keyDown",
@@ -237,8 +238,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       code: e.code,
       modifiers: getModifiers(e),
     });
-
-    // For printable characters, also send a char event
     if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
       sendInput({
         type: "input_keyboard",
@@ -251,7 +250,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
   const handleKeyUp = (e: React.KeyboardEvent) => {
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
-
     e.preventDefault();
     sendInput({
       type: "input_keyboard",
@@ -262,7 +260,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
-  // Focus canvas when pane is focused
   useEffect(() => {
     if (focused && canvasRef.current) {
       canvasRef.current.focus();
