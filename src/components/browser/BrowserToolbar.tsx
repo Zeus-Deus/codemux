@@ -17,13 +17,15 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading }: 
 
   const navigate = async (url: string) => {
     const normalized = url.startsWith("http") ? url : `https://${url}`;
+    console.log("[BrowserToolbar] Navigate:", { browserId, action: "open", url: normalized });
     setNavigating(true);
     try {
-      await agentBrowserRun(browserId, "open", { url: normalized });
+      const result = await agentBrowserRun(browserId, "open", { url: normalized });
+      console.log("[BrowserToolbar] Navigate result:", result);
       onUrlChange(normalized);
       setUrlInput(normalized);
     } catch (err) {
-      console.error("Navigation failed:", err);
+      console.error("[BrowserToolbar] Navigation failed:", err);
     } finally {
       setNavigating(false);
     }
