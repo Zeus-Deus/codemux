@@ -234,62 +234,43 @@ impl AgentBrowserManager {
         format!("ws://localhost:{}", self.stream_port)
     }
 
-    pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
+    pub async fn start_stream(&self, _browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
-        let session = session_name(browser_id);
 
         let mut running = self.running.lock().await;
         if *running {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Step 1: Start agent-browser daemon with stream server using ESM dynamic import.
-        // The CLI uses a native Rust binary that doesn't support the stream server,
-        // so we must start the Node.js daemon directly.
+        // Start daemon + open a page in one Node.js script.
+        // The daemon's startDaemon() runs forever (blocks), so we call it without await.
+        // After 3s, we connect to the daemon's Unix socket and send a "navigate" command
+        // to trigger the browser auto-launch. The CLI binary can't do this because it's
+        // a separate process that doesn't talk to the daemon.
         let script = format!(
-            "import('agent-browser').then(m => m.startDaemon({{ streamPort: {} }})).catch(e => {{ console.error(e.message); process.exit(1); }})",
+            "const m = await import('agent-browser'); \
+             m.startDaemon({{ streamPort: {} }}); \
+             await new Promise(r => setTimeout(r, 3000)); \
+             const net = await import('node:net'); \
+             const sock = net.createConnection(m.getSocketPath()); \
+             sock.write(JSON.stringify({{id:'init',action:'navigate',url:'about:blank'}}) + '\\n'); \
+             sock.on('data', () => {{}});",
             port
         );
-        // DEBUG: Log daemon output to temp file for troubleshooting
-        eprintln!("[codemux::browser] Starting daemon with stream port {}", port);
+        eprintln!("[codemux::browser] Starting daemon+browser on port {}", port);
         let daemon_cmd = format!(
             "node --input-type=module -e {} >>/tmp/codemux-browser-daemon.log 2>&1",
             shell_quote(&script)
         );
-        eprintln!("[codemux::browser] Daemon cmd: {}", daemon_cmd);
         std::process::Command::new("sh")
             .args(["-c", &daemon_cmd])
             .stdin(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;
 
-        // Wait for daemon + stream server to be ready
-        eprintln!("[codemux::browser] Waiting 6s for daemon...");
-        std::thread::sleep(std::time::Duration::from_millis(6000));
-
-        // Step 2: Open a page via CLI to trigger the daemon's browser auto-launch.
-        eprintln!("[codemux::browser] Opening page via CLI...");
-        let open_cmd = format!("npx agent-browser open about:blank --headless --session {}", session);
-        for attempt in 0..3 {
-            let output = std::process::Command::new("sh")
-                .args(["-c", &open_cmd])
-                .output()
-                .map_err(|e| format!("Failed to open browser page: {}", e))?;
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("[codemux::browser] Attempt {}: status={} stdout={} stderr={}",
-                attempt + 1, output.status, stdout.trim(), stderr.trim());
-            if output.status.success() {
-                break;
-            }
-            if attempt < 2 {
-                std::thread::sleep(std::time::Duration::from_millis(3000));
-            }
-        }
-
-        // Give the browser a moment to launch and start screencast
-        eprintln!("[codemux::browser] Waiting 2s for screencast...");
-        std::thread::sleep(std::time::Duration::from_millis(2000));
+        // Wait for daemon + stream server + browser launch + first screencast frames
+        eprintln!("[codemux::browser] Waiting 8s for daemon + browser...");
+        std::thread::sleep(std::time::Duration::from_millis(8000));
         eprintln!("[codemux::browser] Stream ready at ws://localhost:{}", port);
         *running = true;
 
