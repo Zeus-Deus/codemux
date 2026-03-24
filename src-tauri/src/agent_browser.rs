@@ -150,7 +150,7 @@ impl AgentBrowserManager {
     pub fn new() -> Self {
         Self {
             running: Arc::new(Mutex::new(false)),
-            stream_port: 9222,
+            stream_port: 9223,
         }
     }
 
@@ -234,8 +234,7 @@ impl AgentBrowserManager {
         format!("ws://localhost:{}", self.stream_port)
     }
 
-    pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
-        let session = session_name(browser_id);
+    pub async fn start_stream(&self, _browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
 
         let mut running = self.running.lock().await;
@@ -245,8 +244,8 @@ impl AgentBrowserManager {
 
         // Start agent-browser daemon with stream server enabled
         let script = format!(
-            "const d = require('agent-browser/dist/daemon'); d.startDaemon({{ streamPort: {}, session: '{}' }}).catch(e => {{ console.error(e); process.exit(1); }})",
-            port, session
+            "const d = require('agent-browser/dist/daemon'); d.startDaemon({{ streamPort: {} }}).catch(e => {{ console.error(e); process.exit(1); }})",
+            port
         );
 
         std::process::Command::new("node")
