@@ -234,10 +234,12 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "create_browser_pane" => {
             let state: State<'_, AppStateStore> = app.state();
             let pane_id = request.params.get("pane_id").and_then(Value::as_str).unwrap_or_default();
+            let url = request.params.get("url").and_then(Value::as_str).map(String::from);
             crate::commands::browser::create_browser_pane_impl(
                 app.clone(),
                 &state,
                 pane_id.to_string(),
+                url,
             )
             .map(|created_pane_id| serde_json::json!({ "pane_id": created_pane_id }))
         }

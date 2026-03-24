@@ -110,8 +110,8 @@ export const markWorkspaceNotificationsRead = (workspaceId: string) =>
 export const setNotificationSoundEnabled = (enabled: boolean) =>
   invoke("set_notification_sound_enabled", { enabled });
 
-export const createBrowserPane = (paneId: string) =>
-  invoke<string>("create_browser_pane", { paneId });
+export const createBrowserPane = (paneId: string, url?: string) =>
+  invoke<string>("create_browser_pane", { paneId, url: url ?? null });
 
 export const createTab = (workspaceId: string, kind: TabKind) =>
   invoke<string>("create_tab", { workspaceId, kind });

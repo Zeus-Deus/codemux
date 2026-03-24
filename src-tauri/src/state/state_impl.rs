@@ -650,7 +650,7 @@ impl AppStateStore {
         workspace_id
     }
 
-    pub fn create_browser_pane(&self, pane_id: &str) -> Result<(PaneId, BrowserId), String> {
+    pub fn create_browser_pane(&self, pane_id: &str, url: Option<&str>) -> Result<(PaneId, BrowserId), String> {
         let mut snapshot = self.inner.lock().unwrap();
         let (workspace_index, surface_index) = find_pane_location(&snapshot.workspaces, pane_id)
             .ok_or_else(|| format!("No pane found for {pane_id}"))?;
@@ -659,7 +659,7 @@ impl AppStateStore {
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
         let title = format!("Browser {}", snapshot.browser_sessions.len() + 1);
-        let initial_url = DEFAULT_BROWSER_URL.to_string();
+        let initial_url = url.unwrap_or(DEFAULT_BROWSER_URL).to_string();
 
         snapshot.browser_sessions.push(BrowserSessionSnapshot {
             browser_id: browser_id.clone(),
@@ -3157,7 +3157,7 @@ mod tests {
         let workspace = workspace_by_id(&initial_snapshot, &workspace_id);
         let active_pane_id = workspace.surfaces[0].active_pane_id.0.clone();
 
-        store.create_browser_pane(&active_pane_id).unwrap();
+        store.create_browser_pane(&active_pane_id, None).unwrap();
         store.create_terminal_session().unwrap();
 
         assert_swap_invariants_for_workspace(&store, &workspace_id);

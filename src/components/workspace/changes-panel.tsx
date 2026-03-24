@@ -197,13 +197,21 @@ function FileRow({
     <div>
       <Tooltip>
         <TooltipTrigger asChild>
-          <button
-            className={`group flex w-full items-center gap-1 rounded-sm py-0.5 text-left hover:bg-accent/50 transition-colors ${indented ? "pl-5 pr-1" : "px-1"} ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
+          <div
+            role="button"
+            tabIndex={0}
+            className={`group flex w-full items-center gap-1 rounded-sm py-0.5 text-left hover:bg-accent/50 transition-colors cursor-default ${indented ? "pl-5 pr-1" : "px-1"} ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
             onClick={(e) => {
               if (e.altKey || !onOpenDiff) {
                 onToggleExpand();
               } else {
                 onOpenDiff(file.path, staged);
+              }
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                onToggleExpand();
               }
             }}
           >
@@ -246,7 +254,7 @@ function FileRow({
                 {staged ? <Minus className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
               </Button>
             </div>
-          </button>
+          </div>
         </TooltipTrigger>
         <TooltipContent side="left" className="text-xs">
           {file.path}

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { startBrowserStream, agentBrowserRun } from "@/tauri/commands";
+import { useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { Loader2, Globe } from "lucide-react";
 
@@ -48,7 +49,29 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [currentUrl, setCurrentUrl] = useState("about:blank");
+
+  // Read initial URL from browser session state (set by ports section or other callers)
+  const browserSession = useAppStore(
+    (s) => s.appState?.browser_sessions.find((b) => b.browser_id === browserId),
+  );
+  const [currentUrl, setCurrentUrl] = useState(
+    () => browserSession?.current_url ?? "about:blank",
+  );
+  const currentUrlRef = useRef(currentUrl);
+  currentUrlRef.current = currentUrl;
+
+  // Sync URL from state changes (e.g., browserOpenUrl called after mount)
+  useEffect(() => {
+    const stateUrl = browserSession?.current_url;
+    if (stateUrl && stateUrl !== currentUrl) {
+      setCurrentUrl(stateUrl);
+      if (statusRef.current === "live") {
+        agentBrowserRun(browserId, "open", { url: stateUrl }).catch(console.error);
+      }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [browserSession?.current_url]);
+
   const imgRef = useRef<HTMLImageElement | null>(null);
   const drawInfoRef = useRef({ x: 0, y: 0, w: 1280, h: 720 });
   const statusRef = useRef(status);
@@ -120,7 +143,19 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
             const msg = JSON.parse(event.data);
 
             if (msg.type === "frame") {
-              if (statusRef.current !== "live") setStatus("live");
+              if (statusRef.current !== "live") {
+                setStatus("live");
+                // Navigate to pre-set URL when browser first goes live.
+                // Delay 300ms to let browser process fully initialize for CDP commands.
+                const targetUrl = currentUrlRef.current;
+                if (targetUrl && targetUrl !== "about:blank") {
+                  setTimeout(() => {
+                    agentBrowserRun(browserId, "open", { url: targetUrl })
+                      .then(() => setCurrentUrl(targetUrl))
+                      .catch(console.error);
+                  }, 300);
+                }
+              }
               retries = 0;
               const canvas = canvasRef.current;
               if (!canvas) return;
@@ -134,15 +169,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
                   height: msg.metadata.deviceHeight || viewportRef.current.height,
                 };
               }
-
-              const container = containerRef.current;
-              console.log('BROWSER DEBUG frame:', {
-                frameW: msg.metadata?.deviceWidth, frameH: msg.metadata?.deviceHeight,
-                canvasAttrW: canvas.width, canvasAttrH: canvas.height,
-                canvasCssW: canvas.clientWidth, canvasCssH: canvas.clientHeight,
-                canvasStyleW: canvas.style.width, canvasStyleH: canvas.style.height,
-                containerW: container?.clientWidth, containerH: container?.clientHeight,
-              });
 
               if (!imgRef.current) {
                 imgRef.current = new Image();
@@ -330,11 +356,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         canvas.width = cw;
         canvas.height = ch;
       }
-      console.log('BROWSER DEBUG resize:', {
-        containerW: cw, containerH: ch,
-        canvasAttrW: canvas.width, canvasAttrH: canvas.height,
-        canvasCssW: canvas.clientWidth, canvasCssH: canvas.clientHeight,
-      });
       // Debounced: tell browser to resize viewport to match
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {

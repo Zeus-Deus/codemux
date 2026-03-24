@@ -7,8 +7,9 @@ pub(crate) fn create_browser_pane_impl(
     app: tauri::AppHandle,
     state: &AppStateStore,
     pane_id: String,
+    url: Option<String>,
 ) -> Result<String, String> {
-    let (pane_id, _browser_id) = state.create_browser_pane(&pane_id)?;
+    let (pane_id, _browser_id) = state.create_browser_pane(&pane_id, url.as_deref())?;
     crate::state::emit_app_state(&app);
     Ok(pane_id.0)
 }
@@ -29,8 +30,9 @@ pub fn create_browser_pane(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     pane_id: String,
+    url: Option<String>,
 ) -> Result<String, String> {
-    create_browser_pane_impl(app, &state, pane_id)
+    create_browser_pane_impl(app, &state, pane_id, url)
 }
 
 #[tauri::command]

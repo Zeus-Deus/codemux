@@ -3,6 +3,7 @@ import { SidebarHeader } from "./sidebar-header";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarOpenflowSection } from "./sidebar-openflow-section";
 import { SidebarAlertsSection } from "./sidebar-alerts-section";
+import { SidebarPortsSection } from "./sidebar-ports-section";
 import { SidebarFooter } from "./sidebar-footer";
 
 export function AppSidebar() {
@@ -14,6 +15,7 @@ export function AppSidebar() {
         <SidebarOpenflowSection />
         <SidebarAlertsSection />
       </SidebarContent>
+      <SidebarPortsSection />
       <SidebarFooter />
       <SidebarRail />
     </Sidebar>
