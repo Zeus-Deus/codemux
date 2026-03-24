@@ -27,10 +27,17 @@ function mapCoordinates(
   e: React.MouseEvent,
   canvas: HTMLCanvasElement,
   viewport: ViewportInfo,
+  drawInfo: { x: number; y: number; w: number; h: number },
 ): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
-  const x = ((e.clientX - rect.left) / rect.width) * viewport.width;
-  const y = ((e.clientY - rect.top) / rect.height) * viewport.height;
+  // Convert CSS pixel position to canvas pixel position
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const canvasX = (e.clientX - rect.left) * scaleX;
+  const canvasY = (e.clientY - rect.top) * scaleY;
+  // Map from draw area to viewport coordinates
+  const x = ((canvasX - drawInfo.x) / drawInfo.w) * viewport.width;
+  const y = ((canvasY - drawInfo.y) / drawInfo.h) * viewport.height;
   return { x: Math.max(0, Math.round(x)), y: Math.max(0, Math.round(y)) };
 }
 
@@ -43,6 +50,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [currentUrl, setCurrentUrl] = useState("about:blank");
   const imgRef = useRef<HTMLImageElement | null>(null);
+  const drawInfoRef = useRef({ x: 0, y: 0, w: 1280, h: 720 });
   const statusRef = useRef(status);
   statusRef.current = status;
 
@@ -92,6 +100,19 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         ws.onopen = () => {
           if (!active) return;
           setStatus("waiting");
+
+          // Set initial viewport to match container dimensions
+          const container = containerRef.current;
+          if (container) {
+            const rect = container.getBoundingClientRect();
+            const cw = Math.round(rect.width);
+            const ch = Math.round(rect.height);
+            if (cw > 10 && ch > 10) {
+              viewportRef.current = { width: cw, height: ch };
+              agentBrowserRun(browserId, "viewport", { width: cw, height: ch }).catch(() => {});
+              sendInput({ type: "resize", width: cw, height: ch });
+            }
+          }
         };
 
         ws.onmessage = (event) => {
@@ -102,36 +123,55 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               if (statusRef.current !== "live") setStatus("live");
               retries = 0;
               const canvas = canvasRef.current;
-              const container = containerRef.current;
-              if (!canvas || !container) return;
+              if (!canvas) return;
               const ctx = canvas.getContext("2d");
               if (!ctx) return;
 
-              // Size canvas to container
-              const rect = container.getBoundingClientRect();
-              const cw = Math.round(rect.width);
-              const ch = Math.round(rect.height);
-              if (canvas.width !== cw || canvas.height !== ch) {
-                canvas.width = cw;
-                canvas.height = ch;
+              // Update viewport info from frame metadata
+              if (msg.metadata) {
+                viewportRef.current = {
+                  width: msg.metadata.deviceWidth || viewportRef.current.width,
+                  height: msg.metadata.deviceHeight || viewportRef.current.height,
+                };
               }
+
+              const container = containerRef.current;
+              console.log('BROWSER DEBUG frame:', {
+                frameW: msg.metadata?.deviceWidth, frameH: msg.metadata?.deviceHeight,
+                canvasAttrW: canvas.width, canvasAttrH: canvas.height,
+                canvasCssW: canvas.clientWidth, canvasCssH: canvas.clientHeight,
+                canvasStyleW: canvas.style.width, canvasStyleH: canvas.style.height,
+                containerW: container?.clientWidth, containerH: container?.clientHeight,
+              });
 
               if (!imgRef.current) {
                 imgRef.current = new Image();
               }
               const img = imgRef.current;
               img.onload = () => {
-                // Draw frame scaled to fill canvas — viewport should match pane size
-                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                const frameAspect = img.naturalWidth / img.naturalHeight;
+                const canvasAspect = canvas.width / canvas.height;
+
+                let drawW, drawH, drawX, drawY;
+                if (frameAspect > canvasAspect) {
+                  drawW = canvas.width;
+                  drawH = canvas.width / frameAspect;
+                  drawX = 0;
+                  drawY = (canvas.height - drawH) / 2;
+                } else {
+                  drawH = canvas.height;
+                  drawW = canvas.height * frameAspect;
+                  drawX = (canvas.width - drawW) / 2;
+                  drawY = 0;
+                }
+
+                drawInfoRef.current = { x: drawX, y: drawY, w: drawW, h: drawH };
+
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, drawX, drawY, drawW, drawH);
               };
               img.src = `data:image/jpeg;base64,${msg.data}`;
-
-              if (msg.metadata) {
-                viewportRef.current = {
-                  width: msg.metadata.deviceWidth || 1280,
-                  height: msg.metadata.deviceHeight || 720,
-                };
-              }
             } else if (msg.type === "status") {
               if (msg.viewportWidth && msg.viewportHeight) {
                 viewportRef.current = {
@@ -185,7 +225,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const handleMouseDown = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const { x, y } = mapCoordinates(e, canvas, viewportRef.current);
+    const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
       eventType: "mousePressed",
@@ -200,7 +240,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const handleMouseUp = (e: React.MouseEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const { x, y } = mapCoordinates(e, canvas, viewportRef.current);
+    const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
       eventType: "mouseReleased",
@@ -215,7 +255,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (e.buttons === 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const { x, y } = mapCoordinates(e, canvas, viewportRef.current);
+    const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
       eventType: "mouseMoved",
@@ -229,7 +269,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const handleWheel = (e: React.WheelEvent) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const { x, y } = mapCoordinates(e, canvas, viewportRef.current);
+    const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
       eventType: "mouseWheel",
@@ -275,34 +315,40 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
-  // ResizeObserver: update canvas + browser viewport when pane resizes
+  // ResizeObserver: sync canvas + viewport to container dimensions
   useEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const observer = new ResizeObserver(() => {
-      const rect = container.getBoundingClientRect();
-      const cw = Math.round(rect.width);
-      const ch = Math.round(rect.height);
+      const cw = container.clientWidth;
+      const ch = container.clientHeight;
       if (cw < 10 || ch < 10) return;
+      // Immediately sync canvas resolution to container
       if (canvas.width !== cw || canvas.height !== ch) {
         canvas.width = cw;
         canvas.height = ch;
       }
-      // Debounced viewport resize — tell browser to match pane size
+      console.log('BROWSER DEBUG resize:', {
+        containerW: cw, containerH: ch,
+        canvasAttrW: canvas.width, canvasAttrH: canvas.height,
+        canvasCssW: canvas.clientWidth, canvasCssH: canvas.clientHeight,
+      });
+      // Debounced: tell browser to resize viewport to match
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         viewportRef.current = { width: cw, height: ch };
         agentBrowserRun(browserId, "viewport", { width: cw, height: ch }).catch(() => {});
-      }, 300);
+        sendInput({ type: "resize", width: cw, height: ch });
+      }, 200);
     });
     observer.observe(container);
     return () => {
       observer.disconnect();
       if (resizeTimer) clearTimeout(resizeTimer);
     };
-  }, [browserId]);
+  }, [browserId, sendInput]);
 
   useEffect(() => {
     if (focused && canvasRef.current) {
