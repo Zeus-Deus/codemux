@@ -233,23 +233,34 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
-  // Keyboard handlers
+  // Keyboard handlers — CDP needs "rawKeyDown" for non-printable keys (Backspace, Enter, etc.)
+  // and "keyDown" + "char" for printable characters. Also needs windowsVirtualKeyCode.
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Let app shortcuts through
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
     e.preventDefault();
     e.stopPropagation();
+
+    const isPrintable = e.key.length === 1 && !e.ctrlKey && !e.metaKey;
+
     sendInput({
       type: "input_keyboard",
-      eventType: "keyDown",
+      eventType: isPrintable ? "keyDown" : "rawKeyDown",
       key: e.key,
       code: e.code,
+      text: isPrintable ? e.key : undefined,
+      windowsVirtualKeyCode: e.keyCode,
       modifiers: getModifiers(e),
     });
-    if (e.key.length === 1 && !e.ctrlKey && !e.metaKey) {
+
+    if (isPrintable) {
       sendInput({
         type: "input_keyboard",
         eventType: "char",
         text: e.key,
+        key: e.key,
+        code: e.code,
+        windowsVirtualKeyCode: e.keyCode,
         modifiers: getModifiers(e),
       });
     }
@@ -263,6 +274,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       eventType: "keyUp",
       key: e.key,
       code: e.code,
+      windowsVirtualKeyCode: e.keyCode,
       modifiers: getModifiers(e),
     });
   };
@@ -281,7 +293,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         onUrlChange={setCurrentUrl}
         loading={status === "starting" || status === "connecting"}
       />
-      <div className="flex-1 min-h-0 overflow-hidden relative">
+      <div className="flex-1 min-h-0 overflow-hidden relative flex items-center justify-center bg-background">
         {status !== "live" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (
@@ -304,7 +316,8 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          className="w-full h-full object-contain outline-none cursor-default"
+          className="outline-none cursor-default"
+          style={{ maxWidth: "100%", maxHeight: "100%" }}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
           onMouseMove={handleMouseMove}
