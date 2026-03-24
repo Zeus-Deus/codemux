@@ -43,13 +43,14 @@ export function SidebarOpenflowSection() {
           className={`h-3 w-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
         />
         <span>OpenFlow</span>
+        <span className="flex-1" />
         {openflowWorkspaces.length > 0 && (
-          <span className="ml-auto text-[10px] font-semibold tabular-nums text-muted-foreground">
+          <span className="text-[10px] font-semibold tabular-nums text-muted-foreground">
             {openflowWorkspaces.length}
           </span>
         )}
         <button
-          className="ml-1 rounded p-0.5 hover:bg-accent/30 transition-colors"
+          className="rounded p-0.5 hover:bg-accent/30 transition-colors"
           onClick={(e) => {
             e.stopPropagation();
             setNewRunDialogOpen(true);
