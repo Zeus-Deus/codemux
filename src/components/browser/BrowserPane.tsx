@@ -63,8 +63,11 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
       let streamUrl: string;
       try {
+        console.log("[BrowserPane] Calling startBrowserStream...");
         streamUrl = await startBrowserStream(browserId);
+        console.log("[BrowserPane] Got stream URL:", streamUrl);
       } catch (err) {
+        console.error("[BrowserPane] startBrowserStream failed:", err);
         if (cancelled) return;
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
@@ -73,11 +76,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
       if (cancelled) return;
       setStatus("connecting");
+      console.log("[BrowserPane] Connecting WebSocket to", streamUrl);
 
       ws = new WebSocket(streamUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        console.log("[BrowserPane] WebSocket OPEN");
         if (cancelled) return;
         setStatus("waiting");
       };
@@ -86,6 +91,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         if (cancelled) return;
         try {
           const msg = JSON.parse(event.data);
+          console.log("[BrowserPane] Message:", msg.type, msg.type === "frame" ? `(${msg.data?.length} bytes)` : JSON.stringify(msg));
 
           if (msg.type === "frame") {
             setStatus("live");
@@ -123,20 +129,23 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               };
             }
           } else if (msg.type === "error") {
+            console.error("[BrowserPane] Server error:", msg.message);
             setErrorMsg(msg.message);
           }
-        } catch {
-          // Ignore parse errors
+        } catch (parseErr) {
+          console.error("[BrowserPane] Parse error:", parseErr);
         }
       };
 
-      ws.onerror = () => {
+      ws.onerror = (err) => {
+        console.error("[BrowserPane] WebSocket error:", err);
         if (cancelled) return;
         setStatus("error");
         setErrorMsg("WebSocket connection failed");
       };
 
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
+        console.log("[BrowserPane] WebSocket CLOSE code:", ev.code, "reason:", ev.reason);
         if (cancelled) return;
         setStatus("error");
         setErrorMsg("Stream disconnected");

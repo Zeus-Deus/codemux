@@ -250,12 +250,13 @@ impl AgentBrowserManager {
             "import('agent-browser').then(m => m.startDaemon({{ streamPort: {} }})).catch(e => {{ console.error(e.message); process.exit(1); }})",
             port
         );
-        // Redirect to /dev/null via shell to avoid Node.js crashing when
-        // Stdio::null() closes the file descriptors (Node expects writable stdout/stderr)
+        // DEBUG: Log daemon output to temp file for troubleshooting
+        eprintln!("[codemux::browser] Starting daemon with stream port {}", port);
         let daemon_cmd = format!(
-            "node --input-type=module -e {} >/dev/null 2>/dev/null",
+            "node --input-type=module -e {} >>/tmp/codemux-browser-daemon.log 2>&1",
             shell_quote(&script)
         );
+        eprintln!("[codemux::browser] Daemon cmd: {}", daemon_cmd);
         std::process::Command::new("sh")
             .args(["-c", &daemon_cmd])
             .stdin(std::process::Stdio::null())
@@ -263,29 +264,33 @@ impl AgentBrowserManager {
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;
 
         // Wait for daemon + stream server to be ready
-        std::thread::sleep(std::time::Duration::from_millis(4000));
+        eprintln!("[codemux::browser] Waiting 6s for daemon...");
+        std::thread::sleep(std::time::Duration::from_millis(6000));
 
         // Step 2: Open a page via CLI to trigger the daemon's browser auto-launch.
-        // The daemon only launches a browser when it receives a command through its
-        // socket — without this, the stream server has no page to screencast.
-        // Retry up to 3 times in case the daemon socket isn't ready yet.
+        eprintln!("[codemux::browser] Opening page via CLI...");
         let open_cmd = format!("npx agent-browser open about:blank --headless --session {}", session);
         for attempt in 0..3 {
             let output = std::process::Command::new("sh")
                 .args(["-c", &open_cmd])
                 .output()
                 .map_err(|e| format!("Failed to open browser page: {}", e))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("[codemux::browser] Attempt {}: status={} stdout={} stderr={}",
+                attempt + 1, output.status, stdout.trim(), stderr.trim());
             if output.status.success() {
                 break;
             }
             if attempt < 2 {
-                eprintln!("[codemux::browser] page open attempt {} failed, retrying...", attempt + 1);
-                std::thread::sleep(std::time::Duration::from_millis(2000));
+                std::thread::sleep(std::time::Duration::from_millis(3000));
             }
         }
 
         // Give the browser a moment to launch and start screencast
+        eprintln!("[codemux::browser] Waiting 2s for screencast...");
         std::thread::sleep(std::time::Duration::from_millis(2000));
+        eprintln!("[codemux::browser] Stream ready at ws://localhost:{}", port);
         *running = true;
 
         Ok(format!("ws://localhost:{}", port))
