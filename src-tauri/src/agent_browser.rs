@@ -242,22 +242,20 @@ impl AgentBrowserManager {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Start agent-browser daemon with stream server enabled
-        let script = format!(
-            "const d = require('agent-browser/dist/daemon'); d.startDaemon({{ streamPort: {} }}).catch(e => {{ console.error(e); process.exit(1); }})",
-            port
-        );
-
-        std::process::Command::new("node")
-            .args(["-e", &script])
+        // Start agent-browser with stream server via env var.
+        // The daemon auto-starts the WebSocket stream server when
+        // AGENT_BROWSER_STREAM_PORT is set.
+        std::process::Command::new("sh")
+            .args(["-c", "npx agent-browser open about:blank --headless"])
+            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;
 
-        // Wait for stream server to be ready
-        std::thread::sleep(std::time::Duration::from_millis(3000));
+        // Wait for daemon + stream server to be ready
+        std::thread::sleep(std::time::Duration::from_millis(4000));
         *running = true;
 
         Ok(format!("ws://localhost:{}", port))
