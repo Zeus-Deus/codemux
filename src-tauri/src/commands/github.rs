@@ -46,3 +46,8 @@ pub fn merge_pull_request(path: String, pr_number: u32, method: String) -> Resul
 pub fn get_pull_request_checks(path: String) -> Result<Vec<CheckInfo>, String> {
     crate::github::get_pr_checks(Path::new(&path))
 }
+
+#[tauri::command]
+pub fn get_pr_review_comments(path: String) -> Result<Vec<crate::github::ReviewComment>, String> {
+    crate::github::get_pr_review_comments(Path::new(&path))
+}

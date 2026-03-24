@@ -294,6 +294,14 @@ export interface CheckInfo {
   conclusion: string | null;
 }
 
+export interface ReviewComment {
+  id: number;
+  author: string;
+  body: string;
+  state: string;
+  created_at: string;
+}
+
 export type GhStatus =
   | { status: "NotInstalled" }
   | { status: "NotAuthenticated" }

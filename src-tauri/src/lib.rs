@@ -343,6 +343,7 @@ pub fn run() {
             commands::list_pull_requests,
             commands::merge_pull_request,
             commands::get_pull_request_checks,
+            commands::get_pr_review_comments,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,

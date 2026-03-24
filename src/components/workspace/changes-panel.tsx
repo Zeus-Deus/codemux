@@ -32,7 +32,10 @@ import {
   gitPullChanges,
   gitDiscardFile,
   gitLogEntries,
+  createTab,
+  activateTab,
 } from "@/tauri/commands";
+import { useDiffStore } from "@/stores/diff-store";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -131,6 +134,8 @@ function FileRow({
   expanded,
   onToggleExpand,
   onRefresh,
+  onOpenDiff,
+  activeDiffFile,
   indented,
 }: {
   file: GitFileStatus;
@@ -139,6 +144,8 @@ function FileRow({
   expanded: boolean;
   onToggleExpand: () => void;
   onRefresh: () => void;
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
+  activeDiffFile?: string | null;
   indented?: boolean;
 }) {
   const [diff, setDiff] = useState<string | null>(null);
@@ -191,8 +198,14 @@ function FileRow({
       <Tooltip>
         <TooltipTrigger asChild>
           <button
-            className={`group flex w-full items-center gap-1 rounded-sm py-0.5 text-left hover:bg-accent/50 transition-colors ${indented ? "pl-5 pr-1" : "px-1"}`}
-            onClick={onToggleExpand}
+            className={`group flex w-full items-center gap-1 rounded-sm py-0.5 text-left hover:bg-accent/50 transition-colors ${indented ? "pl-5 pr-1" : "px-1"} ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
+            onClick={(e) => {
+              if (e.altKey || !onOpenDiff) {
+                onToggleExpand();
+              } else {
+                onOpenDiff(file.path, staged);
+              }
+            }}
           >
             <span
               className={`shrink-0 w-3.5 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
@@ -255,6 +268,8 @@ function DirectoryGroup({
   expandedStaged,
   onToggleExpand,
   onRefresh,
+  onOpenDiff,
+  activeDiffFile,
 }: {
   dir: string;
   files: GitFileStatus[];
@@ -264,6 +279,8 @@ function DirectoryGroup({
   expandedStaged: boolean;
   onToggleExpand: (path: string, staged: boolean) => void;
   onRefresh: () => void;
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
+  activeDiffFile?: string | null;
 }) {
   const [collapsed, setCollapsed] = useState(false);
 
@@ -280,6 +297,8 @@ function DirectoryGroup({
             expanded={expandedFile === f.path && expandedStaged === staged}
             onToggleExpand={() => onToggleExpand(f.path, staged)}
             onRefresh={onRefresh}
+            onOpenDiff={onOpenDiff}
+            activeDiffFile={activeDiffFile}
           />
         ))}
       </>
@@ -308,6 +327,8 @@ function DirectoryGroup({
             expanded={expandedFile === f.path && expandedStaged === staged}
             onToggleExpand={() => onToggleExpand(f.path, staged)}
             onRefresh={onRefresh}
+            onOpenDiff={onOpenDiff}
+            activeDiffFile={activeDiffFile}
             indented
           />
         ))}
@@ -328,6 +349,8 @@ function FileSection({
   onRefresh,
   onBulkAction,
   bulkLabel,
+  onOpenDiff,
+  activeDiffFile,
 }: {
   label: string;
   files: GitFileStatus[];
@@ -339,6 +362,8 @@ function FileSection({
   onRefresh: () => void;
   onBulkAction: () => void;
   bulkLabel: string;
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
+  activeDiffFile?: string | null;
 }) {
   const groups = useMemo(() => groupByDirectory(files), [files]);
 
@@ -366,6 +391,8 @@ function FileSection({
           expandedStaged={expandedStaged}
           onToggleExpand={onToggleExpand}
           onRefresh={onRefresh}
+          onOpenDiff={onOpenDiff}
+          activeDiffFile={activeDiffFile}
         />
       ))}
     </div>
@@ -476,6 +503,36 @@ export function ChangesPanel({ workspace }: Props) {
     }
   };
 
+  const diffSetFile = useDiffStore((s) => s.setFile);
+  const diffInitTab = useDiffStore((s) => s.initTab);
+
+  // Find active diff tab and its current file for highlighting
+  const activeDiffTab = workspace.tabs.find((t) => t.kind === "diff");
+  const activeDiffState = useDiffStore((s) =>
+    activeDiffTab ? s.getTab(activeDiffTab.tab_id) : undefined,
+  );
+  const activeDiffFile = activeDiffState?.filePath ?? null;
+
+  const handleOpenDiff = useCallback(
+    async (filePath: string, isStaged: boolean) => {
+      const existingDiffTab = workspace.tabs.find((t) => t.kind === "diff");
+      if (existingDiffTab) {
+        await activateTab(workspace.workspace_id, existingDiffTab.tab_id).catch(
+          console.error,
+        );
+        diffSetFile(existingDiffTab.tab_id, filePath, isStaged);
+      } else {
+        try {
+          const tabId = await createTab(workspace.workspace_id, "diff");
+          diffInitTab(tabId, { file: filePath, staged: isStaged });
+        } catch (err) {
+          console.error("Failed to create diff tab:", err);
+        }
+      }
+    },
+    [workspace, diffSetFile, diffInitTab],
+  );
+
   return (
     <TooltipProvider>
       <div className="flex h-full flex-col">
@@ -557,6 +614,8 @@ export function ChangesPanel({ workspace }: Props) {
                 onRefresh={refresh}
                 onBulkAction={handleUnstageAll}
                 bulkLabel="Unstage all"
+                onOpenDiff={handleOpenDiff}
+                activeDiffFile={activeDiffFile}
               />
             )}
 
@@ -572,6 +631,8 @@ export function ChangesPanel({ workspace }: Props) {
                 onRefresh={refresh}
                 onBulkAction={handleStageAll}
                 bulkLabel="Stage all"
+                onOpenDiff={handleOpenDiff}
+                activeDiffFile={activeDiffFile}
               />
             )}
 

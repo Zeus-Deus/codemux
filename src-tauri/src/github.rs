@@ -35,6 +35,15 @@ pub struct CheckInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub state: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum GhStatus {
     NotInstalled,
@@ -222,6 +231,41 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
             status: c["state"].as_str().unwrap_or("pending").to_string(),
             conclusion: c["conclusion"].as_str().map(|s| s.to_string()),
         })
+        .collect())
+}
+
+pub fn get_pr_review_comments(repo_path: &Path) -> Result<Vec<ReviewComment>, String> {
+    let output = run_gh_optional(repo_path, &["pr", "view", "--json", "reviews"]);
+    let Some(json_str) = output else {
+        return Ok(Vec::new());
+    };
+    if json_str.is_empty() {
+        return Ok(Vec::new());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse reviews JSON: {e}"))?;
+    let arr = v["reviews"]
+        .as_array()
+        .ok_or("Expected reviews array")?;
+    Ok(arr
+        .iter()
+        .map(|r| ReviewComment {
+            id: r["id"].as_u64().unwrap_or(0),
+            author: r["author"]["login"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+            body: r["body"].as_str().unwrap_or("").to_string(),
+            state: r["state"]
+                .as_str()
+                .unwrap_or("COMMENTED")
+                .to_string(),
+            created_at: r["submittedAt"]
+                .as_str()
+                .unwrap_or("")
+                .to_string(),
+        })
+        .filter(|r| !r.body.is_empty())
         .collect())
 }
 

@@ -26,6 +26,7 @@ import type {
   ProjectMemorySnapshot,
   ProjectMemoryUpdate,
   PullRequestInfo,
+  ReviewComment,
   SearchResult,
   ShellAppearance,
   TabKind,
@@ -226,6 +227,9 @@ export const mergePullRequest = (path: string, prNumber: number, method: string)
 
 export const getPullRequestChecks = (path: string) =>
   invoke<CheckInfo[]>("get_pull_request_checks", { path });
+
+export const getPrReviewComments = (path: string) =>
+  invoke<ReviewComment[]>("get_pr_review_comments", { path });
 
 // ── Git ──
 

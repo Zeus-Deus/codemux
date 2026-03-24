@@ -8,6 +8,12 @@ import {
   ContextMenuItem,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Plus, X, Terminal, Globe, GitCompare, PanelRight } from "lucide-react";
 import {
   activateTab,
@@ -274,16 +280,33 @@ export function TabBar({ workspace }: Props) {
               </ContextMenu>
             ))}
           </TabsList>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="ml-0.5 shrink-0"
-            onClick={handleCreateTab}
-            title="New terminal tab"
-            aria-label="New terminal tab"
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                className="ml-0.5 shrink-0"
+                title="New tab"
+                aria-label="New tab"
+              >
+                <Plus className="h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onClick={handleCreateTab}>
+                <Terminal className="h-3.5 w-3.5 mr-2" />
+                Terminal
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() =>
+                  createTab(workspace.workspace_id, "diff").catch(console.error)
+                }
+              >
+                <GitCompare className="h-3.5 w-3.5 mr-2" />
+                Diff Viewer
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </Tabs>
 

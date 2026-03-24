@@ -4,6 +4,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { TabBar } from "./tab-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
+import { DiffPane } from "@/components/diff/DiffPane";
 
 function RightPanelResizer() {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
@@ -54,13 +55,20 @@ export function WorkspaceMain() {
   if (!activeWorkspace) return null;
 
   const showRightPanel = rightPanelTab !== null;
+  const activeTab = activeWorkspace.tabs.find(
+    (t) => t.tab_id === activeWorkspace.active_tab_id,
+  );
 
   return (
     <>
       <TabBar workspace={activeWorkspace} />
       <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
         <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
-          <PaneContainer workspace={activeWorkspace} />
+          {activeTab?.kind === "diff" ? (
+            <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
+          ) : (
+            <PaneContainer workspace={activeWorkspace} />
+          )}
         </div>
         {showRightPanel && (
           <>
