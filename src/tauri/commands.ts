@@ -14,6 +14,7 @@ import type {
   GitBranchInfo,
   GitDiffStat,
   GitFileStatus,
+  GitLogEntry,
   HandoffPacket,
   LaunchMode,
   ModelInfo,
@@ -251,6 +252,15 @@ export const gitPushChanges = (path: string) =>
 
 export const getGitBranchInfo = (path: string) =>
   invoke<GitBranchInfo>("get_git_branch_info", { path });
+
+export const gitPullChanges = (path: string) =>
+  invoke("git_pull_changes", { path });
+
+export const gitDiscardFile = (path: string, file: string) =>
+  invoke("git_discard_file", { path, file });
+
+export const gitLogEntries = (path: string, count: number) =>
+  invoke<GitLogEntry[]>("git_log_entries", { path, count });
 
 export const listBranches = (path: string, remote: boolean) =>
   invoke<string[]>("list_branches", { path, remote });

@@ -1,9 +1,16 @@
-use crate::git::{GitBranchInfo, GitDiffStat, GitFileStatus, WorktreeInfo};
+use crate::git::{GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, WorktreeInfo};
 use std::path::Path;
 
 #[tauri::command]
 pub fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
-    crate::git::git_status(Path::new(&path))
+    let p = Path::new(&path);
+    eprintln!("[git_status] path={}, exists={}, is_dir={}", path, p.exists(), p.is_dir());
+    let result = crate::git::git_status(p);
+    match &result {
+        Ok(files) => eprintln!("[git_status] found {} files", files.len()),
+        Err(e) => eprintln!("[git_status] error: {}", e),
+    }
+    result
 }
 
 #[tauri::command]
@@ -34,6 +41,21 @@ pub fn git_commit_changes(path: String, message: String) -> Result<(), String> {
 #[tauri::command]
 pub fn git_push_changes(path: String) -> Result<(), String> {
     crate::git::git_push(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn git_pull_changes(path: String) -> Result<(), String> {
+    crate::git::git_pull(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn git_discard_file(path: String, file: String) -> Result<(), String> {
+    crate::git::git_discard_file(Path::new(&path), &file)
+}
+
+#[tauri::command]
+pub fn git_log_entries(path: String, count: usize) -> Result<Vec<GitLogEntry>, String> {
+    crate::git::git_log(Path::new(&path), count)
 }
 
 #[tauri::command]

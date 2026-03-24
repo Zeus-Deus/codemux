@@ -116,6 +116,8 @@ codemux browser snapshot
 | `codemux browser screenshot` | Take a screenshot |
 | `codemux browser console-logs` | Get console logs |
 
+Additional actions available via the socket API: `back`, `forward`, `reload`, `evaluate` (run JS), `type_text`, `viewport`. See `docs/reference/BROWSER-AGENT-COMMANDS.md` for the full reference.
+
 ## Socket API
 
 You can also control Codemux via JSON commands over the socket:

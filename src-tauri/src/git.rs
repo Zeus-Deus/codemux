@@ -19,6 +19,10 @@ pub struct GitFileStatus {
     pub status: FileStatus,
     pub is_staged: bool,
     pub is_unstaged: bool,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +38,15 @@ pub struct GitBranchInfo {
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitLogEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub message: String,
+    pub author: String,
+    pub time_ago: String,
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
@@ -69,7 +82,19 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
 
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     let output = run_git(repo_path, &["status", "--porcelain=v1"])?;
-    Ok(parse_porcelain_status(&output))
+    let mut files = parse_porcelain_status(&output);
+
+    // Merge per-file diff stats
+    let unstaged_stats = run_git_permissive(repo_path, &["diff", "--numstat"]);
+    let staged_stats = run_git_permissive(repo_path, &["diff", "--cached", "--numstat"]);
+    let per_file = parse_numstat_per_file(&unstaged_stats, &staged_stats);
+    for file in &mut files {
+        if let Some(&(a, d)) = per_file.get(&file.path) {
+            file.additions = a;
+            file.deletions = d;
+        }
+    }
+    Ok(files)
 }
 
 pub fn git_diff(repo_path: &Path, file_path: &str, staged: bool) -> Result<String, String> {
@@ -128,6 +153,45 @@ pub fn git_push(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn git_pull(repo_path: &Path) -> Result<(), String> {
+    run_git(repo_path, &["pull", "--rebase"])?;
+    Ok(())
+}
+
+pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
+    // Try git restore first (works for tracked files)
+    let restore = run_git(repo_path, &["restore", "--", file]);
+    if restore.is_ok() {
+        return Ok(());
+    }
+    // For untracked files, try clean
+    run_git(repo_path, &["clean", "-f", "--", file])?;
+    Ok(())
+}
+
+pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, String> {
+    let count_str = count.to_string();
+    let output = run_git(
+        repo_path,
+        &["log", "--format=%H%n%h%n%s%n%an%n%ar", "-n", &count_str],
+    )?;
+    let lines: Vec<&str> = output.lines().collect();
+    let mut entries = Vec::new();
+    for chunk in lines.chunks(5) {
+        if chunk.len() < 5 {
+            break;
+        }
+        entries.push(GitLogEntry {
+            hash: chunk[0].to_string(),
+            short_hash: chunk[1].to_string(),
+            message: chunk[2].to_string(),
+            author: chunk[3].to_string(),
+            time_ago: chunk[4].to_string(),
+        });
+    }
+    Ok(entries)
+}
+
 pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
     let branch_name = run_git_permissive(repo_path, &["branch", "--show-current"]);
     let branch = if branch_name.is_empty() {
@@ -183,9 +247,25 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
         // Y column: unstaged status (anything except ' ' means unstaged; '?' = untracked = unstaged)
         let is_unstaged = worktree_status != b' ';
 
-        results.push(GitFileStatus { path, status, is_staged, is_unstaged });
+        results.push(GitFileStatus { path, status, is_staged, is_unstaged, additions: 0, deletions: 0 });
     }
     results
+}
+
+fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut map = std::collections::HashMap::new();
+    for line in unstaged.lines().chain(staged.lines()) {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let adds = parts[0].parse::<u32>().unwrap_or(0);
+            let dels = parts[1].parse::<u32>().unwrap_or(0);
+            let path = parts[2].to_string();
+            let entry = map.entry(path).or_insert((0, 0));
+            entry.0 += adds;
+            entry.1 += dels;
+        }
+    }
+    map
 }
 
 fn parse_numstat(output: &str) -> (u32, u32) {

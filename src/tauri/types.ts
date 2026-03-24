@@ -236,6 +236,8 @@ export interface GitFileStatus {
   status: FileStatus;
   is_staged: boolean;
   is_unstaged: boolean;
+  additions: number;
+  deletions: number;
 }
 
 export interface GitDiffStat {
@@ -249,6 +251,14 @@ export interface GitBranchInfo {
   branch: string | null;
   ahead: number;
   behind: number;
+}
+
+export interface GitLogEntry {
+  hash: string;
+  short_hash: string;
+  message: string;
+  author: string;
+  time_ago: string;
 }
 
 export interface EditorInfo {

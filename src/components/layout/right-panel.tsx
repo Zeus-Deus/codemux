@@ -4,6 +4,7 @@ import { X } from "lucide-react";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
 import { ChangesPanel } from "@/components/workspace/changes-panel";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
+import { PrPanel } from "@/components/workspace/pr-panel";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -67,8 +68,8 @@ export function RightPanel({ workspace, activeTab }: Props) {
         <TabsContent value="files" className="flex-1 overflow-hidden">
           <FileTreePanel workspace={workspace} />
         </TabsContent>
-        <TabsContent value="pr" className="flex-1 overflow-auto p-3">
-          <p className="text-xs text-muted-foreground">PR panel — coming soon</p>
+        <TabsContent value="pr" className="flex-1 overflow-hidden">
+          <PrPanel workspace={workspace} />
         </TabsContent>
       </Tabs>
     </div>

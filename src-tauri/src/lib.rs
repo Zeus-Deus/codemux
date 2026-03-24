@@ -90,6 +90,18 @@ pub fn run() {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
+
+                // Ensure a workspace exists for the current project root.
+                // Persisted state may only contain stale worktree workspaces
+                // that point to directories unrelated to the current project.
+                let project_root = crate::project::current_project_root();
+                let project_root_str = project_root.display().to_string();
+                let has_project_workspace = state.snapshot().workspaces.iter().any(|w| w.cwd == project_root_str);
+                if !has_project_workspace {
+                    eprintln!("[startup] No workspace for current project root ({}), creating one", project_root_str);
+                    let ws_id = state.create_workspace_at_path(project_root.clone());
+                    state.activate_workspace(&ws_id.0);
+                }
             }
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
@@ -251,6 +263,9 @@ pub fn run() {
             commands::activate_tab,
             commands::rename_tab,
             commands::reorder_tabs,
+            commands::git_pull_changes,
+            commands::git_discard_file,
+            commands::git_log_entries,
             commands::refresh_workspace_git_info,
             commands::create_browser_pane,
             commands::browser_open_url,
