@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { startBrowserStream } from "@/tauri/commands";
+import { startBrowserStream, agentBrowserRun } from "@/tauri/commands";
 import { BrowserToolbar } from "./BrowserToolbar";
 import { Loader2, Globe } from "lucide-react";
 
@@ -29,15 +29,9 @@ function mapCoordinates(
   viewport: ViewportInfo,
 ): { x: number; y: number } {
   const rect = canvas.getBoundingClientRect();
-  // Account for aspect-ratio letterboxing
-  const scale = Math.min(rect.width / viewport.width, rect.height / viewport.height);
-  const dw = viewport.width * scale;
-  const dh = viewport.height * scale;
-  const dx = (rect.width - dw) / 2;
-  const dy = (rect.height - dh) / 2;
-  const x = ((e.clientX - rect.left - dx) / dw) * viewport.width;
-  const y = ((e.clientY - rect.top - dy) / dh) * viewport.height;
-  return { x: Math.max(0, Math.min(Math.round(x), viewport.width)), y: Math.max(0, Math.min(Math.round(y), viewport.height)) };
+  const x = ((e.clientX - rect.left) / rect.width) * viewport.width;
+  const y = ((e.clientY - rect.top) / rect.height) * viewport.height;
+  return { x: Math.max(0, Math.round(x)), y: Math.max(0, Math.round(y)) };
 }
 
 export function BrowserPane({ browserId, focused, visible }: Props) {
@@ -127,15 +121,8 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               }
               const img = imgRef.current;
               img.onload = () => {
-                // Draw frame preserving aspect ratio (letterbox if needed)
-                const scale = Math.min(canvas.width / img.width, canvas.height / img.height);
-                const dw = img.width * scale;
-                const dh = img.height * scale;
-                const dx = (canvas.width - dw) / 2;
-                const dy = (canvas.height - dh) / 2;
-                ctx.fillStyle = "#09090b"; // background color for letterbox bars
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                ctx.drawImage(img, dx, dy, dw, dh);
+                // Draw frame scaled to fill canvas — viewport should match pane size
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
               };
               img.src = `data:image/jpeg;base64,${msg.data}`;
 
@@ -288,23 +275,34 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     });
   };
 
-  // ResizeObserver: update canvas dimensions when pane resizes
+  // ResizeObserver: update canvas + browser viewport when pane resizes
   useEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const observer = new ResizeObserver(() => {
       const rect = container.getBoundingClientRect();
       const cw = Math.round(rect.width);
       const ch = Math.round(rect.height);
+      if (cw < 10 || ch < 10) return;
       if (canvas.width !== cw || canvas.height !== ch) {
         canvas.width = cw;
         canvas.height = ch;
       }
+      // Debounced viewport resize — tell browser to match pane size
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        viewportRef.current = { width: cw, height: ch };
+        agentBrowserRun(browserId, "viewport", { width: cw, height: ch }).catch(() => {});
+      }, 300);
     });
     observer.observe(container);
-    return () => observer.disconnect();
-  }, []);
+    return () => {
+      observer.disconnect();
+      if (resizeTimer) clearTimeout(resizeTimer);
+    };
+  }, [browserId]);
 
   useEffect(() => {
     if (focused && canvasRef.current) {

@@ -87,6 +87,11 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
         "back" => format!("npx agent-browser back --session {}", session),
         "forward" => format!("npx agent-browser forward --session {}", session),
         "reload" => format!("npx agent-browser reload --session {}", session),
+        "viewport" => {
+            let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
+            let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
+            format!("npx agent-browser viewport {} {} --session {}", w, h, session)
+        }
         _ => return Err(format!("Unknown action: {}", action)),
     };
 
