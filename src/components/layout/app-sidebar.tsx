@@ -12,9 +12,9 @@ export function AppSidebar() {
       <SidebarHeader />
       <SidebarContent>
         <SidebarWorkspaceList />
-        <SidebarOpenflowSection />
-        <SidebarAlertsSection />
       </SidebarContent>
+      <SidebarOpenflowSection />
+      <SidebarAlertsSection />
       <SidebarPortsSection />
       <SidebarFooter />
       <SidebarRail />
