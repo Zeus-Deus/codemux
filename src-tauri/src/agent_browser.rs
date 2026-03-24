@@ -243,6 +243,12 @@ impl AgentBrowserManager {
             return Ok(format!("ws://localhost:{}", port));
         }
 
+        // Kill any stale daemon on this port to avoid EADDRINUSE
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
         // Start daemon + open a page in one Node.js script.
         // The daemon's startDaemon() runs forever (blocks), so we call it without await.
         // After 3s, we connect to the daemon's Unix socket and send a "navigate" command
@@ -259,9 +265,9 @@ impl AgentBrowserManager {
              sock.on('data', () => {{}});",
             session, port
         );
-        eprintln!("[codemux::browser] Starting daemon+browser on port {}", port);
+        eprintln!("[codemux::browser] Starting daemon+browser on port {} session={}", port, session);
         let daemon_cmd = format!(
-            "node --input-type=module -e {} >>/tmp/codemux-browser-daemon.log 2>&1",
+            "node --input-type=module -e {} >/tmp/codemux-browser-daemon.log 2>&1",
             shell_quote(&script)
         );
         std::process::Command::new("sh")

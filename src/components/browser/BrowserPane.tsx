@@ -74,81 +74,90 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       }
 
       if (!active) return;
-      setStatus("connecting");
 
-      ws = new WebSocket(streamUrl);
-      wsRef.current = ws;
+      // Auto-reconnecting WebSocket — retries until screencast is live.
+      // The stream server fails with "Browser not launched" if we connect
+      // before the daemon finishes launching chromium. Retry handles this.
+      let retries = 0;
+      const maxRetries = 15;
 
-      ws.onopen = () => {
+      function connectWS() {
         if (!active) return;
-        setStatus("waiting");
-      };
+        setStatus(retries === 0 ? "connecting" : "waiting");
 
-      ws.onmessage = (event) => {
-        // Always process frames — don't skip even if StrictMode cleanup ran.
-        // The WebSocket ref is shared, so the latest effect's handlers work.
-        try {
-          const msg = JSON.parse(event.data);
+        ws = new WebSocket(streamUrl);
+        wsRef.current = ws;
 
-          if (msg.type === "frame") {
-            if (statusRef.current !== "live") setStatus("live");
-            const canvas = canvasRef.current;
-            if (!canvas) return;
-            const ctx = canvas.getContext("2d");
-            if (!ctx) return;
+        ws.onopen = () => {
+          if (!active) return;
+          setStatus("waiting");
+        };
 
-            if (!imgRef.current) {
-              imgRef.current = new Image();
-            }
-            const img = imgRef.current;
-            img.onload = () => {
-              if (canvas.width !== img.width || canvas.height !== img.height) {
-                canvas.width = img.width;
-                canvas.height = img.height;
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+
+            if (msg.type === "frame") {
+              if (statusRef.current !== "live") setStatus("live");
+              retries = 0; // Reset retries on success
+              const canvas = canvasRef.current;
+              if (!canvas) return;
+              const ctx = canvas.getContext("2d");
+              if (!ctx) return;
+
+              if (!imgRef.current) {
+                imgRef.current = new Image();
               }
-              ctx.drawImage(img, 0, 0);
-            };
-            img.src = `data:image/jpeg;base64,${msg.data}`;
+              const img = imgRef.current;
+              img.onload = () => {
+                if (canvas.width !== img.width || canvas.height !== img.height) {
+                  canvas.width = img.width;
+                  canvas.height = img.height;
+                }
+                ctx.drawImage(img, 0, 0);
+              };
+              img.src = `data:image/jpeg;base64,${msg.data}`;
 
-            if (msg.metadata) {
-              viewportRef.current = {
-                width: msg.metadata.deviceWidth || 1280,
-                height: msg.metadata.deviceHeight || 720,
-              };
+              if (msg.metadata) {
+                viewportRef.current = {
+                  width: msg.metadata.deviceWidth || 1280,
+                  height: msg.metadata.deviceHeight || 720,
+                };
+              }
+            } else if (msg.type === "status") {
+              if (msg.viewportWidth && msg.viewportHeight) {
+                viewportRef.current = {
+                  width: msg.viewportWidth,
+                  height: msg.viewportHeight,
+                };
+              }
+            } else if (msg.type === "error") {
+              // "Browser not launched" = daemon still starting, will auto-retry via onclose
+              if (statusRef.current !== "live") {
+                ws?.close();
+              }
             }
-          } else if (msg.type === "status") {
-            if (msg.viewportWidth && msg.viewportHeight) {
-              viewportRef.current = {
-                width: msg.viewportWidth,
-                height: msg.viewportHeight,
-              };
-            }
-          } else if (msg.type === "error") {
-            // Don't show transient errors if we're already getting frames
-            if (statusRef.current !== "live") {
-              setErrorMsg(msg.message);
-            }
+          } catch {
+            // Ignore parse errors
           }
-        } catch {
-          // Ignore parse errors
-        }
-      };
+        };
 
-      ws.onerror = () => {
-        if (!active) return;
-        if (statusRef.current !== "live") {
-          setStatus("error");
-          setErrorMsg("WebSocket connection failed");
-        }
-      };
+        ws.onerror = () => {};
 
-      ws.onclose = () => {
-        if (!active) return;
-        if (statusRef.current !== "live") {
-          setStatus("error");
-          setErrorMsg("Stream disconnected");
-        }
-      };
+        ws.onclose = () => {
+          if (!active) return;
+          // Auto-reconnect if we haven't received frames yet
+          if (statusRef.current !== "live" && retries < maxRetries) {
+            retries++;
+            setTimeout(connectWS, 1500);
+          } else if (statusRef.current !== "live") {
+            setStatus("error");
+            setErrorMsg("Failed to connect to browser stream");
+          }
+        };
+      }
+
+      connectWS();
     })();
 
     return () => {
