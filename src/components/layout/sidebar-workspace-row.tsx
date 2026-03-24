@@ -17,7 +17,7 @@ import {
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
 import { Badge } from "@/components/ui/badge";
-import { X, TerminalSquare, Workflow } from "lucide-react";
+import { X, TerminalSquare, Workflow, ArrowUp, ArrowDown } from "lucide-react";
 import {
   activateWorkspace,
   closeWorkspace,
@@ -52,6 +52,16 @@ function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
       {workspace.git_branch && (
         <div className="flex items-center gap-1 text-[10px] text-muted-foreground leading-tight">
           <span className="truncate">{workspace.git_branch}</span>
+          {(workspace.git_ahead > 0 || workspace.git_behind > 0) && (
+            <span className="flex items-center gap-0.5 shrink-0 text-[9px] tabular-nums text-muted-foreground/70">
+              {workspace.git_ahead > 0 && (
+                <span className="flex items-center"><ArrowUp className="h-2 w-2" />{workspace.git_ahead}</span>
+              )}
+              {workspace.git_behind > 0 && (
+                <span className="flex items-center"><ArrowDown className="h-2 w-2" />{workspace.git_behind}</span>
+              )}
+            </span>
+          )}
           {workspace.pr_number && (
             <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
               #{workspace.pr_number}

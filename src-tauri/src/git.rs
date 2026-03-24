@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -48,6 +49,7 @@ pub struct GitLogEntry {
     pub message: String,
     pub author: String,
     pub time_ago: String,
+    pub is_pushed: bool,
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
@@ -184,18 +186,31 @@ pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, Strin
         repo_path,
         &["log", "--format=%H%n%h%n%s%n%an%n%ar", "-n", &count_str],
     )?;
+
+    // Get unpushed commit hashes (empty if no upstream)
+    let unpushed_output = run_git_permissive(repo_path, &["rev-list", "@{upstream}..HEAD"]);
+    let unpushed: HashSet<&str> = unpushed_output.lines().collect();
+    let has_upstream = !run_git_permissive(
+        repo_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    )
+    .is_empty();
+
     let lines: Vec<&str> = output.lines().collect();
     let mut entries = Vec::new();
     for chunk in lines.chunks(5) {
         if chunk.len() < 5 {
             break;
         }
+        let hash = chunk[0].to_string();
+        let is_pushed = has_upstream && !unpushed.contains(hash.as_str());
         entries.push(GitLogEntry {
-            hash: chunk[0].to_string(),
+            hash,
             short_hash: chunk[1].to_string(),
             message: chunk[2].to_string(),
             author: chunk[3].to_string(),
             time_ago: chunk[4].to_string(),
+            is_pushed,
         });
     }
     Ok(entries)
@@ -771,5 +786,278 @@ C  source.txt -> copy.txt";
         assert_eq!(results[4].path, "staged-added.rs");
         assert!(results[4].is_staged, "'A ' should be staged");
         assert!(!results[4].is_unstaged, "'A ' should NOT be unstaged");
+    }
+
+    // ---- Additional integration tests ----
+
+    /// Helper: creates a bare "remote" repo and a cloned "local" with an initial commit pushed.
+    fn setup_test_repo_with_remote() -> (TempDir, PathBuf, PathBuf) {
+        let dir = TempDir::new().expect("create temp dir");
+        let remote = dir.path().join("remote.git");
+        let local = dir.path().join("local");
+
+        // Create bare remote
+        run_git(dir.path(), &["init", "--bare", remote.to_str().unwrap()]).expect("init bare");
+
+        // Clone it
+        run_git(dir.path(), &["clone", remote.to_str().unwrap(), local.to_str().unwrap()])
+            .expect("clone");
+
+        // Initial commit + push in local
+        std::fs::write(local.join("init.txt"), "initial").expect("write init file");
+        run_git(&local, &["add", "init.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "initial"],
+        )
+        .expect("initial commit");
+        run_git(&local, &["push"]).expect("initial push");
+
+        (dir, local, remote)
+    }
+
+    #[test]
+    fn test_git_unstage() {
+        let (_dir, repo) = setup_test_repo();
+        std::fs::write(repo.join("unstage-me.txt"), "content").expect("write");
+        git_stage(&repo, &["unstage-me.txt".to_string()]).expect("stage");
+
+        // Verify it's staged
+        let status = git_status(&repo).expect("status");
+        let f = status.iter().find(|s| s.path == "unstage-me.txt").expect("file in status");
+        assert!(f.is_staged, "should be staged before unstage");
+
+        // Unstage it
+        git_unstage(&repo, &["unstage-me.txt".to_string()]).expect("unstage");
+
+        // Verify it's no longer staged (still untracked)
+        let status = git_status(&repo).expect("status after unstage");
+        let f = status.iter().find(|s| s.path == "unstage-me.txt").expect("file still in status");
+        assert!(!f.is_staged, "should not be staged after unstage");
+        assert!(f.is_unstaged, "should be unstaged");
+    }
+
+    #[test]
+    fn test_git_discard_tracked_file() {
+        let (_dir, repo) = setup_test_repo();
+        // Create and commit a file
+        std::fs::write(repo.join("tracked.txt"), "original content").expect("write");
+        run_git(&repo, &["add", "tracked.txt"]).expect("add");
+        run_git(
+            &repo,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "add tracked"],
+        )
+        .expect("commit");
+
+        // Modify the file
+        std::fs::write(repo.join("tracked.txt"), "modified content").expect("modify");
+        let content = std::fs::read_to_string(repo.join("tracked.txt")).expect("read");
+        assert_eq!(content, "modified content");
+
+        // Discard changes
+        git_discard_file(&repo, "tracked.txt").expect("discard");
+
+        // Verify content restored
+        let content = std::fs::read_to_string(repo.join("tracked.txt")).expect("read after discard");
+        assert_eq!(content, "original content");
+    }
+
+    #[test]
+    fn test_git_discard_untracked_file() {
+        let (_dir, repo) = setup_test_repo();
+        let file_path = repo.join("untracked.txt");
+        std::fs::write(&file_path, "should be deleted").expect("write");
+        assert!(file_path.exists(), "file should exist before discard");
+
+        git_discard_file(&repo, "untracked.txt").expect("discard untracked");
+        assert!(!file_path.exists(), "untracked file should be deleted after discard");
+    }
+
+    #[test]
+    fn test_git_log_entries() {
+        let (_dir, repo) = setup_test_repo();
+        // Make 3 more commits (setup_test_repo already has "initial")
+        for i in 1..=3 {
+            std::fs::write(repo.join(format!("file{i}.txt")), format!("content {i}")).expect("write");
+            run_git(&repo, &["add", "."]).expect("add");
+            run_git(
+                &repo,
+                &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", &format!("commit {i}")],
+            )
+            .expect("commit");
+        }
+
+        let entries = git_log(&repo, 10).expect("git log");
+        assert_eq!(entries.len(), 4, "should have 4 entries (initial + 3)");
+
+        // Most recent first
+        assert_eq!(entries[0].message, "commit 3");
+        assert_eq!(entries[1].message, "commit 2");
+        assert_eq!(entries[2].message, "commit 1");
+        assert_eq!(entries[3].message, "initial");
+
+        // Hashes should be non-empty
+        assert!(!entries[0].hash.is_empty());
+        assert!(!entries[0].short_hash.is_empty());
+        assert_eq!(entries[0].author, "Test");
+    }
+
+    #[test]
+    fn test_git_push() {
+        let (_dir, local, remote) = setup_test_repo_with_remote();
+
+        // Make a new commit locally
+        std::fs::write(local.join("pushed.txt"), "push me").expect("write");
+        run_git(&local, &["add", "pushed.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "push test"],
+        )
+        .expect("commit");
+
+        // Push using our function
+        git_push(&local, false).expect("push");
+
+        // Verify by cloning the remote again and checking the log
+        let verify = _dir.path().join("verify");
+        run_git(_dir.path(), &["clone", remote.to_str().unwrap(), verify.to_str().unwrap()])
+            .expect("clone for verify");
+        let log = run_git(&verify, &["log", "--oneline"]).expect("log");
+        assert!(log.contains("push test"), "remote should have the pushed commit");
+    }
+
+    #[test]
+    fn test_git_push_set_upstream() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Create a new local branch with no upstream
+        run_git(&local, &["checkout", "-b", "new-feature"]).expect("create branch");
+        std::fs::write(local.join("feature.txt"), "new feature").expect("write");
+        run_git(&local, &["add", "feature.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "feature commit"],
+        )
+        .expect("commit");
+
+        // Branch should have no upstream
+        let info = git_branch_info(&local).expect("branch info before push");
+        assert!(!info.has_upstream, "new branch should have no upstream");
+
+        // Push with set_upstream
+        git_push(&local, true).expect("push with set upstream");
+
+        // Branch should now have upstream
+        let info = git_branch_info(&local).expect("branch info after push");
+        assert!(info.has_upstream, "branch should have upstream after publish");
+
+        // Verify remote has the branch
+        let remote_branches = run_git(&local, &["ls-remote", "--heads", "origin"]).expect("ls-remote");
+        assert!(remote_branches.contains("new-feature"), "remote should have the branch");
+    }
+
+    #[test]
+    fn test_git_pull() {
+        let (_dir, local, remote) = setup_test_repo_with_remote();
+
+        // Create a second clone that pushes a new commit
+        let clone2 = _dir.path().join("clone2");
+        run_git(_dir.path(), &["clone", remote.to_str().unwrap(), clone2.to_str().unwrap()])
+            .expect("clone2");
+        std::fs::write(clone2.join("from-clone2.txt"), "clone2 content").expect("write in clone2");
+        run_git(&clone2, &["add", "from-clone2.txt"]).expect("add in clone2");
+        run_git(
+            &clone2,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "clone2 commit"],
+        )
+        .expect("commit in clone2");
+        run_git(&clone2, &["push"]).expect("push from clone2");
+
+        // Pull in original local
+        git_pull(&local).expect("pull");
+
+        // Verify local has the new file
+        assert!(
+            local.join("from-clone2.txt").exists(),
+            "pulled file should exist in local"
+        );
+        let log = run_git(&local, &["log", "--oneline"]).expect("log");
+        assert!(log.contains("clone2 commit"), "local should have the pulled commit");
+    }
+
+    #[test]
+    fn test_git_branch_info_with_upstream() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Make a local commit (don't push)
+        std::fs::write(local.join("ahead.txt"), "unpushed").expect("write");
+        run_git(&local, &["add", "ahead.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "unpushed"],
+        )
+        .expect("commit");
+
+        let info = git_branch_info(&local).expect("branch info");
+        assert!(info.has_upstream, "cloned repo should have upstream");
+        assert_eq!(info.ahead, 1, "should be 1 commit ahead");
+        assert_eq!(info.behind, 0, "should not be behind");
+        assert!(info.branch.is_some(), "should have a branch name");
+    }
+
+    #[test]
+    fn test_git_branch_info_no_upstream() {
+        let (_dir, repo) = setup_test_repo();
+
+        let info = git_branch_info(&repo).expect("branch info");
+        assert!(!info.has_upstream, "local-only repo should have no upstream");
+        assert_eq!(info.ahead, 0);
+        assert_eq!(info.behind, 0);
+        assert!(info.branch.is_some(), "should have a branch name");
+    }
+
+    #[test]
+    fn test_git_operations_in_worktree() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path_str = git_create_worktree(&repo, "wt-ops-test", true, None).expect("create worktree");
+        let wt_path = PathBuf::from(&wt_path_str);
+
+        // Write a file in the worktree
+        std::fs::write(wt_path.join("wt-file.txt"), "worktree content").expect("write in worktree");
+
+        // Status should show the new file
+        let status = git_status(&wt_path).expect("status in worktree");
+        assert!(
+            status.iter().any(|s| s.path == "wt-file.txt" && s.is_unstaged),
+            "worktree should show untracked file"
+        );
+
+        // Stage it
+        git_stage(&wt_path, &["wt-file.txt".to_string()]).expect("stage in worktree");
+        let status = git_status(&wt_path).expect("status after stage");
+        assert!(
+            status.iter().any(|s| s.path == "wt-file.txt" && s.is_staged),
+            "file should be staged in worktree"
+        );
+
+        // Commit it
+        run_git(&wt_path, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "wt commit"])
+            .expect("commit in worktree");
+        let status = git_status(&wt_path).expect("status after commit");
+        assert!(status.is_empty(), "worktree should be clean after commit");
+
+        // Log should show the commit
+        let log = git_log(&wt_path, 5).expect("log in worktree");
+        assert!(
+            log.iter().any(|e| e.message == "wt commit"),
+            "worktree log should include our commit"
+        );
+
+        // Branch info should work
+        let info = git_branch_info(&wt_path).expect("branch info in worktree");
+        assert_eq!(info.branch.as_deref(), Some("wt-ops-test"));
+
+        // Cleanup
+        git_remove_worktree(Path::new(&wt_path_str), Some("wt-ops-test")).expect("cleanup worktree");
     }
 }

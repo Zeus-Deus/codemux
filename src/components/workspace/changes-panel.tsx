@@ -580,32 +580,22 @@ export function ChangesPanel({ workspace }: Props) {
                 : <GitCommit className="h-3 w-3 mr-1" />}
               Commit
             </Button>
-            {branchInfo && branchInfo.branch && !branchInfo.has_upstream && (
+            {branchInfo && branchInfo.branch && (
               <Button
                 size="xs"
                 variant="secondary"
-                className="text-xs h-6"
-                disabled={busy}
+                className={`text-xs h-6${branchInfo.has_upstream && branchInfo.ahead === 0 ? " opacity-50" : ""}`}
+                disabled={busy || (branchInfo.has_upstream && branchInfo.ahead === 0)}
                 onClick={handlePush}
               >
                 {busyAction === "push"
                   ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
                   : <ArrowUp className="h-3 w-3 mr-1" />}
-                Publish
-              </Button>
-            )}
-            {branchInfo && branchInfo.has_upstream && branchInfo.ahead > 0 && (
-              <Button
-                size="xs"
-                variant="secondary"
-                className="text-xs h-6"
-                disabled={busy}
-                onClick={handlePush}
-              >
-                {busyAction === "push"
-                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                  : <ArrowUp className="h-3 w-3 mr-1" />}
-                Push {branchInfo.ahead}
+                {!branchInfo.has_upstream
+                  ? "Publish"
+                  : branchInfo.ahead > 0
+                    ? `Push ${branchInfo.ahead}`
+                    : "Push"}
               </Button>
             )}
             {branchInfo && branchInfo.has_upstream && branchInfo.behind > 0 && (
@@ -702,26 +692,40 @@ export function ChangesPanel({ workspace }: Props) {
                   </span>
                 </button>
                 {commitsExpanded &&
-                  commits.map((commit) => (
-                    <Tooltip key={commit.hash}>
-                      <TooltipTrigger asChild>
-                        <div className="flex items-start gap-1.5 rounded-sm px-1.5 py-1 hover:bg-accent/50 transition-colors">
-                          <span className="shrink-0 text-[10px] font-mono text-primary">
-                            {commit.short_hash}
-                          </span>
-                          <div className="flex-1 min-w-0">
-                            <p className="truncate text-xs text-foreground">{commit.message}</p>
-                            <p className="text-[10px] text-muted-foreground">
-                              {commit.author} · {commit.time_ago}
-                            </p>
+                  commits.map((commit, idx) => {
+                    const prevCommit = idx > 0 ? commits[idx - 1] : null;
+                    const showSeparator = prevCommit && !prevCommit.is_pushed && commit.is_pushed;
+                    return (
+                      <div key={commit.hash}>
+                        {showSeparator && (
+                          <div className="text-[9px] text-muted-foreground/50 text-center py-0.5">
+                            — pushed —
                           </div>
-                        </div>
-                      </TooltipTrigger>
-                      <TooltipContent side="left" className="text-xs max-w-64">
-                        {commit.message}
-                      </TooltipContent>
-                    </Tooltip>
-                  ))}
+                        )}
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div className="flex items-start gap-1.5 rounded-sm px-1.5 py-1 hover:bg-accent/50 transition-colors">
+                              {!commit.is_pushed && (
+                                <ArrowUp className="h-2.5 w-2.5 shrink-0 text-warning mt-0.5" />
+                              )}
+                              <span className="shrink-0 text-[10px] font-mono text-primary">
+                                {commit.short_hash}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <p className="truncate text-xs text-foreground">{commit.message}</p>
+                                <p className="text-[10px] text-muted-foreground">
+                                  {commit.author} · {commit.time_ago}
+                                </p>
+                              </div>
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent side="left" className="text-xs max-w-64">
+                            {commit.message}
+                          </TooltipContent>
+                        </Tooltip>
+                      </div>
+                    );
+                  })}
               </div>
             )}
           </div>

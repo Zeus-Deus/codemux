@@ -258,6 +258,7 @@ export interface GitLogEntry {
   hash: string;
   short_hash: string;
   message: string;
+  is_pushed: boolean;
   author: string;
   time_ago: string;
 }
