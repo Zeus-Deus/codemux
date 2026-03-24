@@ -1,5 +1,6 @@
 use tauri::Manager;
 
+pub mod ai;
 pub mod agent_browser;
 pub mod browser;
 pub mod cli;
@@ -258,6 +259,8 @@ pub fn run() {
             commands::notify_attention,
             commands::mark_workspace_notifications_read,
             commands::set_notification_sound_enabled,
+            commands::set_ai_commit_message_enabled,
+            commands::set_ai_commit_message_model,
             commands::create_tab,
             commands::close_tab,
             commands::activate_tab,
@@ -335,6 +338,8 @@ pub fn run() {
             commands::create_worktree,
             commands::remove_worktree,
             commands::list_worktrees,
+            commands::check_claude_available,
+            commands::generate_ai_commit_message,
             commands::check_gh_available,
             commands::check_gh_status,
             commands::check_github_repo,

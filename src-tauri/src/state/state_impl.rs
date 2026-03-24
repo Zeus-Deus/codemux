@@ -281,6 +281,14 @@ pub struct CodemuxConfigSnapshot {
     pub theme_source: String,
     pub linux_first: bool,
     pub notification_sound_enabled: bool,
+    #[serde(default = "default_true")]
+    pub ai_commit_message_enabled: bool,
+    #[serde(default)]
+    pub ai_commit_message_model: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -345,6 +353,14 @@ impl AppStateStore {
 
     pub fn set_notification_sound_enabled(&self, enabled: bool) {
         self.inner.lock().unwrap().config.notification_sound_enabled = enabled;
+    }
+
+    pub fn set_ai_commit_message_enabled(&self, enabled: bool) {
+        self.inner.lock().unwrap().config.ai_commit_message_enabled = enabled;
+    }
+
+    pub fn set_ai_commit_message_model(&self, model: Option<String>) {
+        self.inner.lock().unwrap().config.ai_commit_message_model = model;
     }
 
     pub fn active_terminal_session_id(&self) -> Option<SessionId> {
@@ -2104,6 +2120,8 @@ fn default_app_state() -> AppStateSnapshot {
             theme_source: "omarchy_or_default".into(),
             linux_first: true,
             notification_sound_enabled: true,
+            ai_commit_message_enabled: true,
+            ai_commit_message_model: None,
         },
     }
 }

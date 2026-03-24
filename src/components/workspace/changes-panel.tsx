@@ -21,6 +21,7 @@ import {
   Folder,
   ChevronRight,
   File,
+  Sparkles,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -35,8 +36,11 @@ import {
   gitLogEntries,
   createTab,
   activateTab,
+  checkClaudeAvailable,
+  generateAiCommitMessage,
 } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
+import { useAppStore } from "@/stores/app-store";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
@@ -422,7 +426,12 @@ export function ChangesPanel({ workspace }: Props) {
   const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const config = useAppStore((s) => s.appState?.config);
+  const aiEnabled = config?.ai_commit_message_enabled ?? true;
 
   const refresh = useCallback(() => {
     if (!cwd) return;
@@ -453,10 +462,31 @@ export function ChangesPanel({ workspace }: Props) {
     }
   }, [gitError]);
 
+  useEffect(() => {
+    if (aiEnabled) {
+      checkClaudeAvailable().then(setClaudeReady).catch(() => setClaudeReady(false));
+    }
+  }, [aiEnabled]);
+
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
 
   const busy = busyAction !== null;
+
+  const handleGenerateCommitMsg = async () => {
+    if (isGenerating || staged.length === 0) return;
+    setIsGenerating(true);
+    setGitError(null);
+    try {
+      const model = config?.ai_commit_message_model ?? null;
+      const msg = await generateAiCommitMessage(cwd, model);
+      setCommitMsg(msg);
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setIsGenerating(false);
+    }
+  };
 
   const handleCommit = async () => {
     if (!commitMsg.trim() || staged.length === 0 || busy) return;
@@ -561,13 +591,39 @@ export function ChangesPanel({ workspace }: Props) {
       <div className="flex h-full flex-col">
         {/* Commit bar — pinned at top */}
         <div className="p-1.5 space-y-1 border-b border-border">
-          <Input
-            placeholder="Commit message"
-            value={commitMsg}
-            onChange={(e) => setCommitMsg(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleCommit()}
-            className="h-7 text-xs"
-          />
+          <div className="flex gap-1 items-center">
+            <Input
+              placeholder="Commit message"
+              value={commitMsg}
+              onChange={(e) => setCommitMsg(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleCommit()}
+              className="h-7 text-xs flex-1"
+            />
+            {aiEnabled && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0"
+                    disabled={staged.length === 0 || isGenerating || claudeReady === false}
+                    onClick={handleGenerateCommitMsg}
+                  >
+                    {isGenerating
+                      ? <Loader2 className="h-3 w-3 animate-spin" />
+                      : <Sparkles className="h-3 w-3" />}
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="text-xs">
+                  {claudeReady === false
+                    ? "Claude CLI not found"
+                    : staged.length === 0
+                      ? "Stage files first"
+                      : "Generate commit message"}
+                </TooltipContent>
+              </Tooltip>
+            )}
+          </div>
           <div className="flex gap-1">
             <Button
               size="xs"

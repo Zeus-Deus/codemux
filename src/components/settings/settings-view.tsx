@@ -24,7 +24,12 @@ import {
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
-import { detectEditors, setNotificationSoundEnabled } from "@/tauri/commands";
+import {
+  detectEditors,
+  setNotificationSoundEnabled,
+  setAiCommitMessageEnabled,
+  setAiCommitMessageModel,
+} from "@/tauri/commands";
 import type { EditorInfo } from "@/tauri/types";
 
 type Section = "appearance" | "editor" | "terminal" | "git" | "shortcuts" | "notifications";
@@ -248,6 +253,34 @@ export function SettingsView() {
                   className="w-36 h-9"
                 />
               </SettingRow>
+            </div>
+
+            <div className="mt-8">
+              <h3 className="text-sm font-medium mb-1">AI Tools</h3>
+              <p className="text-xs text-muted-foreground mb-4">
+                AI-assisted git workflows. Requires the Claude CLI.
+              </p>
+              <div className="space-y-1">
+                <SettingRow label="AI commit messages" description="Show the generate button next to the commit input.">
+                  <Switch
+                    checked={config?.ai_commit_message_enabled ?? true}
+                    onCheckedChange={(checked) =>
+                      setAiCommitMessageEnabled(checked).catch(console.error)
+                    }
+                  />
+                </SettingRow>
+                <SettingRow label="Model override" description="Leave empty to use the Claude CLI default.">
+                  <Input
+                    value={config?.ai_commit_message_model ?? ""}
+                    onChange={(e) =>
+                      setAiCommitMessageModel(e.target.value || null).catch(console.error)
+                    }
+                    placeholder="Default"
+                    className="w-36 h-9"
+                    disabled={!(config?.ai_commit_message_enabled ?? true)}
+                  />
+                </SettingRow>
+              </div>
             </div>
           </div>
         );

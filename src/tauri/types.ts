@@ -375,6 +375,8 @@ export interface CodemuxConfigSnapshot {
   theme_source: string;
   linux_first: boolean;
   notification_sound_enabled: boolean;
+  ai_commit_message_enabled: boolean;
+  ai_commit_message_model: string | null;
 }
 
 export interface PortInfoSnapshot {

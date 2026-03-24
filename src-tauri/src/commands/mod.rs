@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod browser;
 pub mod files;
 pub mod git;
@@ -6,6 +7,7 @@ pub mod openflow;
 pub mod presets;
 pub mod workspace;
 
+pub use ai::*;
 pub use browser::*;
 pub use files::*;
 pub use git::*;

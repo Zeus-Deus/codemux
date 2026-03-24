@@ -585,6 +585,28 @@ pub fn set_notification_sound_enabled(
 }
 
 #[tauri::command]
+pub fn set_ai_commit_message_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.set_ai_commit_message_enabled(enabled);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_ai_commit_message_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    model: Option<String>,
+) -> Result<(), String> {
+    state.set_ai_commit_message_model(model);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn create_tab(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
