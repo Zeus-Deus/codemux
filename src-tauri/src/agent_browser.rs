@@ -234,8 +234,9 @@ impl AgentBrowserManager {
         format!("ws://localhost:{}", self.stream_port)
     }
 
-    pub async fn start_stream(&self, _browser_id: &str) -> Result<String, String> {
+    pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
+        let session = session_name(browser_id);
 
         let mut running = self.running.lock().await;
         if *running {
@@ -249,13 +250,14 @@ impl AgentBrowserManager {
         // a separate process that doesn't talk to the daemon.
         let script = format!(
             "const m = await import('agent-browser'); \
+             m.setSession('{}'); \
              m.startDaemon({{ streamPort: {} }}); \
              await new Promise(r => setTimeout(r, 3000)); \
              const net = await import('node:net'); \
              const sock = net.createConnection(m.getSocketPath()); \
              sock.write(JSON.stringify({{id:'init',action:'navigate',url:'about:blank'}}) + '\\n'); \
              sock.on('data', () => {{}});",
-            port
+            session, port
         );
         eprintln!("[codemux::browser] Starting daemon+browser on port {}", port);
         let daemon_cmd = format!(
