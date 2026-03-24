@@ -432,8 +432,8 @@ export const applyOpenflowReviewResult = (
 ) =>
   invoke<OpenFlowRunRecord>("apply_openflow_review_result", { runId, approved, feedback });
 
-export const stopOpenflowRun = (runId: string, reason: string) =>
-  invoke<OpenFlowRunRecord>("stop_openflow_run", { runId, reason });
+export const stopOpenflowRun = (runId: string, reason: string, status: string = "cancelled") =>
+  invoke<OpenFlowRunRecord>("stop_openflow_run", { runId, status, reason });
 
 export const listAvailableCliTools = () =>
   invoke<CliToolInfo[]>("list_available_cli_tools");
@@ -445,11 +445,13 @@ export const listThinkingModesForTool = (toolId: string) =>
   invoke<ThinkingModeInfo[]>("list_thinking_modes_for_tool", { toolId });
 
 export const spawnOpenflowAgents = (
+  workspaceId: string,
   runId: string,
-  configs: AgentConfig[],
-  cwd: string,
+  goal: string,
+  workingDirectory: string,
+  agentConfigs: AgentConfig[],
 ) =>
-  invoke<string[]>("spawn_openflow_agents", { runId, configs, cwd });
+  invoke<string[]>("spawn_openflow_agents", { workspaceId, runId, goal, workingDirectory, agentConfigs });
 
 export const getAgentSessionsForRun = (runId: string) =>
   invoke<AgentSessionState[]>("get_agent_sessions_for_run", { runId });

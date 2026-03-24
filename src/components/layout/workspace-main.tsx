@@ -5,6 +5,7 @@ import { TabBar } from "./tab-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
+import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 
 function RightPanelResizer() {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
@@ -53,6 +54,18 @@ export function WorkspaceMain() {
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 
   if (!activeWorkspace) return null;
+
+  // OpenFlow workspaces get their own dedicated view
+  if (activeWorkspace.workspace_type === "open_flow") {
+    return (
+      <>
+        <TabBar workspace={activeWorkspace} />
+        <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
+          <OpenFlowWorkspace workspace={activeWorkspace} />
+        </div>
+      </>
+    );
+  }
 
   const showRightPanel = rightPanelTab !== null;
   const activeTab = activeWorkspace.tabs.find(
