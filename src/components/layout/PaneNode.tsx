@@ -259,6 +259,25 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
+        <header
+          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-card px-2 cursor-grab active:cursor-grabbing"
+          onPointerDown={(e) => handleDragStart(e, node.pane_id)}
+        >
+          <span className="flex-1 truncate text-xs text-muted-foreground">
+            {node.title}
+          </span>
+          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover/pane:opacity-100">
+            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
+              <SplitSquareHorizontal className="h-3 w-3" />
+            </Button>
+            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
+              <SplitSquareVertical className="h-3 w-3" />
+            </Button>
+            <Button variant="ghost" size="icon-xs" className="hover:bg-destructive/80" onClick={handleClose} aria-label="Close pane" title="Close pane">
+              <X className="h-3 w-3" />
+            </Button>
+          </div>
+        </header>
         <div className="flex-1 min-h-0 overflow-hidden">
           <BrowserPane browserId={node.browser_id} focused={isActive} visible={visible} />
         </div>

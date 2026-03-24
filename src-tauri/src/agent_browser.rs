@@ -234,15 +234,16 @@ impl AgentBrowserManager {
         format!("ws://localhost:{}", self.stream_port)
     }
 
-    pub async fn start_stream(&self, _browser_id: &str) -> Result<String, String> {
+    pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
+        let session = session_name(browser_id);
 
         let mut running = self.running.lock().await;
         if *running {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Start agent-browser daemon with stream server using ESM dynamic import.
+        // Step 1: Start agent-browser daemon with stream server using ESM dynamic import.
         // The CLI uses a native Rust binary that doesn't support the stream server,
         // so we must start the Node.js daemon directly.
         let script = format!(
@@ -259,6 +260,20 @@ impl AgentBrowserManager {
 
         // Wait for daemon + stream server to be ready
         std::thread::sleep(std::time::Duration::from_millis(4000));
+
+        // Step 2: Open a page via CLI to trigger the daemon's browser auto-launch.
+        // The daemon only launches a browser when it receives a command through its
+        // socket — without this, the stream server has no page to screencast.
+        std::process::Command::new("sh")
+            .args(["-c", &format!("npx agent-browser open about:blank --headless --session {}", session)])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("Failed to open browser page: {}", e))?;
+
+        // Give the browser a moment to launch and start screencast
+        std::thread::sleep(std::time::Duration::from_millis(2000));
         *running = true;
 
         Ok(format!("ws://localhost:{}", port))
