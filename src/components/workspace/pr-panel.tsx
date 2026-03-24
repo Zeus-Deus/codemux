@@ -3,7 +3,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
   Select,
@@ -13,17 +12,9 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
-  ExternalLink,
   GitPullRequest,
-  CheckCircle2,
-  XCircle,
-  Clock,
   AlertCircle,
   RefreshCw,
-  Copy,
-  MessageSquare,
-  ShieldCheck,
-  ShieldAlert,
   ChevronLeft,
 } from "lucide-react";
 import {
@@ -31,9 +22,10 @@ import {
   checkGithubRepo,
   getBranchPullRequest,
   createPullRequest,
-  mergePullRequest,
   getPullRequestChecks,
   getPrReviewComments,
+  getPrInlineComments,
+  getPrDeployments,
   listBranches,
 } from "@/tauri/commands";
 import type {
@@ -42,7 +34,15 @@ import type {
   PullRequestInfo,
   CheckInfo,
   ReviewComment,
+  InlineReviewComment,
+  DeploymentInfo,
 } from "@/tauri/types";
+import { PrHeader } from "./pr/pr-header";
+import { PrChecks } from "./pr/pr-checks";
+import { PrReviews } from "./pr/pr-reviews";
+import { PrReviewActions } from "./pr/pr-review-actions";
+import { PrDeployments } from "./pr/pr-deployments";
+import { PrMergeControls } from "./pr/pr-merge-controls";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -51,21 +51,6 @@ interface Props {
 // ── Module-level caches ──
 let ghStatusCache: GhStatus | null = null;
 const repoCheckCache = new Map<string, boolean>();
-
-// ── Constants ──
-
-const STATE_COLORS: Record<string, string> = {
-  OPEN: "bg-success/20 text-success",
-  DRAFT: "bg-muted text-muted-foreground",
-  MERGED: "bg-purple-500/20 text-purple-400",
-  CLOSED: "bg-danger/20 text-danger",
-};
-
-const REVIEW_LABELS: Record<string, { label: string; cls: string }> = {
-  APPROVED: { label: "Approved", cls: "text-success" },
-  CHANGES_REQUESTED: { label: "Changes requested", cls: "text-warning" },
-  REVIEW_REQUIRED: { label: "Review pending", cls: "text-muted-foreground" },
-};
 
 // ── Helpers ──
 
@@ -78,22 +63,6 @@ function branchToTitle(branch: string | null): string {
 }
 
 // ── Small sub-components ──
-
-function CheckIcon({ status }: { status: string }) {
-  if (status === "pass" || status === "success")
-    return <CheckCircle2 className="h-3 w-3 text-success" />;
-  if (status === "fail" || status === "failure")
-    return <XCircle className="h-3 w-3 text-danger" />;
-  return <Clock className="h-3 w-3 text-warning" />;
-}
-
-function ReviewStateIcon({ state }: { state: string }) {
-  if (state === "APPROVED")
-    return <ShieldCheck className="h-3 w-3 text-success" />;
-  if (state === "CHANGES_REQUESTED")
-    return <ShieldAlert className="h-3 w-3 text-warning" />;
-  return <MessageSquare className="h-3 w-3 text-muted-foreground" />;
-}
 
 function StatusMessage({
   icon,
@@ -125,6 +94,7 @@ function PrSkeleton() {
       <div className="space-y-1">
         <Skeleton className="h-3 w-full" />
         <Skeleton className="h-3 w-full" />
+        <Skeleton className="h-3 w-2/3" />
       </div>
       <Skeleton className="h-7 w-full" />
     </div>
@@ -307,194 +277,47 @@ function PrView({
   pr,
   checks,
   reviews,
+  inlineComments,
+  deployments,
   cwd,
   onRefresh,
 }: {
   pr: PullRequestInfo;
   checks: CheckInfo[];
   reviews: ReviewComment[];
+  inlineComments: InlineReviewComment[];
+  deployments: DeploymentInfo[];
   cwd: string;
   onRefresh: () => void;
 }) {
-  const [mergeMethod, setMergeMethod] = useState("squash");
-  const [confirmMerge, setConfirmMerge] = useState(false);
-  const [merging, setMerging] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
-
-  const handleMerge = async () => {
-    if (!confirmMerge) {
-      setConfirmMerge(true);
-      setTimeout(() => setConfirmMerge(false), 5000);
-      return;
-    }
-    setMerging(true);
-    setError(null);
-    try {
-      await mergePullRequest(cwd, pr.number, mergeMethod);
-      onRefresh();
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setMerging(false);
-      setConfirmMerge(false);
-    }
-  };
-
-  const handleCopyUrl = () => {
-    navigator.clipboard.writeText(pr.url);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
-  const stateLabel = pr.is_draft ? "Draft" : (pr.state ?? "OPEN");
-  const stateColorCls =
-    STATE_COLORS[stateLabel.toUpperCase()] ?? STATE_COLORS.OPEN;
-  const review = pr.review_decision ? REVIEW_LABELS[pr.review_decision] : null;
-
   return (
-    <div className="space-y-3 p-3">
-      {/* Header */}
-      <div className="space-y-1">
-        <div className="flex items-center gap-1.5">
-          <Badge className={`text-[10px] px-1.5 py-0 ${stateColorCls}`}>
-            {stateLabel}
-          </Badge>
-          <span className="text-[10px] text-muted-foreground">
-            #{pr.number}
-          </span>
-        </div>
-        <p className="text-xs font-medium text-foreground">{pr.title}</p>
-        <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-          {pr.base_branch && pr.head_branch && (
-            <span>
-              {pr.base_branch} ← {pr.head_branch}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-2 text-[10px]">
-          {pr.additions != null && (
-            <span className="text-success">+{pr.additions}</span>
-          )}
-          {pr.deletions != null && (
-            <span className="text-danger">-{pr.deletions}</span>
-          )}
-          {review && <span className={review.cls}>{review.label}</span>}
-        </div>
-      </div>
+    <div className="space-y-2 p-3">
+      <PrHeader pr={pr} />
 
-      {/* Checks */}
-      {checks.length > 0 && (
-        <div className="space-y-1">
-          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Checks
-          </span>
-          {checks.map((check) => (
-            <div key={check.name} className="flex items-center gap-1.5">
-              <CheckIcon status={check.conclusion ?? check.status} />
-              <span className="text-xs text-foreground truncate">
-                {check.name}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
+      <div className="border-t border-border/30" />
 
-      {/* Reviews */}
-      {reviews.length > 0 && (
-        <div className="space-y-1.5">
-          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            Reviews
-          </span>
-          {reviews.map((r) => (
-            <div key={r.id || `${r.author}-${r.created_at}`} className="space-y-0.5">
-              <div className="flex items-center gap-1.5">
-                <ReviewStateIcon state={r.state} />
-                <span className="text-xs font-medium text-foreground">
-                  {r.author}
-                </span>
-                {r.created_at && (
-                  <span className="text-[10px] text-muted-foreground">
-                    {new Date(r.created_at).toLocaleDateString()}
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-muted-foreground pl-[18px]">
-                {r.body}
-              </p>
-            </div>
-          ))}
-        </div>
-      )}
+      <PrChecks checks={checks} />
+      <PrReviews reviews={reviews} inlineComments={inlineComments} />
 
-      {/* Merge controls */}
       {pr.state === "OPEN" && (
-        <div className="space-y-1.5">
-          <div className="flex gap-1">
-            <Select value={mergeMethod} onValueChange={setMergeMethod}>
-              <SelectTrigger className="h-7 text-xs flex-1">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="squash" className="text-xs">
-                  Squash and merge
-                </SelectItem>
-                <SelectItem value="merge" className="text-xs">
-                  Create merge commit
-                </SelectItem>
-                <SelectItem value="rebase" className="text-xs">
-                  Rebase and merge
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              size="xs"
-              className="text-xs h-7"
-              variant={confirmMerge ? "destructive" : "default"}
-              disabled={merging || pr.mergeable === "CONFLICTING"}
-              onClick={handleMerge}
-            >
-              {merging
-                ? "Merging..."
-                : confirmMerge
-                  ? "Confirm"
-                  : "Merge"}
-            </Button>
-          </div>
-          {pr.mergeable === "CONFLICTING" && (
-            <p className="text-[10px] text-danger">Has merge conflicts</p>
-          )}
-          {error && (
-            <p className="text-xs text-danger break-words">{error}</p>
-          )}
-        </div>
+        <>
+          <div className="border-t border-border/30" />
+          <PrReviewActions
+            cwd={cwd}
+            prNumber={pr.number}
+            onSubmitted={onRefresh}
+          />
+        </>
       )}
 
-      {/* Actions */}
-      <div className="flex items-center gap-1.5">
-        <a
-          href={pr.url}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-xs text-primary hover:underline"
-          onClick={(e) => {
-            e.preventDefault();
-            window.open(pr.url, "_blank");
-          }}
-        >
-          <ExternalLink className="h-3 w-3" />
-          View on GitHub
-        </a>
-        <Button
-          size="xs"
-          variant="ghost"
-          className="text-xs h-6 px-1.5"
-          onClick={handleCopyUrl}
-        >
-          <Copy className="h-3 w-3 mr-1" />
-          {copied ? "Copied" : "Copy URL"}
-        </Button>
-      </div>
+      <PrDeployments deployments={deployments} />
+
+      {pr.state === "OPEN" && (
+        <>
+          <div className="border-t border-border/30" />
+          <PrMergeControls pr={pr} cwd={cwd} onRefresh={onRefresh} />
+        </>
+      )}
     </div>
   );
 }
@@ -516,6 +339,8 @@ export function PrPanel({ workspace }: Props) {
   const [pr, setPr] = useState<PullRequestInfo | null>(null);
   const [checks, setChecks] = useState<CheckInfo[]>([]);
   const [reviews, setReviews] = useState<ReviewComment[]>([]);
+  const [inlineComments, setInlineComments] = useState<InlineReviewComment[]>([]);
+  const [deployments, setDeployments] = useState<DeploymentInfo[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
 
   // Auth init — uses module-level cache
@@ -560,26 +385,35 @@ export function PrPanel({ workspace }: Props) {
       setPr(null);
       setChecks([]);
       setReviews([]);
+      setInlineComments([]);
+      setDeployments([]);
       return;
     }
     setDetailLoading(true);
     try {
-      const [prInfo, prChecks, prReviews] = await Promise.all([
+      const prNum = workspace.pr_number!;
+      const [prInfo, prChecks, prReviews, prInline, prDeploys] = await Promise.all([
         getBranchPullRequest(cwd),
         getPullRequestChecks(cwd).catch(() => [] as CheckInfo[]),
         getPrReviewComments(cwd).catch(() => [] as ReviewComment[]),
+        getPrInlineComments(cwd, prNum).catch(() => [] as InlineReviewComment[]),
+        getPrDeployments(cwd, prNum).catch(() => [] as DeploymentInfo[]),
       ]);
       setPr(prInfo);
       setChecks(prChecks);
       setReviews(prReviews);
+      setInlineComments(prInline);
+      setDeployments(prDeploys);
     } catch {
       setPr(null);
       setChecks([]);
       setReviews([]);
+      setInlineComments([]);
+      setDeployments([]);
     } finally {
       setDetailLoading(false);
     }
-  }, [cwd, hasPr]);
+  }, [cwd, hasPr, workspace.pr_number]);
 
   useEffect(() => {
     if (initialLoading) return;
@@ -594,13 +428,17 @@ export function PrPanel({ workspace }: Props) {
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
     setPr(newPr);
-    // Fetch checks/reviews for the newly created PR
+    const prNum = newPr.number;
     Promise.all([
       getPullRequestChecks(cwd).catch(() => [] as CheckInfo[]),
       getPrReviewComments(cwd).catch(() => [] as ReviewComment[]),
-    ]).then(([c, r]) => {
+      getPrInlineComments(cwd, prNum).catch(() => [] as InlineReviewComment[]),
+      getPrDeployments(cwd, prNum).catch(() => [] as DeploymentInfo[]),
+    ]).then(([c, r, ic, d]) => {
       setChecks(c);
       setReviews(r);
+      setInlineComments(ic);
+      setDeployments(d);
     });
   };
 
@@ -658,6 +496,8 @@ export function PrPanel({ workspace }: Props) {
           pr={pr}
           checks={checks}
           reviews={reviews}
+          inlineComments={inlineComments}
+          deployments={deployments}
           cwd={cwd}
           onRefresh={handleRefresh}
         />

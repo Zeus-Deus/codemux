@@ -24,6 +24,8 @@ pub struct PullRequestInfo {
     pub review_decision: Option<String>,
     #[serde(default)]
     pub checks_passing: Option<bool>,
+    #[serde(alias = "updatedAt", default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +34,14 @@ pub struct CheckInfo {
     #[serde(alias = "state")]
     pub status: String,
     pub conclusion: Option<String>,
+    #[serde(alias = "elapsedTime", default)]
+    pub elapsed_time: Option<String>,
+    #[serde(alias = "detailUrl", default)]
+    pub detail_url: Option<String>,
+    #[serde(alias = "startedAt", default)]
+    pub started_at: Option<String>,
+    #[serde(alias = "completedAt", default)]
+    pub completed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +59,27 @@ pub enum GhStatus {
     NotInstalled,
     NotAuthenticated,
     Authenticated { username: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InlineReviewComment {
+    pub id: u64,
+    pub author: String,
+    pub body: String,
+    pub path: String,
+    pub line: Option<u32>,
+    pub created_at: String,
+    pub in_reply_to_id: Option<u64>,
+    pub pull_request_review_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentInfo {
+    pub id: u64,
+    pub environment: String,
+    pub state: String,
+    pub url: Option<String>,
+    pub created_at: String,
 }
 
 pub fn check_gh_status() -> GhStatus {
@@ -135,7 +166,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
         repo_path,
         &[
             "pr", "view",
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt",
         ],
     );
 
@@ -209,7 +240,7 @@ pub fn merge_pull_request(
 pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
     let output = run_gh_optional(
         repo_path,
-        &["pr", "checks", "--json", "name,state,conclusion"],
+        &["pr", "checks", "--json", "name,state,conclusion,elapsedTime,detailUrl,startedAt,completedAt"],
     );
 
     let Some(json_str) = output else {
@@ -230,6 +261,10 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
             name: c["name"].as_str().unwrap_or("").to_string(),
             status: c["state"].as_str().unwrap_or("pending").to_string(),
             conclusion: c["conclusion"].as_str().map(|s| s.to_string()),
+            elapsed_time: c["elapsedTime"].as_str().map(|s| s.to_string()),
+            detail_url: c["detailUrl"].as_str().map(|s| s.to_string()),
+            started_at: c["startedAt"].as_str().map(|s| s.to_string()),
+            completed_at: c["completedAt"].as_str().map(|s| s.to_string()),
         })
         .collect())
 }
@@ -269,6 +304,139 @@ pub fn get_pr_review_comments(repo_path: &Path) -> Result<Vec<ReviewComment>, St
         .collect())
 }
 
+/// Get "owner/repo" string for API calls.
+fn get_repo_nwo(repo_path: &Path) -> Result<String, String> {
+    run_gh(repo_path, &["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+}
+
+pub fn get_pr_inline_comments(
+    repo_path: &Path,
+    pr_number: u32,
+) -> Result<Vec<InlineReviewComment>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+    let endpoint = format!("repos/{}/pulls/{}/comments", nwo, pr_number);
+    let output = run_gh_optional(repo_path, &["api", &endpoint, "--paginate"]);
+
+    let Some(json_str) = output else {
+        return Ok(Vec::new());
+    };
+    if json_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let v: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse inline comments JSON: {e}"))?;
+    let arr = v.as_array().ok_or("Expected JSON array from inline comments API")?;
+
+    Ok(arr
+        .iter()
+        .map(|c| InlineReviewComment {
+            id: c["id"].as_u64().unwrap_or(0),
+            author: c["user"]["login"].as_str().unwrap_or("").to_string(),
+            body: c["body"].as_str().unwrap_or("").to_string(),
+            path: c["path"].as_str().unwrap_or("").to_string(),
+            line: c["line"].as_u64().map(|n| n as u32),
+            created_at: c["created_at"].as_str().unwrap_or("").to_string(),
+            in_reply_to_id: c["in_reply_to_id"].as_u64(),
+            pull_request_review_id: c["pull_request_review_id"].as_u64(),
+        })
+        .filter(|c| !c.body.is_empty())
+        .collect())
+}
+
+pub fn submit_pr_review(
+    repo_path: &Path,
+    pr_number: u32,
+    event: &str,
+    body: &str,
+) -> Result<(), String> {
+    let number_str = pr_number.to_string();
+    let event_flag = match event {
+        "approve" => "--approve",
+        "request-changes" => "--request-changes",
+        _ => "--comment",
+    };
+    let mut args = vec!["pr", "review", &number_str, event_flag];
+    if !body.is_empty() {
+        args.push("--body");
+        args.push(body);
+    }
+    run_gh(repo_path, &args)?;
+    Ok(())
+}
+
+pub fn get_pr_deployments(
+    repo_path: &Path,
+    pr_number: u32,
+) -> Result<Vec<DeploymentInfo>, String> {
+    let nwo = get_repo_nwo(repo_path)?;
+
+    // Get the PR head SHA to filter deployments
+    let pr_json = run_gh_optional(
+        repo_path,
+        &["pr", "view", &pr_number.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
+    );
+
+    let endpoint = if let Some(sha) = &pr_json {
+        format!("repos/{}/deployments?per_page=5&sha={}", nwo, sha)
+    } else {
+        format!("repos/{}/deployments?per_page=5", nwo)
+    };
+
+    let output = run_gh_optional(repo_path, &["api", &endpoint]);
+    let Some(json_str) = output else {
+        return Ok(Vec::new());
+    };
+    if json_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let v: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse deployments JSON: {e}"))?;
+    let arr = v.as_array().ok_or("Expected JSON array from deployments API")?;
+
+    let mut deployments = Vec::new();
+    for d in arr {
+        let dep_id = d["id"].as_u64().unwrap_or(0);
+        let environment = d["environment"].as_str().unwrap_or("").to_string();
+        let created_at = d["created_at"].as_str().unwrap_or("").to_string();
+
+        // Fetch the latest status to get target_url
+        let status_endpoint = format!("repos/{}/deployments/{}/statuses?per_page=1", nwo, dep_id);
+        let status_output = run_gh_optional(repo_path, &["api", &status_endpoint]);
+
+        let (state, url) = if let Some(status_json) = status_output {
+            if let Ok(sv) = serde_json::from_str::<serde_json::Value>(&status_json) {
+                if let Some(first) = sv.as_array().and_then(|a| a.first()) {
+                    let st = first["state"].as_str().unwrap_or("unknown").to_string();
+                    let u = first["target_url"]
+                        .as_str()
+                        .or_else(|| first["environment_url"].as_str())
+                        .map(|s| s.to_string())
+                        .filter(|s| !s.is_empty());
+                    (st, u)
+                } else {
+                    ("unknown".to_string(), None)
+                }
+            } else {
+                ("unknown".to_string(), None)
+            }
+        } else {
+            ("unknown".to_string(), None)
+        };
+
+        deployments.push(DeploymentInfo {
+            id: dep_id,
+            environment,
+            state,
+            url,
+            created_at,
+        });
+    }
+
+    Ok(deployments)
+}
+
 fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
     PullRequestInfo {
         number: v["number"].as_u64().unwrap_or(0) as u32,
@@ -283,6 +451,7 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
         deletions: v["deletions"].as_u64().map(|n| n as u32),
         review_decision: v["reviewDecision"].as_str().map(|s| s.to_string()),
         checks_passing: None, // populated separately via get_pr_checks
+        updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
     }
 }
 
@@ -342,7 +511,7 @@ mod tests {
     #[test]
     fn test_parse_checks() {
         let json = r#"[
-            {"name": "build", "state": "SUCCESS", "conclusion": "SUCCESS"},
+            {"name": "build", "state": "SUCCESS", "conclusion": "SUCCESS", "elapsedTime": "2m30s", "detailUrl": "https://github.com/u/r/actions/1", "startedAt": "2026-01-01T00:00:00Z", "completedAt": "2026-01-01T00:02:30Z"},
             {"name": "lint", "state": "FAILURE", "conclusion": "FAILURE"},
             {"name": "deploy", "state": "PENDING", "conclusion": null}
         ]"#;
@@ -350,7 +519,58 @@ mod tests {
         assert_eq!(checks.len(), 3);
         assert_eq!(checks[0].name, "build");
         assert_eq!(checks[0].conclusion.as_deref(), Some("SUCCESS"));
+        assert_eq!(checks[0].elapsed_time.as_deref(), Some("2m30s"));
+        assert_eq!(checks[0].detail_url.as_deref(), Some("https://github.com/u/r/actions/1"));
+        assert!(checks[1].elapsed_time.is_none());
         assert!(checks[2].conclusion.is_none());
+    }
+
+    #[test]
+    fn test_parse_inline_review_comment() {
+        let json = r#"[
+            {
+                "id": 100,
+                "user": {"login": "reviewer1"},
+                "body": "This looks wrong",
+                "path": "src/main.rs",
+                "line": 42,
+                "created_at": "2026-01-15T10:00:00Z",
+                "in_reply_to_id": null,
+                "pull_request_review_id": 200
+            }
+        ]"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let arr = v.as_array().unwrap();
+        let c = &arr[0];
+        let comment = InlineReviewComment {
+            id: c["id"].as_u64().unwrap_or(0),
+            author: c["user"]["login"].as_str().unwrap_or("").to_string(),
+            body: c["body"].as_str().unwrap_or("").to_string(),
+            path: c["path"].as_str().unwrap_or("").to_string(),
+            line: c["line"].as_u64().map(|n| n as u32),
+            created_at: c["created_at"].as_str().unwrap_or("").to_string(),
+            in_reply_to_id: c["in_reply_to_id"].as_u64(),
+            pull_request_review_id: c["pull_request_review_id"].as_u64(),
+        };
+        assert_eq!(comment.author, "reviewer1");
+        assert_eq!(comment.path, "src/main.rs");
+        assert_eq!(comment.line, Some(42));
+        assert_eq!(comment.pull_request_review_id, Some(200));
+    }
+
+    #[test]
+    fn test_parse_deployment_info() {
+        let json = r#"{
+            "id": 500,
+            "environment": "preview",
+            "state": "success",
+            "url": "https://preview.example.com",
+            "created_at": "2026-01-20T12:00:00Z"
+        }"#;
+        let dep: DeploymentInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(dep.id, 500);
+        assert_eq!(dep.environment, "preview");
+        assert_eq!(dep.url.as_deref(), Some("https://preview.example.com"));
     }
 
     #[test]

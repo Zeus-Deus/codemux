@@ -288,12 +288,17 @@ export interface PullRequestInfo {
   deletions: number | null;
   review_decision: string | null;
   checks_passing: boolean | null;
+  updated_at: string | null;
 }
 
 export interface CheckInfo {
   name: string;
   status: string;
   conclusion: string | null;
+  elapsed_time: string | null;
+  detail_url: string | null;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface ReviewComment {
@@ -301,6 +306,25 @@ export interface ReviewComment {
   author: string;
   body: string;
   state: string;
+  created_at: string;
+}
+
+export interface InlineReviewComment {
+  id: number;
+  author: string;
+  body: string;
+  path: string;
+  line: number | null;
+  created_at: string;
+  in_reply_to_id: number | null;
+  pull_request_review_id: number | null;
+}
+
+export interface DeploymentInfo {
+  id: number;
+  environment: string;
+  state: string;
+  url: string | null;
   created_at: string;
 }
 

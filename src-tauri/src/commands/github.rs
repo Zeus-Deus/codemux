@@ -1,4 +1,4 @@
-use crate::github::{CheckInfo, GhStatus, PullRequestInfo};
+use crate::github::{CheckInfo, DeploymentInfo, GhStatus, InlineReviewComment, PullRequestInfo};
 use std::path::Path;
 
 #[tauri::command]
@@ -50,4 +50,19 @@ pub fn get_pull_request_checks(path: String) -> Result<Vec<CheckInfo>, String> {
 #[tauri::command]
 pub fn get_pr_review_comments(path: String) -> Result<Vec<crate::github::ReviewComment>, String> {
     crate::github::get_pr_review_comments(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<InlineReviewComment>, String> {
+    crate::github::get_pr_inline_comments(Path::new(&path), pr_number)
+}
+
+#[tauri::command]
+pub fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
+    crate::github::submit_pr_review(Path::new(&path), pr_number, &event, &body)
+}
+
+#[tauri::command]
+pub fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
+    crate::github::get_pr_deployments(Path::new(&path), pr_number)
 }

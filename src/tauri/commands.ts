@@ -27,6 +27,8 @@ import type {
   ProjectMemoryUpdate,
   PullRequestInfo,
   ReviewComment,
+  InlineReviewComment,
+  DeploymentInfo,
   SearchResult,
   ShellAppearance,
   TabKind,
@@ -230,6 +232,15 @@ export const getPullRequestChecks = (path: string) =>
 
 export const getPrReviewComments = (path: string) =>
   invoke<ReviewComment[]>("get_pr_review_comments", { path });
+
+export const getPrInlineComments = (path: string, prNumber: number) =>
+  invoke<InlineReviewComment[]>("get_pr_inline_comments", { path, prNumber });
+
+export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
+  invoke("submit_pr_review", { path, prNumber, event, body });
+
+export const getPrDeployments = (path: string, prNumber: number) =>
+  invoke<DeploymentInfo[]>("get_pr_deployments", { path, prNumber });
 
 // ── Git ──
 
