@@ -242,12 +242,15 @@ impl AgentBrowserManager {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Start agent-browser with stream server via env var.
-        // The daemon auto-starts the WebSocket stream server when
-        // AGENT_BROWSER_STREAM_PORT is set.
-        std::process::Command::new("sh")
-            .args(["-c", "npx agent-browser open about:blank --headless"])
-            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+        // Start agent-browser daemon with stream server using ESM dynamic import.
+        // The CLI uses a native Rust binary that doesn't support the stream server,
+        // so we must start the Node.js daemon directly.
+        let script = format!(
+            "import('agent-browser').then(m => m.startDaemon({{ streamPort: {} }})).catch(e => {{ console.error(e.message); process.exit(1); }})",
+            port
+        );
+        std::process::Command::new("node")
+            .args(["--input-type=module", "-e", &script])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
