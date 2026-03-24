@@ -153,18 +153,16 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
     return () => {
       active = false;
-      // Don't close the WebSocket on StrictMode cleanup — keep it alive
-      // Only close if the component truly unmounts (browserId changes)
+      // Close WebSocket on cleanup so the stream server's client count resets.
+      // On StrictMode remount, the daemon is already running (*running = true),
+      // so startBrowserStream returns instantly and a fresh WS connects.
+      // This fresh connection triggers startScreencast with the browser launched.
+      if (ws) {
+        ws.close();
+        wsRef.current = null;
+      }
     };
   }, [browserId, visible]);
-
-  // Clean up WebSocket on true unmount
-  useEffect(() => {
-    return () => {
-      wsRef.current?.close();
-      wsRef.current = null;
-    };
-  }, []);
 
   // Mouse handlers
   const handleMouseDown = (e: React.MouseEvent) => {
