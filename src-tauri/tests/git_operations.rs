@@ -653,3 +653,410 @@ fn worktree_commit_not_in_other_log() {
 
     git_remove_worktree(Path::new(&wt_path_str), Some("wt-log")).expect("cleanup");
 }
+
+// ═══════════════════════════════════════
+// Merge conflict tests
+// ═══════════════════════════════════════
+
+/// Creates a conflict scenario: main and conflict-branch both modify the same file.
+fn create_conflict_scenario(dir: &TempDir) -> PathBuf {
+    let repo = dir.path().to_path_buf();
+    run_git(&repo, &["init"]);
+    // Initial commit with base content
+    add_and_commit(&repo, "conflict.txt", "base content\n", "base");
+
+    // Create branch and modify
+    run_git(&repo, &["checkout", "-b", "conflict-branch"]);
+    write_file(&repo, "conflict.txt", "branch change\n");
+    run_git(&repo, &["add", "conflict.txt"]);
+    commit(&repo, "branch change");
+
+    // Back to main/master and make conflicting change
+    run_git(&repo, &["checkout", "-"]);
+
+    write_file(&repo, "conflict.txt", "main change\n");
+    run_git(&repo, &["add", "conflict.txt"]);
+    commit(&repo, "main change");
+
+    repo
+}
+
+#[test]
+fn status_shows_conflicted_during_merge() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    // Start a merge that will conflict
+    let output = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output()
+        .expect("run merge");
+    assert!(!output.status.success(), "merge should fail due to conflict");
+
+    let status = git_status(&repo).expect("status");
+    let conflicted: Vec<_> = status.iter().filter(|f| f.status == FileStatus::Conflicted).collect();
+    assert_eq!(conflicted.len(), 1, "should have 1 conflicted file");
+    assert_eq!(conflicted[0].path, "conflict.txt");
+    assert_eq!(conflicted[0].conflict_type.as_deref(), Some("both_modified"));
+    assert!(!conflicted[0].is_staged);
+    assert!(!conflicted[0].is_unstaged);
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn merge_state_detects_in_progress() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    // Start conflicting merge
+    let _ = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output();
+
+    let state = get_merge_state(&repo).expect("merge state");
+    assert!(state.is_merging, "should detect merge in progress");
+    assert!(!state.is_rebasing);
+    assert!(state.merge_head.is_some(), "should have MERGE_HEAD");
+    assert!(!state.conflicted_files.is_empty(), "should have conflicted files");
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn merge_state_clean_repo() {
+    let (_dir, repo) = create_test_repo();
+    let state = get_merge_state(&repo).expect("merge state");
+    assert!(!state.is_merging);
+    assert!(!state.is_rebasing);
+    assert!(state.conflicted_files.is_empty());
+}
+
+#[test]
+fn check_conflicts_detects_conflicts() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let result = check_merge_conflicts(&repo, "conflict-branch").expect("check");
+    assert!(result.has_conflicts, "should detect conflicts");
+    assert_eq!(result.conflicting_files.len(), 1);
+    assert_eq!(result.conflicting_files[0].path, "conflict.txt");
+
+    // Repo should be clean after dry-run (abort worked)
+    let status = git_status(&repo).expect("status after check");
+    assert!(status.is_empty(), "repo should be clean after dry-run check");
+
+    let state = get_merge_state(&repo).expect("state after check");
+    assert!(!state.is_merging, "should not be merging after dry-run");
+}
+
+#[test]
+fn check_conflicts_clean_merge() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = dir.path().to_path_buf();
+    run_git(&repo, &["init"]);
+    write_file(&repo, "base.txt", "base\n");
+    run_git(&repo, &["add", "base.txt"]);
+    run_git(&repo, &[
+        "-c", "user.name=Test", "-c", "user.email=test@test.com",
+        "commit", "-m", "base",
+    ]);
+
+    // Create branch with non-conflicting change
+    run_git(&repo, &["checkout", "-b", "clean-branch"]);
+    write_file(&repo, "new-file.txt", "new content\n");
+    run_git(&repo, &["add", "new-file.txt"]);
+    commit(&repo, "add new file");
+    run_git(&repo, &["checkout", "-"]);
+
+    let result = check_merge_conflicts(&repo, "clean-branch").expect("check");
+    assert!(!result.has_conflicts, "should not have conflicts");
+    assert!(result.conflicting_files.is_empty());
+
+    // Repo should be clean
+    let status = git_status(&repo).expect("status");
+    assert!(status.is_empty(), "repo should be clean after dry-run");
+}
+
+#[test]
+fn resolve_ours_uses_our_content() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    // Start conflicting merge
+    let _ = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output();
+
+    resolve_conflict_ours(&repo, "conflict.txt").expect("resolve ours");
+
+    let content = std::fs::read_to_string(repo.join("conflict.txt")).expect("read");
+    assert_eq!(content, "main change\n", "should have our (main) content");
+
+    // File should no longer be conflicted
+    let status = git_status(&repo).expect("status");
+    assert!(
+        !status.iter().any(|f| f.status == FileStatus::Conflicted),
+        "no more conflicts after resolve"
+    );
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn resolve_theirs_uses_their_content() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let _ = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output();
+
+    resolve_conflict_theirs(&repo, "conflict.txt").expect("resolve theirs");
+
+    let content = std::fs::read_to_string(repo.join("conflict.txt")).expect("read");
+    assert_eq!(content, "branch change\n", "should have their (branch) content");
+
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn mark_resolved_and_continue() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let _ = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output();
+
+    // Manually resolve by writing the file
+    write_file(&repo, "conflict.txt", "manually resolved\n");
+    mark_conflict_resolved(&repo, "conflict.txt").expect("mark resolved");
+
+    // Complete the merge
+    continue_merge(&repo, "merge complete").expect("continue merge");
+
+    // Should be clean now
+    let state = get_merge_state(&repo).expect("state");
+    assert!(!state.is_merging, "should not be merging after continue");
+
+    let log = run_git(&repo, &["log", "--oneline", "-1"]);
+    assert!(log.contains("merge complete"), "commit message should match");
+}
+
+#[test]
+fn abort_merge_restores_state() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let _ = std::process::Command::new("git")
+        .args(["merge", "conflict-branch", "--no-edit"])
+        .current_dir(&repo)
+        .output();
+
+    // Verify we're in a merge state
+    let state = get_merge_state(&repo).expect("state during merge");
+    assert!(state.is_merging);
+
+    abort_merge(&repo).expect("abort");
+
+    // Should be clean
+    let state = get_merge_state(&repo).expect("state after abort");
+    assert!(!state.is_merging);
+
+    let status = git_status(&repo).expect("status after abort");
+    assert!(status.is_empty(), "should be clean after abort");
+}
+
+#[test]
+fn check_conflicts_dirty_tree_errors() {
+    let (_dir, repo) = create_test_repo();
+    write_file(&repo, "dirty.txt", "uncommitted");
+
+    let result = check_merge_conflicts(&repo, "some-branch");
+    assert!(result.is_err(), "should refuse on dirty tree");
+    let err = result.unwrap_err();
+    assert!(err.contains("uncommitted"), "error should mention uncommitted changes: {}", err);
+}
+
+// ═══════════════════════════════════════
+// Resolver branch tests
+// ═══════════════════════════════════════
+
+#[test]
+fn create_resolver_branch_creates_temp() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create resolver branch");
+
+    // Should be on the temp branch
+    let current = run_git(&repo, &["branch", "--show-current"]);
+    assert_eq!(current, info.temp_branch);
+
+    // Should have conflicts
+    assert!(!info.conflicting_files.is_empty(), "should have conflicting files");
+    assert!(info.conflicting_files.iter().any(|f| f.path == "conflict.txt"));
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["checkout", &info.original_branch])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &info.temp_branch])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn create_resolver_branch_name_format() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create resolver branch");
+    assert!(info.temp_branch.starts_with("bot/resolve-"), "branch name should start with bot/resolve-: {}", info.temp_branch);
+    assert!(info.temp_branch.contains("-into-"), "branch name should contain -into-: {}", info.temp_branch);
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["checkout", &info.original_branch])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &info.temp_branch])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn abort_resolution_cleans_up() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create");
+
+    abort_resolution(&repo, &info.temp_branch, &info.original_branch).expect("abort");
+
+    // Should be back on original branch
+    let current = run_git(&repo, &["branch", "--show-current"]);
+    assert_eq!(current, info.original_branch);
+
+    // Temp branch should be deleted
+    let branches = run_git(&repo, &["branch"]);
+    assert!(!branches.contains(&info.temp_branch), "temp branch should be deleted");
+
+    // Repo should be clean
+    let status = git_status(&repo).expect("status");
+    assert!(status.is_empty(), "should be clean after abort");
+}
+
+#[test]
+fn apply_resolution_merges_changes() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create");
+
+    // Manually resolve the conflict
+    write_file(&repo, "conflict.txt", "manually resolved\n");
+    run_git(&repo, &["add", "conflict.txt"]);
+
+    apply_resolution(&repo, &info.temp_branch, &info.original_branch, "resolved merge")
+        .expect("apply");
+
+    // Should be on original branch
+    let current = run_git(&repo, &["branch", "--show-current"]);
+    assert_eq!(current, info.original_branch);
+
+    // File should have resolved content
+    let content = std::fs::read_to_string(repo.join("conflict.txt")).expect("read");
+    assert_eq!(content, "manually resolved\n");
+
+    // Commit should exist
+    let log = run_git(&repo, &["log", "--oneline", "-1"]);
+    assert!(log.contains("resolved merge"), "commit message should match");
+}
+
+#[test]
+fn apply_resolution_with_unresolved_fails() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create");
+
+    // Don't resolve — try to apply directly
+    let result = apply_resolution(&repo, &info.temp_branch, &info.original_branch, "should fail");
+    assert!(result.is_err(), "should fail with unresolved conflicts");
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["checkout", &info.original_branch])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &info.temp_branch])
+        .current_dir(&repo)
+        .output();
+}
+
+#[test]
+fn original_branch_untouched_during_resolution() {
+    let dir = TempDir::new().expect("temp dir");
+    let repo = create_conflict_scenario(&dir);
+
+    // Record original branch's HEAD
+    let original_head = run_git(&repo, &["rev-parse", "HEAD"]);
+
+    let info = create_resolver_branch(&repo, "conflict-branch").expect("create");
+
+    // Check that the original branch hasn't moved
+    let original_head_now = run_git(&repo, &["rev-parse", &info.original_branch]);
+    assert_eq!(original_head, original_head_now, "original branch should not have moved");
+
+    // Cleanup
+    let _ = std::process::Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["checkout", &info.original_branch])
+        .current_dir(&repo)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &info.temp_branch])
+        .current_dir(&repo)
+        .output();
+}

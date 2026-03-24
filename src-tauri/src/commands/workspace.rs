@@ -607,6 +607,50 @@ pub fn set_ai_commit_message_model(
 }
 
 #[tauri::command]
+pub fn set_ai_resolver_enabled(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.set_ai_resolver_enabled(enabled);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_ai_resolver_cli(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    cli: Option<String>,
+) -> Result<(), String> {
+    state.set_ai_resolver_cli(cli);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_ai_resolver_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    model: Option<String>,
+) -> Result<(), String> {
+    state.set_ai_resolver_model(model);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_ai_resolver_strategy(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    strategy: String,
+) -> Result<(), String> {
+    state.set_ai_resolver_strategy(strategy);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn create_tab(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,

@@ -1,4 +1,4 @@
-use crate::git::{GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, WorktreeInfo};
+use crate::git::{ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::Path;
 
 #[tauri::command]
@@ -81,4 +81,77 @@ pub fn remove_worktree(worktree_path: String, branch: Option<String>) -> Result<
 #[tauri::command]
 pub fn list_worktrees(path: String) -> Result<Vec<WorktreeInfo>, String> {
     crate::git::git_list_worktrees(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn get_merge_state(path: String) -> Result<MergeState, String> {
+    crate::git::get_merge_state(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn check_merge_conflicts(path: String, target_branch: String) -> Result<ConflictCheckResult, String> {
+    crate::git::check_merge_conflicts(Path::new(&path), &target_branch)
+}
+
+#[tauri::command]
+pub fn resolve_conflict_ours(path: String, file: String) -> Result<(), String> {
+    crate::git::resolve_conflict_ours(Path::new(&path), &file)
+}
+
+#[tauri::command]
+pub fn resolve_conflict_theirs(path: String, file: String) -> Result<(), String> {
+    crate::git::resolve_conflict_theirs(Path::new(&path), &file)
+}
+
+#[tauri::command]
+pub fn mark_conflict_resolved(path: String, file: String) -> Result<(), String> {
+    crate::git::mark_conflict_resolved(Path::new(&path), &file)
+}
+
+#[tauri::command]
+pub fn abort_merge(path: String) -> Result<(), String> {
+    crate::git::abort_merge(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn continue_merge(path: String, message: String) -> Result<(), String> {
+    crate::git::continue_merge(Path::new(&path), &message)
+}
+
+#[tauri::command]
+pub fn create_resolver_branch(path: String, target_branch: String) -> Result<ResolverBranchInfo, String> {
+    crate::git::create_resolver_branch(Path::new(&path), &target_branch)
+}
+
+#[tauri::command]
+pub fn apply_resolution(path: String, temp_branch: String, original_branch: String, message: String) -> Result<(), String> {
+    crate::git::apply_resolution(Path::new(&path), &temp_branch, &original_branch, &message)
+}
+
+#[tauri::command]
+pub fn abort_resolution(path: String, temp_branch: String, original_branch: String) -> Result<(), String> {
+    crate::git::abort_resolution(Path::new(&path), &temp_branch, &original_branch)
+}
+
+#[tauri::command]
+pub fn get_resolution_diff(path: String) -> Result<String, String> {
+    crate::git::get_resolution_diff(Path::new(&path))
+}
+
+#[tauri::command]
+pub async fn resolve_conflicts_with_agent(
+    path: String,
+    cli: String,
+    model: Option<String>,
+    strategy: String,
+    files: Vec<String>,
+) -> Result<String, String> {
+    crate::ai::resolve_conflicts_with_agent(
+        Path::new(&path),
+        &cli,
+        model.as_deref(),
+        &strategy,
+        &files,
+    )
+    .await
 }

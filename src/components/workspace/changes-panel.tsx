@@ -22,6 +22,10 @@ import {
   ChevronRight,
   File,
   Sparkles,
+  AlertTriangle,
+  GitMerge,
+  XCircle,
+  CheckCircle2,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -34,6 +38,12 @@ import {
   gitPullChanges,
   gitDiscardFile,
   gitLogEntries,
+  getMergeState,
+  resolveConflictOurs,
+  resolveConflictTheirs,
+  markConflictResolved,
+  abortMerge,
+  continueMerge,
   createTab,
   activateTab,
   checkClaudeAvailable,
@@ -41,11 +51,13 @@ import {
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
+import { useAiMergeStore } from "@/stores/ai-merge-store";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
   GitBranchInfo,
   GitLogEntry,
+  MergeState,
 } from "@/tauri/types";
 
 interface Props {
@@ -59,6 +71,7 @@ const STATUS_LABEL: Record<string, string> = {
   renamed: "R",
   untracked: "U",
   copied: "C",
+  conflicted: "!",
 };
 
 const STATUS_COLOR: Record<string, string> = {
@@ -68,6 +81,17 @@ const STATUS_COLOR: Record<string, string> = {
   renamed: "text-primary",
   untracked: "text-muted-foreground",
   copied: "text-muted-foreground",
+  conflicted: "text-danger",
+};
+
+const CONFLICT_TYPE_LABEL: Record<string, string> = {
+  both_modified: "Both Modified",
+  both_added: "Both Added",
+  both_deleted: "Both Deleted",
+  deleted_by_them: "Deleted by Them",
+  deleted_by_us: "Deleted by Us",
+  added_by_them: "Added by Them",
+  added_by_us: "Added by Us",
 };
 
 // ── Helpers ──
@@ -270,6 +294,260 @@ function FileRow({
   );
 }
 
+// ── Conflict File Row ──
+
+function ConflictFileRow({
+  file,
+  cwd,
+  onRefresh,
+  onOpenDiff,
+}: {
+  file: GitFileStatus;
+  cwd: string;
+  onRefresh: () => void;
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const handleResolve = async (action: "ours" | "theirs" | "resolved") => {
+    setBusy(action);
+    try {
+      if (action === "ours") await resolveConflictOurs(cwd, file.path);
+      else if (action === "theirs") await resolveConflictTheirs(cwd, file.path);
+      else await markConflictResolved(cwd, file.path);
+      onRefresh();
+    } catch (err) {
+      console.error("Resolve failed:", err);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const name = fileName(file.path);
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          role="button"
+          tabIndex={0}
+          className="group flex w-full items-center gap-1 rounded-sm py-0.5 px-1 text-left hover:bg-danger/10 transition-colors cursor-default"
+          onClick={() => onOpenDiff?.(file.path, false)}
+        >
+          <span className="shrink-0 w-3.5 text-center text-[10px] font-bold leading-none text-danger">
+            !
+          </span>
+          <File className="h-3 w-3 shrink-0 text-danger/50" />
+          <span className="flex-1 truncate text-xs text-foreground">{name}</span>
+          {file.conflict_type && (
+            <span className="shrink-0 text-[9px] text-danger/70 bg-danger/10 px-1 rounded">
+              {CONFLICT_TYPE_LABEL[file.conflict_type] ?? file.conflict_type}
+            </span>
+          )}
+          <div className="flex items-center shrink-0 gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="text-primary"
+              onClick={(e) => { e.stopPropagation(); handleResolve("ours"); }}
+              title="Accept ours"
+              disabled={busy !== null}
+            >
+              {busy === "ours" ? <Loader2 className="h-3 w-3 animate-spin" /> : <span className="text-[9px] font-bold">O</span>}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="text-purple-400"
+              onClick={(e) => { e.stopPropagation(); handleResolve("theirs"); }}
+              title="Accept theirs"
+              disabled={busy !== null}
+            >
+              {busy === "theirs" ? <Loader2 className="h-3 w-3 animate-spin" /> : <span className="text-[9px] font-bold">T</span>}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="text-success"
+              onClick={(e) => { e.stopPropagation(); handleResolve("resolved"); }}
+              title="Mark as resolved"
+              disabled={busy !== null}
+            >
+              {busy === "resolved" ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle2 className="h-3 w-3" />}
+            </Button>
+          </div>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="left" className="text-xs">
+        {file.path}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ── Conflicts Section ──
+
+function ConflictsSection({
+  files,
+  cwd,
+  onRefresh,
+  onOpenDiff,
+  resolverEnabled,
+  resolverStatus,
+  resolverError,
+  onStartResolve,
+  onApproveResolve,
+  onRejectResolve,
+}: {
+  files: GitFileStatus[];
+  cwd: string;
+  onRefresh: () => void;
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
+  resolverEnabled: boolean;
+  resolverStatus: string;
+  resolverError: string | null;
+  onStartResolve: () => void;
+  onApproveResolve: () => void;
+  onRejectResolve: () => void;
+}) {
+  // Show resolver progress UI when active
+  if (resolverStatus !== "idle") {
+    return (
+      <div className="py-1 px-1.5 space-y-1.5">
+        <div className="flex items-center justify-between py-0.5">
+          <span className="text-[10px] font-medium uppercase tracking-wider text-danger">
+            Conflicts
+          </span>
+        </div>
+
+        {resolverStatus === "creating_branch" && (
+          <div className="flex items-center gap-1.5 px-1 py-1">
+            <Loader2 className="h-3 w-3 animate-spin text-primary" />
+            <span className="text-xs text-muted-foreground">Creating temp branch...</span>
+          </div>
+        )}
+
+        {resolverStatus === "resolving" && (
+          <div className="space-y-1">
+            <div className="flex items-center gap-1.5 px-1 py-1">
+              <Loader2 className="h-3 w-3 animate-spin text-primary" />
+              <span className="text-xs text-muted-foreground">AI is resolving conflicts...</span>
+            </div>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-[10px] h-5 text-danger"
+              onClick={onRejectResolve}
+            >
+              <XCircle className="h-3 w-3 mr-0.5" />
+              Stop & Abort
+            </Button>
+          </div>
+        )}
+
+        {resolverStatus === "review" && (
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-1.5 px-1 py-1">
+              <CheckCircle2 className="h-3.5 w-3.5 text-success" />
+              <span className="text-xs text-foreground font-medium">Conflicts resolved — review changes</span>
+            </div>
+            <div className="flex gap-1">
+              <Button
+                size="xs"
+                className="text-[10px] h-6 flex-1 bg-success/20 text-success hover:bg-success/30"
+                onClick={onApproveResolve}
+              >
+                <CheckCircle2 className="h-3 w-3 mr-0.5" />
+                Approve
+              </Button>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="text-[10px] h-6 text-danger"
+                onClick={onRejectResolve}
+              >
+                <XCircle className="h-3 w-3 mr-0.5" />
+                Reject
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {resolverStatus === "applying" && (
+          <div className="flex items-center gap-1.5 px-1 py-1">
+            <Loader2 className="h-3 w-3 animate-spin text-success" />
+            <span className="text-xs text-muted-foreground">Applying resolution...</span>
+          </div>
+        )}
+
+        {resolverStatus === "error" && (
+          <div className="space-y-1">
+            <p className="text-[10px] text-danger break-words px-1">{resolverError}</p>
+            <div className="flex gap-1">
+              <Button
+                size="xs"
+                variant="ghost"
+                className="text-[10px] h-5"
+                onClick={onStartResolve}
+              >
+                Try Again
+              </Button>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="text-[10px] h-5 text-danger"
+                onClick={onRejectResolve}
+              >
+                Abort
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div className="py-1">
+      <div className="flex items-center justify-between px-1.5 py-0.5">
+        <span className="text-[10px] font-medium uppercase tracking-wider text-danger">
+          Conflicts
+        </span>
+        <span className="text-[10px] tabular-nums text-danger">{files.length}</span>
+      </div>
+      {files.map((file) => (
+        <ConflictFileRow
+          key={file.path}
+          file={file}
+          cwd={cwd}
+          onRefresh={onRefresh}
+          onOpenDiff={onOpenDiff}
+        />
+      ))}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="block px-1.5 mt-1">
+            <Button
+              size="xs"
+              className="text-[10px] h-6 w-full"
+              disabled={!resolverEnabled}
+              onClick={onStartResolve}
+            >
+              <Sparkles className="h-3 w-3 mr-1" />
+              Resolve with AI
+            </Button>
+          </span>
+        </TooltipTrigger>
+        {!resolverEnabled && (
+          <TooltipContent side="bottom" className="text-xs">
+            Configure in Settings &rarr; Git &rarr; AI Tools
+          </TooltipContent>
+        )}
+      </Tooltip>
+    </div>
+  );
+}
+
 // ── Directory Group ──
 
 function DirectoryGroup({
@@ -420,6 +698,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
+  const [mergeState, setMergeState] = useState<MergeState | null>(null);
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [expandedStaged, setExpandedStaged] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
@@ -444,11 +723,13 @@ export function ChangesPanel({ workspace }: Props) {
       getGitStatus(cwd).catch((e) => { console.error("[ChangesPanel] git status failed:", e); return [] as GitFileStatus[]; }),
       getGitBranchInfo(cwd).catch((e) => { console.error("[ChangesPanel] branch info failed:", e); return null; }),
       gitLogEntries(cwd, 10).catch((e) => { console.error("[ChangesPanel] git log failed:", e); return [] as GitLogEntry[]; }),
-    ]).then(([status, info, log]) => {
+      getMergeState(cwd).catch(() => null as MergeState | null),
+    ]).then(([status, info, log, merge]) => {
       console.log("[ChangesPanel] status:", status.length, "files, branch:", info?.branch, "commits:", log.length);
       setFiles(status);
       if (info) setBranchInfo(info);
       setCommits(log);
+      setMergeState(merge);
     });
   }, [cwd]);
 
@@ -485,6 +766,29 @@ export function ChangesPanel({ workspace }: Props) {
 
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
+  const conflicted = useMemo(() => files.filter((f) => f.status === "conflicted"), [files]);
+  const isMerging = mergeState?.is_merging || mergeState?.is_rebasing || false;
+
+  const resolver = useAiMergeStore((s) => s.getResolver(workspace.workspace_id));
+  const startResolution = useAiMergeStore((s) => s.startResolution);
+  const approveResolution = useAiMergeStore((s) => s.approveResolution);
+  const rejectResolution = useAiMergeStore((s) => s.rejectResolution);
+
+  const handleStartResolve = () => {
+    const cli = config?.ai_resolver_cli ?? "claude";
+    const model = config?.ai_resolver_model ?? null;
+    const strategy = config?.ai_resolver_strategy ?? "smart_merge";
+    const target = branchInfo?.branch === "main" ? "main" : "main"; // TODO: detect target from PR or config
+    startResolution(workspace.workspace_id, cwd, target, cli, model, strategy);
+  };
+
+  const handleApproveResolve = () => {
+    approveResolution(workspace.workspace_id, cwd, "Resolve merge conflicts").then(refresh);
+  };
+
+  const handleRejectResolve = () => {
+    rejectResolution(workspace.workspace_id, cwd).then(refresh);
+  };
 
   const busy = busyAction !== null;
 
@@ -495,8 +799,38 @@ export function ChangesPanel({ workspace }: Props) {
     requestGeneration(workspace.workspace_id, cwd, model);
   };
 
+  const handleAbortMerge = async () => {
+    if (busy) return;
+    setBusyAction("commit");
+    setGitError(null);
+    try {
+      await abortMerge(cwd);
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleCompleteMerge = async () => {
+    if (busy) return;
+    setBusyAction("commit");
+    setGitError(null);
+    try {
+      const msg = commitMsg.trim() || "Merge commit";
+      await continueMerge(cwd, msg);
+      setCommitMsg("");
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleCommit = async () => {
-    if (!commitMsg.trim() || staged.length === 0 || busy) return;
+    if (!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0) return;
     setBusyAction("commit");
     setGitError(null);
     try {
@@ -637,7 +971,7 @@ export function ChangesPanel({ workspace }: Props) {
             <Button
               size="xs"
               className="flex-1 text-xs h-6"
-              disabled={!commitMsg.trim() || staged.length === 0 || busy}
+              disabled={!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0}
               onClick={handleCommit}
             >
               {busyAction === "commit"
@@ -708,8 +1042,44 @@ export function ChangesPanel({ workspace }: Props) {
           )}
         </div>
 
+        {/* Merge conflict banner */}
+        {isMerging && (
+          <div className="px-1.5 py-1.5 bg-danger/10 border-b border-danger/20">
+            <div className="flex items-center gap-1.5 mb-1">
+              <AlertTriangle className="h-3.5 w-3.5 text-danger shrink-0" />
+              <span className="text-xs text-danger font-medium">
+                {mergeState?.is_rebasing ? "Rebase" : "Merge"} in progress
+                {conflicted.length > 0 && ` — ${conflicted.length} conflict${conflicted.length !== 1 ? "s" : ""}`}
+              </span>
+            </div>
+            <div className="flex gap-1">
+              {conflicted.length === 0 ? (
+                <Button
+                  size="xs"
+                  className="text-[10px] h-5 flex-1 bg-success/20 text-success hover:bg-success/30"
+                  onClick={handleCompleteMerge}
+                  disabled={busy}
+                >
+                  <GitMerge className="h-3 w-3 mr-0.5" />
+                  {busyAction === "commit" ? "Completing..." : "Complete Merge"}
+                </Button>
+              ) : null}
+              <Button
+                size="xs"
+                variant="ghost"
+                className="text-[10px] h-5 text-danger hover:text-danger"
+                onClick={handleAbortMerge}
+                disabled={busy}
+              >
+                <XCircle className="h-3 w-3 mr-0.5" />
+                Abort
+              </Button>
+            </div>
+          </div>
+        )}
+
         {/* No changes message — outside ScrollArea to avoid scrollbar shift */}
-        {files.length === 0 && (
+        {files.length === 0 && !isMerging && (
           <div className="flex flex-col items-center justify-center min-h-[120px] text-muted-foreground">
             <Check className="h-5 w-5 mb-1.5 opacity-40" />
             <p className="text-xs">No changes</p>
@@ -719,6 +1089,21 @@ export function ChangesPanel({ workspace }: Props) {
         {/* File list */}
         <ScrollArea className="flex-1">
           <div className="px-1">
+            {(conflicted.length > 0 || resolver.status !== "idle") && (
+              <ConflictsSection
+                files={conflicted}
+                cwd={cwd}
+                onRefresh={refresh}
+                onOpenDiff={handleOpenDiff}
+                resolverEnabled={config?.ai_resolver_enabled ?? false}
+                resolverStatus={resolver.status}
+                resolverError={resolver.error}
+                onStartResolve={handleStartResolve}
+                onApproveResolve={handleApproveResolve}
+                onRejectResolve={handleRejectResolve}
+              />
+            )}
+
             {staged.length > 0 && (
               <FileSection
                 label="Staged"

@@ -285,10 +285,22 @@ pub struct CodemuxConfigSnapshot {
     pub ai_commit_message_enabled: bool,
     #[serde(default)]
     pub ai_commit_message_model: Option<String>,
+    #[serde(default)]
+    pub ai_resolver_enabled: bool,
+    #[serde(default)]
+    pub ai_resolver_cli: Option<String>,
+    #[serde(default)]
+    pub ai_resolver_model: Option<String>,
+    #[serde(default = "default_resolver_strategy")]
+    pub ai_resolver_strategy: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_resolver_strategy() -> String {
+    "smart_merge".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -361,6 +373,22 @@ impl AppStateStore {
 
     pub fn set_ai_commit_message_model(&self, model: Option<String>) {
         self.inner.lock().unwrap().config.ai_commit_message_model = model;
+    }
+
+    pub fn set_ai_resolver_enabled(&self, enabled: bool) {
+        self.inner.lock().unwrap().config.ai_resolver_enabled = enabled;
+    }
+
+    pub fn set_ai_resolver_cli(&self, cli: Option<String>) {
+        self.inner.lock().unwrap().config.ai_resolver_cli = cli;
+    }
+
+    pub fn set_ai_resolver_model(&self, model: Option<String>) {
+        self.inner.lock().unwrap().config.ai_resolver_model = model;
+    }
+
+    pub fn set_ai_resolver_strategy(&self, strategy: String) {
+        self.inner.lock().unwrap().config.ai_resolver_strategy = strategy;
     }
 
     pub fn active_terminal_session_id(&self) -> Option<SessionId> {
@@ -2122,6 +2150,10 @@ fn default_app_state() -> AppStateSnapshot {
             notification_sound_enabled: true,
             ai_commit_message_enabled: true,
             ai_commit_message_model: None,
+            ai_resolver_enabled: false,
+            ai_resolver_cli: None,
+            ai_resolver_model: None,
+            ai_resolver_strategy: default_resolver_strategy(),
         },
     }
 }

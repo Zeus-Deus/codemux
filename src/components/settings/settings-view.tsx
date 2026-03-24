@@ -29,6 +29,10 @@ import {
   setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
   setAiCommitMessageModel,
+  setAiResolverEnabled,
+  setAiResolverCli,
+  setAiResolverModel,
+  setAiResolverStrategy,
 } from "@/tauri/commands";
 import type { EditorInfo } from "@/tauri/types";
 
@@ -279,6 +283,71 @@ export function SettingsView() {
                     className="w-36 h-9"
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
+                </SettingRow>
+              </div>
+            </div>
+
+            <div className="mt-8">
+              <h3 className="text-sm font-medium mb-1">Merge Conflict Resolver</h3>
+              <p className="text-xs text-muted-foreground mb-4">
+                AI-powered merge conflict resolution. Creates a safe temp branch, resolves conflicts, then lets you review before applying.
+              </p>
+              <div className="space-y-1">
+                <SettingRow label="Enable resolver" description="Show 'Resolve with AI' button in the conflicts section.">
+                  <Switch
+                    checked={config?.ai_resolver_enabled ?? false}
+                    onCheckedChange={(checked) =>
+                      setAiResolverEnabled(checked).catch(console.error)
+                    }
+                  />
+                </SettingRow>
+                <SettingRow label="CLI tool" description="Which AI CLI to use for resolving conflicts.">
+                  <Select
+                    value={config?.ai_resolver_cli ?? "claude"}
+                    onValueChange={(v) =>
+                      setAiResolverCli(v).catch(console.error)
+                    }
+                    disabled={!(config?.ai_resolver_enabled ?? false)}
+                  >
+                    <SelectTrigger className="w-36 h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="claude">Claude Code</SelectItem>
+                      <SelectItem value="codex">Codex</SelectItem>
+                      <SelectItem value="opencode">OpenCode</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </SettingRow>
+                <SettingRow label="Model override" description="Leave empty to use the CLI default.">
+                  <Input
+                    value={config?.ai_resolver_model ?? ""}
+                    onChange={(e) =>
+                      setAiResolverModel(e.target.value || null).catch(console.error)
+                    }
+                    placeholder="Default"
+                    className="w-36 h-9"
+                    disabled={!(config?.ai_resolver_enabled ?? false)}
+                  />
+                </SettingRow>
+                <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
+                  <Select
+                    value={config?.ai_resolver_strategy ?? "smart_merge"}
+                    onValueChange={(v) =>
+                      setAiResolverStrategy(v).catch(console.error)
+                    }
+                    disabled={!(config?.ai_resolver_enabled ?? false)}
+                  >
+                    <SelectTrigger className="w-48 h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="smart_merge">Smart merge</SelectItem>
+                      <SelectItem value="keep_both">Keep both</SelectItem>
+                      <SelectItem value="prefer_ours">Prefer my branch</SelectItem>
+                      <SelectItem value="prefer_theirs">Prefer target</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </SettingRow>
               </div>
             </div>

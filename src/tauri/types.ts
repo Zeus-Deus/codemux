@@ -229,7 +229,8 @@ export type FileStatus =
   | "deleted"
   | "renamed"
   | "untracked"
-  | "copied";
+  | "copied"
+  | "conflicted";
 
 export interface GitFileStatus {
   path: string;
@@ -238,6 +239,25 @@ export interface GitFileStatus {
   is_unstaged: boolean;
   additions: number;
   deletions: number;
+  conflict_type: string | null;
+}
+
+export interface ConflictFile {
+  path: string;
+  conflict_type: string;
+}
+
+export interface MergeState {
+  is_merging: boolean;
+  is_rebasing: boolean;
+  merge_head: string | null;
+  conflicted_files: ConflictFile[];
+}
+
+export interface ConflictCheckResult {
+  has_conflicts: boolean;
+  conflicting_files: ConflictFile[];
+  target_branch: string;
 }
 
 export interface GitDiffStat {
@@ -401,6 +421,17 @@ export interface CodemuxConfigSnapshot {
   notification_sound_enabled: boolean;
   ai_commit_message_enabled: boolean;
   ai_commit_message_model: string | null;
+  ai_resolver_enabled: boolean;
+  ai_resolver_cli: string | null;
+  ai_resolver_model: string | null;
+  ai_resolver_strategy: string;
+}
+
+export interface ResolverBranchInfo {
+  temp_branch: string;
+  original_branch: string;
+  target_branch: string;
+  conflicting_files: ConflictFile[];
 }
 
 export interface PortInfoSnapshot {

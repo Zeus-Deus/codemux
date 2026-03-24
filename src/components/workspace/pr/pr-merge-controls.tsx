@@ -7,8 +7,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { mergePullRequest } from "@/tauri/commands";
-import type { PullRequestInfo } from "@/tauri/types";
+import { AlertTriangle, Loader2 } from "lucide-react";
+import { mergePullRequest, checkMergeConflicts } from "@/tauri/commands";
+import type { PullRequestInfo, ConflictCheckResult } from "@/tauri/types";
 
 interface Props {
   pr: PullRequestInfo;
@@ -21,6 +22,8 @@ export function PrMergeControls({ pr, cwd, onRefresh }: Props) {
   const [confirmMerge, setConfirmMerge] = useState(false);
   const [merging, setMerging] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [conflictCheck, setConflictCheck] = useState<ConflictCheckResult | null>(null);
+  const [checking, setChecking] = useState(false);
 
   if (pr.state !== "OPEN") return null;
 
@@ -80,7 +83,42 @@ export function PrMergeControls({ pr, cwd, onRefresh }: Props) {
         </Button>
       </div>
       {pr.mergeable === "CONFLICTING" && (
-        <p className="text-[10px] text-danger px-1">Has merge conflicts</p>
+        <div className="space-y-1 px-1">
+          <div className="flex items-center gap-1">
+            <AlertTriangle className="h-3 w-3 text-danger shrink-0" />
+            <p className="text-[10px] text-danger">Has merge conflicts</p>
+          </div>
+          <Button
+            size="xs"
+            variant="ghost"
+            className="text-[10px] h-5"
+            disabled={checking}
+            onClick={async () => {
+              setChecking(true);
+              setConflictCheck(null);
+              try {
+                const result = await checkMergeConflicts(cwd, pr.base_branch ?? "main");
+                setConflictCheck(result);
+              } catch (err) {
+                setError(String(err));
+              } finally {
+                setChecking(false);
+              }
+            }}
+          >
+            {checking ? <Loader2 className="h-3 w-3 animate-spin mr-0.5" /> : null}
+            Check Locally
+          </Button>
+          {conflictCheck?.has_conflicts && (
+            <div className="space-y-0.5">
+              {conflictCheck.conflicting_files.map((f) => (
+                <p key={f.path} className="text-[10px] text-danger/70 font-mono truncate">
+                  {f.path}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
       )}
       {error && (
         <p className="text-xs text-danger break-words px-1">{error}</p>

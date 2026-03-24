@@ -29,6 +29,9 @@ import type {
   ReviewComment,
   InlineReviewComment,
   DeploymentInfo,
+  MergeState,
+  ConflictCheckResult,
+  ResolverBranchInfo,
   SearchResult,
   ShellAppearance,
   TabKind,
@@ -283,6 +286,48 @@ export const listBranches = (path: string, remote: boolean) =>
 export const listWorktrees = (path: string) =>
   invoke<WorktreeInfo[]>("list_worktrees", { path });
 
+// ── Merge Conflicts ──
+
+export const getMergeState = (path: string) =>
+  invoke<MergeState>("get_merge_state", { path });
+
+export const checkMergeConflicts = (path: string, targetBranch: string) =>
+  invoke<ConflictCheckResult>("check_merge_conflicts", { path, targetBranch });
+
+export const resolveConflictOurs = (path: string, file: string) =>
+  invoke("resolve_conflict_ours", { path, file });
+
+export const resolveConflictTheirs = (path: string, file: string) =>
+  invoke("resolve_conflict_theirs", { path, file });
+
+export const markConflictResolved = (path: string, file: string) =>
+  invoke("mark_conflict_resolved", { path, file });
+
+export const abortMerge = (path: string) =>
+  invoke("abort_merge", { path });
+
+export const continueMerge = (path: string, message: string) =>
+  invoke("continue_merge", { path, message });
+
+// ── Resolver Branches ──
+
+export const createResolverBranch = (path: string, targetBranch: string) =>
+  invoke<ResolverBranchInfo>("create_resolver_branch", { path, targetBranch });
+
+export const applyResolution = (path: string, tempBranch: string, originalBranch: string, message: string) =>
+  invoke("apply_resolution", { path, tempBranch, originalBranch, message });
+
+export const abortResolution = (path: string, tempBranch: string, originalBranch: string) =>
+  invoke("abort_resolution", { path, tempBranch, originalBranch });
+
+export const getResolutionDiff = (path: string) =>
+  invoke<string>("get_resolution_diff", { path });
+
+export const resolveConflictsWithAgent = (
+  path: string, cli: string, model: string | null, strategy: string, files: string[]
+) =>
+  invoke<string>("resolve_conflicts_with_agent", { path, cli, model, strategy, files });
+
 // ── AI ──
 
 export const checkClaudeAvailable = () =>
@@ -296,6 +341,18 @@ export const setAiCommitMessageEnabled = (enabled: boolean) =>
 
 export const setAiCommitMessageModel = (model: string | null) =>
   invoke("set_ai_commit_message_model", { model });
+
+export const setAiResolverEnabled = (enabled: boolean) =>
+  invoke("set_ai_resolver_enabled", { enabled });
+
+export const setAiResolverCli = (cli: string | null) =>
+  invoke("set_ai_resolver_cli", { cli });
+
+export const setAiResolverModel = (model: string | null) =>
+  invoke("set_ai_resolver_model", { model });
+
+export const setAiResolverStrategy = (strategy: string) =>
+  invoke("set_ai_resolver_strategy", { strategy });
 
 // ── Browser ──
 

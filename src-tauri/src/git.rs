@@ -12,6 +12,7 @@ pub enum FileStatus {
     Renamed,
     Untracked,
     Copied,
+    Conflicted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,6 +25,8 @@ pub struct GitFileStatus {
     pub additions: u32,
     #[serde(default)]
     pub deletions: u32,
+    #[serde(default)]
+    pub conflict_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +84,18 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
         .unwrap_or_default()
+}
+
+/// Run git and return (stdout, stderr, success) regardless of exit code.
+fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim_end().to_string();
+    Ok((stdout, stderr, output.status.success()))
 }
 
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
@@ -267,22 +282,35 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
             path_part.to_string()
         };
 
-        let status = match (index_status, worktree_status) {
-            (b'?', b'?') => FileStatus::Untracked,
-            (b'A', _) => FileStatus::Added,
-            (b'R', _) => FileStatus::Renamed,
-            (b'C', _) => FileStatus::Copied,
-            (b'D', _) | (_, b'D') => FileStatus::Deleted,
-            (b'M', _) | (_, b'M') => FileStatus::Modified,
-            _ => FileStatus::Modified,
+        let (status, conflict_type) = match (index_status, worktree_status) {
+            // Conflict codes — must be checked before single-letter matches
+            (b'U', b'U') => (FileStatus::Conflicted, Some("both_modified".to_string())),
+            (b'A', b'A') => (FileStatus::Conflicted, Some("both_added".to_string())),
+            (b'D', b'D') => (FileStatus::Conflicted, Some("both_deleted".to_string())),
+            (b'U', b'D') | (b'D', b'U') => (FileStatus::Conflicted, Some("deleted_by_them".to_string())),
+            (b'U', b'A') | (b'A', b'U') => (FileStatus::Conflicted, Some("added_by_them".to_string())),
+            // Normal status codes
+            (b'?', b'?') => (FileStatus::Untracked, None),
+            (b'A', _) => (FileStatus::Added, None),
+            (b'R', _) => (FileStatus::Renamed, None),
+            (b'C', _) => (FileStatus::Copied, None),
+            (b'D', _) | (_, b'D') => (FileStatus::Deleted, None),
+            (b'M', _) | (_, b'M') => (FileStatus::Modified, None),
+            _ => (FileStatus::Modified, None),
         };
 
-        // X column: staged status (anything except ' ' and '?' means staged)
-        let is_staged = index_status != b' ' && index_status != b'?';
-        // Y column: unstaged status (anything except ' ' means unstaged; '?' = untracked = unstaged)
-        let is_unstaged = worktree_status != b' ';
+        // Conflicted files belong to neither staged nor unstaged — they have their own section
+        let (is_staged, is_unstaged) = if status == FileStatus::Conflicted {
+            (false, false)
+        } else {
+            // X column: staged status (anything except ' ' and '?' means staged)
+            let staged = index_status != b' ' && index_status != b'?';
+            // Y column: unstaged status (anything except ' ' means unstaged; '?' = untracked = unstaged)
+            let unstaged = worktree_status != b' ';
+            (staged, unstaged)
+        };
 
-        results.push(GitFileStatus { path, status, is_staged, is_unstaged, additions: 0, deletions: 0 });
+        results.push(GitFileStatus { path, status, is_staged, is_unstaged, additions: 0, deletions: 0, conflict_type });
     }
     results
 }
@@ -315,6 +343,265 @@ fn parse_numstat(output: &str) -> (u32, u32) {
         }
     }
     (total_add, total_del)
+}
+
+// ---- Merge conflict operations ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictFile {
+    pub path: String,
+    pub conflict_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeState {
+    pub is_merging: bool,
+    pub is_rebasing: bool,
+    pub merge_head: Option<String>,
+    pub conflicted_files: Vec<ConflictFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictCheckResult {
+    pub has_conflicts: bool,
+    pub conflicting_files: Vec<ConflictFile>,
+    pub target_branch: String,
+}
+
+/// Get the actual git directory (handles worktrees where .git is a file).
+fn resolve_git_dir(repo_path: &Path) -> Result<PathBuf, String> {
+    let output = run_git(repo_path, &["rev-parse", "--git-dir"])?;
+    let git_dir = PathBuf::from(output.trim());
+    if git_dir.is_absolute() {
+        Ok(git_dir)
+    } else {
+        Ok(repo_path.join(git_dir))
+    }
+}
+
+pub fn get_merge_state(repo_path: &Path) -> Result<MergeState, String> {
+    let git_dir = resolve_git_dir(repo_path)?;
+
+    let is_merging = git_dir.join("MERGE_HEAD").exists();
+    let is_rebasing = git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
+
+    let merge_head = if is_merging {
+        std::fs::read_to_string(git_dir.join("MERGE_HEAD"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    };
+
+    let conflicted_files = if is_merging || is_rebasing {
+        git_status(repo_path)?
+            .into_iter()
+            .filter(|f| f.status == FileStatus::Conflicted)
+            .map(|f| ConflictFile {
+                path: f.path,
+                conflict_type: f.conflict_type.unwrap_or_else(|| "both_modified".to_string()),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok(MergeState { is_merging, is_rebasing, merge_head, conflicted_files })
+}
+
+pub fn check_merge_conflicts(
+    repo_path: &Path,
+    target_branch: &str,
+) -> Result<ConflictCheckResult, String> {
+    // Safety: refuse to run on dirty working tree
+    let status = git_status(repo_path)?;
+    if !status.is_empty() {
+        return Err("Cannot check for conflicts: working tree has uncommitted changes. Commit or stash your changes first.".to_string());
+    }
+
+    // Attempt dry-run merge
+    let (_stdout, _stderr, success) = run_git_full(
+        repo_path,
+        &["merge", "--no-commit", "--no-ff", target_branch],
+    )?;
+
+    if success {
+        // Clean merge — abort to undo
+        let _ = run_git(repo_path, &["merge", "--abort"]);
+        return Ok(ConflictCheckResult {
+            has_conflicts: false,
+            conflicting_files: Vec::new(),
+            target_branch: target_branch.to_string(),
+        });
+    }
+
+    // Merge had conflicts — collect them from status
+    let conflict_status = git_status(repo_path).unwrap_or_default();
+    let conflicting_files: Vec<ConflictFile> = conflict_status
+        .iter()
+        .filter(|f| f.status == FileStatus::Conflicted)
+        .map(|f| ConflictFile {
+            path: f.path.clone(),
+            conflict_type: f.conflict_type.clone().unwrap_or_else(|| "both_modified".to_string()),
+        })
+        .collect();
+
+    // Abort the merge to restore clean state
+    let _ = run_git(repo_path, &["merge", "--abort"]);
+
+    Ok(ConflictCheckResult {
+        has_conflicts: !conflicting_files.is_empty(),
+        conflicting_files,
+        target_branch: target_branch.to_string(),
+    })
+}
+
+pub fn resolve_conflict_ours(repo_path: &Path, file: &str) -> Result<(), String> {
+    run_git(repo_path, &["checkout", "--ours", "--", file])?;
+    run_git(repo_path, &["add", "--", file])?;
+    Ok(())
+}
+
+pub fn resolve_conflict_theirs(repo_path: &Path, file: &str) -> Result<(), String> {
+    run_git(repo_path, &["checkout", "--theirs", "--", file])?;
+    run_git(repo_path, &["add", "--", file])?;
+    Ok(())
+}
+
+pub fn mark_conflict_resolved(repo_path: &Path, file: &str) -> Result<(), String> {
+    run_git(repo_path, &["add", "--", file])?;
+    Ok(())
+}
+
+pub fn abort_merge(repo_path: &Path) -> Result<(), String> {
+    let git_dir = resolve_git_dir(repo_path)?;
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        run_git(repo_path, &["rebase", "--abort"])?;
+    } else {
+        run_git(repo_path, &["merge", "--abort"])?;
+    }
+    Ok(())
+}
+
+pub fn continue_merge(repo_path: &Path, message: &str) -> Result<(), String> {
+    let git_dir = resolve_git_dir(repo_path)?;
+    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
+        // For rebase, continue with the current state
+        run_git(repo_path, &["rebase", "--continue"])?;
+    } else {
+        // For merge, commit with the provided message
+        run_git(repo_path, &["commit", "-m", message])?;
+    }
+    Ok(())
+}
+
+// ---- Resolver branch operations ----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolverBranchInfo {
+    pub temp_branch: String,
+    pub original_branch: String,
+    pub target_branch: String,
+    pub conflicting_files: Vec<ConflictFile>,
+}
+
+pub fn create_resolver_branch(
+    repo_path: &Path,
+    target_branch: &str,
+) -> Result<ResolverBranchInfo, String> {
+    // Get current branch
+    let original_branch = run_git(repo_path, &["branch", "--show-current"])?;
+    if original_branch.is_empty() {
+        return Err("Cannot create resolver branch: not on a named branch".to_string());
+    }
+
+    // Generate temp branch name
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let safe_source = original_branch.replace('/', "-");
+    let safe_target = target_branch.replace('/', "-");
+    let temp_branch = format!("bot/resolve-{}-into-{}-{}", safe_source, safe_target, timestamp);
+
+    // Create and switch to temp branch
+    run_git(repo_path, &["checkout", "-b", &temp_branch])?;
+
+    // Start the merge (will fail with conflicts — that's expected)
+    let (_stdout, _stderr, _success) = run_git_full(
+        repo_path,
+        &["merge", "--no-edit", target_branch],
+    )?;
+
+    // Parse status for conflicted files
+    let status = git_status(repo_path).unwrap_or_default();
+    let conflicting_files: Vec<ConflictFile> = status
+        .iter()
+        .filter(|f| f.status == FileStatus::Conflicted)
+        .map(|f| ConflictFile {
+            path: f.path.clone(),
+            conflict_type: f.conflict_type.clone().unwrap_or_else(|| "both_modified".to_string()),
+        })
+        .collect();
+
+    Ok(ResolverBranchInfo {
+        temp_branch,
+        original_branch,
+        target_branch: target_branch.to_string(),
+        conflicting_files,
+    })
+}
+
+pub fn apply_resolution(
+    repo_path: &Path,
+    temp_branch: &str,
+    original_branch: &str,
+    message: &str,
+) -> Result<(), String> {
+    // Verify all conflicts are resolved
+    let status = git_status(repo_path)?;
+    let unresolved: Vec<_> = status.iter().filter(|f| f.status == FileStatus::Conflicted).collect();
+    if !unresolved.is_empty() {
+        return Err(format!(
+            "Cannot apply resolution: {} unresolved conflict(s)",
+            unresolved.len()
+        ));
+    }
+
+    // Commit the merge on temp branch
+    run_git(repo_path, &["commit", "-m", message])?;
+
+    // Switch back to original branch
+    run_git(repo_path, &["checkout", original_branch])?;
+
+    // Merge the temp branch (should be a fast-forward)
+    run_git(repo_path, &["merge", temp_branch])?;
+
+    // Clean up temp branch
+    let _ = run_git(repo_path, &["branch", "-d", temp_branch]);
+
+    Ok(())
+}
+
+pub fn abort_resolution(
+    repo_path: &Path,
+    temp_branch: &str,
+    original_branch: &str,
+) -> Result<(), String> {
+    // Abort any in-progress merge
+    let _ = run_git(repo_path, &["merge", "--abort"]);
+
+    // Switch back to original branch
+    run_git(repo_path, &["checkout", original_branch])?;
+
+    // Force-delete the temp branch
+    run_git(repo_path, &["branch", "-D", temp_branch])?;
+
+    Ok(())
+}
+
+pub fn get_resolution_diff(repo_path: &Path) -> Result<String, String> {
+    run_git(repo_path, &["diff", "--cached"])
 }
 
 // ---- Worktree operations ----
