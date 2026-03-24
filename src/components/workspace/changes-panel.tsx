@@ -694,7 +694,6 @@ function FileSection({
 
 export function ChangesPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
-  console.log("[ChangesPanel] cwd:", cwd, "worktree_path:", workspace.worktree_path, "workspace.cwd:", workspace.cwd);
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
@@ -725,7 +724,6 @@ export function ChangesPanel({ workspace }: Props) {
       gitLogEntries(cwd, 10).catch((e) => { console.error("[ChangesPanel] git log failed:", e); return [] as GitLogEntry[]; }),
       getMergeState(cwd).catch(() => null as MergeState | null),
     ]).then(([status, info, log, merge]) => {
-      console.log("[ChangesPanel] status:", status.length, "files, branch:", info?.branch, "commits:", log.length);
       setFiles(status);
       if (info) setBranchInfo(info);
       setCommits(log);
@@ -735,7 +733,7 @@ export function ChangesPanel({ workspace }: Props) {
 
   useEffect(() => {
     refresh();
-    refreshRef.current = setInterval(refresh, 3000);
+    refreshRef.current = setInterval(refresh, 10000);
     return () => {
       if (refreshRef.current) clearInterval(refreshRef.current);
     };

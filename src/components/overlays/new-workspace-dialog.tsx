@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -225,9 +226,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[500px] p-0 gap-0">
+      <DialogContent className="max-w-[500px] sm:max-w-[500px] max-h-[85vh] p-0 gap-0">
         <DialogHeader className="p-4 pb-0">
           <DialogTitle className="text-sm">New Workspace</DialogTitle>
+          <DialogDescription className="sr-only">Create a new workspace from a branch or pull request</DialogDescription>
         </DialogHeader>
 
         <Tabs defaultValue="new-branch" className="flex flex-col">
@@ -298,14 +300,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               onChange={(e) => setBranchSearch(e.target.value)}
               className="h-8 text-sm"
             />
-            <ScrollArea className="h-48">
+            <div className="h-48 overflow-y-auto">
               <div className="space-y-0.5">
                 {filteredBranches.map((branch) => {
                   const hasWs = branchWorkspaceMap.has(branch);
                   return (
                     <button
                       key={branch}
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-left hover:bg-accent"
+                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-left hover:bg-accent min-w-0"
                       onClick={() =>
                         hasWs
                           ? activateWorkspace(
@@ -316,17 +318,19 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       disabled={creating}
                     >
                       <GitBranch className="h-3 w-3 shrink-0 text-muted-foreground" />
-                      <span className="truncate flex-1">{branch}</span>
-                      {branch === currentBranch && (
-                        <Badge variant="secondary" className="text-[10px]">
-                          current
-                        </Badge>
-                      )}
-                      {hasWs && (
-                        <Badge variant="outline" className="text-[10px]">
-                          open
-                        </Badge>
-                      )}
+                      <span className="truncate flex-1 min-w-0" title={branch}>{branch}</span>
+                      <div className="flex gap-1 shrink-0">
+                        {branch === currentBranch && (
+                          <Badge variant="secondary" className="text-[10px]">
+                            current
+                          </Badge>
+                        )}
+                        {hasWs && (
+                          <Badge variant="outline" className="text-[10px]">
+                            open
+                          </Badge>
+                        )}
+                      </div>
                     </button>
                   );
                 })}
@@ -336,7 +340,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   </p>
                 )}
               </div>
-            </ScrollArea>
+            </div>
             <PresetSelector
               presets={presets}
               selected={selectedPreset}

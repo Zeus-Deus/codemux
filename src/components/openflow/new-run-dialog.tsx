@@ -11,6 +11,7 @@ import {
   listAvailableCliTools,
   listModelsForTool,
   listThinkingModesForTool,
+  createOpenflowWorkspace,
   createOpenflowRun,
   spawnOpenflowAgents,
   activateWorkspace,
@@ -19,6 +20,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -163,7 +165,7 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
   );
 
   const handlePickFolder = async () => {
-    const folder = await pickFolderDialog("Select project directory");
+    const folder = await pickFolderDialog("Choose folder");
     if (folder) setCwd(folder);
   };
 
@@ -172,6 +174,10 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
     setSubmitting(true);
 
     try {
+      // 1. Create the OpenFlow workspace (returns workspace_id)
+      const workspaceId = await createOpenflowWorkspace(title, goal, cwd || null);
+
+      // 2. Create the run record
       const agentRoles = agents.map((a) => a.role);
       const run = await createOpenflowRun({
         title,
@@ -179,6 +185,7 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
         agent_roles: agentRoles,
       });
 
+      // 3. Build agent configs and spawn agents
       const configs: AgentConfig[] = agents.map((a, i) => ({
         agent_index: i,
         cli_tool: a.cliTool,
@@ -188,28 +195,10 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
         role: a.role,
       }));
 
-      // The workspace is created by createOpenflowRun on the backend
-      // We need the workspace_id — sync runtime to discover it
-      await syncRuntime();
+      await spawnOpenflowAgents(workspaceId, run.run_id, goal, cwd, configs);
 
-      // Use workspace from app state since the run was just created
-      const { useAppStore } = await import("@/stores/app-store");
-      const appState = useAppStore.getState().appState;
-      const openflowWs = appState?.workspaces.find(
-        (w) => w.workspace_type === "open_flow",
-      );
-
-      if (openflowWs) {
-        await spawnOpenflowAgents(
-          openflowWs.workspace_id,
-          run.run_id,
-          goal,
-          cwd,
-          configs,
-        );
-        await activateWorkspace(openflowWs.workspace_id);
-      }
-
+      // 4. Activate the workspace and update state
+      await activateWorkspace(workspaceId);
       setActiveRun(run.run_id);
       await syncRuntime();
       setOpen(false);
@@ -224,9 +213,10 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="max-w-2xl max-h-[85vh] overflow-y-auto">
+      <DialogContent className="max-w-4xl sm:max-w-4xl w-full max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-sm">New OpenFlow Run</DialogTitle>
+          <DialogDescription className="sr-only">Configure and start a multi-agent orchestration run</DialogDescription>
         </DialogHeader>
 
         <div className="space-y-4">
@@ -292,111 +282,113 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
           </div>
 
           {/* Agent config table */}
-          <div className="border rounded-md overflow-hidden">
-            <div className="grid grid-cols-[36px_1fr_1fr_1fr_1fr] gap-px bg-border text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
-              <div className="bg-card px-2 py-1.5">#</div>
-              <div className="bg-card px-2 py-1.5">Tool</div>
-              <div className="bg-card px-2 py-1.5">Model</div>
-              <div className="bg-card px-2 py-1.5">Role</div>
-              <div className="bg-card px-2 py-1.5">Thinking</div>
-            </div>
-            {agents.map((agent, i) => (
-              <div
-                key={i}
-                className="grid grid-cols-[36px_1fr_1fr_1fr_1fr] gap-px bg-border"
-              >
-                <div className="bg-card flex items-center justify-center text-xs text-muted-foreground">
-                  {i}
-                </div>
-                <div className="bg-card p-1">
-                  <Select
-                    value={agent.cliTool}
-                    onValueChange={(v) => {
-                      updateAgent(i, { cliTool: v, model: "", provider: "" });
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-[11px]">
-                      <SelectValue placeholder="Tool" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availableTools.map((t) => (
-                        <SelectItem key={t.id} value={t.id} className="text-xs">
-                          {t.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="bg-card p-1">
-                  <Select
-                    value={agent.model}
-                    onValueChange={(v) => {
-                      const m = models[agent.cliTool]?.find((m) => m.id === v);
-                      updateAgent(i, {
-                        model: v,
-                        provider: m?.provider ?? "",
-                      });
-                    }}
-                  >
-                    <SelectTrigger className="h-7 text-[11px]">
-                      <SelectValue placeholder="Model" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(models[agent.cliTool] ?? []).map((m) => (
-                        <SelectItem key={m.id} value={m.id} className="text-xs">
-                          {m.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="bg-card p-1">
-                  <Select
-                    value={agent.role}
-                    onValueChange={(v) =>
-                      updateAgent(i, { role: v as OpenFlowRole })
-                    }
-                  >
-                    <SelectTrigger className="h-7 text-[11px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {ROLES.map((r) => (
-                        <SelectItem key={r} value={r} className="text-xs capitalize">
-                          {r}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="bg-card p-1">
-                  <Select
-                    value={agent.thinkingMode}
-                    onValueChange={(v) => updateAgent(i, { thinkingMode: v })}
-                  >
-                    <SelectTrigger className="h-7 text-[11px]">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {(thinkingModes[agent.cliTool] ?? [{ id: "auto", name: "Auto", description: "" }]).map(
-                        (tm) => (
-                          <SelectItem
-                            key={tm.id}
-                            value={tm.id}
-                            className="text-xs"
-                          >
-                            {tm.name}
+          <table className="w-full border-collapse border rounded-md text-xs">
+            <thead>
+              <tr className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">
+                <th className="w-10 px-2 py-1.5 text-left border-b">#</th>
+                <th className="w-1/4 px-2 py-1.5 text-left border-b">Tool</th>
+                <th className="w-1/4 px-2 py-1.5 text-left border-b">Model</th>
+                <th className="w-1/4 px-2 py-1.5 text-left border-b">Role</th>
+                <th className="px-2 py-1.5 text-left border-b">Thinking</th>
+              </tr>
+            </thead>
+            <tbody>
+              {agents.map((agent, i) => (
+                <tr key={i} className="border-b border-border/50 last:border-b-0">
+                  <td className="px-2 py-1 text-center text-muted-foreground">{i}</td>
+                  <td className="px-1 py-1">
+                    <Select
+                      value={agent.cliTool}
+                      onValueChange={(v) => {
+                        updateAgent(i, { cliTool: v, model: "", provider: "" });
+                      }}
+                    >
+                      <SelectTrigger className="h-7 text-[11px]">
+                        <SelectValue placeholder="Tool" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {availableTools.map((t) => (
+                          <SelectItem key={t.id} value={t.id} className="text-xs">
+                            {t.name}
                           </SelectItem>
-                        ),
-                      )}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
-            ))}
-          </div>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </td>
+                  <td className="px-1 py-1">
+                    <Select
+                      value={agent.model}
+                      onValueChange={(v) => {
+                        const m = models[agent.cliTool]?.find((m) => m.id === v);
+                        updateAgent(i, {
+                          model: v,
+                          provider: m?.provider ?? "",
+                        });
+                      }}
+                    >
+                      <SelectTrigger className="h-7 text-[11px]">
+                        <SelectValue placeholder="Model" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(models[agent.cliTool] ?? []).map((m) => (
+                          <SelectItem key={m.id} value={m.id} className="text-xs">
+                            {m.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </td>
+                  <td className="px-1 py-1">
+                    <Select
+                      value={agent.role}
+                      onValueChange={(v) =>
+                        updateAgent(i, { role: v as OpenFlowRole })
+                      }
+                    >
+                      <SelectTrigger className="h-7 text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {ROLES.map((r) => (
+                          <SelectItem key={r} value={r} className="text-xs capitalize">
+                            {r}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </td>
+                  <td className="px-1 py-1">
+                    <Select
+                      value={agent.thinkingMode}
+                      onValueChange={(v) => updateAgent(i, { thinkingMode: v })}
+                    >
+                      <SelectTrigger className="h-7 text-[11px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(thinkingModes[agent.cliTool] ?? [{ id: "auto", name: "Auto", description: "" }]).map(
+                          (tm) => (
+                            <SelectItem
+                              key={tm.id}
+                              value={tm.id}
+                              className="text-xs"
+                            >
+                              {tm.name}
+                            </SelectItem>
+                          ),
+                        )}
+                      </SelectContent>
+                    </Select>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
 
-          {/* Submit */}
+        </div>
+
+        {/* Sticky submit footer */}
+        <div className="sticky bottom-0 -mx-4 -mb-4 border-t bg-popover p-4">
           <Button
             className="w-full h-8 text-xs"
             onClick={handleSubmit}

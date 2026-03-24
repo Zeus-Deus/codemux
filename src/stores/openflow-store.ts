@@ -104,28 +104,33 @@ export const useOpenFlowStore = create<OpenFlowStore>((set, get) => ({
   setNewRunDialogOpen: (open) => set({ newRunDialogOpen: open }),
 }));
 
+// Stable empty references to avoid infinite re-render loops.
+// Zustand uses Object.is() — returning [] literal creates a new ref each call.
+const EMPTY_COMM_LOG: CommLogEntry[] = [];
+const EMPTY_SESSIONS: AgentSessionState[] = [];
+
 // Derived selectors
 
 export function useActiveRun(): OpenFlowRunRecord | null {
-  return useOpenFlowStore((s) => {
-    if (!s.runtimeSnapshot || !s.activeRunId) return null;
-    return (
-      s.runtimeSnapshot.active_runs.find((r) => r.run_id === s.activeRunId) ??
-      null
-    );
-  });
+  const activeRunId = useOpenFlowStore((s) => s.activeRunId);
+  const run = useOpenFlowStore((s) =>
+    s.runtimeSnapshot?.active_runs.find((r) => r.run_id === s.activeRunId) ?? null,
+  );
+  return activeRunId ? run : null;
 }
 
 export function useActiveCommLog(): CommLogEntry[] {
-  return useOpenFlowStore((s) => {
-    if (!s.activeRunId) return [];
-    return s.commLog[s.activeRunId] ?? [];
-  });
+  const activeRunId = useOpenFlowStore((s) => s.activeRunId);
+  const log = useOpenFlowStore((s) =>
+    activeRunId ? s.commLog[activeRunId] : undefined,
+  );
+  return log ?? EMPTY_COMM_LOG;
 }
 
 export function useActiveAgentSessions(): AgentSessionState[] {
-  return useOpenFlowStore((s) => {
-    if (!s.activeRunId) return [];
-    return s.agentSessions[s.activeRunId] ?? [];
-  });
+  const activeRunId = useOpenFlowStore((s) => s.activeRunId);
+  const sessions = useOpenFlowStore((s) =>
+    activeRunId ? s.agentSessions[activeRunId] : undefined,
+  );
+  return sessions ?? EMPTY_SESSIONS;
 }
