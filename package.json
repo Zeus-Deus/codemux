@@ -4,6 +4,7 @@
   "description": "",
   "type": "module",
   "scripts": {
+    "postinstall": "bash scripts/patch-agent-browser.sh",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
