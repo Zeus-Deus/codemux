@@ -15,7 +15,8 @@ interface Props {
   projectPath: string;
   workspaces: WorkspaceSnapshot[];
   activeWorkspaceId: string;
-  onWorkspaceDragStart?: (workspaceId: string, sectionId: string | null) => (e: React.DragEvent) => void;
+  onWorkspaceDragStart?: (workspaceId: string, sectionId: string | null, projectPath: string | null) => (e: React.DragEvent) => void;
+  onProjectDragStart?: (e: React.DragEvent) => void;
   dragStateId?: string | null;
 }
 
@@ -25,6 +26,7 @@ export function SidebarProjectGroup({
   workspaces,
   activeWorkspaceId,
   onWorkspaceDragStart,
+  onProjectDragStart,
   dragStateId,
 }: Props) {
   const [collapsed, setCollapsed] = useState(false);
@@ -49,6 +51,9 @@ export function SidebarProjectGroup({
         onClick={handleToggle}
         className="gap-1.5"
         title={projectPath}
+        draggable={!!onProjectDragStart}
+        onDragStart={onProjectDragStart}
+        data-project-header-path={projectPath}
       >
         <Folder className="h-3 w-3 shrink-0 text-muted-foreground/60" />
         <ChevronRight
@@ -71,7 +76,7 @@ export function SidebarProjectGroup({
                 data-ws-id={ws.workspace_id}
                 data-ws-index={idx}
                 draggable={!!onWorkspaceDragStart}
-                onDragStart={onWorkspaceDragStart?.(ws.workspace_id, null)}
+                onDragStart={onWorkspaceDragStart?.(ws.workspace_id, null, projectPath)}
                 className={dragStateId === ws.workspace_id ? "opacity-40" : ""}
               >
                 <SidebarWorkspaceRow

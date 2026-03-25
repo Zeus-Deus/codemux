@@ -29,7 +29,7 @@ interface Props {
   section: WorkspaceSectionSnapshot;
   workspaces: WorkspaceSnapshot[];
   activeWorkspaceId: string;
-  onWorkspaceDragStart?: (workspaceId: string, sectionId: string | null) => (e: React.DragEvent) => void;
+  onWorkspaceDragStart?: (workspaceId: string, sectionId: string | null, projectPath: string | null) => (e: React.DragEvent) => void;
   onSectionDragStart?: (e: React.DragEvent) => void;
   dragStateId?: string | null;
 }
@@ -126,7 +126,7 @@ export function SidebarSectionGroup({
                 data-ws-id={ws.workspace_id}
                 data-ws-index={idx}
                 draggable={!!onWorkspaceDragStart}
-                onDragStart={onWorkspaceDragStart?.(ws.workspace_id, section.section_id)}
+                onDragStart={onWorkspaceDragStart?.(ws.workspace_id, section.section_id, null)}
                 className={dragStateId === ws.workspace_id ? "opacity-40" : ""}
               >
                 <SidebarWorkspaceRow
