@@ -8,10 +8,24 @@ export function useKeyboardShortcuts() {
     const handler = (e: KeyboardEvent) => {
       if (e.repeat) return;
 
-      // Escape closes settings
+      // Escape closes settings and search dialogs
       if (e.key === "Escape" && useUIStore.getState().showSettings) {
         e.preventDefault();
         useUIStore.getState().setShowSettings(false);
+        return;
+      }
+
+      // Ctrl+P — file search
+      if (e.ctrlKey && !e.shiftKey && e.key === "p") {
+        e.preventDefault();
+        useUIStore.getState().setShowFileSearch(true);
+        return;
+      }
+
+      // Ctrl+Shift+F — content search
+      if (e.ctrlKey && e.shiftKey && e.key === "F") {
+        e.preventDefault();
+        useUIStore.getState().setShowContentSearch(true);
         return;
       }
 

@@ -31,6 +31,8 @@ export function CommandPalette({ open, onOpenChange }: Props) {
   const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
+  const setShowContentSearch = useUIStore((s) => s.setShowContentSearch);
   const { toggleSidebar } = useSidebar();
 
   const run = (fn: () => void) => {
@@ -158,6 +160,17 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             Open Diff Viewer
+          </CommandItem>
+        </CommandGroup>
+
+        <CommandGroup heading="Search">
+          <CommandItem onSelect={() => run(() => setShowFileSearch(true))}>
+            Find File by Name
+            <CommandShortcut>Ctrl+P</CommandShortcut>
+          </CommandItem>
+          <CommandItem onSelect={() => run(() => setShowContentSearch(true))}>
+            Search in Files
+            <CommandShortcut>Ctrl+Shift+F</CommandShortcut>
           </CommandItem>
         </CommandGroup>
 

@@ -8,6 +8,8 @@ interface UIStore {
   rightPanelWidth: number;
   showNewWorkspaceDialog: boolean;
   showSettings: boolean;
+  showFileSearch: boolean;
+  showContentSearch: boolean;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -15,6 +17,8 @@ interface UIStore {
   setRightPanelWidth: (width: number) => void;
   setShowNewWorkspaceDialog: (show: boolean) => void;
   setShowSettings: (show: boolean) => void;
+  setShowFileSearch: (show: boolean) => void;
+  setShowContentSearch: (show: boolean) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -24,6 +28,8 @@ export const useUIStore = create<UIStore>()(
       rightPanelWidth: 320,
       showNewWorkspaceDialog: false,
       showSettings: false,
+      showFileSearch: false,
+      showContentSearch: false,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -49,6 +55,8 @@ export const useUIStore = create<UIStore>()(
       setShowNewWorkspaceDialog: (show) => set({ showNewWorkspaceDialog: show }),
 
       setShowSettings: (show) => set({ showSettings: show }),
+      setShowFileSearch: (show) => set({ showFileSearch: show }),
+      setShowContentSearch: (show) => set({ showContentSearch: show }),
     }),
     {
       name: "codemux-ui",

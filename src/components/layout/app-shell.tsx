@@ -7,6 +7,8 @@ import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
+import { FileSearchDialog } from "@/components/search/file-search-dialog";
+import { ContentSearchDialog } from "@/components/search/content-search-dialog";
 
 export function AppShell() {
   const isLoading = useAppStore((s) => s.appState === null);
@@ -50,6 +52,8 @@ export function AppShell() {
         open={commandPaletteOpen}
         onOpenChange={setCommandPaletteOpen}
       />
+      <FileSearchDialog />
+      <ContentSearchDialog />
     </SidebarProvider>
   );
 }
