@@ -1,6 +1,8 @@
 use tauri::Manager;
 
+pub mod agent_context;
 pub mod ai;
+pub mod mcp_server;
 pub mod agent_browser;
 pub mod browser;
 pub mod cli;
@@ -110,6 +112,18 @@ pub fn run() {
                     state.activate_workspace(&ws_id.0);
                 }
             }
+
+            // Ensure .mcp.json exists for all active workspaces
+            if mcp_server::is_auto_mcp_enabled(&handle) {
+                let state: tauri::State<'_, state::AppStateStore> = handle.state();
+                for ws in state.snapshot().workspaces.iter() {
+                    mcp_server::upsert_mcp_config(
+                        std::path::Path::new(&ws.cwd),
+                        &ws.workspace_id.0,
+                    );
+                }
+            }
+
             // Restore window size from SQLite
             {
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
@@ -274,6 +288,7 @@ pub fn run() {
             commands::get_shell_appearance,
             commands::get_app_state,
             commands::create_workspace,
+            commands::regenerate_mcp_config,
             commands::create_workspace_with_preset,
             commands::create_openflow_workspace,
             commands::activate_workspace,

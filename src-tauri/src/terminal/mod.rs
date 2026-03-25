@@ -322,8 +322,25 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     let snapshot = app_state.snapshot();
     let active_workspace_id = snapshot.active_workspace_id.0.clone();
+    cmd.env("CODEMUX", "1");
+    cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("CODEMUX_WORKSPACE_ID", active_workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
+    cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
+    cmd.env("BROWSER", "codemux browser open");
+    cmd.env("CODEMUX_AGENT_CONTEXT", crate::agent_context::CODEMUX_AGENT_CONTEXT);
+
+    // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
+    if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
+        let current_path = env::var("PATH").unwrap_or_default();
+        let prefixed = if current_path.is_empty() {
+            shim_dir
+        } else {
+            format!("{shim_dir}:{current_path}")
+        };
+        cmd.env("PATH", prefixed);
+        cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
+    }
 
     let mut child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -836,8 +853,13 @@ pub fn spawn_pty_for_agent(
     cmd.cwd(cwd);
 
     // Standard Codemux env vars.
+    cmd.env("CODEMUX", "1");
+    cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("CODEMUX_WORKSPACE_ID", &workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", &session_id);
+    cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
+    cmd.env("BROWSER", "codemux browser open");
+    cmd.env("CODEMUX_AGENT_CONTEXT", crate::agent_context::CODEMUX_AGENT_CONTEXT);
 
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();

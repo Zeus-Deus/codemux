@@ -15,7 +15,8 @@
     "tauri": "tauri",
     "tauri:dev:x11": "GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
     "tauri:dev": "WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
-    "cli": "cargo run --manifest-path src-tauri/Cargo.toml --"
+    "cli": "cargo run --manifest-path src-tauri/Cargo.toml --",
+    "build:cli": "cargo build --manifest-path src-tauri/Cargo.toml && cp src-tauri/target/debug/codemux ~/.local/bin/codemux"
   },
   "license": "MIT",
   "dependencies": {

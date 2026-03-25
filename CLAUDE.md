@@ -27,8 +27,25 @@
 - `/codemux-features` auto-loads for new ADE feature implementation.
 - `/codemux-openflow` auto-loads for orchestration runtime work.
 
-## Browser Automation
+## Codemux Environment
 
-- **Never** use `xdg-open` or `open` — always use `codemux browser open <url>`.
-- Check `$CODEMUX_WORKSPACE_ID` to detect if running inside Codemux.
-- Get a snapshot before interacting so you know what elements exist.
+This terminal runs inside Codemux. Check: `test -n "$CODEMUX"`
+
+### Browser
+
+**Never** use `xdg-open` or system browsers. Use:
+- `codemux browser open <url>` — navigate browser pane
+- `codemux browser snapshot --dom` — list interactive elements with selectors
+- `codemux browser click "<selector>"` — click an element
+- `codemux browser fill "<selector>" "<text>"` — type into input
+- `codemux browser screenshot` — capture screenshot
+
+Always get a snapshot before interacting so you know what elements exist.
+
+### Commands
+
+- `codemux browser --help` — browser control
+- `codemux memory show/set/add` — project memory
+- `codemux index build/search` — code search index
+- `codemux capabilities` — JSON listing of all commands
+- `codemux --help` — discover all subcommands

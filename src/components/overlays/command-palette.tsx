@@ -19,6 +19,7 @@ import {
   closeTab,
   cyclePane,
   createBrowserPane,
+  regenerateMcpConfig,
 } from "@/tauri/commands";
 
 interface Props {
@@ -190,6 +191,16 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           </CommandItem>
           <CommandItem onSelect={() => run(() => setShowSettings(true))}>
             Open Settings
+          </CommandItem>
+          <CommandItem
+            onSelect={() =>
+              run(() =>
+                ws &&
+                regenerateMcpConfig(ws.workspace_id).catch(console.error),
+              )
+            }
+          >
+            Regenerate MCP Config
           </CommandItem>
         </CommandGroup>
 

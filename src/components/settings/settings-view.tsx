@@ -21,6 +21,7 @@ import {
   GitBranch,
   Keyboard,
   Bell,
+  Bot,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -33,17 +34,19 @@ import {
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
+  dbGetSetting,
   dbSetSetting,
 } from "@/tauri/commands";
 import type { EditorInfo } from "@/tauri/types";
 
-type Section = "appearance" | "editor" | "terminal" | "git" | "shortcuts" | "notifications";
+type Section = "appearance" | "editor" | "terminal" | "git" | "agent" | "shortcuts" | "notifications";
 
 const NAV_ITEMS: { id: Section; label: string; icon: React.ElementType }[] = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "editor", label: "Editor", icon: Code2 },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
   { id: "git", label: "Git", icon: GitBranch },
+  { id: "agent", label: "Agent", icon: Bot },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
   { id: "notifications", label: "Notifications", icon: Bell },
 ];
@@ -112,6 +115,7 @@ export function SettingsView() {
   const [fontSize, setFontSize] = useState(13);
   const [baseBranch, setBaseBranch] = useState("main");
   const [terminalThemeMode, setTerminalThemeMode] = useState("app");
+  const [autoMcpConfig, setAutoMcpConfig] = useState(true);
 
   useEffect(() => {
     detectEditors()
@@ -119,6 +123,9 @@ export function SettingsView() {
         setEditors(eds);
         if (eds.length > 0) setDefaultEditor(eds[0].id);
       })
+      .catch(() => {});
+    dbGetSetting("auto_mcp_config")
+      .then((val) => setAutoMcpConfig(val !== "false"))
       .catch(() => {});
   }, []);
 
@@ -390,6 +397,30 @@ export function SettingsView() {
                   <Separator className="mt-2" />
                 </div>
               ))}
+            </div>
+          </div>
+        );
+
+      case "agent":
+        return (
+          <div>
+            <SectionHeader
+              title="Agent"
+              description="Configure how Codemux integrates with AI coding agents."
+            />
+            <div className="space-y-1">
+              <SettingRow
+                label="Auto-configure MCP for workspaces"
+                description="Automatically write .mcp.json so agents discover Codemux tools. Disable if you manage MCP config manually."
+              >
+                <Switch
+                  checked={autoMcpConfig}
+                  onCheckedChange={(checked) => {
+                    setAutoMcpConfig(checked);
+                    dbSetSetting("auto_mcp_config", String(checked)).catch(console.error);
+                  }}
+                />
+              </SettingRow>
             </div>
           </div>
         );

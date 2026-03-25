@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { isAppShortcut } from "@/lib/app-shortcuts";
 import {
   writeToPty,
   resizePty,
@@ -305,14 +306,8 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
         ev.preventDefault?.();
         return false;
       }
-      // Tab management shortcuts — bubble to window
-      if (ev.ctrlKey && !ev.altKey) {
-        const key = ev.key.toLowerCase();
-        if (!ev.shiftKey && (key === "t" || key === "w" || key === "k")) return false;
-        if (!ev.shiftKey && ev.key >= "1" && ev.key <= "9") return false;
-        if (ev.shiftKey && (key === "b" || key === "d")) return false;
-        if (ev.key === "]" || ev.key === "[") return false;
-      }
+      // App-level shortcuts — let them bubble to window handlers
+      if (isAppShortcut(ev)) return false;
       return true;
     });
 

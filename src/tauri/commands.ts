@@ -64,6 +64,9 @@ export const restartTerminalSession = (sessionId: string) =>
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });
 
+export const regenerateMcpConfig = (workspaceId: string) =>
+  invoke<void>("regenerate_mcp_config", { workspaceId });
+
 export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
   invoke("update_workspace_cwd", { workspaceId, cwd });
 

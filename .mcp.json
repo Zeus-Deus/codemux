@@ -1,11 +1,20 @@
 {
   "mcpServers": {
+    "codemux": {
+      "args": [
+        "mcp"
+      ],
+      "command": "/home/zeus/Documents/projects/codemux/src-tauri/target/debug/codemux",
+      "env": {
+        "CODEMUX_WORKSPACE_ID": "workspace-127"
+      }
+    },
     "shadcn": {
-      "command": "npx",
       "args": [
         "shadcn@latest",
         "mcp"
-      ]
+      ],
+      "command": "npx"
     }
   }
 }

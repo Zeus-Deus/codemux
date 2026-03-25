@@ -218,6 +218,32 @@ async fn handle_client(app: AppHandle, stream: UnixStream) -> Result<(), String>
     Ok(())
 }
 
+/// Send a request to the running Codemux control socket and return the response.
+/// Used by both the CLI and the MCP server to communicate with the Codemux app.
+pub async fn send_control_request(request: ControlRequest) -> Result<ControlResponse, String> {
+    let socket_path = control_socket_path()
+        .ok_or_else(|| "Control socket path unavailable".to_string())?;
+    let stream = tokio::net::UnixStream::connect(socket_path)
+        .await
+        .map_err(|error| format!("Failed to connect to Codemux control socket: {error}"))?;
+    let (reader, mut writer) = stream.into_split();
+
+    let payload = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    writer
+        .write_all(format!("{payload}\n").as_bytes())
+        .await
+        .map_err(|error| format!("Failed to send request: {error}"))?;
+
+    let mut lines = BufReader::new(reader).lines();
+    let response = lines
+        .next_line()
+        .await
+        .map_err(|error| format!("Failed to read response: {error}"))?
+        .ok_or_else(|| "No response received from Codemux".to_string())?;
+
+    serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
+}
+
 async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
         "status" => Ok(serde_json::json!({

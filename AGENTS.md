@@ -1,141 +1,89 @@
-# Codemux Agent Guide
+# Codemux Agent Environment
 
-This file has two jobs:
+You are running inside Codemux, an Agentic Development Environment (ADE).
 
-- bootstrap agents working on the Codemux repository itself
-- explain how agents should use Codemux browser automation
+**Detect:** `test -n "$CODEMUX"`
 
-## Repo Development Bootstrap
+## Repo Development
 
-Use this section when the task is about developing the Codemux repository itself.
+When working on the Codemux repository itself:
+- Start with `WORKFLOW.md` and `docs/INDEX.md`
+- Read relevant canonical docs before assuming project state
+- Treat `docs/` as the maintained project docs system
+- If docs feel stale, use `docs/reference/DOCS_REINDEX.md`
 
-- start with `WORKFLOW.md` and `docs/INDEX.md`
-- read the relevant canonical docs before assuming project state
-- treat `docs/` as the maintained project docs system
-- if the docs feel stale or messy, use `docs/reference/DOCS_REINDEX.md`
+## Browser Control
 
-These instructions are project-scoped. They matter when an agent is working inside this repository, not when Codemux is later used on unrelated projects.
+**Never** use `xdg-open`, `open`, or system browsers. Use these instead:
 
-## Codemux Browser Automation
+| Command | Description |
+|---------|-------------|
+| `codemux browser open <url>` | Navigate the browser pane to a URL |
+| `codemux browser snapshot --dom` | List all interactive elements with CSS selectors |
+| `codemux browser snapshot` | Get the accessibility tree |
+| `codemux browser click "<selector>"` | Click an element by CSS selector |
+| `codemux browser fill "<selector>" "<text>"` | Type into an input field |
+| `codemux browser screenshot` | Capture screenshot (base64 PNG) |
+| `codemux browser console-logs` | Get browser console output |
+| `codemux browser create` | Create a new browser pane |
 
-Use this section when an agent needs to control the browser inside Codemux.
+The user sees the browser pane live while you control it.
 
-For project-wide context, start with `WORKFLOW.md` and `docs/INDEX.md`. This file stays focused on agent operating behavior inside Codemux itself.
-
-## Always Use Codemux Browser Commands
-
-**NEVER use these commands:**
-
-- `xdg-open` - opens in system browser, not Codemux
-- `open` (macOS) - opens in system browser
-- any other command that opens the default system browser
-
-**ALWAYS use these instead:**
-
-- `codemux browser open <url>` - opens a URL in Codemux's browser pane
-
-The browser automation runs against the browser pane inside Codemux, not your system browser.
-
-## Prerequisites
-
-Before using browser commands, ensure a browser pane exists in your Codemux workspace:
-
-1. Create a browser pane.
-2. Keep the pane visible or active so the commands have a target.
-
-## Quick Start
-
-When working inside Codemux, you have access to browser automation through CLI commands:
-
+**Workflow: Always snapshot before interacting.**
 ```bash
-codemux browser create
-codemux browser open https://example.com
-codemux browser snapshot
-codemux browser click "#submit-button"
-codemux browser fill "#email" "test@example.com"
-codemux browser screenshot
-codemux browser console-logs
+codemux browser open http://localhost:3000
+codemux browser snapshot --dom    # See what's on the page
+codemux browser click "#submit"   # Interact with a known element
 ```
+
+## Git Integration
+
+- Standard git commands work normally
+- Changes appear live in the Codemux sidebar Changes panel
+- Use conventional commit format (feat:, fix:, docs:, etc.)
+- AI commit message generator available in the UI
+
+## Notifications
+
+When you finish a task or need user attention, the user gets notified via Codemux's notification system.
+
+## Memory & Index
+
+| Command | Description |
+|---------|-------------|
+| `codemux memory show` | Show project memory |
+| `codemux memory set --goal "..."` | Set current goal |
+| `codemux memory add decision "..."` | Record a decision |
+| `codemux index build` | Build code search index |
+| `codemux index search "<query>"` | Search indexed code |
 
 ## Environment Variables
 
-Codemux sets these environment variables in terminals running inside it:
+Set automatically in all Codemux terminals:
 
-- `CODEMUX_WORKSPACE_ID` - current workspace ID
-- `CODEMUX_SURFACE_ID` - current terminal surface ID
+| Variable | Value | Purpose |
+|----------|-------|---------|
+| `CODEMUX` | `1` | Detect Codemux environment |
+| `CODEMUX_VERSION` | `0.1.0` | Codemux version |
+| `CODEMUX_WORKSPACE_ID` | workspace ID | Current workspace |
+| `CODEMUX_BROWSER_CMD` | `codemux browser` | Browser command prefix |
+| `BROWSER` | `codemux browser open` | Standard URL handler override |
 
-You can use these to detect if you are running inside Codemux:
+## Rules
 
-```bash
-if [ -n "$CODEMUX_WORKSPACE_ID" ]; then
-    echo "We are inside Codemux"
-fi
-```
+1. **Never** open system browsers — use `codemux browser`
+2. **Never** launch GUI apps — use Codemux built-in tools
+3. The user can see everything you do in real-time
+4. When asked to "test in browser" or "check the website", use `codemux browser open <url>`
+5. Get a snapshot before interacting so you know what elements exist
+6. Use explicit selectors — don't guess element presence
 
-## Common Workflows
-
-### Testing a web app
-
-```bash
-npm run dev
-codemux browser open http://localhost:3000
-codemux browser snapshot
-codemux browser fill "#search" "test query"
-codemux browser click "#submit"
-codemux browser snapshot
-```
-
-### Building and testing a form
+## Discovering Commands
 
 ```bash
-codemux browser open http://localhost:5173/form
-codemux browser fill "#name" "John Doe"
-codemux browser fill "#email" "john@example.com"
-codemux browser fill "#password" "secret123"
-codemux browser click "button[type='submit']"
-codemux browser snapshot
-codemux browser screenshot
+codemux --help              # List all subcommands
+codemux browser --help      # Browser subcommands
+codemux capabilities        # JSON listing of all commands
 ```
 
-### Debugging JavaScript errors
-
-```bash
-codemux browser console-logs
-codemux browser snapshot
-```
-
-## Available Commands
-
-| Command | Description |
-| --- | --- |
-| `codemux browser create` | Create a new browser pane in the current workspace |
-| `codemux browser open <url>` | Navigate to a URL |
-| `codemux browser snapshot` | Get the accessibility tree |
-| `codemux browser click <selector>` | Click an element |
-| `codemux browser fill <selector> <text>` | Fill an input |
-| `codemux browser screenshot` | Take a screenshot |
-| `codemux browser console-logs` | Get console logs |
-
-Additional actions available via the socket API: `back`, `forward`, `reload`, `evaluate` (run JS), `type_text`, `viewport`. See `docs/reference/BROWSER-AGENT-COMMANDS.md` for the full reference.
-
-## Socket API
-
-You can also control Codemux via JSON commands over the socket:
-
-```bash
-echo '{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"open_url","url":"https://example.com"}}}' | nc -U /run/user/1000/codemux.sock
-```
-
-## Tips For Agents
-
-1. Check whether you are inside Codemux with `CODEMUX_WORKSPACE_ID`.
-2. Get a snapshot before interacting so you know what elements exist.
-3. Prefer explicit selectors or refs instead of guessing.
-4. Check console logs when browser behavior is unclear.
-5. Test incrementally.
-6. Always use explicit `codemux browser ...` subcommands and never invoke bare `codemux` from an agent terminal.
-
-## Browser Vs Terminal
-
-- terminal pane: run your dev server, build commands, and tests
-- browser pane: view and interact with the running app inside Codemux
+All commands are also available via the Unix socket API at `$XDG_RUNTIME_DIR/codemux.sock`.

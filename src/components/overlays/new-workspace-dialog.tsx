@@ -10,7 +10,6 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import {
   Select,
@@ -32,6 +31,7 @@ import {
   listBranches,
   listWorktrees,
   getGitBranchInfo,
+  createWorkspace,
   createWorktreeWorkspace,
   importWorktreeWorkspace,
   activateWorkspace,
@@ -102,6 +102,9 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     if (folder) setProjectDir(folder);
   };
 
+  // Tab selection — default to "existing" when branches exist
+  const [activeTab, setActiveTab] = useState("new-branch");
+
   // Git repo detection
   const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
   const [initializing, setInitializing] = useState(false);
@@ -134,6 +137,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [branchSearch, setBranchSearch] = useState("");
+  const [selectedBranch, setSelectedBranch] = useState<string | null>(null);
   const [newBranchName, setNewBranchName] = useState("");
   const [baseBranch, setBaseBranch] = useState("");
 
@@ -154,6 +158,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setCreating(false);
     setNewBranchName("");
     setBranchSearch("");
+    setSelectedBranch(null);
     setIsGitRepo(null);
     setLocalBranches([]);
     setRemoteBranches([]);
@@ -176,6 +181,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         setWorktrees(wt);
         setCurrentBranch(info.branch);
         setBaseBranch(info.branch ?? "main");
+        // Default to "existing" tab when branches are available
+        if (local.length > 0 || remote.length > 0) {
+          setActiveTab("existing");
+        }
       });
 
       // Check gh
@@ -238,22 +247,28 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           return;
         }
 
-        // Check for orphan worktree
-        const orphan = worktrees.find(
-          (wt) => wt.branch === branch || wt.branch === `refs/heads/${branch}`,
-        );
-
         let wsId: string;
-        if (orphan) {
-          wsId = await importWorktreeWorkspace(orphan.path, branch, "single");
+
+        // Current branch: open as workspace directly (no worktree needed)
+        if (branch === currentBranch && !isNewBranch) {
+          wsId = await createWorkspace(projectDir);
         } else {
-          wsId = await createWorktreeWorkspace(
-            projectDir,
-            branch,
-            isNewBranch,
-            "single",
-            isNewBranch ? baseBranch || null : null,
+          // Check for orphan worktree
+          const orphan = worktrees.find(
+            (wt) => wt.branch === branch || wt.branch === `refs/heads/${branch}`,
           );
+
+          if (orphan) {
+            wsId = await importWorktreeWorkspace(orphan.path, branch, "single");
+          } else {
+            wsId = await createWorktreeWorkspace(
+              projectDir,
+              branch,
+              isNewBranch,
+              "single",
+              isNewBranch ? baseBranch || null : null,
+            );
+          }
         }
 
         // Apply preset if selected
@@ -279,13 +294,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[500px] sm:max-w-[500px] max-h-[85vh] p-0 gap-0">
-        <DialogHeader className="p-4 pb-0">
+      <DialogContent className="max-w-[500px] sm:max-w-[500px] h-[440px] max-h-[85vh] flex flex-col p-0 gap-0 overflow-hidden">
+        <DialogHeader className="p-4 pb-0 shrink-0">
           <DialogTitle className="text-sm">New Workspace</DialogTitle>
           <DialogDescription className="sr-only">Create a new workspace from a branch or pull request</DialogDescription>
         </DialogHeader>
 
-        <div className="px-4 pt-3 space-y-1.5">
+        <div className="px-4 pt-3 space-y-1.5 shrink-0">
           <label className="text-xs text-muted-foreground">Project Directory</label>
           <div className="flex gap-1.5">
             <Input
@@ -317,7 +332,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             </Button>
           </div>
         ) : (
-        <Tabs defaultValue="new-branch" className="flex flex-col">
+        <>
+        <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0">
           <TabsList variant="line" className="mx-4 mt-2 h-8">
             <TabsTrigger value="new-branch" className="text-xs px-2 gap-1">
               <Plus className="h-3 w-3" /> New Branch
@@ -331,7 +347,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           </TabsList>
 
           {/* ── New Branch ── */}
-          <TabsContent value="new-branch" className="p-4 pt-3 space-y-3">
+          <TabsContent value="new-branch" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
             <div className="space-y-1.5">
               <label className="text-xs text-muted-foreground">
                 Branch name
@@ -361,80 +377,54 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 </SelectContent>
               </Select>
             </div>
-            <PresetSelector
-              presets={presets}
-              selected={selectedPreset}
-              onSelect={setSelectedPreset}
-            />
-            <Separator />
-            <Button
-              className="w-full h-8 text-xs"
-              disabled={!newBranchName.trim() || creating}
-              onClick={() => handleCreate(newBranchName.trim(), true)}
-            >
-              {creating && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
-              Create Workspace
-            </Button>
           </TabsContent>
 
           {/* ── Existing Branch ── */}
-          <TabsContent value="existing" className="p-4 pt-3 space-y-3">
+          <TabsContent value="existing" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
             <Input
               placeholder="Search branches..."
               value={branchSearch}
               onChange={(e) => setBranchSearch(e.target.value)}
               className="h-8 text-sm"
             />
-            <div className="h-48 overflow-y-auto">
-              <div className="space-y-0.5">
-                {filteredBranches.map((branch) => {
-                  const hasWs = branchWorkspaceMap.has(branch);
-                  return (
-                    <button
-                      key={branch}
-                      className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-left hover:bg-accent min-w-0"
-                      onClick={() =>
-                        hasWs
-                          ? activateWorkspace(
-                              branchWorkspaceMap.get(branch)!,
-                            ).then(() => onOpenChange(false))
-                          : handleCreate(branch, false)
-                      }
-                      disabled={creating}
-                    >
-                      <GitBranch className="h-3 w-3 shrink-0 text-muted-foreground" />
-                      <span className="truncate flex-1 min-w-0" title={branch}>{branch}</span>
-                      <div className="flex gap-1 shrink-0">
-                        {branch === currentBranch && (
-                          <Badge variant="secondary" className="text-[10px]">
-                            current
-                          </Badge>
-                        )}
-                        {hasWs && (
-                          <Badge variant="outline" className="text-[10px]">
-                            open
-                          </Badge>
-                        )}
-                      </div>
-                    </button>
-                  );
-                })}
-                {filteredBranches.length === 0 && (
-                  <p className="text-xs text-muted-foreground text-center py-4">
-                    No branches found
-                  </p>
-                )}
-              </div>
+            <div className="space-y-0.5">
+              {filteredBranches.map((branch) => {
+                const hasWs = branchWorkspaceMap.has(branch);
+                const isSelected = selectedBranch === branch;
+                return (
+                  <button
+                    key={branch}
+                    className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-left hover:bg-accent min-w-0 ${isSelected ? "bg-accent" : ""}`}
+                    onClick={() => setSelectedBranch(branch)}
+                    disabled={creating}
+                  >
+                    <GitBranch className="h-3 w-3 shrink-0 text-muted-foreground" />
+                    <span className="truncate flex-1 min-w-0" title={branch}>{branch}</span>
+                    <div className="flex gap-1 shrink-0">
+                      {branch === currentBranch && (
+                        <Badge variant="secondary" className="text-[10px]">
+                          current
+                        </Badge>
+                      )}
+                      {hasWs && (
+                        <Badge variant="outline" className="text-[10px]">
+                          open
+                        </Badge>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+              {filteredBranches.length === 0 && (
+                <p className="text-xs text-muted-foreground text-center py-4">
+                  No branches found
+                </p>
+              )}
             </div>
-            <PresetSelector
-              presets={presets}
-              selected={selectedPreset}
-              onSelect={setSelectedPreset}
-            />
           </TabsContent>
 
           {/* ── Pull Requests ── */}
-          <TabsContent value="pr" className="p-4 pt-3 space-y-3">
+          <TabsContent value="pr" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
             {!ghAvailable ? (
               <div className="text-center py-6 space-y-2">
                 <AlertCircle className="h-8 w-8 mx-auto text-muted-foreground/40" />
@@ -447,60 +437,92 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
               </div>
             ) : (
-              <ScrollArea className="h-56">
-                <div className="space-y-0.5">
-                  {prs.map((pr) => (
-                    <button
-                      key={pr.number}
-                      className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-accent"
-                      onClick={() =>
-                        pr.head_branch &&
-                        handleCreate(pr.head_branch, false)
-                      }
-                      disabled={creating || !pr.head_branch}
-                    >
-                      <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-muted-foreground mt-0.5" />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-sm truncate">
-                            {pr.title}
-                          </span>
-                          <span className="text-[10px] text-muted-foreground shrink-0">
-                            #{pr.number}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                          <GitBranch className="h-2.5 w-2.5" />
-                          <span className="truncate">
-                            {pr.head_branch}
-                          </span>
-                          {pr.is_draft && (
-                            <Badge
-                              variant="secondary"
-                              className="text-[10px]"
-                            >
-                              draft
-                            </Badge>
-                          )}
-                        </div>
+              <div className="space-y-0.5">
+                {prs.map((pr) => (
+                  <button
+                    key={pr.number}
+                    className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-accent"
+                    onClick={() =>
+                      pr.head_branch &&
+                      handleCreate(pr.head_branch, false)
+                    }
+                    disabled={creating || !pr.head_branch}
+                  >
+                    <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-muted-foreground mt-0.5" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-sm truncate">
+                          {pr.title}
+                        </span>
+                        <span className="text-[10px] text-muted-foreground shrink-0">
+                          #{pr.number}
+                        </span>
                       </div>
-                    </button>
-                  ))}
-                  {prs.length === 0 && (
-                    <p className="text-xs text-muted-foreground text-center py-4">
-                      No open pull requests
-                    </p>
-                  )}
-                </div>
-              </ScrollArea>
+                      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <GitBranch className="h-2.5 w-2.5" />
+                        <span className="truncate">
+                          {pr.head_branch}
+                        </span>
+                        {pr.is_draft && (
+                          <Badge
+                            variant="secondary"
+                            className="text-[10px]"
+                          >
+                            draft
+                          </Badge>
+                        )}
+                      </div>
+                    </div>
+                  </button>
+                ))}
+                {prs.length === 0 && (
+                  <p className="text-xs text-muted-foreground text-center py-4">
+                    No open pull requests
+                  </p>
+                )}
+              </div>
             )}
-            <PresetSelector
-              presets={presets}
-              selected={selectedPreset}
-              onSelect={setSelectedPreset}
-            />
           </TabsContent>
         </Tabs>
+
+        {/* ── Shared footer: preset + action button ── */}
+        <div className="shrink-0 px-4 pb-4 pt-3 space-y-3">
+          <PresetSelector
+            presets={presets}
+            selected={selectedPreset}
+            onSelect={setSelectedPreset}
+          />
+          {activeTab !== "pr" && <Separator />}
+          {activeTab === "new-branch" && (
+            <Button
+              className="w-full h-8 text-xs"
+              disabled={!newBranchName.trim() || creating}
+              onClick={() => handleCreate(newBranchName.trim(), true)}
+            >
+              {creating && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              Create Workspace
+            </Button>
+          )}
+          {activeTab === "existing" && (
+            <Button
+              className="w-full h-8 text-xs"
+              disabled={!selectedBranch || creating}
+              onClick={() => {
+                if (!selectedBranch) return;
+                const existingWsId = branchWorkspaceMap.get(selectedBranch);
+                if (existingWsId) {
+                  activateWorkspace(existingWsId).then(() => onOpenChange(false));
+                } else {
+                  handleCreate(selectedBranch, false);
+                }
+              }}
+            >
+              {creating && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              Open Workspace
+            </Button>
+          )}
+        </div>
+        </>
         )}
 
         {error && (

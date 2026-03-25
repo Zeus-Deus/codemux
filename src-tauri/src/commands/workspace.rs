@@ -64,6 +64,11 @@ pub(crate) fn create_workspace_impl(
     // Run setup scripts in background thread
     spawn_setup_scripts(&app, state, &workspace_id.0, &repo_path);
 
+    // Write .mcp.json for agent auto-discovery
+    if crate::mcp_server::is_auto_mcp_enabled(&app) {
+        crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+    }
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -99,6 +104,21 @@ pub fn get_shell_appearance() -> Result<ShellAppearance, String> {
 #[tauri::command]
 pub fn get_app_state(state: State<'_, AppStateStore>) -> Result<AppStateSnapshot, String> {
     Ok(state.snapshot())
+}
+
+#[tauri::command]
+pub fn regenerate_mcp_config(
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let snapshot = state.snapshot();
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+    crate::mcp_server::upsert_mcp_config(Path::new(&ws.cwd), &workspace_id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -217,6 +237,11 @@ pub fn create_worktree_workspace(
     // Run setup scripts in background thread
     spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
 
+    // Write .mcp.json for agent auto-discovery
+    if crate::mcp_server::is_auto_mcp_enabled(&app) {
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+    }
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -260,6 +285,11 @@ pub fn import_worktree_workspace(
 
     spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
 
+    // Write .mcp.json for agent auto-discovery
+    if crate::mcp_server::is_auto_mcp_enabled(&app) {
+        crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+    }
+
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
 }
@@ -299,6 +329,11 @@ pub fn close_workspace_with_worktree(
                 return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
             }
         }
+    }
+
+    // Remove codemux entry from .mcp.json before closing
+    if let Some(ref wt_path) = worktree_path {
+        crate::mcp_server::remove_mcp_config(Path::new(wt_path));
     }
 
     state
@@ -370,25 +405,32 @@ pub fn close_workspace(
 ) -> Result<String, String> {
     let force = force_delete.unwrap_or(false);
 
+    // Get workspace cwd before closing (needed for teardown and MCP cleanup)
+    let workspace_cwd = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id);
+        ws.map(|w| (w.cwd.clone(), w.title.clone()))
+    };
+
     // Run teardown scripts before closing
     if !force {
-        let cwd = {
-            let snapshot = state.snapshot();
-            let ws = snapshot
-                .workspaces
-                .iter()
-                .find(|w| w.workspace_id.0 == workspace_id);
-            ws.map(|w| (w.cwd.clone(), w.title.clone()))
-        };
-        if let Some((cwd, title)) = cwd {
+        if let Some((ref cwd, ref title)) = workspace_cwd {
             if let Err(e) = crate::scripts::run_teardown_scripts(
-                Path::new(&cwd),
-                &title,
+                Path::new(cwd),
+                title,
                 &workspace_id,
             ) {
                 return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
             }
         }
+    }
+
+    // Remove codemux entry from .mcp.json before closing
+    if let Some((ref cwd, _)) = workspace_cwd {
+        crate::mcp_server::remove_mcp_config(Path::new(cwd));
     }
 
     let fallback = state.close_workspace(&workspace_id)?;

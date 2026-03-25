@@ -223,7 +223,9 @@ pub fn apply_preset(
     let commands = if preset.commands.is_empty() {
         vec![String::new()]
     } else {
-        preset.commands.clone()
+        preset.commands.iter()
+            .map(|cmd| crate::agent_context::inject_agent_context(cmd))
+            .collect()
     };
 
     let sessions_arc = pty_state.sessions.clone();
