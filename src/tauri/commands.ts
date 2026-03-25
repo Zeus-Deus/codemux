@@ -164,9 +164,10 @@ export const importWorktreeWorkspace = (
 export const closeWorkspaceWithWorktree = (
   workspaceId: string,
   removeWorktree: boolean,
+  deleteBranch: boolean,
   forceDelete: boolean,
 ) =>
-  invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, forceDelete });
+  invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
 
 export const getWorkspaceConfig = (path: string) =>
   invoke<WorkspaceConfig | null>("get_workspace_config", { path });

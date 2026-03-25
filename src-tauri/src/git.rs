@@ -720,7 +720,6 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>) -> Result
         if !protected.contains(&branch_name) {
             let current = run_git_permissive(&repo_path, &["branch", "--show-current"]);
             if current != branch_name {
-                // Best-effort: don't fail the whole operation if branch deletion fails
                 let _ = run_git(&repo_path, &["branch", "-D", branch_name]);
             }
         }
@@ -1437,5 +1436,40 @@ C  source.txt -> copy.txt";
         if let Ok(wt_path) = &result {
             let _ = std::fs::remove_dir_all(wt_path);
         }
+    }
+
+    #[test]
+    fn test_delete_workspace_removes_branch() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "test-delete-me", true, None)
+            .expect("create worktree");
+
+        let branches_before = git_list_branches(&repo, false).expect("list before");
+        assert!(branches_before.contains(&"test-delete-me".to_string()), "branch should exist before delete");
+
+        // Remove worktree WITH branch deletion (simulates delete with checkbox checked)
+        git_remove_worktree(Path::new(&wt_path), Some("test-delete-me")).expect("remove with branch");
+
+        let branches_after = git_list_branches(&repo, false).expect("list after");
+        assert!(!branches_after.contains(&"test-delete-me".to_string()), "branch should be gone after delete");
+    }
+
+    #[test]
+    fn test_close_workspace_keeps_branch() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "test-keep-me", true, None)
+            .expect("create worktree");
+
+        let branches_before = git_list_branches(&repo, false).expect("list before");
+        assert!(branches_before.contains(&"test-keep-me".to_string()), "branch should exist before close");
+
+        // Remove worktree WITHOUT branch deletion (simulates close without checkbox)
+        git_remove_worktree(Path::new(&wt_path), None).expect("remove without branch");
+
+        let branches_after = git_list_branches(&repo, false).expect("list after");
+        assert!(branches_after.contains(&"test-keep-me".to_string()), "branch should still exist after close");
+
+        // Clean up the branch manually
+        let _ = run_git(&repo, &["branch", "-D", "test-keep-me"]);
     }
 }

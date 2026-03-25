@@ -308,6 +308,7 @@ pub fn close_workspace_with_worktree(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     remove_worktree: bool,
+    delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
     let force = force_delete.unwrap_or(false);
@@ -350,7 +351,12 @@ pub fn close_workspace_with_worktree(
 
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
-            crate::git::git_remove_worktree(Path::new(&wt_path), branch.as_deref())?;
+            let branch_to_delete = if delete_branch.unwrap_or(false) {
+                branch.as_deref()
+            } else {
+                None
+            };
+            crate::git::git_remove_worktree(Path::new(&wt_path), branch_to_delete)?;
         }
     }
 

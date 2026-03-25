@@ -16,11 +16,20 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { X, TerminalSquare, Workflow, ArrowUp, ArrowDown } from "lucide-react";
 import {
   activateWorkspace,
   closeWorkspace,
+  closeWorkspaceWithWorktree,
   renameWorkspace,
   detectEditors,
   openInEditor,
@@ -73,7 +82,88 @@ function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
   );
 }
 
-function WorkspaceContextMenuItems({ workspace }: { workspace: WorkspaceSnapshot }) {
+function handleCloseWorkspace(workspace: WorkspaceSnapshot) {
+  if (workspace.worktree_path) {
+    closeWorkspaceWithWorktree(workspace.workspace_id, true, false, false).catch(console.error);
+  } else {
+    closeWorkspace(workspace.workspace_id, false).catch(console.error);
+  }
+}
+
+function DeleteWorkspaceDialog({
+  workspace,
+  open,
+  onOpenChange,
+}: {
+  workspace: WorkspaceSnapshot;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const isWorktree = !!workspace.worktree_path;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Delete workspace &ldquo;{workspace.title}&rdquo;?</DialogTitle>
+          <DialogDescription>
+            {isWorktree
+              ? "This will remove the worktree directory."
+              : "This will close the workspace."}
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex justify-end gap-2 pt-2">
+          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          {isWorktree ? (
+            <>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  closeWorkspaceWithWorktree(workspace.workspace_id, true, false, false).catch(console.error);
+                  onOpenChange(false);
+                }}
+              >
+                Delete
+              </Button>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => {
+                  closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false).catch(console.error);
+                  onOpenChange(false);
+                }}
+              >
+                Delete &amp; Remove Branch
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                closeWorkspace(workspace.workspace_id, true).catch(console.error);
+                onOpenChange(false);
+              }}
+            >
+              Delete
+            </Button>
+          )}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function WorkspaceContextMenuItems({
+  workspace,
+  onDeleteRequest,
+}: {
+  workspace: WorkspaceSnapshot;
+  onDeleteRequest: () => void;
+}) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
 
   useEffect(() => {
@@ -126,13 +216,13 @@ function WorkspaceContextMenuItems({ workspace }: { workspace: WorkspaceSnapshot
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem
-        onClick={() => closeWorkspace(workspace.workspace_id, false).catch(console.error)}
+        onClick={() => handleCloseWorkspace(workspace)}
       >
         Close workspace
       </ContextMenuItem>
       <ContextMenuItem
         className="text-destructive focus:text-destructive"
-        onClick={() => closeWorkspace(workspace.workspace_id, true).catch(console.error)}
+        onClick={onDeleteRequest}
       >
         Delete workspace
       </ContextMenuItem>
@@ -141,13 +231,15 @@ function WorkspaceContextMenuItems({ workspace }: { workspace: WorkspaceSnapshot
 }
 
 export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
   };
 
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
-    closeWorkspace(workspace.workspace_id, false).catch(console.error);
+    handleCloseWorkspace(workspace);
   };
 
   const icon =
@@ -159,18 +251,28 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
 
   if (nested) {
     return (
-      <ContextMenu>
-        <ContextMenuTrigger asChild>
-          <SidebarMenuSubButton
-            isActive={isActive}
-            onClick={handleActivate}
-          >
-            {icon}
-            <WorkspaceRowContent workspace={workspace} />
-          </SidebarMenuSubButton>
-        </ContextMenuTrigger>
-        <WorkspaceContextMenuItems workspace={workspace} />
-      </ContextMenu>
+      <>
+        <ContextMenu>
+          <ContextMenuTrigger asChild>
+            <SidebarMenuSubButton
+              isActive={isActive}
+              onClick={handleActivate}
+            >
+              {icon}
+              <WorkspaceRowContent workspace={workspace} />
+            </SidebarMenuSubButton>
+          </ContextMenuTrigger>
+          <WorkspaceContextMenuItems
+            workspace={workspace}
+            onDeleteRequest={() => setShowDeleteDialog(true)}
+          />
+        </ContextMenu>
+        <DeleteWorkspaceDialog
+          workspace={workspace}
+          open={showDeleteDialog}
+          onOpenChange={setShowDeleteDialog}
+        />
+      </>
     );
   }
 
@@ -188,7 +290,10 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
             <WorkspaceRowContent workspace={workspace} />
           </SidebarMenuButton>
         </ContextMenuTrigger>
-        <WorkspaceContextMenuItems workspace={workspace} />
+        <WorkspaceContextMenuItems
+          workspace={workspace}
+          onDeleteRequest={() => setShowDeleteDialog(true)}
+        />
       </ContextMenu>
       {workspace.notification_count > 0 && (
         <SidebarMenuBadge className="bg-warning/20 text-warning">
@@ -198,6 +303,11 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
       <SidebarMenuAction showOnHover onClick={handleClose} title="Close workspace">
         <X className="h-3 w-3" />
       </SidebarMenuAction>
+      <DeleteWorkspaceDialog
+        workspace={workspace}
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+      />
     </SidebarMenuItem>
   );
 }

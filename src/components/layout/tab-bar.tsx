@@ -234,14 +234,17 @@ export function TabBar({ workspace }: Props) {
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
                       {workspace.tabs.length > 1 && (
-                        <button
-                          className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          className="ml-0.5 rounded-sm p-0.5 opacity-0 hover:bg-muted group-hover:opacity-100 transition-opacity focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring cursor-pointer"
                           onClick={(e) => handleCloseTab(e, tab.tab_id)}
+                          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleCloseTab(e as unknown as React.MouseEvent, tab.tab_id); }}
                           aria-label="Close tab"
                           title="Close tab"
                         >
                           <X className="h-2.5 w-2.5" />
-                        </button>
+                        </span>
                       )}
                     </TabsTrigger>
                   </div>

@@ -13,14 +13,7 @@ pub fn init_git_repo(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
-    let p = Path::new(&path);
-    eprintln!("[git_status] path={}, exists={}, is_dir={}", path, p.exists(), p.is_dir());
-    let result = crate::git::git_status(p);
-    match &result {
-        Ok(files) => eprintln!("[git_status] found {} files", files.len()),
-        Err(e) => eprintln!("[git_status] error: {}", e),
-    }
-    result
+    crate::git::git_status(Path::new(&path))
 }
 
 #[tauri::command]
