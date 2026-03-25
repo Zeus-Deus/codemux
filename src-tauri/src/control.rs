@@ -314,18 +314,41 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .map(|_| serde_json::json!({ "written": true }))
         }
         "browser_automation" => {
+            let state: State<'_, AppStateStore> = app.state();
+
+            // Auto-create a browser pane if no browser sessions exist
+            if state.snapshot().browser_sessions.is_empty() {
+                let active_pane_id = {
+                    let snap = state.snapshot();
+                    snap.workspaces.iter()
+                        .find(|w| w.workspace_id == snap.active_workspace_id)
+                        .and_then(|w| w.surfaces.iter()
+                            .find(|s| s.surface_id == w.active_surface_id))
+                        .map(|s| s.active_pane_id.0.clone())
+                };
+                if let Some(pane_id) = active_pane_id {
+                    let url = request.params.get("action")
+                        .and_then(|a| a.get("url"))
+                        .and_then(Value::as_str)
+                        .map(String::from);
+                    let _ = crate::commands::browser::create_browser_pane_impl(
+                        app.clone(), &state, pane_id, url,
+                    );
+                }
+            }
+
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
             let requested_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or("default");
             let browser_id = resolve_browser_id(&app, requested_id);
-            
+
             let action_kind = request.params.get("action")
                 .and_then(|v| v.get("kind"))
                 .and_then(Value::as_str)
                 .unwrap_or("open_url")
                 .to_string();
-            
+
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
-            
+
             agent_browser.run_command(&browser_id, &action_kind, params)
                 .await
                 .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
