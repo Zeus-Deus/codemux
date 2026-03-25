@@ -910,94 +910,6 @@ pub fn run_workspace_setup(
     crate::scripts::run_setup_scripts(Path::new(&cwd), &title, &workspace_id, &app)
 }
 
-// ---- Workspace sections ----
-
-#[tauri::command]
-pub fn create_section(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    name: String,
-    color: String,
-) -> Result<String, String> {
-    let section_id = state.create_section(name, color);
-    crate::state::emit_app_state(&app);
-    Ok(section_id)
-}
-
-#[tauri::command]
-pub fn rename_section(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    section_id: String,
-    name: String,
-) -> Result<(), String> {
-    if state.rename_section(&section_id, name) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err(format!("No section found for {section_id}"))
-    }
-}
-
-#[tauri::command]
-pub fn delete_section(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    section_id: String,
-) -> Result<(), String> {
-    if state.delete_section(&section_id) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err(format!("No section found for {section_id}"))
-    }
-}
-
-#[tauri::command]
-pub fn set_section_color(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    section_id: String,
-    color: String,
-) -> Result<(), String> {
-    if state.set_section_color(&section_id, color) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err(format!("No section found for {section_id}"))
-    }
-}
-
-#[tauri::command]
-pub fn toggle_section_collapsed(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    section_id: String,
-) -> Result<(), String> {
-    if state.toggle_section_collapsed(&section_id) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err(format!("No section found for {section_id}"))
-    }
-}
-
-#[tauri::command]
-pub fn move_workspace_to_section(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    workspace_id: String,
-    section_id: Option<String>,
-    position: Option<usize>,
-) -> Result<(), String> {
-    if state.move_workspace_to_section(&workspace_id, section_id.as_deref(), position) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err("Failed to move workspace to section".to_string())
-    }
-}
-
 #[tauri::command]
 pub fn reorder_workspaces(
     app: tauri::AppHandle,
@@ -1024,19 +936,5 @@ pub fn reorder_tabs(
         Ok(())
     } else {
         Err("Failed to reorder tabs".to_string())
-    }
-}
-
-#[tauri::command]
-pub fn reorder_sections(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    section_ids: Vec<String>,
-) -> Result<(), String> {
-    if state.reorder_sections(section_ids) {
-        crate::state::emit_app_state(&app);
-        Ok(())
-    } else {
-        Err("Failed to reorder sections".to_string())
     }
 }

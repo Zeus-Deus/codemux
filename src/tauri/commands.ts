@@ -174,35 +174,8 @@ export const getWorkspaceConfig = (path: string) =>
 export const runWorkspaceSetup = (workspaceId: string) =>
   invoke<void>("run_workspace_setup", { workspaceId });
 
-// ── Sections ──
-
-export const createSection = (name: string, color: string) =>
-  invoke<string>("create_section", { name, color });
-
-export const renameSection = (sectionId: string, name: string) =>
-  invoke("rename_section", { sectionId, name });
-
-export const deleteSection = (sectionId: string) =>
-  invoke("delete_section", { sectionId });
-
-export const setSectionColor = (sectionId: string, color: string) =>
-  invoke("set_section_color", { sectionId, color });
-
-export const toggleSectionCollapsed = (sectionId: string) =>
-  invoke("toggle_section_collapsed", { sectionId });
-
-export const moveWorkspaceToSection = (
-  workspaceId: string,
-  sectionId: string,
-  position?: number | null,
-) =>
-  invoke("move_workspace_to_section", { workspaceId, sectionId, position: position ?? null });
-
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });
-
-export const reorderSections = (sectionIds: string[]) =>
-  invoke("reorder_sections", { sectionIds });
 
 // ── GitHub ──
 

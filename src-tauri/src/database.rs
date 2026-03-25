@@ -65,7 +65,6 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             user_id TEXT NOT NULL DEFAULT 'local',
             workspace_id TEXT NOT NULL,
             project_id INTEGER REFERENCES projects(id),
-            section_id TEXT,
             tab_order INTEGER NOT NULL DEFAULT 0,
             is_collapsed INTEGER NOT NULL DEFAULT 0,
             last_active_at TEXT,
