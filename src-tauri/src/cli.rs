@@ -36,7 +36,12 @@ pub enum CommandSet {
 pub enum BrowserCommand {
     Create,
     Open { url: String },
-    Snapshot { browser_id: Option<String> },
+    Snapshot {
+        browser_id: Option<String>,
+        /// Use DOM-based query instead of ARIA tree
+        #[arg(long)]
+        dom: bool,
+    },
     Click { selector: String, browser_id: Option<String> },
     Fill { selector: String, value: String, browser_id: Option<String> },
     Screenshot { browser_id: Option<String> },
@@ -207,48 +212,65 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                         command: "create_browser_pane".to_string(),
                         params: json!({"pane_id": ""}),
                     }).await?;
-                    Ok(json!({ "ok": true, "data": response.data.unwrap_or(json!(null)) }))
+                    Ok::<_, String>(json!({ "ok": true, "data": response.data.unwrap_or(json!(null)) }))
                 }
                 BrowserCommand::Open { url } => {
-                    run_agent_browser("default", "open", json!({ "url": url }))
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": "default", "action": { "kind": "open", "url": url } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Snapshot { browser_id } => {
-                    run_agent_browser(browser_id.as_deref().unwrap_or("default"), "snapshot", json!({}))
+                BrowserCommand::Snapshot { browser_id, dom } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let action = if dom {
+                        json!({ "kind": "eval", "script": crate::agent_browser::DOM_SNAPSHOT_SCRIPT })
+                    } else {
+                        json!({ "kind": "snapshot" })
+                    };
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": action }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
                 BrowserCommand::Click { selector, browser_id } => {
-                    run_agent_browser(
-                        browser_id.as_deref().unwrap_or("default"),
-                        "click",
-                        json!({ "selector": selector })
-                    )
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "click", "selector": selector } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
                 BrowserCommand::Fill { selector, value, browser_id } => {
-                    run_agent_browser(
-                        browser_id.as_deref().unwrap_or("default"),
-                        "fill",
-                        json!({ "selector": selector, "value": value })
-                    )
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "fill", "selector": selector, "value": value } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
                 BrowserCommand::Screenshot { browser_id } => {
-                    run_agent_browser(browser_id.as_deref().unwrap_or("default"), "screenshot", json!({}))
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "screenshot" } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
                 BrowserCommand::ConsoleLogs { browser_id } => {
-                    run_agent_browser(browser_id.as_deref().unwrap_or("default"), "console", json!({}))
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "console" } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
                 }
             }?;
             println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
             Ok(true)
         }
     }
-}
-
-fn run_agent_browser(
-    browser_id: &str,
-    action: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let result = crate::agent_browser::run_cli_action(browser_id, action, params)?;
-    serde_json::to_value(result).map_err(|error| error.to_string())
 }
 
 fn normalize_memory_kind(kind: &str) -> &'static str {

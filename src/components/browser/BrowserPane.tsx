@@ -1,8 +1,17 @@
 import { useEffect, useRef, useState, useCallback } from "react";
-import { startBrowserStream, agentBrowserRun } from "@/tauri/commands";
+import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
+import { InspectorPanel } from "./InspectorPanel";
 import { Loader2, Globe } from "lucide-react";
+import type { ElementInfo } from "./inspector";
+import {
+  INSPECTOR_INJECT_SCRIPT,
+  INSPECTOR_CLEANUP_SCRIPT,
+  buildElementQueryScript,
+  parseEvalResult,
+  findFirstTerminalPane,
+} from "./inspector";
 
 interface Props {
   browserId: string;
@@ -72,6 +81,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [browserSession?.current_url]);
 
+  // Inspector state
+  const [inspectorActive, setInspectorActive] = useState(false);
+  const [selectedElement, setSelectedElement] = useState<ElementInfo | null>(null);
+  const inspectorActiveRef = useRef(false);
+  const injectedRef = useRef(false);
+  const inspectorClickRef = useRef(false); // suppress mouseUp after inspector click
+
   const imgRef = useRef<HTMLImageElement | null>(null);
   const drawInfoRef = useRef({ x: 0, y: 0, w: 1280, h: 720 });
   const statusRef = useRef(status);
@@ -82,6 +98,44 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
     }
+  }, []);
+
+  // Inspector toggle
+  const toggleInspector = useCallback(async () => {
+    const next = !inspectorActiveRef.current;
+    inspectorActiveRef.current = next;
+    setInspectorActive(next);
+
+    if (next) {
+      setSelectedElement(null);
+      try {
+        await agentBrowserRun(browserId, "eval", { script: INSPECTOR_INJECT_SCRIPT });
+        injectedRef.current = true;
+      } catch (err) {
+        console.error("[Inspector] Injection failed:", err);
+      }
+    } else {
+      if (injectedRef.current) {
+        agentBrowserRun(browserId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
+        injectedRef.current = false;
+      }
+    }
+  }, [browserId]);
+
+  // Tell Agent: write selector to first terminal pane
+  const handleTellAgent = useCallback(async (selector: string) => {
+    const appState = useAppStore.getState().appState;
+    if (!appState) return;
+    const ws = appState.workspaces.find((w) => w.workspace_id === appState.active_workspace_id);
+    if (!ws) return;
+    const surface = ws.surfaces.find((s) => s.surface_id === ws.active_surface_id);
+    if (!surface) return;
+    const termPane = findFirstTerminalPane(surface.root);
+    if (!termPane) return;
+    await activatePane(termPane.pane_id);
+    const prompt = `In the browser, select the element "${selector}" and `;
+    await writeToPty(termPane.session_id, prompt);
+    setSelectedElement(null);
   }, []);
 
   // Start stream and connect WebSocket
@@ -252,6 +306,30 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
+
+    if (inspectorActiveRef.current) {
+      e.preventDefault();
+      e.stopPropagation();
+      inspectorClickRef.current = true;
+      // Query element at click coordinates
+      agentBrowserRun(browserId, "eval", { script: buildElementQueryScript(x, y) })
+        .then((result) => {
+          const info = parseEvalResult(result);
+          if (info) setSelectedElement(info);
+        })
+        .catch((err) => console.error("[Inspector] Element query failed:", err))
+        .finally(() => {
+          // Auto-disable inspector
+          inspectorActiveRef.current = false;
+          setInspectorActive(false);
+          if (injectedRef.current) {
+            agentBrowserRun(browserId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
+            injectedRef.current = false;
+          }
+        });
+      return;
+    }
+
     sendInput({
       type: "input_mouse",
       eventType: "mousePressed",
@@ -264,6 +342,10 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
+    if (inspectorClickRef.current) {
+      inspectorClickRef.current = false;
+      return;
+    }
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
@@ -278,7 +360,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (e.buttons === 0) return;
+    if (!inspectorActiveRef.current && e.buttons === 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
     const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
@@ -311,6 +393,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   // "rawKeyDown" for non-printable keys (Backspace, Enter, etc.).
   // Do NOT send a separate "char" event — CDP handles text insertion from "keyDown".
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Ctrl+Shift+I toggles element inspector
+    if (e.ctrlKey && e.shiftKey && e.key === "I") {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleInspector();
+      return;
+    }
     if (e.ctrlKey && (e.key === "t" || e.key === "w" || e.key === "k")) return;
     e.preventDefault();
     e.stopPropagation();
@@ -384,7 +473,16 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         currentUrl={currentUrl}
         onUrlChange={setCurrentUrl}
         loading={status === "starting" || status === "connecting"}
+        inspectorActive={inspectorActive}
+        onInspectorToggle={toggleInspector}
       />
+      {selectedElement && (
+        <InspectorPanel
+          element={selectedElement}
+          onDismiss={() => setSelectedElement(null)}
+          onTellAgent={handleTellAgent}
+        />
+      )}
       <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden relative">
         {status !== "live" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
@@ -408,7 +506,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         <canvas
           ref={canvasRef}
           tabIndex={0}
-          className="absolute inset-0 w-full h-full outline-none cursor-default"
+          className={`absolute inset-0 w-full h-full outline-none ${inspectorActive ? "cursor-crosshair" : "cursor-default"}`}
           onMouseDown={handleMouseDown}
           onMouseUp={handleMouseUp}
           onMouseMove={handleMouseMove}

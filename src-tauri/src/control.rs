@@ -32,6 +32,20 @@ pub fn control_socket_path() -> Option<PathBuf> {
     Some(runtime_dir.join("codemux.sock"))
 }
 
+/// Resolve "default" or empty browser_id to the first active browser session's actual ID.
+fn resolve_browser_id(app: &AppHandle, requested: &str) -> String {
+    if !requested.is_empty() && requested != "default" {
+        return requested.to_string();
+    }
+    let state: State<'_, AppStateStore> = app.state();
+    let snapshot = state.snapshot();
+    snapshot
+        .browser_sessions
+        .first()
+        .map(|s| s.browser_id.0.clone())
+        .unwrap_or_else(|| "default".to_string())
+}
+
 pub fn spawn_control_server(app: AppHandle) {
     let Some(socket_path) = control_socket_path() else {
         crate::diagnostics::stderr_line(
@@ -275,7 +289,8 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         }
         "browser_automation" => {
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
-            let browser_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or("default").to_string();
+            let requested_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or("default");
+            let browser_id = resolve_browser_id(&app, requested_id);
             
             let action_kind = request.params.get("action")
                 .and_then(|v| v.get("kind"))

@@ -51,6 +51,77 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// JavaScript that queries the DOM for all interactive elements.
+/// Used as a fallback when the ARIA snapshot returns nothing useful.
+pub const DOM_SNAPSHOT_SCRIPT: &str = r###"(() => {
+  const sel = "a[href], button, input, select, textarea, [role='button'], [role='link'], [role='tab'], [role='checkbox'], [role='radio'], [role='combobox'], [role='menuitem'], [role='searchbox'], [tabindex]:not([tabindex='-1'])";
+  const els = document.querySelectorAll(sel);
+  const results = [];
+  const seen = new Set();
+  for (const el of els) {
+    if (el.offsetParent === null && el.tagName !== "INPUT" && el.getAttribute("type") !== "hidden") continue;
+    try { if (getComputedStyle(el).display === "none" || getComputedStyle(el).visibility === "hidden") continue; } catch(e) { continue; }
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute("role") || tag;
+    const text = (el.getAttribute("aria-label") || el.textContent || el.getAttribute("placeholder") || el.getAttribute("value") || el.getAttribute("title") || "").substring(0, 80).trim().replace(/\s+/g, " ");
+    let selector = "";
+    if (el.id) selector = "#" + el.id;
+    else if (el.getAttribute("name")) selector = tag + "[name='" + el.getAttribute("name") + "']";
+    else if (el.getAttribute("aria-label")) selector = tag + "[aria-label='" + el.getAttribute("aria-label") + "']";
+    else if (tag === "a" && el.getAttribute("href")) {
+      const href = el.getAttribute("href");
+      if (href.length < 60) selector = "a[href='" + href + "']";
+    }
+    if (!selector) {
+      let cur = el; const parts = [];
+      while (cur && cur !== document.body && cur !== document.documentElement) {
+        let seg = cur.tagName.toLowerCase();
+        const parent = cur.parentElement;
+        if (parent) {
+          const siblings = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+          if (siblings.length > 1) seg += ":nth-of-type(" + (siblings.indexOf(cur) + 1) + ")";
+        }
+        parts.unshift(seg);
+        cur = parent;
+        if (parts.length > 4) break;
+      }
+      selector = parts.join(" > ");
+    }
+    const key = role + "|" + text + "|" + selector;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const entry = text ? "- [" + role + "] \"" + text + "\" \u2192 " + selector : "- [" + role + "] " + selector;
+    results.push(entry);
+  }
+  return results.length > 0 ? results.join("\n") : "(no elements found)";
+})()"###;
+
+fn needs_dom_fallback(stdout: &str) -> bool {
+    let trimmed = stdout.trim();
+    trimmed.contains("(no interactive elements)")
+        || trimmed == "- document"
+        || trimmed.is_empty()
+        || trimmed == "(empty)"
+}
+
+fn extract_eval_result(stdout: &str) -> String {
+    // agent-browser eval returns JSON: {"success":true,"data":{"result":"...","origin":"..."}}
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(stdout) {
+        if let Some(result) = json.pointer("/data/result").and_then(|v| v.as_str()) {
+            return result.to_string();
+        }
+    }
+    // Native binary may wrap eval string results in quotes — strip them
+    let trimmed = stdout.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() > 1 {
+        // Unescape the JSON string
+        if let Ok(serde_json::Value::String(s)) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            return s;
+        }
+    }
+    trimmed.to_string()
+}
+
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
     let command = match action {
         "open_url" | "open" => {
@@ -98,6 +169,16 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
     Ok(command)
 }
 
+fn make_request_id() -> String {
+    format!(
+        "req-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    )
+}
+
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
@@ -109,8 +190,43 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+    // Debug logging for snapshot commands
+    if action == "snapshot" || action == "accessibility_snapshot" {
+        eprintln!("[codemux::browser] Snapshot stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(200)]);
+        if !stderr.is_empty() {
+            eprintln!("[codemux::browser] Snapshot stderr: {}", &stderr[..stderr.len().min(200)]);
+        }
+    }
+
     if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
         return Err(format!("agent-browser failed: {} {}", stdout, stderr));
+    }
+
+    // For snapshot: detect useless ARIA result and fall back to DOM-based query
+    if action == "snapshot" || action == "accessibility_snapshot" {
+        eprintln!("[codemux::browser] Snapshot raw stdout for fallback check: {:?}", &stdout[..stdout.len().min(300)]);
+    }
+    if (action == "snapshot" || action == "accessibility_snapshot") && needs_dom_fallback(&stdout) {
+        eprintln!("[codemux::browser] ARIA snapshot empty, falling back to DOM query");
+        let dom_params = serde_json::json!({ "script": DOM_SNAPSHOT_SCRIPT });
+        let dom_cmd = build_agent_browser_command(session, "eval", &dom_params)?;
+        if let Ok(dom_output) = std::process::Command::new("sh").args(["-c", &dom_cmd]).output() {
+            let dom_stdout = String::from_utf8_lossy(&dom_output.stdout).to_string();
+            let dom_tree = extract_eval_result(&dom_stdout);
+            if !dom_tree.is_empty() && dom_tree != "(no elements found)" {
+                let combined = format!(
+                    "{}\n\n--- Interactive Elements (DOM) ---\n{}",
+                    stdout.trim(),
+                    dom_tree
+                );
+                return Ok(BrowserAutomationResult {
+                    request_id: make_request_id(),
+                    browser_id: browser_id.to_string(),
+                    data: serde_json::json!({ "tree": combined }),
+                    message: None,
+                });
+            }
+        }
     }
 
     let data: serde_json::Value = if stdout.contains("{") {
@@ -124,17 +240,17 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     } else if action == "snapshot" || action == "accessibility_snapshot" {
         serde_json::json!({ "tree": stdout })
     } else {
-        serde_json::json!({ "result": stdout, "success": output.status.success() })
+        // For eval results, the native binary may wrap string values in quotes — strip them
+        let result_str = if (action == "evaluate" || action == "eval") && stdout.trim().starts_with('"') {
+            extract_eval_result(&stdout)
+        } else {
+            stdout.clone()
+        };
+        serde_json::json!({ "result": result_str, "success": output.status.success() })
     };
 
     Ok(BrowserAutomationResult {
-        request_id: format!(
-            "req-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis()
-        ),
+        request_id: make_request_id(),
         browser_id: browser_id.to_string(),
         data,
         message: None,

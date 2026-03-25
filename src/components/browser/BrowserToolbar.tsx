@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ArrowLeft, ArrowRight, RotateCw, Loader2 } from "lucide-react";
+import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
 import { agentBrowserRun } from "@/tauri/commands";
 
 interface Props {
@@ -9,9 +9,11 @@ interface Props {
   currentUrl: string;
   onUrlChange: (url: string) => void;
   loading: boolean;
+  inspectorActive: boolean;
+  onInspectorToggle: () => void;
 }
 
-export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading }: Props) {
+export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, inspectorActive, onInspectorToggle }: Props) {
   const [urlInput, setUrlInput] = useState(currentUrl);
   const [navigating, setNavigating] = useState(false);
 
@@ -67,6 +69,16 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading }: 
         ) : (
           <RotateCw className="h-3 w-3" />
         )}
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        aria-label="Element Inspector"
+        title="Element Inspector (Ctrl+Shift+I)"
+        className={inspectorActive ? "bg-primary/20 text-primary" : ""}
+        onClick={onInspectorToggle}
+      >
+        <Crosshair className="h-3 w-3" />
       </Button>
       <Input
         value={urlInput}
