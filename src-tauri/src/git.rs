@@ -613,6 +613,17 @@ pub struct WorktreeInfo {
     pub is_bare: bool,
 }
 
+pub fn is_git_repo(path: &Path) -> bool {
+    run_git(path, &["rev-parse", "--git-dir"]).is_ok()
+}
+
+pub fn git_init_repo(path: &Path) -> Result<String, String> {
+    run_git(path, &["init"])?;
+    run_git(path, &["add", "."])?;
+    run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"])?;
+    Ok("Repository initialized".to_string())
+}
+
 pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, String> {
     let output = if remote {
         run_git(repo_path, &["branch", "-r", "--format=%(refname:short)"])?

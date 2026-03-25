@@ -4,10 +4,10 @@ import {
   SidebarGroupContent,
   SidebarMenu,
 } from "@/components/ui/sidebar";
-import { useSectionedWorkspaces, useAppStore } from "@/stores/app-store";
+import { useSectionedWorkspaces, useProjectGroupedWorkspaces, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { SidebarSectionGroup } from "./sidebar-section-group";
-import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
+import { SidebarProjectGroup } from "./sidebar-project-group";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import {
   reorderWorkspaces,
@@ -28,6 +28,7 @@ interface DropTarget {
 
 export function SidebarWorkspaceList() {
   const { sectionGroups, unsorted } = useSectionedWorkspaces();
+  const projectGroups = useProjectGroupedWorkspaces(unsorted);
   const appState = useAppStore((s) => s.appState);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
@@ -281,24 +282,21 @@ export function SidebarWorkspaceList() {
             />
           )}
 
-          {/* Unsorted workspaces */}
-          <SidebarMenu data-drop-zone="unsorted">
-            {unsorted.map((ws, idx) => (
-              <div
-                key={ws.workspace_id}
-                data-ws-id={ws.workspace_id}
-                data-ws-index={idx}
-                draggable
-                onDragStart={handleWorkspaceDragStart(ws.workspace_id, null)}
-                className={dragState?.id === ws.workspace_id ? "opacity-40" : ""}
-              >
-                <SidebarWorkspaceRow
-                  workspace={ws}
-                  isActive={ws.workspace_id === activeWorkspaceId}
+          {/* Unsorted workspaces grouped by project */}
+          <div data-drop-zone="unsorted">
+            {projectGroups.map((group) => (
+              <SidebarMenu key={group.projectPath}>
+                <SidebarProjectGroup
+                  projectName={group.projectName}
+                  projectPath={group.projectPath}
+                  workspaces={group.workspaces}
+                  activeWorkspaceId={activeWorkspaceId}
+                  onWorkspaceDragStart={handleWorkspaceDragStart}
+                  dragStateId={dragState?.id ?? null}
                 />
-              </div>
+              </SidebarMenu>
             ))}
-          </SidebarMenu>
+          </div>
 
           {/* Section groups */}
           {sectionGroups.map((group) => (

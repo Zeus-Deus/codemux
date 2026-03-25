@@ -245,7 +245,61 @@ export const submitPrReview = (path: string, prNumber: number, event: string, bo
 export const getPrDeployments = (path: string, prNumber: number) =>
   invoke<DeploymentInfo[]>("get_pr_deployments", { path, prNumber });
 
+// ── Database ──
+
+export const dbGetSetting = (key: string) =>
+  invoke<string | null>("db_get_setting", { key });
+
+export const dbSetSetting = (key: string, value: string) =>
+  invoke("db_set_setting", { key, value });
+
+export const dbDeleteSetting = (key: string) =>
+  invoke("db_delete_setting", { key });
+
+export const dbGetAllSettings = () =>
+  invoke<Record<string, string>>("db_get_all_settings");
+
+export const dbGetUiState = (key: string) =>
+  invoke<string | null>("db_get_ui_state", { key });
+
+export const dbSetUiState = (key: string, value: string) =>
+  invoke("db_set_ui_state", { key, value });
+
+export const dbAddRecentProject = (path: string, name: string) =>
+  invoke("db_add_recent_project", { path, name });
+
+export const dbGetRecentProjects = (limit?: number) =>
+  invoke<Array<{ path: string; name: string; last_opened_at: string }>>("db_get_recent_projects", { limit });
+
+export const dbSaveOpenflowRun = (params: {
+  runId: string;
+  title?: string;
+  goal?: string;
+  status?: string;
+  agentCount?: number;
+  startedAt?: string;
+  completedAt?: string;
+}) =>
+  invoke("db_save_openflow_run", params);
+
+export const dbGetOpenflowHistory = (limit?: number) =>
+  invoke<Array<{
+    run_id: string;
+    title: string | null;
+    goal: string | null;
+    status: string | null;
+    agent_count: number | null;
+    started_at: string | null;
+    completed_at: string | null;
+  }>>("db_get_openflow_history", { limit });
+
 // ── Git ──
+
+export const checkIsGitRepo = (path: string) =>
+  invoke<boolean>("check_is_git_repo", { path });
+
+export const initGitRepo = (path: string) =>
+  invoke<string>("init_git_repo", { path });
 
 export const getGitStatus = (path: string) =>
   invoke<GitFileStatus[]>("get_git_status", { path });

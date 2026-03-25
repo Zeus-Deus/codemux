@@ -1,6 +1,7 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useRef, useEffect } from "react";
 import { useActiveWorkspace } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
@@ -25,6 +26,9 @@ function RightPanelResizer() {
         if (handle) handle.dataset.dragging = "false";
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        // Persist to SQLite
+        dbSetUiState("right_panel_width", String(useUIStore.getState().rightPanelWidth))
+          .catch(console.error);
       };
 
       window.addEventListener("pointermove", onMove);
@@ -45,6 +49,13 @@ function RightPanelResizer() {
 }
 
 export function WorkspaceMain() {
+  // Load persisted right panel width from SQLite on mount
+  useEffect(() => {
+    dbGetUiState("right_panel_width").then((val) => {
+      if (val) useUIStore.getState().setRightPanelWidth(Number(val));
+    }).catch(() => {});
+  }, []);
+
   const activeWorkspace = useActiveWorkspace();
   const rightPanelTab = useUIStore((s) =>
     activeWorkspace

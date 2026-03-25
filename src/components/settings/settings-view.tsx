@@ -33,6 +33,7 @@ import {
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
+  dbSetSetting,
 } from "@/tauri/commands";
 import type { EditorInfo } from "@/tauri/types";
 
@@ -268,17 +269,19 @@ export function SettingsView() {
                 <SettingRow label="AI commit messages" description="Show the generate button next to the commit input.">
                   <Switch
                     checked={config?.ai_commit_message_enabled ?? true}
-                    onCheckedChange={(checked) =>
-                      setAiCommitMessageEnabled(checked).catch(console.error)
-                    }
+                    onCheckedChange={(checked) => {
+                      setAiCommitMessageEnabled(checked).catch(console.error);
+                      dbSetSetting("ai_commit_message_enabled", String(checked)).catch(console.error);
+                    }}
                   />
                 </SettingRow>
                 <SettingRow label="Model override" description="Leave empty to use the Claude CLI default.">
                   <Input
                     value={config?.ai_commit_message_model ?? ""}
-                    onChange={(e) =>
-                      setAiCommitMessageModel(e.target.value || null).catch(console.error)
-                    }
+                    onChange={(e) => {
+                      setAiCommitMessageModel(e.target.value || null).catch(console.error);
+                      dbSetSetting("ai_commit_message_model", e.target.value || "").catch(console.error);
+                    }}
                     placeholder="Default"
                     className="w-36 h-9"
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
@@ -296,17 +299,19 @@ export function SettingsView() {
                 <SettingRow label="Enable resolver" description="Show 'Resolve with AI' button in the conflicts section.">
                   <Switch
                     checked={config?.ai_resolver_enabled ?? false}
-                    onCheckedChange={(checked) =>
-                      setAiResolverEnabled(checked).catch(console.error)
-                    }
+                    onCheckedChange={(checked) => {
+                      setAiResolverEnabled(checked).catch(console.error);
+                      dbSetSetting("ai_resolver_enabled", String(checked)).catch(console.error);
+                    }}
                   />
                 </SettingRow>
                 <SettingRow label="CLI tool" description="Which AI CLI to use for resolving conflicts.">
                   <Select
                     value={config?.ai_resolver_cli ?? "claude"}
-                    onValueChange={(v) =>
-                      setAiResolverCli(v).catch(console.error)
-                    }
+                    onValueChange={(v) => {
+                      setAiResolverCli(v).catch(console.error);
+                      dbSetSetting("ai_resolver_cli", v).catch(console.error);
+                    }}
                     disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
                     <SelectTrigger className="w-36 h-9">
@@ -322,9 +327,10 @@ export function SettingsView() {
                 <SettingRow label="Model override" description="Leave empty to use the CLI default.">
                   <Input
                     value={config?.ai_resolver_model ?? ""}
-                    onChange={(e) =>
-                      setAiResolverModel(e.target.value || null).catch(console.error)
-                    }
+                    onChange={(e) => {
+                      setAiResolverModel(e.target.value || null).catch(console.error);
+                      dbSetSetting("ai_resolver_model", e.target.value || "").catch(console.error);
+                    }}
                     placeholder="Default"
                     className="w-36 h-9"
                     disabled={!(config?.ai_resolver_enabled ?? false)}
@@ -333,9 +339,10 @@ export function SettingsView() {
                 <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
                   <Select
                     value={config?.ai_resolver_strategy ?? "smart_merge"}
-                    onValueChange={(v) =>
-                      setAiResolverStrategy(v).catch(console.error)
-                    }
+                    onValueChange={(v) => {
+                      setAiResolverStrategy(v).catch(console.error);
+                      dbSetSetting("ai_resolver_strategy", v).catch(console.error);
+                    }}
                     disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
                     <SelectTrigger className="w-48 h-9">
@@ -401,9 +408,10 @@ export function SettingsView() {
               >
                 <Switch
                   checked={config?.notification_sound_enabled ?? false}
-                  onCheckedChange={(checked) =>
-                    setNotificationSoundEnabled(checked).catch(console.error)
-                  }
+                  onCheckedChange={(checked) => {
+                    setNotificationSoundEnabled(checked).catch(console.error);
+                    dbSetSetting("notification_sound_enabled", String(checked)).catch(console.error);
+                  }}
                 />
               </SettingRow>
               <Separator />

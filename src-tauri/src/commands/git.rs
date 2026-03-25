@@ -2,6 +2,16 @@ use crate::git::{ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus,
 use std::path::Path;
 
 #[tauri::command]
+pub fn check_is_git_repo(path: String) -> bool {
+    crate::git::is_git_repo(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn init_git_repo(path: String) -> Result<String, String> {
+    crate::git::git_init_repo(Path::new(&path))
+}
+
+#[tauri::command]
 pub fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
     let p = Path::new(&path);
     eprintln!("[git_status] path={}, exists={}, is_dir={}", path, p.exists(), p.is_dir());

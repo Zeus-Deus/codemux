@@ -319,10 +319,12 @@ pub fn close_workspace_with_worktree(
 pub fn activate_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
     if state.activate_workspace(&workspace_id) {
         crate::state::emit_app_state(&app);
+        db.set_ui_state("active_workspace", &workspace_id).ok();
         Ok(())
     } else {
         Err(format!("No workspace found for {workspace_id}"))

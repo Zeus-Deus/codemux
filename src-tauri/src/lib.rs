@@ -5,6 +5,7 @@ pub mod agent_browser;
 pub mod browser;
 pub mod cli;
 pub mod commands;
+pub mod database;
 pub mod config;
 pub mod git;
 pub mod github;
@@ -68,6 +69,11 @@ pub fn run() {
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .manage(presets::PresetStoreState::default())
+        .manage(database::init_database().unwrap_or_else(|e| {
+            eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
+            // Fallback: in-memory database so the app still starts
+            database::DatabaseStore::new_in_memory()
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -104,6 +110,45 @@ pub fn run() {
                     state.activate_workspace(&ws_id.0);
                 }
             }
+            // Restore window size from SQLite
+            {
+                let db: tauri::State<'_, database::DatabaseStore> = handle.state();
+                if let (Some(w), Some(h)) = (db.get_ui_state("window_width"), db.get_ui_state("window_height")) {
+                    if let (Ok(w), Ok(h)) = (w.parse::<f64>(), h.parse::<f64>()) {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.set_size(tauri::LogicalSize::new(w, h));
+                        }
+                    }
+                }
+                if let (Some(x), Some(y)) = (db.get_ui_state("window_x"), db.get_ui_state("window_y")) {
+                    if let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+                        }
+                    }
+                }
+            }
+
+            // Save window state on close
+            {
+                let close_handle = handle.clone();
+                if let Some(window) = app.get_webview_window("main") {
+                    window.on_window_event(move |event| {
+                        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                            let db: tauri::State<'_, database::DatabaseStore> = close_handle.state();
+                            if let Ok(size) = close_handle.get_webview_window("main").and_then(|w| w.outer_size().ok()).ok_or(()) {
+                                db.set_ui_state("window_width", &size.width.to_string()).ok();
+                                db.set_ui_state("window_height", &size.height.to_string()).ok();
+                            }
+                            if let Ok(pos) = close_handle.get_webview_window("main").and_then(|w| w.outer_position().ok()).ok_or(()) {
+                                db.set_ui_state("window_x", &pos.x.to_string()).ok();
+                                db.set_ui_state("window_y", &pos.y.to_string()).ok();
+                            }
+                        }
+                    });
+                }
+            }
+
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
             observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
@@ -330,6 +375,18 @@ pub fn run() {
             terminal::detach_pty_output,
             terminal::write_to_pty,
             terminal::resize_pty,
+            commands::db_get_setting,
+            commands::db_set_setting,
+            commands::db_delete_setting,
+            commands::db_get_all_settings,
+            commands::db_get_ui_state,
+            commands::db_set_ui_state,
+            commands::db_add_recent_project,
+            commands::db_get_recent_projects,
+            commands::db_save_openflow_run,
+            commands::db_get_openflow_history,
+            commands::check_is_git_repo,
+            commands::init_git_repo,
             commands::get_git_status,
             commands::get_git_diff,
             commands::get_git_diff_stat,

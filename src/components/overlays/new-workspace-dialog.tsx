@@ -25,6 +25,7 @@ import {
   Plus,
   Loader2,
   AlertCircle,
+  FolderOpen,
 } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import {
@@ -39,6 +40,10 @@ import {
   checkGhAvailable,
   checkGithubRepo,
   listPullRequests,
+  pickFolderDialog,
+  checkIsGitRepo,
+  dbAddRecentProject,
+  initGitRepo,
 } from "@/tauri/commands";
 import type {
   TerminalPreset,
@@ -89,6 +94,34 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   );
   const cwd = activeWs?.cwd ?? "";
 
+  // Project directory (editable, defaults to active workspace cwd)
+  const [projectDir, setProjectDir] = useState(cwd);
+
+  const handlePickFolder = async () => {
+    const folder = await pickFolderDialog("Choose project folder");
+    if (folder) setProjectDir(folder);
+  };
+
+  // Git repo detection
+  const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
+  const [initializing, setInitializing] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const handleInitGit = async () => {
+    if (!projectDir || initializing) return;
+    setInitializing(true);
+    setError(null);
+    try {
+      await initGitRepo(projectDir);
+      setIsGitRepo(true);
+      setReloadKey((k) => k + 1);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setInitializing(false);
+    }
+  };
+
   // Shared state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
@@ -109,47 +142,63 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [ghAvailable, setGhAvailable] = useState(false);
   const [prLoading, setPrLoading] = useState(false);
 
-  // Load data when dialog opens
+  // Sync projectDir when dialog opens or active workspace changes
   useEffect(() => {
-    if (!open || !cwd) return;
+    if (open && cwd) setProjectDir(cwd);
+  }, [open, cwd]);
+
+  // Load data when dialog opens or project directory changes
+  useEffect(() => {
+    if (!open || !projectDir) return;
     setError(null);
     setCreating(false);
     setNewBranchName("");
     setBranchSearch("");
+    setIsGitRepo(null);
+    setLocalBranches([]);
+    setRemoteBranches([]);
+    setPrs([]);
 
-    // Fetch branches
-    Promise.all([
-      listBranches(cwd, false).catch(() => []),
-      listBranches(cwd, true).catch(() => []),
-      listWorktrees(cwd).catch(() => []),
-      getGitBranchInfo(cwd).catch(() => ({ branch: null, ahead: 0, behind: 0 })),
-    ]).then(([local, remote, wt, info]) => {
-      setLocalBranches(local);
-      setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
-      setWorktrees(wt);
-      setCurrentBranch(info.branch);
-      setBaseBranch(info.branch ?? "main");
+    // Check git status first
+    checkIsGitRepo(projectDir).then((isRepo) => {
+      setIsGitRepo(isRepo);
+      if (!isRepo) return;
+
+      // Fetch branches
+      Promise.all([
+        listBranches(projectDir, false).catch(() => []),
+        listBranches(projectDir, true).catch(() => []),
+        listWorktrees(projectDir).catch(() => []),
+        getGitBranchInfo(projectDir).catch(() => ({ branch: null, ahead: 0, behind: 0 })),
+      ]).then(([local, remote, wt, info]) => {
+        setLocalBranches(local);
+        setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
+        setWorktrees(wt);
+        setCurrentBranch(info.branch);
+        setBaseBranch(info.branch ?? "main");
+      });
+
+      // Check gh
+      Promise.all([checkGhAvailable(), checkGithubRepo(projectDir)])
+        .then(([available, isGhRepo]) => {
+          setGhAvailable(available && isGhRepo);
+          if (available && isGhRepo) {
+            setPrLoading(true);
+            listPullRequests(projectDir, "open")
+              .then(setPrs)
+              .catch(() => setPrs([]))
+              .finally(() => setPrLoading(false));
+          }
+        })
+        .catch(() => setGhAvailable(false));
     });
 
-    // Fetch presets
+    // Fetch presets (independent of git status)
     getPresets()
       .then((snap) => setPresets(snap.presets.filter((p) => p.pinned)))
       .catch(() => {});
-
-    // Check gh
-    Promise.all([checkGhAvailable(), checkGithubRepo(cwd)])
-      .then(([available, isRepo]) => {
-        setGhAvailable(available && isRepo);
-        if (available && isRepo) {
-          setPrLoading(true);
-          listPullRequests(cwd, "open")
-            .then(setPrs)
-            .catch(() => setPrs([]))
-            .finally(() => setPrLoading(false));
-        }
-      })
-      .catch(() => setGhAvailable(false));
-  }, [open, cwd]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, projectDir, reloadKey]);
 
   // Merged branch list (deduplicated)
   const allBranches = useMemo(() => {
@@ -176,7 +225,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
   const handleCreate = useCallback(
     async (branch: string, isNewBranch: boolean) => {
-      if (!cwd || creating) return;
+      if (!projectDir || creating) return;
       setCreating(true);
       setError(null);
 
@@ -199,7 +248,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           wsId = await importWorktreeWorkspace(orphan.path, branch, "single");
         } else {
           wsId = await createWorktreeWorkspace(
-            cwd,
+            projectDir,
             branch,
             isNewBranch,
             "single",
@@ -214,6 +263,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           );
         }
 
+        // Track as recent project
+        const projectName = projectDir.split("/").filter(Boolean).pop() || projectDir;
+        dbAddRecentProject(projectDir, projectName).catch(console.error);
+
         onOpenChange(false);
       } catch (err) {
         setError(String(err));
@@ -221,7 +274,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         setCreating(false);
       }
     },
-    [cwd, creating, selectedPreset, baseBranch, branchWorkspaceMap, worktrees, onOpenChange],
+    [projectDir, creating, selectedPreset, baseBranch, branchWorkspaceMap, worktrees, onOpenChange],
   );
 
   return (
@@ -232,6 +285,38 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           <DialogDescription className="sr-only">Create a new workspace from a branch or pull request</DialogDescription>
         </DialogHeader>
 
+        <div className="px-4 pt-3 space-y-1.5">
+          <label className="text-xs text-muted-foreground">Project Directory</label>
+          <div className="flex gap-1.5">
+            <Input
+              value={projectDir}
+              onChange={(e) => setProjectDir(e.target.value)}
+              className="h-8 text-xs flex-1"
+              placeholder={cwd || "Select a project folder"}
+            />
+            <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handlePickFolder}>
+              <FolderOpen className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+
+        {isGitRepo === false ? (
+          <div className="px-4 py-6 flex flex-col items-center gap-3">
+            <AlertCircle className="h-8 w-8 text-muted-foreground/40" />
+            <p className="text-sm text-muted-foreground">
+              This folder is not a git repository
+            </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={handleInitGit}
+              disabled={initializing}
+            >
+              {initializing && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
+              Initialize Git Repository
+            </Button>
+          </div>
+        ) : (
         <Tabs defaultValue="new-branch" className="flex flex-col">
           <TabsList variant="line" className="mx-4 mt-2 h-8">
             <TabsTrigger value="new-branch" className="text-xs px-2 gap-1">
@@ -416,6 +501,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             />
           </TabsContent>
         </Tabs>
+        )}
 
         {error && (
           <div className="mx-4 mb-3 p-2 rounded-md bg-destructive/10 border border-destructive/20 text-xs text-destructive">
