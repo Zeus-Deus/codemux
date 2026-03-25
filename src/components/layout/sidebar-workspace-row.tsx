@@ -107,8 +107,8 @@ function DeleteWorkspaceDialog({
         <DialogHeader>
           <DialogTitle>Delete workspace &ldquo;{workspace.title}&rdquo;?</DialogTitle>
           <DialogDescription>
-            {isWorktree
-              ? "This will remove the worktree directory."
+            {isWorktree && workspace.git_branch
+              ? `This will remove the worktree directory and delete the git branch '${workspace.git_branch}'.`
               : "This will close the workspace."}
           </DialogDescription>
         </DialogHeader>
@@ -117,28 +117,16 @@ function DeleteWorkspaceDialog({
             Cancel
           </Button>
           {isWorktree ? (
-            <>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => {
-                  closeWorkspaceWithWorktree(workspace.workspace_id, true, false, false).catch(console.error);
-                  onOpenChange(false);
-                }}
-              >
-                Delete
-              </Button>
-              <Button
-                variant="destructive"
-                size="sm"
-                onClick={() => {
-                  closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false).catch(console.error);
-                  onOpenChange(false);
-                }}
-              >
-                Delete &amp; Remove Branch
-              </Button>
-            </>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false).catch(console.error);
+                onOpenChange(false);
+              }}
+            >
+              Delete
+            </Button>
           ) : (
             <Button
               variant="destructive"
