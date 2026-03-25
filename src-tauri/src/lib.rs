@@ -18,11 +18,13 @@ pub mod indexing;
 pub mod memory;
 pub mod openflow;
 pub mod observability;
+pub mod os_input;
 pub mod ports;
 pub mod presets;
 pub mod project;
 pub mod scripts;
 pub mod state;
+pub mod stream_input;
 pub mod terminal;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

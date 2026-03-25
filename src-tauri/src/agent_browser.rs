@@ -2,6 +2,44 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// Stealth Chromium flags that reduce bot detection fingerprinting.
+/// Passed via the AGENT_BROWSER_ARGS env var (comma-separated).
+const STEALTH_CHROMIUM_ARGS: &str = "\
+--disable-blink-features=AutomationControlled,\
+--disable-features=AutomationControlled,\
+--disable-infobars,\
+--no-first-run,\
+--no-default-browser-check,\
+--disable-background-timer-throttling,\
+--disable-backgrounding-occluded-windows,\
+--disable-renderer-backgrounding,\
+--disable-component-update,\
+--disable-hang-monitor,\
+--disable-prompt-on-repost,\
+--metrics-recording-only,\
+--password-store=basic";
+
+/// Detect installed Chrome/Chromium version and return a realistic user-agent string.
+fn stealth_user_agent() -> String {
+    let candidates = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
+    for bin in candidates {
+        if let Ok(output) = std::process::Command::new(bin).arg("--version").output() {
+            if output.status.success() {
+                let version_str = String::from_utf8_lossy(&output.stdout);
+                // Parse version like "Chromium 131.0.6778.204" or "Google Chrome 131.0.6778.204"
+                if let Some(ver) = version_str.split_whitespace().last() {
+                    return format!(
+                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{} Safari/537.36",
+                        ver.trim()
+                    );
+                }
+            }
+        }
+    }
+    // Fallback to a reasonable default
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36".to_string()
+}
+
 fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut result = String::new();
@@ -285,6 +323,8 @@ impl AgentBrowserManager {
 
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("npx agent-browser open about:blank --headless --session {}", session)])
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
 
@@ -393,6 +433,8 @@ impl AgentBrowserManager {
         );
         std::process::Command::new("sh")
             .args(["-c", &daemon_cmd])
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .stdin(std::process::Stdio::null())
             .spawn()
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;

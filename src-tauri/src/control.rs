@@ -349,9 +349,27 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
 
-            agent_browser.run_command(&browser_id, &action_kind, params)
-                .await
-                .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+            match action_kind.as_str() {
+                // Tier 2: coordinate-based CDP tools via stream WebSocket
+                "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
+                    let stream_port = agent_browser.stream_port;
+                    crate::stream_input::handle_vision_action(stream_port, &action_kind, params)
+                        .await
+                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                }
+                // Tier 3: OS-level kernel input via ydotool
+                "click_os" | "type_os" => {
+                    crate::os_input::handle_os_action(&action_kind, params)
+                        .await
+                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                }
+                // Tier 1: existing agent-browser CLI path
+                _ => {
+                    agent_browser.run_command(&browser_id, &action_kind, params)
+                        .await
+                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                }
+            }
         }
         "get_project_memory" => memory::get_project_memory(
             request.params

@@ -48,6 +48,20 @@ pub enum BrowserCommand {
     Fill { selector: String, value: String, browser_id: Option<String> },
     Screenshot { browser_id: Option<String> },
     ConsoleLogs { browser_id: Option<String> },
+    /// Click at pixel coordinates via CDP
+    ClickAt { x: f64, y: f64, #[arg(long, default_value = "left")] click_type: String, browser_id: Option<String> },
+    /// Type text at coordinates or cursor position via CDP
+    TypeAt { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    /// Scroll at coordinates via CDP
+    ScrollAt { x: f64, y: f64, #[arg(long, default_value = "down")] direction: String, #[arg(long, default_value = "3")] amount: i32, browser_id: Option<String> },
+    /// Press a key or combo via CDP
+    KeyPress { key: String, browser_id: Option<String> },
+    /// Drag between coordinates via CDP
+    Drag { start_x: f64, start_y: f64, end_x: f64, end_y: f64, browser_id: Option<String> },
+    /// Click at coordinates using OS-level input (ydotool)
+    ClickOs { x: f64, y: f64, browser_id: Option<String> },
+    /// Type text using OS-level input (ydotool)
+    TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +279,68 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "browser_id": bid, "action": { "kind": "console" } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::ClickAt { x, y, click_type, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "click_at", "x": x, "y": y, "click_type": click_type } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::TypeAt { text, x, y, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let mut action = json!({ "kind": "type_at", "text": text });
+                    if let Some(xv) = x { action["x"] = json!(xv); }
+                    if let Some(yv) = y { action["y"] = json!(yv); }
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": action }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::ScrollAt { x, y, direction, amount, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::KeyPress { key, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "key_press", "key": key } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::Drag { start_x, start_y, end_x, end_y, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::ClickOs { x, y, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": { "kind": "click_os", "x": x, "y": y } }),
+                    }).await?;
+                    Ok(response.data.unwrap_or(json!(null)))
+                }
+                BrowserCommand::TypeOs { text, x, y, browser_id } => {
+                    let bid = browser_id.as_deref().unwrap_or("default");
+                    let mut action = json!({ "kind": "type_os", "text": text });
+                    if let Some(xv) = x { action["x"] = json!(xv); }
+                    if let Some(yv) = y { action["y"] = json!(yv); }
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({ "browser_id": bid, "action": action }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }

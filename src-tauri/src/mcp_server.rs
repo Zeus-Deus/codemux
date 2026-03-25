@@ -109,7 +109,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_click",
-            description: "Click an element by CSS selector",
+            description: "Click an element by CSS selector. Fast and precise for dev servers, localhost, docs. If this fails (timeout, element not found, bot detection), escalate to browser_click_at.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -132,7 +132,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_screenshot",
-            description: "Take a screenshot of the browser pane (returns base64-encoded PNG)",
+            description: "Take a screenshot of the browser pane. Returns base64-encoded PNG with viewport dimensions for use with coordinate-based tools (browser_click_at, browser_click_os, etc.).",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -144,6 +144,96 @@ fn register_tools() -> Vec<McpTool> {
             input_schema: json!({
                 "type": "object",
                 "properties": {}
+            }),
+        },
+        // -- Coordinate-based vision tools (Tier 2: CDP via stream WS) --
+        McpTool {
+            name: "browser_click_at",
+            description: "Click at pixel coordinates (x, y) on the browser viewport via CDP. Works on iframes, shadow DOM, canvas, most websites. Take a browser_screenshot first. If this fails on Cloudflare Turnstile or anti-bot captchas, escalate to browser_click_os.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "X coordinate in CSS pixels from left edge" },
+                    "y": { "type": "number", "description": "Y coordinate in CSS pixels from top edge" },
+                    "click_type": { "type": "string", "enum": ["left", "right", "double"], "default": "left" }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        McpTool {
+            name: "browser_type_at",
+            description: "Type text at the current cursor position or at specified coordinates. Uses low-level input events that work in iframes and shadow DOM.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Text to type" },
+                    "x": { "type": "number", "description": "Optional: click here first" },
+                    "y": { "type": "number", "description": "Optional: click here first" }
+                },
+                "required": ["text"]
+            }),
+        },
+        McpTool {
+            name: "browser_scroll_at",
+            description: "Scroll the page at specified coordinates using mouse wheel events.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "X coordinate to scroll at" },
+                    "y": { "type": "number", "description": "Y coordinate to scroll at" },
+                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "default": "down" },
+                    "amount": { "type": "number", "description": "Scroll ticks (1-10, default 3)", "default": 3 }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        McpTool {
+            name: "browser_key_press",
+            description: "Press keyboard keys or combinations (e.g., Enter, Escape, Ctrl+a).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Key to press (e.g., 'Enter', 'Tab', 'Ctrl+a')" }
+                },
+                "required": ["key"]
+            }),
+        },
+        McpTool {
+            name: "browser_drag",
+            description: "Drag from one coordinate to another. Useful for sliders, drag-and-drop, resizing.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "start_x": { "type": "number" }, "start_y": { "type": "number" },
+                    "end_x": { "type": "number" }, "end_y": { "type": "number" }
+                },
+                "required": ["start_x", "start_y", "end_x", "end_y"]
+            }),
+        },
+        // -- OS-level input tools (Tier 3: kernel events via ydotool) --
+        McpTool {
+            name: "browser_click_os",
+            description: "Click at viewport coordinates using OS-level kernel input (ydotool). Produces real mouse events indistinguishable from human clicks with correct screenX/screenY in all frames. Use when browser_click_at fails on Cloudflare Turnstile or aggressive anti-bot systems. Requires ydotool + ydotoold running, and the browser must be visible (not headless).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "X coordinate in the browser viewport" },
+                    "y": { "type": "number", "description": "Y coordinate in the browser viewport" }
+                },
+                "required": ["x", "y"]
+            }),
+        },
+        McpTool {
+            name: "browser_type_os",
+            description: "Type text using OS-level kernel input (ydotool). Use when browser_type_at fails on protected form fields or anti-bot checks.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "Text to type" },
+                    "x": { "type": "number", "description": "Optional: click here first" },
+                    "y": { "type": "number", "description": "Optional: click here first" }
+                },
+                "required": ["text"]
             }),
         },
         // -- Workspace tools --
@@ -365,11 +455,18 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             .await
         }
         "browser_screenshot" => {
-            call_socket("browser_automation", json!({
+            let result = call_socket("browser_automation", json!({
                 "browser_id": "default",
                 "action": { "kind": "screenshot" }
             }))
-            .await
+            .await;
+            let viewport = crate::stream_input::get_viewport(9223).await.unwrap_or((1280, 720));
+            result.map(|data| json!({
+                "screenshot": data,
+                "viewport_width": viewport.0,
+                "viewport_height": viewport.1,
+                "hint": format!("Viewport: {}x{}px. Use browser_click_at with these coordinates. For Cloudflare captchas, use browser_click_os instead.", viewport.0, viewport.1)
+            }))
         }
         "browser_console_logs" => {
             call_socket("browser_automation", json!({
@@ -377,6 +474,67 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
                 "action": { "kind": "console" }
             }))
             .await
+        }
+
+        // -- Coordinate-based vision tools --
+        "browser_click_at" => {
+            let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            let ct = arguments.get("click_type").and_then(Value::as_str).unwrap_or("left");
+            call_socket("browser_automation", json!({
+                "browser_id": "default",
+                "action": { "kind": "click_at", "x": x, "y": y, "click_type": ct }
+            })).await
+        }
+        "browser_type_at" => {
+            let text = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
+            let mut action = json!({ "kind": "type_at", "text": text });
+            if let Some(x) = arguments.get("x").and_then(Value::as_f64) { action["x"] = json!(x); }
+            if let Some(y) = arguments.get("y").and_then(Value::as_f64) { action["y"] = json!(y); }
+            call_socket("browser_automation", json!({ "browser_id": "default", "action": action })).await
+        }
+        "browser_scroll_at" => {
+            let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            let dir = arguments.get("direction").and_then(Value::as_str).unwrap_or("down");
+            let amt = arguments.get("amount").and_then(Value::as_f64).unwrap_or(3.0);
+            call_socket("browser_automation", json!({
+                "browser_id": "default",
+                "action": { "kind": "scroll_at", "x": x, "y": y, "direction": dir, "amount": amt }
+            })).await
+        }
+        "browser_key_press" => {
+            let key = arguments.get("key").and_then(Value::as_str).unwrap_or("Enter");
+            call_socket("browser_automation", json!({
+                "browser_id": "default",
+                "action": { "kind": "key_press", "key": key }
+            })).await
+        }
+        "browser_drag" => {
+            let sx = arguments.get("start_x").and_then(Value::as_f64).unwrap_or(0.0);
+            let sy = arguments.get("start_y").and_then(Value::as_f64).unwrap_or(0.0);
+            let ex = arguments.get("end_x").and_then(Value::as_f64).unwrap_or(0.0);
+            let ey = arguments.get("end_y").and_then(Value::as_f64).unwrap_or(0.0);
+            call_socket("browser_automation", json!({
+                "browser_id": "default",
+                "action": { "kind": "drag", "start_x": sx, "start_y": sy, "end_x": ex, "end_y": ey }
+            })).await
+        }
+        // -- OS-level input tools --
+        "browser_click_os" => {
+            let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            call_socket("browser_automation", json!({
+                "browser_id": "default",
+                "action": { "kind": "click_os", "x": x, "y": y }
+            })).await
+        }
+        "browser_type_os" => {
+            let text = arguments.get("text").and_then(Value::as_str).unwrap_or_default();
+            let mut action = json!({ "kind": "type_os", "text": text });
+            if let Some(x) = arguments.get("x").and_then(Value::as_f64) { action["x"] = json!(x); }
+            if let Some(y) = arguments.get("y").and_then(Value::as_f64) { action["y"] = json!(y); }
+            call_socket("browser_automation", json!({ "browser_id": "default", "action": action })).await
         }
 
         // -- Workspace tools --
@@ -772,7 +930,7 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 26);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -885,7 +1043,7 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 26);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
