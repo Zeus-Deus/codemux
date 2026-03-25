@@ -151,6 +151,40 @@ mod tests {
 
         assert_eq!(find_git_root(worktree.path()), Some(main_repo.path().to_path_buf()));
     }
+
+    #[test]
+    fn test_find_git_root_corrupted_git_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "this is garbage data").unwrap();
+
+        // Should not crash, should fall back to treating directory as root
+        let result = find_git_root(dir.path());
+        assert_eq!(result, Some(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_find_git_root_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // .git file points to a path that doesn't exist on disk
+        fs::write(
+            dir.path().join(".git"),
+            "gitdir: /nonexistent/path/.git/worktrees/feat",
+        )
+        .unwrap();
+
+        // Should parse the path even if the target doesn't exist
+        let result = find_git_root(dir.path());
+        assert_eq!(result, Some(PathBuf::from("/nonexistent/path")));
+    }
+
+    #[test]
+    fn test_find_git_root_no_git_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .git file or directory anywhere
+
+        let result = find_git_root(dir.path());
+        assert_eq!(result, None);
+    }
 }
 
 fn try_read_config(path: &Path) -> Option<WorkspaceConfig> {

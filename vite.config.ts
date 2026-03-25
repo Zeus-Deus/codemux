@@ -7,6 +7,10 @@ const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  test: {
+    environment: "jsdom",
+    setupFiles: ["./vitest.setup.ts"],
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),

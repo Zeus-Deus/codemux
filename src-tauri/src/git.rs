@@ -651,7 +651,10 @@ pub fn git_create_worktree(
     new_branch: bool,
     base: Option<&str>,
 ) -> Result<String, String> {
-    let repo_name = repo_path
+    let git_root = crate::config::workspace_config::find_git_root(repo_path);
+    let repo_name = git_root
+        .as_deref()
+        .unwrap_or(repo_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
@@ -1357,5 +1360,82 @@ C  source.txt -> copy.txt";
 
         // Cleanup
         git_remove_worktree(Path::new(&wt_path_str), Some("wt-ops-test")).expect("cleanup worktree");
+    }
+
+    #[test]
+    fn test_worktree_name_uses_main_repo_not_worktree_dir() {
+        // When creating a new worktree from INSIDE an existing worktree,
+        // the worktree directory name should use the main repo's name,
+        // not the worktree's directory name.
+        let (_dir, repo) = setup_test_repo();
+
+        // Create first worktree
+        let wt1_path = git_create_worktree(&repo, "wt-first", true, None)
+            .expect("create first worktree");
+        let wt1 = PathBuf::from(&wt1_path);
+        assert!(wt1.exists(), "first worktree should exist");
+
+        // Now create a second worktree from INSIDE the first worktree
+        // This simulates: user's active workspace is a worktree, they create another
+        let wt2_path = git_create_worktree(&wt1, "wt-second", true, None)
+            .expect("create second worktree from inside first");
+        let wt2 = PathBuf::from(&wt2_path);
+        assert!(wt2.exists(), "second worktree should exist");
+
+        // Both worktrees should be under the SAME repo-name directory
+        let wt1_parent = PathBuf::from(&wt1_path).parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+        let wt2_parent = PathBuf::from(&wt2_path).parent().unwrap().file_name().unwrap().to_string_lossy().to_string();
+
+        assert_eq!(
+            wt1_parent, wt2_parent,
+            "both worktrees should be under the same project directory, \
+             but wt1 is under '{}' and wt2 is under '{}'. \
+             wt1_path={}, wt2_path={}",
+            wt1_parent, wt2_parent, wt1_path, wt2_path,
+        );
+
+        // The parent dir should be the repo's folder name, not a branch name
+        let repo_folder = repo.file_name().unwrap().to_string_lossy().to_string();
+        assert_eq!(
+            wt2_parent, repo_folder,
+            "worktree should be under repo name '{}', not '{}'",
+            repo_folder, wt2_parent,
+        );
+
+        // Cleanup
+        git_remove_worktree(Path::new(&wt2_path), Some("wt-second")).expect("cleanup wt2");
+        git_remove_worktree(Path::new(&wt1_path), Some("wt-first")).expect("cleanup wt1");
+    }
+
+    #[test]
+    fn test_worktree_branch_with_slashes_sanitized() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "feature/deep/nested", true, None)
+            .expect("create worktree for branch with slashes");
+
+        // Slashes in branch name should be replaced with hyphens in directory name
+        let dir_name = PathBuf::from(&wt_path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(dir_name, "feature-deep-nested", "slashes should be replaced with hyphens");
+        assert!(PathBuf::from(&wt_path).exists(), "worktree should exist");
+
+        git_remove_worktree(Path::new(&wt_path), Some("feature/deep/nested")).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_empty_repo_does_not_crash() {
+        let dir = TempDir::new().expect("create temp dir");
+        let path = dir.path().to_path_buf();
+        run_git(&path, &["init"]).expect("git init");
+        // No commits — behavior may vary by git version but should not crash
+
+        let result = git_create_worktree(&path, "new-branch", true, None);
+        // Either succeeds (modern git) or returns Err (older git) — just don't crash
+        if let Ok(wt_path) = &result {
+            let _ = std::fs::remove_dir_all(wt_path);
+        }
     }
 }

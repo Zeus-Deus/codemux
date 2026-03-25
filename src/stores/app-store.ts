@@ -49,18 +49,7 @@ export interface ProjectGroup {
 }
 
 export function resolveProjectRoot(ws: WorkspaceSnapshot): string {
-  // Prefer worktree_path field (canonical source) over cwd string parsing
-  const pathToCheck = ws.worktree_path || ws.cwd;
-  const worktreeMarker = "/.codemux/worktrees/";
-  const wtIdx = pathToCheck.indexOf(worktreeMarker);
-  if (wtIdx >= 0) {
-    const afterMarker = pathToCheck.substring(wtIdx + worktreeMarker.length);
-    const repoName = afterMarker.split("/")[0];
-    if (repoName) {
-      return pathToCheck.substring(0, wtIdx + worktreeMarker.length + repoName.length);
-    }
-  }
-  return ws.cwd;
+  return ws.project_root || ws.cwd;
 }
 
 export function useProjectGroupedWorkspaces(workspaces: WorkspaceSnapshot[]): ProjectGroup[] {

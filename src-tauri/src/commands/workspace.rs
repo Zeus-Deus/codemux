@@ -51,10 +51,11 @@ pub(crate) fn create_workspace_impl(
         None => state.create_workspace(),
     };
 
-    // Populate git info
+    // Set project root and populate git info
     let repo_path = cwd
         .map(PathBuf::from)
         .unwrap_or_else(crate::project::current_project_root);
+    state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
     populate_git_info(state, &workspace_id.0, &repo_path);
 
     if let Some(session_id) = state.active_terminal_session_id() {
@@ -172,6 +173,7 @@ pub fn create_workspace_with_preset(
         None => state.create_workspace_with_layout(crate::project::current_project_root(), layout),
     };
 
+    state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
     populate_git_info(&state, &workspace_id.0, &repo_path);
 
     let snapshot = state.snapshot();
@@ -219,6 +221,7 @@ pub fn create_worktree_workspace(
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch.clone());
+    state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
 
     populate_git_info(&state, &workspace_id.0, &wt_path_buf);
 
@@ -268,6 +271,11 @@ pub fn import_worktree_workspace(
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch);
+
+    // Resolve the main repo root from the worktree for project grouping
+    if let Some(root) = crate::config::workspace_config::find_git_root(&wt_path_buf) {
+        state.set_workspace_project_root(&workspace_id.0, root.display().to_string());
+    }
 
     populate_git_info(&state, &workspace_id.0, &wt_path_buf);
 

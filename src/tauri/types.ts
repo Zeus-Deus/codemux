@@ -397,6 +397,7 @@ export interface WorkspaceSnapshot {
   notification_count: number;
   latest_agent_state: string | null;
   worktree_path: string | null;
+  project_root: string | null;
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;

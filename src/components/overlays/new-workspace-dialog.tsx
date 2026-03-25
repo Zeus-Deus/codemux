@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
   Dialog,
   DialogContent,
@@ -97,6 +97,15 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   // Project directory (editable, defaults to active workspace cwd)
   const [projectDir, setProjectDir] = useState(cwd);
 
+  // Synchronously reset projectDir when dialog opens.
+  // This runs during render (before effects) so the fetch effect
+  // always sees the correct directory — no two-effect race condition.
+  const prevOpenRef = useRef(false);
+  if (open && !prevOpenRef.current && projectDir !== (cwd || "")) {
+    setProjectDir(cwd || "");
+  }
+  prevOpenRef.current = open;
+
   const handlePickFolder = async () => {
     const folder = await pickFolderDialog("Choose project folder");
     if (folder) setProjectDir(folder);
@@ -146,14 +155,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [ghAvailable, setGhAvailable] = useState(false);
   const [prLoading, setPrLoading] = useState(false);
 
-  // Sync projectDir when dialog opens or active workspace changes
-  useEffect(() => {
-    if (open && cwd) setProjectDir(cwd);
-  }, [open, cwd]);
-
   // Load data when dialog opens or project directory changes
   useEffect(() => {
     if (!open || !projectDir) return;
+    let cancelled = false;
+
     setError(null);
     setCreating(false);
     setNewBranchName("");
@@ -166,6 +172,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
     // Check git status first
     checkIsGitRepo(projectDir).then((isRepo) => {
+      if (cancelled) return;
       setIsGitRepo(isRepo);
       if (!isRepo) return;
 
@@ -176,6 +183,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         listWorktrees(projectDir).catch(() => []),
         getGitBranchInfo(projectDir).catch(() => ({ branch: null, ahead: 0, behind: 0 })),
       ]).then(([local, remote, wt, info]) => {
+        if (cancelled) return;
         setLocalBranches(local);
         setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
         setWorktrees(wt);
@@ -190,22 +198,25 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       // Check gh
       Promise.all([checkGhAvailable(), checkGithubRepo(projectDir)])
         .then(([available, isGhRepo]) => {
+          if (cancelled) return;
           setGhAvailable(available && isGhRepo);
           if (available && isGhRepo) {
             setPrLoading(true);
             listPullRequests(projectDir, "open")
-              .then(setPrs)
-              .catch(() => setPrs([]))
-              .finally(() => setPrLoading(false));
+              .then((p) => { if (!cancelled) setPrs(p); })
+              .catch(() => { if (!cancelled) setPrs([]); })
+              .finally(() => { if (!cancelled) setPrLoading(false); });
           }
         })
-        .catch(() => setGhAvailable(false));
+        .catch(() => { if (!cancelled) setGhAvailable(false); });
     });
 
     // Fetch presets (independent of git status)
     getPresets()
-      .then((snap) => setPresets(snap.presets.filter((p) => p.pinned)))
+      .then((snap) => { if (!cancelled) setPresets(snap.presets.filter((p) => p.pinned)); })
       .catch(() => {});
+
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, projectDir, reloadKey]);
 

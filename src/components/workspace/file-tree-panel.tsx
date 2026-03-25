@@ -93,7 +93,7 @@ function TreeNode({
 }
 
 export function FileTreePanel({ workspace }: Props) {
-  const cwd = workspace.cwd;
+  const cwd = workspace.worktree_path ?? workspace.cwd;
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [dirContents, setDirContents] = useState<Map<string, FileEntry[]>>(new Map());
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());

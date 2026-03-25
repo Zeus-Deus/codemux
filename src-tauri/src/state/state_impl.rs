@@ -253,6 +253,8 @@ pub struct WorkspaceSnapshot {
     #[serde(default)]
     pub worktree_path: Option<String>,
     #[serde(default)]
+    pub project_root: Option<String>,
+    #[serde(default)]
     pub pr_number: Option<u32>,
     #[serde(default)]
     pub pr_state: Option<String>,
@@ -489,6 +491,7 @@ impl AppStateStore {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            project_root: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -653,6 +656,7 @@ impl AppStateStore {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            project_root: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -806,6 +810,17 @@ impl AppStateStore {
         {
             workspace.worktree_path = Some(worktree_path);
             workspace.title = title;
+        }
+    }
+
+    pub fn set_workspace_project_root(&self, workspace_id: &str, project_root: String) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.project_root = Some(project_root);
         }
     }
 
@@ -1977,6 +1992,7 @@ fn default_app_state() -> AppStateSnapshot {
             git_deletions: 0,
             git_changed_files: 0,
             worktree_path: None,
+            project_root: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
