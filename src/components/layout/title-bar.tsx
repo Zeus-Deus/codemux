@@ -34,6 +34,7 @@ import { useAppStore } from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
+import { useSettingsStore, selectDefaultEditor } from "@/stores/settings-store";
 import type { EditorInfo } from "@/tauri/types";
 
 // ── Window Controls ──
@@ -188,8 +189,8 @@ function AppMenu() {
 
 function IdeLauncher() {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
-  const [defaultEditorId, setDefaultEditorId] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const persistedEditor = useSettingsStore(selectDefaultEditor);
   const activeWorkspace = useAppStore(
     (s) =>
       s.appState?.workspaces.find(
@@ -200,19 +201,20 @@ function IdeLauncher() {
   useEffect(() => {
     detectEditors().then((eds) => {
       setEditors(eds);
-      if (eds.length > 0 && !defaultEditorId) {
-        setDefaultEditorId(eds[0].id);
+      if (eds.length > 0 && !persistedEditor) {
+        useSettingsStore.getState().set("editor.default", eds[0].id);
       }
     });
-  }, [defaultEditorId]);
+  }, [persistedEditor]);
 
   const workspacePath = activeWorkspace?.cwd;
+  const defaultEditorId = persistedEditor || (editors.length > 0 ? editors[0].id : null);
 
   const handleOpen = useCallback(
     (editorId: string) => {
       if (!workspacePath || isLoading) return;
       setIsLoading(true);
-      setDefaultEditorId(editorId);
+      useSettingsStore.getState().set("editor.default", editorId);
       openInEditor(editorId, workspacePath).finally(() => setIsLoading(false));
     },
     [workspacePath, isLoading],

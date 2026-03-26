@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use crate::database::DatabaseStore;
 use crate::presets::{
     emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetStoreSnapshot,
     PresetStoreState, TerminalPreset,
@@ -22,6 +23,7 @@ pub fn get_presets(
 #[tauri::command]
 pub fn create_preset(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     name: String,
     description: Option<String>,
@@ -45,7 +47,7 @@ pub fn create_preset(
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     store.presets.push(preset);
-    save_presets(&store)?;
+    save_presets(&db, &store)?;
     drop(store);
 
     emit_presets_changed(&app);
@@ -55,6 +57,7 @@ pub fn create_preset(
 #[tauri::command]
 pub fn update_preset(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
     name: Option<String>,
@@ -104,7 +107,7 @@ pub fn update_preset(
         }
     }
 
-    save_presets(&store)?;
+    save_presets(&db, &store)?;
     drop(store);
 
     emit_presets_changed(&app);
@@ -114,6 +117,7 @@ pub fn update_preset(
 #[tauri::command]
 pub fn delete_preset(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
 ) -> Result<(), String> {
@@ -135,7 +139,7 @@ pub fn delete_preset(
         store.default_preset_id = None;
     }
 
-    save_presets(&store)?;
+    save_presets(&db, &store)?;
     drop(store);
 
     emit_presets_changed(&app);
@@ -145,6 +149,7 @@ pub fn delete_preset(
 #[tauri::command]
 pub fn set_preset_pinned(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
     pinned: bool,
@@ -157,7 +162,7 @@ pub fn set_preset_pinned(
         .ok_or_else(|| format!("Preset not found: {id}"))?;
 
     preset.pinned = pinned;
-    save_presets(&store)?;
+    save_presets(&db, &store)?;
     drop(store);
 
     emit_presets_changed(&app);
@@ -167,12 +172,13 @@ pub fn set_preset_pinned(
 #[tauri::command]
 pub fn set_preset_bar_visible(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     visible: bool,
 ) -> Result<(), String> {
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     store.bar_visible = visible;
-    save_presets(&store)?;
+    save_presets(&db, &store)?;
     drop(store);
 
     emit_presets_changed(&app);
@@ -306,10 +312,13 @@ pub fn apply_preset(
         _ => {
             // "new_tab" — create one tab per command
             for command in &commands {
-                let (_, session_id) = state.create_tab(
+                let (tab_id, session_id) = state.create_tab(
                     &workspace_id,
                     crate::state::TabKind::Terminal,
                 )?;
+
+                // Name the tab after the preset
+                let _ = state.rename_tab(&workspace_id, &tab_id, preset.name.clone());
 
                 if let Some(session_id) = session_id {
                     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());

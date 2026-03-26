@@ -20,6 +20,8 @@ import {
   cyclePane,
   createBrowserPane,
   regenerateMcpConfig,
+  getPresets,
+  setPresetBarVisible,
 } from "@/tauri/commands";
 
 interface Props {
@@ -188,6 +190,17 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           <CommandItem onSelect={() => run(toggleSidebar)}>
             Toggle Sidebar
             <CommandShortcut>Ctrl+B</CommandShortcut>
+          </CommandItem>
+          <CommandItem
+            onSelect={() =>
+              run(() =>
+                getPresets()
+                  .then((s) => setPresetBarVisible(!s.bar_visible))
+                  .catch(console.error),
+              )
+            }
+          >
+            Toggle Preset Bar
           </CommandItem>
           <CommandItem onSelect={() => run(() => setShowSettings(true))}>
             Open Settings

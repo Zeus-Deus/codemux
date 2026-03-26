@@ -2,10 +2,20 @@ import React from "react";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { BrowserPane } from "@/components/browser/BrowserPane";
 import { Button } from "@/components/ui/button";
+import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot } from "@/tauri/types";
+
+// Map known preset names to their icon identifiers
+const PRESET_TITLE_TO_ICON: Record<string, string> = {
+  "Claude Code": "claude",
+  "Codex": "codex",
+  "OpenCode": "opencode",
+  "Gemini": "gemini",
+  "Shell": "terminal",
+};
 
 interface Props {
   node: PaneNodeSnapshot;
@@ -225,7 +235,10 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
           className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2 cursor-grab active:cursor-grabbing"
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
-          <span className="flex-1 truncate text-xs text-muted-foreground">
+          <span className="flex items-center gap-1.5 flex-1 truncate text-xs text-muted-foreground">
+            {PRESET_TITLE_TO_ICON[node.title] && (
+              <PresetIcon icon={PRESET_TITLE_TO_ICON[node.title]} className="h-3 w-3" />
+            )}
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">

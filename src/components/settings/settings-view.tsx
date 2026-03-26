@@ -22,9 +22,21 @@ import {
   Keyboard,
   Bell,
   Bot,
+  Zap,
+  Pin,
+  PinOff,
+  Trash2,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import {
+  useSettingsStore,
+  selectTerminalFontSize,
+  selectTerminalCursorStyle,
+  selectTerminalColorTheme,
+  selectDefaultEditor,
+  selectDefaultBaseBranch,
+} from "@/stores/settings-store";
 import {
   detectEditors,
   setNotificationSoundEnabled,
@@ -34,18 +46,25 @@ import {
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
-  dbGetSetting,
-  dbSetSetting,
 } from "@/tauri/commands";
-import type { EditorInfo } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot } from "@/tauri/types";
 import { EditorIcon } from "@/components/icons/editor-icon";
+import { PresetIcon } from "@/components/icons/preset-icon";
+import {
+  getPresets,
+  setPresetPinned,
+  setPresetBarVisible,
+  deletePreset,
+} from "@/tauri/commands";
+import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "appearance" | "editor" | "terminal" | "git" | "agent" | "shortcuts" | "notifications";
+type Section = "appearance" | "editor" | "terminal" | "presets" | "git" | "agent" | "shortcuts" | "notifications";
 
 const NAV_ITEMS: { id: Section; label: string; icon: React.ElementType }[] = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "editor", label: "Editor", icon: Code2 },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
+  { id: "presets", label: "Presets", icon: Zap },
   { id: "git", label: "Git", icon: GitBranch },
   { id: "agent", label: "Agent", icon: Bot },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
@@ -110,27 +129,43 @@ export function SettingsView() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const settingsSection = useUIStore((s) => s.settingsSection);
   const config = useAppStore((s) => s.appState?.config);
+  const storeSet = useSettingsStore((s) => s.set);
+  const storeGet = useSettingsStore((s) => s.get);
+  const defaultEditor = useSettingsStore(selectDefaultEditor);
+  const cursorStyle = useSettingsStore(selectTerminalCursorStyle);
+  const fontSize = useSettingsStore(selectTerminalFontSize);
+  const baseBranch = useSettingsStore(selectDefaultBaseBranch);
+  const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
+  const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
+
   const initialSection = (settingsSection && NAV_ITEMS.some((n) => n.id === settingsSection) ? settingsSection : "appearance") as Section;
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
-  const [defaultEditor, setDefaultEditor] = useState("");
-  const [cursorStyle, setCursorStyle] = useState("bar");
-  const [fontSize, setFontSize] = useState(13);
-  const [baseBranch, setBaseBranch] = useState("main");
-  const [terminalThemeMode, setTerminalThemeMode] = useState("app");
-  const [autoMcpConfig, setAutoMcpConfig] = useState(true);
+  const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
+
+  const setDefaultEditor = (v: string) => storeSet("editor.default", v);
+  const setCursorStyle = (v: string) => storeSet("terminal.cursor_style", v);
+  const setFontSize = (v: number) => storeSet("terminal.font_size", String(v));
+  const setBaseBranch = (v: string) => storeSet("git.default_base_branch", v);
+  const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
+  const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
+
+  useEffect(() => {
+    getPresets().then(setPresetStore).catch(console.error);
+    const unlisten = onPresetsChanged((snapshot) => setPresetStore(snapshot));
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
 
   useEffect(() => {
     detectEditors()
       .then((eds) => {
         setEditors(eds);
-        if (eds.length > 0) setDefaultEditor(eds[0].id);
+        if (eds.length > 0 && !defaultEditor) {
+          storeSet("editor.default", eds[0].id);
+        }
       })
       .catch(() => {});
-    dbGetSetting("auto_mcp_config")
-      .then((val) => setAutoMcpConfig(val !== "false"))
-      .catch(() => {});
-  }, []);
+  }, [defaultEditor, storeSet]);
 
   const renderSection = () => {
     switch (activeSection) {
@@ -259,6 +294,81 @@ export function SettingsView() {
           </div>
         );
 
+      case "presets":
+        return (
+          <div>
+            <SectionHeader
+              title="Terminal Presets"
+              description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
+            />
+            <div className="space-y-1">
+              {presetStore && (
+                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
+                  <Switch
+                    checked={presetStore.bar_visible}
+                    onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
+                  />
+                </SettingRow>
+              )}
+              <Separator />
+              {presetStore ? (
+                <div className="space-y-2 pt-2">
+                  {presetStore.presets.map((preset) => (
+                    <div
+                      key={preset.id}
+                      className="flex items-center gap-3 px-3 py-2 rounded-lg border border-border/50 bg-card/50"
+                    >
+                      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium truncate">{preset.name}</span>
+                          {preset.is_builtin && (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                              built-in
+                            </Badge>
+                          )}
+                        </div>
+                        {preset.commands.length > 0 && (
+                          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
+                            {preset.commands[0]}
+                          </code>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+                          onClick={() => setPresetPinned(preset.id, !preset.pinned).catch(console.error)}
+                        >
+                          {preset.pinned ? (
+                            <Pin className="h-3.5 w-3.5 text-foreground" />
+                          ) : (
+                            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
+                          )}
+                        </Button>
+                        {!preset.is_builtin && (
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            title="Delete preset"
+                            className="hover:bg-destructive/80"
+                            onClick={() => deletePreset(preset.id).catch(console.error)}
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">Loading presets...</p>
+              )}
+            </div>
+          </div>
+        );
+
       case "git":
         return (
           <div>
@@ -287,7 +397,7 @@ export function SettingsView() {
                     checked={config?.ai_commit_message_enabled ?? true}
                     onCheckedChange={(checked) => {
                       setAiCommitMessageEnabled(checked).catch(console.error);
-                      dbSetSetting("ai_commit_message_enabled", String(checked)).catch(console.error);
+                      storeSet("ai_commit_message_enabled", String(checked));
                     }}
                   />
                 </SettingRow>
@@ -296,7 +406,7 @@ export function SettingsView() {
                     value={config?.ai_commit_message_model ?? ""}
                     onChange={(e) => {
                       setAiCommitMessageModel(e.target.value || null).catch(console.error);
-                      dbSetSetting("ai_commit_message_model", e.target.value || "").catch(console.error);
+                      storeSet("ai_commit_message_model", e.target.value || "");
                     }}
                     placeholder="Default"
                     className="w-36 h-9"
@@ -317,7 +427,7 @@ export function SettingsView() {
                     checked={config?.ai_resolver_enabled ?? false}
                     onCheckedChange={(checked) => {
                       setAiResolverEnabled(checked).catch(console.error);
-                      dbSetSetting("ai_resolver_enabled", String(checked)).catch(console.error);
+                      storeSet("ai_resolver_enabled", String(checked));
                     }}
                   />
                 </SettingRow>
@@ -326,7 +436,7 @@ export function SettingsView() {
                     value={config?.ai_resolver_cli ?? "claude"}
                     onValueChange={(v) => {
                       setAiResolverCli(v).catch(console.error);
-                      dbSetSetting("ai_resolver_cli", v).catch(console.error);
+                      storeSet("ai_resolver_cli", v);
                     }}
                     disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
@@ -345,7 +455,7 @@ export function SettingsView() {
                     value={config?.ai_resolver_model ?? ""}
                     onChange={(e) => {
                       setAiResolverModel(e.target.value || null).catch(console.error);
-                      dbSetSetting("ai_resolver_model", e.target.value || "").catch(console.error);
+                      storeSet("ai_resolver_model", e.target.value || "");
                     }}
                     placeholder="Default"
                     className="w-36 h-9"
@@ -357,7 +467,7 @@ export function SettingsView() {
                     value={config?.ai_resolver_strategy ?? "smart_merge"}
                     onValueChange={(v) => {
                       setAiResolverStrategy(v).catch(console.error);
-                      dbSetSetting("ai_resolver_strategy", v).catch(console.error);
+                      storeSet("ai_resolver_strategy", v);
                     }}
                     disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
@@ -426,7 +536,7 @@ export function SettingsView() {
                   checked={autoMcpConfig}
                   onCheckedChange={(checked) => {
                     setAutoMcpConfig(checked);
-                    dbSetSetting("auto_mcp_config", String(checked)).catch(console.error);
+                    storeSet("auto_mcp_config", String(checked));
                   }}
                 />
               </SettingRow>
@@ -450,7 +560,7 @@ export function SettingsView() {
                   checked={config?.notification_sound_enabled ?? false}
                   onCheckedChange={(checked) => {
                     setNotificationSoundEnabled(checked).catch(console.error);
-                    dbSetSetting("notification_sound_enabled", String(checked)).catch(console.error);
+                    storeSet("notification_sound_enabled", String(checked));
                   }}
                 />
               </SettingRow>

@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::database::DatabaseStore;
+
 const PRESET_SCHEMA_VERSION: u32 = 1;
+const PRESET_STORE_KEY: &str = "preset_store";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -44,17 +45,12 @@ pub struct PresetStoreState {
     pub inner: Mutex<PresetStore>,
 }
 
-impl Default for PresetStoreState {
-    fn default() -> Self {
+impl PresetStoreState {
+    pub fn new(db: &DatabaseStore) -> Self {
         Self {
-            inner: Mutex::new(load_presets()),
+            inner: Mutex::new(load_presets(db)),
         }
     }
-}
-
-fn preset_file_path() -> Option<PathBuf> {
-    let base = dirs::config_dir()?;
-    Some(base.join("codemux").join("presets.json"))
 }
 
 fn builtin_presets() -> Vec<TerminalPreset> {
@@ -117,38 +113,67 @@ fn builtin_presets() -> Vec<TerminalPreset> {
     ]
 }
 
-pub fn load_presets() -> PresetStore {
-    let Some(path) = preset_file_path() else {
-        return default_store();
-    };
+/// Load presets from SQLite. On first run, migrates from legacy JSON file if it exists.
+pub fn load_presets(db: &DatabaseStore) -> PresetStore {
+    // Try SQLite first
+    if let Some(json) = db.get_setting(PRESET_STORE_KEY) {
+        if let Ok(mut store) = serde_json::from_str::<PresetStore>(&json) {
+            sync_builtins(&mut store);
+            return store;
+        }
+    }
 
-    let data = match fs::read_to_string(&path) {
-        Ok(d) => d,
-        Err(_) => return default_store(),
-    };
+    // Try migrating from legacy JSON file
+    if let Some(store) = migrate_from_json_file() {
+        // Persist to SQLite
+        let _ = save_presets(db, &store);
+        return store;
+    }
 
-    let mut store: PresetStore = match serde_json::from_str(&data) {
-        Ok(s) => s,
-        Err(_) => return default_store(),
-    };
+    // Fresh install — use defaults
+    let store = default_store();
+    let _ = save_presets(db, &store);
+    store
+}
 
-    // Sync builtins: add missing ones, prune stale ones (e.g. removed Aider/Dev Server)
+/// Save presets to SQLite settings table.
+pub fn save_presets(db: &DatabaseStore, store: &PresetStore) -> Result<(), String> {
+    let json = serde_json::to_string(store)
+        .map_err(|e| format!("Failed to serialize presets: {e}"))?;
+    db.set_setting(PRESET_STORE_KEY, &json)
+}
+
+/// Sync built-in presets: add missing ones, remove stale ones.
+fn sync_builtins(store: &mut PresetStore) {
     let builtins = builtin_presets();
     let builtin_ids: Vec<&str> = builtins.iter().map(|b| b.id.as_str()).collect();
 
-    // Remove stale builtins whose IDs no longer exist in the current builtin list
+    // Remove stale builtins whose IDs no longer exist
     store.presets.retain(|p| {
         !p.id.starts_with("builtin-") || builtin_ids.contains(&p.id.as_str())
     });
 
-    // Add any missing builtins (handles upgrades when new builtins are added)
+    // Add any missing builtins
     for builtin in &builtins {
         if !store.presets.iter().any(|p| p.id == builtin.id) {
             store.presets.push(builtin.clone());
         }
     }
+}
 
-    store
+/// Try to load from the legacy ~/.config/codemux/presets.json file.
+/// If successful, deletes the JSON file after loading.
+fn migrate_from_json_file() -> Option<PresetStore> {
+    let path = dirs::config_dir()?.join("codemux").join("presets.json");
+    let data = std::fs::read_to_string(&path).ok()?;
+    let mut store: PresetStore = serde_json::from_str(&data).ok()?;
+    sync_builtins(&mut store);
+
+    // Remove the legacy file now that data is in SQLite
+    let _ = std::fs::remove_file(&path);
+    eprintln!("[codemux::presets] Migrated presets from JSON to SQLite");
+
+    Some(store)
 }
 
 fn default_store() -> PresetStore {
@@ -158,25 +183,6 @@ fn default_store() -> PresetStore {
         default_preset_id: None,
         bar_visible: true,
     }
-}
-
-pub fn save_presets(store: &PresetStore) -> Result<(), String> {
-    let Some(path) = preset_file_path() else {
-        return Ok(());
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create config dir: {error}"))?;
-    }
-
-    let json = serde_json::to_string_pretty(store)
-        .map_err(|error| format!("Failed to serialize presets: {error}"))?;
-
-    fs::write(&path, json)
-        .map_err(|error| format!("Failed to write presets: {error}"))?;
-
-    Ok(())
 }
 
 pub fn snapshot_from_store(store: &PresetStore) -> PresetStoreSnapshot {
@@ -222,8 +228,34 @@ mod tests {
 
     #[test]
     fn load_presets_returns_defaults_on_missing_file() {
-        // When there's no config file, load_presets falls back to defaults
-        let store = default_store();
+        let db = DatabaseStore::new_in_memory();
+        let store = load_presets(&db);
         assert_eq!(store.presets.len(), 5);
+        assert!(store.bar_visible);
+    }
+
+    #[test]
+    fn save_and_load_roundtrip() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.bar_visible = false;
+        save_presets(&db, &store).unwrap();
+
+        let loaded = load_presets(&db);
+        assert!(!loaded.bar_visible);
+        assert_eq!(loaded.presets.len(), 5);
+    }
+
+    #[test]
+    fn sync_adds_missing_builtins() {
+        let db = DatabaseStore::new_in_memory();
+        // Save a store with only 2 presets
+        let mut store = default_store();
+        store.presets.retain(|p| p.id == "builtin-claude" || p.id == "builtin-shell");
+        save_presets(&db, &store).unwrap();
+
+        // Load should re-add missing builtins
+        let loaded = load_presets(&db);
+        assert_eq!(loaded.presets.len(), 5);
     }
 }

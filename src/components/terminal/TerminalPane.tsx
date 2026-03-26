@@ -4,6 +4,11 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import {
+  getTerminalFontSize,
+  getTerminalCursorStyle,
+  getTerminalFontFamily,
+} from "@/stores/settings-store";
+import {
   writeToPty,
   resizePty,
   detachPtyOutput,
@@ -245,15 +250,15 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
 
     // ── Create terminal ──
     const term = new Terminal({
-      fontFamily: "'JetBrains Mono Variable', monospace",
+      fontFamily: getTerminalFontFamily(),
       theme: buildThemeFromCSS(),
       convertEol: true,
       cursorBlink: true,
       cursorWidth: 2,
       lineHeight: 1.15,
       letterSpacing: 0,
-      fontSize: 13,
-      cursorStyle: "bar",
+      fontSize: getTerminalFontSize(),
+      cursorStyle: getTerminalCursorStyle() as "bar" | "block" | "underline",
       altClickMovesCursor: true,
     });
 

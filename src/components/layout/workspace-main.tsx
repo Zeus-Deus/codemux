@@ -3,6 +3,7 @@ import { useActiveWorkspace } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
+import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
@@ -86,6 +87,7 @@ export function WorkspaceMain() {
   return (
     <>
       <TabBar workspace={activeWorkspace} />
+      <PresetBar workspaceId={activeWorkspace.workspace_id} />
       <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
         <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
           {activeTab?.kind === "diff" ? (

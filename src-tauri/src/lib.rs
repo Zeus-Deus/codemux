@@ -72,10 +72,8 @@ pub fn run() {
         .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
-        .manage(presets::PresetStoreState::default())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
-            // Fallback: in-memory database so the app still starts
             database::DatabaseStore::new_in_memory()
         }))
         .plugin(tauri_plugin_opener::init())
@@ -92,6 +90,12 @@ pub fn run() {
                     startup_id,
                     pid
                 ));
+            }
+
+            // Initialize presets from SQLite (must happen after database is managed)
+            {
+                let db: tauri::State<'_, database::DatabaseStore> = app.handle().state();
+                app.manage(presets::PresetStoreState::new(&db));
             }
 
             let handle = app.handle().clone();
