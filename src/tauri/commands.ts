@@ -563,6 +563,8 @@ export const updatePreset = (params: {
   workingDirectory: string | null;
   launchMode: LaunchMode;
   icon: string | null;
+  autoRunOnWorkspace?: boolean;
+  autoRunOnNewTab?: boolean;
 }) =>
   invoke("update_preset", params);
 

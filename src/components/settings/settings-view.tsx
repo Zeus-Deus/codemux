@@ -5,6 +5,14 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+  SheetFooter,
+} from "@/components/ui/sheet";
 import { Slider } from "@/components/ui/slider";
 import {
   Select,
@@ -127,38 +135,44 @@ function SectionHeader({ title, description }: { title: string; description: str
   );
 }
 
-function PresetDetailPanel({
+function PresetEditorSheet({
   preset,
-  onClose,
+  open,
+  onOpenChange,
 }: {
-  preset: TerminalPreset;
-  onClose: () => void;
+  preset: TerminalPreset | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
 }) {
-  const [name, setName] = useState(preset.name);
-  const [description, setDescription] = useState(preset.description ?? "");
-  const [commands, setCommands] = useState<string[]>(
-    preset.commands.length > 0 ? preset.commands : [""],
-  );
-  const [launchMode, setLaunchMode] = useState<LaunchMode>(preset.launch_mode);
-  const [pinned, setPinned] = useState(preset.pinned);
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [commands, setCommands] = useState<string[]>([""]);
+  const [launchMode, setLaunchMode] = useState<LaunchMode>("new_tab");
+  const [pinned, setPinned] = useState(true);
+  const [autoRunOnWorkspace, setAutoRunOnWorkspace] = useState(false);
+  const [autoRunOnNewTab, setAutoRunOnNewTab] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  // Sync when preset changes externally
+  // Sync when preset changes
   useEffect(() => {
+    if (!preset) return;
     setName(preset.name);
     setDescription(preset.description ?? "");
-    setCommands(preset.commands.length > 0 ? preset.commands : [""]);
+    setCommands(preset.commands.length > 0 ? [...preset.commands] : [""]);
     setLaunchMode(preset.launch_mode);
     setPinned(preset.pinned);
+    setAutoRunOnWorkspace(preset.auto_run_on_workspace);
+    setAutoRunOnNewTab(preset.auto_run_on_new_tab);
     setConfirmDelete(false);
-  }, [preset.id, preset.name, preset.description, preset.commands, preset.launch_mode, preset.pinned]);
+  }, [preset]);
+
+  if (!preset) return null;
 
   const save = (updates: Partial<{
     name: string;
     description: string | null;
     commands: string[];
     launchMode: LaunchMode;
-    icon: string | null;
   }>) => {
     updatePreset({
       id: preset.id,
@@ -173,7 +187,7 @@ function PresetDetailPanel({
 
   const handleDelete = () => {
     deletePreset(preset.id).catch(console.error);
-    onClose();
+    onOpenChange(false);
   };
 
   const handlePinnedChange = (checked: boolean) => {
@@ -191,9 +205,7 @@ function PresetDetailPanel({
     save({ commands: commands.filter((c) => c.trim()) });
   };
 
-  const addCommand = () => {
-    setCommands([...commands, ""]);
-  };
+  const addCommand = () => setCommands([...commands, ""]);
 
   const removeCommand = (index: number) => {
     const next = commands.filter((_, i) => i !== index);
@@ -203,152 +215,214 @@ function PresetDetailPanel({
   };
 
   return (
-    <div className="w-[380px] shrink-0 border-l border-border bg-background flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
-        <div className="flex items-center gap-2 min-w-0">
-          <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
-          <span className="text-sm font-medium truncate">{preset.name}</span>
-        </div>
-        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Close">
-          <X className="h-3.5 w-3.5" />
-        </Button>
-      </div>
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent
+        side="right"
+        className="sm:max-w-xl w-full flex flex-col gap-0 p-0"
+        showCloseButton={false}
+      >
+        {/* Header */}
+        <SheetHeader className="border-b p-4">
+          <SheetTitle className="flex items-center gap-2 text-sm">
+            <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
+            {preset.name}
+          </SheetTitle>
+          <SheetDescription>
+            Configure commands, targeting, and launch options.
+          </SheetDescription>
+        </SheetHeader>
 
-      {/* Content */}
-      <ScrollArea className="flex-1 min-h-0">
-        <div className="p-4 space-y-5">
+        {/* Scrollable content */}
+        <div className="flex-1 overflow-y-auto p-4 space-y-6">
           {/* Name */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground">Name</label>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Name</label>
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
               onBlur={() => name !== preset.name && save({ name })}
-              disabled={preset.is_builtin}
-              className="h-8 text-sm"
+              placeholder="e.g. Dev Server"
+              className="h-9"
             />
           </div>
 
           {/* Description */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground">Description</label>
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Description</label>
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               onBlur={() => save({ description: description || null })}
-              disabled={preset.is_builtin}
               placeholder="Optional description"
-              className="h-8 text-sm"
+              className="h-9"
             />
           </div>
 
           {/* Commands */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground">Commands</label>
-            <div className="space-y-1.5">
+          <div className="space-y-2">
+            <label className="text-sm font-medium">Commands</label>
+            <div className="flex flex-col gap-1.5">
               {commands.map((cmd, i) => (
-                <div key={i} className="flex items-center gap-1">
+                <div key={i} className="group/cmd flex items-center gap-2">
                   <Input
                     value={cmd}
                     onChange={(e) => handleCommandChange(i, e.target.value)}
                     onBlur={handleCommandBlur}
-                    disabled={preset.is_builtin}
-                    placeholder="e.g. claude --dangerously-skip-permissions"
-                    className="h-8 text-sm font-mono bg-muted/30"
+                    placeholder="e.g. bun run dev"
+                    className="h-9 flex-1 font-mono text-sm"
                   />
-                  {commands.length > 1 && !preset.is_builtin && (
+                  {commands.length > 1 && (
                     <Button
                       variant="ghost"
                       size="icon-xs"
                       onClick={() => removeCommand(i)}
+                      className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
                       aria-label="Remove command"
                     >
-                      <X className="h-3 w-3" />
+                      <X className="h-3.5 w-3.5" />
                     </Button>
                   )}
                 </div>
               ))}
-              {!preset.is_builtin && (
-                <button
-                  type="button"
-                  onClick={addCommand}
-                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  + Add command
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={addCommand}
+                className="mt-1 inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+              >
+                + Add command
+              </button>
             </div>
           </div>
 
-          {/* Launch Mode */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-muted-foreground">Launch Mode</label>
-            <Select
-              value={launchMode}
-              onValueChange={(v: LaunchMode) => {
-                setLaunchMode(v);
-                save({ launchMode: v });
-              }}
-              disabled={preset.is_builtin}
-            >
-              <SelectTrigger className="h-8 text-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="new_tab">Open in new tab</SelectItem>
-                <SelectItem value="split_pane">Split pane</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
+          {/* Advanced section */}
+          <div className="space-y-5 border-t border-border/40 pt-5">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground/80">
+              Advanced
+            </p>
 
-          {/* Pinned */}
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <p className="text-sm font-medium">Show in preset bar</p>
-              <p className="text-xs text-muted-foreground">Pin this preset to the quick-launch bar</p>
+            {/* Launch Mode */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Launch Mode</label>
+              <Select
+                value={launchMode}
+                onValueChange={(v: LaunchMode) => {
+                  setLaunchMode(v);
+                  save({ launchMode: v });
+                }}
+              >
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="new_tab">Open in new tab</SelectItem>
+                  <SelectItem value="split_pane">Split pane</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-            <Switch checked={pinned} onCheckedChange={handlePinnedChange} />
-          </div>
 
-          {/* Delete */}
-          {!preset.is_builtin && (
-            <>
-              <Separator />
-              {confirmDelete ? (
-                <div className="space-y-2">
-                  <p className="text-sm text-destructive">Delete this preset? This cannot be undone.</p>
-                  <div className="flex gap-2">
-                    <Button
-                      variant="destructive"
-                      size="sm"
-                      onClick={handleDelete}
-                    >
-                      Delete
-                    </Button>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setConfirmDelete(false)}
-                    >
-                      Cancel
-                    </Button>
+            {/* Auto-run */}
+            <div className="space-y-3">
+              <label className="text-sm font-medium">Auto-run</label>
+              <div className="space-y-4">
+                <div className="flex items-start gap-3">
+                  <Switch
+                    checked={autoRunOnWorkspace}
+                    onCheckedChange={(checked) => {
+                      setAutoRunOnWorkspace(checked);
+                      updatePreset({
+                        id: preset.id,
+                        name,
+                        description: description || null,
+                        commands: commands.filter((c) => c.trim()),
+                        workingDirectory: preset.working_directory,
+                        launchMode,
+                        icon: preset.icon,
+                        autoRunOnWorkspace: checked,
+                        autoRunOnNewTab: autoRunOnNewTab,
+                      }).catch(console.error);
+                    }}
+                    className="mt-0.5"
+                  />
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">When creating a workspace</p>
+                    <p className="text-xs text-muted-foreground">
+                      Automatically launch this preset for new workspaces.
+                    </p>
                   </div>
                 </div>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => setConfirmDelete(true)}
-                  className="text-sm text-destructive hover:text-destructive/80 transition-colors"
-                >
-                  Delete Preset
-                </button>
-              )}
-            </>
-          )}
+                <div className="flex items-start gap-3">
+                  <Switch
+                    checked={autoRunOnNewTab}
+                    onCheckedChange={(checked) => {
+                      setAutoRunOnNewTab(checked);
+                      updatePreset({
+                        id: preset.id,
+                        name,
+                        description: description || null,
+                        commands: commands.filter((c) => c.trim()),
+                        workingDirectory: preset.working_directory,
+                        launchMode,
+                        icon: preset.icon,
+                        autoRunOnWorkspace: autoRunOnWorkspace,
+                        autoRunOnNewTab: checked,
+                      }).catch(console.error);
+                    }}
+                    className="mt-0.5"
+                  />
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">When opening a new tab</p>
+                    <p className="text-xs text-muted-foreground">
+                      Automatically launch this preset for new tabs.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Pinned */}
+            <div className="flex items-center justify-between">
+              <div className="space-y-0.5">
+                <p className="text-sm font-medium">Show in preset bar</p>
+                <p className="text-xs text-muted-foreground">
+                  Pin this preset to the quick-launch bar
+                </p>
+              </div>
+              <Switch checked={pinned} onCheckedChange={handlePinnedChange} />
+            </div>
+          </div>
         </div>
-      </ScrollArea>
-    </div>
+
+        {/* Footer */}
+        <SheetFooter className="border-t p-4 sm:flex-row sm:items-center sm:justify-between">
+          {!preset.is_builtin ? (
+            confirmDelete ? (
+              <div className="flex items-center gap-2">
+                <Button variant="destructive" size="sm" onClick={handleDelete}>
+                  Confirm Delete
+                </Button>
+                <Button variant="ghost" size="sm" onClick={() => setConfirmDelete(false)}>
+                  Cancel
+                </Button>
+              </div>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setConfirmDelete(true)}
+                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+              >
+                Delete Preset
+              </Button>
+            )
+          ) : (
+            <div />
+          )}
+          <Button size="sm" onClick={() => onOpenChange(false)}>
+            Done
+          </Button>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -525,103 +599,96 @@ export function SettingsView() {
       case "presets": {
         const selectedPreset = presetStore?.presets.find((p) => p.id === selectedPresetId) ?? null;
         return (
-          <div className="flex h-full min-h-0">
-            {/* Left: preset list */}
-            <div className="flex-1 min-w-0 overflow-auto">
-              <SectionHeader
-                title="Terminal Presets"
-                description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
-              />
-              <div className="space-y-1">
-                {presetStore && (
-                  <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
-                    <Switch
-                      checked={presetStore.bar_visible}
-                      onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
-                    />
-                  </SettingRow>
-                )}
-                <Separator />
-                {presetStore ? (
-                  <div className="space-y-2 pt-2">
-                    {presetStore.presets.map((preset) => (
-                      <div
-                        key={preset.id}
-                        className={`flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150 ${
-                          selectedPresetId === preset.id
-                            ? "border-primary/40 bg-primary/5"
-                            : "border-border/50 bg-card/50 hover:bg-accent/30"
-                        }`}
-                        onClick={() =>
-                          setSelectedPresetId(
-                            selectedPresetId === preset.id ? null : preset.id,
-                          )
-                        }
-                      >
-                        <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-medium truncate">{preset.name}</span>
-                            {preset.is_builtin && (
-                              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-                                built-in
-                              </Badge>
-                            )}
-                          </div>
-                          {preset.commands.length > 0 && (
-                            <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
-                              {preset.commands[0]}
-                            </code>
+          <div>
+            <SectionHeader
+              title="Terminal Presets"
+              description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
+            />
+            <div className="space-y-1">
+              {presetStore && (
+                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
+                  <Switch
+                    checked={presetStore.bar_visible}
+                    onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
+                  />
+                </SettingRow>
+              )}
+              <Separator />
+              {presetStore ? (
+                <div className="space-y-2 pt-2">
+                  <p className="text-xs text-muted-foreground mb-3">Click a preset to edit details.</p>
+                  {presetStore.presets.map((preset) => (
+                    <div
+                      key={preset.id}
+                      className={`flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150 ${
+                        selectedPresetId === preset.id
+                          ? "border-primary/40 bg-primary/5"
+                          : "border-border/50 bg-card/50 hover:bg-accent/30"
+                      }`}
+                      onClick={() => setSelectedPresetId(preset.id)}
+                    >
+                      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium truncate">{preset.name}</span>
+                          {preset.is_builtin && (
+                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                              built-in
+                            </Badge>
                           )}
                         </div>
-                        <div className="flex items-center gap-1 shrink-0">
+                        {preset.commands.length > 0 && (
+                          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
+                            {preset.commands[0]}
+                          </code>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPresetPinned(preset.id, !preset.pinned).catch(console.error);
+                          }}
+                        >
+                          {preset.pinned ? (
+                            <Pin className="h-3.5 w-3.5 text-foreground" />
+                          ) : (
+                            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
+                          )}
+                        </Button>
+                        {!preset.is_builtin && (
                           <Button
                             variant="ghost"
                             size="icon-xs"
-                            title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+                            title="Delete preset"
+                            className="hover:bg-destructive/80"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setPresetPinned(preset.id, !preset.pinned).catch(console.error);
+                              deletePreset(preset.id).catch(console.error);
+                              if (selectedPresetId === preset.id) setSelectedPresetId(null);
                             }}
                           >
-                            {preset.pinned ? (
-                              <Pin className="h-3.5 w-3.5 text-foreground" />
-                            ) : (
-                              <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
-                            )}
+                            <Trash2 className="h-3.5 w-3.5" />
                           </Button>
-                          {!preset.is_builtin && (
-                            <Button
-                              variant="ghost"
-                              size="icon-xs"
-                              title="Delete preset"
-                              className="hover:bg-destructive/80"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                deletePreset(preset.id).catch(console.error);
-                                if (selectedPresetId === preset.id) setSelectedPresetId(null);
-                              }}
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </Button>
-                          )}
-                        </div>
+                        )}
                       </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-sm text-muted-foreground">Loading presets...</p>
-                )}
-              </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-sm text-muted-foreground">Loading presets...</p>
+              )}
             </div>
 
-            {/* Right: detail panel */}
-            {selectedPreset && (
-              <PresetDetailPanel
-                preset={selectedPreset}
-                onClose={() => setSelectedPresetId(null)}
-              />
-            )}
+            {/* Editor sheet — renders via portal, not inline */}
+            <PresetEditorSheet
+              preset={selectedPreset}
+              open={!!selectedPreset}
+              onOpenChange={(open) => { if (!open) setSelectedPresetId(null); }}
+            />
           </div>
         );
       }

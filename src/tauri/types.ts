@@ -532,6 +532,8 @@ export interface TerminalPreset {
   icon: string | null;
   pinned: boolean;
   is_builtin: boolean;
+  auto_run_on_workspace: boolean;
+  auto_run_on_new_tab: boolean;
 }
 
 export interface PresetStoreSnapshot {

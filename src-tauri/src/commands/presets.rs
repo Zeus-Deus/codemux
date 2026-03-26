@@ -43,6 +43,8 @@ pub fn create_preset(
         icon: None,
         pinned,
         is_builtin: false,
+        auto_run_on_workspace: false,
+        auto_run_on_new_tab: false,
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -67,6 +69,8 @@ pub fn update_preset(
     launch_mode: Option<LaunchMode>,
     pinned: Option<bool>,
     icon: Option<String>,
+    auto_run_on_workspace: Option<bool>,
+    auto_run_on_new_tab: Option<bool>,
 ) -> Result<(), String> {
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     let preset = store
@@ -75,36 +79,33 @@ pub fn update_preset(
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Preset not found: {id}"))?;
 
-    if preset.is_builtin {
-        // Builtins only allow toggling pinned
-        if let Some(pinned) = pinned {
-            preset.pinned = pinned;
-        }
-        if name.is_some() || commands.is_some() || launch_mode.is_some() {
-            return Err("Cannot modify built-in preset fields other than pinned".into());
-        }
-    } else {
-        if let Some(name) = name {
-            preset.name = name;
-        }
-        if let Some(desc) = description {
-            preset.description = Some(desc);
-        }
-        if let Some(cmds) = commands {
-            preset.commands = cmds;
-        }
-        if let Some(wd) = working_directory {
-            preset.working_directory = if wd.is_empty() { None } else { Some(wd) };
-        }
-        if let Some(mode) = launch_mode {
-            preset.launch_mode = mode;
-        }
-        if let Some(pinned) = pinned {
-            preset.pinned = pinned;
-        }
-        if let Some(icon) = icon {
-            preset.icon = if icon.is_empty() { None } else { Some(icon) };
-        }
+    // All presets are fully editable (only delete is protected for builtins)
+    if let Some(name) = name {
+        preset.name = name;
+    }
+    if let Some(desc) = description {
+        preset.description = Some(desc);
+    }
+    if let Some(cmds) = commands {
+        preset.commands = cmds;
+    }
+    if let Some(wd) = working_directory {
+        preset.working_directory = if wd.is_empty() { None } else { Some(wd) };
+    }
+    if let Some(mode) = launch_mode {
+        preset.launch_mode = mode;
+    }
+    if let Some(pinned) = pinned {
+        preset.pinned = pinned;
+    }
+    if let Some(icon) = icon {
+        preset.icon = if icon.is_empty() { None } else { Some(icon) };
+    }
+    if let Some(v) = auto_run_on_workspace {
+        preset.auto_run_on_workspace = v;
+    }
+    if let Some(v) = auto_run_on_new_tab {
+        preset.auto_run_on_new_tab = v;
     }
 
     save_presets(&db, &store)?;

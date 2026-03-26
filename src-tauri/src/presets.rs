@@ -24,6 +24,10 @@ pub struct TerminalPreset {
     pub icon: Option<String>,
     pub pinned: bool,
     pub is_builtin: bool,
+    #[serde(default)]
+    pub auto_run_on_workspace: bool,
+    #[serde(default)]
+    pub auto_run_on_new_tab: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +69,8 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             icon: Some("claude".into()),
             pinned: true,
             is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         },
         TerminalPreset {
             id: "builtin-codex".into(),
@@ -76,6 +82,8 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             icon: Some("codex".into()),
             pinned: true,
             is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         },
         TerminalPreset {
             id: "builtin-opencode".into(),
@@ -87,6 +95,8 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             icon: Some("opencode".into()),
             pinned: true,
             is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         },
         TerminalPreset {
             id: "builtin-gemini".into(),
@@ -98,6 +108,8 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             icon: Some("gemini".into()),
             pinned: true,
             is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         },
         TerminalPreset {
             id: "builtin-shell".into(),
@@ -109,6 +121,8 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             icon: Some("terminal".into()),
             pinned: false,
             is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         },
     ]
 }
@@ -270,6 +284,8 @@ mod tests {
             icon: None,
             pinned: true,
             is_builtin: false,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
         }
     }
 
@@ -422,5 +438,69 @@ mod tests {
         assert_eq!(p.launch_mode, LaunchMode::SplitPane);
         assert!(!p.pinned);
         assert_eq!(p.description, Some("New desc".into()));
+    }
+
+    #[test]
+    fn builtin_preset_fields_are_editable() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = load_presets(&db);
+
+        // Edit the builtin claude preset
+        let p = store.presets.iter_mut().find(|p| p.id == "builtin-claude").unwrap();
+        p.name = "My Claude".into();
+        p.description = Some("Custom desc".into());
+        p.commands = vec!["claude --dangerously-skip-permissions --verbose".into()];
+        p.launch_mode = LaunchMode::SplitPane;
+        save_presets(&db, &store).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "builtin-claude").unwrap();
+        assert_eq!(p.name, "My Claude");
+        assert_eq!(p.description, Some("Custom desc".into()));
+        assert_eq!(p.commands, vec!["claude --dangerously-skip-permissions --verbose"]);
+        assert_eq!(p.launch_mode, LaunchMode::SplitPane);
+        assert!(p.is_builtin); // still marked as builtin
+    }
+
+    #[test]
+    fn auto_run_fields_default_to_false() {
+        let db = DatabaseStore::new_in_memory();
+        let store = load_presets(&db);
+        for p in &store.presets {
+            assert!(!p.auto_run_on_workspace, "preset {} should default to false", p.id);
+            assert!(!p.auto_run_on_new_tab, "preset {} should default to false", p.id);
+        }
+    }
+
+    #[test]
+    fn auto_run_fields_persist_across_reload() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Test"));
+        save_presets(&db, &store).unwrap();
+
+        // Toggle auto_run_on_workspace on
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        assert!(!p.auto_run_on_workspace);
+        assert!(!p.auto_run_on_new_tab);
+        p.auto_run_on_workspace = true;
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert!(p.auto_run_on_workspace);
+        assert!(!p.auto_run_on_new_tab);
+
+        // Toggle auto_run_on_new_tab on too
+        let mut loaded2 = load_presets(&db);
+        let p = loaded2.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        p.auto_run_on_new_tab = true;
+        save_presets(&db, &loaded2).unwrap();
+
+        let reloaded2 = load_presets(&db);
+        let p = reloaded2.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert!(p.auto_run_on_workspace);
+        assert!(p.auto_run_on_new_tab);
     }
 }
