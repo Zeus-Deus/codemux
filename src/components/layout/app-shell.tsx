@@ -3,6 +3,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
+import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
@@ -17,6 +18,7 @@ export function AppShell() {
   );
   const showSettings = useUIStore((s) => s.showSettings);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -43,17 +45,27 @@ export function AppShell() {
   }
 
   return (
-    <SidebarProvider defaultOpen className="h-screen max-h-screen">
-      <AppSidebar />
-      <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
-        {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
-      </SidebarInset>
-      <CommandPalette
-        open={commandPaletteOpen}
-        onOpenChange={setCommandPaletteOpen}
+    <div className="flex flex-col h-screen max-h-screen">
+      <TitleBar
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={() => setSidebarOpen((o) => !o)}
       />
-      <FileSearchDialog />
-      <ContentSearchDialog />
-    </SidebarProvider>
+      <SidebarProvider
+        open={sidebarOpen}
+        onOpenChange={setSidebarOpen}
+        className="flex-1 min-h-0"
+      >
+        <AppSidebar />
+        <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
+          {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
+        </SidebarInset>
+        <CommandPalette
+          open={commandPaletteOpen}
+          onOpenChange={setCommandPaletteOpen}
+        />
+        <FileSearchDialog />
+        <ContentSearchDialog />
+      </SidebarProvider>
+    </div>
   );
 }

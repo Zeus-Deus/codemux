@@ -107,8 +107,10 @@ function SectionHeader({ title, description }: { title: string; description: str
 
 export function SettingsView() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const settingsSection = useUIStore((s) => s.settingsSection);
   const config = useAppStore((s) => s.appState?.config);
-  const [activeSection, setActiveSection] = useState<Section>("appearance");
+  const initialSection = (settingsSection && NAV_ITEMS.some((n) => n.id === settingsSection) ? settingsSection : "appearance") as Section;
+  const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [defaultEditor, setDefaultEditor] = useState("");
   const [cursorStyle, setCursorStyle] = useState("bar");

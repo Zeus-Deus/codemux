@@ -2,7 +2,7 @@ import { SidebarHeader as ShadcnSidebarHeader } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
-import { Plus, ChevronDown } from "lucide-react";
+import { Plus } from "lucide-react";
 
 export function SidebarHeader() {
   const workspaceCount = useAppStore((s) => s.appState?.workspaces.length ?? 0);
@@ -10,7 +10,6 @@ export function SidebarHeader() {
     (s) => s.appState?.workspaces.find((w) => w.workspace_id === s.appState?.active_workspace_id),
   );
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
-  const setShowSettings = useUIStore((s) => s.setShowSettings);
 
   // Derive repo name from active workspace cwd, fallback to "Workspaces"
   const repoName = activeWorkspace?.cwd
@@ -47,15 +46,6 @@ export function SidebarHeader() {
             onClick={() => setShowDialog(true)}
           >
             <Plus className="h-3 w-3" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="Settings"
-            title="Settings"
-            onClick={() => setShowSettings(true)}
-          >
-            <ChevronDown className="h-3 w-3" />
           </Button>
         </div>
       </div>
