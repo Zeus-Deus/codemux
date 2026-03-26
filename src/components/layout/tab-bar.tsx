@@ -196,7 +196,7 @@ export function TabBar({ workspace }: Props) {
   }
 
   return (
-    <div className="flex h-8 shrink-0 items-center border-b border-border bg-card px-1.5">
+    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-card px-1.5">
       <Tabs
         value={workspace.active_tab_id}
         onValueChange={handleTabChange}
@@ -229,7 +229,7 @@ export function TabBar({ workspace }: Props) {
                   >
                     <TabsTrigger
                       value={tab.tab_id}
-                      className="group relative gap-1 px-2 py-0.5 text-xs"
+                      className="group relative gap-1 px-2 py-1.5 text-xs"
                     >
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>

@@ -4,9 +4,9 @@
       "args": [
         "mcp"
       ],
-      "command": "/home/zeus/Documents/projects/codemux/src-tauri/target/debug/codemux",
+      "command": "/home/zeus/.superset/worktrees/codemux/feature/terminal-tabs-size/src-tauri/target/debug/codemux",
       "env": {
-        "CODEMUX_WORKSPACE_ID": "workspace-127"
+        "CODEMUX_WORKSPACE_ID": "workspace-174"
       }
     },
     "shadcn": {

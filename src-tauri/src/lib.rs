@@ -101,6 +101,7 @@ pub fn run() {
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
+                state.migrate_project_roots();
 
                 // Ensure a workspace exists for the current project root.
                 // Persisted state may only contain stale worktree workspaces

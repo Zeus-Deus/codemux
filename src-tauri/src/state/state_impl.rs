@@ -1852,6 +1852,30 @@ impl AppStateStore {
             }
         }
     }
+
+    /// Re-resolve project_root for all workspaces using find_git_root().
+    /// Fixes old workspaces created before worktree-aware project detection.
+    pub fn migrate_project_roots(&self) {
+        let mut snapshot = self.inner.lock().unwrap();
+        for workspace in &mut snapshot.workspaces {
+            let path_str = workspace
+                .project_root
+                .as_deref()
+                .unwrap_or(&workspace.cwd);
+            let path = std::path::Path::new(path_str);
+            if let Some(resolved) = crate::config::workspace_config::find_git_root(path) {
+                let resolved_str = resolved.display().to_string();
+                let current = workspace.project_root.as_deref().unwrap_or("");
+                if resolved_str != current {
+                    eprintln!(
+                        "[migrate] project_root updated for {}: {} -> {}",
+                        workspace.workspace_id.0, current, resolved_str
+                    );
+                    workspace.project_root = Some(resolved_str);
+                }
+            }
+        }
+    }
 }
 
 pub struct CloseTabResult {

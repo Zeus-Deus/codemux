@@ -51,11 +51,13 @@ pub(crate) fn create_workspace_impl(
         None => state.create_workspace(),
     };
 
-    // Set project root and populate git info
+    // Set project root (resolve through git root for worktree grouping)
     let repo_path = cwd
         .map(PathBuf::from)
         .unwrap_or_else(crate::project::current_project_root);
-    state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
+    let project_root = crate::config::workspace_config::find_git_root(&repo_path)
+        .unwrap_or_else(|| repo_path.clone());
+    state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
     populate_git_info(state, &workspace_id.0, &repo_path);
 
     if let Some(session_id) = state.active_terminal_session_id() {
