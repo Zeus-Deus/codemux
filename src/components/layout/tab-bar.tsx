@@ -14,7 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Plus, X, Terminal, Globe, GitCompare, PanelRight } from "lucide-react";
+import { Plus, X, Terminal, Globe, GitCompare, FileDiff } from "lucide-react";
 import {
   activateTab,
   closeTab,
@@ -308,34 +308,31 @@ export function TabBar({ workspace }: Props) {
                 <GitCompare className="h-3.5 w-3.5 mr-2" />
                 Diff Viewer
               </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => {
+                  const surface = workspace.surfaces.find((s) => s.surface_id === workspace.active_surface_id);
+                  if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
+                }}
+              >
+                <Globe className="h-3.5 w-3.5 mr-2" />
+                Browser
+              </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>
       </Tabs>
 
-      <Button
-        variant="ghost"
-        size="icon-sm"
-        className="shrink-0"
-        onClick={() => {
-          const surface = workspace.surfaces.find((s) => s.surface_id === workspace.active_surface_id);
-          if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
-        }}
-        title="Open browser"
-        aria-label="Open browser"
-      >
-        <Globe className="h-3.5 w-3.5" />
-      </Button>
-
-      <Button
-        variant={rightPanelTab ? "secondary" : "ghost"}
-        size="icon-sm"
-        className="ml-1 shrink-0"
-        onClick={() => toggleRightPanel(workspace.workspace_id, "changes")}
-        title="Toggle panel"
-      >
-        <PanelRight className="h-3.5 w-3.5" />
-      </Button>
+      {!rightPanelTab && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className="ml-1 shrink-0"
+          onClick={() => toggleRightPanel(workspace.workspace_id, "changes")}
+          title="Open panel"
+        >
+          <FileDiff className="h-3.5 w-3.5" />
+        </Button>
+      )}
     </div>
   );
 }
