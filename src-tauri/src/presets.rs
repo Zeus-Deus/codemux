@@ -258,4 +258,169 @@ mod tests {
         let loaded = load_presets(&db);
         assert_eq!(loaded.presets.len(), 5);
     }
+
+    fn make_custom_preset(id: &str, name: &str) -> TerminalPreset {
+        TerminalPreset {
+            id: id.into(),
+            name: name.into(),
+            description: Some("Test preset".into()),
+            commands: vec!["echo hello".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: None,
+            pinned: true,
+            is_builtin: false,
+        }
+    }
+
+    #[test]
+    fn update_preset_name() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "My Preset"));
+        save_presets(&db, &store).unwrap();
+
+        // Update name
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        p.name = "Renamed Preset".into();
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.name, "Renamed Preset");
+        assert_eq!(p.commands, vec!["echo hello"]);
+    }
+
+    #[test]
+    fn update_preset_commands() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Test"));
+        save_presets(&db, &store).unwrap();
+
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        p.commands = vec!["npm run dev".into(), "npm run watch".into()];
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.commands, vec!["npm run dev", "npm run watch"]);
+    }
+
+    #[test]
+    fn update_preset_launch_mode() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Test"));
+        save_presets(&db, &store).unwrap();
+
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.launch_mode, LaunchMode::NewTab);
+        p.launch_mode = LaunchMode::SplitPane;
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.launch_mode, LaunchMode::SplitPane);
+    }
+
+    #[test]
+    fn update_preset_pinned() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Test"));
+        save_presets(&db, &store).unwrap();
+
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        assert!(p.pinned);
+        p.pinned = false;
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert!(!p.pinned);
+    }
+
+    #[test]
+    fn update_preset_description() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Test"));
+        save_presets(&db, &store).unwrap();
+
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        p.description = Some("Updated description".into());
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        let p = reloaded.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.description, Some("Updated description".into()));
+    }
+
+    #[test]
+    fn delete_custom_preset() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "To Delete"));
+        save_presets(&db, &store).unwrap();
+        assert_eq!(load_presets(&db).presets.len(), 6);
+
+        let mut loaded = load_presets(&db);
+        loaded.presets.retain(|p| p.id != "custom-1");
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        assert_eq!(reloaded.presets.len(), 5); // only builtins remain
+        assert!(reloaded.presets.iter().all(|p| p.is_builtin));
+    }
+
+    #[test]
+    fn builtin_presets_survive_custom_delete() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Custom"));
+        save_presets(&db, &store).unwrap();
+
+        // Delete only custom
+        let mut loaded = load_presets(&db);
+        loaded.presets.retain(|p| p.id != "custom-1");
+        save_presets(&db, &loaded).unwrap();
+
+        let reloaded = load_presets(&db);
+        assert!(reloaded.presets.iter().any(|p| p.id == "builtin-claude"));
+        assert!(reloaded.presets.iter().any(|p| p.id == "builtin-codex"));
+        assert!(reloaded.presets.iter().any(|p| p.id == "builtin-gemini"));
+    }
+
+    #[test]
+    fn update_persists_across_reload() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.presets.push(make_custom_preset("custom-1", "Original"));
+        save_presets(&db, &store).unwrap();
+
+        // Update multiple fields
+        let mut loaded = load_presets(&db);
+        let p = loaded.presets.iter_mut().find(|p| p.id == "custom-1").unwrap();
+        p.name = "Updated".into();
+        p.commands = vec!["new-cmd".into()];
+        p.launch_mode = LaunchMode::SplitPane;
+        p.pinned = false;
+        p.description = Some("New desc".into());
+        save_presets(&db, &loaded).unwrap();
+
+        // Fresh load from DB
+        let fresh = load_presets(&db);
+        let p = fresh.presets.iter().find(|p| p.id == "custom-1").unwrap();
+        assert_eq!(p.name, "Updated");
+        assert_eq!(p.commands, vec!["new-cmd"]);
+        assert_eq!(p.launch_mode, LaunchMode::SplitPane);
+        assert!(!p.pinned);
+        assert_eq!(p.description, Some("New desc".into()));
+    }
 }

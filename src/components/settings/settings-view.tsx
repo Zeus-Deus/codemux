@@ -26,6 +26,7 @@ import {
   Pin,
   PinOff,
   Trash2,
+  X,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -47,7 +48,7 @@ import {
   setAiResolverModel,
   setAiResolverStrategy,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
@@ -55,6 +56,7 @@ import {
   setPresetPinned,
   setPresetBarVisible,
   deletePreset,
+  updatePreset,
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
@@ -125,6 +127,231 @@ function SectionHeader({ title, description }: { title: string; description: str
   );
 }
 
+function PresetDetailPanel({
+  preset,
+  onClose,
+}: {
+  preset: TerminalPreset;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState(preset.name);
+  const [description, setDescription] = useState(preset.description ?? "");
+  const [commands, setCommands] = useState<string[]>(
+    preset.commands.length > 0 ? preset.commands : [""],
+  );
+  const [launchMode, setLaunchMode] = useState<LaunchMode>(preset.launch_mode);
+  const [pinned, setPinned] = useState(preset.pinned);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // Sync when preset changes externally
+  useEffect(() => {
+    setName(preset.name);
+    setDescription(preset.description ?? "");
+    setCommands(preset.commands.length > 0 ? preset.commands : [""]);
+    setLaunchMode(preset.launch_mode);
+    setPinned(preset.pinned);
+    setConfirmDelete(false);
+  }, [preset.id, preset.name, preset.description, preset.commands, preset.launch_mode, preset.pinned]);
+
+  const save = (updates: Partial<{
+    name: string;
+    description: string | null;
+    commands: string[];
+    launchMode: LaunchMode;
+    icon: string | null;
+  }>) => {
+    updatePreset({
+      id: preset.id,
+      name: updates.name ?? name,
+      description: updates.description !== undefined ? updates.description : (description || null),
+      commands: updates.commands ?? commands.filter((c) => c.trim()),
+      workingDirectory: preset.working_directory,
+      launchMode: updates.launchMode ?? launchMode,
+      icon: preset.icon,
+    }).catch(console.error);
+  };
+
+  const handleDelete = () => {
+    deletePreset(preset.id).catch(console.error);
+    onClose();
+  };
+
+  const handlePinnedChange = (checked: boolean) => {
+    setPinned(checked);
+    setPresetPinned(preset.id, checked).catch(console.error);
+  };
+
+  const handleCommandChange = (index: number, value: string) => {
+    const next = [...commands];
+    next[index] = value;
+    setCommands(next);
+  };
+
+  const handleCommandBlur = () => {
+    save({ commands: commands.filter((c) => c.trim()) });
+  };
+
+  const addCommand = () => {
+    setCommands([...commands, ""]);
+  };
+
+  const removeCommand = (index: number) => {
+    const next = commands.filter((_, i) => i !== index);
+    const cleaned = next.length > 0 ? next : [""];
+    setCommands(cleaned);
+    save({ commands: cleaned.filter((c) => c.trim()) });
+  };
+
+  return (
+    <div className="w-[380px] shrink-0 border-l border-border bg-background flex flex-col h-full">
+      {/* Header */}
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border shrink-0">
+        <div className="flex items-center gap-2 min-w-0">
+          <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
+          <span className="text-sm font-medium truncate">{preset.name}</span>
+        </div>
+        <Button variant="ghost" size="icon-xs" onClick={onClose} aria-label="Close">
+          <X className="h-3.5 w-3.5" />
+        </Button>
+      </div>
+
+      {/* Content */}
+      <ScrollArea className="flex-1 min-h-0">
+        <div className="p-4 space-y-5">
+          {/* Name */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Name</label>
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onBlur={() => name !== preset.name && save({ name })}
+              disabled={preset.is_builtin}
+              className="h-8 text-sm"
+            />
+          </div>
+
+          {/* Description */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Description</label>
+            <Input
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              onBlur={() => save({ description: description || null })}
+              disabled={preset.is_builtin}
+              placeholder="Optional description"
+              className="h-8 text-sm"
+            />
+          </div>
+
+          {/* Commands */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Commands</label>
+            <div className="space-y-1.5">
+              {commands.map((cmd, i) => (
+                <div key={i} className="flex items-center gap-1">
+                  <Input
+                    value={cmd}
+                    onChange={(e) => handleCommandChange(i, e.target.value)}
+                    onBlur={handleCommandBlur}
+                    disabled={preset.is_builtin}
+                    placeholder="e.g. claude --dangerously-skip-permissions"
+                    className="h-8 text-sm font-mono bg-muted/30"
+                  />
+                  {commands.length > 1 && !preset.is_builtin && (
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => removeCommand(i)}
+                      aria-label="Remove command"
+                    >
+                      <X className="h-3 w-3" />
+                    </Button>
+                  )}
+                </div>
+              ))}
+              {!preset.is_builtin && (
+                <button
+                  type="button"
+                  onClick={addCommand}
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  + Add command
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Launch Mode */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-medium text-muted-foreground">Launch Mode</label>
+            <Select
+              value={launchMode}
+              onValueChange={(v: LaunchMode) => {
+                setLaunchMode(v);
+                save({ launchMode: v });
+              }}
+              disabled={preset.is_builtin}
+            >
+              <SelectTrigger className="h-8 text-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="new_tab">Open in new tab</SelectItem>
+                <SelectItem value="split_pane">Split pane</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {/* Pinned */}
+          <div className="flex items-center justify-between">
+            <div className="space-y-0.5">
+              <p className="text-sm font-medium">Show in preset bar</p>
+              <p className="text-xs text-muted-foreground">Pin this preset to the quick-launch bar</p>
+            </div>
+            <Switch checked={pinned} onCheckedChange={handlePinnedChange} />
+          </div>
+
+          {/* Delete */}
+          {!preset.is_builtin && (
+            <>
+              <Separator />
+              {confirmDelete ? (
+                <div className="space-y-2">
+                  <p className="text-sm text-destructive">Delete this preset? This cannot be undone.</p>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={handleDelete}
+                    >
+                      Delete
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setConfirmDelete(false)}
+                    >
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmDelete(true)}
+                  className="text-sm text-destructive hover:text-destructive/80 transition-colors"
+                >
+                  Delete Preset
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </ScrollArea>
+    </div>
+  );
+}
+
 export function SettingsView() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const settingsSection = useUIStore((s) => s.settingsSection);
@@ -142,6 +369,7 @@ export function SettingsView() {
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
+  const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
 
   const setDefaultEditor = (v: string) => storeSet("editor.default", v);
   const setCursorStyle = (v: string) => storeSet("terminal.cursor_style", v);
@@ -294,80 +522,109 @@ export function SettingsView() {
           </div>
         );
 
-      case "presets":
+      case "presets": {
+        const selectedPreset = presetStore?.presets.find((p) => p.id === selectedPresetId) ?? null;
         return (
-          <div>
-            <SectionHeader
-              title="Terminal Presets"
-              description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
-            />
-            <div className="space-y-1">
-              {presetStore && (
-                <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
-                  <Switch
-                    checked={presetStore.bar_visible}
-                    onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
-                  />
-                </SettingRow>
-              )}
-              <Separator />
-              {presetStore ? (
-                <div className="space-y-2 pt-2">
-                  {presetStore.presets.map((preset) => (
-                    <div
-                      key={preset.id}
-                      className="flex items-center gap-3 px-3 py-2 rounded-lg border border-border/50 bg-card/50"
-                    >
-                      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium truncate">{preset.name}</span>
-                          {preset.is_builtin && (
-                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-                              built-in
-                            </Badge>
+          <div className="flex h-full min-h-0">
+            {/* Left: preset list */}
+            <div className="flex-1 min-w-0 overflow-auto">
+              <SectionHeader
+                title="Terminal Presets"
+                description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
+              />
+              <div className="space-y-1">
+                {presetStore && (
+                  <SettingRow label="Show preset bar" description="Display the preset quick-launch bar below the tab bar.">
+                    <Switch
+                      checked={presetStore.bar_visible}
+                      onCheckedChange={(checked) => setPresetBarVisible(checked).catch(console.error)}
+                    />
+                  </SettingRow>
+                )}
+                <Separator />
+                {presetStore ? (
+                  <div className="space-y-2 pt-2">
+                    {presetStore.presets.map((preset) => (
+                      <div
+                        key={preset.id}
+                        className={`flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150 ${
+                          selectedPresetId === preset.id
+                            ? "border-primary/40 bg-primary/5"
+                            : "border-border/50 bg-card/50 hover:bg-accent/30"
+                        }`}
+                        onClick={() =>
+                          setSelectedPresetId(
+                            selectedPresetId === preset.id ? null : preset.id,
+                          )
+                        }
+                      >
+                        <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-medium truncate">{preset.name}</span>
+                            {preset.is_builtin && (
+                              <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+                                built-in
+                              </Badge>
+                            )}
+                          </div>
+                          {preset.commands.length > 0 && (
+                            <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
+                              {preset.commands[0]}
+                            </code>
                           )}
                         </div>
-                        {preset.commands.length > 0 && (
-                          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
-                            {preset.commands[0]}
-                          </code>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
-                          onClick={() => setPresetPinned(preset.id, !preset.pinned).catch(console.error)}
-                        >
-                          {preset.pinned ? (
-                            <Pin className="h-3.5 w-3.5 text-foreground" />
-                          ) : (
-                            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
-                          )}
-                        </Button>
-                        {!preset.is_builtin && (
+                        <div className="flex items-center gap-1 shrink-0">
                           <Button
                             variant="ghost"
                             size="icon-xs"
-                            title="Delete preset"
-                            className="hover:bg-destructive/80"
-                            onClick={() => deletePreset(preset.id).catch(console.error)}
+                            title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setPresetPinned(preset.id, !preset.pinned).catch(console.error);
+                            }}
                           >
-                            <Trash2 className="h-3.5 w-3.5" />
+                            {preset.pinned ? (
+                              <Pin className="h-3.5 w-3.5 text-foreground" />
+                            ) : (
+                              <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
+                            )}
                           </Button>
-                        )}
+                          {!preset.is_builtin && (
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              title="Delete preset"
+                              className="hover:bg-destructive/80"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                deletePreset(preset.id).catch(console.error);
+                                if (selectedPresetId === preset.id) setSelectedPresetId(null);
+                              }}
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </Button>
+                          )}
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-sm text-muted-foreground">Loading presets...</p>
-              )}
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-muted-foreground">Loading presets...</p>
+                )}
+              </div>
             </div>
+
+            {/* Right: detail panel */}
+            {selectedPreset && (
+              <PresetDetailPanel
+                preset={selectedPreset}
+                onClose={() => setSelectedPresetId(null)}
+              />
+            )}
           </div>
         );
+      }
 
       case "git":
         return (
