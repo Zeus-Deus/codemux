@@ -85,32 +85,35 @@ export function WorkspaceMain() {
   );
 
   return (
-    <>
-      <TabBar workspace={activeWorkspace} />
-      <PresetBar workspaceId={activeWorkspace.workspace_id} />
-      <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
-        <div className="flex-1 min-w-0 min-h-0 overflow-hidden">
+    <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
+      {/* Left: tab bar + preset bar + pane content */}
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
+        <TabBar workspace={activeWorkspace} />
+        <PresetBar workspaceId={activeWorkspace.workspace_id} />
+        <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab?.kind === "diff" ? (
             <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
           ) : (
             <PaneContainer workspace={activeWorkspace} />
           )}
         </div>
-        {showRightPanel && (
-          <>
-            <RightPanelResizer />
-            <div
-              className="shrink-0 h-full overflow-hidden"
-              style={{ width: rightPanelWidth }}
-            >
-              <RightPanel
-                workspace={activeWorkspace}
-                activeTab={rightPanelTab}
-              />
-            </div>
-          </>
-        )}
       </div>
-    </>
+
+      {/* Right: panel spans full height (header aligns with tab bar) */}
+      {showRightPanel && (
+        <>
+          <RightPanelResizer />
+          <div
+            className="shrink-0 h-full overflow-hidden"
+            style={{ width: rightPanelWidth }}
+          >
+            <RightPanel
+              workspace={activeWorkspace}
+              activeTab={rightPanelTab}
+            />
+          </div>
+        </>
+      )}
+    </div>
   );
 }

@@ -30,8 +30,8 @@ export function RightPanel({ workspace, activeTab }: Props) {
         onValueChange={handleTabChange}
         className="flex h-full flex-col"
       >
-        <div className="flex items-center border-b border-border/50 px-1">
-          <TabsList variant="line" className="h-9 flex-1">
+        <div className="flex items-center h-[52px] shrink-0 border-b border-border/50 px-1">
+          <TabsList variant="line" className="h-[52px] flex-1">
             <TabsTrigger value="changes" className="px-3 py-1.5 text-sm after:!hidden data-active:!bg-sidebar-accent data-active:!text-sidebar-accent-foreground data-active:!font-medium hover:bg-sidebar-accent/50 rounded-md">
               Changes
               {workspace.git_changed_files > 0 && (
