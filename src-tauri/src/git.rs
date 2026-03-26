@@ -30,6 +30,12 @@ pub struct GitFileStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseBranchDiff {
+    pub files: Vec<GitFileStatus>,
+    pub merge_base_commit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitDiffStat {
     pub staged_additions: u32,
     pub staged_deletions: u32,
@@ -343,6 +349,142 @@ fn parse_numstat(output: &str) -> (u32, u32) {
         }
     }
     (total_add, total_del)
+}
+
+fn parse_name_status(output: &str) -> Vec<GitFileStatus> {
+    let mut files = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let status_code = parts[0].chars().next().unwrap_or('M');
+        let path_part = parts[1];
+        // Renames show as "R100\told\tnew"
+        let path = if let Some(tab_pos) = path_part.find('\t') {
+            path_part[tab_pos + 1..].to_string()
+        } else {
+            path_part.to_string()
+        };
+        let status = match status_code {
+            'A' => FileStatus::Added,
+            'M' => FileStatus::Modified,
+            'D' => FileStatus::Deleted,
+            'R' => FileStatus::Renamed,
+            'C' => FileStatus::Copied,
+            _ => FileStatus::Modified,
+        };
+        files.push(GitFileStatus {
+            path,
+            status,
+            is_staged: false,
+            is_unstaged: false,
+            additions: 0,
+            deletions: 0,
+            conflict_type: None,
+        });
+    }
+    files
+}
+
+fn parse_single_numstat(output: &str) -> std::collections::HashMap<String, (u32, u32)> {
+    let mut map = std::collections::HashMap::new();
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let adds = parts[0].parse::<u32>().unwrap_or(0);
+            let dels = parts[1].parse::<u32>().unwrap_or(0);
+            // Handle renames: numstat shows "old => new" or just the path
+            let raw_path = parts[2];
+            let path = if let Some(arrow) = raw_path.find(" => ") {
+                // e.g. "{src => dest}/file.txt" or "old.txt => new.txt"
+                let after = &raw_path[arrow + 4..];
+                after.trim_matches('}').to_string()
+            } else {
+                raw_path.to_string()
+            };
+            let entry = map.entry(path).or_insert((0, 0));
+            entry.0 += adds;
+            entry.1 += dels;
+        }
+    }
+    map
+}
+
+/// Resolve a base branch ref, trying origin/<branch> first, then local.
+fn resolve_base_ref(repo_path: &Path, base_branch: &str) -> Result<String, String> {
+    let remote_ref = format!("origin/{}", base_branch);
+    let (_, _, ok) = run_git_full(repo_path, &["rev-parse", "--verify", &remote_ref])?;
+    if ok {
+        return Ok(remote_ref);
+    }
+    let (_, _, ok) = run_git_full(repo_path, &["rev-parse", "--verify", base_branch])?;
+    if ok {
+        return Ok(base_branch.to_string());
+    }
+    Err(format!("Branch '{}' not found locally or on origin", base_branch))
+}
+
+pub fn git_diff_base_branch(repo_path: &Path, base_branch: &str) -> Result<BaseBranchDiff, String> {
+    let base_ref = resolve_base_ref(repo_path, base_branch)?;
+    let merge_base = run_git(repo_path, &["merge-base", "HEAD", &base_ref])?;
+    if merge_base.is_empty() {
+        return Err("No common ancestor found".to_string());
+    }
+
+    let range = format!("{}..HEAD", merge_base);
+    let name_status = run_git_permissive(repo_path, &["diff", "--name-status", &range]);
+    let mut files = parse_name_status(&name_status);
+
+    let numstat = run_git_permissive(repo_path, &["diff", "--numstat", &range]);
+    let stats = parse_single_numstat(&numstat);
+    for file in &mut files {
+        if let Some(&(a, d)) = stats.get(&file.path) {
+            file.additions = a;
+            file.deletions = d;
+        }
+    }
+
+    Ok(BaseBranchDiff {
+        files,
+        merge_base_commit: merge_base,
+    })
+}
+
+pub fn git_diff_base_branch_file(repo_path: &Path, base_branch: &str, file_path: &str) -> Result<String, String> {
+    let base_ref = resolve_base_ref(repo_path, base_branch)?;
+    let merge_base = run_git(repo_path, &["merge-base", "HEAD", &base_ref])?;
+    if merge_base.is_empty() {
+        return Err("No common ancestor found".to_string());
+    }
+    let range = format!("{}..HEAD", merge_base);
+    run_git(repo_path, &["diff", &range, "--", file_path])
+}
+
+pub fn git_default_branch(repo_path: &Path) -> Result<String, String> {
+    // Try symbolic-ref first
+    let (stdout, _, ok) = run_git_full(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"])?;
+    if ok && !stdout.is_empty() {
+        if let Some(branch) = stdout.strip_prefix("refs/remotes/origin/") {
+            let branch = branch.trim();
+            if !branch.is_empty() {
+                return Ok(branch.to_string());
+            }
+        }
+    }
+    // Fallback: check which common branches exist
+    let branches = git_list_branches(repo_path, false).unwrap_or_default();
+    if branches.iter().any(|b| b == "main") {
+        return Ok("main".to_string());
+    }
+    if branches.iter().any(|b| b == "master") {
+        return Ok("master".to_string());
+    }
+    Ok("main".to_string())
 }
 
 // ---- Merge conflict operations ----

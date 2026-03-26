@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { GitCompare } from "lucide-react";
-import { getGitDiff, getGitStatus } from "@/tauri/commands";
+import { getGitDiff, getGitStatus, getBaseBranchDiff, getBaseBranchFileDiff } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
 import { parseDiff } from "@/lib/diff-parser";
 import { DiffToolbar } from "./DiffToolbar";
@@ -23,6 +23,7 @@ export function DiffPane({ tabId, workspace }: Props) {
 
   const [lines, setLines] = useState<DiffLine[]>([]);
   const [files, setFiles] = useState<GitFileStatus[]>([]);
+  const [baseFiles, setBaseFiles] = useState<GitFileStatus[]>([]);
   const [loading, setLoading] = useState(false);
   const viewRef = useRef<DiffViewHandle>(null);
 
@@ -43,6 +44,17 @@ export function DiffPane({ tabId, workspace }: Props) {
     return () => clearInterval(interval);
   }, [cwd]);
 
+  // Fetch against-base file list when in that mode
+  useEffect(() => {
+    if (tab?.section !== "against_base" || !tab?.baseBranch) {
+      setBaseFiles([]);
+      return;
+    }
+    getBaseBranchDiff(cwd, tab.baseBranch)
+      .then((result) => setBaseFiles(result.files))
+      .catch(() => setBaseFiles([]));
+  }, [cwd, tab?.section, tab?.baseBranch]);
+
   // Filter files based on section
   const filteredFiles = useMemo(() => {
     if (!tab) return files;
@@ -51,10 +63,12 @@ export function DiffPane({ tabId, workspace }: Props) {
         return files.filter((f) => f.is_staged);
       case "unstaged":
         return files.filter((f) => f.is_unstaged);
+      case "against_base":
+        return baseFiles;
       default:
         return files;
     }
-  }, [files, tab?.section]);
+  }, [files, baseFiles, tab?.section]);
 
   // Fetch diff when file changes
   useEffect(() => {
@@ -63,11 +77,15 @@ export function DiffPane({ tabId, workspace }: Props) {
       return;
     }
     setLoading(true);
-    getGitDiff(cwd, tab.filePath, tab.staged)
+    const fetchDiff =
+      tab.section === "against_base" && tab.baseBranch
+        ? getBaseBranchFileDiff(cwd, tab.baseBranch, tab.filePath)
+        : getGitDiff(cwd, tab.filePath, tab.staged);
+    fetchDiff
       .then((raw) => setLines(parseDiff(raw)))
       .catch(() => setLines([]))
       .finally(() => setLoading(false));
-  }, [cwd, tab?.filePath, tab?.staged]);
+  }, [cwd, tab?.filePath, tab?.staged, tab?.section, tab?.baseBranch]);
 
   // Sync fileIndex when filePath changes
   useEffect(() => {

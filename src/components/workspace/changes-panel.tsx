@@ -3,6 +3,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
+import {
   Tooltip,
   TooltipTrigger,
   TooltipContent,
@@ -26,6 +32,7 @@ import {
   GitMerge,
   XCircle,
   CheckCircle2,
+  ChevronDown,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -47,6 +54,9 @@ import {
   createTab,
   activateTab,
   checkClaudeAvailable,
+  getBaseBranchDiff,
+  getDefaultBranch,
+  listBranches,
 } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
@@ -707,6 +717,12 @@ export function ChangesPanel({ workspace }: Props) {
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Against-base state
+  const [baseBranch, setBaseBranch] = useState<string>("main");
+  const [baseBranchFiles, setBaseBranchFiles] = useState<GitFileStatus[]>([]);
+  const [baseBranchExpanded, setBaseBranchExpanded] = useState(true);
+  const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
+
   const config = useAppStore((s) => s.appState?.config);
   const aiEnabled = config?.ai_commit_message_enabled ?? true;
 
@@ -761,6 +777,23 @@ export function ChangesPanel({ workspace }: Props) {
       clearGeneration(workspace.workspace_id);
     }
   }, [generation?.status, workspace.workspace_id, consumeMessage, clearGeneration]);
+
+  // Fetch default branch and remote branches on mount
+  useEffect(() => {
+    if (!cwd) return;
+    getDefaultBranch(cwd).then(setBaseBranch).catch(() => setBaseBranch("main"));
+    listBranches(cwd, true).then(setRemoteBranches).catch(() => {});
+  }, [cwd]);
+
+  // Fetch base branch diff
+  const refreshBaseDiff = useCallback(() => {
+    if (!cwd) return;
+    getBaseBranchDiff(cwd, baseBranch)
+      .then((result) => setBaseBranchFiles(result.files))
+      .catch(() => setBaseBranchFiles([]));
+  }, [cwd, baseBranch]);
+
+  useEffect(() => { refreshBaseDiff(); }, [refreshBaseDiff]);
 
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
@@ -836,6 +869,7 @@ export function ChangesPanel({ workspace }: Props) {
       setCommitMsg("");
       setExpandedFile(null);
       refresh();
+      refreshBaseDiff();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -851,6 +885,7 @@ export function ChangesPanel({ workspace }: Props) {
       const needsPublish = branchInfo && !branchInfo.has_upstream;
       await gitPushChanges(cwd, !!needsPublish);
       refresh();
+      refreshBaseDiff();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -897,6 +932,8 @@ export function ChangesPanel({ workspace }: Props) {
 
   const diffSetFile = useDiffStore((s) => s.setFile);
   const diffInitTab = useDiffStore((s) => s.initTab);
+  const diffSetSection = useDiffStore((s) => s.setSection);
+  const diffSetBaseBranch = useDiffStore((s) => s.setBaseBranch);
 
   // Find active diff tab and its current file for highlighting
   const activeDiffTab = workspace.tabs.find((t) => t.kind === "diff");
@@ -923,6 +960,28 @@ export function ChangesPanel({ workspace }: Props) {
       }
     },
     [workspace, diffSetFile, diffInitTab],
+  );
+
+  const handleOpenBaseDiff = useCallback(
+    async (filePath: string) => {
+      const existingDiffTab = workspace.tabs.find((t) => t.kind === "diff");
+      if (existingDiffTab) {
+        await activateTab(workspace.workspace_id, existingDiffTab.tab_id).catch(console.error);
+        diffSetFile(existingDiffTab.tab_id, filePath, false);
+        diffSetBaseBranch(existingDiffTab.tab_id, baseBranch);
+        diffSetSection(existingDiffTab.tab_id, "against_base");
+      } else {
+        try {
+          const tabId = await createTab(workspace.workspace_id, "diff");
+          diffInitTab(tabId, { file: filePath, staged: false });
+          diffSetBaseBranch(tabId, baseBranch);
+          diffSetSection(tabId, "against_base");
+        } catch (err) {
+          console.error("Failed to create diff tab:", err);
+        }
+      }
+    },
+    [workspace, baseBranch, diffSetFile, diffSetBaseBranch, diffSetSection, diffInitTab],
   );
 
   return (
@@ -1134,6 +1193,75 @@ export function ChangesPanel({ workspace }: Props) {
                 onOpenDiff={handleOpenDiff}
                 activeDiffFile={activeDiffFile}
               />
+            )}
+
+            {/* Against Base — files changed vs base branch */}
+            {baseBranchFiles.length > 0 && (
+              <div className="py-1">
+                <div className="flex items-center justify-between px-1.5 py-0.5">
+                  <div className="flex items-center gap-1">
+                    <button
+                      className="flex items-center hover:bg-accent/30 rounded-sm transition-colors px-0.5 -ml-0.5"
+                      onClick={() => setBaseBranchExpanded(!baseBranchExpanded)}
+                    >
+                      <ChevronRight
+                        className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${baseBranchExpanded ? "rotate-90" : ""}`}
+                      />
+                    </button>
+                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Against
+                    </span>
+                    {remoteBranches.length > 1 ? (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button className="flex items-center gap-0.5 rounded-sm px-1 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors">
+                            {baseBranch}
+                            <ChevronDown className="h-2.5 w-2.5 opacity-60" />
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
+                          {remoteBranches.map((b) => (
+                            <DropdownMenuItem
+                              key={b}
+                              onClick={() => setBaseBranch(b)}
+                              className="text-xs"
+                            >
+                              {b === baseBranch && <Check className="h-3 w-3 mr-1.5 shrink-0" />}
+                              <span className={b !== baseBranch ? "pl-[18px]" : ""}>{b}</span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    ) : (
+                      <span className="text-[10px] font-medium text-muted-foreground">
+                        {baseBranch}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-[10px] tabular-nums text-muted-foreground">
+                    {baseBranchFiles.length}
+                  </span>
+                </div>
+                {baseBranchExpanded && (
+                  <div>
+                    {groupByDirectory(baseBranchFiles).map((group) => (
+                      <DirectoryGroup
+                        key={group.dir}
+                        dir={group.dir}
+                        files={group.files}
+                        staged={false}
+                        cwd={cwd}
+                        expandedFile={null}
+                        expandedStaged={false}
+                        onToggleExpand={() => {}}
+                        onRefresh={refreshBaseDiff}
+                        onOpenDiff={(filePath) => handleOpenBaseDiff(filePath)}
+                        activeDiffFile={activeDiffFile}
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
             )}
 
             {/* Recent Commits — collapsed by default */}

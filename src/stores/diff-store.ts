@@ -6,8 +6,9 @@ export interface DiffTabState {
   staged: boolean;
   layout: "split" | "unified";
   focusMode: boolean;
-  section: "staged" | "unstaged" | "all";
+  section: "staged" | "unstaged" | "against_base" | "all";
   fileIndex: number;
+  baseBranch: string | null;
 }
 
 const DEFAULT_TAB: DiffTabState = {
@@ -17,6 +18,7 @@ const DEFAULT_TAB: DiffTabState = {
   focusMode: false,
   section: "all",
   fileIndex: 0,
+  baseBranch: null,
 };
 
 interface DiffStore {
@@ -28,6 +30,7 @@ interface DiffStore {
   toggleFocusMode: (tabId: string) => void;
   setSection: (tabId: string, section: DiffTabState["section"]) => void;
   setFileIndex: (tabId: string, index: number) => void;
+  setBaseBranch: (tabId: string, baseBranch: string | null) => void;
   removeTab: (tabId: string) => void;
 }
 
@@ -91,6 +94,14 @@ export const useDiffStore = create<DiffStore>()(
           tabs: {
             ...s.tabs,
             [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), fileIndex: index },
+          },
+        })),
+
+      setBaseBranch: (tabId, baseBranch) =>
+        set((s) => ({
+          tabs: {
+            ...s.tabs,
+            [tabId]: { ...(s.tabs[tabId] ?? DEFAULT_TAB), baseBranch },
           },
         })),
 

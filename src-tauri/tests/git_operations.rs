@@ -1060,3 +1060,117 @@ fn original_branch_untouched_during_resolution() {
         .current_dir(&repo)
         .output();
 }
+
+// ── Base Branch Diff Tests ──
+
+/// Get the default branch name for a test repo (handles main vs master).
+fn default_branch(path: &Path) -> String {
+    let output = run_git(path, &["branch", "--format=%(refname:short)"]);
+    let first = output.lines().next().unwrap_or("master");
+    first.trim().to_string()
+}
+
+#[test]
+fn base_branch_diff_shows_added_modified_deleted() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let base = default_branch(&local);
+
+    // Create feature branch
+    run_git(&local, &["checkout", "-b", "feature"]);
+
+    // Add a new file
+    std::fs::write(local.join("new.txt"), "new content\n").unwrap();
+    run_git(&local, &["add", "new.txt"]);
+
+    // Modify existing file
+    std::fs::write(local.join("init.txt"), "modified\n").unwrap();
+    run_git(&local, &["add", "init.txt"]);
+
+    commit(&local, "feature changes");
+
+    let result = git_diff_base_branch(&local, &base).expect("diff base branch");
+    assert!(!result.merge_base_commit.is_empty());
+    assert!(result.files.iter().any(|f| f.path == "new.txt" && f.status == FileStatus::Added));
+    assert!(result.files.iter().any(|f| f.path == "init.txt" && f.status == FileStatus::Modified));
+
+    // Check line counts are populated
+    let new_file = result.files.iter().find(|f| f.path == "new.txt").unwrap();
+    assert!(new_file.additions > 0);
+}
+
+#[test]
+fn base_branch_diff_no_changes_returns_empty() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let base = default_branch(&local);
+    run_git(&local, &["checkout", "-b", "feature"]);
+
+    let result = git_diff_base_branch(&local, &base).expect("diff");
+    assert!(result.files.is_empty());
+}
+
+#[test]
+fn base_branch_diff_on_base_branch_returns_empty() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let base = default_branch(&local);
+    let result = git_diff_base_branch(&local, &base).expect("diff");
+    assert!(result.files.is_empty());
+}
+
+#[test]
+fn base_branch_diff_diverged_branches() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let base = default_branch(&local);
+
+    run_git(&local, &["checkout", "-b", "feature"]);
+    std::fs::write(local.join("feature.txt"), "feature work").unwrap();
+    run_git(&local, &["add", "feature.txt"]);
+    commit(&local, "feature commit");
+
+    run_git(&local, &["checkout", &base]);
+    std::fs::write(local.join("main_only.txt"), "main work").unwrap();
+    run_git(&local, &["add", "main_only.txt"]);
+    commit(&local, "main commit");
+    run_git(&local, &["push"]);
+
+    run_git(&local, &["checkout", "feature"]);
+    let result = git_diff_base_branch(&local, &base).expect("diff");
+    assert_eq!(result.files.len(), 1);
+    assert_eq!(result.files[0].path, "feature.txt");
+    assert_eq!(result.files[0].status, FileStatus::Added);
+}
+
+#[test]
+fn base_branch_file_diff_returns_content() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let base = default_branch(&local);
+    run_git(&local, &["checkout", "-b", "feature"]);
+
+    std::fs::write(local.join("init.txt"), "changed content\n").unwrap();
+    run_git(&local, &["add", "init.txt"]);
+    commit(&local, "modify file");
+
+    let diff = git_diff_base_branch_file(&local, &base, "init.txt").expect("file diff");
+    assert!(!diff.is_empty());
+    assert!(diff.contains("changed content"));
+}
+
+#[test]
+fn default_branch_detection() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let branch = git_default_branch(&local).expect("default branch");
+    assert!(branch == "main" || branch == "master");
+}
+
+#[test]
+fn default_branch_fallback_local() {
+    let (_dir, repo) = create_test_repo();
+    let branch = git_default_branch(&repo).expect("default branch");
+    assert!(branch == "main" || branch == "master");
+}
+
+#[test]
+fn base_branch_diff_nonexistent_branch_errors() {
+    let (_dir, local, _remote) = create_test_repo_with_remote();
+    let result = git_diff_base_branch(&local, "nonexistent-branch-xyz");
+    assert!(result.is_err());
+}

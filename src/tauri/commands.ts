@@ -5,6 +5,7 @@ import type {
   AgentConfig,
   AgentSessionState,
   AppStateSnapshot,
+  BaseBranchDiff,
   CheckInfo,
   CliToolInfo,
   CommLogEntry,
@@ -286,6 +287,15 @@ export const getGitDiff = (path: string, file: string, staged: boolean) =>
 
 export const getGitDiffStat = (path: string) =>
   invoke<GitDiffStat>("get_git_diff_stat", { path });
+
+export const getBaseBranchDiff = (path: string, baseBranch: string) =>
+  invoke<BaseBranchDiff>("get_base_branch_diff", { path, baseBranch });
+
+export const getBaseBranchFileDiff = (path: string, baseBranch: string, file: string) =>
+  invoke<string>("get_base_branch_file_diff", { path, baseBranch, file });
+
+export const getDefaultBranch = (path: string) =>
+  invoke<string>("get_default_branch", { path });
 
 export const gitStageFiles = (path: string, files: string[]) =>
   invoke("git_stage_files", { path, files });

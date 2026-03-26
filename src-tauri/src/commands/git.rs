@@ -1,4 +1,4 @@
-use crate::git::{ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeState, ResolverBranchInfo, WorktreeInfo};
+use crate::git::{BaseBranchDiff, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::Path;
 
 #[tauri::command]
@@ -69,6 +69,21 @@ pub fn get_git_branch_info(path: String) -> Result<GitBranchInfo, String> {
 #[tauri::command]
 pub fn list_branches(path: String, remote: bool) -> Result<Vec<String>, String> {
     crate::git::git_list_branches(Path::new(&path), remote)
+}
+
+#[tauri::command]
+pub fn get_base_branch_diff(path: String, base_branch: String) -> Result<BaseBranchDiff, String> {
+    crate::git::git_diff_base_branch(Path::new(&path), &base_branch)
+}
+
+#[tauri::command]
+pub fn get_base_branch_file_diff(path: String, base_branch: String, file: String) -> Result<String, String> {
+    crate::git::git_diff_base_branch_file(Path::new(&path), &base_branch, &file)
+}
+
+#[tauri::command]
+pub fn get_default_branch(path: String) -> Result<String, String> {
+    crate::git::git_default_branch(Path::new(&path))
 }
 
 #[tauri::command]

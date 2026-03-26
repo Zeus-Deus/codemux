@@ -260,6 +260,11 @@ export interface ConflictCheckResult {
   target_branch: string;
 }
 
+export interface BaseBranchDiff {
+  files: GitFileStatus[];
+  merge_base_commit: string;
+}
+
 export interface GitDiffStat {
   staged_additions: number;
   staged_deletions: number;

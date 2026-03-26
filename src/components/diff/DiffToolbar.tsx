@@ -55,7 +55,7 @@ export function DiffToolbar({
       {/* Focus mode section selector */}
       {tab.focusMode && (
         <div className="flex items-center gap-0.5 mr-1">
-          {(["staged", "unstaged", "all"] as const).map((s) => (
+          {(["staged", "unstaged", "against_base", "all"] as const).map((s) => (
             <Button
               key={s}
               size="xs"
@@ -63,10 +63,17 @@ export function DiffToolbar({
               className="h-5 px-1.5 text-[10px]"
               onClick={() => setSection(tabId, s)}
             >
-              {s === "all" ? "All" : s.charAt(0).toUpperCase() + s.slice(1)}
+              {s === "all" ? "All" : s === "against_base" ? (tab.baseBranch ? `vs ${tab.baseBranch}` : "Base") : s.charAt(0).toUpperCase() + s.slice(1)}
             </Button>
           ))}
         </div>
+      )}
+
+      {/* Against-base indicator (shown outside focus mode too) */}
+      {!tab.focusMode && tab.section === "against_base" && tab.baseBranch && (
+        <span className="text-[10px] text-muted-foreground mr-1">
+          vs {tab.baseBranch}
+        </span>
       )}
 
       {/* Layout toggle */}
