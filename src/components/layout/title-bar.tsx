@@ -33,6 +33,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
+import { EditorIcon } from "@/components/icons/editor-icon";
 import type { EditorInfo } from "@/tauri/types";
 
 // ── Window Controls ──
@@ -236,7 +237,11 @@ function IdeLauncher() {
               isLoading && "opacity-50 pointer-events-none",
             )}
           >
-            <ExternalLink className="h-3 w-3 shrink-0" />
+            {defaultEditor ? (
+              <EditorIcon id={defaultEditor.id} className="h-3.5 w-3.5" />
+            ) : (
+              <ExternalLink className="h-3 w-3 shrink-0" />
+            )}
             <span className="hidden sm:inline">
               {defaultEditor?.name ?? "Open"}
             </span>
@@ -267,6 +272,7 @@ function IdeLauncher() {
               key={editor.id}
               onClick={() => handleOpen(editor.id)}
             >
+              <EditorIcon id={editor.id} className="h-4 w-4" />
               <span>{editor.name}</span>
               {editor.id === defaultEditorId && (
                 <span className="ml-auto text-[10px] text-muted-foreground">

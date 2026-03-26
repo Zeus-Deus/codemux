@@ -38,6 +38,7 @@ import {
   dbSetSetting,
 } from "@/tauri/commands";
 import type { EditorInfo } from "@/tauri/types";
+import { EditorIcon } from "@/components/icons/editor-icon";
 
 type Section = "appearance" | "editor" | "terminal" | "git" | "agent" | "shortcuts" | "notifications";
 
@@ -172,7 +173,10 @@ export function SettingsView() {
                   <SelectContent>
                     {editors.map((ed) => (
                       <SelectItem key={ed.id} value={ed.id}>
-                        {ed.name}
+                        <span className="flex items-center gap-2">
+                          <EditorIcon id={ed.id} className="h-4 w-4" />
+                          {ed.name}
+                        </span>
                       </SelectItem>
                     ))}
                     {editors.length === 0 && (
@@ -191,7 +195,10 @@ export function SettingsView() {
                     <div className="space-y-2">
                       {editors.map((ed) => (
                         <div key={ed.id} className="flex items-center justify-between">
-                          <span className="text-sm">{ed.name}</span>
+                          <span className="flex items-center gap-2 text-sm">
+                            <EditorIcon id={ed.id} className="h-4 w-4" />
+                            {ed.name}
+                          </span>
                           <code className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
                             {ed.command}
                           </code>
