@@ -35,6 +35,12 @@ src-tauri/.codemux/
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
+# Auto-generated MCP config (points to local build path)
+.mcp.json
+
+# External tool worktree state
+.superset/
+
 # Logs and local editor temp files
 *.log
 npm-debug.log*

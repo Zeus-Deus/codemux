@@ -1,0 +1,41 @@
+/* Superset Ember dark theme — applied to Codemux */
+/* Source: superset-sh/superset apps/desktop/src/shared/themes/built-in/ember.ts */
+/* Role-mapped: --primary = Ember's sidebar-primary (#e07850) accent */
+
+.dark {
+    --background: oklch(0.182 0.007 34.311);       /* #151110 */
+    --foreground: oklch(0.932 0.003 67.781);        /* #eae8e6 */
+    --card: oklch(0.236 0.005 67.589);              /* #201E1C */
+    --card-foreground: oklch(0.932 0.003 67.781);   /* #eae8e6 */
+    --popover: oklch(0.236 0.005 67.589);           /* #201E1C */
+    --popover-foreground: oklch(0.932 0.003 67.781);/* #eae8e6 */
+    --primary: oklch(0.682 0.141 41.27);            /* #e07850 */
+    --primary-foreground: oklch(0.182 0.007 34.311);/* #151110 */
+    --secondary: oklch(0.279 0.003 48.6);           /* #2a2827 */
+    --secondary-foreground: oklch(0.932 0.003 67.781);/* #eae8e6 */
+    --muted: oklch(0.279 0.003 48.6);              /* #2a2827 */
+    --muted-foreground: oklch(0.724 0.005 56.348); /* #a8a5a3 */
+    --accent: oklch(0.279 0.003 48.6);             /* #2a2827 */
+    --accent-foreground: oklch(0.932 0.003 67.781);/* #eae8e6 */
+    --destructive: oklch(0.579 0.172 24.266);      /* #cc4444 */
+    --destructive-foreground: oklch(0.89 0.058 18.3);/* #ffcccc */
+    --border: oklch(0.279 0.003 48.6);             /* #2a2827 */
+    --input: oklch(0.279 0.003 48.6);              /* #2a2827 */
+    --ring: oklch(0.342 0.003 48.634);             /* #3a3837 */
+    --chart-1: oklch(0.682 0.141 41.27);           /* #e07850 orange */
+    --chart-2: oklch(0.664 0.112 157.441);         /* #50a878 green */
+    --chart-3: oklch(0.754 0.122 83.557);          /* #d4a84b gold */
+    --chart-4: oklch(0.604 0.194 285.498);         /* #7b68ee purple */
+    --chart-5: oklch(0.662 0.142 21.676);          /* #dc6b6b red */
+    --success: oklch(0.664 0.112 157.441);         /* #50a878 */
+    --danger: oklch(0.662 0.142 21.676);           /* #dc6b6b */
+    --warning: oklch(0.754 0.122 83.557);          /* #d4a84b */
+    --sidebar: oklch(0.208 0.005 39.37);           /* #1a1716 */
+    --sidebar-foreground: oklch(0.932 0.003 67.781);/* #eae8e6 */
+    --sidebar-primary: oklch(0.682 0.141 41.27);   /* #e07850 */
+    --sidebar-primary-foreground: oklch(0.182 0.007 34.311);/* #151110 */
+    --sidebar-accent: oklch(0.255 0.006 56.115);   /* #252220 */
+    --sidebar-accent-foreground: oklch(0.932 0.003 67.781);/* #eae8e6 */
+    --sidebar-border: oklch(0.279 0.003 48.6);     /* #2a2827 */
+    --sidebar-ring: oklch(0.342 0.003 48.634);     /* #3a3837 */
+}

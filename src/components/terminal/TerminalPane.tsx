@@ -24,23 +24,23 @@ interface Props {
   title: string;
 }
 
-// Static ANSI palette — doesn't change with presets
+// Static ANSI palette — Superset Ember warm-tinted colors
 const ANSI_COLORS = {
-  black: "#09090b",
-  red: "#ef4444",
-  green: "#22c55e",
-  yellow: "#eab308",
-  blue: "#3b82f6",
-  magenta: "#a855f7",
-  cyan: "#06b6d4",
-  white: "#fafafa",
-  brightBlack: "#52525b",
-  brightRed: "#f87171",
-  brightGreen: "#4ade80",
-  brightYellow: "#facc15",
-  brightBlue: "#60a5fa",
-  brightMagenta: "#c084fc",
-  brightCyan: "#22d3ee",
+  black: "#151110",
+  red: "#dc6b6b",
+  green: "#7ec699",
+  yellow: "#e5c07b",
+  blue: "#61afef",
+  magenta: "#c678dd",
+  cyan: "#56b6c2",
+  white: "#eae8e6",
+  brightBlack: "#5c5856",
+  brightRed: "#e88888",
+  brightGreen: "#98d1a8",
+  brightYellow: "#ecd08f",
+  brightBlue: "#7ec0f5",
+  brightMagenta: "#d494e6",
+  brightCyan: "#73c7d3",
   brightWhite: "#ffffff",
 };
 
@@ -65,7 +65,7 @@ function buildThemeFromCSS(): ITheme {
   return {
     background: getCSSVar("--background"),
     foreground: getCSSVar("--foreground"),
-    cursor: getCSSVar("--foreground"),
+    cursor: getCSSVar("--sidebar-primary"),
     cursorAccent: getCSSVar("--background"),
     selectionBackground: getCSSVar("--accent"),
     selectionForeground: getCSSVar("--accent-foreground"),
