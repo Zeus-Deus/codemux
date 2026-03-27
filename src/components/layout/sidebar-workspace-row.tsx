@@ -1,12 +1,5 @@
 import { useEffect, useState } from "react";
 import {
-  SidebarMenuItem,
-  SidebarMenuButton,
-  SidebarMenuBadge,
-  SidebarMenuAction,
-  SidebarMenuSubButton,
-} from "@/components/ui/sidebar";
-import {
   ContextMenu,
   ContextMenuTrigger,
   ContextMenuContent,
@@ -25,6 +18,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { cn } from "@/lib/utils";
 import { X, TerminalSquare, Workflow, ArrowUp, ArrowDown } from "lucide-react";
 import {
   activateWorkspace,
@@ -39,47 +33,6 @@ import type { WorkspaceSnapshot, EditorInfo } from "@/tauri/types";
 interface Props {
   workspace: WorkspaceSnapshot;
   isActive: boolean;
-  nested?: boolean;
-}
-
-function WorkspaceRowContent({ workspace }: { workspace: WorkspaceSnapshot }) {
-  return (
-    <div className="flex flex-col gap-0 min-w-0 flex-1">
-      <div className="flex items-center justify-between gap-2">
-        <span className="truncate text-sm font-medium leading-tight">{workspace.title}</span>
-        {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
-          <span className="flex items-center gap-1 shrink-0 text-[10px] tabular-nums">
-            {workspace.git_additions > 0 && (
-              <span className="text-success">+{workspace.git_additions}</span>
-            )}
-            {workspace.git_deletions > 0 && (
-              <span className="text-danger">-{workspace.git_deletions}</span>
-            )}
-          </span>
-        )}
-      </div>
-      {workspace.git_branch && (
-        <div className="flex items-center gap-1 text-[10px] text-muted-foreground leading-tight">
-          <span className="truncate">{workspace.git_branch}</span>
-          {(workspace.git_ahead > 0 || workspace.git_behind > 0) && (
-            <span className="flex items-center gap-0.5 shrink-0 text-[9px] tabular-nums text-muted-foreground/70">
-              {workspace.git_ahead > 0 && (
-                <span className="flex items-center"><ArrowUp className="h-2 w-2" />{workspace.git_ahead}</span>
-              )}
-              {workspace.git_behind > 0 && (
-                <span className="flex items-center"><ArrowDown className="h-2 w-2" />{workspace.git_behind}</span>
-              )}
-            </span>
-          )}
-          {workspace.pr_number && (
-            <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
-              #{workspace.pr_number}
-            </Badge>
-          )}
-        </div>
-      )}
-    </div>
-  );
 }
 
 function handleCloseWorkspace(workspace: WorkspaceSnapshot) {
@@ -218,16 +171,11 @@ function WorkspaceContextMenuItems({
   );
 }
 
-export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
+export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
 
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
-  };
-
-  const handleClose = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    handleCloseWorkspace(workspace);
   };
 
   const icon =
@@ -237,65 +185,105 @@ export function SidebarWorkspaceRow({ workspace, isActive, nested }: Props) {
       <TerminalSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
     );
 
-  if (nested) {
-    return (
-      <>
-        <ContextMenu>
-          <ContextMenuTrigger asChild>
-            <SidebarMenuSubButton
-              isActive={isActive}
-              onClick={handleActivate}
-            >
-              {icon}
-              <WorkspaceRowContent workspace={workspace} />
-            </SidebarMenuSubButton>
-          </ContextMenuTrigger>
-          <WorkspaceContextMenuItems
-            workspace={workspace}
-            onDeleteRequest={() => setShowDeleteDialog(true)}
-          />
-        </ContextMenu>
-        <DeleteWorkspaceDialog
-          workspace={workspace}
-          open={showDeleteDialog}
-          onOpenChange={setShowDeleteDialog}
-        />
-      </>
-    );
-  }
-
   return (
-    <SidebarMenuItem>
+    <>
       <ContextMenu>
         <ContextMenuTrigger asChild>
-          <SidebarMenuButton
-            isActive={isActive}
+          <div
+            role="button"
+            tabIndex={0}
             onClick={handleActivate}
-            tooltip={workspace.title}
-            size="lg"
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleActivate(); }}
+            className={cn(
+              "flex w-full pl-3 pr-2 py-1.5 text-sm cursor-pointer group relative",
+              "hover:bg-muted/50 transition-colors",
+              isActive && "bg-muted",
+            )}
           >
-            {icon}
-            <WorkspaceRowContent workspace={workspace} />
-          </SidebarMenuButton>
+            {/* Active left border accent */}
+            {isActive && (
+              <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-primary rounded-r" />
+            )}
+
+            {/* Icon */}
+            <div className="flex items-center shrink-0 mr-2.5 mt-0.5">
+              {icon}
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5">
+                <span className={cn(
+                  "truncate text-[13px] leading-tight font-medium",
+                  isActive ? "text-foreground" : "text-foreground/80",
+                )}>
+                  {workspace.title}
+                </span>
+
+                {/* Git diff stats — hidden on hover, replaced by close button */}
+                {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
+                  <span className="flex items-center gap-1 shrink-0 text-[10px] font-mono tabular-nums transition-opacity group-hover:opacity-0">
+                    {workspace.git_additions > 0 && (
+                      <span className="text-success">+{workspace.git_additions}</span>
+                    )}
+                    {workspace.git_deletions > 0 && (
+                      <span className="text-danger">-{workspace.git_deletions}</span>
+                    )}
+                  </span>
+                )}
+
+                {/* Close button — visible on hover */}
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); handleCloseWorkspace(workspace); }}
+                  className="ml-auto shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground"
+                  aria-label="Close workspace"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+
+                {/* Notification badge */}
+                {workspace.notification_count > 0 && (
+                  <span className="shrink-0 text-[10px] tabular-nums text-warning bg-warning/20 rounded-full px-1.5 py-0.5 leading-none">
+                    {workspace.notification_count}
+                  </span>
+                )}
+              </div>
+
+              {/* Branch name row */}
+              {workspace.git_branch && (
+                <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
+                  <span className="truncate">{workspace.git_branch}</span>
+                  {(workspace.git_ahead > 0 || workspace.git_behind > 0) && (
+                    <span className="flex items-center gap-0.5 shrink-0 text-[10px] tabular-nums">
+                      {workspace.git_ahead > 0 && (
+                        <span className="flex items-center text-success"><ArrowUp className="h-2 w-2" />{workspace.git_ahead}</span>
+                      )}
+                      {workspace.git_behind > 0 && (
+                        <span className="flex items-center text-warning"><ArrowDown className="h-2 w-2" />{workspace.git_behind}</span>
+                      )}
+                    </span>
+                  )}
+                  {workspace.pr_number && (
+                    <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
+                      #{workspace.pr_number}
+                    </Badge>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
         </ContextMenuTrigger>
         <WorkspaceContextMenuItems
           workspace={workspace}
           onDeleteRequest={() => setShowDeleteDialog(true)}
         />
       </ContextMenu>
-      {workspace.notification_count > 0 && (
-        <SidebarMenuBadge className="bg-warning/20 text-warning">
-          {workspace.notification_count}
-        </SidebarMenuBadge>
-      )}
-      <SidebarMenuAction showOnHover onClick={handleClose} title="Close workspace">
-        <X className="h-3 w-3" />
-      </SidebarMenuAction>
       <DeleteWorkspaceDialog
         workspace={workspace}
         open={showDeleteDialog}
         onOpenChange={setShowDeleteDialog}
       />
-    </SidebarMenuItem>
+    </>
   );
 }

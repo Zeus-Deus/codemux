@@ -2,7 +2,6 @@ import { useState, useRef, useCallback } from "react";
 import {
   SidebarGroup,
   SidebarGroupContent,
-  SidebarMenu,
 } from "@/components/ui/sidebar";
 import { useProjectGroupedWorkspaces, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
@@ -301,17 +300,15 @@ export function SidebarWorkspaceList() {
               data-drop-zone-project={group.projectPath}
               className={dragState?.type === "project" && dragState.id === group.projectPath ? "opacity-40" : ""}
             >
-              <SidebarMenu>
-                <SidebarProjectGroup
-                  projectName={group.projectName}
-                  projectPath={group.projectPath}
-                  workspaces={group.workspaces}
-                  activeWorkspaceId={activeWorkspaceId}
-                  onWorkspaceDragStart={handleWorkspaceDragStart}
-                  onProjectDragStart={handleProjectDragStart(group.projectPath)}
-                  dragStateId={dragState?.id ?? null}
-                />
-              </SidebarMenu>
+              <SidebarProjectGroup
+                projectName={group.projectName}
+                projectPath={group.projectPath}
+                workspaces={group.workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                onWorkspaceDragStart={handleWorkspaceDragStart}
+                onProjectDragStart={handleProjectDragStart(group.projectPath)}
+                dragStateId={dragState?.id ?? null}
+              />
             </div>
           ))}
         </div>
