@@ -196,15 +196,15 @@ export function TabBar({ workspace }: Props) {
   }
 
   return (
-    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-background px-1.5">
+    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-background">
       <Tabs
         value={workspace.active_tab_id}
         onValueChange={handleTabChange}
-        className="flex-1 min-w-0"
+        className="flex-1 min-w-0 h-full"
       >
         <div
           ref={tabListRef}
-          className="relative flex items-center"
+          className="relative flex items-center h-full"
           onDragOver={handleDragOver}
           onDrop={handleDrop}
           onDragEnd={handleDragEnd}
@@ -225,11 +225,11 @@ export function TabBar({ workspace }: Props) {
                     data-tab-index={idx}
                     draggable
                     onDragStart={handleDragStart(tab.tab_id)}
-                    className={dragTabId === tab.tab_id ? "opacity-40" : ""}
+                    className={`h-full ${dragTabId === tab.tab_id ? "opacity-40" : ""}`}
                   >
                     <TabsTrigger
                       value={tab.tab_id}
-                      className="group relative gap-1 px-3 !h-full text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
+                      className="group relative gap-1 px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
                     >
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
