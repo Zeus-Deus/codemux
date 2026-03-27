@@ -5,20 +5,21 @@ import { useAppStore } from "@/stores/app-store";
 import { useTauriEvent } from "./use-tauri-event";
 import type { AppStateSnapshot } from "@/tauri/types";
 
-export function useAppStateInit() {
+export function useAppStateInit(skip = false) {
   const setAppState = useAppStore((s) => s.setAppState);
   const lastJsonRef = useRef("");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Fetch initial state on mount
+  // Fetch initial state on mount (skip if not authenticated yet)
   useEffect(() => {
+    if (skip) return;
     getAppState()
       .then((snapshot) => {
         lastJsonRef.current = JSON.stringify(snapshot);
         setAppState(snapshot);
       })
       .catch((err) => console.error("Failed to fetch app state:", err));
-  }, [setAppState]);
+  }, [setAppState, skip]);
 
   // Subscribe to state changes with 16ms debounce + JSON dedup
   const handleStateChanged = useCallback(

@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export type { UnlistenFn };
 import type {
   AppStateSnapshot,
+  AuthStatePayload,
   OrchestratorTriggerResult,
   PresetStoreSnapshot,
   TerminalStatusPayload,
@@ -61,3 +62,8 @@ export const onOpenflowCycle = (
   cb: EventCallback<OrchestratorTriggerResult>,
 ): Promise<UnlistenFn> =>
   listen<OrchestratorTriggerResult>("openflow-cycle", (e) => cb(e.payload));
+
+export const onAuthStateChanged = (
+  cb: EventCallback<AuthStatePayload>,
+): Promise<UnlistenFn> =>
+  listen<AuthStatePayload>("auth-state-changed", (e) => cb(e.payload));

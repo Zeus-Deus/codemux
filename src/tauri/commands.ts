@@ -5,6 +5,8 @@ import type {
   AgentConfig,
   AgentSessionState,
   AppStateSnapshot,
+  AuthResponse,
+  AuthUser,
   BaseBranchDiff,
   CheckInfo,
   CliToolInfo,
@@ -44,6 +46,29 @@ import type {
   WorktreeInfo,
   ProjectScripts,
 } from "./types";
+
+// ── Auth ──
+
+export const startOauthFlow = () =>
+  invoke<void>("start_oauth_flow");
+
+export const signinEmail = (email: string, password: string) =>
+  invoke<AuthResponse>("signin_email", { email, password });
+
+export const signupEmail = (email: string, password: string, name: string) =>
+  invoke<void>("signup_email", { email, password, name });
+
+export const forgotPassword = (email: string) =>
+  invoke<void>("forgot_password", { email });
+
+export const checkAuth = () =>
+  invoke<AuthUser | null>("check_auth");
+
+export const signOut = () =>
+  invoke<void>("sign_out");
+
+export const getAuthToken = () =>
+  invoke<string | null>("get_auth_token");
 
 // ── Core ──
 

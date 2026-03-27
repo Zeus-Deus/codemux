@@ -2,6 +2,7 @@ use tauri::Manager;
 
 pub mod agent_context;
 pub mod ai;
+pub mod auth;
 pub mod mcp_server;
 pub mod agent_browser;
 pub mod browser;
@@ -72,6 +73,7 @@ pub fn run() {
         .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
+        .manage(auth::AuthState::default())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()
@@ -463,7 +465,14 @@ pub fn run() {
             commands::run_project_dev_command,
             commands::list_directory,
             commands::search_in_files,
-            commands::search_file_names
+            commands::search_file_names,
+            commands::start_oauth_flow,
+            commands::signin_email,
+            commands::signup_email,
+            commands::forgot_password,
+            commands::check_auth,
+            commands::sign_out,
+            commands::get_auth_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -41,3 +41,8 @@ libc = "0.2"
 tauri-plugin-single-instance = "2.4.0"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+hostname = "0.4"
+url = "2"
+urlencoding = "2"

@@ -10,6 +10,7 @@ import {
   BookOpen,
   Bug,
   Info,
+  LogOut,
   Minus,
   Square,
   Copy,
@@ -181,6 +182,17 @@ function AppMenu() {
         <DropdownMenuItem disabled>
           <Info className="h-4 w-4" />
           <span>Codemux {version ? `v${version}` : ""}</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          onClick={() => {
+            import("@/stores/auth-store").then(({ useAuthStore }) =>
+              useAuthStore.getState().signOut(),
+            );
+          }}
+        >
+          <LogOut className="h-4 w-4" />
+          <span>Sign Out</span>
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

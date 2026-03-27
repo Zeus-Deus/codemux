@@ -1,3 +1,23 @@
+// ── Auth ──
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string | null;
+  image: string | null;
+}
+
+export interface AuthResponse {
+  user: AuthUser;
+  token: string;
+  expires_at: string;
+}
+
+export interface AuthStatePayload {
+  authenticated: boolean;
+  user: AuthUser | null;
+}
+
 // ── Terminal ──
 
 export interface TerminalSessionSnapshot {

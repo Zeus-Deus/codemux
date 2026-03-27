@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod auth;
 pub mod browser;
 pub mod database;
 pub mod files;
@@ -9,6 +10,7 @@ pub mod presets;
 pub mod workspace;
 
 pub use ai::*;
+pub use auth::*;
 pub use browser::*;
 pub use database::*;
 pub use files::*;
