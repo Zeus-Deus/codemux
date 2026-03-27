@@ -294,21 +294,25 @@ export function SidebarWorkspaceList() {
           )}
 
           {/* Workspaces grouped by project */}
-          {projectGroups.map((group) => (
-            <div
-              key={group.projectPath}
-              data-drop-zone-project={group.projectPath}
-              className={dragState?.type === "project" && dragState.id === group.projectPath ? "opacity-40" : ""}
-            >
-              <SidebarProjectGroup
-                projectName={group.projectName}
-                projectPath={group.projectPath}
-                workspaces={group.workspaces}
-                activeWorkspaceId={activeWorkspaceId}
-                onWorkspaceDragStart={handleWorkspaceDragStart}
-                onProjectDragStart={handleProjectDragStart(group.projectPath)}
-                dragStateId={dragState?.id ?? null}
-              />
+          {projectGroups.map((group, idx) => (
+            <div key={group.projectPath}>
+              {idx > 0 && (
+                <div className="mx-3 h-px bg-muted-foreground/20" />
+              )}
+              <div
+                data-drop-zone-project={group.projectPath}
+                className={dragState?.type === "project" && dragState.id === group.projectPath ? "opacity-40" : ""}
+              >
+                <SidebarProjectGroup
+                  projectName={group.projectName}
+                  projectPath={group.projectPath}
+                  workspaces={group.workspaces}
+                  activeWorkspaceId={activeWorkspaceId}
+                  onWorkspaceDragStart={handleWorkspaceDragStart}
+                  onProjectDragStart={handleProjectDragStart(group.projectPath)}
+                  dragStateId={dragState?.id ?? null}
+                />
+              </div>
             </div>
           ))}
         </div>

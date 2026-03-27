@@ -88,7 +88,7 @@ export function SidebarProjectGroup({
   const letter = projectName.charAt(0).toUpperCase();
 
   return (
-    <div className="py-1.5 border-b border-border last:border-b-0">
+    <div className="py-1.5">
       {/* Project header */}
       <ContextMenu>
         <ContextMenuTrigger asChild>
