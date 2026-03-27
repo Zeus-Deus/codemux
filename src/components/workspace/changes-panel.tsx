@@ -608,8 +608,9 @@ function DirectoryGroup({
 
   return (
     <div>
-      <button
-        className="flex w-full items-center gap-1 px-1 py-0.5 text-left hover:bg-accent/30 transition-colors rounded-sm"
+      <Button
+        variant="ghost"
+        className="w-full justify-start gap-1 px-1 py-0.5 h-auto text-left hover:bg-accent/30 rounded-sm"
         onClick={() => setCollapsed(!collapsed)}
       >
         <ChevronRight
@@ -617,7 +618,7 @@ function DirectoryGroup({
         />
         <Folder className="h-3 w-3 shrink-0 text-muted-foreground/50" />
         <span className="truncate text-[10px] text-muted-foreground">{dir}</span>
-      </button>
+      </Button>
       {!collapsed &&
         files.map((f) => (
           <FileRow
@@ -1200,24 +1201,30 @@ export function ChangesPanel({ workspace }: Props) {
               <div className="py-1">
                 <div className="flex items-center justify-between px-1.5 py-0.5">
                   <div className="flex items-center gap-1">
-                    <button
-                      className="flex items-center hover:bg-accent/30 rounded-sm transition-colors px-0.5 -ml-0.5"
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="hover:bg-accent/30 -ml-0.5"
                       onClick={() => setBaseBranchExpanded(!baseBranchExpanded)}
                     >
                       <ChevronRight
                         className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${baseBranchExpanded ? "rotate-90" : ""}`}
                       />
-                    </button>
+                    </Button>
                     <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                       Against
                     </span>
                     {remoteBranches.length > 1 ? (
                       <DropdownMenu>
                         <DropdownMenuTrigger asChild>
-                          <button className="flex items-center gap-0.5 rounded-sm px-1 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors">
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            className="gap-0.5 px-1 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground"
+                          >
                             {baseBranch}
                             <ChevronDown className="h-2.5 w-2.5 opacity-60" />
-                          </button>
+                          </Button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
                           {remoteBranches.map((b) => (
@@ -1267,8 +1274,9 @@ export function ChangesPanel({ workspace }: Props) {
             {/* Recent Commits — collapsed by default */}
             {commits.length > 0 && (
               <div className="py-1">
-                <button
-                  className="flex w-full items-center justify-between px-1.5 py-0.5 hover:bg-accent/30 rounded-sm transition-colors"
+                <Button
+                  variant="ghost"
+                  className="w-full justify-between px-1.5 py-0.5 h-auto hover:bg-accent/30 rounded-sm"
                   onClick={() => setCommitsExpanded(!commitsExpanded)}
                 >
                   <div className="flex items-center gap-1">
@@ -1282,7 +1290,7 @@ export function ChangesPanel({ workspace }: Props) {
                   <span className="text-[10px] tabular-nums text-muted-foreground">
                     {commits.length}
                   </span>
-                </button>
+                </Button>
                 {commitsExpanded &&
                   commits.map((commit, idx) => {
                     const prevCommit = idx > 0 ? commits[idx - 1] : null;

@@ -1,6 +1,7 @@
 import { useRef, useCallback, useImperativeHandle, forwardRef } from "react";
 import type { DiffLine } from "@/lib/diff-parser";
 import { buildSplitPairs } from "@/lib/diff-parser";
+import { Separator } from "@/components/ui/separator";
 
 interface Props {
   lines: DiffLine[];
@@ -160,7 +161,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
         </div>
 
         {/* Divider */}
-        <div className="bg-border/50" />
+        <Separator orientation="vertical" className="bg-border/50" />
 
         {/* Right — additions / new */}
         <div

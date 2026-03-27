@@ -9,6 +9,7 @@ import {
   Target,
   X,
 } from "lucide-react";
+import { Separator } from "@/components/ui/separator";
 import { useDiffStore, type DiffTabState } from "@/stores/diff-store";
 import { closeTab } from "@/tauri/commands";
 
@@ -97,7 +98,7 @@ export function DiffToolbar({
       </div>
 
       {/* Separator */}
-      <div className="w-px h-3.5 bg-border/50 mx-0.5" />
+      <Separator orientation="vertical" className="!h-3.5 !self-auto bg-border/50 mx-0.5" />
 
       {/* Hunk nav */}
       <Button
@@ -118,7 +119,7 @@ export function DiffToolbar({
       </Button>
 
       {/* Separator */}
-      <div className="w-px h-3.5 bg-border/50 mx-0.5" />
+      <Separator orientation="vertical" className="!h-3.5 !self-auto bg-border/50 mx-0.5" />
 
       {/* File nav */}
       <Button
@@ -144,7 +145,7 @@ export function DiffToolbar({
       </Button>
 
       {/* Separator */}
-      <div className="w-px h-3.5 bg-border/50 mx-0.5" />
+      <Separator orientation="vertical" className="!h-3.5 !self-auto bg-border/50 mx-0.5" />
 
       {/* Focus mode */}
       <Button

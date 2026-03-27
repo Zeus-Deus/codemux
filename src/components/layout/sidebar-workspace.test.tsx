@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // Mock Tauri commands
@@ -59,12 +60,14 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
 describe("SidebarProjectGroup", () => {
   it("shows letter avatar with first letter of project name", () => {
     render(
-      <SidebarProjectGroup
-        projectName="codemux"
-        projectPath="/home/user/codemux"
-        workspaces={[]}
-        activeWorkspaceId=""
-      />,
+      <TooltipProvider>
+        <SidebarProjectGroup
+          projectName="codemux"
+          projectPath="/home/user/codemux"
+          workspaces={[]}
+          activeWorkspaceId=""
+        />
+      </TooltipProvider>,
     );
     // First letter uppercase
     expect(screen.getByText("C")).toBeInTheDocument();
@@ -72,12 +75,14 @@ describe("SidebarProjectGroup", () => {
 
   it("default avatar has neutral styling (no custom color)", () => {
     render(
-      <SidebarProjectGroup
-        projectName="myproject"
-        projectPath="/home/user/myproject"
-        workspaces={[]}
-        activeWorkspaceId=""
-      />,
+      <TooltipProvider>
+        <SidebarProjectGroup
+          projectName="myproject"
+          projectPath="/home/user/myproject"
+          workspaces={[]}
+          activeWorkspaceId=""
+        />
+      </TooltipProvider>,
     );
     const avatar = screen.getByText("M").closest("div");
     // Should have muted classes, no inline style for color

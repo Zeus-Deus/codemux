@@ -258,22 +258,23 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     </span>
                   )}
                   {!isPrimary && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground justify-end"
                       onClick={(e) => { e.stopPropagation(); handleCloseWorkspace(workspace); }}
-                      className="flex items-center justify-end opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground"
                       aria-label="Close workspace"
                     >
                       <X className="h-3.5 w-3.5" />
-                    </button>
+                    </Button>
                   )}
                 </div>
 
                 {/* Notification badge */}
                 {workspace.notification_count > 0 && (
-                  <span className="shrink-0 text-[10px] tabular-nums text-warning bg-warning/20 rounded-full px-1.5 py-0.5 leading-none">
+                  <Badge variant="outline" className="shrink-0 text-[10px] tabular-nums text-warning bg-warning/20 border-transparent px-1.5 py-0.5 leading-none">
                     {workspace.notification_count}
-                  </span>
+                  </Badge>
                 )}
               </div>
 

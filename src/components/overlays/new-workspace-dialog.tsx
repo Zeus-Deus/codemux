@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useMemo, useCallback } from "react";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -412,9 +413,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 const hasWs = branchWorkspaceMap.has(branch);
                 const isSelected = selectedBranch === branch;
                 return (
-                  <button
+                  <Button
                     key={branch}
-                    className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm text-left hover:bg-accent min-w-0 ${isSelected ? "bg-accent" : ""}`}
+                    variant="ghost"
+                    className={cn(
+                      "w-full justify-start gap-2 px-2 py-1.5 h-auto text-sm text-left min-w-0",
+                      isSelected && "bg-accent",
+                    )}
                     onClick={() => setSelectedBranch(branch)}
                     disabled={creating}
                   >
@@ -432,7 +437,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         </Badge>
                       )}
                     </div>
-                  </button>
+                  </Button>
                 );
               })}
               {filteredBranches.length === 0 && (
@@ -459,9 +464,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             ) : (
               <div className="space-y-0.5">
                 {prs.map((pr) => (
-                  <button
+                  <Button
                     key={pr.number}
-                    className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left hover:bg-accent"
+                    variant="ghost"
+                    className="w-full justify-start gap-2 px-2 py-2 h-auto text-left items-start"
                     onClick={() =>
                       pr.head_branch &&
                       handleCreate(pr.head_branch, false)
@@ -493,7 +499,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         )}
                       </div>
                     </div>
-                  </button>
+                  </Button>
                 ))}
                 {prs.length === 0 && (
                   <p className="text-xs text-muted-foreground text-center py-4">

@@ -1,5 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ChevronRight, File, Folder, RefreshCw, Loader2 } from "lucide-react";
 import { listDirectory, detectEditors, openInEditor } from "@/tauri/commands";
 import type { WorkspaceSnapshot, FileEntry, EditorInfo } from "@/tauri/types";
@@ -32,8 +38,9 @@ function TreeNode({
   if (entry.is_dir) {
     return (
       <div>
-        <button
-          className="flex w-full items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-accent text-xs"
+        <Button
+          variant="ghost"
+          className="w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs"
           style={{ paddingLeft: `${8 + depth * 16}px` }}
           onClick={() => onToggleDir(entry.path)}
         >
@@ -43,7 +50,7 @@ function TreeNode({
           <Folder className="h-3 w-3 shrink-0 text-primary/70" />
           <span className="truncate text-foreground">{entry.name}</span>
           {isLoading && <Loader2 className="h-2.5 w-2.5 animate-spin text-muted-foreground ml-auto" />}
-        </button>
+        </Button>
         {isExpanded && children && (
           <div>
             {children.map((child) => (
@@ -73,8 +80,9 @@ function TreeNode({
   }
 
   return (
-    <button
-      className="flex w-full items-center gap-1 rounded-sm px-1.5 py-0.5 hover:bg-accent text-xs"
+    <Button
+      variant="ghost"
+      className="w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs"
       style={{ paddingLeft: `${8 + depth * 16}px` }}
       onClick={() => onClickFile(entry.path)}
     >
@@ -88,7 +96,7 @@ function TreeNode({
             : `${entry.size}B`}
         </span>
       )}
-    </button>
+    </Button>
   );
 }
 
@@ -161,13 +169,21 @@ export function FileTreePanel({ workspace }: Props) {
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-end p-1.5 border-b border-border">
-        <button
-          className="rounded-sm p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-          onClick={refreshRoot}
-          title="Refresh"
-        >
-          <RefreshCw className="h-3 w-3" />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="Refresh"
+              onClick={refreshRoot}
+            >
+              <RefreshCw className="h-3 w-3" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={4}>
+            Refresh
+          </TooltipContent>
+        </Tooltip>
       </div>
       <ScrollArea className="flex-1">
         <div className="py-1">

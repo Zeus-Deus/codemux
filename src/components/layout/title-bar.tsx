@@ -29,6 +29,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
@@ -133,13 +135,13 @@ function AppMenu() {
       <Tooltip>
         <TooltipTrigger asChild>
           <DropdownMenuTrigger asChild>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="icon-sm"
               aria-label="App menu"
-              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
             >
               <Settings className="h-3.5 w-3.5" />
-            </button>
+            </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
         <TooltipContent side="bottom" sideOffset={4}>
@@ -301,17 +303,15 @@ function SidebarToggleButton({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <button
-          type="button"
+        <Button
+          variant="ghost"
+          size="icon-sm"
           aria-label="Toggle sidebar"
           onClick={onToggle}
-          className={cn(
-            "flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground",
-            open && "text-foreground",
-          )}
+          className={cn(open && "text-foreground")}
         >
           <PanelLeft className="h-3.5 w-3.5" />
-        </button>
+        </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>
         Toggle sidebar (Ctrl+B)
@@ -345,7 +345,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       <div className="flex items-center gap-1.5 pr-0.5">
         <IdeLauncher />
         <AppMenu />
-        <div className="w-px h-4 bg-border/50" />
+        <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
         <WindowControls />
       </div>
     </div>

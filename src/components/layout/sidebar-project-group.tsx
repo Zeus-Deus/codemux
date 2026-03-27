@@ -9,6 +9,12 @@ import {
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ChevronRight, Plus, Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
@@ -113,30 +119,39 @@ export function SidebarProjectGroup({
               {letter}
             </div>
 
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              className="flex-1 justify-start gap-1.5 min-w-0 text-left h-auto p-0 hover:bg-transparent"
               onClick={handleToggle}
-              className="flex items-center gap-1.5 flex-1 min-w-0 text-left"
             >
               <span className="truncate text-foreground">{projectName}</span>
               <span className="text-xs text-muted-foreground tabular-nums font-normal">
                 ({workspaces.length})
               </span>
-            </button>
+            </Button>
 
-            <button
-              type="button"
-              onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true, projectPath); }}
-              className="p-1 rounded hover:bg-muted transition-colors shrink-0 ml-1"
-              title="New workspace"
-            >
-              <Plus className="h-4 w-4 text-muted-foreground" />
-            </button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="shrink-0 ml-1"
+                  aria-label="New workspace"
+                  onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true, projectPath); }}
+                >
+                  <Plus className="h-4 w-4 text-muted-foreground" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={4}>
+                New workspace
+              </TooltipContent>
+            </Tooltip>
 
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="shrink-0 ml-1"
               onClick={(e) => { e.stopPropagation(); handleToggle(); }}
-              className="p-1 rounded hover:bg-muted transition-colors shrink-0 ml-1"
             >
               <ChevronRight
                 className={cn(
@@ -144,7 +159,7 @@ export function SidebarProjectGroup({
                   !collapsed && "rotate-90",
                 )}
               />
-            </button>
+            </Button>
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent>

@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -291,13 +292,14 @@ function PresetEditorSheet({
                   )}
                 </div>
               ))}
-              <button
-                type="button"
+              <Button
+                variant="ghost"
+                size="sm"
+                className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
                 onClick={addCommand}
-                className="mt-1 inline-flex w-fit items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
               >
                 + Add command
-              </button>
+              </Button>
             </div>
           </div>
 
@@ -1036,18 +1038,20 @@ export function SettingsView() {
           {NAV_ITEMS.map((item) => {
             const Icon = item.icon;
             return (
-              <button
+              <Button
                 key={item.id}
-                className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm transition-colors ${
+                variant="ghost"
+                className={cn(
+                  "w-full justify-start gap-2.5 px-3 py-2 h-auto text-sm",
                   activeSection === item.id
                     ? "bg-accent text-foreground font-medium"
-                    : "text-muted-foreground hover:text-foreground hover:bg-accent/50"
-                }`}
+                    : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
+                )}
                 onClick={() => setActiveSection(item.id)}
               >
                 <Icon className="h-4 w-4 shrink-0" />
                 {item.label}
-              </button>
+              </Button>
             );
           })}
         </nav>

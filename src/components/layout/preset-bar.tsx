@@ -13,6 +13,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { Separator } from "@/components/ui/separator";
+import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { useUIStore } from "@/stores/ui-store";
 import {
@@ -62,13 +64,13 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
       {/* Settings gear */}
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="icon-xs"
             aria-label="Preset settings"
-            className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
           >
             <Settings className="h-3.5 w-3.5" />
-          </button>
+          </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-52">
           <DropdownMenuCheckboxItem
@@ -86,20 +88,21 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
       </DropdownMenu>
 
       {/* Divider */}
-      <div className="h-4 w-px bg-border mx-0.5 shrink-0" />
+      <Separator orientation="vertical" className="!h-4 !self-auto mx-0.5" />
 
       {/* Preset buttons */}
       {pinnedPresets.map((preset) => (
         <Tooltip key={preset.id}>
           <TooltipTrigger asChild>
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="xs"
+              className="gap-1.5 shrink-0"
               onClick={() => handleLaunch(preset)}
-              className="flex items-center gap-1.5 h-6 px-2 shrink-0 rounded-md text-xs text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
             >
               <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
               <span className="truncate max-w-[120px]">{preset.name}</span>
-            </button>
+            </Button>
           </TooltipTrigger>
           {preset.description && (
             <TooltipContent side="bottom" sideOffset={4}>

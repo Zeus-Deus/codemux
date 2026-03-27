@@ -1,5 +1,10 @@
 import { SidebarHeader as ShadcnSidebarHeader } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { Plus } from "lucide-react";
@@ -19,13 +24,14 @@ export function SidebarHeader() {
   return (
     <ShadcnSidebarHeader className="gap-0 p-2">
       {/* + New Workspace row */}
-      <button
-        className="flex w-full items-center gap-2 rounded-md px-2 py-3 text-sm text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors"
+      <Button
+        variant="ghost"
+        className="w-full justify-start gap-2 px-2 py-3 h-auto text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
         onClick={() => setShowDialog(true)}
       >
         <Plus className="h-3.5 w-3.5" />
         <span>New Workspace</span>
-      </button>
+      </Button>
 
       {/* Repo name + count + actions */}
       <div className="flex items-center justify-between px-2 py-1">
@@ -38,15 +44,21 @@ export function SidebarHeader() {
           </span>
         </div>
         <div className="flex items-center gap-0.5 shrink-0">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            aria-label="New workspace"
-            title="New workspace"
-            onClick={() => setShowDialog(true)}
-          >
-            <Plus className="h-3 w-3" />
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="New workspace"
+                onClick={() => setShowDialog(true)}
+              >
+                <Plus className="h-3 w-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4}>
+              New workspace
+            </TooltipContent>
+          </Tooltip>
         </div>
       </div>
     </ShadcnSidebarHeader>
