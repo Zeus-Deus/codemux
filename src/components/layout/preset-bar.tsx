@@ -16,6 +16,7 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
+import { RunButton } from "./run-button";
 import { useUIStore } from "@/stores/ui-store";
 import {
   getPresets,
@@ -111,6 +112,13 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
           )}
         </Tooltip>
       ))}
+
+      {/* Spacer pushes run button right */}
+      <div className="flex-1 min-w-0" />
+
+      {/* Run button */}
+      <Separator orientation="vertical" className="!h-4 !self-auto mx-0.5" />
+      <RunButton workspaceId={workspaceId} />
     </div>
   );
 }

@@ -183,8 +183,8 @@ export const getProjectScripts = (path: string) =>
 export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
   invoke<void>("set_project_scripts", { path, scripts });
 
-export const runProjectDevCommand = (workspaceId: string) =>
-  invoke<void>("run_project_dev_command", { workspaceId });
+export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
+  invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });

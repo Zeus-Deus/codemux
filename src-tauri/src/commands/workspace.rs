@@ -959,6 +959,7 @@ pub fn run_project_dev_command(
     db: State<'_, crate::database::DatabaseStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
     workspace_id: String,
+    force_new: bool,
 ) -> Result<(), String> {
     let (cwd, project_root) = {
         let snapshot = state.snapshot();
@@ -983,7 +984,9 @@ pub fn run_project_dev_command(
         })?;
 
     // Check if a "Workspace Run" tab already exists for this workspace
-    let existing_run_tab = {
+    let existing_run_tab = if force_new {
+        None
+    } else {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces

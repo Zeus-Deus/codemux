@@ -46,7 +46,17 @@ All scripts have access to these environment variables:
 
 When using Docker Compose with worktrees, each worktree has a different directory name. Docker Compose uses the directory name as the default project name, which means each worktree would create separate containers and volumes.
 
-Codemux automatically sets `COMPOSE_PROJECT_NAME` to the main project folder name, so all worktrees share the same Docker containers and volumes.
+Codemux automatically sets `COMPOSE_PROJECT_NAME` to the main project folder name **in setup and teardown scripts only**. This means `docker compose` commands in those scripts will correctly share containers across worktrees.
+
+However, `COMPOSE_PROJECT_NAME` is **not** available in regular terminal sessions (e.g., when you open a terminal tab and run `docker compose` manually). In a regular terminal, Docker Compose falls back to using the directory name, which differs per worktree.
+
+**To make it work everywhere**, add this line to your setup script so it writes the value into the project's `.env` file:
+
+```bash
+echo "COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME" >> .env
+```
+
+Docker Compose automatically reads `.env` from the working directory, so any terminal session in that worktree will pick up the correct project name — no extra environment variables needed.
 
 ## Run Command
 
@@ -71,7 +81,12 @@ The **Run** command starts your dev server in a dedicated terminal tab:
 ### Docker Compose
 ```json
 {
-  "setup": ["docker compose up -d", "npm install", "npm run db:migrate"],
+  "setup": [
+    "echo COMPOSE_PROJECT_NAME=$COMPOSE_PROJECT_NAME >> .env",
+    "docker compose up -d",
+    "npm install",
+    "npm run db:migrate"
+  ],
   "teardown": ["docker compose down -v"],
   "run": "npm run dev"
 }

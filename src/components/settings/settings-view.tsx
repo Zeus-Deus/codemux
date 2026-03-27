@@ -980,6 +980,13 @@ export function SettingsView() {
                 <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_NAME</code> — workspace title</p>
                 <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_ID</code> — workspace ID</p>
               </div>
+              <div className="rounded-md border border-border bg-muted/50 px-4 py-3 text-sm text-muted-foreground">
+                <p className="font-medium text-foreground mb-1">Docker Compose with worktrees</p>
+                <p>
+                  Codemux automatically sets <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">COMPOSE_PROJECT_NAME</code> to
+                  your project folder name so all worktrees share the same Docker containers and volumes.
+                </p>
+              </div>
             </div>
           </div>
         );
