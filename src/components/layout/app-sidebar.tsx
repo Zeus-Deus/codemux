@@ -5,7 +5,6 @@ import { SidebarOpenflowSection } from "./sidebar-openflow-section";
 import { SidebarAlertsSection } from "./sidebar-alerts-section";
 import { SidebarPortsSection } from "./sidebar-ports-section";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
-import { SidebarFooter } from "./sidebar-footer";
 
 export function AppSidebar() {
   return (
@@ -18,7 +17,6 @@ export function AppSidebar() {
       <SidebarOpenflowSection />
       <SidebarAlertsSection />
       <SidebarPortsSection />
-      <SidebarFooter />
       <SidebarRail />
     </Sidebar>
   );
