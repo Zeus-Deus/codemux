@@ -196,7 +196,7 @@ export function TabBar({ workspace }: Props) {
   }
 
   return (
-    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-card px-1.5">
+    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-background px-1.5">
       <Tabs
         value={workspace.active_tab_id}
         onValueChange={handleTabChange}
@@ -216,7 +216,7 @@ export function TabBar({ workspace }: Props) {
               style={{ left: dropIndicatorLeft }}
             />
           )}
-          <TabsList variant="line" className="h-full gap-0">
+          <TabsList variant="line" className="!h-full !p-0 gap-0">
             {workspace.tabs.map((tab, idx) => (
               <ContextMenu key={tab.tab_id}>
                 <ContextMenuTrigger asChild>
@@ -229,7 +229,7 @@ export function TabBar({ workspace }: Props) {
                   >
                     <TabsTrigger
                       value={tab.tab_id}
-                      className="group relative gap-1 px-2 py-1.5 text-xs"
+                      className="group relative gap-1 px-3 !h-full text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
                     >
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
