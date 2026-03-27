@@ -226,13 +226,13 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "terminal") {
     return (
       <div
-        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/30" : "border-border/30")}
+        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
         data-pane-drop-id={node.pane_id}
         data-pane-title={node.title}
         onPointerDown={handleActivate}
       >
         <header
-          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2 cursor-grab active:cursor-grabbing"
+          className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex items-center gap-1.5 flex-1 truncate text-xs text-muted-foreground">
@@ -268,12 +268,12 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   if (node.kind === "browser") {
     return (
       <div
-        className={cn("group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border", isActive ? "border-primary/30" : "border-border/30")}
+        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
         <header
-          className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-card px-2 cursor-grab active:cursor-grabbing"
+          className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
           <span className="flex-1 truncate text-xs text-muted-foreground">
