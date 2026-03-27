@@ -31,6 +31,7 @@ import type {
   InlineReviewComment,
   DeploymentInfo,
   MergeState,
+  MergeIntoBaseResult,
   ConflictCheckResult,
   ResolverBranchInfo,
   SearchResult,
@@ -341,6 +342,16 @@ export const listWorktrees = (path: string) =>
 
 export const mergeBranch = (path: string, sourceBranch: string) =>
   invoke<string>("merge_branch", { path, sourceBranch });
+
+export const mergeIntoBase = (path: string, baseBranch: string) =>
+  invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch });
+
+export const completeMergeIntoBase = (
+  path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,
+) => invoke("complete_merge_into_base", { path, baseBranch, tempBranch, sourceBranch, deleteSourceBranch });
+
+export const abortMergeIntoBase = (path: string, sourceBranch: string, tempBranch: string) =>
+  invoke("abort_merge_into_base", { path, sourceBranch, tempBranch });
 
 export const getMergeState = (path: string) =>
   invoke<MergeState>("get_merge_state", { path });
