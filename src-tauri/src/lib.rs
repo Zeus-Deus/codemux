@@ -419,6 +419,7 @@ pub fn run() {
             commands::create_worktree,
             commands::remove_worktree,
             commands::list_worktrees,
+            commands::merge_branch,
             commands::get_merge_state,
             commands::check_merge_conflicts,
             commands::resolve_conflict_ours,

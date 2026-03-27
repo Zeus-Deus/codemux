@@ -46,6 +46,7 @@ import {
   gitDiscardFile,
   gitLogEntries,
   getMergeState,
+  mergeBranch,
   resolveConflictOurs,
   resolveConflictTheirs,
   markConflictResolved,
@@ -712,7 +713,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [expandedStaged, setExpandedStaged] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
-  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | null>(null);
+  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | "merge" | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
@@ -901,6 +902,25 @@ export function ChangesPanel({ workspace }: Props) {
     try {
       await gitPullChanges(cwd);
       refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleMergeBranch = async () => {
+    if (busy || isMerging) return;
+    setBusyAction("merge");
+    setGitError(null);
+    try {
+      const hasConflicts = await mergeBranch(cwd, baseBranch);
+      refresh();
+      refreshBaseDiff();
+      if (hasConflicts) {
+        // Conflicts detected — merge is in progress, conflicts section will show
+        // No error needed — the merge banner and conflict UI handle this
+      }
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1245,9 +1265,31 @@ export function ChangesPanel({ workspace }: Props) {
                       </span>
                     )}
                   </div>
-                  <span className="text-[10px] tabular-nums text-muted-foreground">
-                    {baseBranchFiles.length}
-                  </span>
+                  <div className="flex items-center gap-1">
+                    <span className="text-[10px] tabular-nums text-muted-foreground">
+                      {baseBranchFiles.length}
+                    </span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          className="h-4 w-4 hover:bg-accent/50"
+                          onClick={handleMergeBranch}
+                          disabled={busy || isMerging}
+                        >
+                          {busyAction === "merge" ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <GitMerge className="h-3 w-3" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="left">
+                        <p>Merge {baseBranch} into current branch</p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </div>
                 </div>
                 {baseBranchExpanded && (
                   <div>

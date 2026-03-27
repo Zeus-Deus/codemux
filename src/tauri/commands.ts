@@ -339,6 +339,9 @@ export const listWorktrees = (path: string) =>
 
 // ── Merge Conflicts ──
 
+export const mergeBranch = (path: string, sourceBranch: string) =>
+  invoke<boolean>("merge_branch", { path, sourceBranch });
+
 export const getMergeState = (path: string) =>
   invoke<MergeState>("get_merge_state", { path });
 

@@ -551,6 +551,34 @@ pub fn get_merge_state(repo_path: &Path) -> Result<MergeState, String> {
     Ok(MergeState { is_merging, is_rebasing, merge_head, conflicted_files })
 }
 
+/// Merge a source branch into the current branch.
+/// Returns Ok(has_conflicts) — true if conflicts remain to be resolved.
+pub fn merge_branch(repo_path: &Path, source_branch: &str) -> Result<bool, String> {
+    // Safety: refuse to run on dirty working tree
+    let status = git_status(repo_path)?;
+    if !status.is_empty() {
+        return Err("Cannot merge: working tree has uncommitted changes. Commit or stash your changes first.".to_string());
+    }
+
+    let (_stdout, _stderr, success) = run_git_full(
+        repo_path,
+        &["merge", "--no-ff", source_branch],
+    )?;
+
+    if success {
+        return Ok(false); // clean merge, no conflicts
+    }
+
+    // Check if the failure was due to conflicts (merge in progress)
+    let merge_state = get_merge_state(repo_path)?;
+    if merge_state.is_merging && !merge_state.conflicted_files.is_empty() {
+        return Ok(true); // conflicts to resolve
+    }
+
+    // Some other failure (e.g. branch doesn't exist)
+    Err(format!("Merge failed: {}", _stderr.trim()))
+}
+
 pub fn check_merge_conflicts(
     repo_path: &Path,
     target_branch: &str,
@@ -1613,5 +1641,478 @@ C  source.txt -> copy.txt";
 
         // Clean up the branch manually
         let _ = run_git(&repo, &["branch", "-D", "test-keep-me"]);
+    }
+
+    // ── merge_branch comprehensive integration tests ──
+    //
+    // Every test creates real git repos, makes real commits, and verifies
+    // real file contents and git state. No mocks.
+
+    fn git_config(repo: &Path) {
+        let _ = run_git(repo, &["config", "user.name", "Test"]);
+        let _ = run_git(repo, &["config", "user.email", "test@test.com"]);
+    }
+
+    /// Resolve main branch name (git init defaults to "master" on some systems, "main" on others).
+    fn main_branch(repo: &Path) -> &'static str {
+        if run_git(repo, &["rev-parse", "--verify", "main"]).is_ok() { "main" } else { "master" }
+    }
+
+    /// Switch to main, optionally creating divergence.
+    fn checkout_main(repo: &Path) -> &'static str {
+        let name = main_branch(repo);
+        run_git(repo, &["checkout", name]).expect("checkout main");
+        name
+    }
+
+    fn head_hash(repo: &Path) -> String {
+        run_git(repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD").trim().to_string()
+    }
+
+    fn log_oneline(repo: &Path, count: usize) -> String {
+        run_git(repo, &["log", "--oneline", &format!("-{}", count)]).expect("git log")
+    }
+
+    // ── 1. Full clean merge workflow ──
+
+    #[test]
+    fn test_full_merge_workflow_clean() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Feature branch adds feature.txt
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("feature.txt"), "feature work").unwrap();
+        run_git(&repo, &["add", "feature.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add feature.txt"]).unwrap();
+
+        // Main adds main.txt (different file — no conflict)
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("main.txt"), "main work").unwrap();
+        run_git(&repo, &["add", "main.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add main.txt"]).unwrap();
+
+        // Merge main into feature
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).expect("merge should succeed");
+        assert!(!has_conflicts, "clean merge should report no conflicts");
+
+        // Both files exist in working tree
+        assert!(repo.join("feature.txt").exists(), "feature.txt should exist");
+        assert!(repo.join("main.txt").exists(), "main.txt should exist");
+
+        // Git log shows a merge commit
+        let log = log_oneline(&repo, 1);
+        assert!(log.contains("Merge"), "top commit should be a merge commit, got: {}", log);
+
+        // Git status is clean
+        let status = git_status(&repo).unwrap();
+        assert!(status.is_empty(), "working tree should be clean after merge");
+    }
+
+    // ── 2. Conflict → resolve ours ──
+
+    #[test]
+    fn test_full_merge_workflow_with_conflict_resolve_ours() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Shared file on main
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared.txt"]).unwrap();
+
+        // Feature changes it
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature edit"]).unwrap();
+
+        // Main changes it differently
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("shared.txt"), "main version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
+
+        // Merge → conflict
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(has_conflicts);
+
+        // Verify conflict appears in merge state
+        let state = get_merge_state(&repo).unwrap();
+        assert!(state.is_merging);
+        assert!(state.conflicted_files.iter().any(|f| f.path == "shared.txt"),
+            "shared.txt should be in conflicted files");
+
+        // Resolve with ours
+        resolve_conflict_ours(&repo, "shared.txt").unwrap();
+        continue_merge(&repo, "Merge: keep ours").unwrap();
+
+        // Ours wins
+        let content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert_eq!(content, "feature version", "resolve_ours should keep feature content");
+
+        // Clean
+        assert!(git_status(&repo).unwrap().is_empty());
+
+        // Log contains the merge message
+        let log = log_oneline(&repo, 1);
+        assert!(log.contains("Merge: keep ours"), "merge commit message mismatch: {}", log);
+    }
+
+    // ── 3. Conflict → resolve theirs ──
+
+    #[test]
+    fn test_full_merge_workflow_with_conflict_resolve_theirs() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared.txt"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature edit"]).unwrap();
+
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("shared.txt"), "main version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
+
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(has_conflicts);
+
+        resolve_conflict_theirs(&repo, "shared.txt").unwrap();
+        continue_merge(&repo, "Merge: keep theirs").unwrap();
+
+        let content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert_eq!(content, "main version", "resolve_theirs should keep main content");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    // ── 4. Abort restores state exactly ──
+
+    #[test]
+    fn test_full_merge_workflow_abort_restores_state() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared.txt"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature edit"]).unwrap();
+
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("shared.txt"), "main version").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
+
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let pre_merge_head = head_hash(&repo);
+
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(has_conflicts);
+
+        // Abort
+        abort_merge(&repo).unwrap();
+
+        // HEAD restored
+        assert_eq!(head_hash(&repo), pre_merge_head, "HEAD should revert to pre-merge commit");
+
+        // File restored
+        let content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert_eq!(content, "feature version", "file should revert to pre-merge content");
+
+        // Clean status
+        assert!(git_status(&repo).unwrap().is_empty(), "status should be clean after abort");
+
+        // No active merge
+        let state = get_merge_state(&repo).unwrap();
+        assert!(!state.is_merging, "should not be merging after abort");
+        assert!(!state.is_rebasing);
+    }
+
+    // ── 5. Dirty tree refused, uncommitted work preserved ──
+
+    #[test]
+    fn test_merge_refuses_dirty_working_tree() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create a tracked file so we can modify it
+        std::fs::write(repo.join("tracked.txt"), "original").unwrap();
+        run_git(&repo, &["add", "tracked.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add tracked"]).unwrap();
+
+        // Dirty the tree with a staged change
+        std::fs::write(repo.join("tracked.txt"), "dirty").unwrap();
+        run_git(&repo, &["add", "tracked.txt"]).unwrap();
+
+        let main = main_branch(&repo);
+        let result = merge_branch(&repo, main);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("uncommitted changes"));
+
+        // Uncommitted change still intact
+        let content = std::fs::read_to_string(repo.join("tracked.txt")).unwrap();
+        assert_eq!(content, "dirty", "uncommitted change should not be lost");
+
+        // No merge in progress
+        let state = get_merge_state(&repo).unwrap();
+        assert!(!state.is_merging);
+    }
+
+    // ── 6. Multiple conflicted files, mixed resolution strategies ──
+
+    #[test]
+    fn test_merge_multiple_conflicted_files() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create 3 files
+        for name in &["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(repo.join(name), "original").unwrap();
+        }
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add three files"]).unwrap();
+
+        // Feature modifies all 3
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "feature-a").unwrap();
+        std::fs::write(repo.join("b.txt"), "feature-b").unwrap();
+        std::fs::write(repo.join("c.txt"), "feature-c").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature edits all"]).unwrap();
+
+        // Main modifies all 3 differently
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("a.txt"), "main-a").unwrap();
+        std::fs::write(repo.join("b.txt"), "main-b").unwrap();
+        std::fs::write(repo.join("c.txt"), "main-c").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main edits all"]).unwrap();
+
+        // Merge → 3 conflicts
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(has_conflicts);
+
+        let state = get_merge_state(&repo).unwrap();
+        assert_eq!(state.conflicted_files.len(), 3, "all 3 files should conflict");
+
+        // Resolve a.txt with ours
+        resolve_conflict_ours(&repo, "a.txt").unwrap();
+        // Resolve b.txt with theirs
+        resolve_conflict_theirs(&repo, "b.txt").unwrap();
+        // Resolve c.txt manually then mark resolved
+        std::fs::write(repo.join("c.txt"), "manually merged").unwrap();
+        mark_conflict_resolved(&repo, "c.txt").unwrap();
+
+        continue_merge(&repo, "Merge with mixed resolutions").unwrap();
+
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "feature-a");
+        assert_eq!(std::fs::read_to_string(repo.join("b.txt")).unwrap(), "main-b");
+        assert_eq!(std::fs::read_to_string(repo.join("c.txt")).unwrap(), "manually merged");
+
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    // ── 7. Already up to date (no-op merge) ──
+
+    #[test]
+    fn test_merge_when_already_up_to_date() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Feature branches from latest main, main has no new commits
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("feature.txt"), "work").unwrap();
+        run_git(&repo, &["add", "feature.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature work"]).unwrap();
+
+        let pre_merge_head = head_hash(&repo);
+        let log_before = log_oneline(&repo, 5);
+
+        let main = main_branch(&repo);
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(!has_conflicts);
+
+        // HEAD should not change (already up to date, no merge commit needed)
+        assert_eq!(head_hash(&repo), pre_merge_head, "no new commit for already-up-to-date merge");
+
+        // Log should be identical
+        let log_after = log_oneline(&repo, 5);
+        assert_eq!(log_before, log_after, "git log should not change");
+    }
+
+    // ── 8. File additions and deletions merge correctly ──
+
+    #[test]
+    fn test_merge_with_file_additions_and_deletions() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create initial files
+        std::fs::write(repo.join("keep.txt"), "keep me").unwrap();
+        std::fs::write(repo.join("delete_on_main.txt"), "will be deleted on main").unwrap();
+        std::fs::write(repo.join("delete_on_feature.txt"), "will be deleted on feature").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial files"]).unwrap();
+
+        // Feature: delete one, add one
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::remove_file(repo.join("delete_on_feature.txt")).unwrap();
+        std::fs::write(repo.join("new_feature.txt"), "new from feature").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature: delete and add"]).unwrap();
+
+        // Main: delete a different one, add a different one
+        let main = checkout_main(&repo);
+        std::fs::remove_file(repo.join("delete_on_main.txt")).unwrap();
+        std::fs::write(repo.join("new_main.txt"), "new from main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main: delete and add"]).unwrap();
+
+        // Merge
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(!has_conflicts, "non-overlapping adds/deletes should merge clean");
+
+        // Verify final state
+        assert!(repo.join("keep.txt").exists(), "keep.txt should survive");
+        assert!(repo.join("new_feature.txt").exists(), "new_feature.txt should exist");
+        assert!(repo.join("new_main.txt").exists(), "new_main.txt should exist from merge");
+        assert!(!repo.join("delete_on_main.txt").exists(), "delete_on_main.txt should be gone");
+        assert!(!repo.join("delete_on_feature.txt").exists(), "delete_on_feature.txt should be gone");
+
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    // ── 9. Merge does not touch main branch ──
+
+    #[test]
+    fn test_merge_does_not_touch_main_branch() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Diverge main and feature
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("feature.txt"), "feature").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature commit"]).unwrap();
+
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("main.txt"), "main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main commit"]).unwrap();
+        let main_head_before = head_hash(&repo);
+        let main_log_before = log_oneline(&repo, 10);
+
+        // Merge main into feature
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        merge_branch(&repo, main).unwrap();
+
+        // Switch back to main — verify untouched
+        run_git(&repo, &["checkout", main]).unwrap();
+        assert_eq!(head_hash(&repo), main_head_before, "main HEAD should be unchanged");
+        assert_eq!(log_oneline(&repo, 10), main_log_before, "main history should be unchanged");
+        assert!(!repo.join("feature.txt").exists(), "feature.txt should NOT exist on main");
+    }
+
+    // ── 10. Second merge after conflict resolution is clean ──
+
+    #[test]
+    fn test_conflict_resolution_then_second_merge_is_clean() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Set up first conflict
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature v1").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature v1"]).unwrap();
+
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("shared.txt"), "main v1").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main v1"]).unwrap();
+
+        // First merge: conflicts
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(has_conflicts, "first merge should conflict");
+        resolve_conflict_ours(&repo, "shared.txt").unwrap();
+        continue_merge(&repo, "First merge resolved").unwrap();
+
+        // Main adds a NEW file (no conflict with feature)
+        run_git(&repo, &["checkout", main]).unwrap();
+        std::fs::write(repo.join("new_main.txt"), "new on main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add new_main.txt"]).unwrap();
+
+        // Second merge: should be clean
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let has_conflicts = merge_branch(&repo, main).unwrap();
+        assert!(!has_conflicts, "second merge should be clean");
+
+        assert!(repo.join("new_main.txt").exists(), "new file from main should appear");
+        assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    // ── 11. Dry-run (check_merge_conflicts) does not modify repo ──
+
+    #[test]
+    fn test_check_merge_conflicts_dry_run_does_not_modify_repo() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("shared.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "feature").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature edit"]).unwrap();
+
+        let main = checkout_main(&repo);
+        std::fs::write(repo.join("shared.txt"), "main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
+
+        // Record state before dry run
+        run_git(&repo, &["checkout", "feature"]).unwrap();
+        let head_before = head_hash(&repo);
+        let content_before = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+
+        // Dry-run conflict check
+        let result = check_merge_conflicts(&repo, main).unwrap();
+        assert!(result.has_conflicts, "should detect conflicts");
+        assert!(!result.conflicting_files.is_empty());
+
+        // State unchanged
+        assert_eq!(head_hash(&repo), head_before, "HEAD should not change after dry run");
+        let content_after = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert_eq!(content_before, content_after, "file content should not change after dry run");
+        assert!(git_status(&repo).unwrap().is_empty(), "working tree should be clean after dry run");
+
+        let state = get_merge_state(&repo).unwrap();
+        assert!(!state.is_merging, "no merge should be in progress after dry run");
     }
 }
