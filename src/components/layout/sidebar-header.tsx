@@ -26,10 +26,12 @@ export function SidebarHeader() {
       {/* + New Workspace row */}
       <Button
         variant="ghost"
-        className="w-full justify-start gap-2 px-2 py-3 h-auto text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+        className="w-full justify-start pl-3 pr-2 py-3 h-auto text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
         onClick={() => setShowDialog(true)}
       >
-        <Plus className="h-3.5 w-3.5" />
+        <div className="size-6 flex items-center justify-center shrink-0 mr-2.5">
+          <Plus className="h-3.5 w-3.5" />
+        </div>
         <span>New Workspace</span>
       </Button>
 
