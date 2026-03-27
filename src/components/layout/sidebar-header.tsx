@@ -7,7 +7,7 @@ export function SidebarHeader() {
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
 
   return (
-    <ShadcnSidebarHeader className="gap-0 p-2 pb-0">
+    <ShadcnSidebarHeader className="gap-0 p-0">
       {/* + New Workspace row */}
       <Button
         variant="ghost"

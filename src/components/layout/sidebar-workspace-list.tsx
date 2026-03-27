@@ -276,7 +276,7 @@ export function SidebarWorkspaceList() {
   }, [clearDrag]);
 
   return (
-    <SidebarGroup>
+    <SidebarGroup className="p-0">
       <SidebarGroupContent>
         <div
           ref={listRef}
