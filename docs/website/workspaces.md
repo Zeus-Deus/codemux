@@ -94,6 +94,10 @@ When a project has worktree workspaces but no setup scripts configured, a banner
 
 Codemux detects the project root for each workspace by walking up from the workspace directory to find the git root. This works correctly for worktree workspaces — the project root is the main repository, not the worktree directory.
 
+## Merging Without PRs
+
+For solo developers or personal projects where code review isn't needed, Codemux supports merging feature branches directly into main from the Changes panel. The "Merge into [base]" button uses a temporary resolver branch so main is never modified until the merge is verified clean — same safety guarantees as the AI conflict resolver. See [Merge Resolver](../website/merge-resolver.md#merge-into-main) for details.
+
 ## Keyboard Shortcuts
 
 | Shortcut | Action |

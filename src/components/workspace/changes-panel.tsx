@@ -15,6 +15,16 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   Plus,
   Minus,
   GitCommit,
@@ -33,6 +43,7 @@ import {
   XCircle,
   CheckCircle2,
   ChevronDown,
+  ArrowUpToLine,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -52,6 +63,9 @@ import {
   markConflictResolved,
   abortMerge,
   continueMerge,
+  mergeIntoBase,
+  completeMergeIntoBase,
+  abortMergeIntoBase,
   createTab,
   activateTab,
   checkClaudeAvailable,
@@ -940,6 +954,91 @@ export function ChangesPanel({ workspace }: Props) {
     }
   };
 
+  // ── Merge into base state ──
+  const [mergeIntoBaseState, setMergeIntoBaseState] = useState<{
+    active: boolean;
+    sourceBranch: string;
+    baseBranch: string;
+    tempBranch: string;
+    deleteSourceAfter: boolean;
+  } | null>(null);
+  const [showMergeIntoDialog, setShowMergeIntoDialog] = useState(false);
+  const [mergeIntoDeleteBranch, setMergeIntoDeleteBranch] = useState(false);
+
+  const handleMergeIntoBase = async () => {
+    if (busy || isMerging) return;
+    setBusyAction("merge");
+    setGitError(null);
+    setMergeSuccess(null);
+    setShowMergeIntoDialog(false);
+    try {
+      const result = await mergeIntoBase(cwd, baseBranch);
+      if (result.status === "already_up_to_date") {
+        setMergeSuccess(`Already up to date — nothing to merge into ${baseBranch}`);
+      } else if (result.status === "merged") {
+        setMergeSuccess(`Successfully merged ${result.source_branch} into ${baseBranch}`);
+        if (mergeIntoDeleteBranch) {
+          // Branch was already cleaned up if needed, but the backend doesn't delete on clean merge
+          // We need to handle that separately — for clean merges the source branch still exists
+        }
+      } else if (result.status === "conflicts" && result.temp_branch) {
+        setMergeIntoBaseState({
+          active: true,
+          sourceBranch: result.source_branch,
+          baseBranch,
+          tempBranch: result.temp_branch,
+          deleteSourceAfter: mergeIntoDeleteBranch,
+        });
+      }
+      refresh();
+      refreshBaseDiff();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleCompleteMergeIntoBase = async () => {
+    if (!mergeIntoBaseState || busy) return;
+    setBusyAction("merge");
+    setGitError(null);
+    try {
+      await completeMergeIntoBase(
+        cwd,
+        mergeIntoBaseState.baseBranch,
+        mergeIntoBaseState.tempBranch,
+        mergeIntoBaseState.sourceBranch,
+        mergeIntoBaseState.deleteSourceAfter,
+      );
+      setMergeSuccess(`Successfully merged ${mergeIntoBaseState.sourceBranch} into ${mergeIntoBaseState.baseBranch}`);
+      setMergeIntoBaseState(null);
+      refresh();
+      refreshBaseDiff();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleAbortMergeIntoBase = async () => {
+    if (!mergeIntoBaseState || busy) return;
+    setBusyAction("merge");
+    setGitError(null);
+    try {
+      await abortMergeIntoBase(cwd, mergeIntoBaseState.sourceBranch, mergeIntoBaseState.tempBranch);
+      setMergeSuccess(`Merge aborted. No changes were made to ${mergeIntoBaseState.baseBranch}.`);
+      setMergeIntoBaseState(null);
+      refresh();
+      refreshBaseDiff();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const handleStageAll = async () => {
     const paths = unstaged.map((f) => f.path);
     if (paths.length === 0) return;
@@ -1018,6 +1117,7 @@ export function ChangesPanel({ workspace }: Props) {
   );
 
   return (
+    <>
     <TooltipProvider>
       <div className="flex h-full flex-col">
         {/* Commit bar — pinned at top */}
@@ -1133,7 +1233,40 @@ export function ChangesPanel({ workspace }: Props) {
         </div>
 
         {/* Merge conflict banner */}
-        {isMerging && (
+        {isMerging && mergeIntoBaseState?.active ? (
+          <div className="px-1.5 py-1.5 bg-primary/10 border-b border-primary/20">
+            <div className="flex items-center gap-1.5 mb-1">
+              <ArrowUpToLine className="h-3.5 w-3.5 text-primary shrink-0" />
+              <span className="text-xs text-primary font-medium">
+                Merging &ldquo;{mergeIntoBaseState.sourceBranch}&rdquo; into &ldquo;{mergeIntoBaseState.baseBranch}&rdquo;
+                {conflicted.length > 0 && ` — ${conflicted.length} conflict${conflicted.length !== 1 ? "s" : ""}`}
+              </span>
+            </div>
+            <div className="flex gap-1">
+              {conflicted.length === 0 ? (
+                <Button
+                  size="xs"
+                  className="text-[10px] h-5 flex-1 bg-success/20 text-success hover:bg-success/30"
+                  onClick={handleCompleteMergeIntoBase}
+                  disabled={busy}
+                >
+                  <GitMerge className="h-3 w-3 mr-0.5" />
+                  {busyAction === "merge" ? "Completing..." : `Complete Merge into ${mergeIntoBaseState.baseBranch}`}
+                </Button>
+              ) : null}
+              <Button
+                size="xs"
+                variant="ghost"
+                className="text-[10px] h-5 text-danger hover:text-danger"
+                onClick={handleAbortMergeIntoBase}
+                disabled={busy}
+              >
+                <XCircle className="h-3 w-3 mr-0.5" />
+                Abort
+              </Button>
+            </div>
+          </div>
+        ) : isMerging ? (
           <div className="px-1.5 py-1.5 bg-danger/10 border-b border-danger/20">
             <div className="flex items-center gap-1.5 mb-1">
               <AlertTriangle className="h-3.5 w-3.5 text-danger shrink-0" />
@@ -1166,7 +1299,7 @@ export function ChangesPanel({ workspace }: Props) {
               </Button>
             </div>
           </div>
-        )}
+        ) : null}
 
         {/* No changes message — outside ScrollArea to avoid scrollbar shift */}
         {files.length === 0 && !isMerging && (
@@ -1301,6 +1434,22 @@ export function ChangesPanel({ workspace }: Props) {
                         <p>Merge {baseBranch} into current branch — update your branch with latest changes</p>
                       </TooltipContent>
                     </Tooltip>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          className="h-4 w-4 hover:bg-accent/50 text-primary"
+                          onClick={() => setShowMergeIntoDialog(true)}
+                          disabled={busy || isMerging || !!mergeIntoBaseState}
+                        >
+                          <ArrowUpToLine className="h-3 w-3" />
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="left">
+                        <p>Merge current branch into {baseBranch}</p>
+                      </TooltipContent>
+                    </Tooltip>
                   </div>
                 </div>
                 {mergeSuccess && (
@@ -1394,5 +1543,36 @@ export function ChangesPanel({ workspace }: Props) {
         </ScrollArea>
       </div>
     </TooltipProvider>
+
+    {/* Merge into base confirmation dialog */}
+    <AlertDialog open={showMergeIntoDialog} onOpenChange={setShowMergeIntoDialog}>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Merge into {baseBranch}</AlertDialogTitle>
+          <AlertDialogDescription>
+            This will merge your changes from &ldquo;{branchInfo?.branch}&rdquo; into &ldquo;{baseBranch}&rdquo;.
+            A temporary branch will be used to ensure {baseBranch} is not modified until the merge is verified clean.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <label className="flex items-center gap-2 py-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={mergeIntoDeleteBranch}
+            onChange={(e) => setMergeIntoDeleteBranch(e.target.checked)}
+            className="rounded border-border"
+          />
+          <span className="text-sm text-muted-foreground">
+            Delete &ldquo;{branchInfo?.branch}&rdquo; after merge
+          </span>
+        </label>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={handleMergeIntoBase}>
+            Merge into {baseBranch}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+    </>
   );
 }

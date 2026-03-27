@@ -1,4 +1,4 @@
-use crate::git::{BaseBranchDiff, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeState, ResolverBranchInfo, WorktreeInfo};
+use crate::git::{BaseBranchDiff, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::Path;
 
 #[tauri::command]
@@ -104,6 +104,33 @@ pub fn list_worktrees(path: String) -> Result<Vec<WorktreeInfo>, String> {
 #[tauri::command]
 pub fn merge_branch(path: String, source_branch: String) -> Result<String, String> {
     crate::git::merge_branch(Path::new(&path), &source_branch)
+}
+
+#[tauri::command]
+pub fn merge_into_base(path: String, base_branch: String) -> Result<MergeIntoBaseResult, String> {
+    crate::git::merge_into_base(Path::new(&path), &base_branch)
+}
+
+#[tauri::command]
+pub fn complete_merge_into_base(
+    path: String,
+    base_branch: String,
+    temp_branch: String,
+    source_branch: String,
+    delete_source_branch: bool,
+) -> Result<(), String> {
+    crate::git::complete_merge_into_base(
+        Path::new(&path), &base_branch, &temp_branch, &source_branch, delete_source_branch,
+    )
+}
+
+#[tauri::command]
+pub fn abort_merge_into_base(
+    path: String,
+    source_branch: String,
+    temp_branch: String,
+) -> Result<(), String> {
+    crate::git::abort_merge_into_base(Path::new(&path), &source_branch, &temp_branch)
 }
 
 #[tauri::command]

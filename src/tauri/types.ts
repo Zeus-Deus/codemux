@@ -260,6 +260,13 @@ export interface ConflictCheckResult {
   target_branch: string;
 }
 
+export interface MergeIntoBaseResult {
+  status: string;  // "merged", "conflicts", "already_up_to_date"
+  temp_branch: string | null;
+  source_branch: string;
+  conflicted_files: ConflictFile[];
+}
+
 export interface BaseBranchDiff {
   files: GitFileStatus[];
   merge_base_commit: string;
