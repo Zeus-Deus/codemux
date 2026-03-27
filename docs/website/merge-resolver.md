@@ -84,3 +84,43 @@ The "Against [base]" section in the Changes panel shows how your branch differs 
 - Refuses to run on a dirty working tree — commit or stash first
 - Abort always restores your branch to exactly its pre-merge state
 - Works with the same conflict resolution UI as the AI resolver
+
+## Merge Into Main
+
+For solo developers who want to land feature branches without creating a PR, Codemux provides a safe "Merge into [base]" flow. It uses the same temporary resolver branch pattern as the AI conflict resolver — main is **never modified** until the merge is proven clean.
+
+### How It Works
+
+1. In the "Against [base]" section, click the **arrow-up icon** (next to the pull-updates merge icon)
+2. A **confirmation dialog** appears showing the source and target branches, with a checkbox to delete the feature branch after merge
+3. Codemux creates a temporary branch from the base: `merge/{feature}-into-{base}-{timestamp}`
+4. Your feature branch is merged INTO the temp branch (not into main directly)
+5. Three outcomes:
+   - **Clean merge** — Main is fast-forwarded to the temp branch tip, temp branch is deleted, you're switched to main. Done.
+   - **Conflicts** — You stay on the temp branch. A blue merge banner shows "Merging [feature] into [base] — N conflicts". Resolve with the same Ours/Theirs/AI tools. After resolving, click **Complete Merge** to fast-forward main.
+   - **Already up to date** — Nothing to merge. No temp branch created.
+
+### Safety Guarantees
+
+- Main is **never in a dirty or conflicted state** — all conflict resolution happens on the disposable temp branch
+- Fast-forward only — main's history stays clean, the merge commit is created on the temp branch first
+- **Abort at any time** returns you to your feature branch with zero changes to main
+- The temp branch is automatically cleaned up on complete or abort
+- Optionally delete the feature branch after a successful merge
+
+### When to Use This vs PRs
+
+| Workflow | Use when |
+|----------|----------|
+| **Merge into main** | Solo developer, personal projects, no review needed |
+| **Pull request** | Team projects, code review required, CI checks needed |
+| **Merge main into current** | Updating your feature branch with latest main (either workflow) |
+
+### Ours vs Theirs on the Temp Branch
+
+When resolving conflicts during a "Merge into main" flow, the perspective is from the temp branch (which was created from main):
+
+- **Ours** = main's version (the temp branch base)
+- **Theirs** = your feature branch's version (being merged in)
+
+This is the opposite of "Merge main into current" where ours = your branch and theirs = main.

@@ -65,17 +65,27 @@ A collapsible section showing files changed between your branch and a base branc
 
 - **Branch selector** — Dropdown to compare against any remote branch
 - **File list** — Directory-grouped files with status badges and diff stats
-- **Merge button** — Click the merge icon to merge the base branch into your current branch. Updates your feature branch with the latest changes from the base.
 
-### Merge Flow
+Two merge buttons in the section header:
 
-1. Click the merge icon next to the file count in the "Against" section header
+- **Merge [base] into current** (GitMerge icon) — Pull the latest changes from the base branch into your feature branch. Safe, non-destructive.
+- **Merge into [base]** (ArrowUp icon) — Push your feature branch changes into the base branch. Uses a temporary resolver branch so the base is never modified until the merge is verified clean. See [Merge Resolver](merge-resolver.md#merge-into-main) for the full flow.
+
+### Merge [base] into Current
+
+1. Click the merge icon (GitMerge) next to the file count
 2. Codemux runs `git merge --no-ff <base branch>` in the workspace
 3. **Clean merge** — Shows "Merged [base] into current branch" with a green checkmark
 4. **Already up to date** — Shows "Already up to date with [base]" (nothing to merge)
 5. **Conflicts** — The merge banner appears with per-file resolution options (Ours, Theirs, AI Resolve) and an Abort button
 
-This only merges the base INTO your branch (safe direction). It never merges your branch into main — use PRs for that.
+### Merge into [base]
+
+1. Click the arrow-up icon next to the merge icon
+2. A confirmation dialog appears — confirm with optional "delete branch after merge" checkbox
+3. **Clean merge** — Base branch is updated, you're switched to it, success message shown
+4. **Conflicts** — A blue banner shows the in-progress merge with resolve/abort options. All conflict resolution tools (Ours, Theirs, AI) work on the safe temp branch. Click **Complete Merge** when done.
+5. **Abort** — Returns you to your feature branch. Base branch untouched.
 
 ## Recent Commits
 
