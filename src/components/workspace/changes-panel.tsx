@@ -1367,8 +1367,8 @@ export function ChangesPanel({ workspace }: Props) {
               </div>
             )}
 
-            {/* Against Base — files changed vs base branch */}
-            {baseBranchFiles.length > 0 && (
+            {/* Against Base — files changed vs base branch (hidden when on the base branch itself) */}
+            {baseBranchFiles.length > 0 && branchInfo?.branch !== baseBranch && (
               <div className="py-1">
                 <div className="flex items-center justify-between px-1.5 py-0.5">
                   <div className="flex items-center gap-1">
