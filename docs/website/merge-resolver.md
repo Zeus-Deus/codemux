@@ -60,3 +60,27 @@ You can also resolve conflicts manually alongside the AI:
 - **O** (Ours) — Accept your version: `git checkout --ours <file> && git add <file>`
 - **T** (Theirs) — Accept their version: `git checkout --theirs <file> && git add <file>`
 - **Resolved** — Mark as resolved after manual editing: `git add <file>`
+
+## Local Branch Merge
+
+In addition to AI-powered conflict resolution, Codemux supports direct local branch merging from the Changes panel.
+
+### How It Works
+
+The "Against [base]" section in the Changes panel shows how your branch differs from the base branch. A merge button in the section header lets you merge the base branch into your current branch — the safe direction for keeping your feature branch up to date.
+
+1. Click the **merge icon** next to the file count in the "Against" section
+2. Codemux runs `git merge --no-ff <base>` in the workspace directory
+3. Three outcomes:
+   - **Merged** — New commits from the base branch are integrated. A green confirmation appears.
+   - **Already up to date** — The base has no commits your branch doesn't already have.
+   - **Conflicts** — The merge pauses with conflict markers. The same Conflicts section appears with all resolution options: per-file Ours/Theirs buttons, manual editing, or AI resolution.
+4. After resolving all conflicts, click **Complete Merge** in the merge banner
+5. To cancel at any time, click **Abort** to restore your branch to its pre-merge state
+
+### Safety
+
+- Only merges base INTO your branch (never the reverse)
+- Refuses to run on a dirty working tree — commit or stash first
+- Abort always restores your branch to exactly its pre-merge state
+- Works with the same conflict resolution UI as the AI resolver

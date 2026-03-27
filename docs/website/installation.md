@@ -69,3 +69,5 @@ These are not required but enable additional features:
 - **codex** / **opencode** — Alternative AI CLI tools
 - **fd** — Fast file search (`Ctrl+P`)
 - **ripgrep** — Fast code search (`Ctrl+Shift+F`)
+- **ydotool** — OS-level browser input for stealth automation (Tier 3). Requires `ydotoold` daemon running. Only needed for bypassing anti-bot detection.
+- **docker** / **docker compose** — Container management for setup/teardown scripts

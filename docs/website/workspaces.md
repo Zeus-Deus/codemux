@@ -56,16 +56,43 @@ Right-click a workspace in the sidebar to:
 
 ## Setup & Teardown Scripts
 
+Configure commands that run automatically when workspaces open or close. Two configuration methods:
+
+### File-based (`.codemux/config.json`)
+
 Add a `.codemux/config.json` to your project root:
 
 ```json
 {
   "setup": ["npm install", "npm run build"],
-  "teardown": ["docker-compose down"]
+  "teardown": ["docker compose down"],
+  "run": "npm run dev"
 }
 ```
 
-Setup runs automatically when the workspace is created. Teardown runs when it's closed.
+- `setup` — Runs when the workspace opens
+- `teardown` — Runs when the workspace closes
+- `run` — The dev command for the Run button (`Ctrl+Shift+G`)
+
+### Database-based (Settings)
+
+Configure scripts in Settings > Projects. Database settings apply when no `.codemux/config.json` exists. File config takes precedence.
+
+### Docker Compose Support
+
+Scripts automatically receive these environment variables:
+
+- `COMPOSE_PROJECT_NAME` — Derived from the git root directory name, so Docker Compose uses consistent project names across worktrees
+- `CODEMUX_ROOT_PATH` — Full path to the git root
+- `CODEMUX_WORKSPACE_PATH` — Full path to the workspace directory
+
+### Setup Banner
+
+When a project has worktree workspaces but no setup scripts configured, a banner appears in the sidebar suggesting you configure automation. Dismiss it per-project or click "Configure" to open Settings.
+
+### Project Detection
+
+Codemux detects the project root for each workspace by walking up from the workspace directory to find the git root. This works correctly for worktree workspaces — the project root is the main repository, not the worktree directory.
 
 ## Keyboard Shortcuts
 

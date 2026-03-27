@@ -59,6 +59,24 @@ When the Claude CLI is installed and AI commit messages are enabled in Settings:
 
 Configure the model in Settings > Git > AI Tools.
 
+## Against Base
+
+A collapsible section showing files changed between your branch and a base branch (defaults to `main`).
+
+- **Branch selector** — Dropdown to compare against any remote branch
+- **File list** — Directory-grouped files with status badges and diff stats
+- **Merge button** — Click the merge icon to merge the base branch into your current branch. Updates your feature branch with the latest changes from the base.
+
+### Merge Flow
+
+1. Click the merge icon next to the file count in the "Against" section header
+2. Codemux runs `git merge --no-ff <base branch>` in the workspace
+3. **Clean merge** — Shows "Merged [base] into current branch" with a green checkmark
+4. **Already up to date** — Shows "Already up to date with [base]" (nothing to merge)
+5. **Conflicts** — The merge banner appears with per-file resolution options (Ours, Theirs, AI Resolve) and an Abort button
+
+This only merges the base INTO your branch (safe direction). It never merges your branch into main — use PRs for that.
+
 ## Recent Commits
 
 A collapsible section at the bottom shows the 10 most recent commits. Each entry displays:

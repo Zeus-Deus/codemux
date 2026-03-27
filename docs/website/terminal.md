@@ -31,6 +31,23 @@ Each workspace can have multiple tabs. Each tab has its own independent pane tre
 
 Tabs can be reordered by dragging. The last tab cannot be closed.
 
+## Preset Bar
+
+The preset bar sits above the pane area and provides one-click agent launching:
+
+- **Pinned presets** — Pin your most-used agent configurations (Claude Code, Codex, OpenCode, Gemini) for instant access
+- **Run button** — Shows "Run" when a dev command is configured, or "Set Run" to configure one. Press `Ctrl+Shift+G` to run from anywhere.
+- **Settings** — Gear icon opens preset management. Toggle bar visibility from the dropdown.
+
+Custom presets support multiple commands, working directory overrides, and launch modes (new tab or split pane).
+
+## Smart Headers
+
+Terminal pane headers display contextual information:
+
+- **Agent name** — When running a recognized agent (Claude, Codex, OpenCode, Gemini), the header shows the agent name instead of the shell path
+- **CWD** — When running a plain shell, the header shows the current working directory
+
 ## Canvas Renderer
 
 Codemux uses the xterm.js canvas renderer by default with WebGL as a fallback. This avoids the WebGL context freeze that can occur when many terminals are open simultaneously.

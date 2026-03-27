@@ -80,6 +80,73 @@ codemux browser console-logs [browser_id]
 
 Returns captured console output from the page.
 
+## Coordinate-Based Commands (Tier 2)
+
+These commands use pixel coordinates instead of CSS selectors. Useful for canvas elements, iframes, shadow DOM, or when selectors aren't available. Agents typically get coordinates from a screenshot.
+
+### Click at Coordinates
+
+```bash
+# MCP tool: browser_click_at
+{"x": 150, "y": 300}
+```
+
+Moves the mouse along a human-like Bezier curve to (x, y), then clicks.
+
+### Type at Coordinates
+
+```bash
+# MCP tool: browser_type_at
+{"x": 150, "y": 300, "text": "hello world"}
+```
+
+Clicks at the coordinates, then types the text with per-character delays.
+
+### Scroll at Coordinates
+
+```bash
+# MCP tool: browser_scroll_at
+{"x": 400, "y": 300, "deltaX": 0, "deltaY": -200}
+```
+
+Scrolls at the specified position. Negative deltaY scrolls down.
+
+### Key Press
+
+```bash
+# MCP tool: browser_key_press
+{"key": "Enter"}
+```
+
+Sends a keyboard event. Supports keys like `Enter`, `Tab`, `Escape`, `ArrowDown`, etc.
+
+### Drag
+
+```bash
+# MCP tool: browser_drag
+{"startX": 100, "startY": 200, "endX": 300, "endY": 200}
+```
+
+Drags from start to end coordinates with human-like mouse movement.
+
+## OS-Level Commands (Tier 3 — Stealth)
+
+These use `ydotool` to generate kernel-level input events that are indistinguishable from human interaction. Requires `ydotool` + `ydotoold`, headed browser mode, and Hyprland.
+
+### OS Click
+
+```bash
+# MCP tool: browser_click_os
+{"x": 150, "y": 300}
+```
+
+### OS Type
+
+```bash
+# MCP tool: browser_type_os
+{"text": "hello world"}
+```
+
 ## Socket API
 
 For programmatic control, send JSON commands over the Unix socket at `$XDG_RUNTIME_DIR/codemux.sock`:

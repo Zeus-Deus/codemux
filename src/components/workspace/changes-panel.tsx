@@ -1298,7 +1298,7 @@ export function ChangesPanel({ workspace }: Props) {
                         </Button>
                       </TooltipTrigger>
                       <TooltipContent side="left">
-                        <p>Merge {baseBranch} into current branch</p>
+                        <p>Merge {baseBranch} into current branch — update your branch with latest changes</p>
                       </TooltipContent>
                     </Tooltip>
                   </div>
