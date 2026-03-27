@@ -102,7 +102,7 @@ pub fn list_worktrees(path: String) -> Result<Vec<WorktreeInfo>, String> {
 }
 
 #[tauri::command]
-pub fn merge_branch(path: String, source_branch: String) -> Result<bool, String> {
+pub fn merge_branch(path: String, source_branch: String) -> Result<String, String> {
     crate::git::merge_branch(Path::new(&path), &source_branch)
 }
 

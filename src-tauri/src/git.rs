@@ -552,13 +552,15 @@ pub fn get_merge_state(repo_path: &Path) -> Result<MergeState, String> {
 }
 
 /// Merge a source branch into the current branch.
-/// Returns Ok(has_conflicts) — true if conflicts remain to be resolved.
-pub fn merge_branch(repo_path: &Path, source_branch: &str) -> Result<bool, String> {
+/// Returns: "merged" (new commits), "up_to_date" (nothing to merge), or "conflicts".
+pub fn merge_branch(repo_path: &Path, source_branch: &str) -> Result<String, String> {
     // Safety: refuse to run on dirty working tree
     let status = git_status(repo_path)?;
     if !status.is_empty() {
         return Err("Cannot merge: working tree has uncommitted changes. Commit or stash your changes first.".to_string());
     }
+
+    let head_before = run_git(repo_path, &["rev-parse", "HEAD"])?;
 
     let (_stdout, _stderr, success) = run_git_full(
         repo_path,
@@ -566,13 +568,17 @@ pub fn merge_branch(repo_path: &Path, source_branch: &str) -> Result<bool, Strin
     )?;
 
     if success {
-        return Ok(false); // clean merge, no conflicts
+        let head_after = run_git(repo_path, &["rev-parse", "HEAD"])?;
+        if head_before.trim() == head_after.trim() {
+            return Ok("up_to_date".to_string());
+        }
+        return Ok("merged".to_string());
     }
 
     // Check if the failure was due to conflicts (merge in progress)
     let merge_state = get_merge_state(repo_path)?;
     if merge_state.is_merging && !merge_state.conflicted_files.is_empty() {
-        return Ok(true); // conflicts to resolve
+        return Ok("conflicts".to_string());
     }
 
     // Some other failure (e.g. branch doesn't exist)
@@ -1694,8 +1700,8 @@ C  source.txt -> copy.txt";
 
         // Merge main into feature
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).expect("merge should succeed");
-        assert!(!has_conflicts, "clean merge should report no conflicts");
+        let result = merge_branch(&repo, main).expect("merge should succeed");
+        assert_eq!(result, "merged", "clean merge should report 'merged'");
 
         // Both files exist in working tree
         assert!(repo.join("feature.txt").exists(), "feature.txt should exist");
@@ -1736,8 +1742,8 @@ C  source.txt -> copy.txt";
 
         // Merge → conflict
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(has_conflicts);
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "conflicts");
 
         // Verify conflict appears in merge state
         let state = get_merge_state(&repo).unwrap();
@@ -1783,8 +1789,8 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(has_conflicts);
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "conflicts");
 
         resolve_conflict_theirs(&repo, "shared.txt").unwrap();
         continue_merge(&repo, "Merge: keep theirs").unwrap();
@@ -1818,8 +1824,8 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["checkout", "feature"]).unwrap();
         let pre_merge_head = head_hash(&repo);
 
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(has_conflicts);
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "conflicts");
 
         // Abort
         abort_merge(&repo).unwrap();
@@ -1902,8 +1908,8 @@ C  source.txt -> copy.txt";
 
         // Merge → 3 conflicts
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(has_conflicts);
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "conflicts");
 
         let state = get_merge_state(&repo).unwrap();
         assert_eq!(state.conflicted_files.len(), 3, "all 3 files should conflict");
@@ -1942,8 +1948,8 @@ C  source.txt -> copy.txt";
         let log_before = log_oneline(&repo, 5);
 
         let main = main_branch(&repo);
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(!has_conflicts);
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "up_to_date");
 
         // HEAD should not change (already up to date, no merge commit needed)
         assert_eq!(head_hash(&repo), pre_merge_head, "no new commit for already-up-to-date merge");
@@ -1983,8 +1989,8 @@ C  source.txt -> copy.txt";
 
         // Merge
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(!has_conflicts, "non-overlapping adds/deletes should merge clean");
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "merged", "non-overlapping adds/deletes should merge clean");
 
         // Verify final state
         assert!(repo.join("keep.txt").exists(), "keep.txt should survive");
@@ -2055,8 +2061,8 @@ C  source.txt -> copy.txt";
 
         // First merge: conflicts
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(has_conflicts, "first merge should conflict");
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "conflicts", "first merge should conflict");
         resolve_conflict_ours(&repo, "shared.txt").unwrap();
         continue_merge(&repo, "First merge resolved").unwrap();
 
@@ -2068,8 +2074,8 @@ C  source.txt -> copy.txt";
 
         // Second merge: should be clean
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let has_conflicts = merge_branch(&repo, main).unwrap();
-        assert!(!has_conflicts, "second merge should be clean");
+        let result = merge_branch(&repo, main).unwrap();
+        assert_eq!(result, "merged", "second merge should be clean");
 
         assert!(repo.join("new_main.txt").exists(), "new file from main should appear");
         assert!(git_status(&repo).unwrap().is_empty());

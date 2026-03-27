@@ -26,7 +26,7 @@ const mockGetMergeState = vi.fn().mockResolvedValue({
   merge_head: null,
   conflicted_files: [],
 });
-const mockMergeBranch = vi.fn().mockResolvedValue(false);
+const mockMergeBranch = vi.fn().mockResolvedValue("merged");
 const mockGetBaseBranchDiff = vi.fn().mockResolvedValue({
   files: [
     { path: "src/index.ts", status: "modified", is_staged: false, is_unstaged: true, additions: 5, deletions: 2 },
@@ -164,7 +164,7 @@ beforeEach(() => {
     merge_head: null,
     conflicted_files: [],
   });
-  mockMergeBranch.mockResolvedValue(false);
+  mockMergeBranch.mockResolvedValue("merged");
   mockGetBaseBranchDiff.mockResolvedValue({
     files: [
       { path: "src/index.ts", status: "modified", is_staged: false, is_unstaged: true, additions: 5, deletions: 2 },
@@ -215,7 +215,7 @@ describe("Merge button in Against section", () => {
 
   it("clean merge refreshes status and base diff", async () => {
     const user = userEvent.setup();
-    mockMergeBranch.mockResolvedValue(false); // no conflicts
+    mockMergeBranch.mockResolvedValue("merged"); // no conflicts
 
     renderPanel();
     await flushPromises();
@@ -243,7 +243,7 @@ describe("Merge button in Against section", () => {
 
   it("merge with conflicts shows merge banner", async () => {
     const user = userEvent.setup();
-    mockMergeBranch.mockResolvedValue(true); // has conflicts
+    mockMergeBranch.mockResolvedValue("conflicts"); // has conflicts
 
     // After merge, getMergeState will return merging state
     let callCount = 0;

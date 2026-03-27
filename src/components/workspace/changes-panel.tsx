@@ -909,18 +909,30 @@ export function ChangesPanel({ workspace }: Props) {
     }
   };
 
+  const [mergeSuccess, setMergeSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (mergeSuccess) {
+      const t = setTimeout(() => setMergeSuccess(null), 4000);
+      return () => clearTimeout(t);
+    }
+  }, [mergeSuccess]);
+
   const handleMergeBranch = async () => {
     if (busy || isMerging) return;
     setBusyAction("merge");
     setGitError(null);
+    setMergeSuccess(null);
     try {
-      const hasConflicts = await mergeBranch(cwd, baseBranch);
+      const result = await mergeBranch(cwd, baseBranch);
       refresh();
       refreshBaseDiff();
-      if (hasConflicts) {
-        // Conflicts detected — merge is in progress, conflicts section will show
-        // No error needed — the merge banner and conflict UI handle this
+      if (result === "up_to_date") {
+        setMergeSuccess(`Already up to date with ${baseBranch}`);
+      } else if (result === "merged") {
+        setMergeSuccess(`Merged ${baseBranch} into current branch`);
       }
+      // "conflicts" — merge banner and conflict UI handle this automatically
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1291,6 +1303,14 @@ export function ChangesPanel({ workspace }: Props) {
                     </Tooltip>
                   </div>
                 </div>
+                {mergeSuccess && (
+                  <div className="px-2 py-1">
+                    <p className="text-[10px] text-success flex items-center gap-1">
+                      <CheckCircle2 className="h-3 w-3 shrink-0" />
+                      {mergeSuccess}
+                    </p>
+                  </div>
+                )}
                 {baseBranchExpanded && (
                   <div>
                     {groupByDirectory(baseBranchFiles).map((group) => (
