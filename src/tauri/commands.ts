@@ -343,8 +343,8 @@ export const listWorktrees = (path: string) =>
 export const mergeBranch = (path: string, sourceBranch: string) =>
   invoke<string>("merge_branch", { path, sourceBranch });
 
-export const mergeIntoBase = (path: string, baseBranch: string) =>
-  invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch });
+export const mergeIntoBase = (path: string, baseBranch: string, deleteSourceBranch: boolean) =>
+  invoke<MergeIntoBaseResult>("merge_into_base", { path, baseBranch, deleteSourceBranch });
 
 export const completeMergeIntoBase = (
   path: string, baseBranch: string, tempBranch: string, sourceBranch: string, deleteSourceBranch: boolean,

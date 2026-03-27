@@ -970,17 +970,14 @@ export function ChangesPanel({ workspace }: Props) {
     setBusyAction("merge");
     setGitError(null);
     setMergeSuccess(null);
+    setMergeIntoBaseState(null);
     setShowMergeIntoDialog(false);
     try {
-      const result = await mergeIntoBase(cwd, baseBranch);
+      const result = await mergeIntoBase(cwd, baseBranch, mergeIntoDeleteBranch);
       if (result.status === "already_up_to_date") {
         setMergeSuccess(`Already up to date — nothing to merge into ${baseBranch}`);
       } else if (result.status === "merged") {
         setMergeSuccess(`Successfully merged ${result.source_branch} into ${baseBranch}`);
-        if (mergeIntoDeleteBranch) {
-          // Branch was already cleaned up if needed, but the backend doesn't delete on clean merge
-          // We need to handle that separately — for clean merges the source branch still exists
-        }
       } else if (result.status === "conflicts" && result.temp_branch) {
         setMergeIntoBaseState({
           active: true,
@@ -990,12 +987,12 @@ export function ChangesPanel({ workspace }: Props) {
           deleteSourceAfter: mergeIntoDeleteBranch,
         });
       }
-      refresh();
-      refreshBaseDiff();
     } catch (err) {
       setGitError(String(err));
     } finally {
       setBusyAction(null);
+      try { refresh(); } catch { /* ignore */ }
+      try { refreshBaseDiff(); } catch { /* ignore */ }
     }
   };
 
@@ -1361,6 +1358,15 @@ export function ChangesPanel({ workspace }: Props) {
               />
             )}
 
+            {mergeSuccess && (
+              <div className="px-2 py-1">
+                <p className="text-[10px] text-success flex items-center gap-1">
+                  <CheckCircle2 className="h-3 w-3 shrink-0" />
+                  {mergeSuccess}
+                </p>
+              </div>
+            )}
+
             {/* Against Base — files changed vs base branch */}
             {baseBranchFiles.length > 0 && (
               <div className="py-1">
@@ -1434,6 +1440,7 @@ export function ChangesPanel({ workspace }: Props) {
                         <p>Merge {baseBranch} into current branch — update your branch with latest changes</p>
                       </TooltipContent>
                     </Tooltip>
+                    {branchInfo?.branch !== baseBranch && (
                     <Tooltip>
                       <TooltipTrigger asChild>
                         <Button
@@ -1450,16 +1457,9 @@ export function ChangesPanel({ workspace }: Props) {
                         <p>Merge current branch into {baseBranch}</p>
                       </TooltipContent>
                     </Tooltip>
+                    )}
                   </div>
                 </div>
-                {mergeSuccess && (
-                  <div className="px-2 py-1">
-                    <p className="text-[10px] text-success flex items-center gap-1">
-                      <CheckCircle2 className="h-3 w-3 shrink-0" />
-                      {mergeSuccess}
-                    </p>
-                  </div>
-                )}
                 {baseBranchExpanded && (
                   <div>
                     {groupByDirectory(baseBranchFiles).map((group) => (

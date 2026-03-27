@@ -107,8 +107,8 @@ pub fn merge_branch(path: String, source_branch: String) -> Result<String, Strin
 }
 
 #[tauri::command]
-pub fn merge_into_base(path: String, base_branch: String) -> Result<MergeIntoBaseResult, String> {
-    crate::git::merge_into_base(Path::new(&path), &base_branch)
+pub fn merge_into_base(path: String, base_branch: String, delete_source_branch: bool) -> Result<MergeIntoBaseResult, String> {
+    crate::git::merge_into_base(Path::new(&path), &base_branch, delete_source_branch)
 }
 
 #[tauri::command]

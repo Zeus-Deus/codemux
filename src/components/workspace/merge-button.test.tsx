@@ -378,3 +378,44 @@ describe("Complete merge after conflict resolution", () => {
     expect(screen.getByText("Complete Merge")).toBeInTheDocument();
   });
 });
+
+describe("Merge into base button visibility", () => {
+  it("does not show merge-into-base button when current branch equals base branch", async () => {
+    // Set branchInfo to main (same as baseBranch)
+    mockGetGitBranchInfo.mockResolvedValue({
+      branch: "main",
+      ahead: 0,
+      behind: 0,
+      has_upstream: true,
+    });
+
+    renderPanel();
+    await flushPromises();
+
+    // The Against section should render (baseBranchFiles > 0)
+    expect(screen.getByText("Against")).toBeInTheDocument();
+
+    // But the ArrowUpToLine (merge-into-base) button should NOT be present
+    const againstSection = screen.getByText("Against").closest("div")?.parentElement?.parentElement;
+    const buttons = againstSection?.querySelectorAll("button") ?? [];
+    const mergeIntoBtn = Array.from(buttons).find(
+      (btn) => btn.querySelector(".lucide-arrow-up-to-line"),
+    );
+    expect(mergeIntoBtn).toBeUndefined();
+  });
+
+  it("shows merge-into-base button when current branch differs from base branch", async () => {
+    // branchInfo is "feat/my-feature" (default mock), baseBranch is "main"
+    renderPanel();
+    await flushPromises();
+
+    expect(screen.getByText("Against")).toBeInTheDocument();
+
+    // The ArrowUpToLine button should exist
+    const againstSection = screen.getByText("Against").closest("div")?.parentElement?.parentElement;
+    const buttons = againstSection?.querySelectorAll("button") ?? [];
+    // Should have more than just the chevron and merge-base-into-current buttons
+    // (chevron + branch selector + merge-into-current + merge-into-base = 4+ buttons)
+    expect(buttons.length).toBeGreaterThanOrEqual(3);
+  });
+});

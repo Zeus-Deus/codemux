@@ -792,7 +792,7 @@ pub struct MergeIntoBaseResult {
 
 /// Safely merge the current branch into a base branch using a temporary resolver branch.
 /// Main is NEVER modified until the merge is proven clean.
-pub fn merge_into_base(repo_path: &Path, base_branch: &str) -> Result<MergeIntoBaseResult, String> {
+pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch: bool) -> Result<MergeIntoBaseResult, String> {
     // Safety: refuse to run on dirty working tree
     let status = git_status(repo_path)?;
     if !status.is_empty() {
@@ -804,7 +804,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str) -> Result<MergeIntoB
         return Err("Cannot merge: not on a named branch (detached HEAD)".to_string());
     }
     if source_branch == base_branch {
-        return Err(format!("Cannot merge: already on {base_branch}"));
+        return Err(format!("Already on {base_branch}. Switch to a feature branch first."));
     }
 
     // Check if there's anything to merge
@@ -859,6 +859,10 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str) -> Result<MergeIntoB
         run_git(repo_path, &["checkout", base_branch])?;
         run_git(repo_path, &["merge", "--ff-only", &temp_branch])?;
         let _ = run_git(repo_path, &["branch", "-d", &temp_branch]);
+
+        if delete_source_branch {
+            let _ = run_git(repo_path, &["branch", "-d", &source_branch]);
+        }
 
         return Ok(MergeIntoBaseResult {
             status: "merged".to_string(),
@@ -2306,7 +2310,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["add", "."]).unwrap();
         run_git(&repo, &["commit", "-m", "feature commit"]).unwrap();
 
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "merged");
         assert!(result.temp_branch.is_none(), "temp branch should be cleaned up");
         assert_eq!(result.source_branch, "feature");
@@ -2323,6 +2327,37 @@ C  source.txt -> copy.txt";
         assert!(log.contains("Merge feature into"), "should have merge commit: {}", log);
 
         assert!(git_status(&repo).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_merge_into_base_clean_deletes_source() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let main = main_branch(&repo);
+
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("f.txt"), "work").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "feature"]).unwrap();
+
+        let result = merge_into_base(&repo, main, true).unwrap();
+        assert_eq!(result.status, "merged");
+
+        let branches = git_list_branches(&repo, false).unwrap();
+        assert!(!branches.contains(&"feature".to_string()), "feature branch should be deleted");
+    }
+
+    #[test]
+    fn test_merge_into_base_already_on_base_error() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let main = main_branch(&repo);
+
+        let result = merge_into_base(&repo, main, false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Already on"), "should say already on base: {}", err);
+        assert!(err.contains("Switch to a feature branch"), "should suggest switching: {}", err);
     }
 
     #[test]
@@ -2352,7 +2387,7 @@ C  source.txt -> copy.txt";
         let main_head_after_diverge = head_hash(&repo);
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         assert!(result.temp_branch.is_some());
         assert!(!result.conflicted_files.is_empty());
@@ -2390,7 +2425,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "main edit"]).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         let temp = result.temp_branch.unwrap();
 
@@ -2427,7 +2462,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["add", "."]).unwrap();
         run_git(&repo, &["commit", "-m", "feature"]).unwrap();
 
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "merged");
 
         // Now re-create feature and do a conflict merge to test delete_source
@@ -2442,7 +2477,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "main2"]).unwrap();
 
         run_git(&repo, &["checkout", "feature2"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         let temp = result.temp_branch.unwrap();
 
@@ -2477,7 +2512,7 @@ C  source.txt -> copy.txt";
         let main_head_diverged = head_hash(&repo);
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         let temp = result.temp_branch.unwrap();
 
@@ -2528,7 +2563,7 @@ C  source.txt -> copy.txt";
         let main_content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         let temp = result.temp_branch.clone().unwrap();
 
@@ -2560,7 +2595,7 @@ C  source.txt -> copy.txt";
         std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
         run_git(&repo, &["add", "."]).unwrap();
 
-        let result = merge_into_base(&repo, main);
+        let result = merge_into_base(&repo, main, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("uncommitted changes"));
 
@@ -2578,7 +2613,7 @@ C  source.txt -> copy.txt";
         // Feature with no new commits vs main
         run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
 
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "already_up_to_date");
         assert!(result.temp_branch.is_none());
     }
@@ -2602,7 +2637,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "add b"]).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "merged");
 
         // Main has both files
@@ -2637,7 +2672,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "main edits"]).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "conflicts");
         assert_eq!(result.conflicted_files.len(), 3);
         let temp = result.temp_branch.unwrap();
@@ -2678,7 +2713,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["commit", "-m", "main"]).unwrap();
 
         run_git(&repo, &["checkout", "feature"]).unwrap();
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         let temp = result.temp_branch.unwrap();
 
         // Simulate app crash — don't complete or abort
@@ -2703,7 +2738,7 @@ C  source.txt -> copy.txt";
         run_git(&repo, &["add", "."]).unwrap();
         run_git(&repo, &["commit", "-m", "work"]).unwrap();
 
-        let result = merge_into_base(&repo, main).unwrap();
+        let result = merge_into_base(&repo, main, false).unwrap();
         assert_eq!(result.status, "merged");
 
         // Verify merge commit message references the branch
