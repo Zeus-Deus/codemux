@@ -23,7 +23,7 @@ All shortcuts use **Ctrl** on Linux. Defined in `src/hooks/use-keyboard-shortcut
 | Ctrl+P | Find file by name |
 | Ctrl+Shift+E | Open workspace in editor |
 | Ctrl+Shift+F | Search in files |
-| Ctrl+Shift+G | Toggle Changes panel |
+| Ctrl+Shift+G | Run dev command |
 
 ## Panes
 

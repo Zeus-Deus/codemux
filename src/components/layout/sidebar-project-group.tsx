@@ -126,7 +126,7 @@ export function SidebarProjectGroup({
 
             <button
               type="button"
-              onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true); }}
+              onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true, projectPath); }}
               className="p-1 rounded hover:bg-muted transition-colors shrink-0 ml-1"
               title="New workspace"
             >

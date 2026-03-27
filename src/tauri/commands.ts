@@ -41,6 +41,7 @@ import type {
   ThinkingModeInfo,
   WorkspaceConfig,
   WorktreeInfo,
+  ProjectScripts,
 } from "./types";
 
 // ── Core ──
@@ -175,6 +176,15 @@ export const getWorkspaceConfig = (path: string) =>
 
 export const runWorkspaceSetup = (workspaceId: string) =>
   invoke<void>("run_workspace_setup", { workspaceId });
+
+export const getProjectScripts = (path: string) =>
+  invoke<ProjectScripts | null>("get_project_scripts", { path });
+
+export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
+  invoke<void>("set_project_scripts", { path, scripts });
+
+export const runProjectDevCommand = (workspaceId: string) =>
+  invoke<void>("run_project_dev_command", { workspaceId });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });

@@ -545,6 +545,13 @@ export interface PresetStoreSnapshot {
 export interface WorkspaceConfig {
   setup: string[];
   teardown: string[];
+  run: string | null;
+}
+
+export interface ProjectScripts {
+  setup: string[];
+  teardown: string[];
+  run: string | null;
 }
 
 // ── Theme ──

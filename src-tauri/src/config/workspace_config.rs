@@ -1,3 +1,4 @@
+use crate::database::DatabaseStore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,8 @@ pub struct WorkspaceConfig {
     pub setup: Vec<String>,
     #[serde(default)]
     pub teardown: Vec<String>,
+    #[serde(default)]
+    pub run: Option<String>,
 }
 
 /// Find the git repository root by walking up from `path`.
@@ -66,6 +69,26 @@ pub fn read_workspace_config(workspace_path: &Path) -> Option<WorkspaceConfig> {
     }
 
     None
+}
+
+/// Read config with DB fallback: file config takes precedence over DB-stored scripts.
+pub fn read_effective_config(
+    workspace_path: &Path,
+    db: &DatabaseStore,
+) -> Option<WorkspaceConfig> {
+    // File config wins
+    if let Some(config) = read_workspace_config(workspace_path) {
+        return Some(config);
+    }
+
+    // Fall back to DB-stored project scripts
+    let root = find_git_root(workspace_path).unwrap_or_else(|| workspace_path.to_path_buf());
+    let scripts = db.get_project_scripts(&root.to_string_lossy())?;
+    Some(WorkspaceConfig {
+        setup: scripts.setup,
+        teardown: scripts.teardown,
+        run: scripts.run,
+    })
 }
 
 #[cfg(test)]
@@ -184,6 +207,67 @@ mod tests {
 
         let result = find_git_root(dir.path());
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_read_config_with_run_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"setup": ["npm install"], "teardown": [], "run": "npm run dev"}"#,
+        )
+        .unwrap();
+
+        let config = read_workspace_config(dir.path()).unwrap();
+        assert_eq!(config.setup, vec!["npm install"]);
+        assert_eq!(config.run, Some("npm run dev".to_string()));
+    }
+
+    #[test]
+    fn test_read_config_without_run_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"setup": ["npm install"], "teardown": ["echo bye"]}"#,
+        )
+        .unwrap();
+
+        let config = read_workspace_config(dir.path()).unwrap();
+        assert_eq!(config.run, None);
+    }
+
+    #[test]
+    fn test_config_file_precedence_over_db() {
+        let db = crate::database::init_test_database();
+
+        // Save scripts to DB
+        let db_scripts = crate::database::ProjectScripts {
+            setup: vec!["db-setup-cmd".into()],
+            teardown: vec!["db-teardown-cmd".into()],
+            run: Some("db-run-cmd".into()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        db.set_project_scripts(&dir.path().to_string_lossy(), &db_scripts)
+            .unwrap();
+
+        // Also create .codemux/config.json with different values
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"setup": ["file-setup-cmd"], "teardown": ["file-teardown-cmd"], "run": "file-run-cmd"}"#,
+        )
+        .unwrap();
+
+        // read_effective_config should return the file config, not DB
+        let config = read_effective_config(dir.path(), &db).unwrap();
+        assert_eq!(config.setup, vec!["file-setup-cmd"]);
+        assert_eq!(config.teardown, vec!["file-teardown-cmd"]);
+        assert_eq!(config.run, Some("file-run-cmd".into()));
     }
 }
 

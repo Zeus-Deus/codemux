@@ -227,7 +227,7 @@ function Sidebar({
       <div
         data-slot="sidebar-gap"
         className={cn(
-          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear",
+          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear group-data-[resizing]/sidebar-wrapper:!transition-none",
           "group-data-[collapsible=offcanvas]:w-0",
           "group-data-[side=right]:rotate-180",
           variant === "floating" || variant === "inset"
@@ -239,7 +239,7 @@ function Sidebar({
         data-slot="sidebar-container"
         data-side={side}
         className={cn(
-          "absolute inset-y-0 z-10 hidden h-full w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
+          "absolute inset-y-0 z-10 hidden h-full w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear group-data-[resizing]/sidebar-wrapper:!transition-none data-[side=left]:left-0 data-[side=left]:group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)] data-[side=right]:right-0 data-[side=right]:group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)] md:flex",
           // Adjust the padding for floating and inset variants.
           variant === "floating" || variant === "inset"
             ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
@@ -289,6 +289,7 @@ function SidebarTrigger({
 function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
   const { setSidebarWidth } = useSidebar()
   const isDragging = React.useRef(false)
+  const rafId = React.useRef(0)
 
   const handlePointerDown = React.useCallback(
     (e: React.PointerEvent) => {
@@ -297,15 +298,36 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
       const handle = e.currentTarget as HTMLElement
       handle.dataset.dragging = "true"
 
+      // Find the sidebar wrapper to update CSS variable directly during drag
+      const wrapper = handle.closest("[data-slot='sidebar-wrapper']") as HTMLElement | null
+      let lastWidth = 0
+
+      // Disable width transitions during drag so the sidebar tracks the cursor 1:1
+      if (wrapper) wrapper.dataset.resizing = "true"
+
       const onMove = (ev: PointerEvent) => {
-        setSidebarWidth(ev.clientX)
+        const clamped = Math.max(SIDEBAR_WIDTH_MIN, Math.min(SIDEBAR_WIDTH_MAX, ev.clientX))
+        lastWidth = clamped
+        // Update CSS variable directly — no React re-render during drag
+        cancelAnimationFrame(rafId.current)
+        rafId.current = requestAnimationFrame(() => {
+          if (wrapper) {
+            wrapper.style.setProperty("--sidebar-width", `${clamped}px`)
+          }
+        })
       }
 
       const onUp = () => {
         isDragging.current = false
         handle.dataset.dragging = "false"
+        if (wrapper) delete wrapper.dataset.resizing
+        cancelAnimationFrame(rafId.current)
         window.removeEventListener("pointermove", onMove)
         window.removeEventListener("pointerup", onUp)
+        // Commit the final width to React state (single re-render)
+        if (lastWidth > 0) {
+          setSidebarWidth(lastWidth)
+        }
       }
 
       window.addEventListener("pointermove", onMove)

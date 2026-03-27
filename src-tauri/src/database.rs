@@ -28,6 +28,16 @@ pub struct OpenFlowHistoryEntry {
     pub completed_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProjectScripts {
+    #[serde(default)]
+    pub setup: Vec<String>,
+    #[serde(default)]
+    pub teardown: Vec<String>,
+    #[serde(default)]
+    pub run: Option<String>,
+}
+
 fn database_path() -> Option<PathBuf> {
     let config = dirs::config_dir()?;
     Some(config.join("codemux").join("codemux.db"))
@@ -163,7 +173,7 @@ impl DatabaseStore {
 }
 
 #[cfg(test)]
-fn init_test_database() -> DatabaseStore {
+pub fn init_test_database() -> DatabaseStore {
     let conn = Connection::open_in_memory().expect("Failed to open in-memory database");
     conn.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
     create_schema(&conn).unwrap();
@@ -238,6 +248,24 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to set ui_state: {e}"))?;
         Ok(())
+    }
+
+    // ── Project Scripts ──
+
+    pub fn get_project_scripts(&self, project_root: &str) -> Option<ProjectScripts> {
+        let key = format!("project.scripts:{project_root}");
+        self.get_setting(&key)
+            .and_then(|v| serde_json::from_str(&v).ok())
+    }
+
+    pub fn set_project_scripts(
+        &self,
+        project_root: &str,
+        scripts: &ProjectScripts,
+    ) -> Result<(), String> {
+        let key = format!("project.scripts:{project_root}");
+        let value = serde_json::to_string(scripts).map_err(|e| e.to_string())?;
+        self.set_setting(&key, &value)
     }
 
     // ── Recent Projects ──
@@ -973,5 +1001,52 @@ mod tests {
         db.set_setting("large_b", &large_b).unwrap();
         assert_eq!(db.get_setting("large_a"), Some(large_a));
         assert_eq!(db.get_setting("large_b"), Some(large_b));
+    }
+
+    #[test]
+    fn project_scripts_roundtrip() {
+        let db = init_test_database();
+        let scripts = ProjectScripts {
+            setup: vec!["npm install".into(), "cp .env.example .env".into()],
+            teardown: vec!["docker compose down".into()],
+            run: Some("npm run dev".into()),
+        };
+        db.set_project_scripts("/home/user/my-project", &scripts)
+            .unwrap();
+        let loaded = db
+            .get_project_scripts("/home/user/my-project")
+            .expect("scripts should exist");
+        assert_eq!(loaded.setup, vec!["npm install", "cp .env.example .env"]);
+        assert_eq!(loaded.teardown, vec!["docker compose down"]);
+        assert_eq!(loaded.run, Some("npm run dev".into()));
+    }
+
+    #[test]
+    fn project_scripts_missing_returns_none() {
+        let db = init_test_database();
+        assert!(db.get_project_scripts("/nonexistent").is_none());
+    }
+
+    #[test]
+    fn project_scripts_update() {
+        let db = init_test_database();
+        let scripts = ProjectScripts {
+            setup: vec!["npm install".into()],
+            teardown: vec![],
+            run: None,
+        };
+        db.set_project_scripts("/project", &scripts).unwrap();
+
+        let updated = ProjectScripts {
+            setup: vec!["yarn install".into()],
+            teardown: vec!["echo bye".into()],
+            run: Some("yarn dev".into()),
+        };
+        db.set_project_scripts("/project", &updated).unwrap();
+
+        let loaded = db.get_project_scripts("/project").unwrap();
+        assert_eq!(loaded.setup, vec!["yarn install"]);
+        assert_eq!(loaded.teardown, vec!["echo bye"]);
+        assert_eq!(loaded.run, Some("yarn dev".into()));
     }
 }

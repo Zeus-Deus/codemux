@@ -22,6 +22,7 @@ import {
   regenerateMcpConfig,
   getPresets,
   setPresetBarVisible,
+  runProjectDevCommand,
 } from "@/tauri/commands";
 
 interface Props {
@@ -80,6 +81,16 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             onSelect={() => run(() => setShowNewWorkspaceDialog(true))}
           >
             Create New Workspace
+          </CommandItem>
+          <CommandItem
+            onSelect={() =>
+              run(() =>
+                ws && runProjectDevCommand(ws.workspace_id).catch(console.error),
+              )
+            }
+          >
+            Run Dev Command
+            <CommandShortcut>Ctrl+Shift+G</CommandShortcut>
           </CommandItem>
         </CommandGroup>
 

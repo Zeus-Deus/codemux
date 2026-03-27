@@ -256,7 +256,8 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         }
         "create_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
-            crate::commands::workspace::create_workspace_impl(app.clone(), &state, None)
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, None)
                 .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
         }
         "split_pane" => {

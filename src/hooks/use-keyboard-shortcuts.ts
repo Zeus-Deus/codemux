@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { splitPane, closePane, createTab, closeTab } from "@/tauri/commands";
+import { splitPane, closePane, createTab, closeTab, runProjectDevCommand } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -53,6 +53,12 @@ export function useKeyboardShortcuts() {
       if (e.ctrlKey && e.shiftKey && e.key === "W") {
         e.preventDefault();
         if (activePaneId) closePane(activePaneId).catch(console.error);
+      }
+
+      // Ctrl+Shift+G — run project dev command
+      if (e.ctrlKey && e.shiftKey && e.key === "G") {
+        e.preventDefault();
+        runProjectDevCommand(ws.workspace_id).catch(console.error);
       }
 
       // Ctrl+T — new terminal tab

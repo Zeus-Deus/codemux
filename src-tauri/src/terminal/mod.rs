@@ -693,6 +693,56 @@ pub fn write_to_pty(
     )
 }
 
+/// Write data to a PTY by session ID (non-Tauri helper for internal use).
+pub fn write_to_pty_by_session(
+    pty_state: &State<'_, PtyState>,
+    session_id: &str,
+    data: &str,
+) -> Result<(), String> {
+    with_session_runtime(
+        &pty_state.sessions,
+        session_id,
+        || SessionRuntime::new(session_id),
+        |runtime| {
+            let writer = runtime
+                .writer
+                .as_mut()
+                .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
+            writer
+                .write_all(data.as_bytes())
+                .map_err(|e| format!("Failed to write to PTY: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush PTY writer: {e}"))
+        },
+    )
+}
+
+/// Write data to a PTY by session ID using a PtyState directly (for spawned threads).
+pub fn write_to_pty_by_session_direct(
+    pty_state: &PtyState,
+    session_id: &str,
+    data: &str,
+) -> Result<(), String> {
+    with_session_runtime(
+        &pty_state.sessions,
+        session_id,
+        || SessionRuntime::new(session_id),
+        |runtime| {
+            let writer = runtime
+                .writer
+                .as_mut()
+                .ok_or_else(|| format!("Terminal shell {session_id} is not currently writable"))?;
+            writer
+                .write_all(data.as_bytes())
+                .map_err(|e| format!("Failed to write to PTY: {e}"))?;
+            writer
+                .flush()
+                .map_err(|e| format!("Failed to flush PTY writer: {e}"))
+        },
+    )
+}
+
 #[tauri::command]
 pub fn resize_pty(
     _app: AppHandle,

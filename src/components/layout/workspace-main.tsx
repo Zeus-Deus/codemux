@@ -9,9 +9,13 @@ import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 
+const RIGHT_PANEL_MIN = 240;
+const RIGHT_PANEL_MAX = 500;
+
 function RightPanelResizer() {
   const setRightPanelWidth = useUIStore((s) => s.setRightPanelWidth);
   const handleRef = useRef<HTMLDivElement>(null);
+  const rafId = useRef(0);
 
   const startResize = useCallback(
     (e: React.PointerEvent) => {
@@ -19,17 +23,32 @@ function RightPanelResizer() {
       const handle = handleRef.current;
       if (handle) handle.dataset.dragging = "true";
 
+      // Find the right panel element (next sibling of the handle)
+      const panelEl = handle?.nextElementSibling as HTMLElement | null;
+      let lastWidth = 0;
+
       const onMove = (ev: PointerEvent) => {
-        setRightPanelWidth(window.innerWidth - ev.clientX);
+        const width = Math.max(RIGHT_PANEL_MIN, Math.min(RIGHT_PANEL_MAX, window.innerWidth - ev.clientX));
+        lastWidth = width;
+        // Update DOM directly — no React re-render during drag
+        cancelAnimationFrame(rafId.current);
+        rafId.current = requestAnimationFrame(() => {
+          if (panelEl) {
+            panelEl.style.width = `${width}px`;
+          }
+        });
       };
 
       const onUp = () => {
         if (handle) handle.dataset.dragging = "false";
+        cancelAnimationFrame(rafId.current);
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
-        // Persist to SQLite
-        dbSetUiState("right_panel_width", String(useUIStore.getState().rightPanelWidth))
-          .catch(console.error);
+        // Commit to React state + persist to SQLite (single re-render)
+        if (lastWidth > 0) {
+          setRightPanelWidth(lastWidth);
+          dbSetUiState("right_panel_width", String(lastWidth)).catch(console.error);
+        }
       };
 
       window.addEventListener("pointermove", onMove);
@@ -41,7 +60,7 @@ function RightPanelResizer() {
   return (
     <div
       ref={handleRef}
-      className="w-px shrink-0 cursor-col-resize bg-border/50 hover:bg-primary/30 data-[dragging=true]:bg-primary/30 transition-colors relative before:absolute before:inset-y-0 before:-inset-x-1 before:content-['']"
+      className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-primary/20 data-[dragging=true]:bg-primary/30 transition-colors"
       onPointerDown={startResize}
       role="separator"
       aria-orientation="vertical"

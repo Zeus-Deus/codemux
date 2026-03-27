@@ -400,6 +400,8 @@ pub fn run() {
             commands::db_get_recent_projects,
             commands::db_save_openflow_run,
             commands::db_get_openflow_history,
+            commands::get_project_scripts,
+            commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,
             commands::get_git_status,
@@ -454,6 +456,7 @@ pub fn run() {
             commands::apply_preset,
             commands::get_workspace_config,
             commands::run_workspace_setup,
+            commands::run_project_dev_command,
             commands::list_directory,
             commands::search_in_files,
             commands::search_file_names

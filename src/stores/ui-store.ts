@@ -7,6 +7,7 @@ interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;
   rightPanelWidth: number;
   showNewWorkspaceDialog: boolean;
+  newWorkspaceProjectDir: string | null;
   showSettings: boolean;
   settingsSection: string | null;
   showFileSearch: boolean;
@@ -16,7 +17,7 @@ interface UIStore {
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
   toggleRightPanel: (workspaceId: string, tab: RightPanelTab) => void;
   setRightPanelWidth: (width: number) => void;
-  setShowNewWorkspaceDialog: (show: boolean) => void;
+  setShowNewWorkspaceDialog: (show: boolean, projectDir?: string | null) => void;
   setShowSettings: (show: boolean, section?: string | null) => void;
   setShowFileSearch: (show: boolean) => void;
   setShowContentSearch: (show: boolean) => void;
@@ -28,6 +29,7 @@ export const useUIStore = create<UIStore>()(
       rightPanelTabs: {},
       rightPanelWidth: 320,
       showNewWorkspaceDialog: false,
+      newWorkspaceProjectDir: null,
       showSettings: false,
       settingsSection: null,
       showFileSearch: false,
@@ -54,7 +56,8 @@ export const useUIStore = create<UIStore>()(
       setRightPanelWidth: (width) =>
         set({ rightPanelWidth: Math.max(240, Math.min(500, width)) }),
 
-      setShowNewWorkspaceDialog: (show) => set({ showNewWorkspaceDialog: show }),
+      setShowNewWorkspaceDialog: (show, projectDir = null) =>
+        set({ showNewWorkspaceDialog: show, newWorkspaceProjectDir: show ? (projectDir ?? null) : null }),
 
       setShowSettings: (show, section = null) => set({ showSettings: show, settingsSection: show ? (section ?? null) : null }),
       setShowFileSearch: (show) => set({ showFileSearch: show }),

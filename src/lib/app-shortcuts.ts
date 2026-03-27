@@ -23,6 +23,8 @@ export const APP_SHORTCUTS: AppShortcut[] = [
   { key: "d", ctrl: true, shift: true },
   // Close pane
   { key: "w", ctrl: true, shift: true },
+  // Run dev command
+  { key: "g", ctrl: true, shift: true },
   // New tab
   { key: "t", ctrl: true, shift: false },
   // Close tab

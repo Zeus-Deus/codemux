@@ -27,6 +27,7 @@ import {
   FolderOpen,
 } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import {
   listBranches,
   listWorktrees,
@@ -92,17 +93,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const activeWs = appState?.workspaces.find(
     (w) => w.workspace_id === appState.active_workspace_id,
   );
-  const cwd = activeWs?.cwd ?? "";
+  // Use the project dir passed from the "+" button if available,
+  // otherwise fall back to the active workspace's project root or cwd.
+  const storeProjectDir = useUIStore((s) => s.newWorkspaceProjectDir);
+  const defaultDir = storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
 
-  // Project directory (editable, defaults to active workspace cwd)
-  const [projectDir, setProjectDir] = useState(cwd);
+  // Project directory (editable, defaults to the target project root)
+  const [projectDir, setProjectDir] = useState(defaultDir);
 
   // Synchronously reset projectDir when dialog opens.
   // This runs during render (before effects) so the fetch effect
   // always sees the correct directory — no two-effect race condition.
   const prevOpenRef = useRef(false);
-  if (open && !prevOpenRef.current && projectDir !== (cwd || "")) {
-    setProjectDir(cwd || "");
+  if (open && !prevOpenRef.current && projectDir !== (defaultDir || "")) {
+    setProjectDir(defaultDir || "");
   }
   prevOpenRef.current = open;
 
@@ -232,16 +236,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return allBranches.filter((b) => b.toLowerCase().includes(q));
   }, [allBranches, branchSearch]);
 
-  // Check if branch already has a workspace
+  // Check if branch already has a workspace in the SAME project.
+  // Different projects can have branches with the same name (e.g. "main").
+  // Scope to projectDir (the dialog's target project), not the active workspace,
+  // because the user may have changed the project directory in the dialog input.
   const branchWorkspaceMap = useMemo(() => {
     const map = new Map<string, string>();
-    if (appState) {
+    if (appState && projectDir) {
       for (const ws of appState.workspaces) {
-        if (ws.git_branch) map.set(ws.git_branch, ws.workspace_id);
+        if (ws.git_branch && (ws.project_root === projectDir || ws.cwd === projectDir)) {
+          map.set(ws.git_branch, ws.workspace_id);
+        }
       }
     }
     return map;
-  }, [appState]);
+  }, [appState, projectDir]);
 
   const handleCreate = useCallback(
     async (branch: string, isNewBranch: boolean) => {
@@ -318,7 +327,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               value={projectDir}
               onChange={(e) => setProjectDir(e.target.value)}
               className="h-8 text-xs flex-1"
-              placeholder={cwd || "Select a project folder"}
+              placeholder={defaultDir || "Select a project folder"}
             />
             <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handlePickFolder}>
               <FolderOpen className="h-3.5 w-3.5" />

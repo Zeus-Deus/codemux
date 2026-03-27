@@ -17,6 +17,7 @@ use crate::state::{
 use crate::terminal;
 use notify_rust::Notification;
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::{Manager, State};
@@ -44,6 +45,7 @@ fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path
 pub(crate) fn create_workspace_impl(
     app: tauri::AppHandle,
     state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
     cwd: Option<String>,
 ) -> Result<String, String> {
     let workspace_id = match &cwd {
@@ -65,7 +67,7 @@ pub(crate) fn create_workspace_impl(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, state, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, state, db, &workspace_id.0, &repo_path);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -128,9 +130,10 @@ pub fn regenerate_mcp_config(
 pub fn create_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
 ) -> Result<String, String> {
-    create_workspace_impl(app, &state, cwd)
+    create_workspace_impl(app, &state, &db, cwd)
 }
 
 #[tauri::command]
@@ -153,6 +156,7 @@ pub fn create_openflow_workspace(
 pub fn create_workspace_with_preset(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
     layout: String,
 ) -> Result<String, String> {
@@ -191,7 +195,7 @@ pub fn create_workspace_with_preset(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &workspace_id.0, &repo_path);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
@@ -201,6 +205,7 @@ pub fn create_workspace_with_preset(
 pub fn create_worktree_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     repo_path: String,
     branch: String,
     new_branch: bool,
@@ -240,7 +245,7 @@ pub fn create_worktree_workspace(
     }
 
     // Run setup scripts in background thread
-    spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -255,6 +260,7 @@ pub fn create_worktree_workspace(
 pub fn import_worktree_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     worktree_path: String,
     branch: String,
     layout: String,
@@ -293,7 +299,7 @@ pub fn import_worktree_workspace(
         terminal::spawn_pty_for_session(app.clone(), session_id);
     }
 
-    spawn_setup_scripts(&app, &state, &workspace_id.0, &wt_path_buf);
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &wt_path_buf);
 
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
@@ -308,6 +314,7 @@ pub fn import_worktree_workspace(
 pub fn close_workspace_with_worktree(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
     remove_worktree: bool,
     delete_branch: Option<bool>,
@@ -336,6 +343,7 @@ pub fn close_workspace_with_worktree(
                 Path::new(wt_path),
                 &ws_title,
                 &workspace_id,
+                Some(&db),
             ) {
                 return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
             }
@@ -416,6 +424,7 @@ pub fn update_workspace_cwd(
 pub fn close_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
     force_delete: Option<bool>,
 ) -> Result<String, String> {
@@ -438,6 +447,7 @@ pub fn close_workspace(
                 Path::new(cwd),
                 title,
                 &workspace_id,
+                Some(&db),
             ) {
                 return Err(format!("Teardown failed: {e}\nUse force delete to skip teardown."));
             }
@@ -878,9 +888,22 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 fn spawn_setup_scripts(
     app: &tauri::AppHandle,
     state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
     workspace_id: &str,
     workspace_path: &Path,
 ) {
+    // Pre-resolve config AND root path on the calling thread.
+    // The root path must be resolved here (not in the spawned thread) because
+    // find_git_root may race with worktree setup when called after the 500ms delay.
+    let config =
+        crate::config::workspace_config::read_effective_config(workspace_path, db);
+    let config = match config {
+        Some(c) if !c.setup.is_empty() => c,
+        _ => return,
+    };
+
+    let root_path = crate::scripts::resolve_root_path(workspace_path);
+
     let ws_title = {
         let snapshot = state.snapshot();
         snapshot
@@ -897,7 +920,9 @@ fn spawn_setup_scripts(
     std::thread::spawn(move || {
         // Wait for frontend to mount the overlay and register event listeners
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Err(e) = crate::scripts::run_setup_scripts(&ws_path, &ws_title, &ws_id, &app2) {
+        if let Err(e) = crate::scripts::run_setup_scripts_with_config(
+            &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
+        ) {
             eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
         }
     });
@@ -912,6 +937,7 @@ pub fn get_workspace_config(path: String) -> Option<WorkspaceConfig> {
 pub fn run_workspace_setup(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
     let (cwd, title) = {
@@ -923,7 +949,123 @@ pub fn run_workspace_setup(
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
         (ws.cwd.clone(), ws.title.clone())
     };
-    crate::scripts::run_setup_scripts(Path::new(&cwd), &title, &workspace_id, &app)
+    crate::scripts::run_setup_scripts(Path::new(&cwd), &title, &workspace_id, &app, Some(&db))
+}
+
+#[tauri::command]
+pub fn run_project_dev_command(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    pty_state: State<'_, crate::terminal::PtyState>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let (cwd, project_root) = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+        (ws.cwd.clone(), ws.project_root.clone())
+    };
+
+    // Resolve the run command from effective config
+    let config_path = project_root
+        .as_ref()
+        .map(|p| PathBuf::from(p))
+        .unwrap_or_else(|| PathBuf::from(&cwd));
+    let config = crate::config::workspace_config::read_effective_config(&config_path, &db);
+    let run_cmd = config
+        .and_then(|c| c.run)
+        .ok_or_else(|| {
+            "No run command configured. Set one in Settings > Projects.".to_string()
+        })?;
+
+    // Check if a "Workspace Run" tab already exists for this workspace
+    let existing_run_tab = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id);
+        ws.and_then(|w| {
+            w.tabs
+                .iter()
+                .find(|t| t.title == "Workspace Run" && t.kind == TabKind::Terminal)
+                .map(|t| (t.tab_id.clone(), t.surface_id.clone()))
+        })
+    };
+
+    if let Some((tab_id, surface_id)) = existing_run_tab {
+        // Reuse existing tab: activate it and restart the command
+        state.activate_tab(&workspace_id, &tab_id).ok();
+
+        // Get the session ID for this tab's surface
+        if let Some(surface_id) = surface_id {
+            let session_id = {
+                let snapshot = state.snapshot();
+                let ws = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == workspace_id);
+                ws.and_then(|w| {
+                    w.surfaces
+                        .iter()
+                        .find(|s| s.surface_id == surface_id)
+                        .and_then(|s| {
+                            crate::state::session_id_for_pane(&s.root, &s.active_pane_id)
+                        })
+                })
+            };
+
+            if let Some(session_id) = session_id {
+                // Send Ctrl+C, wait briefly, then send the command
+                let data = format!("\x03\n{}\n", run_cmd);
+                crate::terminal::write_to_pty_by_session(
+                    &pty_state,
+                    &session_id.0,
+                    &data,
+                )?;
+            }
+        }
+    } else {
+        // Create a new terminal tab
+        let (tab_id, session_id) = state.create_tab(&workspace_id, TabKind::Terminal)?;
+
+        if let Some(session_id) = &session_id {
+            terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
+        }
+
+        // Rename the tab to "Workspace Run"
+        state
+            .rename_tab(&workspace_id, &tab_id, "Workspace Run".to_string())
+            .ok();
+
+        // Write the run command after a brief delay for the PTY to initialize
+        if let Some(session_id) = session_id {
+            let cmd = run_cmd.clone();
+            let sessions = pty_state.sessions.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(runtime) = guard.get_mut(&session_id.0) {
+                    if let Some(writer) = runtime.writer.as_mut() {
+                        let data = format!("{}\n", cmd);
+                        if let Err(e) = writer.write_all(data.as_bytes()) {
+                            eprintln!(
+                                "[codemux::scripts] Failed to write run command: {e}"
+                            );
+                        }
+                        let _ = writer.flush();
+                    }
+                }
+            });
+        }
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(())
 }
 
 #[tauri::command]

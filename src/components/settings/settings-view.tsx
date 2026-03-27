@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
@@ -31,6 +32,7 @@ import {
   Bell,
   Bot,
   Zap,
+  FolderCog,
   Pin,
   PinOff,
   Trash2,
@@ -55,6 +57,9 @@ import {
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
+  getProjectScripts,
+  setProjectScripts,
+  getWorkspaceConfig,
 } from "@/tauri/commands";
 import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
 import { EditorIcon } from "@/components/icons/editor-icon";
@@ -68,13 +73,14 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "appearance" | "editor" | "terminal" | "presets" | "git" | "agent" | "shortcuts" | "notifications";
+type Section = "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "shortcuts" | "notifications";
 
 const NAV_ITEMS: { id: Section; label: string; icon: React.ElementType }[] = [
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "editor", label: "Editor", icon: Code2 },
   { id: "terminal", label: "Terminal", icon: TerminalSquare },
   { id: "presets", label: "Presets", icon: Zap },
+  { id: "projects", label: "Projects", icon: FolderCog },
   { id: "git", label: "Git", icon: GitBranch },
   { id: "agent", label: "Agent", icon: Bot },
   { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
@@ -89,6 +95,7 @@ const SHORTCUTS = [
   { category: "Workspaces", items: [
     { action: "Next workspace", keys: "Ctrl+]" },
     { action: "Previous workspace", keys: "Ctrl+[" },
+    { action: "Run dev command", keys: "Ctrl+Shift+G" },
   ]},
   { category: "Tabs", items: [
     { action: "New terminal tab", keys: "Ctrl+T" },
@@ -439,11 +446,24 @@ export function SettingsView() {
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
+  const activeWorkspace = useAppStore((s) => {
+    const st = s.appState;
+    return st?.workspaces.find((w) => w.workspace_id === st.active_workspace_id);
+  });
+  const projectRoot = activeWorkspace?.project_root ?? null;
+  const projectName = projectRoot ? projectRoot.split("/").pop() ?? "Project" : "Project";
+
   const initialSection = (settingsSection && NAV_ITEMS.some((n) => n.id === settingsSection) ? settingsSection : "appearance") as Section;
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+
+  // Project scripts state
+  const [setupScripts, setSetupScripts] = useState("");
+  const [teardownScripts, setTeardownScripts] = useState("");
+  const [runCommand, setRunCommand] = useState("");
+  const [hasConfigFile, setHasConfigFile] = useState(false);
 
   const setDefaultEditor = (v: string) => storeSet("editor.default", v);
   const setCursorStyle = (v: string) => storeSet("terminal.cursor_style", v);
@@ -451,6 +471,34 @@ export function SettingsView() {
   const setBaseBranch = (v: string) => storeSet("git.default_base_branch", v);
   const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
   const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
+
+  // Load project scripts when switching to the projects section
+  useEffect(() => {
+    if (activeSection !== "projects" || !projectRoot) return;
+    getProjectScripts(projectRoot).then((scripts) => {
+      if (scripts) {
+        setSetupScripts(scripts.setup.join("\n"));
+        setTeardownScripts(scripts.teardown.join("\n"));
+        setRunCommand(scripts.run ?? "");
+      } else {
+        setSetupScripts("");
+        setTeardownScripts("");
+        setRunCommand("");
+      }
+    }).catch(console.error);
+    getWorkspaceConfig(projectRoot).then((config) => {
+      setHasConfigFile(config !== null);
+    }).catch(console.error);
+  }, [activeSection, projectRoot]);
+
+  const saveProjectScripts = (setup: string, teardown: string, run: string) => {
+    if (!projectRoot) return;
+    setProjectScripts(projectRoot, {
+      setup: setup.trim() ? setup.trim().split("\n").filter((l) => l.trim()) : [],
+      teardown: teardown.trim() ? teardown.trim().split("\n").filter((l) => l.trim()) : [],
+      run: run.trim() || null,
+    }).catch(console.error);
+  };
 
   useEffect(() => {
     getPresets().then(setPresetStore).catch(console.error);
@@ -864,6 +912,72 @@ export function SettingsView() {
                   }}
                 />
               </SettingRow>
+            </div>
+          </div>
+        );
+
+      case "projects":
+        return (
+          <div>
+            <SectionHeader
+              title="Scripts"
+              description={`Automate your workspace lifecycle for ${projectName}. Changes are saved automatically.`}
+            />
+            {hasConfigFile && (
+              <div className="mb-4 rounded-md border border-border bg-muted/50 px-4 py-3 text-sm text-muted-foreground">
+                A <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">.codemux/config.json</code> file was found.
+                File-based configuration takes precedence over these settings.
+              </div>
+            )}
+            <div className="space-y-6">
+              <div>
+                <label className="text-sm font-medium">Setup</label>
+                <p className="text-sm text-muted-foreground mb-2">
+                  Runs when a new workspace is created. One command per line.
+                </p>
+                <Textarea
+                  className="font-mono text-sm min-h-[80px]"
+                  placeholder="e.g. npm install"
+                  value={setupScripts}
+                  onChange={(e) => setSetupScripts(e.target.value)}
+                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                />
+              </div>
+              <div>
+                <label className="text-sm font-medium">Teardown</label>
+                <p className="text-sm text-muted-foreground mb-2">
+                  Runs when a workspace is deleted. One command per line.
+                </p>
+                <Textarea
+                  className="font-mono text-sm min-h-[80px]"
+                  placeholder="e.g. docker compose down"
+                  value={teardownScripts}
+                  onChange={(e) => setTeardownScripts(e.target.value)}
+                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                />
+              </div>
+              <div>
+                <label className="text-sm font-medium">Run</label>
+                <p className="text-sm text-muted-foreground mb-2">
+                  A command to start your dev server, triggered via <kbd className="text-xs bg-muted px-1 py-0.5 rounded border border-border">Ctrl+Shift+G</kbd>.
+                </p>
+                <Input
+                  className="font-mono text-sm"
+                  placeholder="e.g. npm run dev"
+                  value={runCommand}
+                  onChange={(e) => setRunCommand(e.target.value)}
+                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                />
+              </div>
+              <Separator />
+              <div className="text-sm text-muted-foreground space-y-1">
+                <p className="font-medium text-foreground">Environment variables</p>
+                <p><code className="font-mono text-xs">$CODEMUX_ROOT_PATH</code> — main repo root</p>
+                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_PATH</code> — workspace/worktree directory</p>
+                <p><code className="font-mono text-xs">$COMPOSE_PROJECT_NAME</code> — auto-set to project folder name</p>
+                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_NAME</code> — workspace title</p>
+                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_ID</code> — workspace ID</p>
+              </div>
             </div>
           </div>
         );

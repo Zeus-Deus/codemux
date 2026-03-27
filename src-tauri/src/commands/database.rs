@@ -1,4 +1,4 @@
-use crate::database::{DatabaseStore, OpenFlowHistoryEntry, RecentProject};
+use crate::database::{DatabaseStore, OpenFlowHistoryEntry, ProjectScripts, RecentProject};
 use std::collections::HashMap;
 use tauri::State;
 
@@ -40,6 +40,20 @@ pub fn db_add_recent_project(db: State<'_, DatabaseStore>, path: String, name: S
 #[tauri::command]
 pub fn db_get_recent_projects(db: State<'_, DatabaseStore>, limit: Option<u32>) -> Vec<RecentProject> {
     db.get_recent_projects(limit.unwrap_or(20))
+}
+
+#[tauri::command]
+pub fn get_project_scripts(db: State<'_, DatabaseStore>, path: String) -> Option<ProjectScripts> {
+    db.get_project_scripts(&path)
+}
+
+#[tauri::command]
+pub fn set_project_scripts(
+    db: State<'_, DatabaseStore>,
+    path: String,
+    scripts: ProjectScripts,
+) -> Result<(), String> {
+    db.set_project_scripts(&path, &scripts)
 }
 
 #[tauri::command]
