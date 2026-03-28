@@ -8,37 +8,26 @@
 
 ## Global Shortcuts
 
-These work anywhere in the app. All require **Ctrl** (Linux) or **Cmd** (macOS).
+These work anywhere in the app. All require **Ctrl**.
 
-Defined in `src/hooks/use-keyboard-shortcuts.ts` and `src/components/terminal/TerminalPane.tsx`.
+Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, and `src/components/layout/app-shell.tsx`.
 
 | Shortcut | Action | Notes |
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
-| Ctrl+Shift+P | Command palette (alt) | Alternative binding |
+| Ctrl+B | Toggle sidebar | Collapse/expand the left sidebar |
+| Ctrl+P | Find file by name | File name search overlay (via fd/find) |
+| Ctrl+Shift+F | Search in files | Keyword search across workspace files (via rg/grep) |
 | Ctrl+] | Next workspace | Cycles through sidebar workspace list |
 | Ctrl+[ | Previous workspace | |
+| Ctrl+Shift+G | Run dev command | Runs the project's configured dev server command |
 | Ctrl+T | New terminal tab | Standard workspaces only (not OpenFlow) |
 | Ctrl+W | Close active tab | Only when workspace has more than one tab |
 | Ctrl+1 through Ctrl+9 | Jump to tab by position | Tab 1 = leftmost |
-| Ctrl+Shift+B | New browser tab | |
-| Ctrl+B | Toggle File Tree panel | Opens right panel to Files tab |
-| Ctrl+P | Find file by name | File name search overlay |
-| Ctrl+Shift+E | Open workspace in editor | Opens in first detected editor |
-| Ctrl+Shift+F | Search in files | Keyword search across workspace files |
-| Ctrl+Shift+G | Toggle Changes panel | Opens right panel to Changes tab |
-| Ctrl+Shift+J | Next pane | |
-| Ctrl+Shift+K | Previous pane | |
-| Ctrl+L | Next pane | Vim-style alternative |
-| Ctrl+H | Previous pane | Vim-style alternative |
-| Ctrl+Alt+ArrowLeft | Shrink active pane | 5% per keypress |
-| Ctrl+Alt+ArrowRight | Expand active pane | 5% per keypress |
-| Ctrl+Alt+ArrowUp | Shrink active pane (vertical) | 5% per keypress |
-| Ctrl+Alt+ArrowDown | Expand active pane (vertical) | 5% per keypress |
-| Ctrl+Alt+H | Shrink active pane | Vim-style alternative to arrow keys |
-| Ctrl+Alt+L | Expand active pane | |
-| Ctrl+Alt+K | Shrink active pane (vertical) | |
-| Ctrl+Alt+J | Expand active pane (vertical) | |
+| Ctrl+Shift+D | Split active pane right | Horizontal split |
+| Ctrl+Shift+W | Close active pane | |
+| Ctrl+Shift+J | Focus next pane | |
+| Ctrl+Shift+K | Focus previous pane | |
 
 ## Terminal Shortcuts
 
@@ -66,13 +55,13 @@ These work in specific UI contexts.
 
 | Keys | Conflict | Resolution |
 |------|----------|------------|
-| Ctrl+H | Pane cycling vs. browser history-back | Ctrl+H is intercepted at window level before reaching the browser. Some users may expect browser history behavior. |
-| Ctrl+L | Pane cycling vs. browser address bar focus | Ctrl+L is intercepted at window level. Browser address bar must be clicked directly. |
 | Ctrl+W | Close tab vs. close window (some WMs) | Only fires when workspace has >1 tab. When only one tab exists, the event is not prevented and may reach the window manager. |
 
 ## Important Touch Points
 
-- `src/hooks/use-keyboard-shortcuts.ts` — global shortcuts (Ctrl+Shift+D, Ctrl+T, Ctrl+W, etc.)
+- `src/hooks/use-keyboard-shortcuts.ts` — global shortcuts (Ctrl+Shift+D, Ctrl+T, Ctrl+W, Ctrl+Shift+G, etc.)
+- `src/lib/app-shortcuts.ts` — shortcut interception list (blocks keys from reaching xterm.js)
 - `src/components/terminal/TerminalPane.tsx` — `customKeyEventHandler()` (terminal shortcuts)
+- `src/components/layout/app-shell.tsx` — Ctrl+K command palette handler
 - `src/components/layout/tab-bar.tsx` — tab keyboard navigation
-- `src/components/layout/PaneNode.tsx` — pane split/close buttons
+- `src/components/settings/settings-view.tsx` — shortcut display in settings

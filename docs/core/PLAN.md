@@ -46,10 +46,18 @@
 
 1. Harden OpenFlow reliability and intervention flow
 2. Add tasks system (Linear/GitHub issue integration)
-3. Add MCP server for agent self-orchestration
-4. Add settings panel (editor preference, fonts, keybinds, terminal options)
-5. Improve browser pane fidelity (wait conditions, DOM inspection, DevTools)
-6. Add notification sounds
+3. Improve browser pane fidelity (wait conditions, DOM inspection, DevTools)
+4. Add notification sound playback
+5. Add memory drawer UI
+6. Add context menus on workspace rows, sections, and panes
 7. Add custom keybind editor
 8. Linux release packaging and polish
 9. Cross-platform preparation (macOS, Windows)
+
+## Recently Completed
+
+- MCP server for agent self-orchestration (70+ tools exposed via JSON-RPC 2.0)
+- Settings panel (keyboard shortcuts, appearance, project scripts)
+- Auth system (GitHub OAuth, email/password, email verification)
+- Synced settings (per-user server-synced with offline cache)
+- Claude CLI adapter for OpenFlow

@@ -21,11 +21,13 @@
 
 ## Likely Touch Points
 
-- `src/components/panes/BrowserPane.svelte`
-- `src/stores/appState.ts`
+- `src/components/browser/BrowserPane.tsx`
+- `src/components/browser/BrowserToolbar.tsx`
+- `src/stores/app-store.ts`
 - `src-tauri/src/agent_browser.rs`
+- `src-tauri/src/browser.rs`
 - `src-tauri/src/cli.rs`
-- `src-tauri/src/commands.rs`
+- `src-tauri/src/commands/browser.rs`
 - `docs/reference/CONTROL.md`
 - `AGENTS.md`
 

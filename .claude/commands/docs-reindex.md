@@ -7,6 +7,7 @@ Audit the Codemux repo and clean or re-index the markdown docs when they become 
 3. Audit the current codebase before trusting old docs.
 4. Update canonical docs from code reality.
 5. Remove or archive stale duplicates once clean replacements exist.
+6. Check for major features in the codebase that have NO corresponding doc in docs/features/. Create docs for any undocumented features.
 
 ## Additional Resource
 

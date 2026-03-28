@@ -29,6 +29,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 
 ## Current Entry Points
 
+- Auth system: `docs/features/auth.md`
+- Settings sync: `docs/features/settings-sync.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`

@@ -44,9 +44,11 @@
 
 - `src-tauri/src/openflow/orchestrator.rs`
 - `src-tauri/src/openflow/prompts.rs`
-- `src-tauri/src/commands.rs`
+- `src-tauri/src/openflow/adapters/` (claude.rs, opencode.rs)
+- `src-tauri/src/commands/openflow.rs`
 - `src-tauri/src/terminal/mod.rs`
 - `src/components/openflow/`
+- `src/stores/openflow-store.ts`
 - `docs/features/openflow.md`
 
 ## Longer-Term Milestones

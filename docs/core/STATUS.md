@@ -38,8 +38,11 @@ The repo structure is clean and domain-split:
 - Local project memory and lexical indexing
 - CLI and socket control
 - Global overlay manager (single overlay at a time)
+- Auth system: GitHub OAuth, email/password with email verification, encrypted token storage
+- Per-user synced settings with server sync, offline cache, and dirty flag
 - Neutral dark shell theming with Omarchy accent sync
 - Sans-serif shell chrome, monospace terminals
+- MCP server exposing 70+ tools via JSON-RPC 2.0
 
 ## Partial / Being Hardened
 
@@ -55,36 +58,35 @@ The repo structure is clean and domain-split:
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - The legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
 
-## React Frontend Rebuild Status
+## React Frontend Status
 
-The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn (branch `feature/react-frontend-rebuild`). The Rust backend is unchanged.
+The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust backend is unchanged. The port is substantially complete.
 
-### Working in React frontend
+### Ported and Working
 
 - App shell: shadcn Sidebar with collapsible workspace sections, tab bar, right panel
 - Workspace list from real Tauri backend data (zustand + app-state-changed events)
-- Terminal panes with xterm.js + canvas renderer + PTY via Tauri Channel
+- Terminal panes with xterm.js + WebGL renderer + PTY via Tauri Channel
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
-- Right panel: flexbox layout with pointer-based resize (320px default, 240-500px range)
-- Keyboard shortcuts: Ctrl+Shift+D split, Ctrl+Shift+W close pane, Ctrl+T new tab, Ctrl+W close tab
+- Right panel with Changes panel, File tree, and PR panel tabs
+- OpenFlow UI: orchestration view, agent config, communication panel, agent graph
+- Command palette (Ctrl+K) with fuzzy search
+- Search: file name search (Ctrl+P) and content search (Ctrl+Shift+F)
+- Browser pane with screenshot-driven rendering and toolbar
+- Workspace drag-and-drop reordering in sidebar
+- Terminal presets bar with quick-launch
+- Settings panel with keyboard shortcuts, appearance, and project scripts
+- Auth system with GitHub OAuth, email/password, session encryption
+- Synced settings (per-user server-synced with offline cache)
 - Semantic theming: shadcn oklch dark mode + custom --success/--danger/--warning tokens
 - Terminal theme reads dynamically from CSS variables via MutationObserver
-- New workspace creation from sidebar "+" button
 - Tauri bridge: 80+ typed command wrappers, 8 event helpers, all types ported
 
-### TODO — Not yet ported from old Svelte frontend
+### Remaining Gaps
 
-- Right panel content: Changes panel, File tree, PR panel
-- OpenFlow UI (orchestration view, agent config, communication panel)
-- Command palette (Ctrl+K)
-- Search panels (file search, content search)
-- Browser pane rendering
-- Workspace drag-and-drop reordering in sidebar
-- Context menus (workspace, section, pane)
-- Terminal presets bar
-- Notification sounds
-- Settings panel
-- Memory drawer
+- Context menus on workspace rows, section headers, and pane headers (Radix primitive exists but not wired up everywhere)
+- Notification sound playback (toggle exists in settings and state, but no actual audio output)
+- Memory drawer UI (backend memory system exists, no frontend drawer/panel yet)
 
 ## Read This With
 

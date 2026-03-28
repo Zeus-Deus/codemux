@@ -72,6 +72,19 @@ The current canonical browser path is `agent-browser`.
 
 `src-tauri/src/browser.rs` still exists as the legacy Chromium/CDP-backed runtime. It is kept as an internal alternate path, but it is not the primary browser path used by the current pane UI.
 
+## Auth & Settings Sync
+
+Codemux authenticates against a Better Auth API server at `api.codemux.org` (override with `CODEMUX_API_URL`). The desktop app stores encrypted tokens locally and sends Bearer tokens for all API calls.
+
+- auth logic: `src-tauri/src/auth.rs` (encryption, token storage, CSRF, machine key)
+- auth commands: `src-tauri/src/commands/auth.rs` (OAuth flow, email sign-in/up, session check)
+- settings sync: `src-tauri/src/settings_sync.rs` (server fetch/push, offline cache, dirty flag)
+- settings commands: `src-tauri/src/commands/settings_sync.rs` (get, update, patch, reset)
+- frontend auth: `src/stores/auth-store.ts`, `src/components/auth/login-screen.tsx`
+- frontend settings: `src/stores/synced-settings-store.ts`, `src/components/settings/settings-view.tsx`
+
+Per-user settings sync to the server; machine-local settings (sidebar state, window layout, presets) stay in SQLite. The server is the source of truth when reachable; offline cache with dirty flag handles network outages.
+
 ## OpenFlow Boundary
 
 OpenFlow is integrated into Codemux, but it still keeps a separate runtime boundary.
