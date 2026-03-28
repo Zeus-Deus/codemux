@@ -174,14 +174,14 @@ export function NewProjectScreen() {
                   className={cn(
                     "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-all",
                     selected
-                      ? "border-primary/50 bg-primary/5"
+                      ? "border-foreground/50 bg-foreground/5"
                       : "border-border/50 hover:border-border hover:bg-accent/30",
                   )}
                 >
                   <option.icon
                     className={cn(
                       "h-6 w-6",
-                      selected ? "text-primary" : "text-muted-foreground",
+                      selected ? "text-foreground" : "text-muted-foreground",
                     )}
                   />
                   <div>
@@ -263,7 +263,7 @@ export function NewProjectScreen() {
 
           {/* Submit */}
           <div className="flex justify-end pt-2 border-t border-border/40">
-            <Button onClick={handleCreate} disabled={loading} size="sm">
+            <Button onClick={handleCreate} disabled={loading} size="sm" className="bg-foreground text-background hover:bg-foreground/90">
               {loading && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
               {loading
                 ? mode === "clone"
