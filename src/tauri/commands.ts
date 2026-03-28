@@ -352,6 +352,9 @@ export const initGitRepo = (path: string) =>
 export const gitCloneRepo = (url: string, targetDir: string) =>
   invoke<string>("git_clone_repo", { url, targetDir });
 
+export const createEmptyRepo = (parentDir: string, name: string) =>
+  invoke<string>("create_empty_repo", { parentDir, name });
+
 export const getGitStatus = (path: string) =>
   invoke<GitFileStatus[]>("get_git_status", { path });
 

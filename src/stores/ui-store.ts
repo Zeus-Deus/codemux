@@ -16,6 +16,7 @@ interface UIStore {
   pendingWorkspaces: PendingWorkspace[];
   lastSelectedAgentId: string | null;
   showCloneDialog: boolean;
+  showNewProjectScreen: boolean;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -30,6 +31,7 @@ interface UIStore {
   failPendingWorkspace: (id: string, error: string) => void;
   setLastSelectedAgentId: (id: string | null) => void;
   setShowCloneDialog: (show: boolean) => void;
+  setShowNewProjectScreen: (show: boolean) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -46,6 +48,7 @@ export const useUIStore = create<UIStore>()(
       pendingWorkspaces: [],
       lastSelectedAgentId: null,
       showCloneDialog: false,
+      showNewProjectScreen: false,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -93,6 +96,8 @@ export const useUIStore = create<UIStore>()(
       setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
 
       setShowCloneDialog: (show) => set({ showCloneDialog: show }),
+
+      setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
     }),
     {
       name: "codemux-ui",

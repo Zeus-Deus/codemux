@@ -5,11 +5,15 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { FolderPlus, FolderOpen, GitFork } from "lucide-react";
+import { FolderPlus, FolderOpen } from "lucide-react";
 import { useProjectActions } from "@/hooks/use-project-actions";
+import { useUIStore } from "@/stores/ui-store";
 
 export function SidebarAddRepo() {
-  const { openProject, openCloneDialog } = useProjectActions();
+  const { openProject } = useProjectActions();
+  const setShowNewProjectScreen = useUIStore(
+    (s) => s.setShowNewProjectScreen,
+  );
 
   return (
     <div className="border-t border-border p-2">
@@ -29,9 +33,12 @@ export function SidebarAddRepo() {
             <FolderOpen className="mr-2 h-3.5 w-3.5" />
             Open project
           </DropdownMenuItem>
-          <DropdownMenuItem onClick={openCloneDialog} className="text-xs">
-            <GitFork className="mr-2 h-3.5 w-3.5" />
-            Clone repository
+          <DropdownMenuItem
+            onClick={() => setShowNewProjectScreen(true)}
+            className="text-xs"
+          >
+            <FolderPlus className="mr-2 h-3.5 w-3.5" />
+            New project
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

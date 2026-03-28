@@ -10,6 +10,7 @@ import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
+import { NewProjectScreen } from "@/components/overlays/new-project-screen";
 import { FileSearchDialog } from "@/components/search/file-search-dialog";
 import { ContentSearchDialog } from "@/components/search/content-search-dialog";
 
@@ -21,6 +22,7 @@ export function AppShell() {
     (s) => (s.appState?.workspaces.length ?? 0) > 0,
   );
   const showSettings = useUIStore((s) => s.showSettings);
+  const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
@@ -50,6 +52,11 @@ export function AppShell() {
   // Full-screen settings — replaces entire app including sidebar
   if (showSettings) {
     return <SettingsView />;
+  }
+
+  // Full-screen new project — replaces entire app including sidebar
+  if (showNewProjectScreen) {
+    return <NewProjectScreen />;
   }
 
   return (

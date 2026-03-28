@@ -422,6 +422,7 @@ pub fn run() {
             commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,
+            commands::create_empty_repo,
             commands::get_git_status,
             commands::get_git_diff,
             commands::get_git_diff_stat,

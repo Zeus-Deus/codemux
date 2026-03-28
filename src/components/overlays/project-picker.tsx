@@ -13,9 +13,10 @@ import {
   CommandList,
   CommandSeparator,
 } from "@/components/ui/command";
-import { Check, ChevronDown, FolderOpen, GitFork } from "lucide-react";
+import { Check, ChevronDown, FolderOpen, FolderPlus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAppStore, useProjectGroupedWorkspaces } from "@/stores/app-store";
+import { useUIStore } from "@/stores/ui-store";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
 import { useProjectActions } from "@/hooks/use-project-actions";
 
@@ -118,7 +119,10 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
   }, [value, projectGroups, recentProjects]);
 
   const selectedColor = value ? projectColors[value] || null : null;
-  const { openProject, openCloneDialog } = useProjectActions();
+  const { openProject } = useProjectActions();
+  const setShowNewProjectScreen = useUIStore(
+    (s) => s.setShowNewProjectScreen,
+  );
 
   const handleOpenProject = async () => {
     setOpen(false);
@@ -211,12 +215,12 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
               type="button"
               onClick={() => {
                 setOpen(false);
-                openCloneDialog();
+                setShowNewProjectScreen(true);
               }}
               className="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-xs text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors"
             >
-              <GitFork className="h-3.5 w-3.5" />
-              Clone repository
+              <FolderPlus className="h-3.5 w-3.5" />
+              New project
             </button>
           </div>
         </Command>

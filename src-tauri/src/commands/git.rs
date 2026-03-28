@@ -12,6 +12,15 @@ pub fn init_git_repo(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
+    let repo_path = Path::new(&parent_dir).join(&name);
+    std::fs::create_dir_all(&repo_path)
+        .map_err(|e| format!("Failed to create directory: {e}"))?;
+    crate::git::git_init_repo(&repo_path)?;
+    Ok(repo_path.display().to_string())
+}
+
+#[tauri::command]
 pub fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
     crate::git::git_status(Path::new(&path))
 }
