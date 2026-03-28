@@ -19,7 +19,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { cn } from "@/lib/utils";
-import { X, Laptop, GitBranch, Workflow } from "lucide-react";
+import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
 import {
   activateWorkspace,
   closeWorkspace,
@@ -35,15 +35,7 @@ interface Props {
   isActive: boolean;
 }
 
-function handleCloseWorkspace(workspace: WorkspaceSnapshot) {
-  if (workspace.worktree_path) {
-    closeWorkspaceWithWorktree(workspace.workspace_id, true, false, false).catch(console.error);
-  } else {
-    closeWorkspace(workspace.workspace_id, false).catch(console.error);
-  }
-}
-
-function DeleteWorkspaceDialog({
+function RemoveWorkspaceDialog({
   workspace,
   open,
   onOpenChange,
@@ -53,41 +45,98 @@ function DeleteWorkspaceDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const isWorktree = !!workspace.worktree_path;
+  const [deleteBranch, setDeleteBranch] = useState(true);
+
+  const hasUnpushed = workspace.git_ahead > 0;
+  const hasUncommitted = workspace.git_changed_files > 0;
+  const hasWarnings = hasUnpushed || hasUncommitted;
+
+  const warningMessage = hasUnpushed && hasUncommitted
+    ? "Has uncommitted changes and unpushed commits"
+    : hasUncommitted
+      ? "Has uncommitted changes"
+      : hasUnpushed
+        ? "Has unpushed commits"
+        : null;
+
+  const handleHide = () => {
+    if (isWorktree) {
+      closeWorkspaceWithWorktree(workspace.workspace_id, false, false, false).catch(console.error);
+    } else {
+      closeWorkspace(workspace.workspace_id, false).catch(console.error);
+    }
+    onOpenChange(false);
+  };
+
+  const handleDelete = () => {
+    if (isWorktree) {
+      closeWorkspaceWithWorktree(workspace.workspace_id, true, deleteBranch, false).catch(console.error);
+    } else {
+      closeWorkspace(workspace.workspace_id, true).catch(console.error);
+    }
+    onOpenChange(false);
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-sm">
+      <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
-          <DialogTitle>Delete workspace &ldquo;{workspace.title}&rdquo;?</DialogTitle>
+          <DialogTitle className="text-sm">
+            Remove workspace &ldquo;{workspace.title}&rdquo;?
+          </DialogTitle>
           <DialogDescription>
-            {isWorktree && workspace.git_branch
-              ? `This will remove the worktree directory and delete the git branch '${workspace.git_branch}'.`
+            {isWorktree
+              ? "Deleting will permanently remove the worktree. You can hide instead to keep files on disk."
               : "This will close the workspace."}
           </DialogDescription>
         </DialogHeader>
-        <div className="flex justify-end gap-2 pt-2">
-          <Button variant="outline" size="sm" onClick={() => onOpenChange(false)}>
+
+        {/* Warning banner */}
+        {hasWarnings && (
+          <div className="flex items-center gap-2 rounded-md border border-yellow-500/20 bg-yellow-500/10 px-2.5 py-1.5 text-xs text-yellow-400">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            {warningMessage}
+          </div>
+        )}
+
+        {/* Delete branch checkbox */}
+        {isWorktree && (
+          <label className="flex items-center gap-2 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={deleteBranch}
+              onChange={(e) => setDeleteBranch(e.target.checked)}
+              className="rounded border-border"
+            />
+            <span className="text-xs text-muted-foreground">
+              Also delete local branch
+            </span>
+          </label>
+        )}
+
+        <div className="flex justify-end gap-2 pt-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={() => onOpenChange(false)}
+          >
             Cancel
           </Button>
-          {isWorktree ? (
+          <Button
+            variant="secondary"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={handleHide}
+          >
+            Hide
+          </Button>
+          {isWorktree && (
             <Button
               variant="destructive"
               size="sm"
-              onClick={() => {
-                closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false).catch(console.error);
-                onOpenChange(false);
-              }}
-            >
-              Delete
-            </Button>
-          ) : (
-            <Button
-              variant="destructive"
-              size="sm"
-              onClick={() => {
-                closeWorkspace(workspace.workspace_id, true).catch(console.error);
-                onOpenChange(false);
-              }}
+              className="h-7 px-3 text-xs"
+              onClick={handleDelete}
             >
               Delete
             </Button>
@@ -100,10 +149,10 @@ function DeleteWorkspaceDialog({
 
 function WorkspaceContextMenuItems({
   workspace,
-  onDeleteRequest,
+  onRemoveRequest,
 }: {
   workspace: WorkspaceSnapshot;
-  onDeleteRequest: () => void;
+  onRemoveRequest: () => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
 
@@ -156,23 +205,15 @@ function WorkspaceContextMenuItems({
         Copy branch name
       </ContextMenuItem>
       <ContextMenuSeparator />
-      <ContextMenuItem
-        onClick={() => handleCloseWorkspace(workspace)}
-      >
-        Close workspace
-      </ContextMenuItem>
-      <ContextMenuItem
-        className="text-destructive focus:text-destructive"
-        onClick={onDeleteRequest}
-      >
-        Delete workspace
+      <ContextMenuItem onClick={onRemoveRequest}>
+        Close Worktree
       </ContextMenuItem>
     </ContextMenuContent>
   );
 }
 
 export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
-  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
+  const [showRemoveDialog, setShowRemoveDialog] = useState(false);
 
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
@@ -241,7 +282,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     <span className={cn(
                       "flex items-center gap-1.5 text-[10px] font-mono tabular-nums rounded px-1.5 h-5",
                       isActive ? "bg-foreground/10" : "bg-muted/50",
-                      !isPrimary && "transition-opacity group-hover:opacity-0",
+                      "transition-opacity group-hover:opacity-0",
                     )}>
                       {workspace.git_additions > 0 && (
                         <span className="text-success">+{workspace.git_additions}</span>
@@ -251,17 +292,15 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                       )}
                     </span>
                   )}
-                  {!isPrimary && (
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground justify-end"
-                      onClick={(e) => { e.stopPropagation(); handleCloseWorkspace(workspace); }}
-                      aria-label="Close workspace"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground justify-end"
+                    onClick={(e) => { e.stopPropagation(); setShowRemoveDialog(true); }}
+                    aria-label="Remove workspace"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </Button>
                 </div>
 
                 {/* Notification badge */}
@@ -288,13 +327,13 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
         </ContextMenuTrigger>
         <WorkspaceContextMenuItems
           workspace={workspace}
-          onDeleteRequest={() => setShowDeleteDialog(true)}
+          onRemoveRequest={() => setShowRemoveDialog(true)}
         />
       </ContextMenu>
-      <DeleteWorkspaceDialog
+      <RemoveWorkspaceDialog
         workspace={workspace}
-        open={showDeleteDialog}
-        onOpenChange={setShowDeleteDialog}
+        open={showRemoveDialog}
+        onOpenChange={setShowRemoveDialog}
       />
     </>
   );

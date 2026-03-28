@@ -112,20 +112,20 @@ describe("SidebarWorkspaceRow", () => {
     expect(branchIcon).toBeInTheDocument();
   });
 
-  it("hides close button for primary checkout", () => {
+  it("shows remove button for primary checkout", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
       <SidebarWorkspaceRow workspace={ws} isActive={false} />,
     );
-    expect(container.querySelector("[aria-label='Close workspace']")).toBeNull();
+    expect(container.querySelector("[aria-label='Remove workspace']")).not.toBeNull();
   });
 
-  it("shows close button for worktree checkout", () => {
+  it("shows remove button for worktree checkout", () => {
     const ws = makeWorkspace({ worktree_path: "/home/user/.worktrees/feature" });
     const { container } = render(
       <SidebarWorkspaceRow workspace={ws} isActive={false} />,
     );
-    expect(container.querySelector("[aria-label='Close workspace']")).not.toBeNull();
+    expect(container.querySelector("[aria-label='Remove workspace']")).not.toBeNull();
   });
 
   it("shows ahead/behind indicators when counts > 0", () => {
