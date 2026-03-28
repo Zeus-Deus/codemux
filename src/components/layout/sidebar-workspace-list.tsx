@@ -25,6 +25,7 @@ export function SidebarWorkspaceList() {
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
 
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dropIndicatorY, setDropIndicatorY] = useState<number | null>(null);
@@ -311,6 +312,9 @@ export function SidebarWorkspaceList() {
                   onWorkspaceDragStart={handleWorkspaceDragStart}
                   onProjectDragStart={handleProjectDragStart(group.projectPath)}
                   dragStateId={dragState?.id ?? null}
+                  pendingWorkspaces={pendingWorkspaces.filter(
+                    (pw) => pw.projectPath === group.projectPath,
+                  )}
                 />
               </div>
             </div>

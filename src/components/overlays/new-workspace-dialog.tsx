@@ -7,28 +7,39 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
+import { Textarea } from "@/components/ui/textarea";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   GitBranch,
   GitPullRequest,
-  Plus,
   Loader2,
-  AlertCircle,
-  FolderOpen,
+  ArrowUp,
+  ChevronDown,
+  Plus,
+  Check,
+  Paperclip,
+  X,
 } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { PresetIcon } from "@/components/icons/preset-icon";
+import { ProjectPicker } from "./project-picker";
 import {
   listBranches,
   listWorktrees,
@@ -38,55 +49,20 @@ import {
   importWorktreeWorkspace,
   activateWorkspace,
   getPresets,
-  applyPreset,
+  checkIsGitRepo,
+  dbAddRecentProject,
+  generateBranchName,
+  generateRandomBranchName,
   checkGhAvailable,
   checkGithubRepo,
   listPullRequests,
-  pickFolderDialog,
-  checkIsGitRepo,
-  dbAddRecentProject,
-  initGitRepo,
+  pickFilesDialog,
 } from "@/tauri/commands";
-import type {
-  TerminalPreset,
-  PullRequestInfo,
-  WorktreeInfo,
-} from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, PullRequestInfo } from "@/tauri/types";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-}
-
-function PresetSelector({
-  presets,
-  selected,
-  onSelect,
-}: {
-  presets: TerminalPreset[];
-  selected: string | null;
-  onSelect: (id: string | null) => void;
-}) {
-  if (presets.length === 0) return null;
-  return (
-    <div className="space-y-1.5">
-      <label className="text-xs text-muted-foreground">Preset</label>
-      <div className="flex flex-wrap gap-1.5">
-        {presets.map((p) => (
-          <Button
-            key={p.id}
-            variant={selected === p.id ? "secondary" : "outline"}
-            size="sm"
-            className={selected === p.id ? "border-primary bg-primary/10" : ""}
-            onClick={() => onSelect(selected === p.id ? null : p.id)}
-            aria-pressed={selected === p.id}
-          >
-            {p.name}
-          </Button>
-        ))}
-      </div>
-    </div>
-  );
 }
 
 export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
@@ -94,99 +70,78 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const activeWs = appState?.workspaces.find(
     (w) => w.workspace_id === appState.active_workspace_id,
   );
-  // Use the project dir passed from the "+" button if available,
-  // otherwise fall back to the active workspace's project root or cwd.
   const storeProjectDir = useUIStore((s) => s.newWorkspaceProjectDir);
-  const defaultDir = storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
+  const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);
+  const addPendingWorkspace = useUIStore((s) => s.addPendingWorkspace);
+  const removePendingWorkspace = useUIStore((s) => s.removePendingWorkspace);
+  const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
+  const setLastSelectedAgentId = useUIStore((s) => s.setLastSelectedAgentId);
 
-  // Project directory (editable, defaults to the target project root)
+  const defaultDir =
+    storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
+
+  // Form state
   const [projectDir, setProjectDir] = useState(defaultDir);
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [branchName, setBranchName] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
+    lastSelectedAgentId || "builtin-claude",
+  );
+  const [baseBranch, setBaseBranch] = useState("main");
+  const [attachments, setAttachments] = useState<string[]>([]);
 
-  // Synchronously reset projectDir when dialog opens.
-  // This runs during render (before effects) so the fetch effect
-  // always sees the correct directory — no two-effect race condition.
-  const prevOpenRef = useRef(false);
-  if (open && !prevOpenRef.current && projectDir !== (defaultDir || "")) {
-    setProjectDir(defaultDir || "");
-  }
-  prevOpenRef.current = open;
-
-  const handlePickFolder = async () => {
-    const folder = await pickFolderDialog("Choose project folder");
-    if (folder) setProjectDir(folder);
-  };
-
-  // Tab selection — default to "existing" when branches exist
-  const [activeTab, setActiveTab] = useState("new-branch");
-
-  // Git repo detection
-  const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
-  const [initializing, setInitializing] = useState(false);
-  const [reloadKey, setReloadKey] = useState(0);
-
-  const handleInitGit = async () => {
-    if (!projectDir || initializing) return;
-    setInitializing(true);
-    setError(null);
-    try {
-      await initGitRepo(projectDir);
-      setIsGitRepo(true);
-      setReloadKey((k) => k + 1);
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setInitializing(false);
-    }
-  };
-
-  // Shared state
+  // Data state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
-  const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Branch state
   const [localBranches, setLocalBranches] = useState<string[]>([]);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
-  const [branchSearch, setBranchSearch] = useState("");
-  const [selectedBranch, setSelectedBranch] = useState<string | null>(null);
-  const [newBranchName, setNewBranchName] = useState("");
-  const [baseBranch, setBaseBranch] = useState("");
-
-  // PR state
-  const [prs, setPrs] = useState<PullRequestInfo[]>([]);
+  const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
+  const [prBranches, setPrBranches] = useState<Set<string>>(new Set());
+  const [openPrs, setOpenPrs] = useState<PullRequestInfo[]>([]);
   const [ghAvailable, setGhAvailable] = useState(false);
-  const [prLoading, setPrLoading] = useState(false);
 
-  // Load data when dialog opens or project directory changes
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Reset state when dialog opens
+  const prevOpenRef = useRef(false);
+  if (open && !prevOpenRef.current) {
+    const dir = storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
+    if (projectDir !== dir) setProjectDir(dir);
+    setWorkspaceName("");
+    setBranchName("");
+    setPrompt("");
+    setSelectedAgentId(lastSelectedAgentId || "builtin-claude");
+    setBaseBranch("main");
+    setAttachments([]);
+  }
+  prevOpenRef.current = open;
+
+  // Load data when dialog opens or project changes
   useEffect(() => {
     if (!open || !projectDir) return;
     let cancelled = false;
 
-    setError(null);
-    setCreating(false);
-    setNewBranchName("");
-    setBranchSearch("");
-    setSelectedBranch(null);
     setIsGitRepo(null);
     setLocalBranches([]);
     setRemoteBranches([]);
-    setPrs([]);
+    setPrBranches(new Set());
 
-    // Check git status first
     checkIsGitRepo(projectDir).then((isRepo) => {
       if (cancelled) return;
       setIsGitRepo(isRepo);
       if (!isRepo) return;
 
-      // Fetch branches
       Promise.all([
         listBranches(projectDir, false).catch(() => []),
         listBranches(projectDir, true).catch(() => []),
         listWorktrees(projectDir).catch(() => []),
-        getGitBranchInfo(projectDir).catch(() => ({ branch: null, ahead: 0, behind: 0 })),
+        getGitBranchInfo(projectDir).catch(() => ({
+          branch: null,
+          ahead: 0,
+          behind: 0,
+        })),
       ]).then(([local, remote, wt, info]) => {
         if (cancelled) return;
         setLocalBranches(local);
@@ -194,58 +149,57 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         setWorktrees(wt);
         setCurrentBranch(info.branch);
         setBaseBranch(info.branch ?? "main");
-        // Default to "existing" tab when branches are available
-        if (local.length > 0 || remote.length > 0) {
-          setActiveTab("existing");
-        }
       });
 
-      // Check gh
+      // Fetch open PRs for branch badges and "+" menu (non-blocking)
       Promise.all([checkGhAvailable(), checkGithubRepo(projectDir)])
         .then(([available, isGhRepo]) => {
           if (cancelled) return;
           setGhAvailable(available && isGhRepo);
-          if (available && isGhRepo) {
-            setPrLoading(true);
-            listPullRequests(projectDir, "open")
-              .then((p) => { if (!cancelled) setPrs(p); })
-              .catch(() => { if (!cancelled) setPrs([]); })
-              .finally(() => { if (!cancelled) setPrLoading(false); });
-          }
+          if (!available || !isGhRepo) return;
+          listPullRequests(projectDir, "open")
+            .then((prs) => {
+              if (cancelled) return;
+              setOpenPrs(prs);
+              const heads = new Set<string>();
+              for (const pr of prs) {
+                if (pr.head_branch) heads.add(pr.head_branch);
+              }
+              setPrBranches(heads);
+            })
+            .catch(() => {});
         })
-        .catch(() => { if (!cancelled) setGhAvailable(false); });
+        .catch(() => {});
     });
 
-    // Fetch presets (independent of git status)
+    // Fetch presets
     getPresets()
-      .then((snap) => { if (!cancelled) setPresets(snap.presets.filter((p) => p.pinned)); })
+      .then((snap) => {
+        if (!cancelled) setPresets(snap.presets.filter((p) => p.pinned));
+      })
       .catch(() => {});
 
-    return () => { cancelled = true; };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, projectDir, reloadKey]);
+    return () => {
+      cancelled = true;
+    };
+  }, [open, projectDir]);
 
-  // Merged branch list (deduplicated)
-  const allBranches = useMemo(() => {
-    const set = new Set([...localBranches, ...remoteBranches]);
-    return Array.from(set).sort();
-  }, [localBranches, remoteBranches]);
+  // Focus textarea when dialog opens
+  useEffect(() => {
+    if (open) {
+      setTimeout(() => textareaRef.current?.focus(), 100);
+    }
+  }, [open]);
 
-  const filteredBranches = useMemo(() => {
-    if (!branchSearch) return allBranches;
-    const q = branchSearch.toLowerCase();
-    return allBranches.filter((b) => b.toLowerCase().includes(q));
-  }, [allBranches, branchSearch]);
-
-  // Check if branch already has a workspace in the SAME project.
-  // Different projects can have branches with the same name (e.g. "main").
-  // Scope to projectDir (the dialog's target project), not the active workspace,
-  // because the user may have changed the project directory in the dialog input.
+  // Branch workspace map (same project scope)
   const branchWorkspaceMap = useMemo(() => {
     const map = new Map<string, string>();
     if (appState && projectDir) {
       for (const ws of appState.workspaces) {
-        if (ws.git_branch && (ws.project_root === projectDir || ws.cwd === projectDir)) {
+        if (
+          ws.git_branch &&
+          (ws.project_root === projectDir || ws.cwd === projectDir)
+        ) {
           map.set(ws.git_branch, ws.workspace_id);
         }
       }
@@ -253,309 +207,433 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return map;
   }, [appState, projectDir]);
 
-  const handleCreate = useCallback(
-    async (branch: string, isNewBranch: boolean) => {
-      if (!projectDir || creating) return;
-      setCreating(true);
-      setError(null);
+  // All branches merged and deduplicated
+  const allBranches = useMemo(() => {
+    const set = new Set([...localBranches, ...remoteBranches]);
+    return Array.from(set).sort();
+  }, [localBranches, remoteBranches]);
 
-      try {
-        // Check if workspace already exists for this branch
-        const existingWsId = branchWorkspaceMap.get(branch);
-        if (existingWsId) {
-          await activateWorkspace(existingWsId);
-          onOpenChange(false);
-          return;
-        }
-
-        let wsId: string;
-
-        // Current branch: open as workspace directly (no worktree needed)
-        if (branch === currentBranch && !isNewBranch) {
-          wsId = await createWorkspace(projectDir);
-        } else {
-          // Check for orphan worktree
-          const orphan = worktrees.find(
-            (wt) => wt.branch === branch || wt.branch === `refs/heads/${branch}`,
-          );
-
-          if (orphan) {
-            wsId = await importWorktreeWorkspace(orphan.path, branch, "single");
-          } else {
-            wsId = await createWorktreeWorkspace(
-              projectDir,
-              branch,
-              isNewBranch,
-              "single",
-              isNewBranch ? baseBranch || null : null,
-            );
-          }
-        }
-
-        // Apply preset if selected
-        if (selectedPreset) {
-          await applyPreset(wsId, selectedPreset, "split_pane").catch(
-            console.error,
-          );
-        }
-
-        // Track as recent project
-        const projectName = projectDir.split("/").filter(Boolean).pop() || projectDir;
-        dbAddRecentProject(projectDir, projectName).catch(console.error);
-
-        onOpenChange(false);
-      } catch (err) {
-        setError(String(err));
-      } finally {
-        setCreating(false);
-      }
-    },
-    [projectDir, creating, selectedPreset, baseBranch, branchWorkspaceMap, worktrees, onOpenChange],
+  // Selected agent preset
+  const selectedAgent = useMemo(
+    () => presets.find((p) => p.id === selectedAgentId) ?? null,
+    [presets, selectedAgentId],
   );
+
+  // Auto-resize textarea (min 96px = ~5 lines, max 192px = ~10 lines)
+  const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setPrompt(e.target.value);
+    const ta = e.target;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 40), 192)}px`;
+  };
+
+  const handleSubmit = useCallback(async () => {
+    if (!projectDir) return;
+
+    // Build full prompt with attachments
+    const fullPrompt = attachments.length > 0
+      ? `${prompt.trim()}\n\nAttached files:\n${attachments.map((f) => `- ${f}`).join("\n")}`
+      : prompt.trim();
+
+    // Close dialog immediately (optimistic)
+    onOpenChange(false);
+
+    // Generate a temporary ID for the pending workspace
+    const tempId = crypto.randomUUID();
+    const displayName =
+      workspaceName || prompt.slice(0, 40) || branchName || "New workspace";
+
+    addPendingWorkspace({
+      id: tempId,
+      name: displayName,
+      projectPath: projectDir,
+      status: "creating",
+    });
+
+    try {
+      // Determine branch name
+      let resolvedBranch = branchName.trim();
+      let isNewBranch = true;
+
+      if (!resolvedBranch) {
+        if (fullPrompt) {
+          // AI-generated branch name from prompt
+          resolvedBranch = await generateBranchName(prompt, projectDir);
+        } else {
+          // Random branch name
+          resolvedBranch = await generateRandomBranchName(projectDir);
+        }
+      } else {
+        // User provided a branch name — check if it's an existing branch
+        if (allBranches.includes(resolvedBranch)) {
+          isNewBranch = false;
+        }
+      }
+
+      // Check if workspace already exists for this branch
+      const existingWsId = branchWorkspaceMap.get(resolvedBranch);
+      if (existingWsId) {
+        await activateWorkspace(existingWsId);
+        removePendingWorkspace(tempId);
+        return;
+      }
+
+      let wsId: string;
+
+      // Current branch: open as workspace directly
+      if (resolvedBranch === currentBranch && !isNewBranch) {
+        wsId = await createWorkspace(projectDir);
+      } else {
+        // Check for orphan worktree
+        const orphan = worktrees.find(
+          (wt) =>
+            wt.branch === resolvedBranch ||
+            wt.branch === `refs/heads/${resolvedBranch}`,
+        );
+
+        if (orphan) {
+          wsId = await importWorktreeWorkspace(
+            orphan.path,
+            resolvedBranch,
+            "single",
+          );
+        } else {
+          wsId = await createWorktreeWorkspace(
+            projectDir,
+            resolvedBranch,
+            isNewBranch,
+            "single",
+            isNewBranch ? baseBranch || null : null,
+            fullPrompt || null,
+            selectedAgentId,
+          );
+        }
+      }
+
+      // Track as recent project
+      const pName =
+        projectDir.split("/").filter(Boolean).pop() || projectDir;
+      dbAddRecentProject(projectDir, pName).catch(console.error);
+
+      removePendingWorkspace(tempId);
+      await activateWorkspace(wsId);
+    } catch (err) {
+      failPendingWorkspace(tempId, String(err));
+      // Auto-remove failed entry after 5 seconds
+      setTimeout(() => removePendingWorkspace(tempId), 5000);
+    }
+  }, [
+    projectDir,
+    workspaceName,
+    branchName,
+    prompt,
+    attachments,
+    selectedAgentId,
+    baseBranch,
+    allBranches,
+    branchWorkspaceMap,
+    worktrees,
+    currentBranch,
+    onOpenChange,
+    addPendingWorkspace,
+    removePendingWorkspace,
+    failPendingWorkspace,
+  ]);
+
+  // Handle Ctrl+Enter
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-[500px] sm:max-w-[500px] h-[440px] max-h-[85vh] flex flex-col p-0 gap-0 overflow-hidden">
-        <DialogHeader className="p-4 pb-0 shrink-0">
-          <DialogTitle className="text-sm">New Workspace</DialogTitle>
-          <DialogDescription className="sr-only">Create a new workspace from a branch or pull request</DialogDescription>
+      <DialogContent
+        showCloseButton={false}
+        className="sm:max-w-[560px] max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-hidden"
+        onKeyDown={handleKeyDown}
+      >
+        <DialogHeader className="sr-only">
+          <DialogTitle>New Workspace</DialogTitle>
+          <DialogDescription>
+            Create a new workspace from a prompt
+          </DialogDescription>
         </DialogHeader>
 
-        <div className="px-4 pt-3 space-y-1.5 shrink-0">
-          <label className="text-xs text-muted-foreground">Project Directory</label>
-          <div className="flex gap-1.5">
-            <Input
-              value={projectDir}
-              onChange={(e) => setProjectDir(e.target.value)}
-              className="h-8 text-xs flex-1"
-              placeholder={defaultDir || "Select a project folder"}
+        {/* Top row: workspace name + branch name — nearly invisible inline labels */}
+        <div className="flex gap-3 px-4 pt-3 pb-0.5">
+          <Input
+            value={workspaceName}
+            onChange={(e) => setWorkspaceName(e.target.value)}
+            placeholder="Workspace name (optional)"
+            className="h-6 text-xs flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
+          />
+          <Input
+            value={branchName}
+            onChange={(e) => setBranchName(e.target.value)}
+            placeholder="branch name"
+            className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
+          />
+        </div>
+
+        {/* Center: prompt textarea with embedded controls */}
+        <div className="px-3 pt-2 pb-3">
+          <div className="rounded-2xl border border-border bg-muted overflow-hidden">
+            <Textarea
+              ref={textareaRef}
+              value={prompt}
+              onChange={handleTextareaChange}
+              placeholder="What do you want to do?"
+              className="min-h-10 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
+              rows={1}
             />
-            <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handlePickFolder}>
-              <FolderOpen className="h-3.5 w-3.5" />
-            </Button>
+
+            {/* Attachment chips */}
+            {attachments.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                {attachments.map((file) => (
+                  <span
+                    key={file}
+                    className="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-0.5 text-[11px] text-muted-foreground"
+                  >
+                    <Paperclip className="h-2.5 w-2.5" />
+                    <span className="max-w-[160px] truncate">
+                      {file.split("/").pop()}
+                    </span>
+                    <button
+                      type="button"
+                      className="ml-0.5 rounded-full p-0.5 hover:bg-foreground/10 transition-colors"
+                      onClick={() =>
+                        setAttachments((prev) => prev.filter((f) => f !== file))
+                      }
+                    >
+                      <X className="h-2.5 w-2.5" />
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* Footer inside textarea border */}
+            <div className="flex items-center justify-between px-3 pb-3 pt-0">
+              {/* Agent picker — pill with real icon */}
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-foreground transition-colors outline-none hover:bg-muted"
+                  >
+                    {selectedAgent ? (
+                      <>
+                        <PresetIcon icon={selectedAgent.icon} className="h-3.5 w-3.5" />
+                        {selectedAgent.name}
+                      </>
+                    ) : (
+                      <>
+                        <PresetIcon icon="claude" className="h-3.5 w-3.5" />
+                        Claude Code
+                      </>
+                    )}
+                    <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="start" className="w-[200px]">
+                  {presets.map((p) => (
+                    <DropdownMenuItem
+                      key={p.id}
+                      onClick={() => {
+                        setSelectedAgentId(p.id);
+                        setLastSelectedAgentId(p.id);
+                      }}
+                      className="text-xs gap-2"
+                    >
+                      <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
+                      <span className="flex-1">{p.name}</span>
+                      {selectedAgentId === p.id && (
+                        <Check className="h-3.5 w-3.5 text-primary" />
+                      )}
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+              <div className="flex items-center gap-1.5">
+                {/* "+" menu button — attach files, link PR */}
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      type="button"
+                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted/60 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
+                    >
+                      <Plus className="h-4 w-4" />
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-[220px]">
+                    <DropdownMenuItem
+                      className="text-xs"
+                      onClick={async () => {
+                        const files = await pickFilesDialog("Attach files");
+                        if (files.length > 0) {
+                          setAttachments((prev) => {
+                            const existing = new Set(prev);
+                            return [...prev, ...files.filter((f) => !existing.has(f))];
+                          });
+                        }
+                      }}
+                    >
+                      <Paperclip className="mr-2 h-3.5 w-3.5" />
+                      Add attachment
+                    </DropdownMenuItem>
+
+                    {/* Link pull request — sub-menu with PR list */}
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger className="text-xs">
+                        <GitPullRequest className="mr-2 h-3.5 w-3.5" />
+                        Link pull request
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent className="w-[260px] max-h-[240px] overflow-y-auto">
+                        {!ghAvailable ? (
+                          <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                            GitHub CLI not available
+                          </DropdownMenuItem>
+                        ) : openPrs.length === 0 ? (
+                          <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                            No open pull requests
+                          </DropdownMenuItem>
+                        ) : (
+                          openPrs.map((pr) => (
+                            <DropdownMenuItem
+                              key={pr.number}
+                              className="text-xs gap-2"
+                              disabled={!pr.head_branch}
+                              onClick={() => {
+                                if (pr.head_branch) setBranchName(pr.head_branch);
+                              }}
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate">{pr.title}</div>
+                                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                  <span>#{pr.number}</span>
+                                  {pr.head_branch && (
+                                    <>
+                                      <span className="opacity-40">-</span>
+                                      <span className="truncate font-mono">{pr.head_branch}</span>
+                                    </>
+                                  )}
+                                </div>
+                              </div>
+                            </DropdownMenuItem>
+                          ))
+                        )}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+
+                {/* Submit button — circular icon, muted style */}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="Create"
+                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 outline-none"
+                      onClick={handleSubmit}
+                      disabled={!projectDir}
+                    >
+                      <ArrowUp className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">Create workspace</TooltipContent>
+                </Tooltip>
+              </div>
+            </div>
           </div>
         </div>
 
-        {isGitRepo === false ? (
-          <div className="px-4 py-6 flex flex-col items-center gap-3">
-            <AlertCircle className="h-8 w-8 text-muted-foreground/40" />
-            <p className="text-sm text-muted-foreground">
-              This folder is not a git repository
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleInitGit}
-              disabled={initializing}
-            >
-              {initializing && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
-              Initialize Git Repository
-            </Button>
-          </div>
-        ) : (
-        <>
-        <Tabs value={activeTab} onValueChange={setActiveTab} className="flex flex-col flex-1 min-h-0">
-          <TabsList variant="line" className="mx-4 mt-2 h-8">
-            <TabsTrigger value="new-branch" className="text-xs px-2 gap-1">
-              <Plus className="h-3 w-3" /> New Branch
-            </TabsTrigger>
-            <TabsTrigger value="existing" className="text-xs px-2 gap-1">
-              <GitBranch className="h-3 w-3" /> Existing
-            </TabsTrigger>
-            <TabsTrigger value="pr" className="text-xs px-2 gap-1">
-              <GitPullRequest className="h-3 w-3" /> Pull Request
-            </TabsTrigger>
-          </TabsList>
+        {/* Bottom row: project + branch pickers as muted pills */}
+        <div className="flex items-center gap-2 px-4 pb-3">
+          <ProjectPicker
+            value={projectDir || null}
+            onChange={(path) => setProjectDir(path)}
+          />
 
-          {/* ── New Branch ── */}
-          <TabsContent value="new-branch" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
-            <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">
-                Branch name
-              </label>
-              <Input
-                placeholder="feature/my-feature"
-                value={newBranchName}
-                onChange={(e) => setNewBranchName(e.target.value)}
-                className="h-8 text-sm"
-                autoFocus
-              />
-            </div>
-            <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">
-                Base branch
-              </label>
-              <Select value={baseBranch} onValueChange={setBaseBranch}>
-                <SelectTrigger className="h-8 text-sm">
-                  <SelectValue placeholder="Select base branch" />
-                </SelectTrigger>
-                <SelectContent>
-                  {localBranches.map((b) => (
-                    <SelectItem key={b} value={b}>
-                      {b}{b === currentBranch ? " (current)" : ""}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          </TabsContent>
-
-          {/* ── Existing Branch ── */}
-          <TabsContent value="existing" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
-            <Input
-              placeholder="Search branches..."
-              value={branchSearch}
-              onChange={(e) => setBranchSearch(e.target.value)}
-              className="h-8 text-sm"
-            />
-            <div className="space-y-0.5">
-              {filteredBranches.map((branch) => {
-                const hasWs = branchWorkspaceMap.has(branch);
-                const isSelected = selectedBranch === branch;
-                return (
-                  <Button
-                    key={branch}
-                    variant="ghost"
-                    className={cn(
-                      "w-full justify-start gap-2 px-2 py-1.5 h-auto text-sm text-left min-w-0",
-                      isSelected && "bg-accent",
-                    )}
-                    onClick={() => setSelectedBranch(branch)}
-                    disabled={creating}
-                  >
-                    <GitBranch className="h-3 w-3 shrink-0 text-muted-foreground" />
-                    <span className="truncate flex-1 min-w-0" title={branch}>{branch}</span>
-                    <div className="flex gap-1 shrink-0">
-                      {branch === currentBranch && (
-                        <Badge variant="secondary" className="text-[10px]">
-                          current
+          {/* Base branch picker */}
+          {isGitRepo !== false && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-7 gap-1.5 rounded-full bg-muted/60 px-3 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
+                  disabled={allBranches.length === 0}
+                >
+                  <GitBranch className="h-3 w-3" />
+                  <span className="max-w-[100px] truncate">{baseBranch}</span>
+                  <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent
+                align="start"
+                className="max-h-[240px] w-[240px] overflow-y-auto"
+              >
+                {allBranches.map((branch) => {
+                  const isDefault =
+                    branch === "main" || branch === "master";
+                  const hasWs = branchWorkspaceMap.has(branch);
+                  const hasPr = prBranches.has(branch);
+                  return (
+                    <DropdownMenuItem
+                      key={branch}
+                      onClick={() => setBaseBranch(branch)}
+                      className={cn(
+                        "text-xs gap-2",
+                        baseBranch === branch && "bg-accent",
+                      )}
+                    >
+                      <span className="truncate flex-1">{branch}</span>
+                      {hasPr && (
+                        <Badge
+                          variant="secondary"
+                          className="text-[9px] px-1 py-0 bg-purple-500/15 text-purple-400 border-purple-500/20"
+                        >
+                          PR
+                        </Badge>
+                      )}
+                      {isDefault && (
+                        <Badge
+                          variant="secondary"
+                          className="text-[9px] px-1 py-0"
+                        >
+                          default
                         </Badge>
                       )}
                       {hasWs && (
-                        <Badge variant="outline" className="text-[10px]">
+                        <Badge
+                          variant="outline"
+                          className="text-[9px] px-1 py-0"
+                        >
                           open
                         </Badge>
                       )}
-                    </div>
-                  </Button>
-                );
-              })}
-              {filteredBranches.length === 0 && (
-                <p className="text-xs text-muted-foreground text-center py-4">
-                  No branches found
-                </p>
-              )}
-            </div>
-          </TabsContent>
-
-          {/* ── Pull Requests ── */}
-          <TabsContent value="pr" className="px-4 py-3 space-y-3 min-h-0 overflow-y-auto">
-            {!ghAvailable ? (
-              <div className="text-center py-6 space-y-2">
-                <AlertCircle className="h-8 w-8 mx-auto text-muted-foreground/40" />
-                <p className="text-xs text-muted-foreground">
-                  GitHub CLI not available or not a GitHub repo
-                </p>
-              </div>
-            ) : prLoading ? (
-              <div className="flex items-center justify-center py-6">
-                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-              </div>
-            ) : (
-              <div className="space-y-0.5">
-                {prs.map((pr) => (
-                  <Button
-                    key={pr.number}
-                    variant="ghost"
-                    className="w-full justify-start gap-2 px-2 py-2 h-auto text-left items-start"
-                    onClick={() =>
-                      pr.head_branch &&
-                      handleCreate(pr.head_branch, false)
-                    }
-                    disabled={creating || !pr.head_branch}
-                  >
-                    <GitPullRequest className="h-3.5 w-3.5 shrink-0 text-muted-foreground mt-0.5" />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-sm truncate">
-                          {pr.title}
-                        </span>
-                        <span className="text-[10px] text-muted-foreground shrink-0">
-                          #{pr.number}
-                        </span>
-                      </div>
-                      <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
-                        <GitBranch className="h-2.5 w-2.5" />
-                        <span className="truncate">
-                          {pr.head_branch}
-                        </span>
-                        {pr.is_draft && (
-                          <Badge
-                            variant="secondary"
-                            className="text-[10px]"
-                          >
-                            draft
-                          </Badge>
-                        )}
-                      </div>
-                    </div>
-                  </Button>
-                ))}
-                {prs.length === 0 && (
-                  <p className="text-xs text-muted-foreground text-center py-4">
-                    No open pull requests
-                  </p>
+                    </DropdownMenuItem>
+                  );
+                })}
+                {allBranches.length === 0 && (
+                  <DropdownMenuItem disabled className="text-xs">
+                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
+                    Loading...
+                  </DropdownMenuItem>
                 )}
-              </div>
-            )}
-          </TabsContent>
-        </Tabs>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
 
-        {/* ── Shared footer: preset + action button ── */}
-        <div className="shrink-0 px-4 pb-4 pt-3 space-y-3">
-          <PresetSelector
-            presets={presets}
-            selected={selectedPreset}
-            onSelect={setSelectedPreset}
-          />
-          {activeTab !== "pr" && <Separator />}
-          {activeTab === "new-branch" && (
-            <Button
-              className="w-full h-8 text-xs"
-              disabled={!newBranchName.trim() || creating}
-              onClick={() => handleCreate(newBranchName.trim(), true)}
-            >
-              {creating && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
-              Create Workspace
-            </Button>
-          )}
-          {activeTab === "existing" && (
-            <Button
-              className="w-full h-8 text-xs"
-              disabled={!selectedBranch || creating}
-              onClick={() => {
-                if (!selectedBranch) return;
-                const existingWsId = branchWorkspaceMap.get(selectedBranch);
-                if (existingWsId) {
-                  activateWorkspace(existingWsId).then(() => onOpenChange(false));
-                } else {
-                  handleCreate(selectedBranch, false);
-                }
-              }}
-            >
-              {creating && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
-              Open Workspace
-            </Button>
-          )}
+          <span className="ml-auto text-[10px] text-muted-foreground/40 select-none">
+            Ctrl+Enter to create
+          </span>
         </div>
-        </>
-        )}
-
-        {error && (
-          <div className="mx-4 mb-3 p-2 rounded-md bg-destructive/10 border border-destructive/20 text-xs text-destructive">
-            {error}
-          </div>
-        )}
       </DialogContent>
     </Dialog>
   );

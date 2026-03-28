@@ -3,6 +3,7 @@ use tauri::Manager;
 pub mod agent_context;
 pub mod ai;
 pub mod auth;
+pub mod branch_name;
 pub mod mcp_server;
 pub mod agent_browser;
 pub mod browser;
@@ -173,6 +174,16 @@ pub fn run() {
                 }
             }
 
+            // On Hyprland, xdg-desktop-portal-gtk file dialogs tile by default.
+            // Inject a window rule to float and size them like other floating dialogs.
+            let _ = std::process::Command::new("hyprctl")
+                .args([
+                    "keyword",
+                    "windowrule",
+                    "float on, center on, size 800 600, match:class ^(xdg-desktop-portal-gtk)$",
+                ])
+                .output();
+
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
             observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
@@ -298,6 +309,7 @@ pub fn run() {
             commands::get_shell_appearance,
             commands::get_app_state,
             commands::create_workspace,
+            commands::create_empty_workspace,
             commands::regenerate_mcp_config,
             commands::create_workspace_with_preset,
             commands::create_openflow_workspace,
@@ -311,6 +323,8 @@ pub fn run() {
             commands::create_worktree_workspace,
             commands::import_worktree_workspace,
             commands::close_workspace_with_worktree,
+            commands::generate_branch_name,
+            commands::generate_random_branch_name,
             commands::reorder_workspaces,
             commands::split_pane,
             commands::activate_pane,
@@ -376,6 +390,7 @@ pub fn run() {
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,
+            commands::pick_files_dialog,
             commands::list_available_cli_tools,
             commands::list_models_for_tool,
             commands::list_thinking_modes_for_tool,
@@ -438,6 +453,7 @@ pub fn run() {
             commands::abort_resolution,
             commands::get_resolution_diff,
             commands::resolve_conflicts_with_agent,
+            commands::git_clone_repo,
             commands::check_claude_available,
             commands::generate_ai_commit_message,
             commands::check_gh_available,

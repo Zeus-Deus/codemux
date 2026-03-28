@@ -145,7 +145,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             onSelect={() =>
               run(() =>
                 ws &&
-                ws.tabs.length > 1 &&
+                ws.tabs.length > 0 &&
                 closeTab(ws.workspace_id, ws.active_tab_id).catch(
                   console.error,
                 ),

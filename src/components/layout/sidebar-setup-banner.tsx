@@ -30,11 +30,11 @@ export function SidebarSetupBanner() {
     ? projectRoot.split("/").pop() ?? "project"
     : null;
 
-  // Check if there are any worktree workspaces for this project
-  const hasWorktrees = useMemo(() => {
+  // Check if there are any workspaces for this project
+  const hasProjectWorkspaces = useMemo(() => {
     if (!appState || !projectRoot) return false;
     return appState.workspaces.some(
-      (w) => w.project_root === projectRoot && w.worktree_path != null,
+      (w) => w.project_root === projectRoot || w.cwd === projectRoot,
     );
   }, [appState, projectRoot]);
 
@@ -63,8 +63,8 @@ export function SidebarSetupBanner() {
       .catch(() => setHasScripts(true));
   }, [projectRoot]);
 
-  // Don't show if: no project, already dismissed, already has scripts, or no worktrees
-  if (!projectRoot || dismissed || hasScripts || !hasWorktrees) {
+  // Don't show if: no project, already dismissed, already has scripts, or no workspaces
+  if (!projectRoot || dismissed || hasScripts || !hasProjectWorkspaces) {
     return null;
   }
 

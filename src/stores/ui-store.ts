@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import type { PendingWorkspace } from "@/tauri/types";
 
 export type RightPanelTab = "changes" | "files" | "pr";
 
@@ -12,6 +13,9 @@ interface UIStore {
   settingsSection: string | null;
   showFileSearch: boolean;
   showContentSearch: boolean;
+  pendingWorkspaces: PendingWorkspace[];
+  lastSelectedAgentId: string | null;
+  showCloneDialog: boolean;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -21,6 +25,11 @@ interface UIStore {
   setShowSettings: (show: boolean, section?: string | null) => void;
   setShowFileSearch: (show: boolean) => void;
   setShowContentSearch: (show: boolean) => void;
+  addPendingWorkspace: (pw: PendingWorkspace) => void;
+  removePendingWorkspace: (id: string) => void;
+  failPendingWorkspace: (id: string, error: string) => void;
+  setLastSelectedAgentId: (id: string | null) => void;
+  setShowCloneDialog: (show: boolean) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -34,6 +43,9 @@ export const useUIStore = create<UIStore>()(
       settingsSection: null,
       showFileSearch: false,
       showContentSearch: false,
+      pendingWorkspaces: [],
+      lastSelectedAgentId: null,
+      showCloneDialog: false,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -62,12 +74,32 @@ export const useUIStore = create<UIStore>()(
       setShowSettings: (show, section = null) => set({ showSettings: show, settingsSection: show ? (section ?? null) : null }),
       setShowFileSearch: (show) => set({ showFileSearch: show }),
       setShowContentSearch: (show) => set({ showContentSearch: show }),
+
+      addPendingWorkspace: (pw) =>
+        set((s) => ({ pendingWorkspaces: [...s.pendingWorkspaces, pw] })),
+
+      removePendingWorkspace: (id) =>
+        set((s) => ({
+          pendingWorkspaces: s.pendingWorkspaces.filter((pw) => pw.id !== id),
+        })),
+
+      failPendingWorkspace: (id, error) =>
+        set((s) => ({
+          pendingWorkspaces: s.pendingWorkspaces.map((pw) =>
+            pw.id === id ? { ...pw, status: "failed" as const, errorMessage: error } : pw,
+          ),
+        })),
+
+      setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
+
+      setShowCloneDialog: (show) => set({ showCloneDialog: show }),
     }),
     {
       name: "codemux-ui",
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: state.rightPanelWidth,
+        lastSelectedAgentId: state.lastSelectedAgentId,
       }),
     },
   ),

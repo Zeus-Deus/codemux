@@ -107,6 +107,9 @@ export const restartTerminalSession = (sessionId: string) =>
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });
 
+export const createEmptyWorkspace = (cwd: string) =>
+  invoke<string>("create_empty_workspace", { cwd });
+
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 
@@ -194,8 +197,24 @@ export const createWorktreeWorkspace = (
   newBranch: boolean,
   layout: string,
   base?: string | null,
+  initialPrompt?: string | null,
+  agentPresetId?: string | null,
 ) =>
-  invoke<string>("create_worktree_workspace", { repoPath, branch, newBranch, base: base ?? null, layout });
+  invoke<string>("create_worktree_workspace", {
+    repoPath,
+    branch,
+    newBranch,
+    base: base ?? null,
+    layout,
+    initialPrompt: initialPrompt ?? null,
+    agentPresetId: agentPresetId ?? null,
+  });
+
+export const generateBranchName = (prompt: string, projectPath: string) =>
+  invoke<string>("generate_branch_name", { prompt, projectPath });
+
+export const generateRandomBranchName = (projectPath: string) =>
+  invoke<string>("generate_random_branch_name", { projectPath });
 
 export const importWorktreeWorkspace = (
   worktreePath: string,
@@ -329,6 +348,9 @@ export const checkIsGitRepo = (path: string) =>
 
 export const initGitRepo = (path: string) =>
   invoke<string>("init_git_repo", { path });
+
+export const gitCloneRepo = (url: string, targetDir: string) =>
+  invoke<string>("git_clone_repo", { url, targetDir });
 
 export const getGitStatus = (path: string) =>
   invoke<GitFileStatus[]>("get_git_status", { path });
@@ -690,3 +712,6 @@ export const listDirectory = (path: string) =>
 
 export const pickFolderDialog = (title: string) =>
   invoke<string | null>("pick_folder_dialog", { title });
+
+export const pickFilesDialog = (title?: string) =>
+  invoke<string[]>("pick_files_dialog", { title: title ?? null });

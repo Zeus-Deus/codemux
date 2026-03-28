@@ -101,11 +101,9 @@ function DeleteWorkspaceDialog({
 function WorkspaceContextMenuItems({
   workspace,
   onDeleteRequest,
-  isPrimary,
 }: {
   workspace: WorkspaceSnapshot;
   onDeleteRequest: () => void;
-  isPrimary: boolean;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
 
@@ -157,22 +155,18 @@ function WorkspaceContextMenuItems({
       >
         Copy branch name
       </ContextMenuItem>
-      {!isPrimary && (
-        <>
-          <ContextMenuSeparator />
-          <ContextMenuItem
-            onClick={() => handleCloseWorkspace(workspace)}
-          >
-            Close workspace
-          </ContextMenuItem>
-          <ContextMenuItem
-            className="text-destructive focus:text-destructive"
-            onClick={onDeleteRequest}
-          >
-            Delete workspace
-          </ContextMenuItem>
-        </>
-      )}
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={() => handleCloseWorkspace(workspace)}
+      >
+        Close workspace
+      </ContextMenuItem>
+      <ContextMenuItem
+        className="text-destructive focus:text-destructive"
+        onClick={onDeleteRequest}
+      >
+        Delete workspace
+      </ContextMenuItem>
     </ContextMenuContent>
   );
 }
@@ -295,7 +289,6 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
         <WorkspaceContextMenuItems
           workspace={workspace}
           onDeleteRequest={() => setShowDeleteDialog(true)}
-          isPrimary={isPrimary}
         />
       </ContextMenu>
       <DeleteWorkspaceDialog

@@ -592,6 +592,45 @@ impl AppStateStore {
         self.create_workspace_with_layout(cwd_path, WorkspacePresetLayout::Single)
     }
 
+    /// Create a workspace with no tabs, surfaces, or terminal sessions.
+    /// Used by "Add repository" so the empty workspace state shows.
+    pub fn create_empty_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+        let workspace_index = snapshot.workspaces.len() + 1;
+        let cwd = cwd_path.display().to_string();
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title: format!("Workspace {workspace_index}"),
+            workspace_type: WorkspaceType::Standard,
+            cwd,
+            git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: None,
+            project_root: None,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: vec![],
+        });
+
+        snapshot.active_workspace_id = workspace_id.clone();
+        snapshot
+            .notifications
+            .retain(|notification| notification.workspace_id != workspace_id);
+        workspace_id
+    }
+
     pub fn create_workspace_with_layout(
         &self,
         cwd_path: PathBuf,
@@ -1306,14 +1345,31 @@ impl AppStateStore {
                 .get_mut(surface_index)
                 .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
 
-            let updated_root = remove_pane_from_tree(&surface.root, pane_id)
-                .ok_or_else(|| "Cannot close the last pane in a surface".to_string())?;
-            let next_active_pane = first_leaf_pane_id(&updated_root)
-                .ok_or_else(|| "No fallback pane available after close".to_string())?;
+            let updated_root = remove_pane_from_tree(&surface.root, pane_id);
 
-            surface.root = updated_root;
-            surface.active_pane_id = next_active_pane;
-            workspace.active_surface_id = surface.surface_id.clone();
+            if let Some(new_root) = updated_root {
+                // Pane removed but surface still has content
+                let next_active_pane = first_leaf_pane_id(&new_root)
+                    .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                surface.root = new_root;
+                surface.active_pane_id = next_active_pane;
+                workspace.active_surface_id = surface.surface_id.clone();
+            } else {
+                // Last pane closed — remove the surface and its tab
+                let surface_id = workspace.surfaces[surface_index].surface_id.clone();
+                workspace.surfaces.remove(surface_index);
+                workspace.tabs.retain(|t| t.surface_id.as_ref() != Some(&surface_id));
+                if workspace.tabs.is_empty() {
+                    workspace.active_tab_id = String::new();
+                    workspace.active_surface_id = SurfaceId(String::new());
+                } else if workspace.active_surface_id == surface_id {
+                    let new_tab = &workspace.tabs[0];
+                    workspace.active_tab_id = new_tab.tab_id.clone();
+                    if let Some(ref sid) = new_tab.surface_id {
+                        workspace.active_surface_id = sid.clone();
+                    }
+                }
+            }
             active_workspace_id = workspace.workspace_id.clone();
         }
 
@@ -1725,10 +1781,6 @@ impl AppStateStore {
             .find(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
-        if workspace.tabs.len() <= 1 {
-            return Err("Cannot close the last tab".into());
-        }
-
         let tab_index = workspace
             .tabs
             .iter()
@@ -1753,17 +1805,18 @@ impl AppStateStore {
             }
         }
 
-        // If closed tab was active, activate adjacent tab
+        // If closed tab was active, activate adjacent tab (or clear if no tabs left)
         if workspace.active_tab_id == tab_id {
-            let new_index = if tab_index > 0 {
-                tab_index - 1
+            if workspace.tabs.is_empty() {
+                workspace.active_tab_id = String::new();
+                workspace.active_surface_id = SurfaceId(String::new());
             } else {
-                0
-            };
-            let new_tab = &workspace.tabs[new_index];
-            workspace.active_tab_id = new_tab.tab_id.clone();
-            if let Some(ref sid) = new_tab.surface_id {
-                workspace.active_surface_id = sid.clone();
+                let new_index = if tab_index > 0 { tab_index - 1 } else { 0 };
+                let new_tab = &workspace.tabs[new_index];
+                workspace.active_tab_id = new_tab.tab_id.clone();
+                if let Some(ref sid) = new_tab.surface_id {
+                    workspace.active_surface_id = sid.clone();
+                }
             }
         }
 
@@ -1832,10 +1885,15 @@ impl AppStateStore {
     }
 
     /// Migrate workspaces loaded from disk that predate the tab system.
+    /// Only applies to workspaces that have surfaces but no tabs (old format).
+    /// Workspaces with 0 surfaces AND 0 tabs are intentionally empty.
     pub fn migrate_tabs_if_needed(&self) {
         let mut snapshot = self.inner.lock().unwrap();
         for workspace in &mut snapshot.workspaces {
-            if workspace.workspace_type == WorkspaceType::Standard && workspace.tabs.is_empty() {
+            if workspace.workspace_type == WorkspaceType::Standard
+                && workspace.tabs.is_empty()
+                && !workspace.surfaces.is_empty()
+            {
                 let tab_id = next_id("tab");
                 let surface_id = workspace
                     .surfaces

@@ -1,7 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, type Mock } from "vitest";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent, within } from "@testing-library/react";
 import { NewWorkspaceDialog } from "./new-workspace-dialog";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import type { AppStateSnapshot } from "@/tauri/types";
@@ -12,11 +13,26 @@ vi.mock("@/tauri/commands", () => ({
   listBranches: vi.fn().mockResolvedValue([]),
   checkIsGitRepo: vi.fn().mockResolvedValue(true),
   listWorktrees: vi.fn().mockResolvedValue([]),
-  getGitBranchInfo: vi.fn().mockResolvedValue({ branch: "main", ahead: 0, behind: 0 }),
-  checkGhAvailable: vi.fn().mockResolvedValue(false),
-  checkGithubRepo: vi.fn().mockResolvedValue(false),
-  listPullRequests: vi.fn().mockResolvedValue([]),
-  getPresets: vi.fn().mockResolvedValue({ presets: [] }),
+  getGitBranchInfo: vi
+    .fn()
+    .mockResolvedValue({ branch: "main", ahead: 0, behind: 0 }),
+  getPresets: vi.fn().mockResolvedValue({
+    presets: [
+      {
+        id: "builtin-claude",
+        name: "Claude",
+        description: null,
+        commands: ["claude --dangerously-skip-permissions"],
+        working_directory: null,
+        launch_mode: "NewTab",
+        icon: null,
+        pinned: true,
+        is_builtin: true,
+        auto_run_on_workspace: false,
+        auto_run_on_new_tab: false,
+      },
+    ],
+  }),
   pickFolderDialog: vi.fn().mockResolvedValue(null),
   createWorkspace: vi.fn().mockResolvedValue("ws-new"),
   createWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
@@ -24,12 +40,22 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
-  initGitRepo: vi.fn().mockResolvedValue(undefined),
+  dbGetRecentProjects: vi.fn().mockResolvedValue([]),
+  generateBranchName: vi.fn().mockResolvedValue("fix-login-bug"),
+  generateRandomBranchName: vi.fn().mockResolvedValue("swift-bolt"),
+  checkGhAvailable: vi.fn().mockResolvedValue(false),
+  checkGithubRepo: vi.fn().mockResolvedValue(false),
+  listPullRequests: vi.fn().mockResolvedValue([]),
+  pickFilesDialog: vi.fn().mockResolvedValue([]),
 }));
 
 import {
   listBranches,
   checkIsGitRepo,
+  createWorktreeWorkspace,
+  activateWorkspace,
+  generateBranchName,
+  generateRandomBranchName,
 } from "@/tauri/commands";
 
 // ── Helpers ──
@@ -70,7 +96,9 @@ function makeWs(overrides: WsOverrides = {}) {
 
 function setAppState(cwd: string, extraWorkspaces: WsOverrides[] = []) {
   const primary = makeWs({ workspace_id: "ws-1", cwd, project_root: cwd });
-  const extras = extraWorkspaces.map((o, i) => makeWs({ workspace_id: `ws-extra-${i}`, ...o }));
+  const extras = extraWorkspaces.map((o, i) =>
+    makeWs({ workspace_id: `ws-extra-${i}`, ...o }),
+  );
   useAppStore.setState({
     appState: {
       schema_version: 1,
@@ -80,16 +108,22 @@ function setAppState(cwd: string, extraWorkspaces: WsOverrides[] = []) {
       browser_sessions: [],
       notifications: [],
       detected_ports: [],
-      persistence: { schema_version: 1, stores_layout_metadata: true, stores_terminal_metadata: true, stores_live_process_state: false },
+      persistence: {
+        schema_version: 1,
+        stores_layout_metadata: true,
+        stores_terminal_metadata: true,
+        stores_live_process_state: false,
+      },
       config: {} as AppStateSnapshot["config"],
     },
   });
 }
 
-// Radix Dialog uses portals — provide container
 function renderDialog(open: boolean, onOpenChange = vi.fn()) {
   return render(
-    <NewWorkspaceDialog open={open} onOpenChange={onOpenChange} />,
+    <TooltipProvider>
+      <NewWorkspaceDialog open={open} onOpenChange={onOpenChange} />
+    </TooltipProvider>,
   );
 }
 
@@ -99,12 +133,60 @@ beforeEach(() => {
   vi.clearAllMocks();
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);
-  // Reset store state so tests don't bleed
-  useUIStore.setState({ newWorkspaceProjectDir: null });
+  useUIStore.setState({
+    newWorkspaceProjectDir: null,
+    pendingWorkspaces: [],
+    lastSelectedAgentId: null,
+  });
 });
 
-describe("NewWorkspaceDialog branch fetching", () => {
-  it("fetches branches for the selected project directory", async () => {
+describe("NewWorkspaceDialog", () => {
+  it("renders prompt textarea as the main element", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    await waitFor(() => {
+      // Radix Dialog renders two copies — check at least one exists
+      const els = screen.getAllByPlaceholderText("What do you want to do?");
+      expect(els.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("renders workspace name and branch name inputs", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByPlaceholderText("Workspace name (optional)").length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getAllByPlaceholderText("branch name").length,
+      ).toBeGreaterThan(0);
+    });
+  });
+
+  it("renders Create button", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    await waitFor(() => {
+      const buttons = screen.getAllByRole("button", { name: /Create/i });
+      expect(buttons.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("shows Ctrl+Enter hint", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    await waitFor(() => {
+      const hints = screen.getAllByText("Ctrl+Enter to create");
+      expect(hints.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("fetches branches for the project directory", async () => {
     setAppState("/path/to/projectA");
     (listBranches as Mock).mockResolvedValue(["main", "dev"]);
 
@@ -114,197 +196,158 @@ describe("NewWorkspaceDialog branch fetching", () => {
       expect(listBranches).toHaveBeenCalledWith("/path/to/projectA", false);
       expect(listBranches).toHaveBeenCalledWith("/path/to/projectA", true);
     });
-
-    // Branches should appear in the UI
-    await waitFor(() => {
-      expect(screen.getByText("main")).toBeInTheDocument();
-      expect(screen.getByText("dev")).toBeInTheDocument();
-    });
   });
 
-  it("resets state and re-fetches when dialog reopens", async () => {
+  it("re-fetches branches when dialog reopens", async () => {
     setAppState("/path/to/projectA");
     (listBranches as Mock).mockResolvedValue(["main"]);
 
     const { rerender } = render(
-      <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />,
+      <TooltipProvider>
+        <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />
+      </TooltipProvider>,
     );
 
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2); // local + remote
+      expect(listBranches).toHaveBeenCalledTimes(2);
     });
 
-    // Close dialog
     rerender(
-      <NewWorkspaceDialog open={false} onOpenChange={vi.fn()} />,
+      <TooltipProvider>
+        <NewWorkspaceDialog open={false} onOpenChange={vi.fn()} />
+      </TooltipProvider>,
     );
 
     vi.clearAllMocks();
     (checkIsGitRepo as Mock).mockResolvedValue(true);
     (listBranches as Mock).mockResolvedValue(["main", "new-branch"]);
 
-    // Reopen dialog
     rerender(
-      <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />,
+      <TooltipProvider>
+        <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />
+      </TooltipProvider>,
     );
 
-    // Fresh fetch — not cached
     await waitFor(() => {
       expect(listBranches).toHaveBeenCalledTimes(2);
     });
   });
-
-  it("updates branches when project directory changes", async () => {
-    setAppState("/path/to/projectA");
-    (listBranches as Mock).mockImplementation((path: string) => {
-      if (path === "/path/to/projectA") return Promise.resolve(["alpha"]);
-      if (path === "/path/to/projectB") return Promise.resolve(["beta"]);
-      return Promise.resolve([]);
-    });
-
-    renderDialog(true);
-
-    // Initial fetch for project A
-    await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledWith("/path/to/projectA", false);
-    });
-    await waitFor(() => {
-      expect(screen.getByText("alpha")).toBeInTheDocument();
-    });
-
-    // Change project directory via the input (Radix renders aria-hidden copies, use getAllBy)
-    const inputs = screen.getAllByDisplayValue("/path/to/projectA");
-    fireEvent.change(inputs[0], { target: { value: "/path/to/projectB" } });
-
-    // New fetch for project B
-    await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledWith("/path/to/projectB", false);
-    });
-    await waitFor(() => {
-      expect(screen.getByText("beta")).toBeInTheDocument();
-    });
-  });
-
-  it("does not show stale data from previous dialog session", async () => {
-    // Open dialog with project A
-    setAppState("/path/to/projectA");
-    (listBranches as Mock).mockResolvedValue(["alpha-branch"]);
-
-    const { rerender } = render(
-      <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText("alpha-branch")).toBeInTheDocument();
-    });
-
-    // Close dialog
-    rerender(
-      <NewWorkspaceDialog open={false} onOpenChange={vi.fn()} />,
-    );
-
-    // Switch to project B
-    vi.clearAllMocks();
-    (checkIsGitRepo as Mock).mockResolvedValue(true);
-    (listBranches as Mock).mockResolvedValue(["beta-branch"]);
-    setAppState("/path/to/projectB");
-
-    // Reopen dialog — should fetch for B, not show stale A data
-    rerender(
-      <NewWorkspaceDialog open={true} onOpenChange={vi.fn()} />,
-    );
-
-    // Verify it fetched for the NEW project, not the old one
-    await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledWith("/path/to/projectB", false);
-      expect(listBranches).toHaveBeenCalledWith("/path/to/projectB", true);
-    });
-
-    // Should NOT have fetched for the old project
-    expect(listBranches).not.toHaveBeenCalledWith("/path/to/projectA", false);
-
-    // New branches should be visible
-    await waitFor(() => {
-      expect(screen.getByText("beta-branch")).toBeInTheDocument();
-    });
-    expect(screen.queryByText("alpha-branch")).not.toBeInTheDocument();
-  });
 });
 
-import { activateWorkspace } from "@/tauri/commands";
+describe("Submit flow", () => {
+  it("closes dialog immediately on submit (optimistic)", async () => {
+    setAppState("/path/to/project");
+    const onOpenChange = vi.fn();
+    renderDialog(true, onOpenChange);
 
-describe("Branch collision scoping", () => {
-  it("same branch in different projects — Open Workspace does not redirect", async () => {
-    // Project A (active) is on "dev". Project B has "feature" open.
-    // Selecting "feature" in project A should NOT redirect to project B's workspace.
-    useAppStore.setState({
-      appState: {
-        schema_version: 1,
-        active_workspace_id: "ws-1",
-        workspaces: [
-          makeWs({ workspace_id: "ws-1", cwd: "/path/to/projectA", git_branch: "dev", project_root: "/path/to/projectA" }),
-          makeWs({ workspace_id: "ws-b", cwd: "/path/to/projectB", git_branch: "feature", project_root: "/path/to/projectB" }),
-        ],
-        terminal_sessions: [],
-        browser_sessions: [],
-        notifications: [],
-        detected_ports: [],
-        persistence: { schema_version: 1, stores_layout_metadata: true, stores_terminal_metadata: true, stores_live_process_state: false },
-        config: {} as AppStateSnapshot["config"],
-      },
-    });
-    (listBranches as Mock).mockResolvedValue(["dev", "feature"]);
-
-    renderDialog(true);
-
-    // Wait for branches to load in the existing tab
     await waitFor(() => {
-      expect(screen.getByText("feature")).toBeInTheDocument();
+      expect(
+        screen.getAllByRole("button", { name: /Create/i }).length,
+      ).toBeGreaterThan(0);
     });
 
-    // Select "feature" branch — it exists in project B but NOT in project A
-    fireEvent.click(screen.getByText("feature"));
+    // Click the first Create button (Radix renders duplicates)
+    fireEvent.click(screen.getAllByRole("button", { name: /Create/i })[0]);
 
-    // Click the "Open Workspace" button
-    const openBtn = await screen.findByRole("button", { name: /Open Workspace/i });
-    fireEvent.click(openBtn);
-
-    // Should NOT redirect — different projects can share branch names
     await waitFor(() => {
-      expect(activateWorkspace).not.toHaveBeenCalled();
+      expect(onOpenChange).toHaveBeenCalledWith(false);
     });
   });
 
-  it("same branch in same project — Open Workspace redirects", async () => {
-    // Project A (active) already has "feature-x" open with same project_root
-    setAppState("/path/to/projectA", [
-      { cwd: "/path/to/projectA/wt", git_branch: "feature-x", project_root: "/path/to/projectA" },
-    ]);
-    (listBranches as Mock).mockResolvedValue(["main", "feature-x"]);
-
+  it("generates random branch name when no prompt or branch provided", async () => {
+    setAppState("/path/to/project");
     renderDialog(true);
 
     await waitFor(() => {
-      expect(screen.getByText("feature-x")).toBeInTheDocument();
+      expect(
+        screen.getAllByRole("button", { name: /Create/i }).length,
+      ).toBeGreaterThan(0);
     });
 
-    // Select "feature-x" branch
-    fireEvent.click(screen.getByText("feature-x"));
+    fireEvent.click(screen.getAllByRole("button", { name: /Create/i })[0]);
 
-    // Click Open Workspace
-    const openBtn = await screen.findByRole("button", { name: /Open Workspace/i });
-    fireEvent.click(openBtn);
+    await waitFor(() => {
+      expect(generateRandomBranchName).toHaveBeenCalledWith("/path/to/project");
+    });
+  });
 
-    // Should redirect to existing workspace
+  it("generates AI branch name when prompt is provided", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    // Scope to the real dialog element (not Radix's aria-hidden copy)
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    fireEvent.change(textarea, { target: { value: "Fix the login bug" } });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(generateBranchName).toHaveBeenCalledWith(
+        "Fix the login bug",
+        "/path/to/project",
+      );
+    });
+  });
+
+  it("uses explicit branch name when provided", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const branchInput = within(dialog).getByPlaceholderText("branch name");
+    fireEvent.change(branchInput, { target: { value: "my-feature" } });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+        "/path/to/project",
+        "my-feature",
+        true,
+        "single",
+        expect.any(String),
+        null,
+        "builtin-claude",
+      );
+    });
+
+    expect(generateBranchName).not.toHaveBeenCalled();
+    expect(generateRandomBranchName).not.toHaveBeenCalled();
+  });
+
+  it("activates existing workspace when branch already has one", async () => {
+    setAppState("/path/to/project", [
+      {
+        cwd: "/path/to/project/wt",
+        git_branch: "fix-login-bug",
+        project_root: "/path/to/project",
+      },
+    ]);
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    fireEvent.change(textarea, {
+      target: { value: "Fix the login bug" },
+    });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
     await waitFor(() => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
     });
+
+    expect(createWorktreeWorkspace).not.toHaveBeenCalled();
   });
 });
 
 describe("Project directory auto-fill", () => {
-  it("auto-fills project root from + button, not active workspace cwd", async () => {
-    // Active workspace is at a worktree path, but + button passes the project root
+  it("auto-fills project root from + button context", async () => {
     useAppStore.setState({
       appState: {
         schema_version: 1,
@@ -315,34 +358,34 @@ describe("Project directory auto-fill", () => {
             cwd: "/home/user/.codemux/worktrees/myapp/feature-1",
             git_branch: "feature-1",
             project_root: "/home/user/myapp",
-            worktree_path: "/home/user/.codemux/worktrees/myapp/feature-1",
+            worktree_path:
+              "/home/user/.codemux/worktrees/myapp/feature-1",
           }),
         ],
         terminal_sessions: [],
         browser_sessions: [],
         notifications: [],
         detected_ports: [],
-        persistence: { schema_version: 1, stores_layout_metadata: true, stores_terminal_metadata: true, stores_live_process_state: false },
+        persistence: {
+          schema_version: 1,
+          stores_layout_metadata: true,
+          stores_terminal_metadata: true,
+          stores_live_process_state: false,
+        },
         config: {} as AppStateSnapshot["config"],
       },
     });
 
-    // Simulate the "+" button passing the project root
     useUIStore.setState({ newWorkspaceProjectDir: "/home/user/myapp" });
 
     renderDialog(true);
 
-    // The directory input should show the project root, not the worktree path
     await waitFor(() => {
-      const inputs = screen.getAllByDisplayValue("/home/user/myapp");
-      expect(inputs.length).toBeGreaterThan(0);
+      expect(checkIsGitRepo).toHaveBeenCalledWith("/home/user/myapp");
     });
-    // Should NOT contain the worktree path
-    expect(screen.queryByDisplayValue(/\.codemux\/worktrees/)).toBeNull();
   });
 
   it("falls back to project_root when no + button context", async () => {
-    // Active workspace is at a worktree path, no store project dir set
     useAppStore.setState({
       appState: {
         schema_version: 1,
@@ -353,27 +396,30 @@ describe("Project directory auto-fill", () => {
             cwd: "/home/user/.codemux/worktrees/myapp/feature-1",
             git_branch: "feature-1",
             project_root: "/home/user/myapp",
-            worktree_path: "/home/user/.codemux/worktrees/myapp/feature-1",
+            worktree_path:
+              "/home/user/.codemux/worktrees/myapp/feature-1",
           }),
         ],
         terminal_sessions: [],
         browser_sessions: [],
         notifications: [],
         detected_ports: [],
-        persistence: { schema_version: 1, stores_layout_metadata: true, stores_terminal_metadata: true, stores_live_process_state: false },
+        persistence: {
+          schema_version: 1,
+          stores_layout_metadata: true,
+          stores_terminal_metadata: true,
+          stores_live_process_state: false,
+        },
         config: {} as AppStateSnapshot["config"],
       },
     });
 
-    // No store project dir — should fall back to project_root
     useUIStore.setState({ newWorkspaceProjectDir: null });
 
     renderDialog(true);
 
-    // Should show project root, not the worktree cwd
     await waitFor(() => {
-      const inputs = screen.getAllByDisplayValue("/home/user/myapp");
-      expect(inputs.length).toBeGreaterThan(0);
+      expect(checkIsGitRepo).toHaveBeenCalledWith("/home/user/myapp");
     });
   });
 });

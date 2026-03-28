@@ -205,3 +205,26 @@ pub async fn resolve_conflicts_with_agent(
     )
     .await
 }
+
+#[tauri::command]
+pub async fn git_clone_repo(url: String, target_dir: String) -> Result<String, String> {
+    use std::time::Duration;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(120),
+        tokio::process::Command::new("git")
+            .args(["clone", &url, &target_dir])
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => Ok(target_dir),
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("git clone failed: {}", stderr.trim()))
+        }
+        Ok(Err(e)) => Err(format!("Failed to run git clone: {e}")),
+        Err(_) => Err("git clone timed out after 120 seconds".to_string()),
+    }
+}

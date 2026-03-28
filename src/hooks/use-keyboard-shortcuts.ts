@@ -67,10 +67,10 @@ export function useKeyboardShortcuts() {
         createTab(ws.workspace_id, "terminal").catch(console.error);
       }
 
-      // Ctrl+W — close active tab (only if more than one tab)
+      // Ctrl+W — close active tab
       if (e.ctrlKey && !e.shiftKey && e.key === "w") {
         e.preventDefault();
-        if (ws.tabs.length > 1)
+        if (ws.tabs.length > 0)
           closeTab(ws.workspace_id, ws.active_tab_id).catch(console.error);
       }
     };

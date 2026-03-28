@@ -15,11 +15,11 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check } from "lucide-react";
+import { ChevronRight, Plus, Check, Loader2, AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
 const PROJECT_COLORS = [
   { name: "Red", value: "#ef4444" },
@@ -51,6 +51,7 @@ interface Props {
   onWorkspaceDragStart?: (workspaceId: string, projectPath: string | null) => (e: React.DragEvent) => void;
   onProjectDragStart?: (e: React.DragEvent) => void;
   dragStateId?: string | null;
+  pendingWorkspaces?: PendingWorkspace[];
 }
 
 export function SidebarProjectGroup({
@@ -61,6 +62,7 @@ export function SidebarProjectGroup({
   onWorkspaceDragStart,
   onProjectDragStart,
   dragStateId,
+  pendingWorkspaces = [],
 }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
@@ -200,6 +202,26 @@ export function SidebarProjectGroup({
             workspace={ws}
             isActive={ws.workspace_id === activeWorkspaceId}
           />
+        </div>
+      ))}
+
+      {/* Pending workspace entries */}
+      {!collapsed && pendingWorkspaces.map((pw) => (
+        <div
+          key={pw.id}
+          className={cn(
+            "flex items-center gap-2.5 px-3 py-2 pl-[2.75rem] text-sm",
+            pw.status === "failed" ? "opacity-60" : "opacity-70 animate-pulse",
+          )}
+        >
+          {pw.status === "creating" ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
+          ) : (
+            <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+          )}
+          <span className="truncate text-muted-foreground text-xs">
+            {pw.status === "failed" ? pw.errorMessage || "Failed" : pw.name}
+          </span>
         </div>
       ))}
     </div>

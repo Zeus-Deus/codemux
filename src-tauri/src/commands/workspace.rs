@@ -137,6 +137,33 @@ pub fn create_workspace(
 }
 
 #[tauri::command]
+pub fn create_empty_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    cwd: String,
+) -> Result<String, String> {
+    let repo_path = PathBuf::from(&cwd);
+    let workspace_id = state.create_empty_workspace_at_path(repo_path.clone());
+
+    let project_root = crate::config::workspace_config::find_git_root(&repo_path)
+        .unwrap_or_else(|| repo_path.clone());
+    state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
+    populate_git_info(&state, &workspace_id.0, &repo_path);
+
+    // Run setup scripts in background thread
+    spawn_setup_scripts(&app, &state, &db, &workspace_id.0, &repo_path);
+
+    // Write .mcp.json for agent auto-discovery
+    if crate::mcp_server::is_auto_mcp_enabled(&app) {
+        crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+#[tauri::command]
 pub fn create_openflow_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
@@ -206,11 +233,15 @@ pub fn create_worktree_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
+    pty_state: State<'_, crate::terminal::PtyState>,
+    presets: State<'_, crate::presets::PresetStoreState>,
     repo_path: String,
     branch: String,
     new_branch: bool,
     base: Option<String>,
     layout: String,
+    initial_prompt: Option<String>,
+    agent_preset_id: Option<String>,
 ) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
@@ -250,6 +281,104 @@ pub fn create_worktree_workspace(
     // Write .mcp.json for agent auto-discovery
     if crate::mcp_server::is_auto_mcp_enabled(&app) {
         crate::mcp_server::upsert_mcp_config(&wt_path_buf, &workspace_id.0);
+    }
+
+    // Auto-launch agent preset if requested
+    if let Some(ref preset_id) = agent_preset_id {
+        let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let preset = store.presets.iter().find(|p| p.id == *preset_id).cloned();
+        drop(store);
+
+        if let Some(preset) = preset {
+            let commands: Vec<String> = if preset.commands.is_empty() {
+                vec![String::new()]
+            } else {
+                preset
+                    .commands
+                    .iter()
+                    .map(|cmd| crate::agent_context::inject_agent_context(cmd))
+                    .collect()
+            };
+
+            let sessions_arc = pty_state.sessions.clone();
+
+            for command in &commands {
+                let tab_result = state.create_tab(&workspace_id.0, TabKind::Terminal);
+                if let Ok((tab_id, session_id)) = tab_result {
+                    let _ = state.rename_tab(&workspace_id.0, &tab_id, preset.name.clone());
+
+                    if let Some(session_id) = session_id {
+                        terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
+
+                        if !command.is_empty() {
+                            let (cmd, needs_pty_injection) =
+                                crate::branch_name::prepare_agent_command(
+                                    &preset.id,
+                                    command,
+                                    initial_prompt.as_deref(),
+                                );
+
+                            let sessions = sessions_arc.clone();
+                            let sid = session_id.0.clone();
+                            super::presets::write_command_when_ready(
+                                sessions.clone(),
+                                sid.clone(),
+                                cmd,
+                            );
+
+                            // For agents that need PTY injection, write prompt after agent starts
+                            if needs_pty_injection {
+                                if let Some(ref prompt) = initial_prompt {
+                                    let prompt_text = prompt.clone();
+                                    let sessions2 = sessions_arc.clone();
+                                    let sid2 = session_id.0.clone();
+                                    std::thread::spawn(move || {
+                                        // Wait for PTY writer
+                                        let max_attempts = 100;
+                                        let mut writer_found = false;
+                                        for _ in 0..max_attempts {
+                                            std::thread::sleep(
+                                                std::time::Duration::from_millis(50),
+                                            );
+                                            let ready = {
+                                                let guard = sessions2
+                                                    .lock()
+                                                    .unwrap_or_else(|e| e.into_inner());
+                                                guard
+                                                    .get(&sid2)
+                                                    .map(|rt| rt.writer.is_some())
+                                                    .unwrap_or(false)
+                                            };
+                                            if ready {
+                                                writer_found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !writer_found {
+                                            return;
+                                        }
+
+                                        // Wait for agent TUI to initialize
+                                        std::thread::sleep(std::time::Duration::from_secs(2));
+
+                                        let mut guard = sessions2
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        if let Some(runtime) = guard.get_mut(&sid2) {
+                                            if let Some(writer) = runtime.writer.as_mut() {
+                                                let _ = writer.write_all(prompt_text.as_bytes());
+                                                let _ = writer.write_all(b"\n");
+                                                let _ = writer.flush();
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     crate::state::emit_app_state(&app);

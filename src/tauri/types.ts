@@ -366,6 +366,14 @@ export interface WorktreeInfo {
   is_bare: boolean;
 }
 
+export interface PendingWorkspace {
+  id: string;
+  name: string;
+  projectPath: string;
+  status: "creating" | "failed";
+  errorMessage?: string;
+}
+
 export interface PullRequestInfo {
   number: number;
   url: string;

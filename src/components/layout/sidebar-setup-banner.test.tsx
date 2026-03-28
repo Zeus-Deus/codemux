@@ -66,7 +66,7 @@ describe("SidebarSetupBanner", () => {
     expect(screen.getByText(/Automate workspace setup/)).toBeInTheDocument();
   });
 
-  it("hides when no worktree workspaces", async () => {
+  it("shows banner for non-worktree workspaces with matching project", async () => {
     mockAppState = {
       active_workspace_id: "ws-1",
       workspaces: [
@@ -79,7 +79,7 @@ describe("SidebarSetupBanner", () => {
     };
     render(<SidebarSetupBanner />);
     await flushPromises();
-    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+    expect(screen.getByText("Setup")).toBeInTheDocument();
   });
 
   it("hides when no project root", async () => {

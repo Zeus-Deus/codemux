@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod auth;
+pub mod branch_name;
 pub mod browser;
 pub mod database;
 pub mod files;
@@ -12,6 +13,7 @@ pub mod workspace;
 
 pub use ai::*;
 pub use auth::*;
+pub use branch_name::*;
 pub use browser::*;
 pub use database::*;
 pub use files::*;
@@ -202,6 +204,38 @@ pub async fn pick_folder_dialog<R: Runtime>(
 
     builder.pick_folder(move |path| {
         let _ = tx.send(path.map(|path| path.to_string()));
+    });
+
+    rx.await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn pick_files_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Attach files"));
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.pick_files(move |paths| {
+        let _ = tx.send(
+            paths
+                .map(|ps| ps.into_iter().map(|p| p.to_string()).collect())
+                .unwrap_or_default(),
+        );
     });
 
     rx.await.map_err(|error| error.to_string())

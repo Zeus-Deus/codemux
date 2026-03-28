@@ -395,7 +395,7 @@ fn write_command_to_pty(
 /// Polls for the PTY writer to become available (every 50ms, up to 5s timeout),
 /// then waits an additional 150ms for the shell prompt to finish rendering
 /// before writing the plain command text + newline.
-fn write_command_when_ready(
+pub(crate) fn write_command_when_ready(
     sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: String,
     command: String,

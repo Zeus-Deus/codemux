@@ -1,5 +1,5 @@
-import { Terminal } from "lucide-react";
 import { PaneNode } from "./PaneNode";
+import { EmptyWorkspaceState } from "./empty-workspace-state";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -12,14 +12,7 @@ export function PaneContainer({ workspace }: Props) {
   );
 
   if (!activeSurface) {
-    return (
-      <div className="flex h-full items-center justify-center bg-background text-muted-foreground">
-        <div className="text-center space-y-3">
-          <Terminal className="h-12 w-12 mx-auto opacity-30" />
-          <p className="text-sm">No active surface</p>
-        </div>
-      </div>
-    );
+    return <EmptyWorkspaceState />;
   }
 
   return (
