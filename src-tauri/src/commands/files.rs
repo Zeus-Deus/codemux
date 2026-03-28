@@ -334,6 +334,15 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
         .collect())
 }
 
+#[tauri::command]
+pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| format!("Failed to open file manager: {e}"))?;
+    Ok(())
+}
+
 fn search_with_find(
     path: &str,
     query: &str,

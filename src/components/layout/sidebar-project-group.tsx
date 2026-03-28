@@ -25,8 +25,7 @@ import {
 } from "@/components/ui/tooltip";
 import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { dbGetUiState, dbSetUiState, closeWorkspace, closeWorkspaceWithWorktree } from "@/tauri/commands";
+import { dbGetUiState, dbSetUiState, closeWorkspace, closeWorkspaceWithWorktree, revealInFileManager } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
@@ -104,7 +103,7 @@ export function SidebarProjectGroup({
   const [showCloseDialog, setShowCloseDialog] = useState(false);
 
   const handleRevealInFileManager = () => {
-    revealItemInDir(projectPath).catch(console.error);
+    revealInFileManager(projectPath).catch(console.error);
   };
 
   const handleCopyPath = () => {
