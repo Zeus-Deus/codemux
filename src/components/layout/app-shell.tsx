@@ -59,6 +59,11 @@ export function AppShell() {
     return <NewProjectScreen />;
   }
 
+  // Full-screen empty state — no sidebar, no title bar
+  if (!hasWorkspaces) {
+    return <EmptyState />;
+  }
+
   return (
     <div className="flex flex-col h-screen max-h-screen">
       <TitleBar
@@ -72,7 +77,7 @@ export function AppShell() {
       >
         <AppSidebar />
         <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
-          {hasWorkspaces ? <WorkspaceMain /> : <EmptyState />}
+          <WorkspaceMain />
         </SidebarInset>
         <CommandPalette
           open={commandPaletteOpen}

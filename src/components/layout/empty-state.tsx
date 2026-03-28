@@ -1,35 +1,8 @@
-import { FolderOpen, FolderPlus } from "lucide-react";
+import { FolderOpen, Plus } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useUIStore } from "@/stores/ui-store";
-import logomark from "@/assets/codemux-logomark.svg";
-
-function ActionCard({
-  icon,
-  title,
-  description,
-  onClick,
-}: {
-  icon: React.ReactNode;
-  title: string;
-  description: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="flex w-full items-center gap-4 rounded-xl border-2 border-dashed border-border/60 bg-card/50 px-5 py-4 text-left transition-all hover:border-primary/40 hover:bg-card"
-    >
-      <div className="rounded-lg bg-muted p-2.5 text-muted-foreground">
-        {icon}
-      </div>
-      <div>
-        <div className="text-sm font-medium text-foreground">{title}</div>
-        <div className="text-xs text-muted-foreground">{description}</div>
-      </div>
-    </button>
-  );
-}
+import wordmark from "@/assets/codemux-wordmark.svg";
 
 export function EmptyState() {
   const { openProject } = useProjectActions();
@@ -38,33 +11,45 @@ export function EmptyState() {
   );
 
   return (
-    <div className="flex h-full items-center justify-center px-6">
-      <div className="w-full max-w-sm space-y-6">
-        <div className="flex flex-col items-center gap-4">
-          <img
-            src={logomark}
-            alt=""
-            className="h-12 w-auto select-none opacity-25"
-            draggable={false}
-          />
-          <p className="text-sm text-muted-foreground">
-            Open a project to get started
-          </p>
-        </div>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
+      <div className="flex flex-col items-center">
+        {/* Wordmark */}
+        <img
+          src={wordmark}
+          alt=""
+          className="h-8 w-auto select-none opacity-80 mb-10"
+          draggable={false}
+        />
 
-        <div className="space-y-3">
-          <ActionCard
-            icon={<FolderOpen className="h-5 w-5" />}
-            title="Open existing project"
-            description="Open a local folder with your code"
-            onClick={() => openProject()}
-          />
-          <ActionCard
-            icon={<FolderPlus className="h-5 w-5" />}
-            title="New project"
-            description="Create a new repo or clone from URL"
+        {/* Open project card */}
+        <button
+          type="button"
+          onClick={() => openProject()}
+          className="w-[400px] rounded-xl border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-all hover:border-foreground/30 hover:bg-card"
+        >
+          <FolderOpen className="h-8 w-8 mx-auto mb-3 text-muted-foreground" />
+          <div className="text-sm font-medium text-foreground">
+            Open Project
+          </div>
+          <div className="text-xs text-muted-foreground mt-1">
+            Open a local folder with your code
+          </div>
+        </button>
+
+        {/* New project link */}
+        <div className="mt-6 flex flex-col items-center gap-2">
+          <span className="text-xs text-muted-foreground/60">
+            Or start a new project
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            className="text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setShowNewProjectScreen(true)}
-          />
+          >
+            <Plus className="h-3.5 w-3.5 mr-1" />
+            New Project
+          </Button>
         </div>
       </div>
     </div>
