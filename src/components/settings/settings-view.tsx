@@ -38,16 +38,22 @@ import {
   PinOff,
   Trash2,
   X,
+  UserCircle,
+  LogOut,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { useAuthStore } from "@/stores/auth-store";
 import {
-  useSettingsStore,
+  useSyncedSettingsStore,
   selectTerminalFontSize,
   selectTerminalCursorStyle,
-  selectTerminalColorTheme,
   selectDefaultEditor,
   selectDefaultBaseBranch,
+} from "@/stores/synced-settings-store";
+import {
+  useSettingsStore,
+  selectTerminalColorTheme,
 } from "@/stores/settings-store";
 import {
   detectEditors,
@@ -74,19 +80,35 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "shortcuts" | "notifications";
+type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "shortcuts" | "notifications";
 
-const NAV_ITEMS: { id: Section; label: string; icon: React.ElementType }[] = [
-  { id: "appearance", label: "Appearance", icon: Palette },
-  { id: "editor", label: "Editor", icon: Code2 },
-  { id: "terminal", label: "Terminal", icon: TerminalSquare },
-  { id: "presets", label: "Presets", icon: Zap },
-  { id: "projects", label: "Projects", icon: FolderCog },
-  { id: "git", label: "Git", icon: GitBranch },
-  { id: "agent", label: "Agent", icon: Bot },
-  { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
-  { id: "notifications", label: "Notifications", icon: Bell },
+interface NavItem { id: Section; label: string; icon: React.ElementType }
+interface NavGroup { label: string; items: NavItem[] }
+
+const NAV_GROUPS: NavGroup[] = [
+  {
+    label: "PERSONAL",
+    items: [
+      { id: "account", label: "Account", icon: UserCircle },
+      { id: "appearance", label: "Appearance", icon: Palette },
+      { id: "notifications", label: "Notifications", icon: Bell },
+      { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
+    ],
+  },
+  {
+    label: "EDITOR & WORKFLOW",
+    items: [
+      { id: "editor", label: "Editor", icon: Code2 },
+      { id: "terminal", label: "Terminal", icon: TerminalSquare },
+      { id: "presets", label: "Presets", icon: Zap },
+      { id: "projects", label: "Projects", icon: FolderCog },
+      { id: "git", label: "Git", icon: GitBranch },
+      { id: "agent", label: "Agent", icon: Bot },
+    ],
+  },
 ];
+
+const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
 
 const SHORTCUTS = [
   { category: "General", items: [
@@ -441,12 +463,18 @@ export function SettingsView() {
   const config = useAppStore((s) => s.appState?.config);
   const storeSet = useSettingsStore((s) => s.set);
   const storeGet = useSettingsStore((s) => s.get);
-  const defaultEditor = useSettingsStore(selectDefaultEditor);
-  const cursorStyle = useSettingsStore(selectTerminalCursorStyle);
-  const fontSize = useSettingsStore(selectTerminalFontSize);
-  const baseBranch = useSettingsStore(selectDefaultBaseBranch);
+  const defaultEditor = useSyncedSettingsStore(selectDefaultEditor);
+  const cursorStyle = useSyncedSettingsStore(selectTerminalCursorStyle);
+  const fontSize = useSyncedSettingsStore(selectTerminalFontSize);
+  const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
+
+  const authUser = useAuthStore((s) => s.user);
+  const isDevBypass = useAuthStore((s) => s.devBypass);
+  const signOut = useAuthStore((s) => s.signOut);
+  const syncedSettings = useSyncedSettingsStore((s) => s.settings);
+  const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
 
   const activeWorkspace = useAppStore((s) => {
     const st = s.appState;
@@ -455,7 +483,7 @@ export function SettingsView() {
   const projectRoot = activeWorkspace?.project_root ?? null;
   const projectName = projectRoot ? projectRoot.split("/").pop() ?? "Project" : "Project";
 
-  const initialSection = (settingsSection && NAV_ITEMS.some((n) => n.id === settingsSection) ? settingsSection : "appearance") as Section;
+  const initialSection = (settingsSection && ALL_SECTIONS.some((n) => n.id === settingsSection) ? settingsSection : "account") as Section;
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
@@ -467,10 +495,18 @@ export function SettingsView() {
   const [runCommand, setRunCommand] = useState("");
   const [hasConfigFile, setHasConfigFile] = useState(false);
 
-  const setDefaultEditor = (v: string) => storeSet("editor.default", v);
-  const setCursorStyle = (v: string) => storeSet("terminal.cursor_style", v);
-  const setFontSize = (v: number) => storeSet("terminal.font_size", String(v));
-  const setBaseBranch = (v: string) => storeSet("git.default_base_branch", v);
+  const setDefaultEditor = (v: string) => {
+    updateSyncedSetting("editor", "default_ide", v).catch(console.error);
+  };
+  const setCursorStyle = (v: string) => {
+    updateSyncedSetting("terminal", "cursor_style", v).catch(console.error);
+  };
+  const setFontSize = (v: number) => {
+    updateSyncedSetting("appearance", "terminal_font_size", v).catch(console.error);
+  };
+  const setBaseBranch = (v: string) => {
+    updateSyncedSetting("git", "default_base_branch", v).catch(console.error);
+  };
   const setTerminalThemeMode = (v: string) => storeSet("terminal.color_theme", v);
   const setAutoMcpConfig = (v: boolean) => storeSet("auto_mcp_config", v ? "true" : "false");
 
@@ -512,15 +548,64 @@ export function SettingsView() {
     detectEditors()
       .then((eds) => {
         setEditors(eds);
-        if (eds.length > 0 && !defaultEditor) {
-          storeSet("editor.default", eds[0].id);
+        if (eds.length > 0 && !defaultEditor && !useSyncedSettingsStore.getState().isLoading) {
+          updateSyncedSetting("editor", "default_ide", eds[0].id).catch(console.error);
         }
       })
       .catch(() => {});
-  }, [defaultEditor, storeSet]);
+  }, [defaultEditor, updateSyncedSetting]);
 
   const renderSection = () => {
     switch (activeSection) {
+      case "account":
+        return (
+          <div>
+            <SectionHeader
+              title="Account"
+              description="Your Codemux account details."
+            />
+            <div className="space-y-1">
+              {authUser ? (
+                <>
+                  <SettingRow label="Email" description="Your sign-in email address.">
+                    <span className="text-sm text-muted-foreground">{authUser.email}</span>
+                  </SettingRow>
+                  <Separator />
+                  <SettingRow label="Name" description="Your display name.">
+                    <span className="text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
+                  </SettingRow>
+                  {isDevBypass && (
+                    <>
+                      <Separator />
+                      <SettingRow label="Mode" description="Running in dev bypass mode — no server connection.">
+                        <Badge variant="secondary">Dev Mode</Badge>
+                      </SettingRow>
+                    </>
+                  )}
+                  <Separator />
+                  <div className="pt-4">
+                    <Button
+                      variant="ghost"
+                      className="text-destructive hover:bg-destructive/10 hover:text-destructive gap-2"
+                      onClick={() => {
+                        signOut();
+                        setShowSettings(false);
+                      }}
+                    >
+                      <LogOut className="h-4 w-4" />
+                      Sign out
+                    </Button>
+                  </div>
+                </>
+              ) : (
+                <div className="py-4 text-sm text-muted-foreground">
+                  Not signed in. Close settings and sign in to manage your account.
+                </div>
+              )}
+            </div>
+          </div>
+        );
+
       case "appearance":
         return (
           <div>
@@ -1007,7 +1092,7 @@ export function SettingsView() {
                   checked={config?.notification_sound_enabled ?? false}
                   onCheckedChange={(checked) => {
                     setNotificationSoundEnabled(checked).catch(console.error);
-                    storeSet("notification_sound_enabled", String(checked));
+                    updateSyncedSetting("notifications", "sound_enabled", checked).catch(console.error);
                   }}
                 />
               </SettingRow>
@@ -1016,7 +1101,13 @@ export function SettingsView() {
                 label="Desktop notifications"
                 description="Show system notifications via D-Bus when events occur."
               >
-                <Switch checked disabled aria-label="Desktop notifications (not yet implemented)" />
+                <Switch
+                  checked={syncedSettings.notifications.desktop_enabled}
+                  onCheckedChange={(checked) => {
+                    // TODO: wire to actual desktop notification system when implemented
+                    updateSyncedSetting("notifications", "desktop_enabled", checked).catch(console.error);
+                  }}
+                />
               </SettingRow>
             </div>
           </div>
@@ -1041,26 +1132,35 @@ export function SettingsView() {
       {/* Body */}
       <div className="flex flex-1 min-h-0">
         {/* Left nav */}
-        <nav className="w-52 shrink-0 border-r border-border p-3 space-y-1">
-          {NAV_ITEMS.map((item) => {
-            const Icon = item.icon;
-            return (
-              <Button
-                key={item.id}
-                variant="ghost"
-                className={cn(
-                  "w-full justify-start gap-2.5 px-3 py-2 h-auto text-sm",
-                  activeSection === item.id
-                    ? "bg-accent text-foreground font-medium"
-                    : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
-                )}
-                onClick={() => setActiveSection(item.id)}
-              >
-                <Icon className="h-4 w-4 shrink-0" />
-                {item.label}
-              </Button>
-            );
-          })}
+        <nav className="w-52 shrink-0 border-r border-border p-3 space-y-4">
+          {NAV_GROUPS.map((group) => (
+            <div key={group.label}>
+              <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
+                {group.label}
+              </p>
+              <div className="space-y-0.5">
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <Button
+                      key={item.id}
+                      variant="ghost"
+                      className={cn(
+                        "w-full justify-start gap-2.5 px-3 py-2 h-auto text-sm",
+                        activeSection === item.id
+                          ? "bg-accent text-foreground font-medium"
+                          : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
+                      )}
+                      onClick={() => setActiveSection(item.id)}
+                    >
+                      <Icon className="h-4 w-4 shrink-0" />
+                      {item.label}
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </nav>
 
         {/* Content */}

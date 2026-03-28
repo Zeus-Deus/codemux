@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useTauriEvent } from "./use-tauri-event";
-import { onAuthStateChanged } from "@/tauri/events";
+import { onAuthStateChanged, onSettingsSynced } from "@/tauri/events";
 import { useAuthStore } from "@/stores/auth-store";
-import type { AuthStatePayload } from "@/tauri/types";
+import { useSyncedSettingsStore, DEFAULT_SETTINGS } from "@/stores/synced-settings-store";
+import type { AuthStatePayload, UserSettings } from "@/tauri/types";
 
 /**
  * Listens to "auth-state-changed" Tauri events (from OAuth callback, token expiry, etc.)
@@ -12,6 +13,7 @@ import type { AuthStatePayload } from "@/tauri/types";
 export function useAuthEvents() {
   const setUser = useAuthStore((s) => s.setUser);
   const checkAuth = useAuthStore((s) => s.checkAuth);
+  const applySettings = useSyncedSettingsStore((s) => s.applySettingsFromEvent);
   const lastCheckRef = useRef(0);
 
   // Handle auth-state-changed events from the Rust backend
@@ -19,8 +21,10 @@ export function useAuthEvents() {
     (payload: AuthStatePayload) => {
       if (payload.authenticated && payload.user) {
         setUser(payload.user);
+        useSyncedSettingsStore.getState().loadSettings();
       } else {
         setUser(null);
+        useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS, isLoading: true });
       }
       // Also clear the signing-in state since the flow completed
       useAuthStore.setState({ isSigningIn: false });
@@ -29,6 +33,16 @@ export function useAuthEvents() {
   );
 
   useTauriEvent(onAuthStateChanged, handleAuthEvent, [handleAuthEvent]);
+
+  // Handle settings-synced events from the Rust backend
+  const handleSettingsSynced = useCallback(
+    (settings: UserSettings) => {
+      applySettings(settings);
+    },
+    [applySettings],
+  );
+
+  useTauriEvent(onSettingsSynced, handleSettingsSynced, [handleSettingsSynced]);
 
   // Re-verify token on window focus (at most once per 5 minutes)
   useEffect(() => {

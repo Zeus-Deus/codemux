@@ -1,3 +1,42 @@
+// ── Synced Settings ──
+
+export interface AppearanceSettings {
+  theme: string;
+  shell_font: string | null;
+  terminal_font_size: number;
+}
+
+export interface EditorSettings {
+  default_ide: string | null;
+}
+
+export interface TerminalSyncSettings {
+  scrollback_limit: number;
+  cursor_style: string;
+}
+
+export interface GitSyncSettings {
+  default_base_branch: string;
+}
+
+export interface KeyboardSettings {
+  shortcuts: Record<string, string>;
+}
+
+export interface NotificationSyncSettings {
+  sound_enabled: boolean;
+  desktop_enabled: boolean;
+}
+
+export interface UserSettings {
+  appearance: AppearanceSettings;
+  editor: EditorSettings;
+  terminal: TerminalSyncSettings;
+  git: GitSyncSettings;
+  keyboard: KeyboardSettings;
+  notifications: NotificationSyncSettings;
+}
+
 // ── Auth ──
 
 export interface AuthUser {

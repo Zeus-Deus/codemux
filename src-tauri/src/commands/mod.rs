@@ -7,6 +7,7 @@ pub mod git;
 pub mod github;
 pub mod openflow;
 pub mod presets;
+pub mod settings_sync;
 pub mod workspace;
 
 pub use ai::*;
@@ -18,6 +19,7 @@ pub use git::*;
 pub use github::*;
 pub use openflow::*;
 pub use presets::*;
+pub use settings_sync::*;
 pub use workspace::*;
 
 use crate::indexing::{

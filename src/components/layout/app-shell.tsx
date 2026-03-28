@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useSettingsStore } from "@/stores/settings-store";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
@@ -15,6 +16,7 @@ import { ContentSearchDialog } from "@/components/search/content-search-dialog";
 export function AppShell() {
   const isLoading = useAppStore((s) => s.appState === null);
   const settingsLoaded = useSettingsStore((s) => s.loaded);
+  const syncedLoading = useSyncedSettingsStore((s) => s.isLoading);
   const hasWorkspaces = useAppStore(
     (s) => (s.appState?.workspaces.length ?? 0) > 0,
   );
@@ -37,7 +39,7 @@ export function AppShell() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  if (isLoading || !settingsLoaded) {
+  if (isLoading || !settingsLoaded || syncedLoading) {
     return (
       <div className="flex h-screen items-center justify-center bg-background text-muted-foreground">
         Loading…

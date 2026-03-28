@@ -2,6 +2,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 
 export { Channel };
 import type {
+  UserSettings,
   AgentConfig,
   AgentSessionState,
   AppStateSnapshot,
@@ -69,6 +70,20 @@ export const signOut = () =>
 
 export const getAuthToken = () =>
   invoke<string | null>("get_auth_token");
+
+// ── Settings Sync ──
+
+export const getSyncedSettings = () =>
+  invoke<UserSettings>("get_synced_settings");
+
+export const updateSyncedSettings = (settings: UserSettings) =>
+  invoke<UserSettings>("update_synced_settings", { settings });
+
+export const updateSetting = (section: string, key: string, value: unknown) =>
+  invoke<UserSettings>("update_setting", { section, key, value });
+
+export const resetSyncedSettings = () =>
+  invoke<UserSettings>("reset_synced_settings");
 
 // ── Core ──
 

@@ -24,6 +24,7 @@ pub mod ports;
 pub mod presets;
 pub mod project;
 pub mod scripts;
+pub mod settings_sync;
 pub mod state;
 pub mod stream_input;
 pub mod terminal;
@@ -473,6 +474,10 @@ pub fn run() {
             commands::check_auth,
             commands::sign_out,
             commands::get_auth_token,
+            commands::get_synced_settings,
+            commands::update_synced_settings,
+            commands::update_setting,
+            commands::reset_synced_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,14 +1,11 @@
 import { create } from "zustand";
 import { dbGetAllSettings, dbSetSetting } from "@/tauri/commands";
+import { useSyncedSettingsStore } from "./synced-settings-store";
 
-const DEFAULTS: Record<string, string> = {
-  "terminal.font_size": "13",
-  "terminal.cursor_style": "bar",
+/** Machine-local settings only. Per-user settings live in synced-settings-store. */
+export const SETTINGS_DEFAULTS: Record<string, string> = {
   "terminal.color_theme": "app",
   "terminal.font_family": "'JetBrains Mono Variable', monospace",
-  "editor.default": "",
-  "git.default_base_branch": "main",
-  notification_sound_enabled: "true",
   ai_commit_message_enabled: "true",
   ai_commit_message_model: "",
   ai_resolver_enabled: "false",
@@ -45,7 +42,7 @@ export const useSettingsStore = create<SettingsStore>()((setState, getState) => 
   },
 
   get: (key: string) => {
-    return getState().settings[key] ?? DEFAULTS[key] ?? "";
+    return getState().settings[key] ?? SETTINGS_DEFAULTS[key] ?? "";
   },
 
   set: (key: string, value: string) => {
@@ -56,18 +53,10 @@ export const useSettingsStore = create<SettingsStore>()((setState, getState) => 
   },
 }));
 
-// ── Typed selectors (computed from raw settings) ──
+// ── Machine-local imperative getters ──
 
 function raw(key: string): string {
-  return useSettingsStore.getState().settings[key] ?? DEFAULTS[key] ?? "";
-}
-
-export function getTerminalFontSize(): number {
-  return Number(raw("terminal.font_size")) || 13;
-}
-
-export function getTerminalCursorStyle(): string {
-  return raw("terminal.cursor_style");
+  return useSettingsStore.getState().settings[key] ?? SETTINGS_DEFAULTS[key] ?? "";
 }
 
 export function getTerminalColorTheme(): string {
@@ -78,30 +67,28 @@ export function getTerminalFontFamily(): string {
   return raw("terminal.font_family");
 }
 
+// ── Per-user imperative getters (redirect to synced store for backward compat) ──
+
+export function getTerminalFontSize(): number {
+  return useSyncedSettingsStore.getState().settings.appearance.terminal_font_size;
+}
+
+export function getTerminalCursorStyle(): string {
+  return useSyncedSettingsStore.getState().settings.terminal.cursor_style;
+}
+
 export function getDefaultEditor(): string {
-  return raw("editor.default");
+  return useSyncedSettingsStore.getState().settings.editor.default_ide ?? "";
 }
 
 export function getDefaultBaseBranch(): string {
-  return raw("git.default_base_branch");
+  return useSyncedSettingsStore.getState().settings.git.default_base_branch;
 }
 
-// ── React hook selectors (trigger re-renders) ──
-
-export const selectTerminalFontSize = (s: SettingsStore): number =>
-  Number(s.settings["terminal.font_size"] ?? DEFAULTS["terminal.font_size"]) || 13;
-
-export const selectTerminalCursorStyle = (s: SettingsStore): string =>
-  s.settings["terminal.cursor_style"] ?? DEFAULTS["terminal.cursor_style"]!;
+// ── Machine-local React hook selectors ──
 
 export const selectTerminalColorTheme = (s: SettingsStore): string =>
-  s.settings["terminal.color_theme"] ?? DEFAULTS["terminal.color_theme"]!;
+  s.settings["terminal.color_theme"] ?? SETTINGS_DEFAULTS["terminal.color_theme"]!;
 
 export const selectTerminalFontFamily = (s: SettingsStore): string =>
-  s.settings["terminal.font_family"] ?? DEFAULTS["terminal.font_family"]!;
-
-export const selectDefaultEditor = (s: SettingsStore): string =>
-  s.settings["editor.default"] ?? DEFAULTS["editor.default"]!;
-
-export const selectDefaultBaseBranch = (s: SettingsStore): string =>
-  s.settings["git.default_base_branch"] ?? DEFAULTS["git.default_base_branch"]!;
+  s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;

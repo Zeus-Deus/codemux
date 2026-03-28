@@ -188,6 +188,21 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
                 name: verify.user.name,
                 image: verify.user.image,
             };
+
+            // Background-fetch synced settings after successful auth
+            let settings_handle = app.clone();
+            let settings_token = token.clone();
+            tauri::async_runtime::spawn(async move {
+                match crate::settings_sync::fetch_settings(&settings_token).await {
+                    Ok(s) => {
+                        let _ = settings_handle.emit("settings-synced", &s);
+                    }
+                    Err(e) => {
+                        eprintln!("[settings-sync] Background fetch failed: {e}");
+                    }
+                }
+            });
+
             Ok(Some(user))
         }
         Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
@@ -210,6 +225,11 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 #[tauri::command]
 pub fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
     clear_token();
+    crate::settings_sync::clear_cache();
+
+    // Reset frontend settings store to defaults before auth-state-changed
+    let _ = app.emit("settings-synced", &crate::settings_sync::UserSettings::default());
+
     let payload = AuthStatePayload {
         authenticated: false,
         user: None,

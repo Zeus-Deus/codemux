@@ -8,6 +8,7 @@ import type {
   PresetStoreSnapshot,
   TerminalStatusPayload,
   ThemeColors,
+  UserSettings,
 } from "./types";
 
 export type EventCallback<T> = (payload: T) => void;
@@ -62,6 +63,11 @@ export const onOpenflowCycle = (
   cb: EventCallback<OrchestratorTriggerResult>,
 ): Promise<UnlistenFn> =>
   listen<OrchestratorTriggerResult>("openflow-cycle", (e) => cb(e.payload));
+
+export const onSettingsSynced = (
+  cb: EventCallback<UserSettings>,
+): Promise<UnlistenFn> =>
+  listen<UserSettings>("settings-synced", (e) => cb(e.payload));
 
 export const onAuthStateChanged = (
   cb: EventCallback<AuthStatePayload>,
