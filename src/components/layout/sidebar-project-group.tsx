@@ -5,19 +5,28 @@ import {
   ContextMenuTrigger,
   ContextMenuContent,
   ContextMenuItem,
+  ContextMenuSeparator,
   ContextMenuSub,
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check, Loader2, AlertCircle } from "lucide-react";
+import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { dbGetUiState, dbSetUiState, closeWorkspace, closeWorkspaceWithWorktree } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
@@ -90,6 +99,27 @@ export function SidebarProjectGroup({
     } else {
       dbSetUiState(`project.color:${projectPath}`, "").catch(console.error);
     }
+  };
+
+  const [showCloseDialog, setShowCloseDialog] = useState(false);
+
+  const handleRevealInFileManager = () => {
+    revealItemInDir(projectPath).catch(console.error);
+  };
+
+  const handleCopyPath = () => {
+    navigator.clipboard.writeText(projectPath).catch(console.error);
+  };
+
+  const handleCloseProject = () => {
+    for (const ws of workspaces) {
+      if (ws.worktree_path) {
+        closeWorkspaceWithWorktree(ws.workspace_id, false, false, true).catch(console.error);
+      } else {
+        closeWorkspace(ws.workspace_id, true).catch(console.error);
+      }
+    }
+    setShowCloseDialog(false);
   };
 
   const hasColor = !!customColor;
@@ -165,6 +195,14 @@ export function SidebarProjectGroup({
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent>
+          <ContextMenuItem onClick={handleRevealInFileManager}>
+            <FolderOpen className="mr-2 h-3.5 w-3.5" />
+            Open in File Manager
+          </ContextMenuItem>
+          <ContextMenuItem onClick={handleCopyPath}>
+            <Clipboard className="mr-2 h-3.5 w-3.5" />
+            Copy Path
+          </ContextMenuItem>
           <ContextMenuSub>
             <ContextMenuSubTrigger>Change Color</ContextMenuSubTrigger>
             <ContextMenuSubContent className="w-36">
@@ -185,8 +223,49 @@ export function SidebarProjectGroup({
               ))}
             </ContextMenuSubContent>
           </ContextMenuSub>
+          <ContextMenuSeparator />
+          <ContextMenuItem
+            className="text-destructive focus:text-destructive"
+            onClick={() => setShowCloseDialog(true)}
+          >
+            Close Project
+          </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
+
+      {/* Close project confirmation dialog */}
+      <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
+        <DialogContent showCloseButton={false} className="max-w-[340px]">
+          <DialogHeader>
+            <DialogTitle className="text-sm">
+              Close project &ldquo;{projectName}&rdquo;?
+            </DialogTitle>
+            <DialogDescription>
+              This will close {workspaces.length} workspace{workspaces.length !== 1 ? "s" : ""} and
+              kill all active terminals in this project.
+              Your files and git history will remain on disk.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex justify-end gap-2 pt-1">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-3 text-xs"
+              onClick={() => setShowCloseDialog(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 px-3 text-xs"
+              onClick={handleCloseProject}
+            >
+              Close Project
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Workspace rows */}
       {!collapsed && workspaces.map((ws, idx) => (
