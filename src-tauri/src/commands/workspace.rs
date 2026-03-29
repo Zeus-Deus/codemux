@@ -860,6 +860,7 @@ pub fn create_tab(
         "terminal" => TabKind::Terminal,
         "browser" => TabKind::Browser,
         "diff" => TabKind::Diff,
+        "editor" => TabKind::Editor,
         _ => return Err(format!("Unsupported tab kind: {kind}")),
     };
 

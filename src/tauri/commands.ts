@@ -734,6 +734,12 @@ export const revealInFileManager = (path: string) =>
 export const listDirectory = (path: string) =>
   invoke<FileEntry[]>("list_directory", { path });
 
+export const readFile = (path: string) =>
+  invoke<string>("read_file", { path });
+
+export const writeFile = (path: string, content: string) =>
+  invoke<void>("write_file", { path, content });
+
 // ── Dialogs ──
 
 export const pickFolderDialog = (title: string) =>

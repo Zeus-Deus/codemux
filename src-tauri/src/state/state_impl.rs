@@ -27,6 +27,7 @@ pub enum TabKind {
     Terminal,
     Browser,
     Diff,
+    Editor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1862,6 +1863,16 @@ impl AppStateStore {
                     tab_id: tab_id.clone(),
                     kind: TabKind::Diff,
                     title: "Changes".into(),
+                    surface_id: None,
+                    browser_id: None,
+                });
+                workspace.active_tab_id = tab_id.clone();
+            }
+            TabKind::Editor => {
+                workspace.tabs.push(TabSnapshot {
+                    tab_id: tab_id.clone(),
+                    kind: TabKind::Editor,
+                    title: "Editor".into(),
                     surface_id: None,
                     browser_id: None,
                 });

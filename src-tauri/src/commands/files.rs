@@ -390,3 +390,36 @@ fn search_with_find(
         })
         .collect())
 }
+
+const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
+
+#[tauri::command]
+pub fn read_file(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("Not a file: {path}"));
+    }
+
+    let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read metadata: {e}"))?;
+    if metadata.len() > MAX_FILE_SIZE {
+        return Err(format!(
+            "File too large ({:.1} MB, limit is 2 MB)",
+            metadata.len() as f64 / (1024.0 * 1024.0)
+        ));
+    }
+
+    let bytes = std::fs::read(p).map_err(|e| format!("Failed to read file: {e}"))?;
+
+    // Detect binary: check for null bytes in first 8 KB
+    let check_len = bytes.len().min(8192);
+    if bytes[..check_len].contains(&0) {
+        return Err("Binary file".into());
+    }
+
+    String::from_utf8(bytes).map_err(|_| "Binary file (not valid UTF-8)".into())
+}
+
+#[tauri::command]
+pub fn write_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
+}

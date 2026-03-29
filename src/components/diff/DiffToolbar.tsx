@@ -7,15 +7,19 @@ import {
   ChevronLeft,
   ChevronRight,
   Target,
+  Pencil,
   X,
 } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { useDiffStore, type DiffTabState } from "@/stores/diff-store";
 import { closeTab } from "@/tauri/commands";
+import { openEditorTab } from "@/lib/open-editor-tab";
+import type { TabSnapshot } from "@/tauri/types";
 
 interface Props {
   tabId: string;
   workspaceId: string;
+  tabs: TabSnapshot[];
   tab: DiffTabState;
   fileCount: number;
   fileIndex: number;
@@ -28,6 +32,7 @@ interface Props {
 export function DiffToolbar({
   tabId,
   workspaceId,
+  tabs,
   tab,
   fileCount,
   fileIndex,
@@ -50,6 +55,18 @@ export function DiffToolbar({
       <span className="text-xs font-mono text-muted-foreground truncate min-w-0">
         {tab.filePath ?? "No file selected"}
       </span>
+
+      {tab.filePath && (
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          onClick={() => openEditorTab(workspaceId, tabs, tab.filePath!).catch(console.error)}
+          aria-label="Edit file"
+          title="Edit file"
+        >
+          <Pencil className="h-3 w-3" />
+        </Button>
+      )}
 
       <div className="flex-1" />
 

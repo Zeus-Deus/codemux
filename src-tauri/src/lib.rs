@@ -505,6 +505,8 @@ pub fn run() {
             commands::list_directory,
             commands::search_in_files,
             commands::search_file_names,
+            commands::read_file,
+            commands::write_file,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,
             commands::signin_email,

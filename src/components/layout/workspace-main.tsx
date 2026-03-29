@@ -7,6 +7,7 @@ import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
+import { EditorPane } from "@/components/editor/EditorPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 
@@ -132,6 +133,8 @@ export function WorkspaceMain() {
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab?.kind === "diff" ? (
             <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
+          ) : activeTab?.kind === "editor" ? (
+            <EditorPane tabId={activeTab.tab_id} />
           ) : (
             <PaneContainer workspace={activeWorkspace} />
           )}

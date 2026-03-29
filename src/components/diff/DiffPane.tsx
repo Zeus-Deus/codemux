@@ -132,6 +132,7 @@ export function DiffPane({ tabId, workspace }: Props) {
         <DiffToolbar
           tabId={tabId}
           workspaceId={workspace.workspace_id}
+          tabs={workspace.tabs}
           tab={tab}
           fileCount={filteredFiles.length}
           fileIndex={tab.fileIndex}
@@ -159,6 +160,7 @@ export function DiffPane({ tabId, workspace }: Props) {
       <DiffToolbar
         tabId={tabId}
         workspaceId={workspace.workspace_id}
+        tabs={workspace.tabs}
         tab={tab}
         fileCount={filteredFiles.length}
         fileIndex={tab.fileIndex}

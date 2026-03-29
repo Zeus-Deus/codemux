@@ -163,3 +163,84 @@
     @apply font-mono;
     }
 }
+
+/* ── Rendered markdown ── */
+.markdown-rendered {
+  color: var(--foreground);
+  font-family: system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.7;
+}
+.markdown-rendered h1, .markdown-rendered h2, .markdown-rendered h3,
+.markdown-rendered h4, .markdown-rendered h5, .markdown-rendered h6 {
+  color: var(--foreground);
+  font-weight: 600;
+  margin-top: 1.5em;
+  margin-bottom: 0.5em;
+  line-height: 1.3;
+}
+.markdown-rendered h1 { font-size: 1.75em; }
+.markdown-rendered h2 { font-size: 1.4em; border-bottom: 1px solid var(--border); padding-bottom: 0.25em; }
+.markdown-rendered h3 { font-size: 1.15em; }
+.markdown-rendered h4 { font-size: 1em; }
+.markdown-rendered p { margin: 0.75em 0; }
+.markdown-rendered a { color: var(--sidebar-primary); text-decoration: underline; text-underline-offset: 2px; }
+.markdown-rendered a:hover { opacity: 0.8; }
+.markdown-rendered strong { font-weight: 600; }
+.markdown-rendered em { font-style: italic; }
+.markdown-rendered ul, .markdown-rendered ol { margin: 0.5em 0; padding-left: 1.5em; }
+.markdown-rendered ul { list-style-type: disc; }
+.markdown-rendered ol { list-style-type: decimal; }
+.markdown-rendered li { margin: 0.25em 0; }
+.markdown-rendered li > ul, .markdown-rendered li > ol { margin: 0.15em 0; }
+.markdown-rendered blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 1em;
+  margin: 0.75em 0;
+  color: var(--muted-foreground);
+}
+.markdown-rendered code {
+  font-family: 'JetBrains Mono Variable', monospace;
+  font-size: 0.85em;
+  background: var(--muted);
+  padding: 0.15em 0.35em;
+  border-radius: 3px;
+}
+.markdown-rendered pre {
+  margin: 0.75em 0;
+  padding: 0.75em 1em;
+  background: var(--muted);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.markdown-rendered pre code {
+  background: none;
+  padding: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.markdown-rendered hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.5em 0;
+}
+.markdown-rendered table {
+  border-collapse: collapse;
+  margin: 0.75em 0;
+  width: 100%;
+  font-size: 13px;
+}
+.markdown-rendered th, .markdown-rendered td {
+  border: 1px solid var(--border);
+  padding: 0.4em 0.75em;
+  text-align: left;
+}
+.markdown-rendered th {
+  background: var(--muted);
+  font-weight: 600;
+}
+.markdown-rendered img { max-width: 100%; border-radius: 6px; margin: 0.75em 0; }
+.markdown-rendered input[type="checkbox"] {
+  margin-right: 0.5em;
+  accent-color: var(--sidebar-primary);
+}

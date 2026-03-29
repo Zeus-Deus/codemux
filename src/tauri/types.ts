@@ -442,7 +442,7 @@ export type GhStatus =
   | { status: "NotAuthenticated" }
   | { status: "Authenticated"; username: string };
 
-export type TabKind = "terminal" | "browser" | "diff";
+export type TabKind = "terminal" | "browser" | "diff" | "editor";
 
 export interface TabSnapshot {
   tab_id: string;

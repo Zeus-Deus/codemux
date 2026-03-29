@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -8,8 +8,9 @@ import {
 } from "@/components/ui/tooltip";
 import { ChevronRight, Folder, RefreshCw, Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
-import { listDirectory, detectEditors, openInEditor } from "@/tauri/commands";
-import type { WorkspaceSnapshot, FileEntry, EditorInfo } from "@/tauri/types";
+import { listDirectory } from "@/tauri/commands";
+import { openEditorTab } from "@/lib/open-editor-tab";
+import type { WorkspaceSnapshot, FileEntry } from "@/tauri/types";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -107,17 +108,12 @@ export function FileTreePanel({ workspace }: Props) {
   const [dirContents, setDirContents] = useState<Map<string, FileEntry[]>>(new Map());
   const [loadingDirs, setLoadingDirs] = useState<Set<string>>(new Set());
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
-  const editorsRef = useRef<EditorInfo[]>([]);
-
-  // Load root + detect editors on mount
+  // Load root on mount
   useEffect(() => {
     if (!cwd) return;
     listDirectory(cwd)
       .then(setRootEntries)
       .catch(() => setRootEntries([]));
-    detectEditors()
-      .then((eds) => { editorsRef.current = eds; })
-      .catch(() => {});
   }, [cwd]);
 
   const toggleDir = useCallback(
@@ -152,12 +148,12 @@ export function FileTreePanel({ workspace }: Props) {
     [expandedDirs, dirContents],
   );
 
-  const clickFile = useCallback((path: string) => {
-    const editor = editorsRef.current[0];
-    if (editor) {
-      openInEditor(editor.id, path).catch(console.error);
-    }
-  }, []);
+  const clickFile = useCallback(
+    (path: string) => {
+      openEditorTab(workspace.workspace_id, workspace.tabs, path).catch(console.error);
+    },
+    [workspace.workspace_id, workspace.tabs],
+  );
 
   const refreshRoot = () => {
     setDirContents(new Map());

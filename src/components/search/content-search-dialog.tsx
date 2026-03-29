@@ -10,7 +10,8 @@ import { Button } from "@/components/ui/button";
 import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useActiveWorkspace } from "@/stores/app-store";
-import { searchInFiles, detectEditors, openInEditor } from "@/tauri/commands";
+import { searchInFiles } from "@/tauri/commands";
+import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
 
 interface GroupedResults {
@@ -86,18 +87,16 @@ export function ContentSearchDialog() {
 
   const openFile = useCallback(
     async (filePath: string) => {
+      if (!workspace) return;
       try {
-        const editors = await detectEditors();
-        if (editors.length > 0) {
-          const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
-          await openInEditor(editors[0].id, fullPath);
-        }
+        const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
+        await openEditorTab(workspace.workspace_id, workspace.tabs, fullPath);
       } catch (err) {
         console.error("Failed to open file:", err);
       }
       setOpen(false);
     },
-    [cwd, setOpen],
+    [workspace, cwd, setOpen],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

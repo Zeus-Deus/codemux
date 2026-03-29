@@ -943,7 +943,7 @@ export function ChangesPanel({ workspace }: Props) {
   // Against-base state
   const [baseBranch, setBaseBranch] = useState<string>("main");
   const [baseBranchFiles, setBaseBranchFiles] = useState<GitFileStatus[]>([]);
-  const [baseBranchExpanded, setBaseBranchExpanded] = useState(true);
+  const [baseBranchExpanded, setBaseBranchExpanded] = useState(false);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
 
   const config = useAppStore((s) => s.appState?.config);

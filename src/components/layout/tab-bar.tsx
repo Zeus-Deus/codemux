@@ -14,7 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Plus, X, Terminal, Globe, GitCompare, FileDiff } from "lucide-react";
+import { Plus, X, Terminal, Globe, GitCompare, FileDiff, FileCode } from "lucide-react";
 import {
   activateTab,
   closeTab,
@@ -27,6 +27,7 @@ import {
 import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNodeSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { useEditorStore } from "@/stores/editor-store";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 
@@ -38,6 +39,7 @@ const tabIcon: Record<TabKind, React.ReactNode> = {
   terminal: <Terminal className="h-3 w-3" />,
   browser: <Globe className="h-3 w-3" />,
   diff: <GitCompare className="h-3 w-3" />,
+  editor: <FileCode className="h-3 w-3" />,
 };
 
 function collectPaneIds(node: PaneNodeSnapshot): string[] {
@@ -254,6 +256,7 @@ export function TabBar({ workspace }: Props) {
                     >
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
+                      {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
                       {tabStatusMap.has(tab.tab_id) && (
                         <StatusIndicator status={tabStatusMap.get(tab.tab_id)!} />
                       )}
@@ -356,4 +359,10 @@ export function TabBar({ workspace }: Props) {
       )}
     </div>
   );
+}
+
+function EditorDirtyDot({ tabId }: { tabId: string }) {
+  const isDirty = useEditorStore((s) => s.getTab(tabId)?.isDirty ?? false);
+  if (!isDirty) return null;
+  return <span className="w-1.5 h-1.5 rounded-full bg-foreground/50 shrink-0" title="Unsaved changes" />;
 }
