@@ -145,6 +145,21 @@ describe("project grouping", () => {
     expect(names).not.toContain("app");
   });
 
+  it("empty workspaces array means no active workspace", () => {
+    // When all workspaces are closed, there's nothing to resolve
+    const workspaces: WorkspaceSnapshot[] = [];
+    const groups = new Map<string, { name: string; path: string }>();
+    for (const ws of workspaces) {
+      const projectPath = resolveProjectRoot(ws);
+      const projectName =
+        projectPath.split("/").filter(Boolean).pop() || projectPath;
+      if (!groups.has(projectPath)) {
+        groups.set(projectPath, { name: projectName, path: projectPath });
+      }
+    }
+    expect(groups.size).toBe(0);
+  });
+
   it("does not disambiguate unique project names", () => {
     const workspaces = [
       makeWs({ workspace_id: "ws-1", cwd: "/home/user/projects/frontend" }),

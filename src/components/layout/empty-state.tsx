@@ -17,7 +17,7 @@ export function EmptyState() {
         <img
           src={wordmark}
           alt=""
-          className="h-8 w-auto select-none opacity-80 mb-10"
+          className="h-[72px] w-auto select-none opacity-80 mb-10"
           draggable={false}
         />
 

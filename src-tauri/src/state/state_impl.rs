@@ -96,6 +96,15 @@ fn persist_debouncer() -> &'static PersistDebouncer {
     PERSIST_DEBOUNCER.get_or_init(PersistDebouncer::new)
 }
 
+/// Synchronously persist the current app state. Called on app close to
+/// ensure the debounced write completes before the process exits.
+pub fn flush_persisted_state(store: &AppStateStore) {
+    let snapshot = store.snapshot();
+    if let Err(e) = save_persisted_state(&snapshot) {
+        eprintln!("[codemux::state] Failed to persist layout state on close: {e}");
+    }
+}
+
 use crate::project::current_project_root;
 
 const APP_STATE_SCHEMA_VERSION: u32 = 1;
@@ -351,6 +360,16 @@ impl AppStateStore {
 
     pub fn replace_snapshot(&self, snapshot: AppStateSnapshot) {
         *self.inner.lock().unwrap() = snapshot;
+    }
+
+    /// Remove all workspaces and sessions, keeping config intact.
+    /// Used on first launch so the splash screen shows instead of
+    /// the auto-created CWD workspace from default_app_state().
+    pub fn clear_workspaces(&self) {
+        let mut snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.clear();
+        snapshot.terminal_sessions.clear();
+        snapshot.active_workspace_id = WorkspaceId(String::new());
     }
 
     pub fn set_notification_sound_enabled(&self, enabled: bool) {
@@ -3248,5 +3267,67 @@ mod tests {
         let after_split = store.snapshot();
         let second_workspace = workspace_by_id(&after_split, &second_workspace_id);
         assert_eq!(terminal_count_for_workspace(second_workspace), 3);
+    }
+
+    #[test]
+    fn close_last_workspace_empties_state() {
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.workspaces.len(), 1);
+
+        let ws_id = snapshot.workspaces[0].workspace_id.0.clone();
+        let result = store.close_workspace(&ws_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, "");
+
+        let after = store.snapshot();
+        assert!(after.workspaces.is_empty());
+        assert_eq!(after.active_workspace_id.0, "");
+    }
+
+    #[test]
+    fn close_one_of_many_workspaces_keeps_others() {
+        let store = AppStateStore::default();
+
+        let ws2_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-b"),
+            WorkspacePresetLayout::Single,
+        );
+        let ws3_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-c"),
+            WorkspacePresetLayout::Single,
+        );
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.workspaces.len(), 3);
+
+        // Close the second workspace
+        let result = store.close_workspace(&ws2_id.0);
+        assert!(result.is_ok());
+
+        let after = store.snapshot();
+        assert_eq!(after.workspaces.len(), 2);
+        assert!(after.workspaces.iter().all(|w| w.workspace_id.0 != ws2_id.0));
+        assert!(after.workspaces.iter().any(|w| w.workspace_id.0 == ws3_id.0));
+        // Active workspace should be set to the first remaining
+        assert!(!after.active_workspace_id.0.is_empty());
+    }
+
+    #[test]
+    fn clear_workspaces_empties_state_but_keeps_config() {
+        let store = AppStateStore::default();
+        let before = store.snapshot();
+        assert_eq!(before.workspaces.len(), 1);
+        assert!(!before.terminal_sessions.is_empty());
+
+        store.clear_workspaces();
+
+        let after = store.snapshot();
+        assert!(after.workspaces.is_empty());
+        assert!(after.terminal_sessions.is_empty());
+        assert_eq!(after.active_workspace_id.0, "");
+        // Config should be preserved
+        assert!(after.config.linux_first);
+        assert_eq!(after.config.theme_source, "omarchy_or_default");
     }
 }

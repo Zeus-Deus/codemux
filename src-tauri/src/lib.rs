@@ -110,18 +110,12 @@ pub fn run() {
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
                 state.migrate_project_roots();
-
-                // Ensure a workspace exists for the current project root.
-                // Persisted state may only contain stale worktree workspaces
-                // that point to directories unrelated to the current project.
-                let project_root = crate::project::current_project_root();
-                let project_root_str = project_root.display().to_string();
-                let has_project_workspace = state.snapshot().workspaces.iter().any(|w| w.cwd == project_root_str);
-                if !has_project_workspace {
-                    eprintln!("[startup] No workspace for current project root ({}), creating one", project_root_str);
-                    let ws_id = state.create_workspace_at_path(project_root.clone());
-                    state.activate_workspace(&ws_id.0);
-                }
+            } else {
+                // First launch — no persisted layout exists. Replace the
+                // default_app_state (which creates a CWD workspace) with an
+                // empty state so the user sees the splash screen instead.
+                let state: tauri::State<'_, state::AppStateStore> = handle.state();
+                state.clear_workspaces();
             }
 
             // Ensure .mcp.json exists for all active workspaces
@@ -169,6 +163,9 @@ pub fn run() {
                                 db.set_ui_state("window_x", &pos.x.to_string()).ok();
                                 db.set_ui_state("window_y", &pos.y.to_string()).ok();
                             }
+                            // Flush any pending debounced state write before exit
+                            let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
+                            state::flush_persisted_state(&app_state);
                         }
                     });
                 }
