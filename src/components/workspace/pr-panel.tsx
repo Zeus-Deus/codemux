@@ -264,7 +264,7 @@ function NoPrView({
       <p className="text-xs text-muted-foreground">
         No pull request for this branch
       </p>
-      <Button size="xs" className="text-xs" onClick={() => setShowForm(true)}>
+      <Button variant="secondary" size="xs" className="text-xs" onClick={() => setShowForm(true)}>
         Create Pull Request
       </Button>
     </div>
