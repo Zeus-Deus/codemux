@@ -46,6 +46,7 @@ import type {
   WorkspaceConfig,
   WorktreeInfo,
   ProjectScripts,
+  DetectedSetup,
 } from "./types";
 
 // ── Auth ──
@@ -245,6 +246,9 @@ export const setProjectScripts = (path: string, scripts: ProjectScripts) =>
 
 export const runProjectDevCommand = (workspaceId: string, forceNew?: boolean) =>
   invoke<void>("run_project_dev_command", { workspaceId, forceNew: forceNew ?? false });
+
+export const detectPackageManager = (projectPath: string) =>
+  invoke<DetectedSetup[]>("detect_package_manager", { projectPath });
 
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });

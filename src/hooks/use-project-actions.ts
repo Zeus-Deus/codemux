@@ -36,9 +36,11 @@ export function useProjectActions() {
 
     await dbAddRecentProject(folder, name);
 
-    // Create a default workspace on the current branch and navigate to it
+    // Create a temporary workspace so the project appears in the sidebar,
+    // then show the onboarding wizard in the content area.
     const wsId = await createEmptyWorkspace(folder);
     await activateWorkspace(wsId);
+    useUIStore.getState().setOnboardingProjectDir(folder);
 
     return { success: true, path: folder, name };
   }, []);
@@ -53,9 +55,11 @@ export function useProjectActions() {
       const name = clonedPath.split("/").filter(Boolean).pop() || clonedPath;
       await dbAddRecentProject(clonedPath, name);
 
-      // Create a default workspace on the current branch and navigate to it
+      // Create a temporary workspace so the project appears in the sidebar,
+      // then show the onboarding wizard in the content area.
       const wsId = await createEmptyWorkspace(clonedPath);
       await activateWorkspace(wsId);
+      useUIStore.getState().setOnboardingProjectDir(clonedPath);
 
       return { path: clonedPath, name };
     },

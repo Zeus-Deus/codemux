@@ -467,6 +467,7 @@ pub fn run() {
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
             commands::get_pr_deployments,
+            commands::detect_package_manager,
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,

@@ -628,6 +628,13 @@ export interface ProjectScripts {
   run: string | null;
 }
 
+export interface DetectedSetup {
+  id: string;
+  label: string;
+  command: string;
+  enabled: boolean;
+}
+
 // ── Theme ──
 
 export interface ThemeColors {

@@ -8,6 +8,7 @@ import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
+import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 
 const RIGHT_PANEL_MIN = 240;
 const RIGHT_PANEL_MAX = 500;
@@ -77,6 +78,8 @@ export function WorkspaceMain() {
   }, []);
 
   const activeWorkspace = useActiveWorkspace();
+  const onboardingProjectDir = useUIStore((s) => s.onboardingProjectDir);
+  const setOnboardingProjectDir = useUIStore((s) => s.setOnboardingProjectDir);
   const rightPanelTab = useUIStore((s) =>
     activeWorkspace
       ? s.rightPanelTabs[activeWorkspace.workspace_id] ?? null
@@ -85,6 +88,23 @@ export function WorkspaceMain() {
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 
   if (!activeWorkspace) return null;
+
+  // Onboarding wizard — renders in the content area for first-time project setup
+  const isOnboarding =
+    onboardingProjectDir &&
+    (activeWorkspace.project_root === onboardingProjectDir ||
+      activeWorkspace.cwd === onboardingProjectDir);
+
+  if (isOnboarding) {
+    return (
+      <ProjectOnboarding
+        projectDir={onboardingProjectDir}
+        tempWorkspaceId={activeWorkspace.workspace_id}
+        onComplete={() => setOnboardingProjectDir(null)}
+        onCancel={() => setOnboardingProjectDir(null)}
+      />
+    );
+  }
 
   // OpenFlow workspaces get their own dedicated view
   if (activeWorkspace.workspace_type === "open_flow") {

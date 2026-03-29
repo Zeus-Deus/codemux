@@ -17,6 +17,7 @@ interface UIStore {
   lastSelectedAgentId: string | null;
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
+  onboardingProjectDir: string | null;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -32,6 +33,7 @@ interface UIStore {
   setLastSelectedAgentId: (id: string | null) => void;
   setShowCloneDialog: (show: boolean) => void;
   setShowNewProjectScreen: (show: boolean) => void;
+  setOnboardingProjectDir: (dir: string | null) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -49,6 +51,7 @@ export const useUIStore = create<UIStore>()(
       lastSelectedAgentId: null,
       showCloneDialog: false,
       showNewProjectScreen: false,
+      onboardingProjectDir: null,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -98,6 +101,8 @@ export const useUIStore = create<UIStore>()(
       setShowCloneDialog: (show) => set({ showCloneDialog: show }),
 
       setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
+
+      setOnboardingProjectDir: (dir) => set({ onboardingProjectDir: dir }),
     }),
     {
       name: "codemux-ui",

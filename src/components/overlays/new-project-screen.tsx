@@ -105,8 +105,11 @@ export function NewProjectScreen() {
       const name =
         projectPath.split("/").filter(Boolean).pop() || projectPath;
       await dbAddRecentProject(projectPath, name);
+      // Create a temporary workspace so the project appears in sidebar,
+      // then show the onboarding wizard in the content area.
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspace(wsId);
+      useUIStore.getState().setOnboardingProjectDir(projectPath);
       setShowNewProjectScreen(false);
     } catch (err) {
       setError(String(err));
