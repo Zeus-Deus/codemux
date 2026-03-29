@@ -181,10 +181,10 @@ function SectionHeader({
 }) {
   const textColor = variant === "danger" ? "text-danger" : "text-muted-foreground";
   return (
-    <div className="flex items-center px-1.5 py-0.5">
+    <div className="flex items-center">
       <button
         type="button"
-        className="flex flex-1 items-center gap-1.5 text-left min-w-0 hover:bg-accent/30 rounded-sm -ml-0.5 pl-0.5 py-0.5 cursor-pointer transition-colors"
+        className="flex flex-1 items-center gap-1.5 text-left min-w-0 hover:bg-accent/30 rounded-sm px-2 py-1.5 cursor-pointer transition-colors"
         onClick={onToggle}
       >
         <ChevronRight
@@ -196,7 +196,7 @@ function SectionHeader({
         <span className={`text-xs tabular-nums ${textColor}`}>{count}</span>
       </button>
       {actions && (
-        <div className="flex items-center gap-0.5 shrink-0">{actions}</div>
+        <div className="flex items-center gap-0.5 shrink-0 pr-1.5">{actions}</div>
       )}
     </div>
   );
@@ -419,7 +419,7 @@ function FileRow({
           <div
             role="button"
             tabIndex={0}
-            className={`group flex w-full items-center gap-1.5 rounded-sm py-1 text-left hover:bg-accent/50 transition-colors cursor-default px-1.5 ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
+            className={`group flex w-full items-stretch gap-1 rounded-sm text-left hover:bg-accent/50 transition-colors cursor-default px-1.5 ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
             onClick={(e) => {
               if (e.altKey || !onOpenDiff) {
                 onToggleExpand();
@@ -434,22 +434,26 @@ function FileRow({
               }
             }}
           >
-            <span
-              className={`shrink-0 w-3 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
-            >
-              {STATUS_LABEL[file.status] ?? "?"}
-            </span>
-            <span className="flex-1 truncate text-xs text-foreground">{name}</span>
-            {(file.additions > 0 || file.deletions > 0) && (
-              <span className="flex items-center gap-0.5 shrink-0 text-[10px] tabular-nums">
-                {file.additions > 0 && (
-                  <span className="text-success">+{file.additions}</span>
-                )}
-                {file.deletions > 0 && (
-                  <span className="text-danger">-{file.deletions}</span>
+            <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
+              <span
+                className={`shrink-0 w-3 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
+              >
+                {STATUS_LABEL[file.status] ?? "?"}
+              </span>
+              <span className="flex-1 min-w-0 flex items-center gap-1">
+                <span className="truncate text-xs text-foreground">{name}</span>
+                {(file.additions > 0 || file.deletions > 0) && (
+                  <span className="flex items-center gap-0.5 shrink-0 text-[10px] tabular-nums opacity-60">
+                    {file.additions > 0 && (
+                      <span className="text-success">+{file.additions}</span>
+                    )}
+                    {file.deletions > 0 && (
+                      <span className="text-danger">-{file.deletions}</span>
+                    )}
+                  </span>
                 )}
               </span>
-            )}
+            </div>
             <div className="flex items-center shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
               {!staged && (
                 <Button
@@ -520,18 +524,22 @@ function ConflictFileRow({
         <div
           role="button"
           tabIndex={0}
-          className="group flex w-full items-center gap-1.5 rounded-sm py-1 px-1.5 text-left hover:bg-danger/10 transition-colors cursor-default"
+          className="group flex w-full items-stretch gap-1 rounded-sm px-1.5 text-left hover:bg-danger/10 transition-colors cursor-default"
           onClick={() => onOpenDiff?.(file.path, false)}
         >
-          <span className="shrink-0 w-3 text-center text-[10px] font-bold leading-none text-danger">
-            !
-          </span>
-          <span className="flex-1 truncate text-xs text-foreground">{name}</span>
-          {file.conflict_type && (
-            <span className="shrink-0 text-[9px] text-danger/70 bg-danger/10 px-1 rounded">
-              {CONFLICT_TYPE_LABEL[file.conflict_type] ?? file.conflict_type}
+          <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
+            <span className="shrink-0 w-3 text-center text-[10px] font-bold leading-none text-danger">
+              !
             </span>
-          )}
+            <span className="flex-1 min-w-0 flex items-center gap-1">
+              <span className="truncate text-xs text-foreground">{name}</span>
+              {file.conflict_type && (
+                <span className="shrink-0 text-[9px] text-danger/70 bg-danger/10 px-1 rounded">
+                  {CONFLICT_TYPE_LABEL[file.conflict_type] ?? file.conflict_type}
+                </span>
+              )}
+            </span>
+          </div>
           <div className="flex items-center shrink-0 gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
             <Button
               variant="ghost"
@@ -854,7 +862,7 @@ function FileSection({
   const groups = useMemo(() => groupByDirectory(files), [files]);
 
   return (
-    <div className="py-1">
+    <div>
       <SectionHeader
         title={label}
         count={files.length}
@@ -871,33 +879,37 @@ function FileSection({
           </Tooltip>
         }
       />
-      {!collapsed && (flat ? files.map((f) => (
-        <FileRow
-          key={f.path}
-          file={f}
-          staged={staged}
-          cwd={cwd}
-          expanded={expandedFile === f.path && expandedStaged === staged}
-          onToggleExpand={() => onToggleExpand(f.path, staged)}
-          onRefresh={onRefresh}
-          onOpenDiff={onOpenDiff}
-          activeDiffFile={activeDiffFile}
-        />
-      )) : groups.map((group) => (
-        <DirectoryGroup
-          key={group.dir}
-          dir={group.dir}
-          files={group.files}
-          staged={staged}
-          cwd={cwd}
-          expandedFile={expandedFile}
-          expandedStaged={expandedStaged}
-          onToggleExpand={onToggleExpand}
-          onRefresh={onRefresh}
-          onOpenDiff={onOpenDiff}
-          activeDiffFile={activeDiffFile}
-        />
-      )))}
+      {!collapsed && (
+        <div className="px-0.5 pb-1">
+          {flat ? files.map((f) => (
+            <FileRow
+              key={f.path}
+              file={f}
+              staged={staged}
+              cwd={cwd}
+              expanded={expandedFile === f.path && expandedStaged === staged}
+              onToggleExpand={() => onToggleExpand(f.path, staged)}
+              onRefresh={onRefresh}
+              onOpenDiff={onOpenDiff}
+              activeDiffFile={activeDiffFile}
+            />
+          )) : groups.map((group) => (
+            <DirectoryGroup
+              key={group.dir}
+              dir={group.dir}
+              files={group.files}
+              staged={staged}
+              cwd={cwd}
+              expandedFile={expandedFile}
+              expandedStaged={expandedStaged}
+              onToggleExpand={onToggleExpand}
+              onRefresh={onRefresh}
+              onOpenDiff={onOpenDiff}
+              activeDiffFile={activeDiffFile}
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
