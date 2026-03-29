@@ -253,8 +253,8 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           true, // new branch
           "single",
           baseBranch || null,
-          task.trim() || null,
-          selectedAgentId,
+          null, // no initial prompt — task is only for branch naming
+          null, // no agent preset — workspace opens empty
         );
 
         const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;

@@ -8,6 +8,7 @@ import {
   createEmptyWorkspace,
   activateWorkspace,
 } from "@/tauri/commands";
+import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 
 interface OpenProjectResult {
@@ -36,11 +37,14 @@ export function useProjectActions() {
 
     await dbAddRecentProject(folder, name);
 
-    // Create a temporary workspace so the project appears in the sidebar,
-    // then show the onboarding wizard in the content area.
+    // Only show the onboarding wizard if there are no existing workspaces
+    // across any project. If workspaces already exist, just create and activate.
+    const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
     const wsId = await createEmptyWorkspace(folder);
     await activateWorkspace(wsId);
-    useUIStore.getState().setOnboardingProjectDir(folder);
+    if (!hasWorkspaces) {
+      useUIStore.getState().setOnboardingProjectDir(folder);
+    }
 
     return { success: true, path: folder, name };
   }, []);
@@ -55,11 +59,12 @@ export function useProjectActions() {
       const name = clonedPath.split("/").filter(Boolean).pop() || clonedPath;
       await dbAddRecentProject(clonedPath, name);
 
-      // Create a temporary workspace so the project appears in the sidebar,
-      // then show the onboarding wizard in the content area.
+      const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(clonedPath);
       await activateWorkspace(wsId);
-      useUIStore.getState().setOnboardingProjectDir(clonedPath);
+      if (!hasWorkspaces) {
+        useUIStore.getState().setOnboardingProjectDir(clonedPath);
+      }
 
       return { path: clonedPath, name };
     },

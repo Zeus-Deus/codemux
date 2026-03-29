@@ -11,6 +11,7 @@ import {
   X,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
+import { useAppStore } from "@/stores/app-store";
 import {
   pickFolderDialog,
   createEmptyRepo,
@@ -105,11 +106,12 @@ export function NewProjectScreen() {
       const name =
         projectPath.split("/").filter(Boolean).pop() || projectPath;
       await dbAddRecentProject(projectPath, name);
-      // Create a temporary workspace so the project appears in sidebar,
-      // then show the onboarding wizard in the content area.
+      const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspace(wsId);
-      useUIStore.getState().setOnboardingProjectDir(projectPath);
+      if (!hasWorkspaces) {
+        useUIStore.getState().setOnboardingProjectDir(projectPath);
+      }
       setShowNewProjectScreen(false);
     } catch (err) {
       setError(String(err));
