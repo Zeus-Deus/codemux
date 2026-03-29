@@ -1,8 +1,8 @@
 use tauri::{Emitter, State};
 
 use crate::auth::{
-    api_base_url, clear_token, is_token_expired, load_token, save_token, AuthResponse,
-    AuthState, AuthStatePayload, AuthUser,
+    api_base_url, clear_token, is_token_expired, load_cached_user, load_token, save_auth,
+    AuthResponse, AuthState, AuthStatePayload, AuthUser,
 };
 
 #[tauri::command]
@@ -69,17 +69,19 @@ pub async fn signin_email(
         .await
         .map_err(|e| format!("Parse response: {e}"))?;
 
-    save_token(&api_resp.token, &api_resp.expires_at)?;
+    let user = AuthUser {
+        id: api_resp.user.id.clone(),
+        email: api_resp.user.email.clone(),
+        name: api_resp.user.name.clone(),
+        image: api_resp.user.image.clone(),
+    };
+
+    save_auth(&api_resp.token, &api_resp.expires_at, Some(&user))?;
 
     let auth_response = AuthResponse {
         token: api_resp.token.clone(),
         expires_at: api_resp.expires_at.clone(),
-        user: AuthUser {
-            id: api_resp.user.id.clone(),
-            email: api_resp.user.email.clone(),
-            name: api_resp.user.name.clone(),
-            image: api_resp.user.image.clone(),
-        },
+        user: user.clone(),
     };
 
     let payload = AuthStatePayload {
@@ -189,6 +191,9 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
                 image: verify.user.image,
             };
 
+            // Cache user data for offline/network-error auth
+            let _ = save_auth(&token, &expires_at, Some(&user));
+
             // Background-fetch synced settings after successful auth
             let settings_handle = app.clone();
             let settings_token = token.clone();
@@ -215,9 +220,8 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
             Ok(None)
         }
         _ => {
-            // Network error — don't clear token, user might be offline
-            // Return the stored state without verification
-            Ok(None)
+            // Network error — trust the unexpired token and return cached user
+            Ok(load_cached_user())
         }
     }
 }
