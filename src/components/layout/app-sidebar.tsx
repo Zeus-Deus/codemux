@@ -19,7 +19,7 @@ export function AppSidebar() {
       <SidebarOpenflowSection />
       <SidebarAlertsSection />
       <SidebarPortsSection />
-      <SidebarFooter>
+      <SidebarFooter className="gap-0 p-0">
         <SidebarAddRepo />
       </SidebarFooter>
       <SidebarRail />

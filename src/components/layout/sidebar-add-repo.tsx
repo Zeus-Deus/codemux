@@ -5,6 +5,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { SidebarSeparator } from "@/components/ui/sidebar";
 import { FolderPlus, FolderOpen } from "lucide-react";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useUIStore } from "@/stores/ui-store";
@@ -16,16 +17,18 @@ export function SidebarAddRepo() {
   );
 
   return (
-    <div className="border-t border-border p-2">
+    <>
+      <SidebarSeparator />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button
             variant="ghost"
-            size="sm"
-            className="w-full justify-start gap-2 text-muted-foreground hover:text-foreground"
+            className="w-full justify-start pl-3 pr-2 py-3 h-auto text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           >
-            <FolderPlus className="h-4 w-4" />
-            Add repository
+            <div className="size-6 flex items-center justify-center shrink-0 mr-2.5">
+              <FolderPlus className="h-3.5 w-3.5" />
+            </div>
+            <span>Add repository</span>
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent side="top" align="start">
@@ -42,6 +45,6 @@ export function SidebarAddRepo() {
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-    </div>
+    </>
   );
 }
