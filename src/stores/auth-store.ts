@@ -45,16 +45,26 @@ export const useAuthStore = create<AuthStore>((set) => ({
   devBypass: false,
 
   checkAuth: async () => {
+    console.log("[AUTH-DEBUG] checkAuth() ENTER, current state:", {
+      isAuthenticated: useAuthStore.getState().isAuthenticated,
+      isLoading: useAuthStore.getState().isLoading,
+      hasUser: !!useAuthStore.getState().user,
+    });
     set({ isLoading: true, error: null });
     try {
+      console.log("[AUTH-DEBUG] checkAuth() calling Tauri check_auth command...");
       const user = await checkAuthCmd();
+      console.log("[AUTH-DEBUG] checkAuth() Tauri returned:", user);
       if (user) {
+        console.log("[AUTH-DEBUG] checkAuth() -> authenticated=true, user.id=", user.id);
         set({ user, isAuthenticated: true, isLoading: false });
       } else {
+        console.log("[AUTH-DEBUG] checkAuth() -> authenticated=false (user was null)");
         set({ user: null, isAuthenticated: false, isLoading: false });
       }
     } catch (err) {
-      console.warn("[auth] checkAuth failed, enabling dev bypass:", err);
+      console.warn("[AUTH-DEBUG] checkAuth() THREW error:", err);
+      console.warn("[AUTH-DEBUG] checkAuth() -> enabling dev bypass");
       // In dev mode or if API unreachable, allow bypass
       set({
         user: DEV_USER,
@@ -110,6 +120,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   signOut: async () => {
+    console.log("[AUTH-DEBUG] signOut() called", new Error().stack);
     try {
       await signOutCmd();
     } catch {
@@ -124,6 +135,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   setUser: (user) => {
+    console.log("[AUTH-DEBUG] setUser() called with:", user?.id ?? "null", new Error().stack);
     if (user) {
       set({ user, isAuthenticated: true, isSigningIn: false });
     } else {

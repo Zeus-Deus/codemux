@@ -134,7 +134,9 @@ const NONCE_LEN: usize = 12;
 fn token_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join("codemux").join("auth-token.enc")
+    let path = data_dir.join("codemux").join("auth-token.enc");
+    eprintln!("[AUTH-DEBUG] token_file_path() -> {:?}", path);
+    path
 }
 
 fn machine_id() -> Vec<u8> {
@@ -219,6 +221,12 @@ pub fn save_token(token: &str, expires_at: &str) -> Result<(), String> {
 }
 
 pub fn save_auth(token: &str, expires_at: &str, user: Option<&AuthUser>) -> Result<(), String> {
+    eprintln!(
+        "[AUTH-DEBUG] save_auth() | has_user={} expires_at={} token_prefix={}...",
+        user.is_some(),
+        expires_at,
+        &token[..token.len().min(8)]
+    );
     let stored = StoredAuth {
         token: token.to_string(),
         expires_at: expires_at.to_string(),
@@ -231,35 +239,86 @@ pub fn save_auth(token: &str, expires_at: &str, user: Option<&AuthUser>) -> Resu
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
-    fs::write(&path, &encrypted).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+    let result = fs::write(&path, &encrypted).map_err(|e| format!("write: {e}"));
+    eprintln!("[AUTH-DEBUG] save_auth() | write result={:?} path={:?}", result.as_ref().map(|_| "ok"), path);
+    result
 }
 
 pub fn load_token() -> Option<(String, String)> {
     let path = token_file_path();
-    let data = fs::read(&path).ok()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
-    Some((stored.token, stored.expires_at))
+    let exists = path.exists();
+    eprintln!("[AUTH-DEBUG] load_token() | file_exists={} path={:?}", exists, path);
+
+    let data = match fs::read(&path) {
+        Ok(d) => {
+            eprintln!("[AUTH-DEBUG] load_token() | read OK, {} bytes", d.len());
+            d
+        }
+        Err(e) => {
+            eprintln!("[AUTH-DEBUG] load_token() | read FAILED: {}", e);
+            return None;
+        }
+    };
+
+    let decrypted = match decrypt_data(&data) {
+        Ok(d) => {
+            eprintln!("[AUTH-DEBUG] load_token() | decrypt OK, {} bytes", d.len());
+            d
+        }
+        Err(e) => {
+            eprintln!("[AUTH-DEBUG] load_token() | decrypt FAILED: {}", e);
+            return None;
+        }
+    };
+
+    match serde_json::from_slice::<StoredAuth>(&decrypted) {
+        Ok(stored) => {
+            eprintln!(
+                "[AUTH-DEBUG] load_token() | deserialize OK, has_user={}, expires_at={}",
+                stored.user.is_some(),
+                stored.expires_at
+            );
+            Some((stored.token, stored.expires_at))
+        }
+        Err(e) => {
+            eprintln!("[AUTH-DEBUG] load_token() | deserialize FAILED: {}", e);
+            None
+        }
+    }
 }
 
 pub fn load_cached_user() -> Option<AuthUser> {
     let path = token_file_path();
+    let exists = path.exists();
+    eprintln!("[AUTH-DEBUG] load_cached_user() | file_exists={}", exists);
     let data = fs::read(&path).ok()?;
     let decrypted = decrypt_data(&data).ok()?;
     let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    eprintln!("[AUTH-DEBUG] load_cached_user() | has_user={}", stored.user.is_some());
     stored.user
 }
 
 pub fn clear_token() {
     let path = token_file_path();
+    let existed = path.exists();
+    let bt = std::backtrace::Backtrace::force_capture();
+    eprintln!(
+        "[AUTH-DEBUG] clear_token() called | file_existed={} path={:?}\n  backtrace:\n{}",
+        existed, path, bt
+    );
     let _ = fs::remove_file(&path);
 }
 
 pub fn is_token_expired(expires_at: &str) -> bool {
-    chrono::DateTime::parse_from_rfc3339(expires_at)
-        .map(|dt| dt < chrono::Utc::now())
-        .unwrap_or(true)
+    let now = chrono::Utc::now();
+    let result = chrono::DateTime::parse_from_rfc3339(expires_at)
+        .map(|dt| dt < now)
+        .unwrap_or(true);
+    eprintln!(
+        "[AUTH-DEBUG] is_token_expired() | expires_at={} now={} expired={}",
+        expires_at, now.to_rfc3339(), result
+    );
+    result
 }
 
 // ── Localhost callback server ────────────────────────────────────
@@ -427,6 +486,10 @@ fn emit_auth_state(app: &tauri::AppHandle, token: &str, expires_at: &str) {
         user,
     };
 
+    eprintln!(
+        "[AUTH-DEBUG] emit_auth_state() | authenticated={} has_user={}",
+        payload.authenticated, payload.user.is_some()
+    );
     let _ = app.emit("auth-state-changed", &payload);
 }
 

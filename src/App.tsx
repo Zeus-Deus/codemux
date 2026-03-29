@@ -14,8 +14,15 @@ function App() {
 
   // Check auth on mount, then load synced settings if authenticated
   useEffect(() => {
+    console.log("[AUTH-DEBUG] App.tsx useEffect MOUNT - calling checkAuth()");
     checkAuth().then(() => {
-      if (useAuthStore.getState().isAuthenticated) {
+      const state = useAuthStore.getState();
+      console.log("[AUTH-DEBUG] App.tsx checkAuth() resolved:", {
+        isAuthenticated: state.isAuthenticated,
+        userId: state.user?.id,
+        devBypass: state.devBypass,
+      });
+      if (state.isAuthenticated) {
         useSyncedSettingsStore.getState().loadSettings();
       }
     });
@@ -27,6 +34,8 @@ function App() {
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
+
+  console.log("[AUTH-DEBUG] App.tsx render:", { isLoading, isAuthenticated });
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;
