@@ -812,21 +812,24 @@ function DirectoryGroup({
         <Folder className="h-3 w-3 shrink-0 text-muted-foreground/50" />
         <span className="truncate text-[10px] text-muted-foreground">{dir}</span>
       </Button>
-      {!collapsed &&
-        files.map((f) => (
-          <FileRow
-            key={f.path}
-            file={f}
-            staged={staged}
-            cwd={cwd}
-            expanded={expandedFile === f.path && expandedStaged === staged}
-            onToggleExpand={() => onToggleExpand(f.path, staged)}
-            onRefresh={onRefresh}
-            onOpenDiff={onOpenDiff}
-            activeDiffFile={activeDiffFile}
-            indented
-          />
-        ))}
+      {!collapsed && (
+        <div className="ml-1.5 border-l border-border pl-0.5">
+          {files.map((f) => (
+            <FileRow
+              key={f.path}
+              file={f}
+              staged={staged}
+              cwd={cwd}
+              expanded={expandedFile === f.path && expandedStaged === staged}
+              onToggleExpand={() => onToggleExpand(f.path, staged)}
+              onRefresh={onRefresh}
+              onOpenDiff={onOpenDiff}
+              activeDiffFile={activeDiffFile}
+              indented
+            />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
