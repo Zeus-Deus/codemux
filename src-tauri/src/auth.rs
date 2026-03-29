@@ -131,7 +131,7 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 // AES-GCM tag is appended by the aes-gcm crate inside the ciphertext
 
-fn token_file_path() -> PathBuf {
+pub(crate) fn token_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
     data_dir.join("codemux").join("auth-token.enc")
@@ -237,22 +237,80 @@ pub fn save_auth(token: &str, expires_at: &str, user: Option<&AuthUser>) -> Resu
 
 pub fn load_token() -> Option<(String, String)> {
     let path = token_file_path();
-    let data = fs::read(&path).ok()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    eprintln!("[auth] load_token: path={}", path.display());
+
+    let data = match fs::read(&path) {
+        Ok(d) => {
+            eprintln!("[auth] load_token: file read OK ({} bytes)", d.len());
+            d
+        }
+        Err(e) => {
+            eprintln!("[auth] load_token: FILE READ FAILED: {e} (path={})", path.display());
+            return None;
+        }
+    };
+
+    let decrypted = match decrypt_data(&data) {
+        Ok(d) => {
+            eprintln!("[auth] load_token: decryption OK ({} bytes)", d.len());
+            d
+        }
+        Err(e) => {
+            eprintln!("[auth] load_token: DECRYPTION FAILED: {e}");
+            return None;
+        }
+    };
+
+    let stored: StoredAuth = match serde_json::from_slice(&decrypted) {
+        Ok(s) => {
+            eprintln!("[auth] load_token: JSON parse OK");
+            s
+        }
+        Err(e) => {
+            eprintln!("[auth] load_token: JSON PARSE FAILED: {e}");
+            return None;
+        }
+    };
+
     Some((stored.token, stored.expires_at))
 }
 
 pub fn load_cached_user() -> Option<AuthUser> {
     let path = token_file_path();
-    let data = fs::read(&path).ok()?;
-    let decrypted = decrypt_data(&data).ok()?;
-    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    eprintln!("[auth] load_cached_user: path={}", path.display());
+
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[auth] load_cached_user: FILE READ FAILED: {e}");
+            return None;
+        }
+    };
+
+    let decrypted = match decrypt_data(&data) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("[auth] load_cached_user: DECRYPTION FAILED: {e}");
+            return None;
+        }
+    };
+
+    let stored: StoredAuth = match serde_json::from_slice(&decrypted) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[auth] load_cached_user: JSON PARSE FAILED: {e}");
+            return None;
+        }
+    };
+
     stored.user
 }
 
 pub fn clear_token() {
-    eprintln!("[auth] CLEAR_TOKEN CALLED\n{}", std::backtrace::Backtrace::force_capture());
+    use std::io::Write;
+    let msg = format!("[auth] CLEAR_TOKEN CALLED - backtrace:\n{}\n", std::backtrace::Backtrace::force_capture());
+    let _ = std::io::stderr().write_all(msg.as_bytes());
+    let _ = std::io::stderr().flush();
     let path = token_file_path();
     let _ = fs::remove_file(&path);
 }
