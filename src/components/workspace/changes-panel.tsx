@@ -155,6 +155,46 @@ function fileName(path: string): string {
   return idx >= 0 ? path.substring(idx + 1) : path;
 }
 
+// ── Section Header ──
+
+function SectionHeader({
+  title,
+  count,
+  expanded,
+  onToggle,
+  actions,
+  variant = "default",
+}: {
+  title: string;
+  count: number;
+  expanded: boolean;
+  onToggle: () => void;
+  actions?: React.ReactNode;
+  variant?: "default" | "danger";
+}) {
+  const textColor = variant === "danger" ? "text-danger" : "text-muted-foreground";
+  return (
+    <div className="flex items-center px-1.5 py-0.5">
+      <button
+        type="button"
+        className="flex flex-1 items-center gap-1.5 text-left min-w-0 hover:bg-accent/30 rounded-sm -ml-0.5 pl-0.5 py-0.5 cursor-pointer transition-colors"
+        onClick={onToggle}
+      >
+        <ChevronRight
+          className={`h-3 w-3 shrink-0 ${textColor} transition-transform ${expanded ? "rotate-90" : ""}`}
+        />
+        <span className={`text-xs font-medium uppercase tracking-wide ${textColor}`}>
+          {title}
+        </span>
+        <span className={`text-xs tabular-nums ${textColor}`}>{count}</span>
+      </button>
+      {actions && (
+        <div className="flex items-center gap-0.5 shrink-0">{actions}</div>
+      )}
+    </div>
+  );
+}
+
 // ── Diff View ──
 
 function DiffView({ diff }: { diff: string }) {
@@ -448,11 +488,13 @@ function ConflictsSection({
   // Show resolver progress UI when active
   if (resolverStatus !== "idle") {
     return (
-      <div className="py-1 px-1.5 space-y-1.5">
-        <div className="flex items-center justify-between py-0.5">
-          <span className="text-[10px] font-medium uppercase tracking-wider text-danger">
-            Conflicts
-          </span>
+      <div className="py-1 space-y-1.5">
+        <div className="px-1.5">
+          <div className="flex items-center gap-1.5 py-0.5 pl-0.5">
+            <span className="text-xs font-medium uppercase tracking-wide text-danger">
+              Conflicts
+            </span>
+          </div>
         </div>
 
         {resolverStatus === "creating_branch" && (
@@ -542,24 +584,29 @@ function ConflictsSection({
     );
   }
 
+  const [conflictsCollapsed, setConflictsCollapsed] = useState(false);
+
   return (
     <div className="py-1">
-      <div className="flex items-center justify-between px-1.5 py-0.5">
-        <span className="text-[10px] font-medium uppercase tracking-wider text-danger">
-          Conflicts
-        </span>
-        <span className="text-[10px] tabular-nums text-danger">{files.length}</span>
-      </div>
-      {files.map((file) => (
-        <ConflictFileRow
-          key={file.path}
-          file={file}
-          cwd={cwd}
-          onRefresh={onRefresh}
-          onOpenDiff={onOpenDiff}
-        />
-      ))}
-      <Tooltip>
+      <SectionHeader
+        title="Conflicts"
+        count={files.length}
+        expanded={!conflictsCollapsed}
+        onToggle={() => setConflictsCollapsed(!conflictsCollapsed)}
+        variant="danger"
+      />
+      {!conflictsCollapsed && (
+        <>
+          {files.map((file) => (
+            <ConflictFileRow
+              key={file.path}
+              file={file}
+              cwd={cwd}
+              onRefresh={onRefresh}
+              onOpenDiff={onOpenDiff}
+            />
+          ))}
+          <Tooltip>
         <TooltipTrigger asChild>
           <span className="block px-1.5 mt-1">
             <Button
@@ -579,7 +626,9 @@ function ConflictsSection({
             Configure in Settings &rarr; Git &rarr; AI Tools
           </TooltipContent>
         )}
-      </Tooltip>
+          </Tooltip>
+        </>
+      )}
     </div>
   );
 }
@@ -700,36 +749,22 @@ function FileSection({
 
   return (
     <div className="py-1">
-      <div className="group/section flex items-center px-1.5 py-0.5">
-        <button
-          type="button"
-          className="flex flex-1 items-center gap-1 text-left min-w-0 hover:bg-accent/30 rounded-sm -ml-0.5 pl-0.5 py-0.5"
-          onClick={() => setCollapsed(!collapsed)}
-        >
-          <ChevronRight
-            className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${!collapsed ? "rotate-90" : ""}`}
-          />
-          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-            {label}
-          </span>
-          <span className="text-[10px] tabular-nums text-muted-foreground">{files.length}</span>
-        </button>
-        <div className="flex items-center gap-0.5 shrink-0">
+      <SectionHeader
+        title={label}
+        count={files.length}
+        expanded={!collapsed}
+        onToggle={() => setCollapsed(!collapsed)}
+        actions={
           <Tooltip>
             <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="h-6 w-6"
-                onClick={onBulkAction}
-              >
-                {staged ? <Minus className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              <Button variant="ghost" size="icon-xs" className="h-6 w-6" onClick={onBulkAction}>
+                {staged ? <Minus className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
               </Button>
             </TooltipTrigger>
             <TooltipContent side="bottom" className="text-xs">{bulkLabel}</TooltipContent>
           </Tooltip>
-        </div>
-      </div>
+        }
+      />
       {!collapsed && (flat ? files.map((f) => (
         <FileRow
           key={f.path}
@@ -1715,66 +1750,54 @@ export function ChangesPanel({ workspace }: Props) {
             {/* Against Base — files changed vs base branch (hidden when on the base branch itself) */}
             {baseBranchFiles.length > 0 && branchInfo?.branch !== baseBranch && (
               <div className="py-1">
-                <div className="flex items-center justify-between px-1.5 py-0.5">
-                  <div className="flex items-center gap-1">
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      className="hover:bg-accent/30 -ml-0.5"
-                      onClick={() => setBaseBranchExpanded(!baseBranchExpanded)}
-                    >
-                      <ChevronRight
-                        className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${baseBranchExpanded ? "rotate-90" : ""}`}
-                      />
-                    </Button>
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                      Against {baseBranch}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <span className="text-[10px] tabular-nums text-muted-foreground">
-                      {baseBranchFiles.length}
-                    </span>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          className="h-4 w-4 hover:bg-accent/50"
-                          onClick={handleMergeBranch}
-                          disabled={busy || isMerging}
-                        >
-                          {busyAction === "merge" ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <GitMerge className="h-3 w-3" />
-                          )}
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="left">
-                        <p>Merge {baseBranch} into current branch — update your branch with latest changes</p>
-                      </TooltipContent>
-                    </Tooltip>
-                    {branchInfo?.branch !== baseBranch && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          className="h-4 w-4 hover:bg-accent/50 text-foreground"
-                          onClick={() => setShowMergeIntoDialog(true)}
-                          disabled={busy || isMerging || !!mergeIntoBaseState}
-                        >
-                          <ArrowUpToLine className="h-3 w-3" />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent side="left">
-                        <p>Merge current branch into {baseBranch}</p>
-                      </TooltipContent>
-                    </Tooltip>
-                    )}
-                  </div>
-                </div>
+                <SectionHeader
+                  title={`Against ${baseBranch}`}
+                  count={baseBranchFiles.length}
+                  expanded={baseBranchExpanded}
+                  onToggle={() => setBaseBranchExpanded(!baseBranchExpanded)}
+                  actions={
+                    <>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="icon-xs"
+                            className="h-6 w-6"
+                            onClick={handleMergeBranch}
+                            disabled={busy || isMerging}
+                          >
+                            {busyAction === "merge" ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <GitMerge className="h-3.5 w-3.5" />
+                            )}
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent side="left">
+                          Merge {baseBranch} into current branch
+                        </TooltipContent>
+                      </Tooltip>
+                      {branchInfo?.branch !== baseBranch && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="h-6 w-6"
+                              onClick={() => setShowMergeIntoDialog(true)}
+                              disabled={busy || isMerging || !!mergeIntoBaseState}
+                            >
+                              <ArrowUpToLine className="h-3.5 w-3.5" />
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="left">
+                            Merge current branch into {baseBranch}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </>
+                  }
+                />
                 {baseBranchExpanded && (
                   <div>
                     {viewMode === "flat" ? baseBranchFiles.map((f) => (
@@ -1812,23 +1835,12 @@ export function ChangesPanel({ workspace }: Props) {
             {/* Recent Commits — collapsed by default */}
             {commits.length > 0 && (
               <div className="py-1">
-                <Button
-                  variant="ghost"
-                  className="w-full justify-between px-1.5 py-0.5 h-auto hover:bg-accent/30 rounded-sm"
-                  onClick={() => setCommitsExpanded(!commitsExpanded)}
-                >
-                  <div className="flex items-center gap-1">
-                    <ChevronRight
-                      className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${commitsExpanded ? "rotate-90" : ""}`}
-                    />
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                      Recent Commits
-                    </span>
-                  </div>
-                  <span className="text-[10px] tabular-nums text-muted-foreground">
-                    {commits.length}
-                  </span>
-                </Button>
+                <SectionHeader
+                  title="Recent Commits"
+                  count={commits.length}
+                  expanded={commitsExpanded}
+                  onToggle={() => setCommitsExpanded(!commitsExpanded)}
+                />
                 {commitsExpanded &&
                   commits.map((commit, idx) => {
                     const prevCommit = idx > 0 ? commits[idx - 1] : null;
