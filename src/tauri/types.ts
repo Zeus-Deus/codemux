@@ -359,6 +359,11 @@ export interface GitLogEntry {
   time_ago: string;
 }
 
+export interface CommitFileEntry {
+  path: string;
+  status: string;
+}
+
 export interface EditorInfo {
   id: string;
   name: string;

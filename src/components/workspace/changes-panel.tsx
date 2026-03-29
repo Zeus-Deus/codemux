@@ -82,7 +82,14 @@ import {
   gitFetchChanges,
   gitStashPush,
   gitStashPop,
+  getCommitFiles,
 } from "@/tauri/commands";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+} from "@/components/ui/context-menu";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
@@ -93,6 +100,7 @@ import type {
   GitBranchInfo,
   GitLogEntry,
   MergeState,
+  CommitFileEntry,
 } from "@/tauri/types";
 
 interface Props {
@@ -190,6 +198,116 @@ function SectionHeader({
       </button>
       {actions && (
         <div className="flex items-center gap-0.5 shrink-0">{actions}</div>
+      )}
+    </div>
+  );
+}
+
+// ── Commit Row ──
+
+const STATUS_ICON: Record<string, string> = {
+  added: "A",
+  modified: "M",
+  deleted: "D",
+  renamed: "R",
+  copied: "C",
+};
+
+const COMMIT_FILE_COLOR: Record<string, string> = {
+  added: "text-success",
+  modified: "text-warning",
+  deleted: "text-danger",
+  renamed: "text-primary",
+  copied: "text-muted-foreground",
+};
+
+function formatRelativeTime(timeAgo: string): string {
+  // The backend returns e.g. "3 hours ago", "5 minutes ago", "2 days ago"
+  // Convert to compact format: "3h ago", "5m ago", "2d ago"
+  const match = timeAgo.match(/^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/);
+  if (!match) return timeAgo;
+  const [, n, unit] = match;
+  const abbrev: Record<string, string> = {
+    second: "s", minute: "m", hour: "h", day: "d", week: "w", month: "mo", year: "y",
+  };
+  return `${n}${abbrev[unit] ?? unit} ago`;
+}
+
+function CommitRow({
+  commit,
+  cwd,
+  expanded,
+  onToggle,
+}: {
+  commit: GitLogEntry;
+  cwd: string;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const [files, setFiles] = useState<CommitFileEntry[] | null>(null);
+
+  useEffect(() => {
+    if (expanded && files === null) {
+      getCommitFiles(cwd, commit.hash)
+        .then(setFiles)
+        .catch(() => setFiles([]));
+    }
+  }, [expanded, cwd, commit.hash, files]);
+
+  const handleCopyHash = () => {
+    navigator.clipboard.writeText(commit.hash).catch(console.error);
+  };
+
+  return (
+    <div>
+      <ContextMenu>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <ContextMenuTrigger asChild>
+              <button
+                type="button"
+                className="flex w-full items-center gap-1.5 rounded-sm px-1.5 py-1 text-left hover:bg-accent/50 cursor-pointer transition-colors"
+                onClick={onToggle}
+              >
+                <ChevronRight
+                  className={`h-2.5 w-2.5 shrink-0 text-muted-foreground transition-transform ${expanded ? "rotate-90" : ""}`}
+                />
+                <span className="shrink-0 text-[10px] font-mono text-muted-foreground">
+                  {commit.short_hash}
+                </span>
+                <span className="flex-1 truncate text-xs text-foreground">{commit.message}</span>
+                <span className="shrink-0 text-[10px] text-muted-foreground">
+                  {formatRelativeTime(commit.time_ago)}
+                </span>
+              </button>
+            </ContextMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="right" className="text-xs max-w-64">
+            {commit.message}
+          </TooltipContent>
+        </Tooltip>
+        <ContextMenuContent className="w-52">
+          <ContextMenuItem onClick={handleCopyHash} className="text-xs">
+            <Check className="h-3.5 w-3.5 mr-2" />
+            Copy Commit Hash
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+      {expanded && files && files.length > 0 && (
+        <div className="ml-4 pl-1.5 border-l border-border mt-0.5 mb-0.5">
+          {files.map((f) => (
+            <div
+              key={f.path}
+              className="flex items-center gap-1 px-1 py-0.5 text-xs"
+            >
+              <span className={`shrink-0 w-3.5 text-center text-[10px] font-bold leading-none ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
+                {STATUS_ICON[f.status] ?? "?"}
+              </span>
+              <File className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+              <span className="truncate text-xs text-foreground">{fileName(f.path)}</span>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
@@ -811,6 +929,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [viewMode, setViewMode] = useState<"grouped" | "flat">("grouped");
   const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
+  const [expandedCommits, setExpandedCommits] = useState<Set<string>>(new Set());
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -1832,50 +1951,32 @@ export function ChangesPanel({ workspace }: Props) {
               </div>
             )}
 
-            {/* Recent Commits — collapsed by default */}
+            {/* Commits — collapsed by default */}
             {commits.length > 0 && (
               <div className="py-1">
                 <SectionHeader
-                  title="Recent Commits"
+                  title="Commits"
                   count={commits.length}
                   expanded={commitsExpanded}
                   onToggle={() => setCommitsExpanded(!commitsExpanded)}
                 />
                 {commitsExpanded &&
-                  commits.map((commit, idx) => {
-                    const prevCommit = idx > 0 ? commits[idx - 1] : null;
-                    const showSeparator = prevCommit && !prevCommit.is_pushed && commit.is_pushed;
-                    return (
-                      <div key={commit.hash}>
-                        {showSeparator && (
-                          <div className="text-[9px] text-muted-foreground/50 text-center py-0.5">
-                            — pushed —
-                          </div>
-                        )}
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <div className="flex items-start gap-1.5 rounded-sm px-1.5 py-1 hover:bg-accent/50 transition-colors">
-                              {!commit.is_pushed && (
-                                <ArrowUp className="h-2.5 w-2.5 shrink-0 text-warning mt-0.5" />
-                              )}
-                              <span className="shrink-0 text-[10px] font-mono text-primary">
-                                {commit.short_hash}
-                              </span>
-                              <div className="flex-1 min-w-0">
-                                <p className="truncate text-xs text-foreground">{commit.message}</p>
-                                <p className="text-[10px] text-muted-foreground">
-                                  {commit.author} · {commit.time_ago}
-                                </p>
-                              </div>
-                            </div>
-                          </TooltipTrigger>
-                          <TooltipContent side="left" className="text-xs max-w-64">
-                            {commit.message}
-                          </TooltipContent>
-                        </Tooltip>
-                      </div>
-                    );
-                  })}
+                  commits.map((commit) => (
+                    <CommitRow
+                      key={commit.hash}
+                      commit={commit}
+                      cwd={cwd}
+                      expanded={expandedCommits.has(commit.hash)}
+                      onToggle={() => {
+                        setExpandedCommits((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(commit.hash)) next.delete(commit.hash);
+                          else next.add(commit.hash);
+                          return next;
+                        });
+                      }}
+                    />
+                  ))}
               </div>
             )}
           </div>

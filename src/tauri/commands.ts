@@ -19,6 +19,7 @@ import type {
   GitDiffStat,
   GitFileStatus,
   GitLogEntry,
+  CommitFileEntry,
   HandoffPacket,
   LaunchMode,
   ModelInfo,
@@ -409,6 +410,9 @@ export const gitDiscardFile = (path: string, file: string) =>
 
 export const gitLogEntries = (path: string, count: number) =>
   invoke<GitLogEntry[]>("git_log_entries", { path, count });
+
+export const getCommitFiles = (path: string, hash: string) =>
+  invoke<CommitFileEntry[]>("get_commit_files", { path, hash });
 
 export const listBranches = (path: string, remote: boolean) =>
   invoke<string[]>("list_branches", { path, remote });

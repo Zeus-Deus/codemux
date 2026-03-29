@@ -61,6 +61,12 @@ pub struct GitLogEntry {
     pub is_pushed: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitFileEntry {
+    pub path: String,
+    pub status: String,
+}
+
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -254,6 +260,45 @@ pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, Strin
         });
     }
     Ok(entries)
+}
+
+pub fn get_commit_files(repo_path: &Path, hash: &str) -> Result<Vec<CommitFileEntry>, String> {
+    let output = run_git(
+        repo_path,
+        &["diff-tree", "--no-commit-id", "--name-status", "-r", hash],
+    )?;
+    let mut files = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "M\tpath" or "A\tpath" or "D\tpath" or "R100\told\tnew"
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let status_code = parts[0].chars().next().unwrap_or('M');
+        let status = match status_code {
+            'A' => "added",
+            'M' => "modified",
+            'D' => "deleted",
+            'R' => "renamed",
+            'C' => "copied",
+            _ => "modified",
+        };
+        // For renames/copies, parts[1] is "old\tnew" — use the new path
+        let path = if status_code == 'R' || status_code == 'C' {
+            parts[1].split('\t').last().unwrap_or(parts[1])
+        } else {
+            parts[1]
+        };
+        files.push(CommitFileEntry {
+            path: path.to_string(),
+            status: status.to_string(),
+        });
+    }
+    Ok(files)
 }
 
 pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
@@ -2906,5 +2951,75 @@ C  source.txt -> copy.txt";
         // No stash entries
         let result = git_stash_pop(&repo);
         assert!(result.is_err(), "pop with empty stash should error");
+    }
+
+    // ── get_commit_files tests ──
+
+    #[test]
+    fn test_get_commit_files_added() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("new.txt"), "hello").unwrap();
+        std::fs::write(repo.join("other.txt"), "world").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add files"]).unwrap();
+
+        let hash = run_git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let files = get_commit_files(&repo, &hash).unwrap();
+
+        assert_eq!(files.len(), 2, "should have 2 files");
+        let new_file = files.iter().find(|f| f.path == "new.txt").expect("new.txt");
+        assert_eq!(new_file.status, "added");
+        let other_file = files.iter().find(|f| f.path == "other.txt").expect("other.txt");
+        assert_eq!(other_file.status, "added");
+    }
+
+    #[test]
+    fn test_get_commit_files_modified() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        run_git(&repo, &["add", "file.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add file"]).unwrap();
+
+        std::fs::write(repo.join("file.txt"), "modified").unwrap();
+        run_git(&repo, &["add", "file.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "modify file"]).unwrap();
+
+        let hash = run_git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let files = get_commit_files(&repo, &hash).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "file.txt");
+        assert_eq!(files[0].status, "modified");
+    }
+
+    #[test]
+    fn test_get_commit_files_deleted() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        std::fs::write(repo.join("doomed.txt"), "bye").unwrap();
+        run_git(&repo, &["add", "doomed.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add file"]).unwrap();
+
+        run_git(&repo, &["rm", "doomed.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "delete file"]).unwrap();
+
+        let hash = run_git(&repo, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        let files = get_commit_files(&repo, &hash).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "doomed.txt");
+        assert_eq!(files[0].status, "deleted");
+    }
+
+    #[test]
+    fn test_get_commit_files_invalid_hash() {
+        let (_dir, repo) = setup_test_repo();
+        let result = get_commit_files(&repo, "deadbeefdeadbeef");
+        assert!(result.is_err(), "invalid hash should return error");
     }
 }

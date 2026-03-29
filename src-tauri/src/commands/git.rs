@@ -1,4 +1,4 @@
-use crate::git::{BaseBranchDiff, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
+use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::Path;
 
 #[tauri::command]
@@ -83,6 +83,11 @@ pub fn git_discard_file(path: String, file: String) -> Result<(), String> {
 #[tauri::command]
 pub fn git_log_entries(path: String, count: usize) -> Result<Vec<GitLogEntry>, String> {
     crate::git::git_log(Path::new(&path), count)
+}
+
+#[tauri::command]
+pub fn get_commit_files(path: String, hash: String) -> Result<Vec<CommitFileEntry>, String> {
+    crate::git::get_commit_files(Path::new(&path), &hash)
 }
 
 #[tauri::command]
