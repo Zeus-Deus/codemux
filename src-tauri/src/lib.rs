@@ -409,6 +409,7 @@ pub fn run() {
             terminal::detach_pty_output,
             terminal::write_to_pty,
             terminal::resize_pty,
+            terminal::clear_agent_status,
             commands::db_get_setting,
             commands::db_set_setting,
             commands::db_delete_setting,

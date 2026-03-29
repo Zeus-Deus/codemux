@@ -685,6 +685,9 @@ export const writeToPty = (sessionId: string, data: string) =>
 export const resizePty = (sessionId: string, cols: number, rows: number) =>
   invoke("resize_pty", { cols, rows, sessionId });
 
+export const clearAgentStatus = (sessionId: string) =>
+  invoke("clear_agent_status", { sessionId });
+
 export const detachPtyOutput = (sessionId: string) =>
   invoke("detach_pty_output", { sessionId });
 

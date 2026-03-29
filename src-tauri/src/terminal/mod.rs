@@ -811,6 +811,20 @@ pub fn resize_pty(
     Ok(())
 }
 
+/// Clear stuck Working/Permission status for a terminal session.
+/// Called from the frontend when the user presses Escape in a terminal
+/// where an agent was processing — the agent stops but stays alive,
+/// so the PTY exit cleanup never fires.
+#[tauri::command]
+pub fn clear_agent_status(
+    session_id: String,
+    app_state: State<'_, AppStateStore>,
+    app: AppHandle,
+) {
+    app_state.clear_transient_pane_status_by_session(&session_id);
+    state::emit_app_state(&app);
+}
+
 /// Spawn a PTY for an OpenFlow agent terminal session.
 ///
 /// Unlike `spawn_pty_for_session` (which launches the user's default shell),

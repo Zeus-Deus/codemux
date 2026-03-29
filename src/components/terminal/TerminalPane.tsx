@@ -14,8 +14,10 @@ import {
   detachPtyOutput,
   attachPtyOutput,
   getTerminalStatus,
+  clearAgentStatus,
   Channel,
 } from "@/tauri/commands";
+import { useAppStore } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
 // import { useThemeColors } from "@/hooks/use-theme-colors";
@@ -24,6 +26,7 @@ import type { TerminalStatusPayload } from "@/tauri/types";
 
 interface Props {
   sessionId: string;
+  paneId?: string;
   focused: boolean;
   visible: boolean;
   title: string;
@@ -98,7 +101,7 @@ function extractBytes(payload: unknown): Uint8Array | null {
   return null;
 }
 
-export function TerminalPane({ sessionId, focused, visible }: Props) {
+export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   // TODO: re-enable as "system theme" option in settings
   // const { theme, shellAppearance } = useThemeColors();
 
@@ -272,6 +275,22 @@ export function TerminalPane({ sessionId, focused, visible }: Props) {
 
     // ── Custom key handler ──
     term.attachCustomKeyEventHandler((ev) => {
+      // Escape / Ctrl+C — clear this pane's Working/Permission status.
+      // Claude Code's Stop hook does NOT fire on user interrupts (Ctrl+C, Escape).
+      // Check this specific pane's status to avoid false positives (e.g. vim).
+      if (ev.type === "keydown" && paneId) {
+        const isInterrupt =
+          ev.key === "Escape" ||
+          (ev.key === "c" && ev.ctrlKey && !ev.shiftKey && !ev.altKey);
+        if (isInterrupt) {
+          const status =
+            useAppStore.getState().appState?.pane_statuses[paneId];
+          if (status === "working" || status === "permission") {
+            clearAgentStatus(sid).catch(console.error);
+          }
+          return true; // let the key pass through to the terminal
+        }
+      }
       // Shift+Enter
       if (ev.shiftKey && ev.key === "Enter") {
         if (kittyLevelRef.current > 0) {

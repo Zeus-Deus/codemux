@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 use crate::state::{self, AppStateStore, PaneStatus};
 
 static HOOK_PORT: OnceLock<u16> = OnceLock::new();
+static MONITOR_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
 pub fn hook_port() -> Option<u16> {
     HOOK_PORT.get().copied()
@@ -90,7 +94,9 @@ fn map_event_type(event_type: &str) -> Option<PaneStatus> {
             Some(PaneStatus::Working)
         }
         // Stop events → Review (caller decides idle vs review)
-        "Stop" | "agent-turn-complete" | "AfterAgent" | "sessionEnd" => Some(PaneStatus::Review),
+        "Stop" | "agent-turn-complete" | "AfterAgent" => Some(PaneStatus::Review),
+        // Session end → Idle (agent is exiting, always clear)
+        "sessionEnd" | "SessionEnd" => Some(PaneStatus::Idle),
         // Permission events
         "PermissionRequest" | "Notification" | "preToolUse" | "permission.ask"
         | "beforeShellExecution" | "beforeMCPExecution" => Some(PaneStatus::Permission),
@@ -114,8 +120,20 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
         status
     };
 
+    let is_active_status =
+        matches!(resolved_status, PaneStatus::Working | PaneStatus::Permission);
     state.set_pane_status_by_session(session_id, resolved_status);
     state::emit_app_state(app);
+
+    // When status becomes Working/Permission, start monitoring for agent exit.
+    // This catches cases where the agent exits without sending a Stop hook
+    // (e.g., user presses Ctrl+C or Escape to kill/exit the agent CLI).
+    if is_active_status {
+        let pty_state: tauri::State<'_, crate::terminal::PtyState> = app.state();
+        if let Some(shell_pid) = pty_state.get_session_pids().get(session_id).copied() {
+            start_agent_exit_monitor(app.clone(), session_id.to_string(), shell_pid);
+        }
+    }
 }
 
 /// Check if the pane for a session is in the currently active workspace.
@@ -149,6 +167,108 @@ fn find_session_in_node(
         }
         state::PaneNodeSnapshot::Browser { .. } => false,
     }
+}
+
+// ── Agent exit monitor ──
+// Detects when an agent process exits without sending a Stop hook by polling
+// the shell's foreground process group via /proc. When the shell becomes the
+// foreground process (no child command running), any stuck Working/Permission
+// status is cleared.
+
+fn monitor_sessions() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
+    MONITOR_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Check if the shell process is the foreground process group (no child command
+/// running). Returns `true` when the shell's pgrp equals the terminal's
+/// foreground pgrp, or when the process no longer exists.
+#[cfg(target_os = "linux")]
+fn shell_is_foreground(shell_pid: u32) -> bool {
+    let stat_path = format!("/proc/{shell_pid}/stat");
+    let stat = match std::fs::read_to_string(&stat_path) {
+        Ok(s) => s,
+        Err(_) => return true, // Process gone — treat as exited
+    };
+    // /proc/PID/stat: PID (comm) state ppid pgrp session tty_nr tpgid ...
+    let after_comm = match stat.rfind(')') {
+        Some(idx) if idx + 2 < stat.len() => &stat[idx + 2..],
+        _ => return false,
+    };
+    let fields: Vec<&str> = after_comm.split_whitespace().collect();
+    // [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr [5]=tpgid
+    if fields.len() < 6 {
+        return false;
+    }
+    let pgrp: i32 = fields[2].parse().unwrap_or(0);
+    let tpgid: i32 = fields[5].parse().unwrap_or(-1);
+    tpgid == pgrp
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shell_is_foreground(_shell_pid: u32) -> bool {
+    false
+}
+
+/// Start a background thread that monitors when an agent exits so that stuck
+/// Working/Permission status indicators can be cleared.
+fn start_agent_exit_monitor(app: AppHandle, session_id: String, shell_pid: u32) {
+    let monitors = monitor_sessions();
+    let mut guard = monitors.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Don't spawn duplicate monitors for the same session
+    if let Some(active) = guard.get(&session_id) {
+        if active.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+
+    let active = Arc::new(AtomicBool::new(true));
+    guard.insert(session_id.clone(), active.clone());
+    drop(guard);
+
+    std::thread::spawn(move || {
+        // Give the agent time to start before polling
+        std::thread::sleep(Duration::from_secs(2));
+
+        while active.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(1000));
+
+            // Check if the pane status is still active (Working/Permission)
+            let state: tauri::State<'_, AppStateStore> = app.state();
+            let snapshot = state.snapshot();
+            let still_active = snapshot
+                .workspaces
+                .iter()
+                .find_map(|ws| {
+                    ws.surfaces
+                        .iter()
+                        .find_map(|s| state::find_terminal_pane_id(&s.root, &session_id))
+                })
+                .and_then(|pane_id| snapshot.pane_statuses.get(&pane_id.0))
+                .map(|s| matches!(s, PaneStatus::Working | PaneStatus::Permission))
+                .unwrap_or(false);
+
+            if !still_active {
+                break; // Status already cleared by a hook or terminal exit
+            }
+
+            // Check if the shell is the foreground process (agent has exited)
+            if shell_is_foreground(shell_pid) {
+                state.clear_transient_pane_status_by_session(&session_id);
+                state::emit_app_state(&app);
+                eprintln!(
+                    "[codemux::hooks] Agent exit detected for session {} — cleared stuck status",
+                    session_id
+                );
+                break;
+            }
+        }
+
+        // Cleanup
+        if let Ok(mut guard) = monitor_sessions().lock() {
+            guard.remove(&session_id);
+        }
+    });
 }
 
 // ── Hook script and agent registration ──
@@ -242,6 +362,7 @@ pub fn register_claude_code_hooks() {
         ("UserPromptSubmit", "UserPromptSubmit"),
         ("Stop", "Stop"),
         ("PermissionRequest", "PermissionRequest"),
+        ("SessionEnd", "sessionEnd"),
     ];
 
     let hooks = settings
