@@ -190,6 +190,25 @@ pub fn git_pull(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn git_fetch(repo_path: &Path) -> Result<(), String> {
+    run_git(repo_path, &["fetch"])?;
+    Ok(())
+}
+
+pub fn git_stash_push(repo_path: &Path, include_untracked: bool) -> Result<(), String> {
+    if include_untracked {
+        run_git(repo_path, &["stash", "push", "--include-untracked"])?;
+    } else {
+        run_git(repo_path, &["stash", "push"])?;
+    }
+    Ok(())
+}
+
+pub fn git_stash_pop(repo_path: &Path) -> Result<(), String> {
+    run_git(repo_path, &["stash", "pop"])?;
+    Ok(())
+}
+
 pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
     // Try git restore first (works for tracked files)
     let restore = run_git(repo_path, &["restore", "--", file]);
@@ -2744,5 +2763,148 @@ C  source.txt -> copy.txt";
         // Verify merge commit message references the branch
         let log = run_git(&repo, &["log", "--oneline", "-1"]).unwrap();
         assert!(log.contains("feat/my-feature"), "merge commit should name the branch: {}", log);
+    }
+
+    // ── git_fetch tests ──
+
+    #[test]
+    fn test_git_fetch_pulls_remote_refs() {
+        let (_dir, local, remote) = setup_test_repo_with_remote();
+
+        // Push a new commit from a second clone so remote is ahead
+        let clone2 = _dir.path().join("clone2");
+        run_git(
+            _dir.path(),
+            &["clone", remote.to_str().unwrap(), clone2.to_str().unwrap()],
+        )
+        .expect("clone2");
+        std::fs::write(clone2.join("fetched.txt"), "fetch me").expect("write in clone2");
+        run_git(&clone2, &["add", "fetched.txt"]).expect("add");
+        run_git(
+            &clone2,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "fetch target"],
+        )
+        .expect("commit in clone2");
+        run_git(&clone2, &["push"]).expect("push from clone2");
+
+        // Fetch (not pull) in local — working tree should NOT have the file yet
+        git_fetch(&local).expect("fetch");
+        assert!(
+            !local.join("fetched.txt").exists(),
+            "fetch should not update working tree"
+        );
+
+        // But the remote ref should be updated — branch info should show behind
+        let info = git_branch_info(&local).expect("branch info after fetch");
+        assert!(info.behind > 0, "should be behind after fetch: behind={}", info.behind);
+    }
+
+    #[test]
+    fn test_git_fetch_no_remote_is_noop() {
+        let (_dir, repo) = setup_test_repo();
+        // Repo has no remote configured — git fetch exits 0 (no-op)
+        let result = git_fetch(&repo);
+        assert!(result.is_ok(), "fetch on repo with no remote should succeed as no-op");
+    }
+
+    // ── git_stash tests ──
+
+    #[test]
+    fn test_git_stash_push_stashes_changes() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create and commit a file
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        run_git(&repo, &["add", "file.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add file"]).unwrap();
+
+        // Modify it (unstaged change)
+        std::fs::write(repo.join("file.txt"), "modified").unwrap();
+        let status = git_status(&repo).unwrap();
+        assert!(!status.is_empty(), "should have changes before stash");
+
+        // Stash
+        git_stash_push(&repo, false).expect("stash push");
+
+        // Working tree should be clean
+        let status = git_status(&repo).unwrap();
+        assert!(status.is_empty(), "working tree should be clean after stash");
+
+        // File should be back to original
+        let content = std::fs::read_to_string(repo.join("file.txt")).unwrap();
+        assert_eq!(content, "original", "file should be reverted after stash");
+    }
+
+    #[test]
+    fn test_git_stash_push_include_untracked() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create an untracked file
+        std::fs::write(repo.join("untracked.txt"), "new file").unwrap();
+
+        // Stash without include_untracked — untracked file should remain
+        // (nothing tracked to stash, so this would error — create a tracked change too)
+        std::fs::write(repo.join("init.txt"), "tracked").unwrap();
+        run_git(&repo, &["add", "init.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add init"]).unwrap();
+        std::fs::write(repo.join("init.txt"), "changed").unwrap();
+
+        git_stash_push(&repo, false).expect("stash without untracked");
+        assert!(
+            repo.join("untracked.txt").exists(),
+            "untracked file should still exist after stash without --include-untracked"
+        );
+
+        // Now create another tracked change + untracked file and stash with include_untracked
+        std::fs::write(repo.join("init.txt"), "changed again").unwrap();
+        std::fs::write(repo.join("new_untracked.txt"), "also new").unwrap();
+
+        git_stash_push(&repo, true).expect("stash with untracked");
+        assert!(
+            !repo.join("new_untracked.txt").exists(),
+            "untracked file should be gone after stash --include-untracked"
+        );
+    }
+
+    #[test]
+    fn test_git_stash_push_nothing_to_stash_is_noop() {
+        let (_dir, repo) = setup_test_repo();
+        // Clean working tree — git stash push exits 0 with "No local changes to save"
+        let result = git_stash_push(&repo, false);
+        assert!(result.is_ok(), "stash with nothing to stash should succeed as no-op");
+    }
+
+    #[test]
+    fn test_git_stash_pop_restores_changes() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Create, commit, modify
+        std::fs::write(repo.join("file.txt"), "original").unwrap();
+        run_git(&repo, &["add", "file.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add file"]).unwrap();
+        std::fs::write(repo.join("file.txt"), "stashed content").unwrap();
+
+        // Stash then pop
+        git_stash_push(&repo, false).expect("stash");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("file.txt")).unwrap(),
+            "original",
+            "should be clean after stash"
+        );
+
+        git_stash_pop(&repo).expect("stash pop");
+        let content = std::fs::read_to_string(repo.join("file.txt")).unwrap();
+        assert_eq!(content, "stashed content", "pop should restore stashed changes");
+    }
+
+    #[test]
+    fn test_git_stash_pop_empty_stash_returns_error() {
+        let (_dir, repo) = setup_test_repo();
+        // No stash entries
+        let result = git_stash_pop(&repo);
+        assert!(result.is_err(), "pop with empty stash should error");
     }
 }

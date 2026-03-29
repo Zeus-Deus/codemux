@@ -1,12 +1,12 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import { Textarea } from "@/components/ui/textarea";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
@@ -44,6 +44,13 @@ import {
   CheckCircle2,
   ChevronDown,
   ArrowUpToLine,
+  GitBranch,
+  Archive,
+  ArchiveRestore,
+  List,
+  FolderTree,
+  ArrowDownUp,
+  Download,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -72,6 +79,9 @@ import {
   getBaseBranchDiff,
   getDefaultBranch,
   listBranches,
+  gitFetchChanges,
+  gitStashPush,
+  gitStashPop,
 } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
@@ -669,6 +679,7 @@ function FileSection({
   bulkLabel,
   onOpenDiff,
   activeDiffFile,
+  flat,
 }: {
   label: string;
   files: GitFileStatus[];
@@ -682,23 +693,56 @@ function FileSection({
   bulkLabel: string;
   onOpenDiff?: (filePath: string, staged: boolean) => void;
   activeDiffFile?: string | null;
+  flat?: boolean;
 }) {
+  const [collapsed, setCollapsed] = useState(false);
   const groups = useMemo(() => groupByDirectory(files), [files]);
 
   return (
     <div className="py-1">
-      <div className="flex items-center justify-between px-1.5 py-0.5">
-        <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-          {label}
-        </span>
-        <div className="flex items-center gap-1.5">
+      <div className="group/section flex items-center px-1.5 py-0.5">
+        <button
+          type="button"
+          className="flex flex-1 items-center gap-1 text-left min-w-0 hover:bg-accent/30 rounded-sm -ml-0.5 pl-0.5 py-0.5"
+          onClick={() => setCollapsed(!collapsed)}
+        >
+          <ChevronRight
+            className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${!collapsed ? "rotate-90" : ""}`}
+          />
+          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+            {label}
+          </span>
           <span className="text-[10px] tabular-nums text-muted-foreground">{files.length}</span>
-          <Button variant="ghost" size="xs" className="h-5 px-1.5 text-[10px]" onClick={onBulkAction}>
-            {bulkLabel}
-          </Button>
+        </button>
+        <div className="flex items-center gap-0.5 shrink-0">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="h-6 w-6"
+                onClick={onBulkAction}
+              >
+                {staged ? <Minus className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-xs">{bulkLabel}</TooltipContent>
+          </Tooltip>
         </div>
       </div>
-      {groups.map((group) => (
+      {!collapsed && (flat ? files.map((f) => (
+        <FileRow
+          key={f.path}
+          file={f}
+          staged={staged}
+          cwd={cwd}
+          expanded={expandedFile === f.path && expandedStaged === staged}
+          onToggleExpand={() => onToggleExpand(f.path, staged)}
+          onRefresh={onRefresh}
+          onOpenDiff={onOpenDiff}
+          activeDiffFile={activeDiffFile}
+        />
+      )) : groups.map((group) => (
         <DirectoryGroup
           key={group.dir}
           dir={group.dir}
@@ -712,7 +756,7 @@ function FileSection({
           onOpenDiff={onOpenDiff}
           activeDiffFile={activeDiffFile}
         />
-      ))}
+      )))}
     </div>
   );
 }
@@ -728,7 +772,8 @@ export function ChangesPanel({ workspace }: Props) {
   const [expandedFile, setExpandedFile] = useState<string | null>(null);
   const [expandedStaged, setExpandedStaged] = useState(false);
   const [commitMsg, setCommitMsg] = useState("");
-  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | "merge" | null>(null);
+  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | "merge" | "fetch" | "stash" | null>(null);
+  const [viewMode, setViewMode] = useState<"grouped" | "flat">("grouped");
   const [gitError, setGitError] = useState<string | null>(null);
   const [commitsExpanded, setCommitsExpanded] = useState(false);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
@@ -924,6 +969,81 @@ export function ChangesPanel({ workspace }: Props) {
     }
   };
 
+  const handleFetch = async () => {
+    if (busy) return;
+    setBusyAction("fetch");
+    setGitError(null);
+    try {
+      await gitFetchChanges(cwd);
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleFetchAndPull = async () => {
+    if (busy) return;
+    setBusyAction("fetch");
+    setGitError(null);
+    try {
+      await gitFetchChanges(cwd);
+      setBusyAction("pull");
+      await gitPullChanges(cwd);
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSync = async () => {
+    if (busy) return;
+    setBusyAction("pull");
+    setGitError(null);
+    try {
+      await gitPullChanges(cwd);
+      setBusyAction("push");
+      await gitPushChanges(cwd, false);
+      refresh();
+      refreshBaseDiff();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleStash = async (includeUntracked: boolean) => {
+    if (busy) return;
+    setBusyAction("stash");
+    setGitError(null);
+    try {
+      await gitStashPush(cwd, includeUntracked);
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleStashPop = async () => {
+    if (busy) return;
+    setBusyAction("stash");
+    setGitError(null);
+    try {
+      await gitStashPop(cwd);
+      refresh();
+    } catch (err) {
+      setGitError(String(err));
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
   const [mergeSuccess, setMergeSuccess] = useState<string | null>(null);
 
   useEffect(() => {
@@ -1051,6 +1171,73 @@ export function ChangesPanel({ workspace }: Props) {
     refresh();
   };
 
+  // Smart primary action for ButtonGroup
+  const canCommit = !!commitMsg.trim() && staged.length > 0 && !busy && conflicted.length === 0;
+  const pushCount = branchInfo?.ahead ?? 0;
+  const pullCount = branchInfo?.behind ?? 0;
+  const hasUpstream = branchInfo?.has_upstream ?? false;
+
+  const primaryAction = (() => {
+    if (canCommit) {
+      return {
+        label: "Commit",
+        icon: busyAction === "commit" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <GitCommit className="h-3.5 w-3.5" />,
+        handler: handleCommit,
+        disabled: false,
+        tooltip: "Commit staged changes (Ctrl+Enter)",
+        badge: null as string | null,
+      };
+    }
+    if (pushCount > 0 && pullCount > 0) {
+      return {
+        label: "Sync",
+        icon: (busyAction === "push" || busyAction === "pull") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDownUp className="h-3.5 w-3.5" />,
+        handler: handleSync,
+        disabled: busy,
+        tooltip: `Pull ${pullCount}, push ${pushCount}`,
+        badge: `${pullCount}/${pushCount}`,
+      };
+    }
+    if (pushCount > 0) {
+      return {
+        label: "Push",
+        icon: busyAction === "push" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUp className="h-3.5 w-3.5" />,
+        handler: handlePush,
+        disabled: busy,
+        tooltip: `Push ${pushCount} commit${pushCount !== 1 ? "s" : ""} to remote`,
+        badge: String(pushCount),
+      };
+    }
+    if (pullCount > 0) {
+      return {
+        label: "Pull",
+        icon: busyAction === "pull" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDown className="h-3.5 w-3.5" />,
+        handler: handlePull,
+        disabled: busy,
+        tooltip: `Pull ${pullCount} commit${pullCount !== 1 ? "s" : ""}`,
+        badge: String(pullCount),
+      };
+    }
+    if (!hasUpstream && branchInfo?.branch) {
+      return {
+        label: "Publish Branch",
+        icon: busyAction === "push" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUp className="h-3.5 w-3.5" />,
+        handler: handlePush,
+        disabled: busy,
+        tooltip: "Publish branch to remote",
+        badge: null,
+      };
+    }
+    return {
+      label: "Commit",
+      icon: <GitCommit className="h-3.5 w-3.5" />,
+      handler: handleCommit,
+      disabled: true,
+      tooltip: staged.length === 0 ? "No staged changes" : "Enter a commit message",
+      badge: null,
+    };
+  })();
+
   const handleToggleExpand = (path: string, isStaged: boolean) => {
     if (expandedFile === path && expandedStaged === isStaged) {
       setExpandedFile(null);
@@ -1118,24 +1305,140 @@ export function ChangesPanel({ workspace }: Props) {
     <>
     <TooltipProvider>
       <div className="flex h-full flex-col">
-        {/* Commit bar — pinned at top */}
-        <div className="p-1.5 space-y-1 border-b border-border">
-          <div className="flex gap-1 items-center">
-            <Input
+        {/* Toolbar row — above commit area, matches Superset layout */}
+        <div className="flex items-center gap-0.5 px-2 py-1.5">
+          {/* Base branch selector */}
+          {remoteBranches.length > 1 ? (
+            <DropdownMenu>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <Button variant="ghost" size="icon-xs" className="size-6 p-0">
+                      <GitBranch className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  Base: {baseBranch}
+                </TooltipContent>
+              </Tooltip>
+              <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
+                {remoteBranches.map((b) => (
+                  <DropdownMenuItem
+                    key={b}
+                    onClick={() => setBaseBranch(b)}
+                    className="text-xs"
+                  >
+                    {b === baseBranch && <Check className="h-3 w-3 mr-1.5 shrink-0" />}
+                    <span className={b !== baseBranch ? "pl-[18px]" : ""}>{b}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="icon-xs" className="size-6 p-0" disabled>
+                  <GitBranch className="h-3.5 w-3.5" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">
+                Base: {baseBranch}
+              </TooltipContent>
+            </Tooltip>
+          )}
+
+          {/* Stash dropdown */}
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button variant="ghost" size="icon-xs" className="size-6 p-0" disabled={busy}>
+                    <Archive className="h-3.5 w-3.5" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">
+                Stash
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="start" className="w-52">
+              <DropdownMenuItem onClick={() => handleStash(false)} className="text-xs">
+                <Archive className="h-3.5 w-3.5" />
+                Stash Changes
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => handleStash(true)} className="text-xs">
+                <Archive className="h-3.5 w-3.5" />
+                Stash (Include Untracked)
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onClick={handleStashPop} className="text-xs">
+                <ArchiveRestore className="h-3.5 w-3.5" />
+                Pop Stash
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {/* View mode toggle */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="size-6 p-0"
+                onClick={() => setViewMode(viewMode === "grouped" ? "flat" : "grouped")}
+              >
+                {viewMode === "grouped" ? <FolderTree className="h-3.5 w-3.5" /> : <List className="h-3.5 w-3.5" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-xs">
+              {viewMode === "grouped" ? "Switch to flat view" : "Switch to grouped view"}
+            </TooltipContent>
+          </Tooltip>
+
+          {/* Refresh */}
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="size-6 p-0"
+                onClick={() => { refresh(); refreshBaseDiff(); }}
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" className="text-xs">
+              Refresh
+            </TooltipContent>
+          </Tooltip>
+        </div>
+
+        {/* Commit area */}
+        <div className="flex flex-col gap-1.5 px-2 py-2 border-b border-border">
+          {/* Textarea with AI sparkle overlay */}
+          <div className="relative">
+            <Textarea
               placeholder="Commit message"
               value={commitMsg}
               onChange={(e) => setCommitMsg(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleCommit()}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !primaryAction.disabled) {
+                  e.preventDefault();
+                  primaryAction.handler();
+                }
+              }}
               disabled={isGenerating}
-              className="h-7 text-xs flex-1"
+              className="min-h-[52px] resize-none text-xs bg-background pr-7"
             />
             {aiEnabled && (
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <span className="shrink-0" tabIndex={0}>
+                  <span className="absolute top-1.5 right-1.5 shrink-0" tabIndex={0}>
                     <Button
                       variant="ghost"
                       size="icon-xs"
+                      className="h-5 w-5"
                       disabled={staged.length === 0 || isGenerating || claudeReady === false}
                       onClick={handleGenerateCommitMsg}
                     >
@@ -1155,77 +1458,115 @@ export function ChangesPanel({ workspace }: Props) {
               </Tooltip>
             )}
           </div>
-          <div className="flex gap-1">
-            <Button
-              size="xs"
-              variant="secondary"
-              className="flex-1 text-xs h-6"
-              disabled={!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0}
-              onClick={handleCommit}
-            >
-              {busyAction === "commit"
-                ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                : <GitCommit className="h-3 w-3 mr-1" />}
-              Commit
-            </Button>
-            {branchInfo && branchInfo.branch && (() => {
-              const pushDisabled = busy || (branchInfo.has_upstream && branchInfo.ahead === 0);
-              return (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span>
-                      <Button
-                        size="xs"
-                        variant="secondary"
-                        className={`text-xs h-6${pushDisabled ? " opacity-50" : ""}`}
-                        disabled={pushDisabled}
-                        onClick={handlePush}
-                      >
-                        {busyAction === "push"
-                          ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                          : <ArrowUp className="h-3 w-3 mr-1" />}
-                        {!branchInfo.has_upstream
-                          ? "Publish"
-                          : branchInfo.ahead > 0
-                            ? `Push ${branchInfo.ahead}`
-                            : "Push"}
-                      </Button>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="text-xs">
-                    {branchInfo.has_upstream && branchInfo.ahead === 0
-                      ? "Nothing to push"
-                      : !branchInfo.has_upstream
-                        ? "Publish branch to remote"
-                        : `Push ${branchInfo.ahead} commit${branchInfo.ahead !== 1 ? "s" : ""} to remote`}
-                  </TooltipContent>
-                </Tooltip>
-              );
-            })()}
-            {branchInfo && branchInfo.has_upstream && branchInfo.behind > 0 && (
-              <Button
-                size="xs"
-                variant="secondary"
-                className="text-xs h-6"
-                disabled={busy}
-                onClick={handlePull}
-              >
-                {busyAction === "pull"
-                  ? <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                  : <ArrowDown className="h-3 w-3 mr-1" />}
-                Pull {branchInfo.behind}
-              </Button>
-            )}
-            <Button
-              size="xs"
-              variant="ghost"
-              className="h-6 w-6 p-0"
-              onClick={refresh}
-              title="Refresh"
-            >
-              <RefreshCw className="h-3 w-3" />
-            </Button>
+
+          {/* Smart ButtonGroup: primary action + dropdown */}
+          <div data-slot="button-group" className="flex w-full items-stretch">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="flex-1 gap-1.5 h-7 text-xs rounded-r-none border-r-0"
+                  onClick={primaryAction.handler}
+                  disabled={primaryAction.disabled}
+                >
+                  {primaryAction.icon}
+                  <span>{primaryAction.label}</span>
+                  {primaryAction.badge && (
+                    <span className="text-[10px] opacity-70">{primaryAction.badge}</span>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">{primaryAction.tooltip}</TooltipContent>
+            </Tooltip>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-1.5 rounded-l-none"
+                  disabled={busy}
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-48 text-xs">
+                <DropdownMenuItem
+                  onClick={handleCommit}
+                  disabled={!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0}
+                  className="text-xs"
+                >
+                  <GitCommit className="h-3.5 w-3.5" />
+                  Commit
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={() => {
+                    if (!commitMsg.trim() || staged.length === 0 || busy) return;
+                    (async () => {
+                      try {
+                        await gitCommitChanges(cwd, commitMsg.trim());
+                        setCommitMsg("");
+                        await handlePush();
+                      } catch (err) { setGitError(String(err)); }
+                      refresh();
+                      refreshBaseDiff();
+                    })();
+                  }}
+                  disabled={!commitMsg.trim() || staged.length === 0 || busy}
+                  className="text-xs"
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                  Commit & Push
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onClick={handlePush}
+                  disabled={busy || (branchInfo?.has_upstream && (branchInfo?.ahead ?? 0) === 0)}
+                  className="text-xs"
+                >
+                  <ArrowUp className="h-3.5 w-3.5" />
+                  <span className="flex-1">{!branchInfo?.has_upstream ? "Publish Branch" : "Push"}</span>
+                  {(branchInfo?.ahead ?? 0) > 0 && (
+                    <span className="text-[10px] text-muted-foreground">{branchInfo?.ahead}</span>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={handlePull}
+                  disabled={busy || !branchInfo?.has_upstream || (branchInfo?.behind ?? 0) === 0}
+                  className="text-xs"
+                >
+                  <ArrowDown className="h-3.5 w-3.5" />
+                  <span className="flex-1">Pull</span>
+                  {(branchInfo?.behind ?? 0) > 0 && (
+                    <span className="text-[10px] text-muted-foreground">{branchInfo?.behind}</span>
+                  )}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  onClick={handleSync}
+                  disabled={busy || ((branchInfo?.ahead ?? 0) === 0 && (branchInfo?.behind ?? 0) === 0)}
+                  className="text-xs"
+                >
+                  <ArrowDownUp className="h-3.5 w-3.5" />
+                  Sync
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={handleFetch} disabled={busy} className="text-xs">
+                  <Download className="h-3.5 w-3.5" />
+                  Fetch
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={handleFetchAndPull} disabled={busy} className="text-xs">
+                  <Download className="h-3.5 w-3.5" />
+                  Fetch & Pull
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem onClick={() => { refresh(); refreshBaseDiff(); }} className="text-xs">
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  Refresh
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
+
           {gitError && (
             <p className="text-[10px] text-destructive break-words px-0.5">{gitError}</p>
           )}
@@ -1300,7 +1641,7 @@ export function ChangesPanel({ workspace }: Props) {
           </div>
         ) : null}
 
-        {/* No changes message — outside ScrollArea to avoid scrollbar shift */}
+        {/* No changes message */}
         {files.length === 0 && !isMerging && (
           <div className="flex flex-col items-center justify-center min-h-[120px] text-muted-foreground">
             <Check className="h-5 w-5 mb-1.5 opacity-40" />
@@ -1309,7 +1650,7 @@ export function ChangesPanel({ workspace }: Props) {
         )}
 
         {/* File list */}
-        <ScrollArea className="flex-1">
+        <div className="flex-1 min-h-0 overflow-y-auto">
           <div className="px-1">
             {(conflicted.length > 0 || resolver.status !== "idle") && (
               <ConflictsSection
@@ -1340,12 +1681,13 @@ export function ChangesPanel({ workspace }: Props) {
                 bulkLabel="Unstage all"
                 onOpenDiff={handleOpenDiff}
                 activeDiffFile={activeDiffFile}
+                flat={viewMode === "flat"}
               />
             )}
 
             {unstaged.length > 0 && (
               <FileSection
-                label="Changes"
+                label="Unstaged"
                 files={unstaged}
                 staged={false}
                 cwd={cwd}
@@ -1357,6 +1699,7 @@ export function ChangesPanel({ workspace }: Props) {
                 bulkLabel="Stage all"
                 onOpenDiff={handleOpenDiff}
                 activeDiffFile={activeDiffFile}
+                flat={viewMode === "flat"}
               />
             )}
 
@@ -1385,38 +1728,8 @@ export function ChangesPanel({ workspace }: Props) {
                       />
                     </Button>
                     <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                      Against
+                      Against {baseBranch}
                     </span>
-                    {remoteBranches.length > 1 ? (
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="xs"
-                            className="gap-0.5 px-1 py-0.5 text-[10px] font-medium text-muted-foreground hover:bg-accent/50 hover:text-foreground"
-                          >
-                            {baseBranch}
-                            <ChevronDown className="h-2.5 w-2.5 opacity-60" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
-                          {remoteBranches.map((b) => (
-                            <DropdownMenuItem
-                              key={b}
-                              onClick={() => setBaseBranch(b)}
-                              className="text-xs"
-                            >
-                              {b === baseBranch && <Check className="h-3 w-3 mr-1.5 shrink-0" />}
-                              <span className={b !== baseBranch ? "pl-[18px]" : ""}>{b}</span>
-                            </DropdownMenuItem>
-                          ))}
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    ) : (
-                      <span className="text-[10px] font-medium text-muted-foreground">
-                        {baseBranch}
-                      </span>
-                    )}
                   </div>
                   <div className="flex items-center gap-1">
                     <span className="text-[10px] tabular-nums text-muted-foreground">
@@ -1464,7 +1777,19 @@ export function ChangesPanel({ workspace }: Props) {
                 </div>
                 {baseBranchExpanded && (
                   <div>
-                    {groupByDirectory(baseBranchFiles).map((group) => (
+                    {viewMode === "flat" ? baseBranchFiles.map((f) => (
+                      <FileRow
+                        key={f.path}
+                        file={f}
+                        staged={false}
+                        cwd={cwd}
+                        expanded={false}
+                        onToggleExpand={() => {}}
+                        onRefresh={refreshBaseDiff}
+                        onOpenDiff={(filePath) => handleOpenBaseDiff(filePath)}
+                        activeDiffFile={activeDiffFile}
+                      />
+                    )) : groupByDirectory(baseBranchFiles).map((group) => (
                       <DirectoryGroup
                         key={group.dir}
                         dir={group.dir}
@@ -1542,7 +1867,7 @@ export function ChangesPanel({ workspace }: Props) {
               </div>
             )}
           </div>
-        </ScrollArea>
+        </div>
       </div>
     </TooltipProvider>
 

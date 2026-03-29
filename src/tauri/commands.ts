@@ -395,6 +395,15 @@ export const getGitBranchInfo = (path: string) =>
 export const gitPullChanges = (path: string) =>
   invoke("git_pull_changes", { path });
 
+export const gitFetchChanges = (path: string) =>
+  invoke("git_fetch_changes", { path });
+
+export const gitStashPush = (path: string, includeUntracked: boolean) =>
+  invoke("git_stash_push", { path, includeUntracked });
+
+export const gitStashPop = (path: string) =>
+  invoke("git_stash_pop", { path });
+
 export const gitDiscardFile = (path: string, file: string) =>
   invoke("git_discard_file", { path, file });
 

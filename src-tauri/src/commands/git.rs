@@ -61,6 +61,21 @@ pub fn git_pull_changes(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn git_fetch_changes(path: String) -> Result<(), String> {
+    crate::git::git_fetch(Path::new(&path))
+}
+
+#[tauri::command]
+pub fn git_stash_push(path: String, include_untracked: bool) -> Result<(), String> {
+    crate::git::git_stash_push(Path::new(&path), include_untracked)
+}
+
+#[tauri::command]
+pub fn git_stash_pop(path: String) -> Result<(), String> {
+    crate::git::git_stash_pop(Path::new(&path))
+}
+
+#[tauri::command]
 pub fn git_discard_file(path: String, file: String) -> Result<(), String> {
     crate::git::git_discard_file(Path::new(&path), &file)
 }

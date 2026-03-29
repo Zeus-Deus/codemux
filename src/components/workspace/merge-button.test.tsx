@@ -183,7 +183,7 @@ describe("Merge button in Against section", () => {
     // The merge button should have a tooltip "Merge main into current branch"
     // Look for the GitMerge icon button in the Against section
     // At minimum, the "Against" section should be visible with a merge button
-    expect(screen.getByText("Against")).toBeInTheDocument();
+    expect(screen.getByText("Against main")).toBeInTheDocument();
   });
 
   it("calls mergeBranch with correct args on click", async () => {
@@ -193,12 +193,12 @@ describe("Merge button in Against section", () => {
 
     // Find the merge button — it's in the Against section near the file count
     // The Against section renders when baseBranchFiles.length > 0
-    const againstSection = screen.getByText("Against").closest("div")?.parentElement;
+    const againstSection = screen.getByText("Against main").closest("div")?.parentElement;
     expect(againstSection).toBeTruthy();
 
     // Click the merge button — find it by proximity to the file count
     // The merge button is the last button-like element in the section header
-    const headerDiv = screen.getByText("Against").closest(".flex");
+    const headerDiv = screen.getByText("Against main").closest(".flex");
     const allMergeButtons = headerDiv?.parentElement?.querySelectorAll("button") ?? [];
     // The merge button is the one that's not the expand/collapse chevron and not the branch selector
     for (const btn of allMergeButtons) {
@@ -221,7 +221,7 @@ describe("Merge button in Against section", () => {
     await flushPromises();
 
     // Click merge
-    const headerDiv = screen.getByText("Against").closest(".flex")?.parentElement;
+    const headerDiv = screen.getByText("Against main").closest(".flex")?.parentElement;
     const allButtons = headerDiv?.querySelectorAll("button") ?? [];
     for (const btn of allButtons) {
       if (btn.querySelector(".lucide-git-merge")) {
@@ -277,7 +277,7 @@ describe("Merge button in Against section", () => {
     await flushPromises();
 
     // Click merge
-    const headerDiv = screen.getByText("Against").closest(".flex")?.parentElement;
+    const headerDiv = screen.getByText("Against main").closest(".flex")?.parentElement;
     const allButtons = headerDiv?.querySelectorAll("button") ?? [];
     for (const btn of allButtons) {
       if (btn.querySelector(".lucide-git-merge")) {
@@ -303,7 +303,7 @@ describe("Merge button in Against section", () => {
     await flushPromises();
 
     // "Against" section should not render
-    expect(screen.queryByText("Against")).not.toBeInTheDocument();
+    expect(screen.queryByText("Against main")).not.toBeInTheDocument();
   });
 
   it("shows error when merge fails (e.g., dirty tree)", async () => {
@@ -314,7 +314,7 @@ describe("Merge button in Against section", () => {
     await flushPromises();
 
     // Click merge
-    const headerDiv = screen.getByText("Against").closest(".flex")?.parentElement;
+    const headerDiv = screen.getByText("Against main").closest(".flex")?.parentElement;
     const allButtons = headerDiv?.querySelectorAll("button") ?? [];
     for (const btn of allButtons) {
       if (btn.querySelector(".lucide-git-merge")) {
@@ -393,7 +393,7 @@ describe("Against section and merge button visibility on base branch", () => {
     await flushPromises();
 
     // The Against section should NOT render when on the base branch
-    expect(screen.queryByText("Against")).not.toBeInTheDocument();
+    expect(screen.queryByText("Against main")).not.toBeInTheDocument();
   });
 
   it("shows Against section with both merge buttons when on a feature branch", async () => {
@@ -401,6 +401,6 @@ describe("Against section and merge button visibility on base branch", () => {
     renderPanel();
     await flushPromises();
 
-    expect(screen.getByText("Against")).toBeInTheDocument();
+    expect(screen.getByText("Against main")).toBeInTheDocument();
   });
 });
