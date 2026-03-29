@@ -33,7 +33,6 @@ import {
   Check,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   listBranches,
   listWorktrees,
@@ -49,7 +48,7 @@ import {
   dbAddRecentProject,
   getPresets,
 } from "@/tauri/commands";
-import type { WorktreeInfo, DetectedSetup, TerminalPreset } from "@/tauri/types";
+import type { WorktreeInfo, DetectedSetup } from "@/tauri/types";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -68,6 +67,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // ── Step 1 state ──
   const [task, setTask] = useState("");
   const [generatedBranch, setGeneratedBranch] = useState("");
+  const [branchEdited, setBranchEdited] = useState(false);
   const [baseBranch, setBaseBranch] = useState("main");
   const [advancedOpen, setAdvancedOpen] = useState(false);
 
@@ -79,10 +79,8 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const [teardownOpen, setTeardownOpen] = useState(false);
 
   // ── Agent state ──
-  const [presets, setPresets] = useState<TerminalPreset[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const lastSelectedAgentId = useUIStore((s) => s.lastSelectedAgentId);
-  const setLastSelectedAgentId = useUIStore((s) => s.setLastSelectedAgentId);
   const addPendingWorkspace = useUIStore((s) => s.addPendingWorkspace);
   const removePendingWorkspace = useUIStore((s) => s.removePendingWorkspace);
   const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
@@ -109,12 +107,6 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     [worktrees, projectDir],
   );
 
-  // ── Selected agent preset ──
-  const selectedAgent = useMemo(
-    () => presets.find((p) => p.id === selectedAgentId) ?? null,
-    [presets, selectedAgentId],
-  );
-
   // ── Load data on mount ──
   useEffect(() => {
     let cancelled = false;
@@ -136,7 +128,6 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       setBaseBranch(defBranch);
       setActions(detected.map((d) => ({ ...d, checked: d.enabled })));
       const pinned = presetSnap.presets.filter((p) => p.pinned);
-      setPresets(pinned);
       setSelectedAgentId(lastSelectedAgentId || pinned.find((p) => p.id === "builtin-claude")?.id || pinned[0]?.id || null);
     });
 
@@ -152,9 +143,10 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     }
   }, [step]);
 
-  // ── Debounced branch name generation ──
+  // ── Debounced branch name generation (only when not manually edited) ──
   const handleTaskChange = (value: string) => {
     setTask(value);
+    if (branchEdited) return;
     if (branchGenTimeout.current) clearTimeout(branchGenTimeout.current);
     if (!value.trim()) {
       setGeneratedBranch("");
@@ -168,6 +160,12 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
         setGeneratedBranch("");
       }
     }, 500);
+  };
+
+  // ── Manual branch name edit ──
+  const handleBranchChange = (value: string) => {
+    setBranchEdited(true);
+    setGeneratedBranch(value);
   };
 
   // ── Step 1 → Step 2 ──
@@ -311,23 +309,6 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     onComplete();
   };
 
-  // ── Import single worktree ──
-  const handleImportSingle = async (wt: WorktreeInfo) => {
-    if (!wt.branch) return;
-    const branch = wt.branch.replace(/^refs\/heads\//, "");
-    try {
-      // Close the temporary empty workspace
-      await closeWorkspace(tempWorkspaceId, false).catch(() => {});
-      const wsId = await importWorktreeWorkspace(wt.path, branch, "single");
-      const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
-      dbAddRecentProject(projectDir, pName).catch(console.error);
-      await activateWorkspace(wsId);
-      onComplete();
-    } catch (err) {
-      console.error("Failed to import worktree:", wt.path, err);
-    }
-  };
-
   // ── Key handling ──
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -353,15 +334,13 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                 {externalWorktrees.slice(0, 5).map((wt) => {
                   const branch = wt.branch?.replace(/^refs\/heads\//, "") ?? "";
                   return (
-                    <button
+                    <span
                       key={wt.path}
-                      type="button"
-                      onClick={() => handleImportSingle(wt)}
-                      className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-xs font-mono text-muted-foreground hover:bg-muted/80 hover:text-foreground transition-colors max-w-[180px]"
+                      className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-xs font-mono text-muted-foreground max-w-[180px]"
                     >
                       <GitBranch className="h-3 w-3 shrink-0" />
                       <span className="truncate">{branch}</span>
-                    </button>
+                    </span>
                   );
                 })}
                 {externalWorktrees.length > 5 && (
@@ -419,15 +398,19 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   />
                 </div>
 
-                {/* Branch name display — always visible */}
-                <div className="rounded-md border border-border/60 bg-card/40 px-3 py-2 text-sm">
+                {/* Branch name — editable */}
+                <div className="rounded-md border border-border/60 bg-card/40 px-3 py-1.5 text-sm">
                   <div className="flex items-center gap-2 text-muted-foreground">
                     <GitBranch className="h-3.5 w-3.5 shrink-0" />
-                    <span className="font-mono">
-                      {generatedBranch || "branch-name"}
-                    </span>
-                    <span className="text-muted-foreground/50">from</span>
-                    <span className="font-mono">{baseBranch}</span>
+                    <input
+                      type="text"
+                      value={generatedBranch}
+                      onChange={(e) => handleBranchChange(e.target.value)}
+                      placeholder="branch-name"
+                      className="flex-1 min-w-0 bg-transparent font-mono text-sm text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
+                    />
+                    <span className="text-muted-foreground/50 shrink-0">from</span>
+                    <span className="font-mono shrink-0">{baseBranch}</span>
                   </div>
                 </div>
 
@@ -496,6 +479,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   <Button
                     onClick={handleContinue}
                     disabled={!task.trim()}
+                    className="bg-foreground text-background hover:bg-foreground/90"
                   >
                     Continue
                     <ChevronRight className="h-4 w-4" />
@@ -645,50 +629,6 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     Back
                   </Button>
                   <div className="flex items-center gap-2">
-                    {/* Agent picker */}
-                    <DropdownMenu>
-                      <DropdownMenuTrigger asChild>
-                        <button
-                          type="button"
-                          className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-foreground transition-colors outline-none hover:bg-muted"
-                        >
-                          {selectedAgent ? (
-                            <>
-                              <PresetIcon
-                                icon={selectedAgent.icon}
-                                className="h-3.5 w-3.5"
-                              />
-                              {selectedAgent.name}
-                            </>
-                          ) : (
-                            <>
-                              <PresetIcon icon="claude" className="h-3.5 w-3.5" />
-                              Claude Code
-                            </>
-                          )}
-                          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
-                        </button>
-                      </DropdownMenuTrigger>
-                      <DropdownMenuContent align="end" className="w-[200px]">
-                        {presets.map((p) => (
-                          <DropdownMenuItem
-                            key={p.id}
-                            onClick={() => {
-                              setSelectedAgentId(p.id);
-                              setLastSelectedAgentId(p.id);
-                            }}
-                            className="text-xs gap-2"
-                          >
-                            <PresetIcon icon={p.icon} className="h-3.5 w-3.5" />
-                            <span className="flex-1">{p.name}</span>
-                            {selectedAgentId === p.id && (
-                              <Check className="h-3.5 w-3.5 text-primary" />
-                            )}
-                          </DropdownMenuItem>
-                        ))}
-                      </DropdownMenuContent>
-                    </DropdownMenu>
-
                     <Button
                       variant="outline"
                       onClick={() => handleCreateWorkspace(false)}
@@ -699,6 +639,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                     <Button
                       onClick={() => handleCreateWorkspace(true)}
                       disabled={isCreating}
+                      className="bg-foreground text-background hover:bg-foreground/90"
                     >
                       {isCreating ? "Creating..." : "Create workspace"}
                       <ChevronRight className="h-4 w-4" />
