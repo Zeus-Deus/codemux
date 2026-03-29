@@ -45,7 +45,6 @@ export const useAuthStore = create<AuthStore>((set) => ({
   devBypass: false,
 
   checkAuth: async () => {
-    console.log("[auth] checkAuth called");
     set({ isLoading: true, error: null });
 
     const maxRetries = 3;
@@ -54,7 +53,6 @@ export const useAuthStore = create<AuthStore>((set) => ({
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         const user = await checkAuthCmd();
-        console.log("[auth] checkAuth result:", user ? "authenticated" : "not authenticated");
         if (user) {
           set({ user, isAuthenticated: true, isLoading: false });
         } else {
@@ -62,14 +60,12 @@ export const useAuthStore = create<AuthStore>((set) => ({
         }
         return;
       } catch (err) {
-        console.error(`[auth] checkAuth attempt ${attempt}/${maxRetries} failed:`, err);
         if (attempt < maxRetries) {
           await new Promise((resolve) => setTimeout(resolve, retryDelay));
         }
       }
     }
 
-    console.error("[auth] checkAuth all retries failed, enabling dev bypass");
     set({
       user: DEV_USER,
       isAuthenticated: true,

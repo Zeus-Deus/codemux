@@ -1,9 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
+
+use tauri::Manager;
+
+use crate::database::DatabaseStore;
+
+// fs is used by machine_id() and token_file_path() (migration support)
+use std::fs;
 
 use aes_gcm::aead::{Aead, KeyInit, OsRng};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -214,11 +220,16 @@ fn decrypt_data(data: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("decrypt: {e}"))
 }
 
-pub fn save_token(token: &str, expires_at: &str) -> Result<(), String> {
-    save_auth(token, expires_at, None)
+pub fn save_token(db: &DatabaseStore, token: &str, expires_at: &str) -> Result<(), String> {
+    save_auth(db, token, expires_at, None)
 }
 
-pub fn save_auth(token: &str, expires_at: &str, user: Option<&AuthUser>) -> Result<(), String> {
+pub fn save_auth(
+    db: &DatabaseStore,
+    token: &str,
+    expires_at: &str,
+    user: Option<&AuthUser>,
+) -> Result<(), String> {
     let stored = StoredAuth {
         token: token.to_string(),
         expires_at: expires_at.to_string(),
@@ -226,93 +237,32 @@ pub fn save_auth(token: &str, expires_at: &str, user: Option<&AuthUser>) -> Resu
     };
     let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
     let encrypted = encrypt_data(&json)?;
-
-    let path = token_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
-    }
-    fs::write(&path, &encrypted).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+    db.save_auth_token(&encrypted)
 }
 
-pub fn load_token() -> Option<(String, String)> {
-    let path = token_file_path();
-    eprintln!("[auth] load_token: path={}", path.display());
-
-    let data = match fs::read(&path) {
-        Ok(d) => {
-            eprintln!("[auth] load_token: file read OK ({} bytes)", d.len());
-            d
-        }
-        Err(e) => {
-            eprintln!("[auth] load_token: FILE READ FAILED: {e} (path={})", path.display());
-            return None;
-        }
-    };
-
-    let decrypted = match decrypt_data(&data) {
-        Ok(d) => {
-            eprintln!("[auth] load_token: decryption OK ({} bytes)", d.len());
-            d
-        }
-        Err(e) => {
-            eprintln!("[auth] load_token: DECRYPTION FAILED: {e}");
-            return None;
-        }
-    };
-
-    let stored: StoredAuth = match serde_json::from_slice(&decrypted) {
-        Ok(s) => {
-            eprintln!("[auth] load_token: JSON parse OK");
-            s
-        }
-        Err(e) => {
-            eprintln!("[auth] load_token: JSON PARSE FAILED: {e}");
-            return None;
-        }
-    };
-
+pub fn load_token(db: &DatabaseStore) -> Option<(String, String)> {
+    let data = db.load_auth_token()?;
+    let decrypted = decrypt_data(&data).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
     Some((stored.token, stored.expires_at))
 }
 
-pub fn load_cached_user() -> Option<AuthUser> {
-    let path = token_file_path();
-    eprintln!("[auth] load_cached_user: path={}", path.display());
-
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[auth] load_cached_user: FILE READ FAILED: {e}");
-            return None;
-        }
-    };
-
-    let decrypted = match decrypt_data(&data) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[auth] load_cached_user: DECRYPTION FAILED: {e}");
-            return None;
-        }
-    };
-
-    let stored: StoredAuth = match serde_json::from_slice(&decrypted) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[auth] load_cached_user: JSON PARSE FAILED: {e}");
-            return None;
-        }
-    };
-
+pub fn load_cached_user(db: &DatabaseStore) -> Option<AuthUser> {
+    let data = db.load_auth_token()?;
+    let decrypted = decrypt_data(&data).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
     stored.user
 }
 
-pub fn clear_token() {
+pub fn clear_token(db: &DatabaseStore) {
     use std::io::Write;
-    let msg = format!("[auth] CLEAR_TOKEN CALLED - backtrace:\n{}\n", std::backtrace::Backtrace::force_capture());
+    let msg = format!(
+        "[auth] CLEAR_TOKEN CALLED - backtrace:\n{}\n",
+        std::backtrace::Backtrace::force_capture()
+    );
     let _ = std::io::stderr().write_all(msg.as_bytes());
     let _ = std::io::stderr().flush();
-    let path = token_file_path();
-    let _ = fs::remove_file(&path);
+    db.clear_auth_token();
 }
 
 pub fn is_token_expired(expires_at: &str) -> bool {
@@ -418,8 +368,9 @@ pub fn start_callback_server(
                             continue;
                         }
 
-                        if let Err(e) = save_token(token, expires_at) {
-                            eprintln!("[auth] Failed to save token: {e}");
+                        let db: tauri::State<'_, DatabaseStore> = handle_clone.state();
+                        if let Err(e) = save_token(&db, token, expires_at) {
+                            eprintln!("[auth] Failed to save token in callback: {e}");
                         }
 
                         // Emit auth event to frontend
@@ -478,7 +429,8 @@ fn emit_auth_state(app: &tauri::AppHandle, token: &str, expires_at: &str) {
 
     // Cache user data for offline/network-error auth
     if let Some(ref u) = user {
-        let _ = save_auth(token, expires_at, Some(u));
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let _ = save_auth(&db, token, expires_at, Some(u));
     }
 
     let payload = AuthStatePayload {
@@ -515,8 +467,9 @@ p{opacity:.6;font-size:.9rem}
 mod tests {
     use super::*;
 
-    // Tests that touch the shared token file must hold this lock
-    static TOKEN_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn test_db() -> DatabaseStore {
+        DatabaseStore::new_in_memory()
+    }
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
@@ -530,11 +483,9 @@ mod tests {
     fn encrypted_data_is_not_plaintext() {
         let plaintext = b"secret-token-value-12345";
         let encrypted = encrypt_data(plaintext).unwrap();
-        // The encrypted bytes should not contain the plaintext substring
         let plaintext_str = std::str::from_utf8(plaintext).unwrap();
         let encrypted_str = String::from_utf8_lossy(&encrypted);
         assert!(!encrypted_str.contains(plaintext_str));
-        // Also check raw bytes
         assert!(encrypted.windows(plaintext.len()).all(|w| w != plaintext));
     }
 
@@ -542,7 +493,6 @@ mod tests {
     fn decrypt_with_wrong_key_returns_error() {
         let plaintext = b"some secret data";
         let mut encrypted = encrypt_data(plaintext).unwrap();
-        // Corrupt the salt so a different key is derived
         encrypted[0] ^= 0xff;
         encrypted[1] ^= 0xff;
         assert!(decrypt_data(&encrypted).is_err());
@@ -550,31 +500,27 @@ mod tests {
 
     #[test]
     fn corrupted_data_returns_error() {
-        // Too short
         assert!(decrypt_data(&[0u8; 10]).is_err());
-        // Random garbage
         let garbage = vec![0xdeu8; 100];
         assert!(decrypt_data(&garbage).is_err());
-        // Empty
         assert!(decrypt_data(&[]).is_err());
     }
 
     #[test]
     fn token_save_load_roundtrip() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
+        let db = test_db();
         let token = "test-token-abc123";
         let expires = "2099-01-01T00:00:00Z";
-        save_token(token, expires).unwrap();
+        save_token(&db, token, expires).unwrap();
 
-        let loaded = load_token();
+        let loaded = load_token(&db);
         assert!(loaded.is_some());
         let (t, e) = loaded.unwrap();
         assert_eq!(t, token);
         assert_eq!(e, expires);
 
-        // Cleanup
-        clear_token();
-        assert!(load_token().is_none());
+        clear_token(&db);
+        assert!(load_token(&db).is_none());
     }
 
     #[test]
@@ -582,10 +528,7 @@ mod tests {
         let state = AuthState::default();
         let token = state.generate_csrf_state();
         assert!(!token.is_empty());
-
-        // First validation should succeed
         assert!(state.validate_csrf_state(&token));
-        // Second should fail (one-time use)
         assert!(!state.validate_csrf_state(&token));
     }
 
@@ -598,24 +541,18 @@ mod tests {
     #[test]
     fn csrf_state_expired_token_fails() {
         let state = AuthState::default();
-
-        // Manually insert an expired state (11 minutes ago)
         {
             let mut states = state.csrf_states.lock().unwrap();
             let expired = Instant::now() - std::time::Duration::from_secs(660);
             states.insert("expired-state".into(), expired);
         }
-
         assert!(!state.validate_csrf_state("expired-state"));
     }
 
     #[test]
     fn token_expiry_check() {
-        // Future date
         assert!(!is_token_expired("2099-12-31T23:59:59Z"));
-        // Past date
         assert!(is_token_expired("2000-01-01T00:00:00Z"));
-        // Invalid format
         assert!(is_token_expired("not-a-date"));
     }
 
@@ -632,34 +569,30 @@ mod tests {
 
     #[test]
     fn encryption_integrity_with_user_data() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
+        let db = test_db();
         let token = "sec-token-integrity-xK9mZ";
         let expires = "2099-01-01T00:00:00Z";
         let user = test_user();
-        save_auth(token, expires, Some(&user)).unwrap();
+        save_auth(&db, token, expires, Some(&user)).unwrap();
 
-        // Read raw bytes from disk — must NOT be valid JSON
-        let raw = fs::read(token_file_path()).unwrap();
+        // Read raw encrypted bytes from SQLite — must NOT be valid JSON
+        let raw = db.load_auth_token().unwrap();
         assert!(
             serde_json::from_slice::<serde_json::Value>(&raw).is_err(),
-            "raw file bytes must not be valid JSON"
+            "raw encrypted bytes must not be valid JSON"
         );
-
-        // Cleanup
-        clear_token();
     }
 
     #[test]
-    fn no_plaintext_leakage_in_encrypted_file() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
+    fn no_plaintext_leakage_in_encrypted_data() {
+        let db = test_db();
         let token = "sec-token-leakcheck-Qw7pR";
         let expires = "2099-01-01T00:00:00Z";
         let user = test_user();
-        save_auth(token, expires, Some(&user)).unwrap();
+        save_auth(&db, token, expires, Some(&user)).unwrap();
 
-        let raw = fs::read(token_file_path()).unwrap();
+        let raw = db.load_auth_token().unwrap();
 
-        // Scan raw bytes for plaintext substrings
         let sensitive = [
             token.as_bytes(),
             user.email.as_bytes(),
@@ -669,88 +602,65 @@ mod tests {
         for secret in &sensitive {
             assert!(
                 raw.windows(secret.len()).all(|w| w != *secret),
-                "plaintext leaked in encrypted file: {:?}",
+                "plaintext leaked in encrypted data: {:?}",
                 std::str::from_utf8(secret).unwrap()
             );
         }
-
-        // Cleanup
-        clear_token();
     }
 
     #[test]
     fn decryption_roundtrip_with_user() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
+        let db = test_db();
         let token = "sec-token-roundtrip-Lm3nB";
         let expires = "2099-06-15T12:00:00Z";
         let user = test_user();
-        save_auth(token, expires, Some(&user)).unwrap();
+        save_auth(&db, token, expires, Some(&user)).unwrap();
 
-        // Verify load_token still works
-        let (t, e) = load_token().unwrap();
+        let (t, e) = load_token(&db).unwrap();
         assert_eq!(t, token);
         assert_eq!(e, expires);
 
-        // Verify load_cached_user returns exact data
-        let cached = load_cached_user().unwrap();
+        let cached = load_cached_user(&db).unwrap();
         assert_eq!(cached.id, user.id);
         assert_eq!(cached.email, user.email);
         assert_eq!(cached.name, user.name);
         assert_eq!(cached.image, user.image);
-
-        // Cleanup
-        clear_token();
     }
 
     #[test]
-    fn backward_compat_save_token_without_user() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
+    fn save_token_without_user() {
+        let db = test_db();
         let token = "sec-token-compat-Hj8kW";
         let expires = "2099-01-01T00:00:00Z";
 
-        // save_token (old API) writes no user field
-        save_token(token, expires).unwrap();
+        save_token(&db, token, expires).unwrap();
 
-        // load_token works normally
-        let (t, e) = load_token().unwrap();
+        let (t, e) = load_token(&db).unwrap();
         assert_eq!(t, token);
         assert_eq!(e, expires);
 
-        // load_cached_user returns None, not an error
-        assert!(load_cached_user().is_none());
-
-        // Cleanup
-        clear_token();
+        // No user was saved
+        assert!(load_cached_user(&db).is_none());
     }
 
     #[test]
-    fn corrupted_file_returns_none_gracefully() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
-        let path = token_file_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).ok();
-        }
+    fn corrupted_data_returns_none_gracefully() {
+        let db = test_db();
 
-        // Write garbage bytes
+        // Write garbage bytes directly into SQLite
         let garbage: Vec<u8> = (0u32..300).map(|i| (i.wrapping_mul(0xDE)) as u8).collect();
-        fs::write(&path, &garbage).unwrap();
+        db.save_auth_token(&garbage).unwrap();
 
-        // Both must return None, not panic
-        assert!(load_token().is_none());
-        assert!(load_cached_user().is_none());
-
-        // Cleanup
-        clear_token();
+        assert!(load_token(&db).is_none());
+        assert!(load_cached_user(&db).is_none());
     }
 
     #[test]
-    fn missing_file_returns_none_gracefully() {
-        let _lock = TOKEN_FILE_LOCK.lock().unwrap();
-        // Ensure file does not exist
-        clear_token();
+    fn missing_data_returns_none_gracefully() {
+        let db = test_db();
 
-        // Both must return None, not panic
-        assert!(load_token().is_none());
-        assert!(load_cached_user().is_none());
+        // Empty database — no token stored
+        assert!(load_token(&db).is_none());
+        assert!(load_cached_user(&db).is_none());
     }
 }

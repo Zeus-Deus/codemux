@@ -97,17 +97,17 @@ pub fn run() {
                 ));
             }
 
-            // Auth token path diagnostics
+            // Migrate auth token from file to SQLite (one-time)
             {
-                let token_path = crate::auth::token_file_path();
-                let tauri_data_dir = app.path().app_local_data_dir().ok();
-                eprintln!("[auth-diag] Token file path: {}", token_path.display());
-                eprintln!("[auth-diag] Token file exists: {}", token_path.exists());
-                if let Some(ref td) = tauri_data_dir {
-                    eprintln!("[auth-diag] Tauri app_local_data_dir: {}", td.display());
-                    eprintln!("[auth-diag] Token inside Tauri data dir: {}", token_path.starts_with(td));
-                } else {
-                    eprintln!("[auth-diag] Tauri app_local_data_dir: UNAVAILABLE");
+                let db: tauri::State<'_, database::DatabaseStore> = app.handle().state();
+                let old_path = crate::auth::token_file_path();
+                if old_path.exists() {
+                    if db.load_auth_token().is_none() {
+                        if let Ok(data) = std::fs::read(&old_path) {
+                            let _ = db.save_auth_token(&data);
+                        }
+                    }
+                    let _ = std::fs::remove_file(&old_path);
                 }
             }
 

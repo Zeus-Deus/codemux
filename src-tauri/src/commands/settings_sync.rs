@@ -1,10 +1,11 @@
-use tauri::Emitter;
+use tauri::{Emitter, State};
 
 use crate::auth::{is_token_expired, load_token};
+use crate::database::DatabaseStore;
 use crate::settings_sync::{self, UserSettings};
 
-fn get_valid_token() -> Option<String> {
-    let (token, expires_at) = load_token()?;
+fn get_valid_token(db: &DatabaseStore) -> Option<String> {
+    let (token, expires_at) = load_token(db)?;
     if is_token_expired(&expires_at) {
         None
     } else {
@@ -17,8 +18,11 @@ fn emit_settings_synced(app: &tauri::AppHandle, settings: &UserSettings) {
 }
 
 #[tauri::command]
-pub async fn get_synced_settings(app: tauri::AppHandle) -> Result<UserSettings, String> {
-    let token = match get_valid_token() {
+pub async fn get_synced_settings(
+    app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
+) -> Result<UserSettings, String> {
+    let token = match get_valid_token(&db) {
         Some(t) => t,
         None => return Ok(settings_sync::load_cache().unwrap_or_default()),
     };
@@ -38,9 +42,10 @@ pub async fn get_synced_settings(app: tauri::AppHandle) -> Result<UserSettings, 
 #[tauri::command]
 pub async fn update_synced_settings(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     settings: UserSettings,
 ) -> Result<UserSettings, String> {
-    let token = match get_valid_token() {
+    let token = match get_valid_token(&db) {
         Some(t) => t,
         None => {
             // Not authenticated — save locally only
@@ -59,6 +64,7 @@ pub async fn update_synced_settings(
 #[tauri::command]
 pub async fn update_setting(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     section: String,
     key: String,
     value: serde_json::Value,
@@ -69,7 +75,7 @@ pub async fn update_setting(
     partial_root.insert(section.clone(), serde_json::Value::Object(partial_section));
     let partial = serde_json::Value::Object(partial_root);
 
-    let token = match get_valid_token() {
+    let token = match get_valid_token(&db) {
         Some(t) => t,
         None => {
             // Offline: merge into local cache
@@ -98,10 +104,13 @@ pub async fn update_setting(
 }
 
 #[tauri::command]
-pub async fn reset_synced_settings(app: tauri::AppHandle) -> Result<UserSettings, String> {
+pub async fn reset_synced_settings(
+    app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
+) -> Result<UserSettings, String> {
     let defaults = UserSettings::default();
 
-    let token = match get_valid_token() {
+    let token = match get_valid_token(&db) {
         Some(t) => t,
         None => {
             settings_sync::clear_cache();

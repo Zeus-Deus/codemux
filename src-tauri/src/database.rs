@@ -110,6 +110,12 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             completed_at TEXT,
             UNIQUE(run_id)
         );
+
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            encrypted_data BLOB NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -347,6 +353,35 @@ impl DatabaseStore {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect()
+    }
+}
+
+// ── Auth Tokens ──
+
+impl DatabaseStore {
+    pub fn save_auth_token(&self, encrypted_data: &[u8]) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO auth_tokens (id, encrypted_data, updated_at) VALUES (1, ?1, datetime('now'))",
+            params![encrypted_data],
+        )
+        .map_err(|e| format!("Failed to save auth token: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_auth_token(&self) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT encrypted_data FROM auth_tokens WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    pub fn clear_auth_token(&self) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute("DELETE FROM auth_tokens WHERE id = 1", []);
     }
 }
 

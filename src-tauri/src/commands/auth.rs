@@ -4,6 +4,7 @@ use crate::auth::{
     api_base_url, clear_token, is_token_expired, load_cached_user, load_token, save_auth,
     AuthResponse, AuthState, AuthStatePayload, AuthUser,
 };
+use crate::database::DatabaseStore;
 
 #[tauri::command]
 pub async fn start_oauth_flow(
@@ -38,6 +39,7 @@ pub async fn start_oauth_flow(
 #[tauri::command]
 pub async fn signin_email(
     app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
     email: String,
     password: String,
 ) -> Result<AuthResponse, String> {
@@ -76,7 +78,7 @@ pub async fn signin_email(
         image: api_resp.user.image.clone(),
     };
 
-    save_auth(&api_resp.token, &api_resp.expires_at, Some(&user))?;
+    save_auth(&db, &api_resp.token, &api_resp.expires_at, Some(&user))?;
 
     let auth_response = AuthResponse {
         token: api_resp.token.clone(),
@@ -155,23 +157,17 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, String> {
-    eprintln!("[auth] check_auth called");
-
-    let (token, expires_at) = match load_token() {
-        Some(t) => {
-            eprintln!("[auth] token loaded: true, expires_at={}", t.1);
-            t
-        }
-        None => {
-            eprintln!("[auth] NO TOKEN - returning None");
-            return Ok(None);
-        }
+pub async fn check_auth(
+    app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
+) -> Result<Option<AuthUser>, String> {
+    let (token, expires_at) = match load_token(&db) {
+        Some(t) => t,
+        None => return Ok(None),
     };
 
     if is_token_expired(&expires_at) {
-        eprintln!("[auth] TOKEN EXPIRED - returning None");
-        clear_token();
+        clear_token(&db);
         let payload = AuthStatePayload {
             authenticated: false,
             user: None,
@@ -182,7 +178,6 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 
     let base = api_base_url();
     let url = format!("{base}/api/auth/desktop/verify");
-    eprintln!("[auth] calling verify API at {url}");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -193,7 +188,6 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            eprintln!("[auth] API returned 200");
             let verify: VerifyResp = r.json().await.map_err(|e| e.to_string())?;
             let user = AuthUser {
                 id: verify.user.id,
@@ -203,7 +197,7 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
             };
 
             // Cache user data for offline/network-error auth
-            let _ = save_auth(&token, &expires_at, Some(&user));
+            let _ = save_auth(&db, &token, &expires_at, Some(&user));
 
             // Background-fetch synced settings after successful auth
             let settings_handle = app.clone();
@@ -219,12 +213,10 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
                 }
             });
 
-            eprintln!("[auth] returning: Some(user)");
             Ok(Some(user))
         }
         Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-            eprintln!("[auth] API returned 401 - clearing token");
-            clear_token();
+            clear_token(&db);
             let payload = AuthStatePayload {
                 authenticated: false,
                 user: None,
@@ -232,21 +224,14 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
             let _ = app.emit("auth-state-changed", &payload);
             Ok(None)
         }
-        Ok(r) => {
-            let status = r.status();
-            eprintln!("[auth] API returned unexpected status: {status} - using cached user");
-            Ok(load_cached_user())
-        }
-        Err(e) => {
-            eprintln!("[auth] NETWORK ERROR: {e:?} - using cached user");
-            Ok(load_cached_user())
-        }
+        Ok(_) => Ok(load_cached_user(&db)),
+        Err(_) => Ok(load_cached_user(&db)),
     }
 }
 
 #[tauri::command]
-pub fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
-    clear_token();
+pub fn sign_out(app: tauri::AppHandle, db: State<'_, DatabaseStore>) -> Result<(), String> {
+    clear_token(&db);
     crate::settings_sync::clear_cache();
 
     // Reset frontend settings store to defaults before auth-state-changed
@@ -261,11 +246,11 @@ pub fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_auth_token() -> Result<Option<String>, String> {
-    match load_token() {
+pub fn get_auth_token(db: State<'_, DatabaseStore>) -> Result<Option<String>, String> {
+    match load_token(&db) {
         Some((token, expires_at)) => {
             if is_token_expired(&expires_at) {
-                clear_token();
+                clear_token(&db);
                 Ok(None)
             } else {
                 Ok(Some(token))
