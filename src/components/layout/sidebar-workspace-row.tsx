@@ -275,7 +275,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
           >
             {/* Active left border accent */}
             {isActive && (
-              <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-primary rounded-r" />
+              <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground rounded-r" />
             )}
 
             {/* Icon — size-6 container matches project header avatar width */}
