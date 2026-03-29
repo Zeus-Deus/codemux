@@ -90,6 +90,11 @@ export interface BrowserSessionSnapshot {
   last_error: string | null;
 }
 
+// ── Pane Status ──
+
+export type PaneStatus = "idle" | "working" | "permission" | "review";
+export type ActivePaneStatus = Exclude<PaneStatus, "idle">;
+
 // ── Notifications ──
 
 export interface NotificationSnapshot {
@@ -530,6 +535,7 @@ export interface AppStateSnapshot {
   browser_sessions: BrowserSessionSnapshot[];
   notifications: NotificationSnapshot[];
   detected_ports: PortInfoSnapshot[];
+  pane_statuses: Record<string, PaneStatus>;
   persistence: PersistenceSchema;
   config: CodemuxConfigSnapshot;
 }

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -192,6 +193,15 @@ pub struct BrowserSessionSnapshot {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneStatus {
+    Idle,
+    Working,
+    Permission,
+    Review,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationLevel {
@@ -333,6 +343,9 @@ pub struct AppStateSnapshot {
     pub notifications: Vec<NotificationSnapshot>,
     #[serde(default)]
     pub detected_ports: Vec<PortInfoSnapshot>,
+    /// Per-pane agent status (pane_id → status). Only non-idle entries are stored.
+    #[serde(default)]
+    pub pane_statuses: HashMap<String, PaneStatus>,
     pub persistence: PersistenceSchema,
     pub config: CodemuxConfigSnapshot,
 }
@@ -441,6 +454,26 @@ impl AppStateStore {
             for notification in snapshot.notifications.iter_mut() {
                 if notification.workspace_id.0 == workspace_id {
                     notification.read = true;
+                }
+            }
+            // Clear review statuses only for the active tab's panes (not all tabs)
+            if let Some(workspace) = snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            {
+                let active_surface_id = workspace.active_surface_id.clone();
+                if let Some(surface) = workspace
+                    .surfaces
+                    .iter()
+                    .find(|s| s.surface_id == active_surface_id)
+                {
+                    let pane_ids = collect_pane_ids_from_node(&surface.root);
+                    for pid in pane_ids {
+                        if snapshot.pane_statuses.get(&pid) == Some(&PaneStatus::Review) {
+                            snapshot.pane_statuses.remove(&pid);
+                        }
+                    }
                 }
             }
             if let Some(workspace) = snapshot
@@ -1597,6 +1630,53 @@ impl AppStateStore {
         false
     }
 
+    /// Set agent status for a pane. Idle removes the entry.
+    pub fn set_pane_status(&self, pane_id: &str, status: PaneStatus) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if status == PaneStatus::Idle {
+            snapshot.pane_statuses.remove(pane_id);
+        } else {
+            snapshot.pane_statuses.insert(pane_id.to_string(), status);
+        }
+    }
+
+    /// Resolve session_id to pane_id and set status. Returns true if found.
+    pub fn set_pane_status_by_session(&self, session_id: &str, status: PaneStatus) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_terminal_pane_id(&s.root, session_id))
+        });
+        if let Some(pane_id) = pane_id {
+            if status == PaneStatus::Idle {
+                snapshot.pane_statuses.remove(&pane_id.0);
+            } else {
+                snapshot.pane_statuses.insert(pane_id.0, status);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear working/permission status for a session (on terminal exit).
+    pub fn clear_transient_pane_status_by_session(&self, session_id: &str) {
+        let mut snapshot = self.inner.lock().unwrap();
+        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_terminal_pane_id(&s.root, session_id))
+        });
+        if let Some(pane_id) = pane_id {
+            if let Some(status) = snapshot.pane_statuses.get(&pane_id.0) {
+                if matches!(status, PaneStatus::Working | PaneStatus::Permission) {
+                    snapshot.pane_statuses.remove(&pane_id.0);
+                }
+            }
+        }
+    }
+
     pub fn add_notification(
         &self,
         session_id: Option<String>,
@@ -1876,6 +1956,20 @@ impl AppStateStore {
         workspace.active_tab_id = tab_id.to_string();
         if let Some(ref surface_id) = tab.surface_id {
             workspace.active_surface_id = surface_id.clone();
+
+            // Clear "review" pane statuses for panes in this tab only
+            if let Some(surface) = workspace
+                .surfaces
+                .iter()
+                .find(|s| s.surface_id == *surface_id)
+            {
+                let pane_ids = collect_pane_ids_from_node(&surface.root);
+                for pid in pane_ids {
+                    if snapshot.pane_statuses.get(&pid) == Some(&PaneStatus::Review) {
+                        snapshot.pane_statuses.remove(&pid);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -2133,6 +2227,7 @@ fn default_app_state() -> AppStateSnapshot {
         browser_sessions: vec![],
         notifications: vec![],
         detected_ports: vec![],
+        pane_statuses: HashMap::new(),
         persistence: PersistenceSchema {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             stores_layout_metadata: true,
@@ -2272,7 +2367,18 @@ fn first_terminal_pane(root: &PaneNodeSnapshot) -> Option<(PaneId, SessionId)> {
     }
 }
 
-fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -> Option<PaneId> {
+fn collect_pane_ids_from_node(node: &PaneNodeSnapshot) -> Vec<String> {
+    match node {
+        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
+            vec![pane_id.0.clone()]
+        }
+        PaneNodeSnapshot::Split { children, .. } => {
+            children.iter().flat_map(collect_pane_ids_from_node).collect()
+        }
+    }
+}
+
+pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -> Option<PaneId> {
     match root {
         PaneNodeSnapshot::Terminal {
             pane_id,

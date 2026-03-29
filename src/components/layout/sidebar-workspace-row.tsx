@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -28,7 +28,10 @@ import {
   detectEditors,
   openInEditor,
 } from "@/tauri/commands";
-import type { WorkspaceSnapshot, EditorInfo } from "@/tauri/types";
+import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
+import { useAppStore } from "@/stores/app-store";
+import { getWorkspaceStatus } from "@/lib/pane-status";
+import { StatusIndicator } from "@/components/ui/status-indicator";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -212,8 +215,34 @@ function WorkspaceContextMenuItems({
   );
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function AsciiSpinner() {
+  const [frame, setFrame] = useState(0);
+  const frameRef = useRef(0);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      frameRef.current = (frameRef.current + 1) % SPINNER_FRAMES.length;
+      setFrame(frameRef.current);
+    }, 80);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <span className="text-amber-500 text-sm leading-none select-none" aria-label="Agent working">
+      {SPINNER_FRAMES[frame]}
+    </span>
+  );
+}
+
 export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const [showRemoveDialog, setShowRemoveDialog] = useState(false);
+
+  const workspaceStatus: ActivePaneStatus | null = useAppStore((s) => {
+    if (!s.appState) return null;
+    return getWorkspaceStatus(workspace.surfaces, s.appState.pane_statuses);
+  });
 
   const handleActivate = () => {
     activateWorkspace(workspace.workspace_id).catch(console.error);
@@ -250,8 +279,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
             )}
 
             {/* Icon — size-6 container matches project header avatar width */}
-            <div className="size-6 flex items-center justify-center shrink-0 mr-2.5">
-              {icon}
+            <div className="relative size-6 flex items-center justify-center shrink-0 mr-2.5">
+              {workspaceStatus === "working" ? (
+                <AsciiSpinner />
+              ) : (
+                <>
+                  {icon}
+                  {workspaceStatus && (
+                    <StatusIndicator
+                      status={workspaceStatus}
+                      className="absolute -top-0.5 -right-0.5"
+                    />
+                  )}
+                </>
+              )}
             </div>
 
             {/* Content */}

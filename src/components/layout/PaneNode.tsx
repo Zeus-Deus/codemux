@@ -6,7 +6,9 @@ import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
-import type { PaneNodeSnapshot } from "@/tauri/types";
+import type { PaneNodeSnapshot, PaneStatus } from "@/tauri/types";
+import { useAppStore } from "@/stores/app-store";
+import { StatusIndicator } from "@/components/ui/status-indicator";
 
 // Map known preset names to their icon identifiers
 const PRESET_TITLE_TO_ICON: Record<string, string> = {
@@ -210,6 +212,9 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   }
 
   const isActive = node.pane_id === activePaneId;
+  const paneStatus: PaneStatus | undefined = useAppStore(
+    (s) => s.appState?.pane_statuses[node.pane_id],
+  );
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
@@ -240,6 +245,9 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
               <PresetIcon icon={PRESET_TITLE_TO_ICON[node.title]} className="h-3 w-3" />
             )}
             {node.title}
+            {paneStatus && paneStatus !== "idle" && (
+              <StatusIndicator status={paneStatus} />
+            )}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
             <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">

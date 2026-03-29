@@ -190,6 +190,14 @@ fn emit_terminal_status(
         },
     );
 
+    // On terminal exit, clear transient pane status (working/permission → idle)
+    if matches!(
+        payload.state,
+        TerminalLifecycleState::Exited | TerminalLifecycleState::Failed
+    ) {
+        app_state.clear_transient_pane_status_by_session(&payload.session_id);
+    }
+
     if let Err(error) = app.emit("terminal-status", payload) {
         eprintln!("[codemux::terminal] Failed to emit terminal status: {error}");
     }
@@ -326,9 +334,22 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
     cmd.env("CODEMUX_WORKSPACE_ID", active_workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
+    cmd.env("CODEMUX_SESSION_ID", session_id.clone());
     cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
     cmd.env("BROWSER", "codemux browser open");
     cmd.env("CODEMUX_AGENT_CONTEXT", crate::agent_context::CODEMUX_AGENT_CONTEXT);
+
+    // Inject pane ID and hook server port for agent status notifications
+    if let Some(pane_id) = snapshot.workspaces.iter().find_map(|ws| {
+        ws.surfaces
+            .iter()
+            .find_map(|s| crate::state::find_terminal_pane_id(&s.root, &session_id))
+    }) {
+        cmd.env("CODEMUX_PANE_ID", pane_id.0);
+    }
+    if let Some(port) = crate::hooks::hook_port() {
+        cmd.env("CODEMUX_HOOK_PORT", port.to_string());
+    }
 
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {

@@ -25,7 +25,10 @@ import {
   splitPane,
 } from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
-import type { WorkspaceSnapshot, TabKind } from "@/tauri/types";
+import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNodeSnapshot } from "@/tauri/types";
+import { useAppStore } from "@/stores/app-store";
+import { getHighestPriorityStatus } from "@/lib/pane-status";
+import { StatusIndicator } from "@/components/ui/status-indicator";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -37,11 +40,29 @@ const tabIcon: Record<TabKind, React.ReactNode> = {
   diff: <GitCompare className="h-3 w-3" />,
 };
 
+function collectPaneIds(node: PaneNodeSnapshot): string[] {
+  if (node.kind === "split") return node.children.flatMap(collectPaneIds);
+  return [node.pane_id];
+}
+
 export function TabBar({ workspace }: Props) {
   const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspace.workspace_id] ?? null,
   );
+
+  // Compute per-tab status from pane statuses
+  const paneStatuses = useAppStore((s) => s.appState?.pane_statuses ?? {});
+  const tabStatusMap = new Map<string, ActivePaneStatus>();
+  for (const tab of workspace.tabs) {
+    if (!tab.surface_id) continue;
+    const surface = workspace.surfaces.find((s) => s.surface_id === tab.surface_id);
+    if (!surface) continue;
+    const ids = collectPaneIds(surface.root);
+    const statuses: (PaneStatus | undefined)[] = ids.map((id) => paneStatuses[id]);
+    const highest = getHighestPriorityStatus(statuses);
+    if (highest) tabStatusMap.set(tab.tab_id, highest);
+  }
 
   // Drag state
   const [dragTabId, setDragTabId] = useState<string | null>(null);
@@ -233,6 +254,9 @@ export function TabBar({ workspace }: Props) {
                     >
                       {tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
+                      {tabStatusMap.has(tab.tab_id) && (
+                        <StatusIndicator status={tabStatusMap.get(tab.tab_id)!} />
+                      )}
                       <span
                         role="button"
                         tabIndex={0}

@@ -27,6 +27,7 @@ pub mod project;
 pub mod scripts;
 pub mod settings_sync;
 pub mod state;
+pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
 
@@ -190,6 +191,8 @@ pub fn run() {
             let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
             indexing::spawn_index_watcher(index_store);
             control::spawn_control_server(app.handle().clone());
+            hooks::start_hook_server(app.handle().clone());
+            hooks::register_claude_code_hooks();
 
             // Periodically refresh git info for the active workspace
             let git_handle = app.handle().clone();

@@ -108,6 +108,7 @@ function setAppState(cwd: string, extraWorkspaces: WsOverrides[] = []) {
       browser_sessions: [],
       notifications: [],
       detected_ports: [],
+      pane_statuses: {},
       persistence: {
         schema_version: 1,
         stores_layout_metadata: true,
@@ -366,6 +367,7 @@ describe("Project directory auto-fill", () => {
         browser_sessions: [],
         notifications: [],
         detected_ports: [],
+      pane_statuses: {},
         persistence: {
           schema_version: 1,
           stores_layout_metadata: true,
@@ -404,6 +406,7 @@ describe("Project directory auto-fill", () => {
         browser_sessions: [],
         notifications: [],
         detected_ports: [],
+      pane_statuses: {},
         persistence: {
           schema_version: 1,
           stores_layout_metadata: true,
