@@ -6,7 +6,8 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Loader2, FileText } from "lucide-react";
+import { Loader2 } from "lucide-react";
+import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
 import { useActiveWorkspace } from "@/stores/app-store";
 import { searchFileNames, detectEditors, openInEditor } from "@/tauri/commands";
@@ -137,7 +138,7 @@ export function FileSearchDialog() {
                 onClick={() => openFile(filePath)}
                 onMouseEnter={() => setSelectedIndex(idx)}
               >
-                <FileText className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <FileTypeIcon filename={fileName} className="h-3.5 w-3.5 opacity-75" />
                 <div className="min-w-0 flex-1">
                   <span className="font-medium">{fileName}</span>
                   {dirPath && (

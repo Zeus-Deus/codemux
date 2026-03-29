@@ -6,7 +6,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, File, Folder, RefreshCw, Loader2 } from "lucide-react";
+import { ChevronRight, Folder, RefreshCw, Loader2 } from "lucide-react";
+import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { listDirectory, detectEditors, openInEditor } from "@/tauri/commands";
 import type { WorkspaceSnapshot, FileEntry, EditorInfo } from "@/tauri/types";
 
@@ -87,7 +88,7 @@ function TreeNode({
       onClick={() => onClickFile(entry.path)}
     >
       <span className="w-3 shrink-0" />
-      <File className="h-3 w-3 shrink-0 text-muted-foreground" />
+      <FileTypeIcon filename={entry.name} className="h-3.5 w-3.5 opacity-75" />
       <span className="truncate text-foreground">{entry.name}</span>
       {entry.size !== null && (
         <span className="ml-auto text-[10px] text-muted-foreground/50 tabular-nums shrink-0">

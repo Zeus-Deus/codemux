@@ -35,7 +35,6 @@ import {
   Check,
   Trash2,
   ChevronRight,
-  File,
   Sparkles,
   AlertTriangle,
   GitMerge,
@@ -89,6 +88,13 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from "@/components/ui/context-menu";
+import {
+  VscDiffAdded,
+  VscDiffModified,
+  VscDiffRemoved,
+  VscDiffRenamed,
+  VscCopy,
+} from "react-icons/vsc";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
@@ -106,24 +112,36 @@ interface Props {
   workspace: WorkspaceSnapshot;
 }
 
-const STATUS_LABEL: Record<string, string> = {
-  added: "A",
-  modified: "M",
-  deleted: "D",
-  renamed: "R",
-  untracked: "U",
-  copied: "C",
-  conflicted: "!",
-};
+const STATUS_ICON_CLASS = "w-3 h-3";
+
+function StatusIcon({ status }: { status: string }) {
+  switch (status) {
+    case "added":
+    case "untracked":
+      return <VscDiffAdded className={STATUS_ICON_CLASS} />;
+    case "modified":
+      return <VscDiffModified className={STATUS_ICON_CLASS} />;
+    case "deleted":
+      return <VscDiffRemoved className={STATUS_ICON_CLASS} />;
+    case "renamed":
+      return <VscDiffRenamed className={STATUS_ICON_CLASS} />;
+    case "copied":
+      return <VscCopy className={STATUS_ICON_CLASS} />;
+    case "conflicted":
+      return <VscDiffModified className={STATUS_ICON_CLASS} />;
+    default:
+      return null;
+  }
+}
 
 const STATUS_COLOR: Record<string, string> = {
-  added: "text-success",
-  modified: "text-warning",
-  deleted: "text-danger",
-  renamed: "text-primary",
-  untracked: "text-muted-foreground",
-  copied: "text-muted-foreground",
-  conflicted: "text-danger",
+  added: "text-green-400",
+  modified: "text-yellow-400",
+  deleted: "text-red-400",
+  renamed: "text-blue-400",
+  untracked: "text-green-400",
+  copied: "text-purple-400",
+  conflicted: "text-red-400",
 };
 
 const CONFLICT_TYPE_LABEL: Record<string, string> = {
@@ -204,20 +222,12 @@ function SectionHeader({
 
 // ── Commit Row ──
 
-const STATUS_ICON: Record<string, string> = {
-  added: "A",
-  modified: "M",
-  deleted: "D",
-  renamed: "R",
-  copied: "C",
-};
-
 const COMMIT_FILE_COLOR: Record<string, string> = {
-  added: "text-success",
-  modified: "text-warning",
-  deleted: "text-danger",
-  renamed: "text-primary",
-  copied: "text-muted-foreground",
+  added: "text-green-400",
+  modified: "text-yellow-400",
+  deleted: "text-red-400",
+  renamed: "text-blue-400",
+  copied: "text-purple-400",
 };
 
 function formatRelativeTime(timeAgo: string): string {
@@ -299,10 +309,9 @@ function CommitRow({
               key={f.path}
               className="flex items-center gap-1 px-1 py-0.5 text-xs"
             >
-              <span className={`shrink-0 w-3.5 text-center text-[10px] font-bold leading-none ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
-                {STATUS_ICON[f.status] ?? "?"}
+              <span className={`shrink-0 flex items-center ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
+                <StatusIcon status={f.status} />
               </span>
-              <File className="h-3 w-3 shrink-0 text-muted-foreground/50" />
               <span className="truncate text-xs text-foreground">{fileName(f.path)}</span>
             </div>
           ))}
@@ -435,10 +444,8 @@ function FileRow({
             }}
           >
             <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-              <span
-                className={`shrink-0 w-3 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
-              >
-                {STATUS_LABEL[file.status] ?? "?"}
+              <span className={`shrink-0 flex items-center ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}>
+                <StatusIcon status={file.status} />
               </span>
               <span className="flex-1 min-w-0 flex items-center gap-1">
                 <span className="truncate text-xs text-foreground">{name}</span>
@@ -528,8 +535,8 @@ function ConflictFileRow({
           onClick={() => onOpenDiff?.(file.path, false)}
         >
           <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-            <span className="shrink-0 w-3 text-center text-[10px] font-bold leading-none text-danger">
-              !
+            <span className="shrink-0 flex items-center text-red-400">
+              <StatusIcon status="conflicted" />
             </span>
             <span className="flex-1 min-w-0 flex items-center gap-1">
               <span className="truncate text-xs text-foreground">{name}</span>
