@@ -390,7 +390,7 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
         {/* Sticky submit footer */}
         <div className="sticky bottom-0 -mx-4 -mb-4 border-t bg-popover p-4">
           <Button
-            className="w-full h-8 text-xs"
+            className="w-full h-8 text-xs bg-foreground text-background hover:bg-foreground/90"
             onClick={handleSubmit}
             disabled={!goal.trim() || !cwd.trim() || submitting}
           >

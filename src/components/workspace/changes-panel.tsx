@@ -373,7 +373,7 @@ function ConflictFileRow({
             <Button
               variant="ghost"
               size="icon-xs"
-              className="text-primary"
+              className="text-foreground"
               onClick={(e) => { e.stopPropagation(); handleResolve("ours"); }}
               title="Accept ours"
               disabled={busy !== null}
@@ -554,6 +554,7 @@ function ConflictsSection({
           <span className="block px-1.5 mt-1">
             <Button
               size="xs"
+              variant="secondary"
               className="text-[10px] h-6 w-full"
               disabled={!resolverEnabled}
               onClick={onStartResolve}
@@ -1157,6 +1158,7 @@ export function ChangesPanel({ workspace }: Props) {
           <div className="flex gap-1">
             <Button
               size="xs"
+              variant="secondary"
               className="flex-1 text-xs h-6"
               disabled={!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0}
               onClick={handleCommit}
@@ -1446,7 +1448,7 @@ export function ChangesPanel({ workspace }: Props) {
                         <Button
                           variant="ghost"
                           size="icon-xs"
-                          className="h-4 w-4 hover:bg-accent/50 text-primary"
+                          className="h-4 w-4 hover:bg-accent/50 text-foreground"
                           onClick={() => setShowMergeIntoDialog(true)}
                           disabled={busy || isMerging || !!mergeIntoBaseState}
                         >
@@ -1567,7 +1569,7 @@ export function ChangesPanel({ workspace }: Props) {
         </label>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={handleMergeIntoBase}>
+          <AlertDialogAction onClick={handleMergeIntoBase} className="bg-foreground text-background hover:bg-foreground/90">
             Merge into {baseBranch}
           </AlertDialogAction>
         </AlertDialogFooter>

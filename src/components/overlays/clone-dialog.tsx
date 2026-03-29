@@ -130,6 +130,7 @@ export function CloneDialog() {
               size="sm"
               onClick={handleClone}
               disabled={!url.trim() || cloning}
+              className="bg-foreground text-background hover:bg-foreground/90"
             >
               {cloning && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
               {cloning ? "Cloning..." : "Clone"}

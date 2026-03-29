@@ -666,7 +666,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleImportAll}>
+            <AlertDialogAction onClick={handleImportAll} className="bg-foreground text-background hover:bg-foreground/90">
               Import all
             </AlertDialogAction>
           </AlertDialogFooter>

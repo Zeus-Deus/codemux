@@ -128,6 +128,15 @@ color: var(--status-color);
 - Danger: secondary style, hover reveals danger color on text and border.
 - Icon: transparent bg, `--ui-text-muted` icon. Hover: layer-2 bg + primary text.
 
+#### Overlay Button Color Rule
+
+- Buttons inside overlays, wizards, splash screens, dialogs, and onboarding flows use neutral inverted styling: `bg-foreground text-background hover:bg-foreground/90`
+- This keeps overlays calm and professional regardless of which shadcn preset is active, since `--foreground` and `--background` are always neutral in every preset
+- Buttons in the main app chrome (sidebar, preset bar, pane headers) may use `bg-primary` for accent emphasis
+- Secondary/cancel buttons: `variant="outline"` or `variant="ghost"`
+- Destructive buttons: `variant="destructive"`
+- Never hardcode hex colors on buttons — always use shadcn CSS variables via variants or semantic classes
+
 ### Motion
 
 ```

@@ -757,7 +757,7 @@ export function SettingsView() {
                       key={preset.id}
                       className={`flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150 ${
                         selectedPresetId === preset.id
-                          ? "border-primary/40 bg-primary/5"
+                          ? "border-foreground/40 bg-foreground/5"
                           : "border-border/50 bg-card/50 hover:bg-accent/30"
                       }`}
                       onClick={() => setSelectedPresetId(preset.id)}
