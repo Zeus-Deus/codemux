@@ -32,7 +32,7 @@ export function RightPanel({ workspace, activeTab }: Props) {
       >
         <div className="flex items-center h-[52px] shrink-0 border-b border-border/50">
           <TabsList variant="line" className="!h-full !p-0 gap-0 flex-1">
-            <TabsTrigger value="changes" className="px-3 !h-full !py-0 !m-0 text-sm !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-background data-[state=active]:!text-foreground data-[state=active]:!font-medium data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
+            <TabsTrigger value="changes" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
               Changes
               {workspace.git_changed_files > 0 && (
                 <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
@@ -40,10 +40,10 @@ export function RightPanel({ workspace, activeTab }: Props) {
                 </span>
               )}
             </TabsTrigger>
-            <TabsTrigger value="files" className="px-3 !h-full !py-0 !m-0 text-sm !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-background data-[state=active]:!text-foreground data-[state=active]:!font-medium data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
+            <TabsTrigger value="files" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
               Files
             </TabsTrigger>
-            <TabsTrigger value="pr" className="px-3 !h-full !py-0 !m-0 text-sm !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-background data-[state=active]:!text-foreground data-[state=active]:!font-medium data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
+            <TabsTrigger value="pr" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
               PR
               {workspace.pr_number && (
                 <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
