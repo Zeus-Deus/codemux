@@ -119,6 +119,7 @@ These are not required to build or run Codemux but enable additional features. A
 - **Stale CLI binary**: `npm run build:cli` copies the binary to `~/.local/bin/codemux`. This can shadow the dev build if you forget it's there. Remove it with `rm ~/.local/bin/codemux` when you don't need it.
 - **`.mcp.json` is auto-generated**: Codemux writes `.mcp.json` per-workspace at runtime with the current binary path. It's in `.gitignore` — never commit or manually edit it.
 - **Auth in dev mode**: If the auth API (`api.codemux.org`) is unreachable, the app auto-bypasses auth with a dev placeholder user. No account needed for local development. To point to a local auth API, set `CODEMUX_API_URL=http://localhost:3000`.
+- **Claude Code hooks in `~/.claude/settings.json`**: Codemux writes hook entries to this file on startup for agent status tracking. If Claude Code shows a settings error, check this file for entries under the `hooks` key pointing to `~/.codemux/hooks/notify.sh`. The hooks are harmless — they silently no-op when Codemux isn't running.
 
 ## Project Layout
 

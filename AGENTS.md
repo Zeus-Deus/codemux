@@ -69,6 +69,40 @@ Set automatically in all Codemux terminals:
 | `CODEMUX_BROWSER_CMD` | `codemux browser` | Browser command prefix |
 | `BROWSER` | `codemux browser open` | Standard URL handler override |
 
+## Agent Launch Integration
+
+### Claude Code Launch Command
+
+Codemux launches Claude Code with:
+
+```bash
+claude --dangerously-skip-permissions --system-prompt "$CODEMUX_AGENT_CONTEXT" "your task description"
+```
+
+- `--dangerously-skip-permissions` — Runs Claude Code in autonomous mode without interactive permission prompts
+- `--system-prompt "$CODEMUX_AGENT_CONTEXT"` — Injects context telling Claude Code to use Codemux's browser commands instead of system browsers
+- The final argument is the user's task description from workspace creation
+
+### CODEMUX_AGENT_CONTEXT
+
+This environment variable is set on all Codemux terminal sessions. It contains instructions for agents about using Codemux's built-in browser commands. The `--system-prompt` flag references it so Claude Code receives this context at launch.
+
+Users can edit agent presets in Settings > Presets, but should keep the `--system-prompt "$CODEMUX_AGENT_CONTEXT"` flag for best results.
+
+### Hook Integration
+
+Codemux registers hooks in `~/.claude/settings.json` on startup to track Claude Code's status in real-time. Three events are registered:
+
+- `UserPromptSubmit` — Agent started working
+- `Stop` — Agent finished
+- `PermissionRequest` — Agent needs input
+
+The hooks call `~/.codemux/hooks/notify.sh`, which sends an HTTP request to Codemux's local hook server. This powers the [agent status indicators](docs/website/agent-status.md) (amber/red/green dots in the sidebar and tab bar).
+
+**If you see Claude Code settings errors**, check `~/.claude/settings.json` for Codemux entries under the `hooks` key. Codemux only modifies the `hooks` section and preserves all other settings.
+
+The hooks are safe when Codemux isn't running — the notification script checks for required environment variables and silently exits if they're not set.
+
 ## Rules
 
 1. **Never** open system browsers — use `codemux browser`

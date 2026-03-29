@@ -40,6 +40,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Control and automation work: `docs/reference/CONTROL.md`
 - Docs cleanup and recovery work: `docs/reference/DOCS_REINDEX.md`
 - Agent behavior rules: `AGENTS.md`
+- Website docs: `docs/website/index.md` (workspaces, projects, terminal, agent status, settings, etc.)
 
 ## Update Rules
 

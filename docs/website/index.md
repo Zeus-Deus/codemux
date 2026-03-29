@@ -24,6 +24,7 @@ Codemux is a terminal-first agent development environment (ADE) built with Tauri
 ### Workspace & Layout
 
 - [Workspaces](workspaces.md) — Creating, managing, and organizing workspaces
+- [Projects](projects.md) — Open, create, and manage projects with onboarding wizard
 - [Terminal](terminal.md) — Terminal panes, tabs, splits, and configuration
 - [Browser](browser.md) — Embedded browser pane with agent automation
 - [Command Palette](command-palette.md) — Quick actions via `Ctrl+K`
@@ -37,8 +38,10 @@ Codemux is a terminal-first agent development environment (ADE) built with Tauri
 
 ### Features
 
+- [Agent Status Indicators](agent-status.md) — Real-time agent activity tracking
 - [Port Detection](ports.md) — Auto-detected listening ports
 - [Settings](settings.md) — Appearance, terminal, git, and AI tool configuration
+- [Setup Scripts](setup-scripts.md) — Automatic project setup and teardown
 - [OpenFlow](openflow.md) — Multi-agent orchestration
 
 ### Reference

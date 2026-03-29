@@ -41,6 +41,29 @@ The preset bar sits above the pane area and provides one-click agent launching:
 
 Custom presets support multiple commands, working directory overrides, and launch modes (new tab or split pane).
 
+## Agent Launch and Prompt Handoff
+
+When you create a workspace with a task description and an agent selected, Codemux automatically launches the agent and hands off your prompt:
+
+### How Prompts Are Delivered
+
+- **Claude Code and Codex** — The prompt is embedded directly in the CLI command as a quoted argument (e.g., `claude --dangerously-skip-permissions "fix the login bug"`)
+- **OpenCode and Gemini** — The prompt is injected via PTY input after a 2-second delay, since these agents use TUI interfaces that need time to initialize
+
+### Agent Context (`--system-prompt`)
+
+For Claude Code, Codemux appends `--system-prompt "$CODEMUX_AGENT_CONTEXT"` to the launch command. This environment variable contains instructions telling Claude Code to use Codemux's built-in browser commands instead of system browsers, and lists the available `codemux browser` subcommands.
+
+The `CODEMUX_AGENT_CONTEXT` env var is set on all terminal sessions, so the `$CODEMUX_AGENT_CONTEXT` reference in the flag expands at shell execution time.
+
+### Autonomous Mode
+
+The default Claude Code preset uses `--dangerously-skip-permissions` to run in autonomous mode. This skips Claude Code's interactive permission prompts, which is appropriate for agent work in Codemux where you monitor progress through the [agent status indicators](agent-status.md) instead.
+
+### Custom Agent Presets
+
+You can edit the built-in presets or create your own in Settings > Presets. When editing a Claude Code preset, keep the `--system-prompt "$CODEMUX_AGENT_CONTEXT"` flag for best results — this ensures the agent knows how to use Codemux's browser and tools.
+
 ## Smart Headers
 
 Terminal pane headers display contextual information:

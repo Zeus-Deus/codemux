@@ -1,11 +1,25 @@
 ---
 title: Settings
-description: Configure appearance, terminal, git, AI tools, and keyboard shortcuts.
+description: Configure appearance, terminal, git, AI tools, and keyboard shortcuts. Settings sync across devices.
 ---
 
 # Settings
 
 Open settings from the command palette (`Ctrl+K` > "Open Settings") or the sidebar gear icon.
+
+## Settings Sync
+
+Most personal settings sync across devices via your Codemux account. When you sign in, your settings are pulled from the server. Changes you make are saved both locally and to the cloud. If you're offline, changes are cached locally and synced when you reconnect.
+
+Machine-local settings (sidebar state, window layout, terminal presets, project scripts) stay on the current machine.
+
+## Account
+
+The Account section shows your profile information:
+
+- **Signed in via GitHub** — Shows your GitHub email and display name
+- **Email/password accounts** — Shows your email
+- **Sign out** — Clears your token and settings cache
 
 ## Appearance
 
@@ -66,7 +80,28 @@ Settings configured here are stored in the database. File-based config (`.codemu
 
 A read-only reference of all keyboard shortcuts grouped by category. See [Keyboard Shortcuts](keyboard-shortcuts.md) for the full list.
 
+## Agent
+
+- **AI commit messages** — Model override for the commit message generator
+- **Merge conflict resolver** — CLI tool selection (Claude Code, Codex, OpenCode), model override, strategy (smart merge, keep both, prefer my branch, prefer target)
+
 ## Notifications
 
 - **Sound** — Toggle notification sounds on/off
-- Desktop notifications use the system notification daemon (notify-rust)
+- **Desktop notifications** — Toggle desktop notifications on/off
+- Notifications use the system notification daemon (notify-rust)
+
+## All Settings Sections
+
+| Section | Category | Synced |
+|---------|----------|--------|
+| Account | Personal | No (auth state) |
+| Appearance | Personal | Partial |
+| Notifications | Personal | Yes |
+| Shortcuts | Personal | No (read-only reference) |
+| Editor | Editor & Workflow | Yes |
+| Terminal | Editor & Workflow | Yes |
+| Presets | Editor & Workflow | No (local) |
+| Projects | Editor & Workflow | No (local) |
+| Git | Editor & Workflow | Yes |
+| Agent | Editor & Workflow | No (local) |
