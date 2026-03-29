@@ -34,7 +34,6 @@ import {
   Loader2,
   Check,
   Trash2,
-  Folder,
   ChevronRight,
   File,
   Sparkles,
@@ -358,7 +357,6 @@ function FileRow({
   onRefresh,
   onOpenDiff,
   activeDiffFile,
-  indented,
 }: {
   file: GitFileStatus;
   staged: boolean;
@@ -368,7 +366,6 @@ function FileRow({
   onRefresh: () => void;
   onOpenDiff?: (filePath: string, staged: boolean) => void;
   activeDiffFile?: string | null;
-  indented?: boolean;
 }) {
   const [diff, setDiff] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -422,7 +419,7 @@ function FileRow({
           <div
             role="button"
             tabIndex={0}
-            className={`group flex w-full items-center gap-1 rounded-sm py-0.5 text-left hover:bg-accent/50 transition-colors cursor-default ${indented ? "pl-5 pr-1" : "px-1"} ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
+            className={`group flex w-full items-center gap-1.5 rounded-sm py-1 text-left hover:bg-accent/50 transition-colors cursor-default px-1.5 ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
             onClick={(e) => {
               if (e.altKey || !onOpenDiff) {
                 onToggleExpand();
@@ -438,11 +435,10 @@ function FileRow({
             }}
           >
             <span
-              className={`shrink-0 w-3.5 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
+              className={`shrink-0 w-3 text-center text-[10px] font-bold leading-none ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}
             >
               {STATUS_LABEL[file.status] ?? "?"}
             </span>
-            <File className="h-3 w-3 shrink-0 text-muted-foreground/50" />
             <span className="flex-1 truncate text-xs text-foreground">{name}</span>
             {(file.additions > 0 || file.deletions > 0) && (
               <span className="flex items-center gap-0.5 shrink-0 text-[10px] tabular-nums">
@@ -524,13 +520,12 @@ function ConflictFileRow({
         <div
           role="button"
           tabIndex={0}
-          className="group flex w-full items-center gap-1 rounded-sm py-0.5 px-1 text-left hover:bg-danger/10 transition-colors cursor-default"
+          className="group flex w-full items-center gap-1.5 rounded-sm py-1 px-1.5 text-left hover:bg-danger/10 transition-colors cursor-default"
           onClick={() => onOpenDiff?.(file.path, false)}
         >
-          <span className="shrink-0 w-3.5 text-center text-[10px] font-bold leading-none text-danger">
+          <span className="shrink-0 w-3 text-center text-[10px] font-bold leading-none text-danger">
             !
           </span>
-          <File className="h-3 w-3 shrink-0 text-danger/50" />
           <span className="flex-1 truncate text-xs text-foreground">{name}</span>
           {file.conflict_type && (
             <span className="shrink-0 text-[9px] text-danger/70 bg-danger/10 px-1 rounded">
@@ -776,8 +771,6 @@ function DirectoryGroup({
   onOpenDiff?: (filePath: string, staged: boolean) => void;
   activeDiffFile?: string | null;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
-
   // Root-level files (no directory) render without header
   if (dir === "") {
     return (
@@ -801,35 +794,27 @@ function DirectoryGroup({
 
   return (
     <div>
-      <Button
-        variant="ghost"
-        className="w-full justify-start gap-1 px-1 py-0.5 h-auto text-left hover:bg-accent/30 rounded-sm"
-        onClick={() => setCollapsed(!collapsed)}
-      >
-        <ChevronRight
-          className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${!collapsed ? "rotate-90" : ""}`}
-        />
-        <Folder className="h-3 w-3 shrink-0 text-muted-foreground/50" />
+      <div className="flex items-center gap-1 px-1.5 py-0.5">
         <span className="truncate text-[10px] text-muted-foreground">{dir}</span>
-      </Button>
-      {!collapsed && (
-        <div className="ml-1.5 border-l border-border pl-0.5">
-          {files.map((f) => (
-            <FileRow
-              key={f.path}
-              file={f}
-              staged={staged}
-              cwd={cwd}
-              expanded={expandedFile === f.path && expandedStaged === staged}
-              onToggleExpand={() => onToggleExpand(f.path, staged)}
-              onRefresh={onRefresh}
-              onOpenDiff={onOpenDiff}
-              activeDiffFile={activeDiffFile}
-              indented
-            />
-          ))}
-        </div>
-      )}
+        <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">
+          {files.length}
+        </span>
+      </div>
+      <div className="ml-1.5 border-l border-border pl-0.5">
+        {files.map((f) => (
+          <FileRow
+            key={f.path}
+            file={f}
+            staged={staged}
+            cwd={cwd}
+            expanded={expandedFile === f.path && expandedStaged === staged}
+            onToggleExpand={() => onToggleExpand(f.path, staged)}
+            onRefresh={onRefresh}
+            onOpenDiff={onOpenDiff}
+            activeDiffFile={activeDiffFile}
+          />
+        ))}
+      </div>
     </div>
   );
 }
