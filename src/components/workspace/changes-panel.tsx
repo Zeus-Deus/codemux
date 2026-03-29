@@ -309,7 +309,7 @@ function CommitRow({
               key={f.path}
               className="flex items-center gap-1 px-1 py-0.5 text-xs"
             >
-              <span className={`shrink-0 flex items-center ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
+              <span className={`shrink-0 w-4 flex items-center justify-center ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
                 <StatusIcon status={f.status} />
               </span>
               <span className="truncate text-xs text-foreground">{fileName(f.path)}</span>
@@ -444,7 +444,7 @@ function FileRow({
             }}
           >
             <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-              <span className={`shrink-0 flex items-center ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}>
+              <span className={`shrink-0 w-4 flex items-center justify-center ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}>
                 <StatusIcon status={file.status} />
               </span>
               <span className="flex-1 min-w-0 flex items-center gap-1">
@@ -535,7 +535,7 @@ function ConflictFileRow({
           onClick={() => onOpenDiff?.(file.path, false)}
         >
           <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-            <span className="shrink-0 flex items-center text-red-400">
+            <span className="shrink-0 w-4 flex items-center justify-center text-red-400">
               <StatusIcon status="conflicted" />
             </span>
             <span className="flex-1 min-w-0 flex items-center gap-1">
@@ -815,7 +815,7 @@ function DirectoryGroup({
           {files.length}
         </span>
       </div>
-      <div className="ml-1.5 border-l border-border pl-0.5">
+      <div>
         {files.map((f) => (
           <FileRow
             key={f.path}
