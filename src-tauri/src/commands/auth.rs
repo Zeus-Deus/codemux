@@ -156,21 +156,21 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, String> {
-    eprintln!("[AUTH-DEBUG] check_auth() ENTER");
+    eprintln!("[auth] check_auth called");
 
     let (token, expires_at) = match load_token() {
         Some(t) => {
-            eprintln!("[AUTH-DEBUG] check_auth() | load_token returned Some, expires_at={}", t.1);
+            eprintln!("[auth] token loaded: true, expires_at={}", t.1);
             t
         }
         None => {
-            eprintln!("[AUTH-DEBUG] check_auth() | load_token returned None -> returning None");
+            eprintln!("[auth] NO TOKEN - returning None");
             return Ok(None);
         }
     };
 
     if is_token_expired(&expires_at) {
-        eprintln!("[AUTH-DEBUG] check_auth() | token EXPIRED -> clear_token + return None");
+        eprintln!("[auth] TOKEN EXPIRED - returning None");
         clear_token();
         let payload = AuthStatePayload {
             authenticated: false,
@@ -182,7 +182,7 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 
     let base = api_base_url();
     let url = format!("{base}/api/auth/desktop/verify");
-    eprintln!("[AUTH-DEBUG] check_auth() | calling verify API at {}", url);
+    eprintln!("[auth] calling verify API at {url}");
 
     let client = reqwest::Client::new();
     let resp = client
@@ -193,7 +193,7 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 
     match resp {
         Ok(r) if r.status().is_success() => {
-            eprintln!("[AUTH-DEBUG] check_auth() | verify API returned 200 OK");
+            eprintln!("[auth] API returned 200");
             let verify: VerifyResp = r.json().await.map_err(|e| e.to_string())?;
             let user = AuthUser {
                 id: verify.user.id,
@@ -219,11 +219,11 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
                 }
             });
 
-            eprintln!("[AUTH-DEBUG] check_auth() | returning Some(user), id={}", user.id);
+            eprintln!("[auth] returning: Some(user)");
             Ok(Some(user))
         }
         Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED => {
-            eprintln!("[AUTH-DEBUG] check_auth() | verify API returned 401 UNAUTHORIZED -> clear_token + return None");
+            eprintln!("[auth] API returned 401 - clearing token");
             clear_token();
             let payload = AuthStatePayload {
                 authenticated: false,
@@ -234,11 +234,11 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
         }
         Ok(r) => {
             let status = r.status();
-            eprintln!("[AUTH-DEBUG] check_auth() | verify API returned unexpected status={} -> using cached user", status);
+            eprintln!("[auth] API returned unexpected status: {status} - using cached user");
             Ok(load_cached_user())
         }
         Err(e) => {
-            eprintln!("[AUTH-DEBUG] check_auth() | verify API NETWORK ERROR: {} -> using cached user", e);
+            eprintln!("[auth] NETWORK ERROR: {e:?} - using cached user");
             Ok(load_cached_user())
         }
     }
@@ -246,7 +246,6 @@ pub async fn check_auth(app: tauri::AppHandle) -> Result<Option<AuthUser>, Strin
 
 #[tauri::command]
 pub fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
-    eprintln!("[AUTH-DEBUG] sign_out() called");
     clear_token();
     crate::settings_sync::clear_cache();
 
@@ -263,22 +262,16 @@ pub fn sign_out(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_auth_token() -> Result<Option<String>, String> {
-    eprintln!("[AUTH-DEBUG] get_auth_token() ENTER");
     match load_token() {
         Some((token, expires_at)) => {
             if is_token_expired(&expires_at) {
-                eprintln!("[AUTH-DEBUG] get_auth_token() | token expired -> clear_token");
                 clear_token();
                 Ok(None)
             } else {
-                eprintln!("[AUTH-DEBUG] get_auth_token() | token valid, returning Some");
                 Ok(Some(token))
             }
         }
-        None => {
-            eprintln!("[AUTH-DEBUG] get_auth_token() | no token found");
-            Ok(None)
-        }
+        None => Ok(None),
     }
 }
 

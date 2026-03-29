@@ -19,13 +19,10 @@ export function useAuthEvents() {
   // Handle auth-state-changed events from the Rust backend
   const handleAuthEvent = useCallback(
     (payload: AuthStatePayload) => {
-      console.log("[AUTH-DEBUG] auth-state-changed EVENT received:", payload);
       if (payload.authenticated && payload.user) {
-        console.log("[AUTH-DEBUG] event -> setUser(authenticated), user.id=", payload.user.id);
         setUser(payload.user);
         useSyncedSettingsStore.getState().loadSettings();
       } else {
-        console.log("[AUTH-DEBUG] event -> setUser(null) [unauthenticated]");
         setUser(null);
         useSyncedSettingsStore.setState({ settings: DEFAULT_SETTINGS, isLoading: true });
       }
@@ -53,19 +50,12 @@ export function useAuthEvents() {
 
     const handleVisibility = () => {
       if (document.visibilityState !== "visible") return;
-      if (!useAuthStore.getState().isAuthenticated) {
-        console.log("[AUTH-DEBUG] visibility change but not authenticated, skipping re-check");
-        return;
-      }
+      if (!useAuthStore.getState().isAuthenticated) return;
 
       const now = Date.now();
-      if (now - lastCheckRef.current < RECHECK_INTERVAL) {
-        console.log("[AUTH-DEBUG] visibility change but within 5min debounce, skipping");
-        return;
-      }
+      if (now - lastCheckRef.current < RECHECK_INTERVAL) return;
       lastCheckRef.current = now;
 
-      console.log("[AUTH-DEBUG] visibility change -> re-checking auth");
       checkAuth();
     };
 

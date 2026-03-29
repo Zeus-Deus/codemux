@@ -45,34 +45,37 @@ export const useAuthStore = create<AuthStore>((set) => ({
   devBypass: false,
 
   checkAuth: async () => {
-    console.log("[AUTH-DEBUG] checkAuth() ENTER, current state:", {
-      isAuthenticated: useAuthStore.getState().isAuthenticated,
-      isLoading: useAuthStore.getState().isLoading,
-      hasUser: !!useAuthStore.getState().user,
-    });
+    console.log("[auth] checkAuth called");
     set({ isLoading: true, error: null });
-    try {
-      console.log("[AUTH-DEBUG] checkAuth() calling Tauri check_auth command...");
-      const user = await checkAuthCmd();
-      console.log("[AUTH-DEBUG] checkAuth() Tauri returned:", user);
-      if (user) {
-        console.log("[AUTH-DEBUG] checkAuth() -> authenticated=true, user.id=", user.id);
-        set({ user, isAuthenticated: true, isLoading: false });
-      } else {
-        console.log("[AUTH-DEBUG] checkAuth() -> authenticated=false (user was null)");
-        set({ user: null, isAuthenticated: false, isLoading: false });
+
+    const maxRetries = 3;
+    const retryDelay = 500;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const user = await checkAuthCmd();
+        console.log("[auth] checkAuth result:", user ? "authenticated" : "not authenticated");
+        if (user) {
+          set({ user, isAuthenticated: true, isLoading: false });
+        } else {
+          set({ user: null, isAuthenticated: false, isLoading: false });
+        }
+        return;
+      } catch (err) {
+        console.error(`[auth] checkAuth attempt ${attempt}/${maxRetries} failed:`, err);
+        if (attempt < maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelay));
+        }
       }
-    } catch (err) {
-      console.warn("[AUTH-DEBUG] checkAuth() THREW error:", err);
-      console.warn("[AUTH-DEBUG] checkAuth() -> enabling dev bypass");
-      // In dev mode or if API unreachable, allow bypass
-      set({
-        user: DEV_USER,
-        isAuthenticated: true,
-        isLoading: false,
-        devBypass: true,
-      });
     }
+
+    console.error("[auth] checkAuth all retries failed, enabling dev bypass");
+    set({
+      user: DEV_USER,
+      isAuthenticated: true,
+      isLoading: false,
+      devBypass: true,
+    });
   },
 
   startOAuthFlow: async () => {
@@ -120,7 +123,6 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   signOut: async () => {
-    console.log("[AUTH-DEBUG] signOut() called", new Error().stack);
     try {
       await signOutCmd();
     } catch {
@@ -135,7 +137,6 @@ export const useAuthStore = create<AuthStore>((set) => ({
   },
 
   setUser: (user) => {
-    console.log("[AUTH-DEBUG] setUser() called with:", user?.id ?? "null", new Error().stack);
     if (user) {
       set({ user, isAuthenticated: true, isSigningIn: false });
     } else {
