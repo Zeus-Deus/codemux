@@ -316,31 +316,12 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         }
         "browser_automation" => {
             let state: State<'_, AppStateStore> = app.state();
-
-            // Auto-create a browser pane if no browser sessions exist
-            if state.snapshot().browser_sessions.is_empty() {
-                let active_pane_id = {
-                    let snap = state.snapshot();
-                    snap.workspaces.iter()
-                        .find(|w| w.workspace_id == snap.active_workspace_id)
-                        .and_then(|w| w.surfaces.iter()
-                            .find(|s| s.surface_id == w.active_surface_id))
-                        .map(|s| s.active_pane_id.0.clone())
-                };
-                if let Some(pane_id) = active_pane_id {
-                    let url = request.params.get("action")
-                        .and_then(|a| a.get("url"))
-                        .and_then(Value::as_str)
-                        .map(String::from);
-                    let _ = crate::commands::browser::create_browser_pane_impl(
-                        app.clone(), &state, pane_id, url,
-                    );
-                }
-            }
-
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
-            let requested_id = request.params.get("browser_id").and_then(Value::as_str).unwrap_or("default");
-            let browser_id = resolve_browser_id(&app, requested_id);
+            let workspace_id = request.params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
 
             let action_kind = request.params.get("action")
                 .and_then(|v| v.get("kind"))
@@ -350,27 +331,149 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
 
-            match action_kind.as_str() {
+            eprintln!("[browser-auto] === browser_automation called === workspace_id={:?} action={:?}", workspace_id, action_kind);
+
+            // Resolve the CLI session name to use for agent-browser commands.
+            let cli_session_name = if !workspace_id.is_empty() {
+                // Workspace-scoped path: find or create agent session for this workspace.
+                let agent_session = state.resolve_agent_browser_session(
+                    &workspace_id,
+                    agent_browser.stream_port,
+                );
+
+                eprintln!(
+                    "[browser-auto] session state: pane_id={:?} user_dismissed={} is_active={} cli_session={}",
+                    agent_session.pane_id, agent_session.user_dismissed, agent_session.is_active, agent_session.cli_session_name
+                );
+
+                // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
+                let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;
+                eprintln!(
+                    "[browser-auto] should auto-create? {} (pane_id.is_none()={} !user_dismissed={})",
+                    should_create, agent_session.pane_id.is_none(), !agent_session.user_dismissed
+                );
+
+                if should_create {
+                    let target_pane_id = {
+                        let snap = state.snapshot();
+                        let ws = snap.workspaces.iter()
+                            .find(|w| w.workspace_id.0 == workspace_id);
+                        if ws.is_none() {
+                            eprintln!(
+                                "[browser-auto] SKIP: workspace {} not found (available: {:?})",
+                                workspace_id,
+                                snap.workspaces.iter().map(|w| &w.workspace_id.0).collect::<Vec<_>>()
+                            );
+                        }
+                        let surface = ws.and_then(|w| {
+                            eprintln!(
+                                "[browser-auto] workspace found, active_surface_id={:?} surfaces={:?}",
+                                w.active_surface_id.0,
+                                w.surfaces.iter().map(|s| &s.surface_id.0).collect::<Vec<_>>()
+                            );
+                            w.surfaces.iter().find(|s| s.surface_id == w.active_surface_id)
+                        });
+                        if surface.is_none() && ws.is_some() {
+                            eprintln!("[browser-auto] SKIP: active surface not found in workspace");
+                        }
+                        surface.map(|s| {
+                            eprintln!("[browser-auto] target split pane: {}", s.active_pane_id.0);
+                            s.active_pane_id.0.clone()
+                        })
+                    };
+                    if let Some(pane_id) = target_pane_id {
+                        // Save the user's current workspace so we can restore it after
+                        // create_browser_pane (which sets active_workspace_id).
+                        let user_workspace = state.snapshot().active_workspace_id.clone();
+
+                        let url = params.get("url")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        eprintln!("[browser-auto] CREATING browser pane: split_from={} url={:?}", pane_id, url);
+                        match state.create_browser_pane(&pane_id, url.as_deref()) {
+                            Ok((new_pane_id, new_browser_id)) => {
+                                eprintln!("[browser-auto] pane created: pane_id={} browser_id={}", new_pane_id.0, new_browser_id.0);
+                                // Mark the browser session as agent-backed BEFORE
+                                // emitting state so the pane starts its screencast
+                                // daemon with the agent's session name.
+                                state.set_browser_agent_session_name(
+                                    &new_browser_id,
+                                    agent_session.cli_session_name.clone(),
+                                );
+                                let _ = state.attach_agent_browser_to_pane(
+                                    &workspace_id,
+                                    &new_pane_id,
+                                    &new_browser_id,
+                                );
+                                // Restore the user's workspace — don't steal focus.
+                                state.activate_workspace(&user_workspace.0);
+                                crate::state::emit_app_state(&app);
+                            }
+                            Err(e) => {
+                                eprintln!("[browser-auto] PANE CREATION FAILED: {:?}", e);
+                            }
+                        }
+                    } else {
+                        eprintln!("[browser-auto] SKIP: no target pane resolved for split");
+                    }
+                }
+
+                // Track URL on the agent session for reconnection.
+                if action_kind == "open" {
+                    if let Some(url) = params.get("url").and_then(Value::as_str) {
+                        let _ = state.update_agent_browser_url(&workspace_id, url.to_string());
+                    }
+                }
+
+                agent_session.cli_session_name
+            } else {
+                eprintln!("[browser-auto] SKIP workspace path: empty workspace_id, using legacy global");
+                // Legacy global path: no workspace context (backward compat).
+                if state.snapshot().browser_sessions.is_empty() {
+                    let active_pane_id = {
+                        let snap = state.snapshot();
+                        snap.workspaces.iter()
+                            .find(|w| w.workspace_id == snap.active_workspace_id)
+                            .and_then(|w| w.surfaces.iter()
+                                .find(|s| s.surface_id == w.active_surface_id))
+                            .map(|s| s.active_pane_id.0.clone())
+                    };
+                    if let Some(pane_id) = active_pane_id {
+                        let url = params.get("url")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                        let _ = crate::commands::browser::create_browser_pane_impl(
+                            app.clone(), &state, pane_id, url,
+                        );
+                    }
+                }
+                resolve_browser_id(&app, "default")
+            };
+
+            eprintln!("[browser-auto] dispatching action={} via cli_session={}", action_kind, cli_session_name);
+            let result = match action_kind.as_str() {
                 // Tier 2: coordinate-based CDP tools via stream WebSocket
                 "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
                     let stream_port = agent_browser.stream_port;
-                    crate::stream_input::handle_vision_action(stream_port, &action_kind, params)
+                    crate::stream_input::handle_vision_action(stream_port, &action_kind, params, &cli_session_name)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
                 // Tier 3: OS-level kernel input via ydotool
                 "click_os" | "type_os" => {
-                    crate::os_input::handle_os_action(&action_kind, params)
+                    crate::os_input::handle_os_action(&action_kind, params, &cli_session_name)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
                 // Tier 1: existing agent-browser CLI path
                 _ => {
-                    agent_browser.run_command(&browser_id, &action_kind, params)
+                    agent_browser.run_command(&cli_session_name, &action_kind, params)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
-            }
+            };
+            eprintln!("[browser-auto] command completed ok={}", result.is_ok());
+            result
         }
         "get_project_memory" => memory::get_project_memory(
             request.params

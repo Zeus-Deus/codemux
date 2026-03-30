@@ -9,9 +9,29 @@ pub(crate) fn create_browser_pane_impl(
     pane_id: String,
     url: Option<String>,
 ) -> Result<String, String> {
-    let (pane_id, _browser_id) = state.create_browser_pane(&pane_id, url.as_deref())?;
+    // Check if this workspace has a detached agent browser session to reconnect to.
+    let workspace_id = state.workspace_id_for_pane(&pane_id);
+    let agent_session = workspace_id
+        .as_ref()
+        .and_then(|wid| state.find_detached_agent_browser(wid));
+
+    // Use the agent session's URL if reconnecting and no explicit URL was given.
+    let effective_url = if url.is_some() {
+        url
+    } else {
+        agent_session.as_ref().and_then(|s| s.current_url.clone())
+    };
+
+    let (new_pane_id, browser_id) = state.create_browser_pane(&pane_id, effective_url.as_deref())?;
+
+    // Attach the agent session to the new pane for reconnection.
+    if let (Some(wid), Some(_)) = (&workspace_id, &agent_session) {
+        let _ = state.attach_agent_browser_to_pane(wid, &new_pane_id, &browser_id);
+        eprintln!("[BROWSER] Reconnected agent browser session to new pane in workspace {wid}");
+    }
+
     crate::state::emit_app_state(&app);
-    Ok(pane_id.0)
+    Ok(new_pane_id.0)
 }
 
 pub(crate) fn browser_open_url_impl(
@@ -192,7 +212,13 @@ pub async fn start_browser_stream(
     manager: State<'_, AgentBrowserManager>,
     browser_id: String,
 ) -> Result<String, String> {
-    manager.start_stream(&browser_id).await
+    eprintln!("[stream] start_browser_stream command called with browser_id={:?}", browser_id);
+    let result = manager.start_stream(&browser_id).await;
+    match &result {
+        Ok(url) => eprintln!("[stream] returning stream_url={}", url),
+        Err(e) => eprintln!("[stream] start_stream FAILED: {}", e),
+    }
+    result
 }
 
 #[tauri::command]

@@ -22,8 +22,6 @@ pub fn start_hook_server(app: AppHandle) -> u16 {
     let port = listener.local_addr().unwrap().port();
     HOOK_PORT.set(port).ok();
 
-    eprintln!("[codemux::hooks] Hook server listening on 127.0.0.1:{port}");
-
     std::thread::spawn(move || {
         // Accept connections until the app exits
         for stream in listener.incoming() {
@@ -122,7 +120,7 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
 
     let is_active_status =
         matches!(resolved_status, PaneStatus::Working | PaneStatus::Permission);
-    state.set_pane_status_by_session(session_id, resolved_status);
+    state.set_pane_status_by_session(session_id, resolved_status.clone());
     state::emit_app_state(app);
 
     // When status becomes Working/Permission, start monitoring for agent exit.
@@ -256,10 +254,6 @@ fn start_agent_exit_monitor(app: AppHandle, session_id: String, shell_pid: u32) 
             if shell_is_foreground(shell_pid) {
                 state.clear_transient_pane_status_by_session(&session_id);
                 state::emit_app_state(&app);
-                eprintln!(
-                    "[codemux::hooks] Agent exit detected for session {} — cleared stuck status",
-                    session_id
-                );
                 break;
             }
         }
@@ -405,9 +399,7 @@ pub fn register_claude_code_hooks() {
     // Write back
     match serde_json::to_string_pretty(&settings) {
         Ok(json) => {
-            if std::fs::write(&settings_path, json).is_ok() {
-                eprintln!("[codemux::hooks] Registered Claude Code hooks in {}", settings_path.display());
-            }
+            let _ = std::fs::write(&settings_path, json);
         }
         Err(e) => eprintln!("[codemux::hooks] Failed to serialize settings: {e}"),
     }
@@ -458,12 +450,7 @@ pub fn unregister_claude_code_hooks() {
 
     match serde_json::to_string_pretty(&settings) {
         Ok(json) => {
-            if std::fs::write(&settings_path, json).is_ok() {
-                eprintln!(
-                    "[codemux::hooks] Unregistered Claude Code hooks from {}",
-                    settings_path.display()
-                );
-            }
+            let _ = std::fs::write(&settings_path, json);
         }
         Err(e) => eprintln!("[codemux::hooks] Failed to serialize settings: {e}"),
     }

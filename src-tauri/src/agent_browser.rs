@@ -76,6 +76,9 @@ pub struct BrowserAutomationResult {
     pub message: Option<String>,
 }
 
+/// Default stream port for the browser screencast WebSocket.
+pub const DEFAULT_STREAM_PORT: u16 = 9223;
+
 pub struct AgentBrowserManager {
     pub running: Arc<Mutex<bool>>,
     pub stream_port: u16,
@@ -309,7 +312,7 @@ impl AgentBrowserManager {
     pub fn new() -> Self {
         Self {
             running: Arc::new(Mutex::new(false)),
-            stream_port: 9223,
+            stream_port: DEFAULT_STREAM_PORT,
         }
     }
 
@@ -399,9 +402,28 @@ impl AgentBrowserManager {
         let port = self.stream_port;
         let session = session_name(browser_id);
 
+        eprintln!("[stream] start_stream called browser_id={:?} session={} port={}", browser_id, session, port);
+
         let mut running = self.running.lock().await;
         if *running {
+            eprintln!("[stream] already running — returning ws://localhost:{}", port);
             return Ok(format!("ws://localhost:{}", port));
+        }
+
+        // Check if a daemon is already listening on the stream port (e.g., started
+        // by a preceding agent-browser CLI command). If so, adopt it instead of
+        // killing and restarting — that would destroy the agent's active session.
+        if let Ok(output) = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser {}/tcp 2>/dev/null", port)])
+            .output()
+        {
+            let has_listener = output.status.success() && !output.stdout.is_empty();
+            eprintln!("[stream] port probe: has_listener={} stdout={:?}", has_listener, String::from_utf8_lossy(&output.stdout).trim());
+            if has_listener {
+                eprintln!("[stream] adopting existing daemon on port {}", port);
+                *running = true;
+                return Ok(format!("ws://localhost:{}", port));
+            }
         }
 
         // Kill any stale daemon on this port to avoid EADDRINUSE

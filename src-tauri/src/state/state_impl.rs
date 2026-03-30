@@ -192,6 +192,31 @@ pub struct BrowserSessionSnapshot {
     pub history_index: usize,
     pub is_loading: bool,
     pub last_error: Option<String>,
+    /// When set, this pane is backed by an agent browser session. The pane
+    /// must start its screencast daemon with this session name so it connects
+    /// to the same Chromium instance the agent's MCP commands use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentBrowserSession {
+    pub session_id: String,
+    pub workspace_id: WorkspaceId,
+    /// Stable CLI --session name derived from workspace_id.
+    pub cli_session_name: String,
+    /// WebSocket stream URL (ws://localhost:9223 in this phase).
+    pub stream_url: String,
+    pub current_url: Option<String>,
+    pub is_active: bool,
+    /// Attached pane (None when detached after pane close).
+    pub pane_id: Option<PaneId>,
+    /// BrowserSessionSnapshot link (None when detached).
+    pub browser_id: Option<BrowserId>,
+    /// Set when user explicitly closes the agent's browser pane.
+    /// Prevents auto-recreation until user manually reopens.
+    #[serde(default)]
+    pub user_dismissed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +366,8 @@ pub struct AppStateSnapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub terminal_sessions: Vec<TerminalSessionSnapshot>,
     pub browser_sessions: Vec<BrowserSessionSnapshot>,
+    #[serde(default)]
+    pub agent_browser_sessions: Vec<AgentBrowserSession>,
     pub notifications: Vec<NotificationSnapshot>,
     #[serde(default)]
     pub detected_ports: Vec<PortInfoSnapshot>,
@@ -727,6 +754,7 @@ impl AppStateStore {
                 history_index: 0,
                 is_loading: false,
                 last_error: None,
+                agent_session_name: None,
             });
             browser = Some(browser_id);
         }
@@ -797,6 +825,7 @@ impl AppStateStore {
             history_index: 0,
             is_loading: false,
             last_error: None,
+            agent_session_name: None,
         });
 
         let workspace = snapshot
@@ -990,6 +1019,9 @@ impl AppStateStore {
                     .iter()
                     .any(|id| id == &session.session_id.0)
             });
+            snapshot
+                .agent_browser_sessions
+                .retain(|s| s.workspace_id.0 != workspace_id);
             snapshot.active_workspace_id = WorkspaceId("".into());
             return Ok(WorkspaceId("".into()));
         }
@@ -1010,6 +1042,9 @@ impl AppStateStore {
                 .iter()
                 .any(|id| id == &session.session_id.0)
         });
+        snapshot
+            .agent_browser_sessions
+            .retain(|s| s.workspace_id.0 != workspace_id);
         let fallback_workspace = snapshot
             .workspaces
             .first()
@@ -1455,6 +1490,118 @@ impl AppStateStore {
             .map(|browser_id| browser_id.0)
     }
 
+    // ── Agent Browser Session Methods ──
+
+    /// Find or create an agent browser session for a workspace.
+    pub fn resolve_agent_browser_session(
+        &self,
+        workspace_id: &str,
+        stream_port: u16,
+    ) -> AgentBrowserSession {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        {
+            return session.clone();
+        }
+        let session = AgentBrowserSession {
+            session_id: next_id("agent-browser"),
+            workspace_id: WorkspaceId(workspace_id.to_string()),
+            cli_session_name: format!("ws-{workspace_id}"),
+            stream_url: format!("ws://localhost:{stream_port}"),
+            current_url: None,
+            is_active: false,
+            pane_id: None,
+            browser_id: None,
+            user_dismissed: false,
+        };
+        snapshot.agent_browser_sessions.push(session.clone());
+        session
+    }
+
+    /// Link an agent browser session to a pane.
+    pub fn attach_agent_browser_to_pane(
+        &self,
+        workspace_id: &str,
+        pane_id: &PaneId,
+        browser_id: &BrowserId,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No agent browser session for workspace {workspace_id}"))?;
+        session.pane_id = Some(pane_id.clone());
+        session.browser_id = Some(browser_id.clone());
+        session.is_active = true;
+        session.user_dismissed = false;
+        Ok(())
+    }
+
+    /// Unlink a pane from its agent browser session but keep the session alive.
+    /// Sets user_dismissed so auto-creation won't immediately reopen the pane.
+    pub fn detach_agent_browser_from_pane(
+        &self,
+        browser_id: &str,
+    ) -> Option<AgentBrowserSession> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.browser_id.as_ref().map(|b| b.0.as_str()) == Some(browser_id))?;
+        session.pane_id = None;
+        session.browser_id = None;
+        session.user_dismissed = true;
+        Some(session.clone())
+    }
+
+    /// Check if a browser_id belongs to an agent browser session.
+    pub fn is_agent_browser_session(&self, browser_id: &str) -> bool {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .agent_browser_sessions
+            .iter()
+            .any(|s| s.browser_id.as_ref().map(|b| b.0.as_str()) == Some(browser_id))
+    }
+
+    /// Find an active but pane-less agent browser session for a workspace.
+    pub fn find_detached_agent_browser(
+        &self,
+        workspace_id: &str,
+    ) -> Option<AgentBrowserSession> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .agent_browser_sessions
+            .iter()
+            .find(|s| s.workspace_id.0 == workspace_id && s.is_active && s.pane_id.is_none())
+            .cloned()
+    }
+
+    /// Update the current URL on the agent browser session for a workspace.
+    pub fn update_agent_browser_url(
+        &self,
+        workspace_id: &str,
+        url: String,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No agent browser session for workspace {workspace_id}"))?;
+        session.current_url = Some(url);
+        Ok(())
+    }
+
+    /// Find the workspace that contains a given pane.
+    pub fn workspace_id_for_pane(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        find_workspace_id_for_pane(&snapshot.workspaces, pane_id).map(|wid| wid.0)
+    }
+
     pub fn swap_panes(&self, source_pane_id: &str, target_pane_id: &str) -> Result<(), String> {
         if source_pane_id == target_pane_id {
             return Ok(());
@@ -1531,6 +1678,19 @@ impl AppStateStore {
         browser.is_loading = true;
         browser.last_error = None;
         Ok(())
+    }
+
+    /// Mark a browser session as agent-backed so the pane connects to the
+    /// agent's existing stream instead of starting its own daemon.
+    pub fn set_browser_agent_session_name(&self, browser_id: &BrowserId, session_name: String) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(browser) = snapshot
+            .browser_sessions
+            .iter_mut()
+            .find(|b| b.browser_id == *browser_id)
+        {
+            browser.agent_session_name = Some(session_name);
+        }
     }
 
     pub fn browser_history_step(&self, browser_id: &str, step: isize) -> Result<(), String> {
@@ -1841,6 +2001,7 @@ impl AppStateStore {
                     history_index: 0,
                     is_loading: false,
                     last_error: None,
+                    agent_session_name: None,
                 });
 
                 let workspace = snapshot
@@ -2094,6 +2255,94 @@ pub fn load_persisted_state() -> Option<AppStateSnapshot> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Remove all browser panes and browser sessions from a snapshot.
+/// Browser panes are live streaming connections — there is nothing to restore
+/// after restart. Stale browser panes cause white-screen bugs because they
+/// start a daemon with the wrong session name.
+pub fn strip_browser_panes_from_snapshot(mut snapshot: AppStateSnapshot) -> AppStateSnapshot {
+    snapshot.browser_sessions.clear();
+
+    for workspace in &mut snapshot.workspaces {
+        // Remove browser pane nodes from all surface trees.
+        for surface in &mut workspace.surfaces {
+            if let Some(cleaned) = remove_browser_nodes(&surface.root) {
+                surface.root = cleaned;
+            }
+            // else: entire tree was browser-only — leave it as-is;
+            // workspace startup will recreate the surface layout.
+
+            // If active pane was a browser, reset to first remaining pane.
+            if !pane_exists_in_node(&surface.root, &surface.active_pane_id.0) {
+                surface.active_pane_id = pane_id_from_node(&surface.root);
+            }
+        }
+
+        // Remove browser tabs and their orphaned surfaces.
+        let browser_surface_ids: std::collections::HashSet<String> = workspace
+            .tabs
+            .iter()
+            .filter(|t| t.kind == TabKind::Browser)
+            .filter_map(|t| t.surface_id.as_ref().map(|s| s.0.clone()))
+            .collect();
+        workspace.tabs.retain(|t| t.kind != TabKind::Browser);
+        workspace
+            .surfaces
+            .retain(|s| !browser_surface_ids.contains(&s.surface_id.0));
+
+        // If active tab was removed, fall back to the first remaining tab.
+        if !workspace.tabs.iter().any(|t| t.tab_id == workspace.active_tab_id) {
+            if let Some(first) = workspace.tabs.first() {
+                workspace.active_tab_id = first.tab_id.clone();
+                if let Some(sid) = &first.surface_id {
+                    workspace.active_surface_id = sid.clone();
+                }
+            }
+        }
+    }
+
+    snapshot
+}
+
+/// Recursively remove Browser leaf nodes from a pane tree, collapsing splits.
+/// Returns None when the entire subtree consisted only of browser panes.
+fn remove_browser_nodes(node: &PaneNodeSnapshot) -> Option<PaneNodeSnapshot> {
+    match node {
+        PaneNodeSnapshot::Browser { .. } => None,
+        PaneNodeSnapshot::Terminal { .. } => Some(node.clone()),
+        PaneNodeSnapshot::Split {
+            pane_id,
+            direction,
+            child_sizes,
+            children,
+        } => {
+            let remaining: Vec<_> = children
+                .iter()
+                .filter_map(remove_browser_nodes)
+                .collect();
+            match remaining.len() {
+                0 => None,
+                1 => remaining.into_iter().next(),
+                _ => Some(PaneNodeSnapshot::Split {
+                    pane_id: pane_id.clone(),
+                    direction: direction.clone(),
+                    child_sizes: rebalance_sizes(child_sizes, remaining.len()),
+                    children: remaining,
+                }),
+            }
+        }
+    }
+}
+
+fn pane_exists_in_node(node: &PaneNodeSnapshot, pane_id: &str) -> bool {
+    match node {
+        PaneNodeSnapshot::Terminal { pane_id: pid, .. }
+        | PaneNodeSnapshot::Browser { pane_id: pid, .. } => pid.0 == pane_id,
+        PaneNodeSnapshot::Split { children, .. } => {
+            children.iter().any(|c| pane_exists_in_node(c, pane_id))
+        }
+    }
+}
+
 /// Remove OpenFlow workspaces and their terminal sessions from a snapshot.
 /// Used on startup so persisted agent sessions from crashed runs are not respawned.
 pub fn strip_openflow_from_snapshot(mut snapshot: AppStateSnapshot) -> AppStateSnapshot {
@@ -2167,6 +2416,12 @@ pub fn restore_session_ids(snapshot: &AppStateSnapshot) {
                 .iter()
                 .map(|session| extract_numeric_suffix(&session.browser_id.0)),
         )
+        .chain(
+            snapshot
+                .agent_browser_sessions
+                .iter()
+                .map(|session| extract_numeric_suffix(&session.session_id.as_str())),
+        )
         .flatten()
         .max()
         .unwrap_or(0);
@@ -2236,6 +2491,7 @@ fn default_app_state() -> AppStateSnapshot {
             exit_code: None,
         }],
         browser_sessions: vec![],
+        agent_browser_sessions: vec![],
         notifications: vec![],
         detected_ports: vec![],
         pane_statuses: HashMap::new(),
@@ -2468,8 +2724,16 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
 
     // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
     let mut snapshot = strip_openflow_from_snapshot(snapshot.clone());
+    // Browser panes are live streaming connections — stale panes start a
+    // daemon with the wrong session name, causing white-screen bugs.
+    snapshot = strip_browser_panes_from_snapshot(snapshot);
     // Detected ports are runtime-only state — never persist them.
     snapshot.detected_ports.clear();
+    // Pane statuses are runtime-only — agents are dead after restart.
+    snapshot.pane_statuses.clear();
+    // Agent browser sessions are runtime-only — pane_id/browser_id/user_dismissed
+    // become stale after restart and block auto-creation.
+    snapshot.agent_browser_sessions.clear();
 
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
@@ -3446,5 +3710,182 @@ mod tests {
         // Config should be preserved
         assert!(after.config.linux_first);
         assert_eq!(after.config.theme_source, "omarchy_or_default");
+    }
+
+    // ── Agent Browser Session Tests ──
+
+    #[test]
+    fn agent_browser_session_created_for_workspace() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        assert_eq!(session.workspace_id, ws_id);
+        assert_eq!(session.cli_session_name, format!("ws-{}", ws_id.0));
+        assert_eq!(session.stream_url, "ws://localhost:9223");
+        assert!(!session.is_active);
+        assert!(session.pane_id.is_none());
+        assert!(session.browser_id.is_none());
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn agent_browser_session_scoped_per_workspace() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws2_id.0, 9223);
+
+        assert_ne!(s1.session_id, s2.session_id);
+        assert_ne!(s1.cli_session_name, s2.cli_session_name);
+        assert_eq!(store.snapshot().agent_browser_sessions.len(), 2);
+    }
+
+    #[test]
+    fn agent_browser_resolve_idempotent() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+
+        let s1 = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        assert_eq!(s1.session_id, s2.session_id);
+        assert_eq!(store.snapshot().agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn agent_browser_attach_detach_cycle() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let _session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        // Create a browser pane to attach to
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+
+        // Attach
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        let snap = store.snapshot();
+        let attached = &snap.agent_browser_sessions[0];
+        assert_eq!(attached.pane_id.as_ref().unwrap(), &pane_id);
+        assert_eq!(attached.browser_id.as_ref().unwrap(), &browser_id);
+        assert!(attached.is_active);
+
+        // Detach
+        let detached = store
+            .detach_agent_browser_from_pane(&browser_id.0)
+            .unwrap();
+        assert!(detached.pane_id.is_none());
+        assert!(detached.browser_id.is_none());
+
+        // Session still exists and is_active stays true (process still running)
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn user_browser_close_destroys_session() {
+        let store = AppStateStore::default();
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, _browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+
+        assert_eq!(store.snapshot().browser_sessions.len(), 1);
+
+        // close_pane removes BrowserSessionSnapshot
+        store.close_pane(&pane_id.0).unwrap();
+        assert_eq!(store.snapshot().browser_sessions.len(), 0);
+    }
+
+    #[test]
+    fn agent_browser_pane_close_preserves_session() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let _session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        // Detach before close (simulates what close_pane command does)
+        store.detach_agent_browser_from_pane(&browser_id.0);
+
+        // close_pane removes BrowserSessionSnapshot but agent session survives
+        store.close_pane(&pane_id.0).unwrap();
+
+        let snap = store.snapshot();
+        assert_eq!(snap.browser_sessions.len(), 0);
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_none());
+    }
+
+    #[test]
+    fn workspace_close_removes_agent_session() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+
+        store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        store.resolve_agent_browser_session(&ws2_id.0, 9223);
+        assert_eq!(store.snapshot().agent_browser_sessions.len(), 2);
+
+        store.close_workspace(&ws2_id.0).unwrap();
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        assert_eq!(snap.agent_browser_sessions[0].workspace_id, ws1_id);
+    }
+
+    #[test]
+    fn find_detached_finds_correct_workspace() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp"));
+
+        let _s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let _s2 = store.resolve_agent_browser_session(&ws2_id.0, 9223);
+
+        // Create and attach browser panes in both workspaces
+        let pane1 = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id1, browser_id1) = store
+            .create_browser_pane(&pane1.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws1_id.0, &pane_id1, &browser_id1)
+            .unwrap();
+
+        let pane2 = store.snapshot().workspaces[1].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id2, browser_id2) = store
+            .create_browser_pane(&pane2.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws2_id.0, &pane_id2, &browser_id2)
+            .unwrap();
+
+        // Detach ws1 only
+        store.detach_agent_browser_from_pane(&browser_id1.0);
+
+        assert!(store.find_detached_agent_browser(&ws1_id.0).is_some());
+        assert!(store.find_detached_agent_browser(&ws2_id.0).is_none());
     }
 }

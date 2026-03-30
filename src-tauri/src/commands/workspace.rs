@@ -588,6 +588,18 @@ pub fn close_workspace(
         crate::mcp_server::remove_mcp_config(Path::new(cwd));
     }
 
+    // Close agent browser CLI session for this workspace
+    if let Some(agent_session) = state.find_detached_agent_browser(&workspace_id) {
+        let cli_name = agent_session.cli_session_name.clone();
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let manager: State<'_, crate::agent_browser::AgentBrowserManager> = app_handle.state();
+            if let Err(error) = manager.close(&cli_name).await {
+                eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
+            }
+        });
+    }
+
     let fallback = state.close_workspace(&workspace_id)?;
     crate::state::emit_app_state(&app);
     Ok(fallback.0)
@@ -674,13 +686,19 @@ pub fn close_pane(
     }
 
     if let Some(browser_id) = removed_browser_id {
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let manager: State<'_, BrowserManager> = app_handle.state();
-            if let Err(error) = manager.close_browser(&browser_id).await {
-                eprintln!("[BROWSER] Failed to close browser {browser_id}: {error}");
-            }
-        });
+        if state.is_agent_browser_session(&browser_id) {
+            // Agent session: detach pane reference, keep process alive
+            state.detach_agent_browser_from_pane(&browser_id);
+        } else {
+            // User session: kill Chromium process as before
+            let app_handle = app.clone();
+            tauri::async_runtime::spawn(async move {
+                let manager: State<'_, BrowserManager> = app_handle.state();
+                if let Err(error) = manager.close_browser(&browser_id).await {
+                    eprintln!("[BROWSER] Failed to close browser {browser_id}: {error}");
+                }
+            });
+        }
     }
 
     crate::state::emit_app_state(&app);

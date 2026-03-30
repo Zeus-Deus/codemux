@@ -6,6 +6,7 @@ import { agentBrowserRun } from "@/tauri/commands";
 
 interface Props {
   browserId: string;
+  sessionId?: string;
   currentUrl: string;
   onUrlChange: (url: string) => void;
   loading: boolean;
@@ -13,7 +14,8 @@ interface Props {
   onInspectorToggle: () => void;
 }
 
-export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, inspectorActive, onInspectorToggle }: Props) {
+export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, loading, inspectorActive, onInspectorToggle }: Props) {
+  const cmdId = sessionId ?? browserId;
   const [urlInput, setUrlInput] = useState(currentUrl);
   const [navigating, setNavigating] = useState(false);
 
@@ -22,7 +24,7 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, in
     console.log("[BrowserToolbar] Navigate:", { browserId, action: "open", url: normalized });
     setNavigating(true);
     try {
-      const result = await agentBrowserRun(browserId, "open", { url: normalized });
+      const result = await agentBrowserRun(cmdId, "open", { url: normalized });
       console.log("[BrowserToolbar] Navigate result:", result);
       onUrlChange(normalized);
       setUrlInput(normalized);
@@ -46,7 +48,7 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, in
         variant="ghost"
         size="icon-xs"
         aria-label="Back"
-        onClick={() => agentBrowserRun(browserId, "back", {}).catch(console.error)}
+        onClick={() => agentBrowserRun(cmdId, "back", {}).catch(console.error)}
       >
         <ArrowLeft className="h-3 w-3" />
       </Button>
@@ -54,7 +56,7 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, in
         variant="ghost"
         size="icon-xs"
         aria-label="Forward"
-        onClick={() => agentBrowserRun(browserId, "forward", {}).catch(console.error)}
+        onClick={() => agentBrowserRun(cmdId, "forward", {}).catch(console.error)}
       >
         <ArrowRight className="h-3 w-3" />
       </Button>
@@ -62,7 +64,7 @@ export function BrowserToolbar({ browserId, currentUrl, onUrlChange, loading, in
         variant="ghost"
         size="icon-xs"
         aria-label="Refresh"
-        onClick={() => agentBrowserRun(browserId, "reload", {}).catch(console.error)}
+        onClick={() => agentBrowserRun(cmdId, "reload", {}).catch(console.error)}
       >
         {navigating || loading ? (
           <Loader2 className="h-3 w-3 animate-spin" />

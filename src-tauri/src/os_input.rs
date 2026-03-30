@@ -274,7 +274,7 @@ fn make_request_id() -> String {
     format!("req-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
 }
 
-pub async fn handle_os_action(action: &str, params: Value) -> Result<BrowserAutomationResult, String> {
+pub async fn handle_os_action(action: &str, params: Value, browser_id: &str) -> Result<BrowserAutomationResult, String> {
     // Check ydotool availability
     if !is_ydotool_available().await {
         return Err(
@@ -302,7 +302,7 @@ pub async fn handle_os_action(action: &str, params: Value) -> Result<BrowserAuto
 
     Ok(BrowserAutomationResult {
         request_id: make_request_id(),
-        browser_id: "default".to_string(),
+        browser_id: browser_id.to_string(),
         data: json!({ "result": text, "success": true }),
         message: Some(text),
     })

@@ -290,7 +290,7 @@ fn make_request_id() -> String {
     format!("req-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis())
 }
 
-pub async fn handle_vision_action(port: u16, action: &str, params: Value) -> Result<BrowserAutomationResult, String> {
+pub async fn handle_vision_action(port: u16, action: &str, params: Value, browser_id: &str) -> Result<BrowserAutomationResult, String> {
     let text = match action {
         "click_at" => {
             let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -327,7 +327,7 @@ pub async fn handle_vision_action(port: u16, action: &str, params: Value) -> Res
 
     Ok(BrowserAutomationResult {
         request_id: make_request_id(),
-        browser_id: "default".to_string(),
+        browser_id: browser_id.to_string(),
         data: json!({ "result": text, "success": true }),
         message: Some(text),
     })

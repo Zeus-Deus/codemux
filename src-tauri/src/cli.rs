@@ -222,6 +222,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             Ok(true)
         }
         Some(CommandSet::Browser { command }) => {
+            let ws_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
             let result = match command {
                 BrowserCommand::Create => {
                     let response = send_control_request(ControlRequest {
@@ -233,12 +234,11 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                 BrowserCommand::Open { url } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": "default", "action": { "kind": "open", "url": url } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "open", "url": url } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Snapshot { browser_id, dom } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::Snapshot { browser_id: _, dom } => {
                     let action = if dom {
                         json!({ "kind": "eval", "script": crate::agent_browser::DOM_SNAPSHOT_SCRIPT })
                     } else {
@@ -246,101 +246,90 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     };
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": action }),
+                        params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Click { selector, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::Click { selector, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "click", "selector": selector } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click", "selector": selector } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Fill { selector, value, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::Fill { selector, value, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "fill", "selector": selector, "value": value } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "fill", "selector": selector, "value": value } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Screenshot { browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::Screenshot { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "screenshot" } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "screenshot" } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::ConsoleLogs { browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::ConsoleLogs { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "console" } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "console" } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::ClickAt { x, y, click_type, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::ClickAt { x, y, click_type, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "click_at", "x": x, "y": y, "click_type": click_type } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_at", "x": x, "y": y, "click_type": click_type } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::TypeAt { text, x, y, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::TypeAt { text, x, y, browser_id: _ } => {
                     let mut action = json!({ "kind": "type_at", "text": text });
                     if let Some(xv) = x { action["x"] = json!(xv); }
                     if let Some(yv) = y { action["y"] = json!(yv); }
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": action }),
+                        params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::ScrollAt { x, y, direction, amount, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::ScrollAt { x, y, direction, amount, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::KeyPress { key, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::KeyPress { key, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "key_press", "key": key } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "key_press", "key": key } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::Drag { start_x, start_y, end_x, end_y, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::Drag { start_x, start_y, end_x, end_y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::ClickOs { x, y, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::ClickOs { x, y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": { "kind": "click_os", "x": x, "y": y } }),
+                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_os", "x": x, "y": y } }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }
-                BrowserCommand::TypeOs { text, x, y, browser_id } => {
-                    let bid = browser_id.as_deref().unwrap_or("default");
+                BrowserCommand::TypeOs { text, x, y, browser_id: _ } => {
                     let mut action = json!({ "kind": "type_os", "text": text });
                     if let Some(xv) = x { action["x"] = json!(xv); }
                     if let Some(yv) = y { action["y"] = json!(yv); }
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "browser_id": bid, "action": action }),
+                        params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
                     Ok(response.data.unwrap_or(json!(null)))
                 }

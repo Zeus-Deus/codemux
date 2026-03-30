@@ -88,6 +88,19 @@ export interface BrowserSessionSnapshot {
   history_index: number;
   is_loading: boolean;
   last_error: string | null;
+  agent_session_name?: string | null;
+}
+
+export interface AgentBrowserSession {
+  session_id: string;
+  workspace_id: string;
+  cli_session_name: string;
+  stream_url: string;
+  current_url: string | null;
+  is_active: boolean;
+  pane_id: string | null;
+  browser_id: string | null;
+  user_dismissed: boolean;
 }
 
 // ── Pane Status ──
@@ -538,6 +551,7 @@ export interface AppStateSnapshot {
   workspaces: WorkspaceSnapshot[];
   terminal_sessions: TerminalSessionSnapshot[];
   browser_sessions: BrowserSessionSnapshot[];
+  agent_browser_sessions: AgentBrowserSession[];
   notifications: NotificationSnapshot[];
   detected_ports: PortInfoSnapshot[];
   pane_statuses: Record<string, PaneStatus>;

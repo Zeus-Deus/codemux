@@ -58,13 +58,26 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const frameCountRef = useRef(0);
 
   // Read initial URL from browser session state (set by ports section or other callers)
   const browserSession = useAppStore(
     (s) => s.appState?.browser_sessions.find((b) => b.browser_id === browserId),
   );
+  // Check if this browser pane is backed by an agent browser session (for reconnection)
+  const agentSession = useAppStore(
+    (s) => s.appState?.agent_browser_sessions?.find((abs) => abs.browser_id === browserId),
+  );
+  const agentSessionRef = useRef(agentSession);
+  agentSessionRef.current = agentSession;
+
+  // The session ID to use for all agent-browser CLI commands.
+  // When backed by an agent session, use cli_session_name so that
+  // user interactions and MCP tools operate on the same Chromium session.
+  const effectiveSessionId = agentSession?.cli_session_name ?? browserId;
+
   const [currentUrl, setCurrentUrl] = useState(
-    () => browserSession?.current_url ?? "about:blank",
+    () => agentSession?.current_url ?? browserSession?.current_url ?? "about:blank",
   );
   const currentUrlRef = useRef(currentUrl);
   currentUrlRef.current = currentUrl;
@@ -75,7 +88,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (stateUrl && stateUrl !== currentUrl) {
       setCurrentUrl(stateUrl);
       if (statusRef.current === "live") {
-        agentBrowserRun(browserId, "open", { url: stateUrl }).catch(console.error);
+        agentBrowserRun(effectiveSessionId, "open", { url: stateUrl }).catch(console.error);
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -109,14 +122,14 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (next) {
       setSelectedElement(null);
       try {
-        await agentBrowserRun(browserId, "eval", { script: INSPECTOR_INJECT_SCRIPT });
+        await agentBrowserRun(effectiveSessionId, "eval", { script: INSPECTOR_INJECT_SCRIPT });
         injectedRef.current = true;
       } catch (err) {
         console.error("[Inspector] Injection failed:", err);
       }
     } else {
       if (injectedRef.current) {
-        agentBrowserRun(browserId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
+        agentBrowserRun(effectiveSessionId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
         injectedRef.current = false;
       }
     }
@@ -144,16 +157,30 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
     let ws: WebSocket | null = null;
     let active = true;
+    let msgCount = 0;
 
     (async () => {
       setStatus("starting");
       setErrorMsg(null);
+      frameCountRef.current = 0;
 
+      console.log("[bp] mount", { browserId, agentSessionName: browserSession?.agent_session_name, visible });
+
+      // agent_session_name is set on the BrowserSessionSnapshot in the same
+      // state snapshot that creates the pane, so it is always available on
+      // first mount — no cross-reference lookup or race condition.
+      // Use the agent's session name so the screencast daemon connects to
+      // the same Chromium instance the agent's MCP commands use.
+      const streamSessionId = browserSession?.agent_session_name ?? browserId;
+
+      console.log("[bp] calling startBrowserStream with:", streamSessionId);
       let streamUrl: string;
       try {
-        streamUrl = await startBrowserStream(browserId);
+        streamUrl = await startBrowserStream(streamSessionId);
+        console.log("[bp] startBrowserStream returned:", { streamUrl });
       } catch (err) {
         if (!active) return;
+        console.error("[bp] startBrowserStream FAILED:", err);
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
         return;
@@ -171,11 +198,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         if (!active) return;
         setStatus(retries === 0 ? "connecting" : "waiting");
 
+        console.log("[bp] creating WebSocket to:", streamUrl, "retry:", retries);
         ws = new WebSocket(streamUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
           if (!active) return;
+          console.log("[bp] ws CONNECTED to:", ws!.url);
           setStatus("waiting");
 
           // Set initial viewport to match container dimensions
@@ -186,7 +215,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
             const ch = Math.round(rect.height);
             if (cw > 10 && ch > 10) {
               viewportRef.current = { width: cw, height: ch };
-              agentBrowserRun(browserId, "viewport", { width: cw, height: ch }).catch(() => {});
+              agentBrowserRun(effectiveSessionId, "viewport", { width: cw, height: ch }).catch(() => {});
               sendInput({ type: "resize", width: cw, height: ch });
             }
           }
@@ -195,19 +224,28 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
+            msgCount++;
+            if (msgCount <= 5) {
+              console.log("[bp] ws message #" + msgCount, { type: msg.type, dataLen: typeof msg.data === "string" ? msg.data.length : 0, keys: Object.keys(msg) });
+            }
 
             if (msg.type === "frame") {
+              frameCountRef.current++;
               if (statusRef.current !== "live") {
                 setStatus("live");
-                // Navigate to pre-set URL when browser first goes live.
-                // Delay 300ms to let browser process fully initialize for CDP commands.
-                const targetUrl = currentUrlRef.current;
-                if (targetUrl && targetUrl !== "about:blank") {
-                  setTimeout(() => {
-                    agentBrowserRun(browserId, "open", { url: targetUrl })
-                      .then(() => setCurrentUrl(targetUrl))
-                      .catch(console.error);
-                  }, 300);
+                // Skip navigation on reconnect — the agent's browser is already showing the right page.
+                const isReconnect = !!agentSessionRef.current;
+                if (!isReconnect) {
+                  // Navigate to pre-set URL when browser first goes live.
+                  // Delay 300ms to let browser process fully initialize for CDP commands.
+                  const targetUrl = currentUrlRef.current;
+                  if (targetUrl && targetUrl !== "about:blank") {
+                    setTimeout(() => {
+                      agentBrowserRun(effectiveSessionId, "open", { url: targetUrl })
+                        .then(() => setCurrentUrl(targetUrl))
+                        .catch(console.error);
+                    }, 300);
+                  }
                 }
               }
               retries = 0;
@@ -229,6 +267,9 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               }
               const img = imgRef.current;
               img.onload = () => {
+                if (frameCountRef.current <= 3) {
+                  console.log("[bp] drawing frame #" + frameCountRef.current, { natW: img.naturalWidth, natH: img.naturalHeight, canvasW: canvas.width, canvasH: canvas.height });
+                }
                 const frameAspect = img.naturalWidth / img.naturalHeight;
                 const canvasAspect = canvas.width / canvas.height;
 
@@ -260,6 +301,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
                 };
               }
             } else if (msg.type === "error") {
+              console.warn("[browser] daemon error message", msg);
               // "Browser not launched" = daemon still starting, will auto-retry via onclose
               if (statusRef.current !== "live") {
                 ws?.close();
@@ -270,9 +312,12 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
           }
         };
 
-        ws.onerror = () => {};
+        ws.onerror = (ev) => {
+          console.error("[bp] ws ERROR", ev);
+        };
 
-        ws.onclose = () => {
+        ws.onclose = (ev) => {
+          console.log("[bp] ws CLOSED", { code: ev.code, reason: ev.reason, status: statusRef.current, retries });
           if (!active) return;
           // Auto-reconnect if we haven't received frames yet
           if (statusRef.current !== "live" && retries < maxRetries) {
@@ -299,7 +344,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         wsRef.current = null;
       }
     };
-  }, [browserId, visible]);
+  }, [browserId, visible, browserSession?.agent_session_name]);
 
   // Mouse handlers
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -312,7 +357,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       e.stopPropagation();
       inspectorClickRef.current = true;
       // Query element at click coordinates
-      agentBrowserRun(browserId, "eval", { script: buildElementQueryScript(x, y) })
+      agentBrowserRun(effectiveSessionId, "eval", { script: buildElementQueryScript(x, y) })
         .then((result) => {
           const info = parseEvalResult(result);
           if (info) setSelectedElement(info);
@@ -323,7 +368,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
           inspectorActiveRef.current = false;
           setInspectorActive(false);
           if (injectedRef.current) {
-            agentBrowserRun(browserId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
+            agentBrowserRun(effectiveSessionId, "eval", { script: INSPECTOR_CLEANUP_SCRIPT }).catch(console.error);
             injectedRef.current = false;
           }
         });
@@ -449,7 +494,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
         viewportRef.current = { width: cw, height: ch };
-        agentBrowserRun(browserId, "viewport", { width: cw, height: ch }).catch(() => {});
+        agentBrowserRun(effectiveSessionId, "viewport", { width: cw, height: ch }).catch(() => {});
         sendInput({ type: "resize", width: cw, height: ch });
       }, 200);
     });
@@ -470,6 +515,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     <div className="flex h-full w-full flex-col bg-card">
       <BrowserToolbar
         browserId={browserId}
+        sessionId={effectiveSessionId}
         currentUrl={currentUrl}
         onUrlChange={setCurrentUrl}
         loading={status === "starting" || status === "connecting"}
@@ -484,6 +530,8 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         />
       )}
       <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden relative">
+        {/* Diagnostic: render decision */}
+        {(() => { if (status !== "live") console.log("[bp] render: overlay shown, status=" + status); return null; })()}
         {status !== "live" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (

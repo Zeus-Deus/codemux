@@ -413,26 +413,29 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     };
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
+    // Workspace ID for workspace-scoped browser routing.
+    let workspace_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
+
     let result = match tool_name.as_str() {
         // -- Browser tools --
         "browser_navigate" => {
             let url = arguments.get("url").and_then(Value::as_str).unwrap_or_default();
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "open", "url": url }
             }))
             .await
         }
         "browser_snapshot" => {
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "eval", "script": crate::agent_browser::DOM_SNAPSHOT_SCRIPT }
             }))
             .await
         }
         "browser_accessibility_snapshot" => {
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "snapshot" }
             }))
             .await
@@ -440,7 +443,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         "browser_click" => {
             let selector = arguments.get("selector").and_then(Value::as_str).unwrap_or_default();
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "click", "selector": selector }
             }))
             .await
@@ -449,18 +452,18 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let selector = arguments.get("selector").and_then(Value::as_str).unwrap_or_default();
             let value = arguments.get("value").and_then(Value::as_str).unwrap_or_default();
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "fill", "selector": selector, "value": value }
             }))
             .await
         }
         "browser_screenshot" => {
             let result = call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "screenshot" }
             }))
             .await;
-            let viewport = crate::stream_input::get_viewport(9223).await.unwrap_or((1280, 720));
+            let viewport = crate::stream_input::get_viewport(crate::agent_browser::DEFAULT_STREAM_PORT).await.unwrap_or((1280, 720));
             result.map(|data| json!({
                 "screenshot": data,
                 "viewport_width": viewport.0,
@@ -470,7 +473,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
         "browser_console_logs" => {
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "console" }
             }))
             .await
@@ -482,7 +485,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             let ct = arguments.get("click_type").and_then(Value::as_str).unwrap_or("left");
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "click_at", "x": x, "y": y, "click_type": ct }
             })).await
         }
@@ -491,7 +494,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let mut action = json!({ "kind": "type_at", "text": text });
             if let Some(x) = arguments.get("x").and_then(Value::as_f64) { action["x"] = json!(x); }
             if let Some(y) = arguments.get("y").and_then(Value::as_f64) { action["y"] = json!(y); }
-            call_socket("browser_automation", json!({ "browser_id": "default", "action": action })).await
+            call_socket("browser_automation", json!({ "workspace_id": &workspace_id, "action": action })).await
         }
         "browser_scroll_at" => {
             let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
@@ -499,14 +502,14 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let dir = arguments.get("direction").and_then(Value::as_str).unwrap_or("down");
             let amt = arguments.get("amount").and_then(Value::as_f64).unwrap_or(3.0);
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "scroll_at", "x": x, "y": y, "direction": dir, "amount": amt }
             })).await
         }
         "browser_key_press" => {
             let key = arguments.get("key").and_then(Value::as_str).unwrap_or("Enter");
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "key_press", "key": key }
             })).await
         }
@@ -516,7 +519,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let ex = arguments.get("end_x").and_then(Value::as_f64).unwrap_or(0.0);
             let ey = arguments.get("end_y").and_then(Value::as_f64).unwrap_or(0.0);
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "drag", "start_x": sx, "start_y": sy, "end_x": ex, "end_y": ey }
             })).await
         }
@@ -525,7 +528,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             call_socket("browser_automation", json!({
-                "browser_id": "default",
+                "workspace_id": &workspace_id,
                 "action": { "kind": "click_os", "x": x, "y": y }
             })).await
         }
@@ -534,7 +537,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let mut action = json!({ "kind": "type_os", "text": text });
             if let Some(x) = arguments.get("x").and_then(Value::as_f64) { action["x"] = json!(x); }
             if let Some(y) = arguments.get("y").and_then(Value::as_f64) { action["y"] = json!(y); }
-            call_socket("browser_automation", json!({ "browser_id": "default", "action": action })).await
+            call_socket("browser_automation", json!({ "workspace_id": &workspace_id, "action": action })).await
         }
 
         // -- Workspace tools --
