@@ -163,11 +163,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       setErrorMsg(null);
       frameCountRef.current = 0;
 
-      // agent_session_name is set on the BrowserSessionSnapshot in the same
-      // state snapshot that creates the pane, so it is always available on
-      // first mount — no cross-reference lookup or race condition.
-      // Use the agent's session name so the screencast daemon connects to
-      // the same Chromium instance the agent's MCP commands use.
       const streamSessionId = browserSession?.agent_session_name ?? browserId;
 
       let streamUrl: string;
@@ -286,9 +281,10 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
                 };
               }
             } else if (msg.type === "error") {
-              console.warn("[browser] daemon error message", msg);
-              // "Browser not launched" = daemon still starting, will auto-retry via onclose
-              if (statusRef.current !== "live") {
+              const errText = msg.message || msg.error || "";
+              // "Browser not launched" = daemon still starting, close to trigger retry.
+              // Other errors (e.g. "Screencast already active") are benign — stay connected.
+              if (errText.includes("not launched") && statusRef.current !== "live") {
                 ws?.close();
               }
             }

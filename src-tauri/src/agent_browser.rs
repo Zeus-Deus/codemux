@@ -401,7 +401,6 @@ impl AgentBrowserManager {
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
         let session = session_name(browser_id);
-
         let mut running = self.running.lock().await;
         if *running {
             return Ok(format!("ws://localhost:{}", port));
@@ -426,26 +425,18 @@ impl AgentBrowserManager {
             .output();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Start daemon + open a page in one Node.js script.
-        // The daemon's startDaemon() runs forever (blocks), so we call it without await.
-        // After 3s, we connect to the daemon's Unix socket and send a "navigate" command
-        // to trigger the browser auto-launch. The CLI binary can't do this because it's
-        // a separate process that doesn't talk to the daemon.
-        let script = format!(
+        // Step 1: Start the daemon process (runs forever, serves both the
+        // WebSocket stream on `port` and a Unix socket for CLI commands).
+        let daemon_script = format!(
             "const m = await import('agent-browser'); \
              m.setSession('{}'); \
-             m.startDaemon({{ streamPort: {} }}); \
-             await new Promise(r => setTimeout(r, 3000)); \
-             const net = await import('node:net'); \
-             const sock = net.createConnection(m.getSocketPath()); \
-             sock.write(JSON.stringify({{id:'init',action:'navigate',url:'about:blank'}}) + '\\n'); \
-             sock.on('data', () => {{}});",
+             await m.startDaemon({{ streamPort: {} }});",
             session, port
         );
-        eprintln!("[codemux::browser] Starting daemon+browser on port {} session={}", port, session);
+        eprintln!("[codemux::browser] Starting daemon on port {} session={}", port, session);
         let daemon_cmd = format!(
             "node --input-type=module -e {} >/tmp/codemux-browser-daemon.log 2>&1",
-            shell_quote(&script)
+            shell_quote(&daemon_script)
         );
         std::process::Command::new("sh")
             .args(["-c", &daemon_cmd])
@@ -455,10 +446,25 @@ impl AgentBrowserManager {
             .spawn()
             .map_err(|e| format!("Failed to start browser stream: {}", e))?;
 
-        // Wait for daemon + stream server + browser launch + first screencast frames
-        eprintln!("[codemux::browser] Waiting 8s for daemon + browser...");
-        std::thread::sleep(std::time::Duration::from_millis(8000));
-        eprintln!("[codemux::browser] Stream ready at ws://localhost:{}", port);
+        // Wait for the daemon's WS server and Unix socket to be ready.
+        std::thread::sleep(std::time::Duration::from_millis(3000));
+
+        // Step 2: Launch the browser via the CLI (has proper retries and
+        // error handling, unlike raw socket writes). This triggers the
+        // daemon's BrowserManager to launch Chromium.
+        eprintln!("[codemux::browser] Launching browser via CLI session={}", session);
+        let launch_cmd = format!(
+            "npx agent-browser open about:blank --session {}",
+            session
+        );
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &launch_cmd])
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+            .output();
+
+        // Give Chromium a moment to finish launching and produce screencast frames.
+        std::thread::sleep(std::time::Duration::from_millis(3000));
         *running = true;
 
         Ok(format!("ws://localhost:{}", port))

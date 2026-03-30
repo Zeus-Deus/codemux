@@ -93,7 +93,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_snapshot",
-            description: "Get a list of interactive DOM elements with CSS selectors, text content, and bounding boxes",
+            description: "Get a list of interactive DOM elements with CSS selectors, text content, and bounding boxes. Use this when you need CSS selectors for browser_click/browser_fill.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -101,7 +101,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_accessibility_snapshot",
-            description: "Get the accessibility (ARIA) tree of the current page",
+            description: "Get the accessibility tree with clickable ref IDs like [ref=e4]. PREFERRED for clicking: pass the ref as the selector to browser_click (e.g. selector=\"@e4\"). Refs use Playwright's full actionability pipeline (auto-wait, auto-scroll, retry) and are more reliable than CSS selectors or coordinates.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -109,22 +109,22 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_click",
-            description: "Click an element by CSS selector. Fast and precise for dev servers, localhost, docs. If this fails (timeout, element not found, bot detection), escalate to browser_click_at.",
+            description: "Click an element. Accepts a snapshot ref like \"@e4\" (most reliable — uses Playwright auto-wait and retry) or a CSS selector. Always call browser_accessibility_snapshot first and use refs when possible. Only fall back to browser_click_at with coordinates if selectors fail due to bot detection.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "CSS selector of the element to click" }
+                    "selector": { "type": "string", "description": "Snapshot ref (e.g. \"@e4\") or CSS selector" }
                 },
                 "required": ["selector"]
             }),
         },
         McpTool {
             name: "browser_fill",
-            description: "Type text into an input field by CSS selector",
+            description: "Type text into an input field. Accepts a snapshot ref like \"@e3\" (most reliable) or a CSS selector.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "CSS selector of the input element" },
+                    "selector": { "type": "string", "description": "Snapshot ref (e.g. \"@e3\") or CSS selector" },
                     "value": { "type": "string", "description": "Text to type into the field" }
                 },
                 "required": ["selector", "value"]
