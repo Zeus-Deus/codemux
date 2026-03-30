@@ -157,14 +157,11 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
     let ws: WebSocket | null = null;
     let active = true;
-    let msgCount = 0;
 
     (async () => {
       setStatus("starting");
       setErrorMsg(null);
       frameCountRef.current = 0;
-
-      console.log("[bp] mount", { browserId, agentSessionName: browserSession?.agent_session_name, visible });
 
       // agent_session_name is set on the BrowserSessionSnapshot in the same
       // state snapshot that creates the pane, so it is always available on
@@ -173,14 +170,12 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       // the same Chromium instance the agent's MCP commands use.
       const streamSessionId = browserSession?.agent_session_name ?? browserId;
 
-      console.log("[bp] calling startBrowserStream with:", streamSessionId);
       let streamUrl: string;
       try {
         streamUrl = await startBrowserStream(streamSessionId);
-        console.log("[bp] startBrowserStream returned:", { streamUrl });
       } catch (err) {
         if (!active) return;
-        console.error("[bp] startBrowserStream FAILED:", err);
+        console.error("[browser] startBrowserStream FAILED", err);
         setStatus("error");
         setErrorMsg(`Failed to start browser: ${err}`);
         return;
@@ -198,13 +193,11 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         if (!active) return;
         setStatus(retries === 0 ? "connecting" : "waiting");
 
-        console.log("[bp] creating WebSocket to:", streamUrl, "retry:", retries);
         ws = new WebSocket(streamUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {
           if (!active) return;
-          console.log("[bp] ws CONNECTED to:", ws!.url);
           setStatus("waiting");
 
           // Set initial viewport to match container dimensions
@@ -224,11 +217,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         ws.onmessage = (event) => {
           try {
             const msg = JSON.parse(event.data);
-            msgCount++;
-            if (msgCount <= 5) {
-              console.log("[bp] ws message #" + msgCount, { type: msg.type, dataLen: typeof msg.data === "string" ? msg.data.length : 0, keys: Object.keys(msg) });
-            }
-
             if (msg.type === "frame") {
               frameCountRef.current++;
               if (statusRef.current !== "live") {
@@ -267,9 +255,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
               }
               const img = imgRef.current;
               img.onload = () => {
-                if (frameCountRef.current <= 3) {
-                  console.log("[bp] drawing frame #" + frameCountRef.current, { natW: img.naturalWidth, natH: img.naturalHeight, canvasW: canvas.width, canvasH: canvas.height });
-                }
                 const frameAspect = img.naturalWidth / img.naturalHeight;
                 const canvasAspect = canvas.width / canvas.height;
 
@@ -313,11 +298,10 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         };
 
         ws.onerror = (ev) => {
-          console.error("[bp] ws ERROR", ev);
+          console.error("[browser] ws ERROR", ev);
         };
 
-        ws.onclose = (ev) => {
-          console.log("[bp] ws CLOSED", { code: ev.code, reason: ev.reason, status: statusRef.current, retries });
+        ws.onclose = () => {
           if (!active) return;
           // Auto-reconnect if we haven't received frames yet
           if (statusRef.current !== "live" && retries < maxRetries) {
@@ -530,8 +514,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         />
       )}
       <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden relative">
-        {/* Diagnostic: render decision */}
-        {(() => { if (status !== "live") console.log("[bp] render: overlay shown, status=" + status); return null; })()}
         {status !== "live" && (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-card z-10">
             {status === "error" ? (

@@ -561,6 +561,17 @@ export const agentBrowserScreenshot = (browserId: string) =>
 export const startBrowserStream = (browserId: string) =>
   invoke<string>("start_browser_stream", { browserId });
 
+// ── Browser Data ──
+
+export const getBrowserDataSize = () =>
+  invoke<number>("get_browser_data_size");
+
+export const clearBrowserCookies = () =>
+  invoke<void>("clear_browser_cookies");
+
+export const clearAllBrowserData = () =>
+  invoke<void>("clear_all_browser_data");
+
 // ── OpenFlow ──
 
 export const getOpenflowRuntimeSnapshot = () =>

@@ -402,11 +402,8 @@ impl AgentBrowserManager {
         let port = self.stream_port;
         let session = session_name(browser_id);
 
-        eprintln!("[stream] start_stream called browser_id={:?} session={} port={}", browser_id, session, port);
-
         let mut running = self.running.lock().await;
         if *running {
-            eprintln!("[stream] already running — returning ws://localhost:{}", port);
             return Ok(format!("ws://localhost:{}", port));
         }
 
@@ -417,10 +414,7 @@ impl AgentBrowserManager {
             .args(["-c", &format!("fuser {}/tcp 2>/dev/null", port)])
             .output()
         {
-            let has_listener = output.status.success() && !output.stdout.is_empty();
-            eprintln!("[stream] port probe: has_listener={} stdout={:?}", has_listener, String::from_utf8_lossy(&output.stdout).trim());
-            if has_listener {
-                eprintln!("[stream] adopting existing daemon on port {}", port);
+            if output.status.success() && !output.stdout.is_empty() {
                 *running = true;
                 return Ok(format!("ws://localhost:{}", port));
             }

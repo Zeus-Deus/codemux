@@ -1,6 +1,7 @@
 use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult};
 use crate::browser::BrowserManager;
 use crate::state::AppStateStore;
+use std::path::PathBuf;
 use tauri::State;
 
 pub(crate) fn create_browser_pane_impl(
@@ -212,13 +213,7 @@ pub async fn start_browser_stream(
     manager: State<'_, AgentBrowserManager>,
     browser_id: String,
 ) -> Result<String, String> {
-    eprintln!("[stream] start_browser_stream command called with browser_id={:?}", browser_id);
-    let result = manager.start_stream(&browser_id).await;
-    match &result {
-        Ok(url) => eprintln!("[stream] returning stream_url={}", url),
-        Err(e) => eprintln!("[stream] start_stream FAILED: {}", e),
-    }
-    result
+    manager.start_stream(&browser_id).await
 }
 
 #[tauri::command]
@@ -227,4 +222,63 @@ pub async fn agent_browser_screenshot(
     browser_id: String,
 ) -> Result<String, String> {
     manager.get_screenshot(&browser_id).await
+}
+
+// ── Browser Data Management ──
+
+fn agent_browser_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".agent-browser")
+}
+
+fn dir_size(path: &std::path::Path) -> u64 {
+    if !path.is_dir() {
+        return 0;
+    }
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
+#[tauri::command]
+pub fn get_browser_data_size() -> Result<u64, String> {
+    Ok(dir_size(&agent_browser_dir()))
+}
+
+#[tauri::command]
+pub fn clear_browser_cookies() -> Result<(), String> {
+    let sessions_dir = agent_browser_dir().join("sessions");
+    if sessions_dir.exists() {
+        std::fs::remove_dir_all(&sessions_dir)
+            .map_err(|e| format!("Failed to clear browser cookies: {e}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn clear_all_browser_data() -> Result<(), String> {
+    let dir = agent_browser_dir();
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .map_err(|e| format!("Failed to clear browser data: {e}"))?;
+    }
+    Ok(())
 }

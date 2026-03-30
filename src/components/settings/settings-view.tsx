@@ -40,6 +40,7 @@ import {
   X,
   UserCircle,
   LogOut,
+  Globe,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -67,6 +68,9 @@ import {
   getProjectScripts,
   setProjectScripts,
   getWorkspaceConfig,
+  getBrowserDataSize,
+  clearBrowserCookies,
+  clearAllBrowserData,
 } from "@/tauri/commands";
 import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
 import { EditorIcon } from "@/components/icons/editor-icon";
@@ -80,7 +84,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "shortcuts" | "notifications";
+type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "browser" | "shortcuts" | "notifications";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -104,6 +108,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "projects", label: "Projects", icon: FolderCog },
       { id: "git", label: "Git", icon: GitBranch },
       { id: "agent", label: "Agent", icon: Bot },
+      { id: "browser", label: "Browser", icon: Globe },
     ],
   },
 ];
@@ -161,6 +166,106 @@ function SectionHeader({ title, description }: { title: string; description: str
     <div className="mb-6">
       <h2 className="text-base font-semibold tracking-tight">{title}</h2>
       <p className="text-sm text-muted-foreground mt-1">{description}</p>
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
+  return `${(bytes / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+function BrowserSection() {
+  const [dataSize, setDataSize] = useState<number | null>(null);
+  const [clearing, setClearing] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
+
+  const refreshSize = () => {
+    getBrowserDataSize().then(setDataSize).catch(() => setDataSize(0));
+  };
+
+  useEffect(() => { refreshSize(); }, []);
+
+  const handleClearCookies = async () => {
+    if (!confirm("This will clear all saved cookies and site data. You'll need to re-accept cookie consent pages. Continue?")) return;
+    setClearing("cookies");
+    setMessage(null);
+    try {
+      await clearBrowserCookies();
+      setMessage("Cookies and site data cleared.");
+      refreshSize();
+    } catch (e) {
+      setMessage(`Failed: ${e}`);
+    } finally {
+      setClearing(null);
+    }
+  };
+
+  const handleClearAll = async () => {
+    if (!confirm("This will completely reset the browser. All cookies, cache, and saved data will be deleted. Continue?")) return;
+    setClearing("all");
+    setMessage(null);
+    try {
+      await clearAllBrowserData();
+      setMessage("All browser data cleared.");
+      refreshSize();
+    } catch (e) {
+      setMessage(`Failed: ${e}`);
+    } finally {
+      setClearing(null);
+    }
+  };
+
+  return (
+    <div>
+      <SectionHeader
+        title="Browser"
+        description="Manage the built-in browser profile used by agents and browser panes."
+      />
+      <div className="space-y-1">
+        <SettingRow
+          label="Profile storage"
+          description="Total size of cached browser data, screenshots, and session files."
+        >
+          <span className="text-sm font-mono text-muted-foreground">
+            {dataSize === null ? "..." : formatBytes(dataSize)}
+          </span>
+        </SettingRow>
+        <Separator />
+        <SettingRow
+          label="Clear cookies & site data"
+          description="Removes saved cookies and session storage. You'll need to re-accept cookie consent pages."
+        >
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={clearing !== null}
+            onClick={handleClearCookies}
+          >
+            {clearing === "cookies" ? "Clearing..." : "Clear cookies"}
+          </Button>
+        </SettingRow>
+        <Separator />
+        <SettingRow
+          label="Clear all browser data"
+          description="Completely resets the browser profile. Removes cookies, cache, screenshots, and all saved data."
+        >
+          <Button
+            variant="destructive"
+            size="sm"
+            disabled={clearing !== null}
+            onClick={handleClearAll}
+          >
+            {clearing === "all" ? "Clearing..." : "Clear all data"}
+          </Button>
+        </SettingRow>
+        {message && (
+          <p className="text-sm text-muted-foreground pt-2">{message}</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -1002,6 +1107,9 @@ export function SettingsView() {
             </div>
           </div>
         );
+
+      case "browser":
+        return <BrowserSection />;
 
       case "projects":
         return (

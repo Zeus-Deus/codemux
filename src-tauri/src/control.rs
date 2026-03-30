@@ -331,8 +331,6 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
 
-            eprintln!("[browser-auto] === browser_automation called === workspace_id={:?} action={:?}", workspace_id, action_kind);
-
             // Resolve the CLI session name to use for agent-browser commands.
             let cli_session_name = if !workspace_id.is_empty() {
                 // Workspace-scoped path: find or create agent session for this workspace.
@@ -341,45 +339,16 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                     agent_browser.stream_port,
                 );
 
-                eprintln!(
-                    "[browser-auto] session state: pane_id={:?} user_dismissed={} is_active={} cli_session={}",
-                    agent_session.pane_id, agent_session.user_dismissed, agent_session.is_active, agent_session.cli_session_name
-                );
-
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
                 let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;
-                eprintln!(
-                    "[browser-auto] should auto-create? {} (pane_id.is_none()={} !user_dismissed={})",
-                    should_create, agent_session.pane_id.is_none(), !agent_session.user_dismissed
-                );
 
                 if should_create {
                     let target_pane_id = {
                         let snap = state.snapshot();
-                        let ws = snap.workspaces.iter()
-                            .find(|w| w.workspace_id.0 == workspace_id);
-                        if ws.is_none() {
-                            eprintln!(
-                                "[browser-auto] SKIP: workspace {} not found (available: {:?})",
-                                workspace_id,
-                                snap.workspaces.iter().map(|w| &w.workspace_id.0).collect::<Vec<_>>()
-                            );
-                        }
-                        let surface = ws.and_then(|w| {
-                            eprintln!(
-                                "[browser-auto] workspace found, active_surface_id={:?} surfaces={:?}",
-                                w.active_surface_id.0,
-                                w.surfaces.iter().map(|s| &s.surface_id.0).collect::<Vec<_>>()
-                            );
-                            w.surfaces.iter().find(|s| s.surface_id == w.active_surface_id)
-                        });
-                        if surface.is_none() && ws.is_some() {
-                            eprintln!("[browser-auto] SKIP: active surface not found in workspace");
-                        }
-                        surface.map(|s| {
-                            eprintln!("[browser-auto] target split pane: {}", s.active_pane_id.0);
-                            s.active_pane_id.0.clone()
-                        })
+                        snap.workspaces.iter()
+                            .find(|w| w.workspace_id.0 == workspace_id)
+                            .and_then(|w| w.surfaces.iter().find(|s| s.surface_id == w.active_surface_id))
+                            .map(|s| s.active_pane_id.0.clone())
                     };
                     if let Some(pane_id) = target_pane_id {
                         // Save the user's current workspace so we can restore it after
@@ -389,10 +358,8 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                         let url = params.get("url")
                             .and_then(Value::as_str)
                             .map(String::from);
-                        eprintln!("[browser-auto] CREATING browser pane: split_from={} url={:?}", pane_id, url);
                         match state.create_browser_pane(&pane_id, url.as_deref()) {
                             Ok((new_pane_id, new_browser_id)) => {
-                                eprintln!("[browser-auto] pane created: pane_id={} browser_id={}", new_pane_id.0, new_browser_id.0);
                                 // Mark the browser session as agent-backed BEFORE
                                 // emitting state so the pane starts its screencast
                                 // daemon with the agent's session name.
@@ -409,12 +376,8 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                                 state.activate_workspace(&user_workspace.0);
                                 crate::state::emit_app_state(&app);
                             }
-                            Err(e) => {
-                                eprintln!("[browser-auto] PANE CREATION FAILED: {:?}", e);
-                            }
+                            Err(_e) => {}
                         }
-                    } else {
-                        eprintln!("[browser-auto] SKIP: no target pane resolved for split");
                     }
                 }
 
@@ -427,7 +390,6 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
                 agent_session.cli_session_name
             } else {
-                eprintln!("[browser-auto] SKIP workspace path: empty workspace_id, using legacy global");
                 // Legacy global path: no workspace context (backward compat).
                 if state.snapshot().browser_sessions.is_empty() {
                     let active_pane_id = {
@@ -450,7 +412,6 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 resolve_browser_id(&app, "default")
             };
 
-            eprintln!("[browser-auto] dispatching action={} via cli_session={}", action_kind, cli_session_name);
             let result = match action_kind.as_str() {
                 // Tier 2: coordinate-based CDP tools via stream WebSocket
                 "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
@@ -472,7 +433,6 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
             };
-            eprintln!("[browser-auto] command completed ok={}", result.is_ok());
             result
         }
         "get_project_memory" => memory::get_project_memory(

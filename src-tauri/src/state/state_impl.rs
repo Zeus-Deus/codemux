@@ -1506,10 +1506,20 @@ impl AppStateStore {
         {
             return session.clone();
         }
+        // Derive a stable session name from the workspace cwd so the
+        // agent-browser Chromium storage state (cookies, localStorage)
+        // persists across app restarts. Workspace IDs are regenerated
+        // on each startup, but the cwd stays the same.
+        let cli_session_name = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| stable_browser_session_name(&w.cwd))
+            .unwrap_or_else(|| format!("ws-{workspace_id}"));
         let session = AgentBrowserSession {
             session_id: next_id("agent-browser"),
             workspace_id: WorkspaceId(workspace_id.to_string()),
-            cli_session_name: format!("ws-{workspace_id}"),
+            cli_session_name,
             stream_url: format!("ws://localhost:{stream_port}"),
             current_url: None,
             is_active: false,
@@ -3295,6 +3305,23 @@ fn remove_pane_from_tree(
     }
 }
 
+/// Build a stable browser session name from a workspace cwd so that
+/// agent-browser's storage state (cookies, localStorage) persists across
+/// app restarts. Uses the directory basename plus a short hash for uniqueness.
+fn stable_browser_session_name(cwd: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let dir_name = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("default");
+    let mut hasher = DefaultHasher::new();
+    cwd.hash(&mut hasher);
+    let hash = hasher.finish();
+    format!("ws-{}-{:06x}", dir_name, hash & 0xFFFFFF)
+}
+
 fn next_id(prefix: &str) -> String {
     let value = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{prefix}-{value}")
@@ -3721,7 +3748,8 @@ mod tests {
 
         let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
         assert_eq!(session.workspace_id, ws_id);
-        assert_eq!(session.cli_session_name, format!("ws-{}", ws_id.0));
+        // cli_session_name is now derived from the workspace cwd for cookie persistence
+        assert!(session.cli_session_name.starts_with("ws-"), "expected stable cwd-based name, got: {}", session.cli_session_name);
         assert_eq!(session.stream_url, "ws://localhost:9223");
         assert!(!session.is_active);
         assert!(session.pane_id.is_none());
