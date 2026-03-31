@@ -349,7 +349,6 @@ pub fn run() {
             commands::resize_split,
             commands::resize_active_pane,
             commands::notify_attention,
-            commands::mark_workspace_notifications_read,
             commands::set_notification_sound_enabled,
             commands::set_ai_commit_message_enabled,
             commands::set_ai_commit_message_model,

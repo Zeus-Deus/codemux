@@ -160,9 +160,6 @@ export const resizeActivePane = (delta: number) =>
 export const notifyAttention = (message: string, sessionId: string, paneId: string) =>
   invoke<string>("notify_attention", { message, sessionId, paneId });
 
-export const markWorkspaceNotificationsRead = (workspaceId: string) =>
-  invoke("mark_workspace_notifications_read", { workspaceId });
-
 export const setNotificationSoundEnabled = (enabled: boolean) =>
   invoke("set_notification_sound_enabled", { enabled });
 

@@ -744,18 +744,6 @@ pub fn notify_attention(
 }
 
 #[tauri::command]
-pub fn mark_workspace_notifications_read(
-    app: tauri::AppHandle,
-    state: State<'_, AppStateStore>,
-    workspace_id: String,
-) -> Result<(), String> {
-    if state.mark_workspace_notifications_read(&workspace_id) {
-        crate::state::emit_app_state(&app);
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub fn set_notification_sound_enabled(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,

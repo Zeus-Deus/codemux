@@ -1892,37 +1892,6 @@ impl AppStateStore {
         Ok(notification_id)
     }
 
-    pub fn mark_workspace_notifications_read(&self, workspace_id: &str) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
-        let mut changed = false;
-
-        for notification in snapshot.notifications.iter_mut() {
-            if notification.workspace_id.0 == workspace_id && !notification.read {
-                notification.read = true;
-                changed = true;
-            }
-        }
-
-        let unread_count = snapshot
-            .notifications
-            .iter()
-            .filter(|notification| {
-                notification.workspace_id.0 == workspace_id && !notification.read
-            })
-            .count() as u32;
-
-        if let Some(workspace) = snapshot
-            .workspaces
-            .iter_mut()
-            .find(|workspace| workspace.workspace_id.0 == workspace_id)
-        {
-            workspace.notification_count = unread_count;
-            return changed;
-        }
-
-        false
-    }
-
     // ---- Tab management ----
 
     pub fn create_tab(

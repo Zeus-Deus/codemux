@@ -2,7 +2,6 @@ import { Sidebar, SidebarContent, SidebarFooter, SidebarRail } from "@/component
 import { SidebarHeader } from "./sidebar-header";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarOpenflowSection } from "./sidebar-openflow-section";
-import { SidebarAlertsSection } from "./sidebar-alerts-section";
 import { SidebarPortsSection } from "./sidebar-ports-section";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
 import { SidebarAddRepo } from "./sidebar-add-repo";
@@ -17,7 +16,6 @@ export function AppSidebar() {
       </SidebarContent>
       <SidebarSetupBanner />
       <SidebarOpenflowSection />
-      <SidebarAlertsSection />
       <SidebarPortsSection />
       <SidebarFooter className="gap-0 p-0">
         <SidebarAddRepo />
