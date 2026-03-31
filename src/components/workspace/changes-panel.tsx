@@ -1540,6 +1540,49 @@ export function ChangesPanel({ workspace }: Props) {
             </DropdownMenuContent>
           </DropdownMenu>
 
+          {/* Merge dropdown */}
+          <DropdownMenu>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className="size-6 p-0"
+                    disabled={busy || branchInfo?.branch === baseBranch}
+                  >
+                    {busyAction === "merge" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <GitMerge className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">
+                {branchInfo?.branch === baseBranch ? "Already on base branch" : "Merge"}
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent align="start" className="w-52">
+              <DropdownMenuItem
+                onClick={handleMergeBranch}
+                disabled={isMerging}
+                className="text-xs"
+              >
+                <GitMerge className="h-3.5 w-3.5" />
+                Merge {baseBranch} into current
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => setShowMergeIntoDialog(true)}
+                disabled={isMerging || !!mergeIntoBaseState}
+                className="text-xs"
+              >
+                <ArrowUpToLine className="h-3.5 w-3.5" />
+                Merge into {baseBranch}
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
           {/* View mode toggle */}
           <Tooltip>
             <TooltipTrigger asChild>
