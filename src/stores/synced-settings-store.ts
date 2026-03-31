@@ -34,6 +34,15 @@ type SyncedSettingsStore = SyncedSettingsState & SyncedSettingsActions;
 
 export { DEFAULT_SETTINGS };
 
+// Each optimistic write increments this. Async responses only apply if
+// the generation matches, preventing stale backend responses from
+// reverting a newer optimistic update.
+let _settingsGen = 0;
+// How many writes are currently awaiting a backend response. While > 0,
+// applySettingsFromEvent skips incoming Tauri events because the async
+// response path already handles them with a gen-check.
+let _inflightWrites = 0;
+
 export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
   settings: DEFAULT_SETTINGS,
   isLoading: true,
@@ -50,17 +59,23 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
   },
 
   updateSettings: async (settings) => {
-    // Optimistic update
+    const gen = ++_settingsGen;
+    _inflightWrites++;
     set({ settings, isSyncing: true });
     try {
       const saved = await updateSyncedSettings(settings);
-      set({ settings: saved, isSyncing: false });
+      if (_settingsGen === gen) set({ settings: saved, isSyncing: false });
+      else set({ isSyncing: false });
     } catch {
       set({ isSyncing: false });
+    } finally {
+      _inflightWrites--;
     }
   },
 
   updateSetting: async (section, key, value) => {
+    const gen = ++_settingsGen;
+    _inflightWrites++;
     // Optimistic update — apply locally first
     set((s) => {
       const json = JSON.parse(JSON.stringify(s.settings)) as Record<string, Record<string, unknown>>;
@@ -71,23 +86,44 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
     });
     try {
       const saved = await updateSettingCmd(section, key, value);
-      set({ settings: saved, isSyncing: false });
+      if (_settingsGen === gen) {
+        // Re-apply our intended value on top of the server response.
+        // The server PATCH deep-merges nested objects, so sending
+        // e.g. { shortcuts: {} } is a no-op from the server's
+        // perspective. Force-set the exact field we wrote.
+        const patched = JSON.parse(JSON.stringify(saved)) as Record<string, Record<string, unknown>>;
+        if (patched[section]) patched[section][key] = value;
+        set({ settings: patched as unknown as UserSettings, isSyncing: false });
+      } else {
+        set({ isSyncing: false });
+      }
     } catch {
       set({ isSyncing: false });
+    } finally {
+      _inflightWrites--;
     }
   },
 
   resetSettings: async () => {
+    const gen = ++_settingsGen;
+    _inflightWrites++;
     set({ settings: DEFAULT_SETTINGS, isSyncing: true });
     try {
       const saved = await resetSyncedSettings();
-      set({ settings: saved, isSyncing: false });
+      if (_settingsGen === gen) set({ settings: saved, isSyncing: false });
+      else set({ isSyncing: false });
     } catch {
       set({ isSyncing: false });
+    } finally {
+      _inflightWrites--;
     }
   },
 
   applySettingsFromEvent: (settings) => {
+    // Skip events while local writes are in flight — the async response
+    // path handles those with gen-checks. Only apply events from
+    // external sources (other devices, server push).
+    if (_inflightWrites > 0) return;
     set({ settings });
   },
 }));

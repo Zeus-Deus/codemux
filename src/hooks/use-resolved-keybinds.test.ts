@@ -67,4 +67,43 @@ describe("resolveKeybinds", () => {
     const entry = result.keybindMap.get("commandPalette");
     expect(entry?.isCustom).toBe(false);
   });
+
+  describe("conflict override → reset flow", () => {
+    // Simulates: user rebinds fileSearch to Ctrl+K (commandPalette's default),
+    // confirms conflict → commandPalette gets unbound → then resets commandPalette.
+    const CONFLICT_OVERRIDES = { fileSearch: "Ctrl+K", commandPalette: "" };
+
+    it("unbound-via-conflict action has isCustom=true", () => {
+      const result = resolveKeybinds(CONFLICT_OVERRIDES);
+      const entry = result.keybindMap.get("commandPalette")!;
+      expect(entry.activeKeys).toBe("");
+      expect(entry.isCustom).toBe(true);
+    });
+
+    it("overriding action has correct combo and isCustom=true", () => {
+      const result = resolveKeybinds(CONFLICT_OVERRIDES);
+      const entry = result.keybindMap.get("fileSearch")!;
+      expect(entry.activeKeys).toBe("Ctrl+K");
+      expect(entry.isCustom).toBe(true);
+    });
+
+    it("resetting the unbound action restores its default", () => {
+      // Simulate removeOverride("commandPalette"): delete the key
+      const afterReset = { fileSearch: "Ctrl+K" };
+      const result = resolveKeybinds(afterReset);
+      const entry = result.keybindMap.get("commandPalette")!;
+      expect(entry.activeKeys).toBe("Ctrl+K");
+      expect(entry.isCustom).toBe(false);
+    });
+
+    it("Reset All clears everything including conflict-unbound entries", () => {
+      const result = resolveKeybinds({});
+      const cp = result.keybindMap.get("commandPalette")!;
+      const fs = result.keybindMap.get("fileSearch")!;
+      expect(cp.activeKeys).toBe("Ctrl+K");
+      expect(cp.isCustom).toBe(false);
+      expect(fs.activeKeys).toBe("Ctrl+P");
+      expect(fs.isCustom).toBe(false);
+    });
+  });
 });

@@ -43,21 +43,25 @@ export function KeybindEditor() {
   const updateSetting = useSyncedSettingsStore((s) => s.updateSetting);
   const hasAnyOverrides = Object.keys(overrides).length > 0;
 
+  /** Read the latest overrides from the store (avoids stale closures). */
+  const freshOverrides = () =>
+    useSyncedSettingsStore.getState().settings.keyboard.shortcuts;
+
   const saveOverride = useCallback(
     (id: string, combo: string) => {
-      const next = { ...overrides, [id]: combo };
+      const next = { ...freshOverrides(), [id]: combo };
       updateSetting("keyboard", "shortcuts", next).catch(console.error);
     },
-    [overrides, updateSetting],
+    [updateSetting],
   );
 
   const removeOverride = useCallback(
     (id: string) => {
-      const next = { ...overrides };
+      const next = { ...freshOverrides() };
       delete next[id];
       updateSetting("keyboard", "shortcuts", next).catch(console.error);
     },
-    [overrides, updateSetting],
+    [updateSetting],
   );
 
   const resetAll = useCallback(() => {
@@ -109,8 +113,7 @@ export function KeybindEditor() {
 
   const confirmConflict = useCallback(() => {
     if (!pendingConflict) return;
-    // Unbind the conflicting actions
-    const next = { ...overrides };
+    const next = { ...freshOverrides() };
     for (const id of pendingConflict.conflictIds) {
       next[id] = "";
     }
@@ -118,7 +121,7 @@ export function KeybindEditor() {
     updateSetting("keyboard", "shortcuts", next).catch(console.error);
     setRecordingId(null);
     setPendingConflict(null);
-  }, [pendingConflict, overrides, updateSetting]);
+  }, [pendingConflict, updateSetting]);
 
   const cancelConflict = useCallback(() => {
     setPendingConflict(null);
