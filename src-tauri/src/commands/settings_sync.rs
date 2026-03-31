@@ -27,10 +27,9 @@ pub async fn get_synced_settings(
         None => return Ok(settings_sync::load_cache().unwrap_or_default()),
     };
 
-    // Server is the source of truth when reachable. Don't push dirty cache
-    // before fetching — a stale cache (e.g., defaults written during sign-out
-    // by auto-detect effects) would overwrite the user's real settings.
-    match settings_sync::fetch_settings(&token).await {
+    // Server is the source of truth when reachable. sync_settings fetches first,
+    // then flushes any offline changes — safe ordering prevents stale cache overwrites.
+    match settings_sync::sync_settings(&token).await {
         Ok(s) => {
             emit_settings_synced(&app, &s);
             Ok(s)

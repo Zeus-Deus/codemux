@@ -199,16 +199,16 @@ pub async fn check_auth(
             // Cache user data for offline/network-error auth
             let _ = save_auth(&db, &token, &expires_at, Some(&user));
 
-            // Background-fetch synced settings after successful auth
+            // Background-sync settings after successful auth (fetch + flush dirty)
             let settings_handle = app.clone();
             let settings_token = token.clone();
             tauri::async_runtime::spawn(async move {
-                match crate::settings_sync::fetch_settings(&settings_token).await {
+                match crate::settings_sync::sync_settings(&settings_token).await {
                     Ok(s) => {
                         let _ = settings_handle.emit("settings-synced", &s);
                     }
                     Err(e) => {
-                        eprintln!("[settings-sync] Background fetch failed: {e}");
+                        eprintln!("[settings-sync] Background sync failed: {e}");
                     }
                 }
             });
