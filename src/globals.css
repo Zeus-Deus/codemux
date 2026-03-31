@@ -142,6 +142,13 @@
   transition: opacity 0.1s ease;
 }
 
+/* Prevent terminals, canvases, and iframes from stealing pointer events during pane resize drag */
+body.pane-resizing .xterm,
+body.pane-resizing canvas,
+body.pane-resizing iframe {
+  pointer-events: none !important;
+}
+
 .pane-drop-overlay span {
   font-size: 0.75rem;
   font-weight: 500;

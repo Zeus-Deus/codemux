@@ -42,4 +42,18 @@ describe("keybind-registry", () => {
   it("getRegistryEntry returns undefined for unknown ID", () => {
     expect(getRegistryEntry("nonExistentAction")).toBeUndefined();
   });
+
+  it("registers reload-blocking shortcuts", () => {
+    const blockReload = getRegistryEntry("blockReload");
+    expect(blockReload).toBeDefined();
+    expect(blockReload!.defaultKeys).toBe("Ctrl+R");
+
+    const blockHardReload = getRegistryEntry("blockHardReload");
+    expect(blockHardReload).toBeDefined();
+    expect(blockHardReload!.defaultKeys).toBe("Ctrl+Shift+R");
+
+    const blockF5 = getRegistryEntry("blockF5Reload");
+    expect(blockF5).toBeDefined();
+    expect(blockF5!.defaultKeys).toBe("F5");
+  });
 });

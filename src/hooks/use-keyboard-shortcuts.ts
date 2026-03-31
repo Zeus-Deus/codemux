@@ -177,5 +177,10 @@ function dispatch(actionId: string, _e: KeyboardEvent): boolean {
     return true;
   }
 
+  // Block browser reload shortcuts — returning true triggers preventDefault
+  if (actionId === "blockReload" || actionId === "blockHardReload" || actionId === "blockF5Reload") {
+    return true;
+  }
+
   return false;
 }

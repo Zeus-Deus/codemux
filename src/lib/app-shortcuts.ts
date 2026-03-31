@@ -55,7 +55,6 @@ updateAppShortcuts({});
  * to let the event bubble (return false) or keep it (return true).
  */
 export function isAppShortcut(event: KeyboardEvent): boolean {
-  if (!event.ctrlKey && !event.altKey) return false;
   const key = event.key.toLowerCase();
   return _cached.some(
     (s) =>

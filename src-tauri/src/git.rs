@@ -1100,7 +1100,7 @@ pub fn git_create_worktree(
     Ok(path_str)
 }
 
-pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>) -> Result<(), String> {
+pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
     // Find the main repo by reading .git file in worktree
     let git_file = worktree_path.join(".git");
     let repo_path = if git_file.is_file() {
@@ -1122,10 +1122,43 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>) -> Result
         worktree_path.to_path_buf()
     };
 
-    run_git(
-        &repo_path,
-        &["worktree", "remove", &worktree_path.to_string_lossy(), "--force"],
-    )?;
+    if !force {
+        // Check for uncommitted changes
+        let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
+        let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
+        if dirty_count > 0 {
+            return Err(format!(
+                "Worktree has {dirty_count} uncommitted change(s). Use force to override."
+            ));
+        }
+
+        // Check for unpushed commits (only if upstream exists)
+        let upstream = run_git_permissive(
+            worktree_path,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        );
+        if !upstream.is_empty() && !upstream.contains("fatal") {
+            let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
+            let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
+            if unpushed_count > 0 {
+                return Err(format!(
+                    "Worktree has {unpushed_count} unpushed commit(s). Use force to override."
+                ));
+            }
+        }
+    }
+
+    if force {
+        run_git(
+            &repo_path,
+            &["worktree", "remove", &worktree_path.to_string_lossy(), "--force"],
+        )?;
+    } else {
+        run_git(
+            &repo_path,
+            &["worktree", "remove", &worktree_path.to_string_lossy()],
+        )?;
+    }
 
     // Delete the branch if requested (skip main/master and the repo's current branch)
     if let Some(branch_name) = branch {
@@ -1334,7 +1367,7 @@ C  source.txt -> copy.txt";
         let branches = git_list_branches(&repo, false).expect("list branches");
         assert!(branches.contains(&"feature-test".to_string()), "branch should exist");
 
-        git_remove_worktree(Path::new(&wt_path), Some("feature-test")).expect("remove worktree");
+        git_remove_worktree(Path::new(&wt_path), Some("feature-test"), true).expect("remove worktree");
         assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
 
         let branches_after = git_list_branches(&repo, false).expect("list branches after");
@@ -1352,7 +1385,7 @@ C  source.txt -> copy.txt";
         let info = git_branch_info(Path::new(&wt_path)).expect("branch info");
         assert_eq!(info.branch.as_deref(), Some("existing-branch"));
 
-        git_remove_worktree(Path::new(&wt_path), Some("existing-branch")).expect("cleanup");
+        git_remove_worktree(Path::new(&wt_path), Some("existing-branch"), true).expect("cleanup");
     }
 
     #[test]
@@ -1371,7 +1404,7 @@ C  source.txt -> copy.txt";
         // The worktree should have dev.txt (inherited from develop)
         assert!(PathBuf::from(&wt_path).join("dev.txt").exists(), "should have develop's file");
 
-        git_remove_worktree(Path::new(&wt_path), Some("feature-from-dev")).expect("cleanup");
+        git_remove_worktree(Path::new(&wt_path), Some("feature-from-dev"), true).expect("cleanup");
     }
 
     #[test]
@@ -1387,8 +1420,8 @@ C  source.txt -> copy.txt";
         assert!(branches.iter().any(|b| *b == Some("wt-one")), "should include wt-one");
         assert!(branches.iter().any(|b| *b == Some("wt-two")), "should include wt-two");
 
-        git_remove_worktree(Path::new(&wt1), Some("wt-one")).expect("cleanup wt1");
-        git_remove_worktree(Path::new(&wt2), Some("wt-two")).expect("cleanup wt2");
+        git_remove_worktree(Path::new(&wt1), Some("wt-one"), true).expect("cleanup wt1");
+        git_remove_worktree(Path::new(&wt2), Some("wt-two"), true).expect("cleanup wt2");
     }
 
     #[test]
@@ -1454,7 +1487,7 @@ C  source.txt -> copy.txt";
     fn test_remove_worktree_preserves_main() {
         let (_dir, repo) = setup_test_repo();
         let wt_path = git_create_worktree(&repo, "temp-branch", true, None).expect("create worktree");
-        git_remove_worktree(Path::new(&wt_path), Some("main")).expect("remove with main as branch arg");
+        git_remove_worktree(Path::new(&wt_path), Some("main"), true).expect("remove with main as branch arg");
 
         // main should still exist (it was the branch arg but is protected)
         let branches = git_list_branches(&repo, false).expect("list branches");
@@ -1771,7 +1804,7 @@ C  source.txt -> copy.txt";
         assert_eq!(info.branch.as_deref(), Some("wt-ops-test"));
 
         // Cleanup
-        git_remove_worktree(Path::new(&wt_path_str), Some("wt-ops-test")).expect("cleanup worktree");
+        git_remove_worktree(Path::new(&wt_path_str), Some("wt-ops-test"), true).expect("cleanup worktree");
     }
 
     #[test]
@@ -1815,8 +1848,8 @@ C  source.txt -> copy.txt";
         );
 
         // Cleanup
-        git_remove_worktree(Path::new(&wt2_path), Some("wt-second")).expect("cleanup wt2");
-        git_remove_worktree(Path::new(&wt1_path), Some("wt-first")).expect("cleanup wt1");
+        git_remove_worktree(Path::new(&wt2_path), Some("wt-second"), true).expect("cleanup wt2");
+        git_remove_worktree(Path::new(&wt1_path), Some("wt-first"), true).expect("cleanup wt1");
     }
 
     #[test]
@@ -1834,7 +1867,7 @@ C  source.txt -> copy.txt";
         assert_eq!(dir_name, "feature-deep-nested", "slashes should be replaced with hyphens");
         assert!(PathBuf::from(&wt_path).exists(), "worktree should exist");
 
-        git_remove_worktree(Path::new(&wt_path), Some("feature/deep/nested")).expect("cleanup");
+        git_remove_worktree(Path::new(&wt_path), Some("feature/deep/nested"), true).expect("cleanup");
     }
 
     #[test]
@@ -1861,7 +1894,7 @@ C  source.txt -> copy.txt";
         assert!(branches_before.contains(&"test-delete-me".to_string()), "branch should exist before delete");
 
         // Remove worktree WITH branch deletion (simulates delete with checkbox checked)
-        git_remove_worktree(Path::new(&wt_path), Some("test-delete-me")).expect("remove with branch");
+        git_remove_worktree(Path::new(&wt_path), Some("test-delete-me"), true).expect("remove with branch");
 
         let branches_after = git_list_branches(&repo, false).expect("list after");
         assert!(!branches_after.contains(&"test-delete-me".to_string()), "branch should be gone after delete");
@@ -1877,13 +1910,80 @@ C  source.txt -> copy.txt";
         assert!(branches_before.contains(&"test-keep-me".to_string()), "branch should exist before close");
 
         // Remove worktree WITHOUT branch deletion (simulates close without checkbox)
-        git_remove_worktree(Path::new(&wt_path), None).expect("remove without branch");
+        git_remove_worktree(Path::new(&wt_path), None, true).expect("remove without branch");
 
         let branches_after = git_list_branches(&repo, false).expect("list after");
         assert!(branches_after.contains(&"test-keep-me".to_string()), "branch should still exist after close");
 
         // Clean up the branch manually
         let _ = run_git(&repo, &["branch", "-D", "test-keep-me"]);
+    }
+
+    // ── worktree deletion safety tests ──
+
+    #[test]
+    fn test_remove_worktree_clean_no_force() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "clean-wt", true, None).expect("create worktree");
+
+        // Clean worktree should be removable without force
+        git_remove_worktree(Path::new(&wt_path), Some("clean-wt"), false).expect("should succeed on clean worktree");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+    }
+
+    #[test]
+    fn test_remove_worktree_blocks_dirty() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "dirty-wt", true, None).expect("create worktree");
+
+        // Create uncommitted changes in the worktree
+        std::fs::write(PathBuf::from(&wt_path).join("dirty.txt"), "unsaved work").expect("write");
+
+        let result = git_remove_worktree(Path::new(&wt_path), None, false);
+        assert!(result.is_err(), "should block removal of dirty worktree");
+        let err = result.unwrap_err();
+        assert!(err.contains("uncommitted change"), "error should mention uncommitted changes: {err}");
+        assert!(PathBuf::from(&wt_path).exists(), "worktree should still exist");
+
+        // Cleanup with force
+        git_remove_worktree(Path::new(&wt_path), Some("dirty-wt"), true).expect("force cleanup");
+    }
+
+    #[test]
+    fn test_remove_worktree_force_overrides_dirty() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "force-dirty-wt", true, None).expect("create worktree");
+
+        // Create uncommitted changes
+        std::fs::write(PathBuf::from(&wt_path).join("dirty.txt"), "unsaved work").expect("write");
+
+        // Force should override dirty check
+        git_remove_worktree(Path::new(&wt_path), Some("force-dirty-wt"), true).expect("force should succeed");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+    }
+
+    #[test]
+    fn test_remove_worktree_no_upstream_allowed() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "no-upstream-wt", true, None).expect("create worktree");
+
+        // Commit something in the worktree (no upstream configured)
+        run_git(Path::new(&wt_path), &["-c", "user.name=Test", "-c", "user.email=test@test.com",
+            "commit", "--allow-empty", "-m", "local commit"]).expect("commit");
+
+        // Should succeed since there's no upstream — lenient policy
+        git_remove_worktree(Path::new(&wt_path), Some("no-upstream-wt"), false).expect("should succeed without upstream");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
+    }
+
+    #[test]
+    fn test_remove_worktree_no_upstream_clean_allows_delete() {
+        let (_dir, repo) = setup_test_repo();
+        let wt_path = git_create_worktree(&repo, "local-only-wt", true, None).expect("create worktree");
+
+        // Clean working tree, no upstream — force=false should succeed (lenient policy)
+        git_remove_worktree(Path::new(&wt_path), Some("local-only-wt"), false).expect("clean local-only worktree should be deletable without force");
+        assert!(!PathBuf::from(&wt_path).exists(), "worktree dir should be gone");
     }
 
     // ── merge_branch comprehensive integration tests ──

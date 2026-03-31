@@ -22,6 +22,9 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "toggleSidebar", label: "Toggle sidebar", category: "general", defaultKeys: "Ctrl+B" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
   { id: "closeOverlay", label: "Close overlay", category: "general", defaultKeys: "Escape", description: "Close settings, search, or command palette" },
+  { id: "blockReload", label: "Block reload", category: "general", defaultKeys: "Ctrl+R", description: "Prevents accidental app reload" },
+  { id: "blockHardReload", label: "Block hard reload", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Prevents accidental app reload" },
+  { id: "blockF5Reload", label: "Block F5 reload", category: "general", defaultKeys: "F5", description: "Prevents accidental app reload" },
 
   // ── Search ──
   { id: "fileSearch", label: "Find file by name", category: "search", defaultKeys: "Ctrl+P" },

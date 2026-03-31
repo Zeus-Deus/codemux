@@ -121,8 +121,8 @@ pub fn create_worktree(path: String, branch: String, new_branch: bool, base: Opt
 }
 
 #[tauri::command]
-pub fn remove_worktree(worktree_path: String, branch: Option<String>) -> Result<(), String> {
-    crate::git::git_remove_worktree(Path::new(&worktree_path), branch.as_deref())
+pub fn remove_worktree(worktree_path: String, branch: Option<String>, force: Option<bool>) -> Result<(), String> {
+    crate::git::git_remove_worktree(Path::new(&worktree_path), branch.as_deref(), force.unwrap_or(false))
 }
 
 #[tauri::command]

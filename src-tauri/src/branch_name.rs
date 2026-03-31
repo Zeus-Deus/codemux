@@ -26,7 +26,6 @@ const NOUNS: &[&str] = &[
 /// Sanitize a string into a valid git branch name.
 pub fn sanitize_branch_name(raw: &str) -> String {
     let mut name: String = raw
-        .to_lowercase()
         .chars()
         .map(|c| match c {
             ' ' | '_' => '-',
@@ -195,7 +194,7 @@ mod tests {
 
     #[test]
     fn sanitize_basic() {
-        assert_eq!(sanitize_branch_name("Fix Login Bug"), "fix-login-bug");
+        assert_eq!(sanitize_branch_name("Fix Login Bug"), "Fix-Login-Bug");
     }
 
     #[test]
@@ -235,7 +234,17 @@ mod tests {
 
     #[test]
     fn sanitize_uppercase() {
-        assert_eq!(sanitize_branch_name("FIX-BUG"), "fix-bug");
+        assert_eq!(sanitize_branch_name("FIX-BUG"), "FIX-BUG");
+    }
+
+    #[test]
+    fn sanitize_mixed_case_preserved() {
+        assert_eq!(sanitize_branch_name("Feature/MyBranch"), "FeatureMyBranch");
+    }
+
+    #[test]
+    fn sanitize_camel_case() {
+        assert_eq!(sanitize_branch_name("fixLoginPage"), "fixLoginPage");
     }
 
     #[test]

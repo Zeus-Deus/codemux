@@ -595,7 +595,7 @@ fn worktree_operations_independent() {
     let main_status = git_status(&repo).expect("main status");
     assert!(main_status.is_empty(), "main repo should be clean after wt commit");
 
-    git_remove_worktree(Path::new(&wt_path_str), Some("wt-indep")).expect("cleanup");
+    git_remove_worktree(Path::new(&wt_path_str), Some("wt-indep"), true).expect("cleanup");
 }
 
 #[test]
@@ -620,7 +620,7 @@ fn worktree_status_isolated() {
     assert!(main_status.iter().any(|s| s.path == "main-file.txt"), "main should see main-file");
     assert!(!main_status.iter().any(|s| s.path == "wt-file.txt"), "main should not see wt-file");
 
-    git_remove_worktree(Path::new(&wt_path_str), Some("wt-iso")).expect("cleanup");
+    git_remove_worktree(Path::new(&wt_path_str), Some("wt-iso"), true).expect("cleanup");
 }
 
 #[test]
@@ -651,7 +651,7 @@ fn worktree_commit_not_in_other_log() {
         "worktree log should contain its own commit"
     );
 
-    git_remove_worktree(Path::new(&wt_path_str), Some("wt-log")).expect("cleanup");
+    git_remove_worktree(Path::new(&wt_path_str), Some("wt-log"), true).expect("cleanup");
 }
 
 // ═══════════════════════════════════════

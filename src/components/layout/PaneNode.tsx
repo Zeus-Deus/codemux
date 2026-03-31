@@ -41,6 +41,9 @@ function startResize(
   e.preventDefault();
   e.stopPropagation();
 
+  // Safety: clear stale class from a prior drag interrupted by unmount
+  document.body.classList.remove("pane-resizing");
+
   const container = (e.target as HTMLElement).closest("[data-split-container]");
   if (!container) return;
 
@@ -48,6 +51,7 @@ function startResize(
   const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
   const handle = e.currentTarget as HTMLElement;
   handle.dataset.dragging = "true";
+  document.body.classList.add("pane-resizing");
   let lastSizes: number[] | null = null;
 
   const onMove = (ev: PointerEvent) => {
@@ -82,6 +86,7 @@ function startResize(
 
   const onUp = () => {
     handle.dataset.dragging = "false";
+    document.body.classList.remove("pane-resizing");
     // Persist final sizes to backend once on release
     if (lastSizes) {
       resizeSplit(node.pane_id, lastSizes).catch(console.error);

@@ -495,7 +495,7 @@ pub fn close_workspace_with_worktree(
             } else {
                 None
             };
-            crate::git::git_remove_worktree(Path::new(&wt_path), branch_to_delete)?;
+            crate::git::git_remove_worktree(Path::new(&wt_path), branch_to_delete, true)?;
         }
     }
 
