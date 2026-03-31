@@ -15,9 +15,12 @@ interface UIStore {
   showContentSearch: boolean;
   pendingWorkspaces: PendingWorkspace[];
   lastSelectedAgentId: string | null;
+  showCommandPalette: boolean;
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
   onboardingProjectDir: string | null;
+  /** Callback ref set by AppShell after SidebarProvider mounts */
+  sidebarToggleFn: (() => void) | null;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -31,9 +34,12 @@ interface UIStore {
   removePendingWorkspace: (id: string) => void;
   failPendingWorkspace: (id: string, error: string) => void;
   setLastSelectedAgentId: (id: string | null) => void;
+  setShowCommandPalette: (show: boolean) => void;
+  toggleCommandPalette: () => void;
   setShowCloneDialog: (show: boolean) => void;
   setShowNewProjectScreen: (show: boolean) => void;
   setOnboardingProjectDir: (dir: string | null) => void;
+  setSidebarToggleFn: (fn: (() => void) | null) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -49,9 +55,11 @@ export const useUIStore = create<UIStore>()(
       showContentSearch: false,
       pendingWorkspaces: [],
       lastSelectedAgentId: null,
+      showCommandPalette: false,
       showCloneDialog: false,
       showNewProjectScreen: false,
       onboardingProjectDir: null,
+      sidebarToggleFn: null,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -98,11 +106,16 @@ export const useUIStore = create<UIStore>()(
 
       setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
 
+      setShowCommandPalette: (show) => set({ showCommandPalette: show }),
+      toggleCommandPalette: () => set((s) => ({ showCommandPalette: !s.showCommandPalette })),
+
       setShowCloneDialog: (show) => set({ showCloneDialog: show }),
 
       setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
 
       setOnboardingProjectDir: (dir) => set({ onboardingProjectDir: dir }),
+
+      setSidebarToggleFn: (fn) => set({ sidebarToggleFn: fn }),
     }),
     {
       name: "codemux-ui",

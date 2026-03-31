@@ -24,10 +24,18 @@ import {
   setPresetBarVisible,
   runProjectDevCommand,
 } from "@/tauri/commands";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 
 interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+}
+
+function ShortcutHint({ actionId }: { actionId: string }) {
+  const { getKeysForAction } = useResolvedKeybinds();
+  const keys = getKeysForAction(actionId);
+  if (!keys) return null;
+  return <CommandShortcut>{keys}</CommandShortcut>;
 }
 
 export function CommandPalette({ open, onOpenChange }: Props) {
@@ -90,7 +98,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             Run Dev Command
-            <CommandShortcut>Ctrl+Shift+G</CommandShortcut>
+            <ShortcutHint actionId="runDevCommand" />
           </CommandItem>
         </CommandGroup>
 
@@ -104,7 +112,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             Split Pane Right
-            <CommandShortcut>Ctrl+Shift+D</CommandShortcut>
+            <ShortcutHint actionId="splitPaneRight" />
           </CommandItem>
           <CommandItem
             onSelect={() =>
@@ -125,7 +133,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             Close Pane
-            <CommandShortcut>Ctrl+Shift+W</CommandShortcut>
+            <ShortcutHint actionId="closePane" />
           </CommandItem>
         </CommandGroup>
 
@@ -139,7 +147,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             New Terminal Tab
-            <CommandShortcut>Ctrl+T</CommandShortcut>
+            <ShortcutHint actionId="newTab" />
           </CommandItem>
           <CommandItem
             onSelect={() =>
@@ -153,7 +161,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
             }
           >
             Close Tab
-            <CommandShortcut>Ctrl+W</CommandShortcut>
+            <ShortcutHint actionId="closeTab" />
           </CommandItem>
           <CommandItem
             onSelect={() =>
@@ -180,11 +188,11 @@ export function CommandPalette({ open, onOpenChange }: Props) {
         <CommandGroup heading="Search">
           <CommandItem onSelect={() => run(() => setShowFileSearch(true))}>
             Find File by Name
-            <CommandShortcut>Ctrl+P</CommandShortcut>
+            <ShortcutHint actionId="fileSearch" />
           </CommandItem>
           <CommandItem onSelect={() => run(() => setShowContentSearch(true))}>
             Search in Files
-            <CommandShortcut>Ctrl+Shift+F</CommandShortcut>
+            <ShortcutHint actionId="contentSearch" />
           </CommandItem>
         </CommandGroup>
 
@@ -200,7 +208,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           </CommandItem>
           <CommandItem onSelect={() => run(toggleSidebar)}>
             Toggle Sidebar
-            <CommandShortcut>Ctrl+B</CommandShortcut>
+            <ShortcutHint actionId="toggleSidebar" />
           </CommandItem>
           <CommandItem
             onSelect={() =>
@@ -215,6 +223,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           </CommandItem>
           <CommandItem onSelect={() => run(() => setShowSettings(true))}>
             Open Settings
+            <ShortcutHint actionId="openSettings" />
           </CommandItem>
           <CommandItem
             onSelect={() =>

@@ -115,33 +115,7 @@ const NAV_GROUPS: NavGroup[] = [
 
 const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
 
-const SHORTCUTS = [
-  { category: "General", items: [
-    { action: "Command palette", keys: "Ctrl+K" },
-    { action: "Toggle sidebar", keys: "Ctrl+B" },
-  ]},
-  { category: "Workspaces", items: [
-    { action: "Next workspace", keys: "Ctrl+]" },
-    { action: "Previous workspace", keys: "Ctrl+[" },
-    { action: "Run dev command", keys: "Ctrl+Shift+G" },
-  ]},
-  { category: "Tabs", items: [
-    { action: "New terminal tab", keys: "Ctrl+T" },
-    { action: "Close tab", keys: "Ctrl+W" },
-    { action: "Switch to tab 1–9", keys: "Ctrl+1–9" },
-  ]},
-  { category: "Panes", items: [
-    { action: "Split pane right", keys: "Ctrl+Shift+D" },
-    { action: "Close pane", keys: "Ctrl+Shift+W" },
-    { action: "Focus next pane", keys: "Ctrl+Shift+J" },
-    { action: "Focus previous pane", keys: "Ctrl+Shift+K" },
-  ]},
-  { category: "Terminal", items: [
-    { action: "Copy selection", keys: "Ctrl+Shift+C" },
-    { action: "Paste", keys: "Ctrl+Shift+V" },
-    { action: "Backward kill word", keys: "Ctrl+Backspace" },
-  ]},
-];
+import { KeybindEditor } from "./keybind-editor";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -1052,37 +1026,7 @@ export function SettingsView() {
         );
 
       case "shortcuts":
-        return (
-          <div>
-            <SectionHeader
-              title="Keyboard Shortcuts"
-              description="All available shortcuts. Custom keybinds coming in a future update."
-            />
-            <div className="space-y-6">
-              {SHORTCUTS.map((group) => (
-                <div key={group.category}>
-                  <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground mb-2">
-                    {group.category}
-                  </p>
-                  <div className="space-y-0">
-                    {group.items.map((item) => (
-                      <div
-                        key={item.action}
-                        className="flex items-center justify-between py-2.5"
-                      >
-                        <span className="text-sm">{item.action}</span>
-                        <kbd className="text-xs font-mono text-muted-foreground bg-muted px-2 py-1 rounded-md border border-border">
-                          {item.keys}
-                        </kbd>
-                      </div>
-                    ))}
-                  </div>
-                  <Separator className="mt-2" />
-                </div>
-              ))}
-            </div>
-          </div>
-        );
+        return <KeybindEditor />;
 
       case "agent":
         return (

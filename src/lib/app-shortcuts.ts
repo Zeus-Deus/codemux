@@ -3,48 +3,51 @@
  * xterm.js or other focused components. When the terminal has focus, these
  * keys are blocked from the terminal and bubble up to window-level handlers.
  *
- * Keep in sync with: use-keyboard-shortcuts.ts, app-shell.tsx (Ctrl+K)
+ * Dynamically derived from the keybind registry + user overrides.
  */
 
+import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
+import { parseKeyCombo } from "@/lib/keybind-utils";
+import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
+
 export interface AppShortcut {
-  key: string;    // event.key (lowercase)
+  key: string; // event.key (lowercase)
   ctrl: boolean;
   shift: boolean;
+  alt: boolean;
 }
 
-export const APP_SHORTCUTS: AppShortcut[] = [
-  // Command palette
-  { key: "k", ctrl: true, shift: false },
-  // File search
-  { key: "p", ctrl: true, shift: false },
-  // Content search
-  { key: "f", ctrl: true, shift: true },
-  // Split pane right
-  { key: "d", ctrl: true, shift: true },
-  // Close pane
-  { key: "w", ctrl: true, shift: true },
-  // Run dev command
-  { key: "g", ctrl: true, shift: true },
-  // New tab
-  { key: "t", ctrl: true, shift: false },
-  // Close tab
-  { key: "w", ctrl: true, shift: false },
-  // Toggle sidebar
-  { key: "b", ctrl: true, shift: false },
-  // Cycle workspace forward/backward
-  { key: "]", ctrl: true, shift: false },
-  { key: "[", ctrl: true, shift: false },
-  // Tab switching (Ctrl+1 through Ctrl+9)
-  { key: "1", ctrl: true, shift: false },
-  { key: "2", ctrl: true, shift: false },
-  { key: "3", ctrl: true, shift: false },
-  { key: "4", ctrl: true, shift: false },
-  { key: "5", ctrl: true, shift: false },
-  { key: "6", ctrl: true, shift: false },
-  { key: "7", ctrl: true, shift: false },
-  { key: "8", ctrl: true, shift: false },
-  { key: "9", ctrl: true, shift: false },
-];
+let _cached: AppShortcut[] = [];
+let _lastOverrides: Record<string, string> | null = null;
+
+/** Rebuild the app shortcut list from current overrides. Called by use-keyboard-shortcuts. */
+export function updateAppShortcuts(overrides: Record<string, string>) {
+  if (overrides === _lastOverrides) return;
+  _lastOverrides = overrides;
+
+  const resolved = resolveKeybinds(overrides);
+  const shortcuts: AppShortcut[] = [];
+
+  for (const [id, entry] of resolved.keybindMap) {
+    // Terminal-level shortcuts are handled inside xterm, not intercepted
+    const reg = KEYBIND_REGISTRY.find((e) => e.id === id);
+    if (reg?.when === "terminal") continue;
+    if (!entry.activeKeys) continue;
+
+    const parsed = parseKeyCombo(entry.activeKeys);
+    shortcuts.push({
+      key: parsed.key.toLowerCase(),
+      ctrl: parsed.ctrl,
+      shift: parsed.shift,
+      alt: parsed.alt,
+    });
+  }
+
+  _cached = shortcuts;
+}
+
+// Initialize with defaults on module load
+updateAppShortcuts({});
 
 /**
  * Check if a keyboard event matches any app-level shortcut.
@@ -52,9 +55,13 @@ export const APP_SHORTCUTS: AppShortcut[] = [
  * to let the event bubble (return false) or keep it (return true).
  */
 export function isAppShortcut(event: KeyboardEvent): boolean {
-  if (!event.ctrlKey) return false;
+  if (!event.ctrlKey && !event.altKey) return false;
   const key = event.key.toLowerCase();
-  return APP_SHORTCUTS.some(
-    (s) => s.key === key && s.ctrl === event.ctrlKey && s.shift === event.shiftKey,
+  return _cached.some(
+    (s) =>
+      s.key === key &&
+      s.ctrl === event.ctrlKey &&
+      s.shift === event.shiftKey &&
+      s.alt === event.altKey,
   );
 }

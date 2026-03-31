@@ -111,3 +111,6 @@ export const selectNotificationSoundEnabled = (s: SyncedSettingsState): boolean 
 
 export const selectDesktopNotificationsEnabled = (s: SyncedSettingsState): boolean =>
   s.settings.notifications.desktop_enabled;
+
+export const selectKeyboardShortcuts = (s: SyncedSettingsState): Record<string, string> =>
+  s.settings.keyboard.shortcuts;

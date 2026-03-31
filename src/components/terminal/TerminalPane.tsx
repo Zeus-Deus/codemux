@@ -3,6 +3,9 @@ import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isAppShortcut } from "@/lib/app-shortcuts";
+import { matchesKeyCombo } from "@/lib/keybind-utils";
+import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
+import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
   getTerminalFontSize,
   getTerminalCursorStyle,
@@ -302,16 +305,21 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         }
         return true;
       }
-      // Ctrl+Backspace → Ctrl+W
-      if (ev.ctrlKey && ev.key === "Backspace") {
+      // Terminal-level shortcuts (resolved from keybind registry)
+      const overrides = useSyncedSettingsStore.getState().settings.keyboard.shortcuts;
+      const resolved = resolveKeybinds(overrides);
+      const killCombo = resolved.getKeysForAction("backwardKillWord");
+      const copyCombo = resolved.getKeysForAction("copySelection");
+      const pasteCombo = resolved.getKeysForAction("pasteTerminal");
+
+      if (killCombo && matchesKeyCombo(ev, killCombo)) {
         if (ev.type === "keydown") {
           writeToPty(sid, "\x17").catch(console.error);
         }
         ev.preventDefault?.();
         return false;
       }
-      // Ctrl+Shift+C → copy
-      if (ev.ctrlKey && ev.shiftKey && ev.key === "C") {
+      if (copyCombo && matchesKeyCombo(ev, copyCombo)) {
         if (ev.type === "keydown") {
           const selection = term.getSelection();
           if (selection) navigator.clipboard.writeText(selection).catch(console.error);
@@ -319,8 +327,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         ev.preventDefault?.();
         return false;
       }
-      // Ctrl+Shift+V → paste
-      if (ev.ctrlKey && ev.shiftKey && ev.key === "V") {
+      if (pasteCombo && matchesKeyCombo(ev, pasteCombo)) {
         if (ev.type === "keydown") {
           navigator.clipboard
             .readText()

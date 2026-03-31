@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import {
   PanelLeft,
   Search,
@@ -93,15 +94,11 @@ function WindowControls() {
 // ── Search Trigger ──
 
 function SearchTrigger() {
+  const { getKeysForAction } = useResolvedKeybinds();
+  const toggleCombo = getKeysForAction("commandPalette");
+
   const handleClick = useCallback(() => {
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key: "k",
-        code: "KeyK",
-        ctrlKey: true,
-        bubbles: true,
-      }),
-    );
+    useUIStore.getState().toggleCommandPalette();
   }, []);
 
   return (
@@ -113,12 +110,21 @@ function SearchTrigger() {
       >
         <Search className="h-3 w-3 shrink-0" />
         <span className="truncate">Search...</span>
-        <kbd className="ml-auto shrink-0 text-[10px] text-muted-foreground/60 border border-border/40 rounded px-1 py-px">
-          Ctrl+K
-        </kbd>
+        {toggleCombo && (
+          <kbd className="ml-auto shrink-0 text-[10px] text-muted-foreground/60 border border-border/40 rounded px-1 py-px">
+            {toggleCombo}
+          </kbd>
+        )}
       </button>
     </div>
   );
+}
+
+function SettingsShortcutHint() {
+  const { getKeysForAction } = useResolvedKeybinds();
+  const keys = getKeysForAction("openSettings");
+  if (!keys) return null;
+  return <kbd className="ml-auto text-[10px] text-muted-foreground">{keys}</kbd>;
 }
 
 // ── App Menu ──
@@ -155,7 +161,7 @@ function AppMenu() {
         >
           <Settings className="h-4 w-4" />
           <span>Settings</span>
-          <kbd className="ml-auto text-[10px] text-muted-foreground">Ctrl+,</kbd>
+          <SettingsShortcutHint />
         </DropdownMenuItem>
         <DropdownMenuItem
           onClick={() => setShowSettings(true, "shortcuts")}

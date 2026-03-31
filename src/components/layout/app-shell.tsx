@@ -23,22 +23,18 @@ export function AppShell() {
   );
   const showSettings = useUIStore((s) => s.showSettings);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
-  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
+  const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
   useEffect(() => {
     useSettingsStore.getState().load();
   }, []);
 
+  // Register sidebar toggle in UIStore so the central keyboard hook can call it
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === "k") {
-        e.preventDefault();
-        setCommandPaletteOpen((o) => !o);
-      }
-    };
-    window.addEventListener("keydown", handler);
-    return () => window.removeEventListener("keydown", handler);
+    useUIStore.getState().setSidebarToggleFn(() => setSidebarOpen((o) => !o));
+    return () => useUIStore.getState().setSidebarToggleFn(null);
   }, []);
 
   if (isLoading || !settingsLoaded || syncedLoading) {
