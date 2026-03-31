@@ -1,10 +1,10 @@
 # Git Bot — AI-Powered Merge Conflict Resolution
 
-- Purpose: Design doc for the Git Bot feature — an AI agent that resolves merge conflicts on temporary branches.
-- Audience: Anyone implementing or reviewing this feature.
-- Authority: Active plan only, not current truth.
-- Update when: Design decisions, priorities, or open questions change.
-- Read next: `docs/features/openflow.md`, `docs/core/STATUS.md`
+- Purpose: Track remaining work and hardening priorities for the merge resolver.
+- Audience: Anyone improving or validating the merge resolver.
+- Authority: Active work plan, not current truth. See `docs/features/merge-resolver.md` for current capability.
+- Update when: Priorities, open questions, or hardening targets change.
+- Read next: `docs/features/merge-resolver.md`, `docs/core/STATUS.md`
 
 ## Goal
 
@@ -89,9 +89,15 @@ A dedicated AI agent that resolves merge conflicts using a user-selected model. 
 
 ## Already Landed
 
-- (none — this is a planned feature, not yet implemented)
+- Temporary branch creation and cleanup (`create_resolver_branch`, `abort_resolution`)
+- AI agent invocation for conflict resolution (`resolve_conflicts_with_agent`)
+- Resolution diff generation and review (`get_resolution_diff`)
+- Apply resolution with merge (`apply_resolution`)
+- Frontend state machine with full lifecycle tracking (`ai-merge-store.ts`)
+- Integration points in Changes panel and PR panel
+- Settings for CLI tool and model selection
 
 ## Notes
 
-- This is a planned feature — not yet implemented.
-- Keep this file about design decisions and next steps. Move implementation details to `docs/features/git-bot.md` once work begins.
+- Current capability documented in `docs/features/merge-resolver.md`.
+- Keep this file about remaining hardening work and open questions.

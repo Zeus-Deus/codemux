@@ -24,7 +24,7 @@ The repo structure is clean and domain-split:
 - Pane splits, resize, drag-swap, close
 - Git worktree-based workspaces (create from new/existing branch, import orphans)
 - Built-in diff viewer / Changes panel (right sidebar, stage/unstage/commit/push)
-- File tree panel (right sidebar, lazy-loaded, opens in external editor)
+- File tree panel (right sidebar, lazy-loaded, opens in built-in editor or external editor)
 - Search: keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+P via fd)
 - Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge)
 - Port detection (auto-scan, sidebar display, open in browser)
@@ -42,12 +42,14 @@ The repo structure is clean and domain-split:
 - Per-user synced settings with server sync, offline cache, and dirty flag
 - Neutral dark shell theming with Omarchy accent sync
 - Sans-serif shell chrome, monospace terminals
-- MCP server exposing 70+ tools via JSON-RPC 2.0
+- Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
+- MCP server exposing 26 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
 
 ## Partial / Being Hardened
 
 - Browser pane: screenshot-driven, functional but lower fidelity than native
 - OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
+- AI merge resolver: backend and frontend working, needs testing depth and live validation
 - Session persistence: layout persists, scrollback lost on restart
 - Browser automation depth: basic commands work, missing wait conditions and DOM inspection
 
@@ -87,9 +89,10 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 - Context menus on workspace rows, section headers, and pane headers (Radix primitive exists but not wired up everywhere)
 - Notification sound playback (toggle exists in settings and state, but no actual audio output)
 - Memory drawer UI (backend memory system exists, no frontend drawer/panel yet)
+- File editor: no LSP integration, no multi-cursor, no rename/delete from editor
 
 ## Read This With
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/browser.md` or `docs/features/openflow.md` for subsystem detail
+- `docs/features/browser.md`, `docs/features/openflow.md`, `docs/features/mcp-server.md`, `docs/features/file-editor.md`, or `docs/features/merge-resolver.md` for subsystem detail

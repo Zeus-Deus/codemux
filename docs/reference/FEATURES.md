@@ -118,6 +118,34 @@
 - Project memory persisted independently per project root
 - Debounced disk writes (500ms quiet period) to prevent write amplification
 
+## File Editor
+
+- Built-in code editor using CodeMirror 6 with syntax highlighting
+- Open files from file tree or search results as editor tabs
+- Language support for 20+ languages (JS, TS, Rust, Python, Go, etc.)
+- Markdown rendered preview mode
+- Dirty state tracking with modified indicator on tabs
+- Custom dark theme matching Codemux shell
+- File tree with `.gitignore` awareness and common directory exclusion
+- 2 MB file size limit, UTF-8 only, binary file detection
+
+## AI Merge Resolver
+
+- AI-powered merge conflict resolution on temporary branches
+- Safety model: never touches real branches without explicit user approval
+- Temporary branch creation (`bot/merge-*`), resolution, diff review, approve/reject
+- Configurable CLI tool and model for the resolver agent
+- Entry points in Changes panel and PR panel
+- Full state machine: idle → creating_branch → resolving → review → applying
+
+## MCP Server
+
+- JSON-RPC 2.0 MCP server over stdio transport (26 tools)
+- Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
+- Workspace, pane, notification, and git tools for agent self-orchestration
+- Auto-configuration for Claude Code and Claude Desktop
+- Launched via `codemux mcp`
+
 ## CLI / Socket Control
 
 - Unix socket server at `$XDG_RUNTIME_DIR/codemux.sock`

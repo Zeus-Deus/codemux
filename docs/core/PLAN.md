@@ -56,7 +56,9 @@
 
 ## Recently Completed
 
-- MCP server for agent self-orchestration (70+ tools exposed via JSON-RPC 2.0)
+- Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
+- AI merge conflict resolver with temp-branch safety model
+- MCP server for agent self-orchestration (26 tools via JSON-RPC 2.0)
 - Settings panel (keyboard shortcuts, appearance, project scripts)
 - Auth system (GitHub OAuth, email/password, email verification)
 - Synced settings (per-user server-synced with offline cache)

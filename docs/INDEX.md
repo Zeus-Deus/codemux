@@ -34,6 +34,9 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
+- MCP server: `docs/features/mcp-server.md`
+- File editor: `docs/features/file-editor.md`
+- Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`
