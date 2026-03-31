@@ -281,7 +281,7 @@ pub fn apply_preset(
                     let sessions = sessions_arc.clone();
                     let sid = session_id.0.clone();
                     let cmd = command.clone();
-                    write_command_when_ready(sessions, sid, cmd);
+                    write_command_when_ready(sessions, sid, cmd, 120);
                 }
             }
         }
@@ -306,7 +306,7 @@ pub fn apply_preset(
                 for sid in session_ids {
                     let sessions = sessions_arc.clone();
                     let cmd = combined.clone();
-                    write_command_when_ready(sessions, sid, cmd);
+                    write_command_when_ready(sessions, sid, cmd, 120);
                 }
             }
         }
@@ -328,7 +328,7 @@ pub fn apply_preset(
                         let sessions = sessions_arc.clone();
                         let sid = session_id.0.clone();
                         let cmd = command.clone();
-                        write_command_when_ready(sessions, sid, cmd);
+                        write_command_when_ready(sessions, sid, cmd, 120);
                     }
                 }
             }
@@ -391,54 +391,122 @@ fn write_command_to_pty(
     }
 }
 
-/// Write a command string to a newly-spawned PTY after the shell is ready.
-/// Polls for the PTY writer to become available (every 50ms, up to 5s timeout),
-/// then waits an additional 150ms for the shell prompt to finish rendering
-/// before writing the plain command text + newline.
+/// Write a command to a newly-spawned PTY after the shell is ready.
+///
+/// Phase 1: Polls for `writer.is_some()` (every 50ms, up to 5s).
+/// Phase 2: Detects shell readiness via quiet-after-output heuristic — waits
+///          until PTY output has arrived and then gone quiet for `settle_ms`.
+///
+/// Callers are low-frequency (preset application, workspace creation),
+/// so thread-per-command is acceptable.
 pub(crate) fn write_command_when_ready(
     sessions: Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: String,
     command: String,
+    settle_ms: u64,
 ) {
     std::thread::spawn(move || {
-        // Poll until the PTY writer is available (shell process spawned).
-        let max_attempts = 100; // 100 × 50ms = 5s timeout
-        let mut writer_found = false;
-        for _ in 0..max_attempts {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let ready = {
-                let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .get(&session_id)
-                    .map(|rt| rt.writer.is_some())
-                    .unwrap_or(false)
-            };
-            if ready {
-                writer_found = true;
-                break;
-            }
-        }
-
-        if !writer_found {
-            eprintln!(
-                "[codemux::presets] Timeout waiting for PTY writer for session {session_id}"
-            );
-            return;
-        }
-
-        // Let the shell prompt finish rendering before sending the command.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-
-        // Write only the plain command text followed by a newline.
-        let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(runtime) = guard.get_mut(&session_id) {
-            if let Some(writer) = runtime.writer.as_mut() {
-                let _ = writer.write_all(command.as_bytes());
-                let _ = writer.write_all(b"\n");
-                let _ = writer.flush();
-            }
-        }
+        wait_and_write_command(&sessions, &session_id, &command, settle_ms);
     });
+}
+
+/// Synchronous core of `write_command_when_ready`. Blocks the calling thread.
+fn wait_and_write_command(
+    sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
+    session_id: &str,
+    command: &str,
+    settle_ms: u64,
+) {
+    let overall_start = std::time::Instant::now();
+    let overall_timeout = std::time::Duration::from_secs(5);
+
+    // Phase 1: Poll until the PTY writer is available (shell process spawned).
+    let mut writer_found = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if overall_start.elapsed() >= overall_timeout {
+            break;
+        }
+        let ready = {
+            let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(session_id)
+                .map(|rt| rt.writer.is_some())
+                .unwrap_or(false)
+        };
+        if ready {
+            writer_found = true;
+            break;
+        }
+    }
+
+    if !writer_found {
+        eprintln!(
+            "[codemux::presets] Timeout waiting for PTY writer for session {session_id}"
+        );
+        return;
+    }
+
+    // Phase 2: Wait for shell output to arrive and then go quiet.
+    let quiet_threshold = std::time::Duration::from_millis(settle_ms);
+    let poll_interval = std::time::Duration::from_millis(30);
+
+    let initial_len = {
+        let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get(session_id)
+            .map(|rt| rt.pending_output.len())
+            .unwrap_or(0)
+    };
+
+    let mut snapshot_len = initial_len;
+    let mut last_growth = std::time::Instant::now();
+    // If output already arrived during Phase 1, start quiet timer immediately.
+    let mut saw_output = initial_len > 0;
+    let mut detection_method = "timeout_fallback";
+
+    loop {
+        std::thread::sleep(poll_interval);
+
+        if overall_start.elapsed() >= overall_timeout {
+            break;
+        }
+
+        let current_len = {
+            let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .get(session_id)
+                .map(|rt| rt.pending_output.len())
+                .unwrap_or(0)
+        };
+
+        if current_len > snapshot_len {
+            snapshot_len = current_len;
+            last_growth = std::time::Instant::now();
+            saw_output = true;
+        }
+
+        if saw_output && last_growth.elapsed() >= quiet_threshold {
+            detection_method = "quiet_detected";
+            break;
+        }
+    }
+
+    eprintln!(
+        "[codemux::presets] Shell readiness for {session_id}: {detection_method} \
+         (output_chunks={snapshot_len}, elapsed={:?})",
+        overall_start.elapsed()
+    );
+
+    // Write the plain command text followed by a newline.
+    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(runtime) = guard.get_mut(session_id) {
+        if let Some(writer) = runtime.writer.as_mut() {
+            let _ = writer.write_all(command.as_bytes());
+            let _ = writer.write_all(b"\n");
+            let _ = writer.flush();
+        }
+    }
 }
 
 /// Check whether a command's binary exists on the system via `which`.
@@ -455,4 +523,102 @@ fn command_binary_exists(command: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::terminal::SessionRuntime;
+    use std::collections::HashMap;
+
+    fn make_sessions() -> Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>> {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Helper: create a session with a mock writer (a Vec<u8> sink).
+    fn insert_session_with_writer(
+        sessions: &Arc<std::sync::Mutex<HashMap<String, SessionRuntime>>>,
+        session_id: &str,
+    ) {
+        let mut guard = sessions.lock().unwrap();
+        let mut runtime = SessionRuntime::new(session_id);
+        // Use a Vec<u8> as a mock writer (implements Write)
+        let mock_writer: Box<dyn Write + Send> = Box::new(Vec::<u8>::new());
+        runtime.writer = Some(mock_writer);
+        guard.insert(session_id.to_string(), runtime);
+    }
+
+    #[test]
+    fn test_write_command_to_pty_immediate() {
+        let sessions = make_sessions();
+        insert_session_with_writer(&sessions, "sess");
+
+        write_command_to_pty(&sessions, "sess", "echo hello");
+
+        // Verify command was written
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        let writer = runtime.writer.as_ref().unwrap();
+        // Downcast to check contents — the writer is a Vec<u8>
+        let writer_ptr = writer.as_ref() as *const dyn Write as *const Vec<u8>;
+        let written = unsafe { &*writer_ptr };
+        assert_eq!(written, b"echo hello\n");
+    }
+
+    #[test]
+    fn test_quiet_detection() {
+        let sessions = make_sessions();
+        insert_session_with_writer(&sessions, "sess");
+
+        let sessions_clone = sessions.clone();
+        // Simulate shell startup output from a background thread
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut guard = sessions_clone.lock().unwrap();
+            let runtime = guard.get_mut("sess").unwrap();
+            runtime.pending_output.push_back(vec![b'$', b' ']);
+        });
+
+        let start = std::time::Instant::now();
+        // Call synchronous core directly with short settle time
+        wait_and_write_command(&sessions, "sess", "test-cmd", 80);
+        let elapsed = start.elapsed();
+
+        producer.join().unwrap();
+
+        // Should have detected quiet and fired, not hit the 5s timeout
+        assert!(elapsed < std::time::Duration::from_secs(2), "should detect quiet quickly, took {elapsed:?}");
+    }
+
+    #[test]
+    fn test_hard_timeout() {
+        let sessions = make_sessions();
+        insert_session_with_writer(&sessions, "sess");
+        // No output will ever be produced — should hit the hard timeout
+
+        let start = std::time::Instant::now();
+        wait_and_write_command(&sessions, "sess", "timeout-cmd", 120);
+        let elapsed = start.elapsed();
+
+        // Should have taken approximately 5s (the hard timeout)
+        assert!(elapsed >= std::time::Duration::from_secs(4), "should wait near full timeout, took {elapsed:?}");
+        assert!(elapsed < std::time::Duration::from_secs(7), "should not exceed timeout significantly");
+    }
+
+    #[test]
+    fn test_writer_not_found_timeout() {
+        let sessions = make_sessions();
+        // Session exists but with NO writer (simulates spawn failure)
+        {
+            let mut guard = sessions.lock().unwrap();
+            guard.insert("no-writer".to_string(), SessionRuntime::new("no-writer"));
+        }
+
+        let start = std::time::Instant::now();
+        wait_and_write_command(&sessions, "no-writer", "cmd", 120);
+        let elapsed = start.elapsed();
+
+        // Should timeout waiting for writer (~5s)
+        assert!(elapsed >= std::time::Duration::from_secs(4), "should wait for writer timeout");
+    }
 }

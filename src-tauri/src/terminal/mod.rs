@@ -5,6 +5,8 @@ use std::env;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::RawFd;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -75,6 +77,10 @@ fn strip_ansi_codes(s: &str) -> String {
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
 const OUTPUT_BUFFER_LIMIT: usize = 1024;
+/// PTY output batching: flush after this many accumulated bytes.
+const PTY_BATCH_SIZE: usize = 32_768;
+/// PTY output batching: flush after this much time since last flush (~1 frame at 60 Hz).
+const PTY_BATCH_INTERVAL: Duration = Duration::from_millis(16);
 /// Safety cap so we never spawn hundreds of PTYs on startup (e.g. after corrupted or stale persisted state).
 const MAX_STARTUP_SESSIONS: usize = 50;
 
@@ -105,7 +111,7 @@ pub struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    fn new(session_id: &str) -> Self {
+    pub(crate) fn new(session_id: &str) -> Self {
         Self {
             writer: None,
             master: None,
@@ -168,6 +174,15 @@ fn with_session_runtime<T>(
     f(runtime)
 }
 
+fn with_existing_session_runtime<T>(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    f: impl FnOnce(&mut SessionRuntime) -> T,
+) -> Option<T> {
+    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_mut(session_id).map(f)
+}
+
 fn emit_terminal_status(
     app: &AppHandle,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
@@ -181,14 +196,26 @@ fn emit_terminal_status(
         payload.exit_code,
     );
 
-    with_session_runtime(
-        sessions,
-        &payload.session_id,
-        || SessionRuntime::new(&payload.session_id),
-        |runtime| {
-            runtime.last_status = payload.clone();
-        },
-    );
+    // For terminal states (Failed/Exited), don't create a new SessionRuntime
+    // entry — the session is done. For Starting/Ready, use or_insert to ensure
+    // the entry exists.
+    match payload.state {
+        TerminalLifecycleState::Failed | TerminalLifecycleState::Exited => {
+            with_existing_session_runtime(sessions, &payload.session_id, |runtime| {
+                runtime.last_status = payload.clone();
+            });
+        }
+        _ => {
+            with_session_runtime(
+                sessions,
+                &payload.session_id,
+                || SessionRuntime::new(&payload.session_id),
+                |runtime| {
+                    runtime.last_status = payload.clone();
+                },
+            );
+        }
+    }
 
     // On terminal exit, clear transient pane status (working/permission → idle)
     if matches!(
@@ -226,6 +253,104 @@ fn queue_or_send_output(
             }
         },
     );
+}
+
+/// Flush accumulated PTY output as a single batched chunk.
+/// Resets `batch` and `last_flush` after flushing.
+fn flush_pty_batch(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    batch: &mut Vec<u8>,
+    last_flush: &mut Instant,
+) {
+    if !batch.is_empty() {
+        let chunk = std::mem::take(batch);
+        queue_or_send_output(sessions, session_id, chunk);
+        *last_flush = Instant::now();
+    }
+}
+
+/// Poll a file descriptor for read-readiness with a timeout.
+/// Returns true if data is available (POLLIN) or the fd is dead (POLLHUP/POLLERR),
+/// meaning the caller should attempt read() to get data or discover the error.
+/// Returns false on timeout (no events within timeout_ms).
+/// Retries on EINTR (signal interruption).
+#[cfg(unix)]
+fn poll_read_ready(fd: RawFd, timeout_ms: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // Safety: pfd is a valid pollfd struct on the stack.
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() == Some(libc::EINTR) {
+                continue; // Interrupted by signal, retry
+            }
+            // Other poll error (e.g. EBADF) — return true so caller
+            // hits read() which will surface the actual error.
+            return true;
+        }
+        return ret > 0 && (pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR)) != 0;
+    }
+}
+
+/// Batched PTY reader loop. Uses poll() to guarantee pending data is flushed
+/// within PTY_BATCH_INTERVAL even when no more output arrives.
+///
+/// `poll_fd` is the raw fd for the PTY master (used for poll readiness checks).
+/// `reader` is the cloned reader (a dup of the same fd, used for actual reads).
+/// `pre_read_hook` is called with each read's raw data before it's batched,
+/// allowing per-read processing (e.g. comm log in the agent loop).
+#[cfg(unix)]
+fn batched_reader_loop(
+    reader: &mut dyn Read,
+    poll_fd: RawFd,
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    mut pre_read_hook: impl FnMut(&[u8]),
+) {
+    let mut buf = [0u8; 4096];
+    let mut batch: Vec<u8> = Vec::with_capacity(PTY_BATCH_SIZE);
+    let mut last_flush = Instant::now();
+    let timeout_ms = PTY_BATCH_INTERVAL.as_millis() as i32;
+
+    loop {
+        // If the batch has data, use a timed poll so we flush on timeout.
+        // If the batch is empty, block indefinitely until data arrives.
+        let poll_timeout = if batch.is_empty() { -1 } else { timeout_ms };
+
+        if !poll_read_ready(poll_fd, poll_timeout) {
+            // Timeout with no new data — flush pending batch.
+            flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+            continue;
+        }
+
+        match reader.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let data = &buf[..n];
+                pre_read_hook(data);
+                batch.extend_from_slice(data);
+                if batch.len() >= PTY_BATCH_SIZE
+                    || last_flush.elapsed() >= PTY_BATCH_INTERVAL
+                {
+                    flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                }
+            }
+            Ok(_) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                break;
+            }
+            Err(error) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                eprintln!("[codemux::terminal] PTY read error: {error}");
+                break;
+            }
+        }
+    }
 }
 
 fn default_shell() -> String {
@@ -269,6 +394,37 @@ fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -
         .find(|session| session.session_id.0 == session_id)
         .map(|session| session.cwd)
         .unwrap_or_else(|| current_project_root().display().to_string())
+}
+
+/// RAII guard that kills and waits on a PTY child process if not explicitly
+/// disarmed. Prevents zombie processes when spawn_pty_for_session or
+/// spawn_pty_for_agent encounters an error after the child has been spawned.
+struct ChildGuard {
+    child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
+}
+
+impl ChildGuard {
+    fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
+        Self {
+            child: Some(child),
+        }
+    }
+
+    /// Take ownership of the child, disarming the guard.
+    /// Call this once the child is handed off to the waiter thread.
+    fn disarm(mut self) -> Box<dyn portable_pty::Child + Send + Sync> {
+        self.child.take().expect("ChildGuard already disarmed")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            eprintln!("[codemux::terminal] Killing orphaned child process");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
@@ -363,7 +519,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
 
-    let mut child = match pty_pair.slave.spawn_command(cmd) {
+    let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(error) => {
             emit_terminal_status(
@@ -380,7 +536,10 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         }
     };
 
-    let child_pid = child.process_id();
+    // Wrap child in a guard that kills+waits on drop, preventing zombies
+    // if a subsequent step fails before the waiter thread is spawned.
+    let guard = ChildGuard::new(child);
+    let child_pid = guard.child.as_ref().and_then(|c| c.process_id());
 
     drop(pty_pair.slave);
 
@@ -391,13 +550,14 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to clone PTY reader: {error}")),
                     exit_code: None,
                 },
             );
-            return;
+            remove_session_runtime(&sessions, &session_id);
+            return; // guard drops here, kills+waits on child
         }
     };
 
@@ -408,15 +568,23 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to take PTY writer: {error}")),
                     exit_code: None,
                 },
             );
-            return;
+            remove_session_runtime(&sessions, &session_id);
+            return; // guard drops here, kills+waits on child
         }
     };
+
+    // All resources acquired — disarm the guard and hand child to the waiter thread.
+    let mut child = guard.disarm();
+
+    // Extract the raw fd for poll() before moving master into SessionRuntime.
+    // The reader fd is a dup of this fd, so polling either detects data on both.
+    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
 
     with_session_runtime(
         &sessions,
@@ -443,20 +611,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let chunk = buf[..n].to_vec();
-                    queue_or_send_output(&read_sessions, &read_session_id, chunk);
-                }
-                Ok(_) => break,
-                Err(error) => {
-                    eprintln!("[codemux::terminal] PTY read error: {error}");
-                    break;
-                }
-            }
-        }
+        batched_reader_loop(&mut reader, poll_fd, &read_sessions, &read_session_id, |_| {});
     });
 
     let wait_app = app.clone();
@@ -999,7 +1154,7 @@ pub fn spawn_pty_for_agent(
         },
     );
 
-    let mut child = match pty_pair.slave.spawn_command(cmd) {
+    let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(error) => {
             emit_terminal_status(
@@ -1016,7 +1171,8 @@ pub fn spawn_pty_for_agent(
         }
     };
 
-    let child_pid = child.process_id();
+    let guard = ChildGuard::new(child);
+    let child_pid = guard.child.as_ref().and_then(|c| c.process_id());
 
     drop(pty_pair.slave);
 
@@ -1027,13 +1183,14 @@ pub fn spawn_pty_for_agent(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to clone PTY reader for agent: {error}")),
                     exit_code: None,
                 },
             );
-            return;
+            remove_session_runtime(&sessions, &session_id);
+            return; // guard drops here, kills+waits on child
         }
     };
 
@@ -1044,15 +1201,20 @@ pub fn spawn_pty_for_agent(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to take PTY writer for agent: {error}")),
                     exit_code: None,
                 },
             );
-            return;
+            remove_session_runtime(&sessions, &session_id);
+            return; // guard drops here, kills+waits on child
         }
     };
+
+    let mut child = guard.disarm();
+
+    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
 
     with_session_runtime(
         &sessions,
@@ -1101,69 +1263,61 @@ pub fn spawn_pty_for_agent(
         };
 
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
         let mut comm_log_buffer: Vec<String> = Vec::new();
-        let mut last_flush = Instant::now();
+        let mut comm_last_flush = Instant::now();
 
-        loop {
-            match reader.read(&mut buf) {
-                Ok(n) if n > 0 => {
-                    let chunk = buf[..n].to_vec();
+        batched_reader_loop(
+            &mut reader,
+            poll_fd,
+            &read_sessions,
+            &read_session_id,
+            |data| {
+                // Buffer agent output for communication log (cleaned); flush periodically
+                if let Some((ref log_lock, ref role)) = log_lock_opt {
+                    if let Ok(text) = std::str::from_utf8(data) {
+                        let cleaned = strip_ansi_codes(text);
+                        let trimmed = cleaned.trim();
 
-                    // Buffer agent output for communication log (cleaned); flush periodically
-                    if let Some((ref log_lock, ref role)) = log_lock_opt {
-                        if let Ok(text) = String::from_utf8(chunk.clone()) {
-                            let cleaned = strip_ansi_codes(&text);
-                            let trimmed = cleaned.trim();
-
-                            if !trimmed.is_empty()
-                                && trimmed.len() > 2
-                                && !trimmed.starts_with('\x1b')
-                                && !trimmed.starts_with("No orchestration progress detected")
-                                && !trimmed.starts_with("STOP: General Agent")
-                                && !trimmed.chars().all(|c| {
-                                    c.is_whitespace()
-                                        || c == '▀'
-                                        || c == '▄'
-                                        || c == '█'
-                                        || c == ' '
-                                })
+                        if !trimmed.is_empty()
+                            && trimmed.len() > 2
+                            && !trimmed.starts_with('\x1b')
+                            && !trimmed.starts_with("No orchestration progress detected")
+                            && !trimmed.starts_with("STOP: General Agent")
+                            && !trimmed.chars().all(|c| {
+                                c.is_whitespace()
+                                    || c == '\u{2580}'
+                                    || c == '\u{2584}'
+                                    || c == '\u{2588}'
+                                    || c == ' '
+                            })
+                        {
+                            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                            let entry = format!(
+                                "[{}] [{}] {}\n",
+                                timestamp,
+                                role.to_uppercase(),
+                                trimmed
+                            );
+                            comm_log_buffer.push(entry);
+                            if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
+                                || comm_last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
                             {
-                                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let entry = format!(
-                                    "[{}] [{}] {}\n",
-                                    timestamp,
-                                    role.to_uppercase(),
-                                    trimmed
-                                );
-                                comm_log_buffer.push(entry);
-                                if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
-                                    || last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
-                                {
-                                    if let Ok(mut file) = log_lock.lock() {
-                                        for e in &comm_log_buffer {
-                                            let _ = file.write_all(e.as_bytes());
-                                        }
-                                        let _ = file.flush();
+                                if let Ok(mut file) = log_lock.lock() {
+                                    for e in &comm_log_buffer {
+                                        let _ = file.write_all(e.as_bytes());
                                     }
-                                    comm_log_buffer.clear();
-                                    last_flush = Instant::now();
+                                    let _ = file.flush();
                                 }
+                                comm_log_buffer.clear();
+                                comm_last_flush = Instant::now();
                             }
                         }
                     }
-
-                    queue_or_send_output(&read_sessions, &read_session_id, chunk);
                 }
-                Ok(_) => break,
-                Err(error) => {
-                    eprintln!("[codemux::terminal] Agent PTY read error: {error}");
-                    break;
-                }
-            }
-        }
+            },
+        );
 
-        // Flush any remaining buffered entries
+        // Flush any remaining comm log entries
         if let Some((ref log_lock, _)) = log_lock_opt {
             if !comm_log_buffer.is_empty() {
                 if let Ok(mut file) = log_lock.lock() {
@@ -1298,4 +1452,209 @@ pub fn spawn_pty_for_agent(
 
         state::emit_app_state(&wait_app);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn test_failed_status_does_not_create_ghost_entry() {
+        let sessions = make_sessions();
+
+        // with_existing_session_runtime should not create an entry
+        let result = with_existing_session_runtime(&sessions, "ghost-session", |runtime| {
+            runtime.last_status.state = TerminalLifecycleState::Failed;
+        });
+
+        assert!(result.is_none(), "should not create entry for non-existent session");
+        let guard = sessions.lock().unwrap();
+        assert!(!guard.contains_key("ghost-session"), "no ghost entry should exist");
+    }
+
+    #[test]
+    fn test_starting_status_creates_entry() {
+        let sessions = make_sessions();
+
+        with_session_runtime(
+            &sessions,
+            "new-session",
+            || SessionRuntime::new("new-session"),
+            |runtime| {
+                runtime.last_status = TerminalStatusPayload {
+                    session_id: "new-session".to_string(),
+                    state: TerminalLifecycleState::Starting,
+                    message: Some("Starting shell...".into()),
+                    exit_code: None,
+                };
+            },
+        );
+
+        let guard = sessions.lock().unwrap();
+        assert!(guard.contains_key("new-session"), "Starting should create entry");
+    }
+
+    #[test]
+    fn test_get_session_pids_no_stale_after_cleanup() {
+        let pty_state = PtyState::default();
+        let sessions = pty_state.sessions.clone();
+
+        with_session_runtime(&sessions, "sess-1", || SessionRuntime::new("sess-1"), |runtime| {
+            runtime.child_pid = Some(12345);
+        });
+        assert_eq!(pty_state.get_session_pids().len(), 1);
+
+        // Simulate cleanup: update status then remove
+        with_existing_session_runtime(&sessions, "sess-1", |runtime| {
+            runtime.last_status.state = TerminalLifecycleState::Failed;
+        });
+        remove_session_runtime(&sessions, "sess-1");
+
+        assert!(pty_state.get_session_pids().is_empty(), "no stale pids after cleanup");
+    }
+
+    #[test]
+    fn test_queue_or_send_output_buffers_chunks() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "sess", || SessionRuntime::new("sess"), |_| {});
+
+        queue_or_send_output(&sessions, "sess", vec![1, 2, 3]);
+        queue_or_send_output(&sessions, "sess", vec![4, 5, 6]);
+
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        assert_eq!(runtime.pending_output.len(), 2);
+        assert_eq!(runtime.pending_output[0], vec![1, 2, 3]);
+        assert_eq!(runtime.pending_output[1], vec![4, 5, 6]);
+    }
+
+    #[test]
+    fn test_ring_buffer_eviction() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "sess", || SessionRuntime::new("sess"), |_| {});
+
+        for i in 0..OUTPUT_BUFFER_LIMIT + 10 {
+            queue_or_send_output(&sessions, "sess", vec![i as u8]);
+        }
+
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_LIMIT);
+        // Oldest 10 evicted; first remaining is chunk #10
+        assert_eq!(runtime.pending_output[0], vec![10]);
+    }
+
+    #[test]
+    fn test_flush_pty_batch_sends_and_resets() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "sess", || SessionRuntime::new("sess"), |_| {});
+
+        let mut batch = vec![1u8, 2, 3, 4, 5];
+        let mut last_flush = Instant::now() - Duration::from_secs(1);
+
+        flush_pty_batch(&sessions, "sess", &mut batch, &mut last_flush);
+
+        assert!(batch.is_empty(), "batch should be cleared after flush");
+        assert!(last_flush.elapsed() < Duration::from_millis(100), "last_flush should be recent");
+
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        assert_eq!(runtime.pending_output.len(), 1);
+        assert_eq!(runtime.pending_output[0], vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_flush_pty_batch_noop_on_empty() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "sess", || SessionRuntime::new("sess"), |_| {});
+
+        let mut batch: Vec<u8> = Vec::new();
+        let original_time = Instant::now() - Duration::from_secs(10);
+        let mut last_flush = original_time;
+
+        flush_pty_batch(&sessions, "sess", &mut batch, &mut last_flush);
+
+        assert_eq!(last_flush, original_time, "last_flush should not change on empty batch");
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        assert_eq!(runtime.pending_output.len(), 0, "no output should be queued");
+    }
+
+    /// Verify that data written to a PTY appears in pending_output within
+    /// PTY_BATCH_INTERVAL even when no further writes occur. This tests the
+    /// poll()-based flush timeout in batched_reader_loop.
+    #[test]
+    fn test_batch_flushes_on_timeout_without_further_writes() {
+        use portable_pty::{native_pty_system, PtySize};
+
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "test-pty", || SessionRuntime::new("test-pty"), |_| {});
+
+        // Open a real PTY pair.
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 2,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("failed to open pty");
+
+        let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        let mut writer = pair.master.take_writer().expect("take writer");
+        drop(pair.slave);
+
+        // Start the batched reader loop in a background thread.
+        let read_sessions = sessions.clone();
+        let reader_handle = std::thread::spawn(move || {
+            batched_reader_loop(&mut reader, poll_fd, &read_sessions, "test-pty", |_| {});
+        });
+
+        // Write a small payload — well below PTY_BATCH_SIZE.
+        let payload = b"hello from pty test\r\n";
+        writer.write_all(payload).expect("write failed");
+        writer.flush().expect("flush failed");
+
+        // Wait for PTY_BATCH_INTERVAL plus generous margin for thread scheduling
+        // under load (CI, parallel test runs). The key assertion is that the data
+        // arrives WITHOUT another write — not that it arrives in exactly 16ms.
+        let margin = Duration::from_millis(200);
+        std::thread::sleep(PTY_BATCH_INTERVAL + margin);
+
+        // The data should now be in pending_output — flushed by the poll timeout,
+        // NOT requiring another write.
+        let found = {
+            let guard = sessions.lock().unwrap();
+            let runtime = guard.get("test-pty").unwrap();
+            !runtime.pending_output.is_empty()
+        };
+        assert!(found, "data should appear in pending_output within PTY_BATCH_INTERVAL + margin");
+
+        // Verify the content includes our payload.
+        let content = {
+            let guard = sessions.lock().unwrap();
+            let runtime = guard.get("test-pty").unwrap();
+            runtime
+                .pending_output
+                .iter()
+                .flat_map(|c| c.iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(
+            content_str.contains("hello from pty test"),
+            "pending_output should contain the written payload, got: {content_str:?}"
+        );
+
+        // Clean up: drop the writer to close the PTY, which causes the reader loop
+        // to see EOF and exit.
+        drop(writer);
+        reader_handle.join().expect("reader thread panicked");
+    }
 }

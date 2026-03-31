@@ -324,54 +324,19 @@ pub fn create_worktree_workspace(
                                 sessions.clone(),
                                 sid.clone(),
                                 cmd,
+                                120,
                             );
 
                             // For agents that need PTY injection, write prompt after agent starts
+                            // using a longer settle time for agent TUI initialization.
                             if needs_pty_injection {
                                 if let Some(ref prompt) = initial_prompt {
-                                    let prompt_text = prompt.clone();
-                                    let sessions2 = sessions_arc.clone();
-                                    let sid2 = session_id.0.clone();
-                                    std::thread::spawn(move || {
-                                        // Wait for PTY writer
-                                        let max_attempts = 100;
-                                        let mut writer_found = false;
-                                        for _ in 0..max_attempts {
-                                            std::thread::sleep(
-                                                std::time::Duration::from_millis(50),
-                                            );
-                                            let ready = {
-                                                let guard = sessions2
-                                                    .lock()
-                                                    .unwrap_or_else(|e| e.into_inner());
-                                                guard
-                                                    .get(&sid2)
-                                                    .map(|rt| rt.writer.is_some())
-                                                    .unwrap_or(false)
-                                            };
-                                            if ready {
-                                                writer_found = true;
-                                                break;
-                                            }
-                                        }
-                                        if !writer_found {
-                                            return;
-                                        }
-
-                                        // Wait for agent TUI to initialize
-                                        std::thread::sleep(std::time::Duration::from_secs(2));
-
-                                        let mut guard = sessions2
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner());
-                                        if let Some(runtime) = guard.get_mut(&sid2) {
-                                            if let Some(writer) = runtime.writer.as_mut() {
-                                                let _ = writer.write_all(prompt_text.as_bytes());
-                                                let _ = writer.write_all(b"\n");
-                                                let _ = writer.flush();
-                                            }
-                                        }
-                                    });
+                                    super::presets::write_command_when_ready(
+                                        sessions_arc.clone(),
+                                        session_id.0.clone(),
+                                        prompt.clone(),
+                                        1500,
+                                    );
                                 }
                             }
                         }
