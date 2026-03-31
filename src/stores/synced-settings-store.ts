@@ -93,7 +93,16 @@ export const useSyncedSettingsStore = create<SyncedSettingsStore>()((set) => ({
         // perspective. Force-set the exact field we wrote.
         const patched = JSON.parse(JSON.stringify(saved)) as Record<string, Record<string, unknown>>;
         if (patched[section]) patched[section][key] = value;
-        set({ settings: patched as unknown as UserSettings, isSyncing: false });
+        const corrected = patched as unknown as UserSettings;
+        set({ settings: corrected, isSyncing: false });
+
+        // If the server response didn't match our intent (deep-merge
+        // semantics), do a background full PUT to correct the server.
+        const serverVal = JSON.stringify((saved as unknown as Record<string, Record<string, unknown>>)[section]?.[key]);
+        const intendedVal = JSON.stringify(value);
+        if (serverVal !== intendedVal) {
+          updateSyncedSettings(corrected).catch(() => {});
+        }
       } else {
         set({ isSyncing: false });
       }
