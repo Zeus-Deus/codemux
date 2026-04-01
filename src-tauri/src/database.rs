@@ -256,6 +256,16 @@ impl DatabaseStore {
         Ok(())
     }
 
+    pub fn delete_ui_state(&self, key: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM ui_state WHERE user_id = 'local' AND key = ?1",
+            params![key],
+        )
+        .map_err(|e| format!("Failed to delete ui_state: {e}"))?;
+        Ok(())
+    }
+
     // ── Project Scripts ──
 
     pub fn get_project_scripts(&self, project_root: &str) -> Option<ProjectScripts> {

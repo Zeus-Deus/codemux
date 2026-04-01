@@ -164,16 +164,45 @@ pub fn run() {
             // Restore window size from SQLite
             {
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
-                if let (Some(w), Some(h)) = (db.get_ui_state("window_width"), db.get_ui_state("window_height")) {
-                    if let (Ok(w), Ok(h)) = (w.parse::<f64>(), h.parse::<f64>()) {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.set_size(tauri::LogicalSize::new(w, h));
-                        }
+                let saved_w = db.get_ui_state("window_width").and_then(|v| v.parse::<f64>().ok());
+                let saved_h = db.get_ui_state("window_height").and_then(|v| v.parse::<f64>().ok());
+
+                if let (Some(w), Some(h), Some(window)) = (saved_w, saved_h, app.get_webview_window("main")) {
+                    // Reject nonsensical or tiled/maximized dimensions
+                    let too_small = w < 200.0 || h < 200.0;
+                    let fills_monitor = window.current_monitor().ok().flatten().map_or(false, |m| {
+                        let sf = m.scale_factor();
+                        let mw = m.size().width as f64 / sf;
+                        let mh = m.size().height as f64 / sf;
+                        w + 100.0 >= mw && h + 100.0 >= mh
+                    });
+                    if !too_small && !fills_monitor {
+                        let _ = window.set_size(tauri::LogicalSize::new(w, h));
                     }
+                    // else: keep tauri.conf.json default (800×600)
                 }
-                if let (Some(x), Some(y)) = (db.get_ui_state("window_x"), db.get_ui_state("window_y")) {
-                    if let (Ok(x), Ok(y)) = (x.parse::<i32>(), y.parse::<i32>()) {
-                        if let Some(window) = app.get_webview_window("main") {
+
+                // Restore position, but only if it falls within a visible monitor.
+                // Skips off-screen positions (e.g. second monitor was unplugged).
+                // On Wayland set_position is a compositor no-op regardless.
+                if let (Some(x), Some(y)) = (
+                    db.get_ui_state("window_x").and_then(|v| v.parse::<i32>().ok()),
+                    db.get_ui_state("window_y").and_then(|v| v.parse::<i32>().ok()),
+                ) {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let on_screen = window.available_monitors().map_or(false, |monitors| {
+                            monitors.iter().any(|m| {
+                                let sf = m.scale_factor();
+                                let pos = m.position();
+                                let sz = m.size();
+                                let mx = (pos.x as f64 / sf) as i32;
+                                let my = (pos.y as f64 / sf) as i32;
+                                let mw = (sz.width as f64 / sf) as i32;
+                                let mh = (sz.height as f64 / sf) as i32;
+                                x >= mx && x < mx + mw && y >= my && y < my + mh
+                            })
+                        });
+                        if on_screen {
                             let _ = window.set_position(tauri::LogicalPosition::new(x, y));
                         }
                     }
@@ -187,13 +216,41 @@ pub fn run() {
                     window.on_window_event(move |event| {
                         if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
                             let db: tauri::State<'_, database::DatabaseStore> = close_handle.state();
-                            if let Ok(size) = close_handle.get_webview_window("main").and_then(|w| w.outer_size().ok()).ok_or(()) {
-                                db.set_ui_state("window_width", &size.width.to_string()).ok();
-                                db.set_ui_state("window_height", &size.height.to_string()).ok();
-                            }
-                            if let Ok(pos) = close_handle.get_webview_window("main").and_then(|w| w.outer_position().ok()).ok_or(()) {
-                                db.set_ui_state("window_x", &pos.x.to_string()).ok();
-                                db.set_ui_state("window_y", &pos.y.to_string()).ok();
+                            if let Some(w) = close_handle.get_webview_window("main") {
+                                let sf = w.scale_factor().unwrap_or(1.0);
+
+                                if let Ok(size) = w.outer_size() {
+                                    // Convert physical → logical for DPI-safe persistence
+                                    let lw = size.width as f64 / sf;
+                                    let lh = size.height as f64 / sf;
+
+                                    // Skip saving if the window fills the monitor
+                                    // (tiled/maximized). Tiling WMs don't reliably
+                                    // report is_maximized(), so compare against monitor
+                                    // dimensions instead.
+                                    let fills_monitor = w.current_monitor().ok().flatten().map_or(false, |m| {
+                                        let mw = m.size().width as f64 / sf;
+                                        let mh = m.size().height as f64 / sf;
+                                        lw + 100.0 >= mw && lh + 100.0 >= mh
+                                    });
+
+                                    if fills_monitor {
+                                        // Clear stale tiled dimensions so the restore
+                                        // path falls back to the tauri.conf.json default.
+                                        db.delete_ui_state("window_width").ok();
+                                        db.delete_ui_state("window_height").ok();
+                                    } else {
+                                        db.set_ui_state("window_width", &lw.to_string()).ok();
+                                        db.set_ui_state("window_height", &lh.to_string()).ok();
+                                    }
+                                }
+
+                                if let Ok(pos) = w.outer_position() {
+                                    let lx = (pos.x as f64 / sf) as i32;
+                                    let ly = (pos.y as f64 / sf) as i32;
+                                    db.set_ui_state("window_x", &lx.to_string()).ok();
+                                    db.set_ui_state("window_y", &ly.to_string()).ok();
+                                }
                             }
                             // Flush any pending debounced state write before exit
                             let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
