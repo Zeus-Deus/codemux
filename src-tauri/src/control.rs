@@ -548,7 +548,11 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .params
                 .get("project_root")
                 .and_then(Value::as_str)
-                .map(str::to_string);
+                .map(str::to_string)
+                .or_else(|| {
+                    let state: State<'_, crate::state::AppStateStore> = app.state();
+                    state.active_workspace_cwd().map(|(_, cwd)| cwd)
+                });
             let store: State<'_, indexing::ProjectIndexStore> = app.state();
             indexing::rebuild_index(project_root)
                 .map(|snapshot| {

@@ -276,8 +276,19 @@ pub fn run() {
             observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
             config::watch_theme_file(handle.clone());
             terminal::spawn_missing_ptys(handle);
-            let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
-            indexing::spawn_index_watcher(index_store);
+
+            // Initialize the project index from the active workspace's CWD.
+            // If no workspace exists yet, the index stays empty and the watcher
+            // does not start — avoiding the old bug where $HOME was scanned.
+            {
+                let app_state: tauri::State<'_, state::AppStateStore> = app.handle().state();
+                let index_store: tauri::State<'_, indexing::ProjectIndexStore> = app.handle().state();
+                if let Some((_, cwd)) = app_state.active_workspace_cwd() {
+                    index_store.initialize_for_project(std::path::PathBuf::from(cwd));
+                }
+                indexing::spawn_index_watcher(index_store);
+            }
+
             control::spawn_control_server(app.handle().clone());
             hooks::start_hook_server(app.handle().clone());
             hooks::register_claude_code_hooks();

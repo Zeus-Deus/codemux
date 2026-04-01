@@ -1,17 +1,21 @@
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::project::current_project_root;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 const INDEX_SCHEMA_VERSION: u32 = 1;
 const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024;
 const CHUNK_LINE_COUNT: usize = 40;
 const DEFAULT_SEARCH_LIMIT: usize = 12;
+/// Stop indexing after accumulating this many bytes of file content.
+const MAX_TOTAL_INDEX_BYTES: usize = 50 * 1024 * 1024;
 const TEXT_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "svelte", "md", "json", "toml", "yaml", "yml", "py", "go",
     "java", "c", "cpp", "h", "hpp", "css", "html", "txt", "sh",
@@ -111,17 +115,23 @@ pub struct ProjectIndexStore {
 
 impl Default for ProjectIndexStore {
     fn default() -> Self {
+        // Start with an empty index. The actual project root is set later in
+        // setup() once the active workspace is known, avoiding the old bug
+        // where env::current_dir() (often $HOME) was scanned.
         Self {
-            inner: Arc::new(Mutex::new(load_or_default_index(None).unwrap_or_else(
-                |_| {
-                    default_index(resolve_project_root(None).unwrap_or_else(|_| PathBuf::from(".")))
-                },
-            ))),
+            inner: Arc::new(Mutex::new(default_index(PathBuf::new()))),
         }
     }
 }
 
 impl ProjectIndexStore {
+    /// Load (or build) the index for a specific project directory.
+    pub fn initialize_for_project(&self, project_root: PathBuf) {
+        let snapshot = load_or_default_index(Some(project_root.display().to_string()))
+            .unwrap_or_else(|_| default_index(project_root));
+        *self.inner.lock().unwrap() = snapshot;
+    }
+
     pub fn snapshot(&self) -> ProjectIndexSnapshot {
         self.inner.lock().unwrap().clone()
     }
@@ -161,6 +171,14 @@ pub fn search_index(
 
 pub fn spawn_index_watcher(store: tauri::State<'_, ProjectIndexStore>) {
     let project_root = PathBuf::from(store.snapshot().project_root);
+    if project_root.as_os_str().is_empty() || !project_root.is_dir() {
+        eprintln!("[codemux::index] No valid project root — skipping index watcher");
+        return;
+    }
+    eprintln!(
+        "[codemux::index] Watching project root: {}",
+        project_root.display()
+    );
     let store = store.inner.clone();
 
     std::thread::spawn(move || {
@@ -262,7 +280,23 @@ fn load_or_default_index(project_root: Option<String>) -> Result<ProjectIndexSna
 fn build_index_for_root(project_root: &Path) -> Result<ProjectIndexSnapshot, String> {
     let mut files = Vec::new();
     let mut chunks = Vec::new();
-    scan_directory(project_root, project_root, &mut files, &mut chunks)?;
+    let mut seen_dirs = HashSet::new();
+    let mut total_bytes: usize = 0;
+    scan_directory(
+        project_root,
+        project_root,
+        &mut files,
+        &mut chunks,
+        &mut seen_dirs,
+        &mut total_bytes,
+    )?;
+
+    if total_bytes >= MAX_TOTAL_INDEX_BYTES {
+        eprintln!(
+            "[codemux::index] Index size cap reached ({} bytes), some files were skipped",
+            total_bytes
+        );
+    }
 
     Ok(ProjectIndexSnapshot {
         schema_version: INDEX_SCHEMA_VERSION,
@@ -284,7 +318,25 @@ fn scan_directory(
     dir: &Path,
     files: &mut Vec<IndexedFile>,
     chunks: &mut Vec<IndexedChunk>,
+    seen_dirs: &mut HashSet<(u64, u64)>,
+    total_bytes: &mut usize,
 ) -> Result<(), String> {
+    // Cycle detection: track visited directories by (device, inode) identity.
+    // This prevents infinite recursion when symlinks create cycles.
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = fs::metadata(dir) {
+            let key = (meta.dev(), meta.ino());
+            if !seen_dirs.insert(key) {
+                return Ok(());
+            }
+        }
+    }
+
+    if *total_bytes >= MAX_TOTAL_INDEX_BYTES {
+        return Ok(());
+    }
+
     let entries = fs::read_dir(dir)
         .map_err(|error| format!("Failed to read directory {}: {error}", dir.display()))?;
 
@@ -298,8 +350,12 @@ fn scan_directory(
             if IGNORED_DIRS.iter().any(|ignored| *ignored == file_name) {
                 continue;
             }
-            scan_directory(project_root, &path, files, chunks)?;
+            scan_directory(project_root, &path, files, chunks, seen_dirs, total_bytes)?;
             continue;
+        }
+
+        if *total_bytes >= MAX_TOTAL_INDEX_BYTES {
+            return Ok(());
         }
 
         if !is_indexable_file(&path) {
@@ -307,6 +363,7 @@ fn scan_directory(
         }
 
         if let Some((file, file_chunks)) = index_file(project_root, &path)? {
+            *total_bytes += file.size_bytes as usize;
             files.push(file);
             chunks.extend(file_chunks);
         }
@@ -516,7 +573,7 @@ fn default_index(project_root: PathBuf) -> ProjectIndexSnapshot {
 fn resolve_project_root(project_root: Option<String>) -> Result<PathBuf, String> {
     match project_root {
         Some(root) => Ok(PathBuf::from(root)),
-        None => Ok(current_project_root()),
+        None => Err("No project root specified".into()),
     }
 }
 

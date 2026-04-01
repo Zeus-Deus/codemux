@@ -101,9 +101,11 @@ pub fn generate_project_handoff(project_root: Option<String>) -> Result<HandoffP
 #[tauri::command]
 pub fn rebuild_project_index(
     store: State<'_, ProjectIndexStore>,
+    app_state: State<'_, crate::state::AppStateStore>,
     project_root: Option<String>,
 ) -> Result<ProjectIndexSnapshot, String> {
-    let snapshot = rebuild_index(project_root)?;
+    let root = project_root.or_else(|| app_state.active_workspace_cwd().map(|(_, cwd)| cwd));
+    let snapshot = rebuild_index(root)?;
     store.replace_snapshot(snapshot.clone());
     Ok(snapshot)
 }
