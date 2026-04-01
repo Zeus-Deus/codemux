@@ -34,6 +34,9 @@ src-tauri/.codemux/
 .env.*
 !.env.example
 
+# TypeScript build cache
+*.tsbuildinfo
+
 # Vite temp files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
