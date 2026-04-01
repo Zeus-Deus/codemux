@@ -42,6 +42,8 @@ tokio-tungstenite = "0.26"
 futures-util = "0.3"
 libc = "0.2"
 tauri-plugin-single-instance = "2.4.0"
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 aes-gcm = "0.10"

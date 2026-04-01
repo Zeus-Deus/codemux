@@ -13,6 +13,7 @@ import { CommandPalette } from "@/components/overlays/command-palette";
 import { NewProjectScreen } from "@/components/overlays/new-project-screen";
 import { FileSearchDialog } from "@/components/search/file-search-dialog";
 import { ContentSearchDialog } from "@/components/search/content-search-dialog";
+import { UpdateToast } from "@/components/update/update-toast";
 
 export function AppShell() {
   const isLoading = useAppStore((s) => s.appState === null);
@@ -82,6 +83,7 @@ export function AppShell() {
         <FileSearchDialog />
         <ContentSearchDialog />
       </SidebarProvider>
+      <UpdateToast />
     </div>
   );
 }

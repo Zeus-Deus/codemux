@@ -755,3 +755,8 @@ export const pickFolderDialog = (title: string) =>
 
 export const pickFilesDialog = (title?: string) =>
   invoke<string[]>("pick_files_dialog", { title: title ?? null });
+
+// ── Update ──
+
+export const getPackageFormat = () =>
+  invoke<string>("get_package_format");
