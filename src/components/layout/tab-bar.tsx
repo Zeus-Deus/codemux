@@ -15,6 +15,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Plus, X, Terminal, Globe, GitCompare, FileDiff, FileCode } from "lucide-react";
+import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   activateTab,
   closeTab,
@@ -254,7 +255,7 @@ export function TabBar({ workspace }: Props) {
                       value={tab.tab_id}
                       className="group relative gap-1 px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20"
                     >
-                      {tabIcon[tab.kind]}
+                      {tab.icon ? <PresetIcon icon={tab.icon} className="h-3 w-3" /> : tabIcon[tab.kind]}
                       <span className="truncate max-w-[120px]">{tab.title}</span>
                       {tab.kind === "editor" && <EditorDirtyDot tabId={tab.tab_id} />}
                       {tabStatusMap.has(tab.tab_id) && (

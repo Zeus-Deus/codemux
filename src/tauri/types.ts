@@ -463,6 +463,7 @@ export interface TabSnapshot {
   title: string;
   surface_id: string | null;
   browser_id: string | null;
+  icon: string | null;
 }
 
 export type PaneNodeSnapshot =

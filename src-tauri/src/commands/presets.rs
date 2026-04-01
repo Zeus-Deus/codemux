@@ -318,8 +318,9 @@ pub fn apply_preset(
                     crate::state::TabKind::Terminal,
                 )?;
 
-                // Name the tab after the preset
+                // Name the tab after the preset and set its icon
                 let _ = state.rename_tab(&workspace_id, &tab_id, preset.name.clone());
+                let _ = state.set_tab_icon(&workspace_id, &tab_id, preset.icon.clone());
 
                 if let Some(session_id) = session_id {
                     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());

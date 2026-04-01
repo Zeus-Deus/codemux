@@ -306,6 +306,7 @@ pub fn create_worktree_workspace(
                 let tab_result = state.create_tab(&workspace_id.0, TabKind::Terminal);
                 if let Ok((tab_id, session_id)) = tab_result {
                     let _ = state.rename_tab(&workspace_id.0, &tab_id, preset.name.clone());
+                    let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
 
                     if let Some(session_id) = session_id {
                         terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());

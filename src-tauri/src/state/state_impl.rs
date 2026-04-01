@@ -37,6 +37,8 @@ pub struct TabSnapshot {
     pub title: String,
     pub surface_id: Option<SurfaceId>,
     pub browser_id: Option<BrowserId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// Debounces disk persistence so that rapid state changes (e.g. drag-swap +
@@ -788,6 +790,7 @@ impl AppStateStore {
                 title: "Terminal".into(),
                 surface_id: Some(surface_id.clone()),
                 browser_id: None,
+                icon: None,
             }],
             active_tab_id: default_tab_id,
             active_surface_id: surface_id.clone(),
@@ -1964,6 +1967,7 @@ impl AppStateStore {
                     title: format!("Terminal {}", count + 1),
                     surface_id: Some(surface_id.clone()),
                     browser_id: None,
+                    icon: None,
                 });
                 workspace.active_tab_id = tab_id.clone();
                 workspace.active_surface_id = surface_id;
@@ -1995,6 +1999,7 @@ impl AppStateStore {
                     title: "Browser".into(),
                     surface_id: None,
                     browser_id: Some(browser_id),
+                    icon: None,
                 });
                 workspace.active_tab_id = tab_id.clone();
             }
@@ -2005,6 +2010,7 @@ impl AppStateStore {
                     title: "Changes".into(),
                     surface_id: None,
                     browser_id: None,
+                    icon: None,
                 });
                 workspace.active_tab_id = tab_id.clone();
             }
@@ -2015,6 +2021,7 @@ impl AppStateStore {
                     title: "Editor".into(),
                     surface_id: None,
                     browser_id: None,
+                    icon: None,
                 });
                 workspace.active_tab_id = tab_id.clone();
             }
@@ -2148,6 +2155,29 @@ impl AppStateStore {
         Ok(())
     }
 
+    pub fn set_tab_icon(
+        &self,
+        workspace_id: &str,
+        tab_id: &str,
+        icon: Option<String>,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        let tab = workspace
+            .tabs
+            .iter_mut()
+            .find(|t| t.tab_id == tab_id)
+            .ok_or_else(|| format!("No tab found for {tab_id}"))?;
+
+        tab.icon = icon;
+        Ok(())
+    }
+
     /// Migrate workspaces loaded from disk that predate the tab system.
     /// Only applies to workspaces that have surfaces but no tabs (old format).
     /// Workspaces with 0 surfaces AND 0 tabs are intentionally empty.
@@ -2169,6 +2199,7 @@ impl AppStateStore {
                     title: "Terminal".into(),
                     surface_id,
                     browser_id: None,
+                    icon: None,
                 });
                 workspace.active_tab_id = tab_id;
             }
@@ -2444,6 +2475,7 @@ fn default_app_state() -> AppStateSnapshot {
                 title: "Terminal".into(),
                 surface_id: Some(surface_id.clone()),
                 browser_id: None,
+                icon: None,
             }],
             active_tab_id: default_tab_id,
             active_surface_id: surface_id.clone(),
