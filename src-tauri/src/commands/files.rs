@@ -336,6 +336,17 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
 
 #[tauri::command]
 pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    if Command::new("which")
+        .arg("xdg-open")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+        == false
+    {
+        return Err("xdg-open not found — cannot open file manager. Install xdg-utils.".to_string());
+    }
     Command::new("xdg-open")
         .arg(&path)
         .spawn()

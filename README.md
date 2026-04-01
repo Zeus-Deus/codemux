@@ -40,8 +40,19 @@ chmod +x Codemux-*.AppImage
 
 ### Requirements
 
+**Required:**
 - Linux (X11 or Wayland)
-- [ydotool](https://github.com/ReimuNotMoe/ydotool) — required for browser automation features
+- git
+
+**Required for browser panes:**
+- A Chromium-based browser (Chromium, Google Chrome, or Brave)
+- [ydotool](https://github.com/ReimuNotMoe/ydotool) with ydotoold running — needed for browser automation
+
+**Optional (recommended):**
+- [ripgrep](https://github.com/BurntSushi/ripgrep) — faster file content search (falls back to grep)
+- [fd](https://github.com/sharkdp/fd) — faster file name search (falls back to find)
+- [GitHub CLI](https://cli.github.com/) — enables PR creation and GitHub integration
+- A notification daemon — for desktop notifications (most desktop environments include one)
 
 ## Quick Start
 

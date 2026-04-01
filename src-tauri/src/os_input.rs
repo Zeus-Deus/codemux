@@ -278,9 +278,9 @@ pub async fn handle_os_action(action: &str, params: Value, browser_id: &str) -> 
     // Check ydotool availability
     if !is_ydotool_available().await {
         return Err(
-            "OS-level input not available. Install ydotool: \
-             'sudo pacman -S ydotool' then 'systemctl --user enable --now ydotool'. \
-             Also ensure the browser is running in headed mode (not headless)."
+            "OS-level input not available. Install ydotool with your system package manager \
+             and ensure ydotoold is running (e.g. 'systemctl --user enable --now ydotool'). \
+             The browser must also be running in headed mode (not headless)."
                 .to_string(),
         );
     }

@@ -28,8 +28,51 @@ pub struct ControlResponse {
 }
 
 pub fn control_socket_path() -> Option<PathBuf> {
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)?;
-    Some(runtime_dir.join("codemux.sock"))
+    if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+        return Some(runtime_dir.join("codemux.sock"));
+    }
+
+    // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
+    let uid = unsafe { libc::getuid() };
+    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}"));
+    if fallback_dir.exists() {
+        // Verify the existing directory is owned by us and has safe permissions.
+        use std::os::unix::fs::MetadataExt;
+        match fs::metadata(&fallback_dir) {
+            Ok(meta) => {
+                if meta.uid() != uid {
+                    crate::diagnostics::stderr_line(&format!(
+                        "[codemux::control] Fallback dir {} is owned by uid {} (expected {}); refusing to use it",
+                        fallback_dir.display(), meta.uid(), uid
+                    ));
+                    return None;
+                }
+            }
+            Err(e) => {
+                crate::diagnostics::stderr_line(&format!(
+                    "[codemux::control] Cannot stat fallback dir {}: {e}",
+                    fallback_dir.display()
+                ));
+                return None;
+            }
+        }
+    } else {
+        if let Err(e) = fs::create_dir(&fallback_dir) {
+            crate::diagnostics::stderr_line(&format!(
+                "[codemux::control] Failed to create fallback runtime dir {}: {e}",
+                fallback_dir.display()
+            ));
+            return None;
+        }
+        // Restrict to owner only (mode 0700).
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&fallback_dir, fs::Permissions::from_mode(0o700));
+    }
+    crate::diagnostics::stderr_line(&format!(
+        "[codemux::control] XDG_RUNTIME_DIR unset, using fallback: {}",
+        fallback_dir.display()
+    ));
+    Some(fallback_dir.join("codemux.sock"))
 }
 
 /// Resolve "default" or empty browser_id to the first active browser session's actual ID.
