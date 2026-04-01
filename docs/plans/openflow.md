@@ -8,17 +8,8 @@
 
 ## Active Priorities
 
-1. Orchestrator response behavior (DONE):
-   - FIXED: backend-driven orchestration loop replaces frontend polling; runs continuously at 5s intervals
-   - FIXED: user injections wake the orchestration loop immediately via `tokio::sync::Notify`
-   - FIXED: stuck probes written directly to comm log as SYSTEM PROBE entries (no more shell escaping feedback loop)
-   - FIXED: Blocked phase now recoverable via user injection
-   - FIXED: WaitingApproval stays until explicit user approval
-   - FIXED: implicit completion removed; only explicit DONE: markers count
-   - FIXED: stuck detection thresholds raised to realistic values (50-90 seconds)
-   - FIXED: probe re-arming fixed to clear on meaningful progress, not just counts
-   - FIXED: conflicting `run_autonomous_loop` / `advance_run_phase` auto-advance removed
-   - FIXED: wrapper script hardened with `eval` and error recovery
+1. Orchestrator prompt improvement:
+   - improve orchestrator prompt for consistent parallel assignment across all models
    - simple user questions should be answered directly
    - modification requests should trigger a fresh planning and build loop
 2. Browser integration in the OpenFlow workspace:
@@ -29,16 +20,18 @@
     - prevent stray GUI launches from agent sessions
 4. Scale and log handling:
    - validate 15-20 agent runs under both dev and normal workflows
-5. Claude CLI adapter (DONE):
-   - FIXED: `ClaudeAdapter` implemented with dedicated wrapper script (`claude-wrapper.sh`)
-   - FIXED: uses `claude -p` with `--system-prompt`, `--resume`, `--output-format json`, `--permission-mode bypassPermissions`
-   - FIXED: session ID captured from JSON output for session continuation
-   - FIXED: `--system-prompt` passed on every call (doesn't persist across `--resume`)
-   - FIXED: auto-translator converts opencode's internal delegation patterns to ASSIGN lines
-   - all Claude models work: haiku (cheapest), sonnet (balanced), opus (strongest)
-6. Remaining work:
+5. End-to-end validation:
    - validate end-to-end with Claude CLI on real multi-agent runs
-   - improve orchestrator prompt for consistent parallel assignment across all models
+   - validate with OpenCode adapter on real multi-agent runs
+
+## Recently Completed
+
+- Backend-driven orchestration loop (5s intervals, Notify-based wakeup, stuck probes, phase recovery)
+- Claude CLI adapter with dedicated wrapper script, session continuation, auto-translator
+- Wrapper script hardening with eval and error recovery
+- Stuck detection tuning (50-90s thresholds, probe re-arming on progress)
+- WaitingApproval stays until explicit user approval
+- Implicit completion removed; only explicit DONE: markers count
 
 ## Likely Touch Points
 

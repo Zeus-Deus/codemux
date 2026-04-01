@@ -51,9 +51,9 @@ A dedicated AI agent that resolves merge conflicts using a user-selected model. 
 
 ## Active Priorities
 
-1. Design backend temp-branch creation and conflict detection commands
-2. Design agent session integration (reuse OpenFlow infrastructure)
-3. Design conflict review UI (side-by-side diff with approve/reject)
+1. Deepen test coverage with real multi-file conflict scenarios
+2. Live validation on real merge workflows across different project types
+3. Improve partial resolution UX (some files resolved, some need human input)
 
 ## Open Questions
 

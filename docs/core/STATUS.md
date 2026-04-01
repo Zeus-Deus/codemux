@@ -14,7 +14,6 @@ The repo structure is clean and domain-split:
 
 - `src/` is the React + Tailwind + shadcn UI and Tauri IPC layer
 - `src-tauri/` is the Rust app/runtime layer
-- `src-old/` preserves the previous Svelte frontend for reference
 
 ## Solid — Daily-Drivable Features
 
@@ -62,7 +61,7 @@ The repo structure is clean and domain-split:
 
 ## React Frontend Status
 
-The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust backend is unchanged. The port is substantially complete.
+The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust backend is unchanged. The port is complete and the old Svelte frontend has been removed.
 
 ### Ported and Working
 
@@ -95,4 +94,4 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/browser.md`, `docs/features/openflow.md`, `docs/features/mcp-server.md`, `docs/features/file-editor.md`, or `docs/features/merge-resolver.md` for subsystem detail
+- `docs/features/*` for subsystem detail (browser, openflow, mcp-server, file-editor, merge-resolver, changes-panel, pr-integration, search, notifications, auth, settings-sync, setup-teardown)

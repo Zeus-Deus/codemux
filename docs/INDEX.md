@@ -37,6 +37,10 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - MCP server: `docs/features/mcp-server.md`
 - File editor: `docs/features/file-editor.md`
 - Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
+- Changes panel: `docs/features/changes-panel.md`
+- PR integration: `docs/features/pr-integration.md`
+- Search: `docs/features/search.md`
+- Notifications: `docs/features/notifications.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`
