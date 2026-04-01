@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo/svg/logomark-white.svg" alt="Codemux" width="80" />
+<img src="assets/logo/svg/codemux-logomark-white.svg" alt="Codemux" width="80" />
 
 # Codemux
 
