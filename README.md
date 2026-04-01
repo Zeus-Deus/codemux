@@ -1,83 +1,76 @@
+<div align="center">
+
+<img src="assets/logo/svg/logomark-white.svg" alt="Codemux" width="80" />
+
 # Codemux
 
-Codemux is a Linux-first AI coding workspace built around terminal agents, browser-assisted testing, and local automation.
+**The Agentic Development Environment for Builders**
 
-It combines:
+<!-- Replace with your screenshot -->
 
-- multi-session terminals
-- browser panes for in-workspace testing
-- split layouts and workspace navigation
-- attention and notification signaling for agents
-- local CLI and socket control
-- local project memory and indexing
+![Codemux Screenshot](assets/codemux-home.png)
 
-Long term, it is also meant to host `OpenFlow`, a multi-agent orchestration system built into the workspace.
+</div>
 
-## Current Status
+---
 
-Codemux is useful as a serious prototype workspace, but it is not ship-ready yet.
+Codemux is a Linux-first workspace that brings terminals, browser panes, and multi-agent orchestration into one app. Run coding agents side by side, review changes, test in-browser, and ship — without leaving the window.
 
-Solid enough to treat as real product surface today:
+## Features
 
-- workspace shell and sidebar
-- multi-session terminals
-- pane splits, resizing, close, swap, and restore
-- notifications and attention badges
-- local project memory and lexical indexing
-- local CLI and socket control basics
+- **Multi-workspace terminals** — Split, resize, swap, and manage terminal sessions across isolated workspaces
+- **Browser panes** — Embedded browser alongside your terminals for testing and agent-assisted browsing
+- **Git worktree isolation** — Each workspace gets its own worktree so agents never interfere with each other
+- **Built-in diff review** — See what changed, commit, and manage branches without switching tools
+- **OpenFlow orchestration** — Run multiple AI agents in parallel with automatic task delegation and stuck detection
+- **Notifications & attention signals** — Know exactly when an agent needs you, with desktop notifications and per-pane indicators
+- **CLI & socket control** — Automate everything via `codemux` CLI or the local Unix socket API
+- **Custom keybinds** — Full keyboard-first workflow with a command palette and rebindable shortcuts
 
-Still prototype-level or in active hardening:
+## Install
 
-- browser pane interaction fidelity and validation
-- browser automation polish around the visible pane
-- OpenFlow reliability, browser integration, and intervention flow
-- Linux release-readiness validation and polish
+### AppImage (any Linux distro)
 
-For the current source of truth, read `docs/core/STATUS.md`.
-
-## Run
-
-Install dependencies:
+Download the latest `.AppImage` from [Releases](https://github.com/Zeus-Deus/codemux/releases), make it executable, and run:
 
 ```bash
+chmod +x Codemux-*.AppImage
+./Codemux-*.AppImage
+```
+
+### Requirements
+
+- Linux (X11 or Wayland)
+- [ydotool](https://github.com/ReimuNotMoe/ydotool) — required for browser automation features
+
+## Quick Start
+
+1. Launch Codemux
+2. Create a project by pointing it at a git repository
+3. Create a workspace — each workspace gets an isolated git worktree
+4. Open terminal panes, start your coding agent, and work
+
+Split panes with keybinds, open a browser pane for testing, and use the changes panel to review diffs and commit when ready.
+
+## Build from Source
+
+```bash
+# Clone the repo
+git clone https://github.com/Zeus-Deus/codemux.git
+cd codemux
+
+# Install dependencies
 npm install
-```
 
-Run the standard verification pass:
-
-```bash
-npm run verify
-```
-
-Run the app:
-
-```bash
+# Run in development mode
 npm run tauri:dev
+
+# Build for release
+npm run tauri:build
 ```
 
-X11 fallback when native Wayland is not working well:
+**System dependencies:** Rust, Node.js, and the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/) for your distro.
 
-```bash
-npm run tauri:dev:x11
-```
+## License
 
-## Browser And Agent Workflow
-
-When working inside Codemux, use explicit browser subcommands such as:
-
-```bash
-codemux browser create
-codemux browser open http://localhost:3000
-codemux browser snapshot
-```
-
-See `AGENTS.md` for agent behavior rules and `docs/reference/CONTROL.md` for protocol details.
-
-## Docs
-
-- `WORKFLOW.md`: first file for a fresh coding session
-- `docs/INDEX.md`: canonical internal docs hub
-- `docs/core/PROJECT.md`: durable product direction
-- `docs/core/STATUS.md`: current repo reality
-- `docs/core/PLAN.md`: roadmap and build order
-- `docs/core/TESTING.md`: verification policy
+Elastic License 2.0 — see [LICENSE.md](LICENSE.md).
