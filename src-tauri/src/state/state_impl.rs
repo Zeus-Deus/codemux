@@ -8,6 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+const MAX_NOTIFICATIONS: usize = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceType {
@@ -1882,6 +1884,10 @@ impl AppStateStore {
             read: is_active_workspace,
             created_at_ms: current_time_ms(),
         });
+        let count = snapshot.notifications.len();
+        if count > MAX_NOTIFICATIONS {
+            snapshot.notifications.drain(..count - MAX_NOTIFICATIONS);
+        }
 
         if let Some(workspace) = snapshot
             .workspaces
