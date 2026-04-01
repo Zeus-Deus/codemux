@@ -152,7 +152,7 @@ These use `ydotool` to generate kernel-level input events that are indistinguish
 For programmatic control, send JSON commands over the Unix socket at `$XDG_RUNTIME_DIR/codemux.sock`:
 
 ```bash
-echo '{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"open_url","url":"https://example.com"}}}' | nc -U /run/user/1000/codemux.sock
+echo '{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"open_url","url":"https://example.com"}}}' | nc -U $XDG_RUNTIME_DIR/codemux.sock
 ```
 
 ### Available Actions

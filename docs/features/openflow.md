@@ -50,7 +50,7 @@ It must remain project-agnostic: web apps are only one test case, not the produc
 
 - **Claude models (via Claude CLI)**: highly recommended for orchestrator role; all models (haiku, sonnet, opus) follow the ASSIGN protocol reliably; tested at 100% compliance
 - **opencode with Claude-based models** (e.g., github-copilot/claude-sonnet-4.6): generally reliable
-- **opencode with MiniMax-M2.7**: unreliable as orchestrator (~33% ASSIGN compliance); the model's internal "General Agent" / "Explore Agent" delegation system competes with OpenFlow's ASSIGN protocol; the auto-translator mitigates this but native ASSIGN output is more reliable
+- **opencode with MiniMax-M2.7**: limited as orchestrator (~33% ASSIGN compliance); the model's internal delegation system competes with OpenFlow's ASSIGN protocol. Works better with auto-translator enabled
 
 ## Constraints
 

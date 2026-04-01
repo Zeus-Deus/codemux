@@ -29,7 +29,7 @@ sudo apt install libwebkit2gtk-4.1-dev build-essential curl wget file libssl-dev
 ## Build from Source
 
 ```bash
-git clone https://github.com/user/codemux.git
+git clone https://github.com/Zeus-Deus/codemux.git
 cd codemux
 npm install
 npm run build

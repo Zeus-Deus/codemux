@@ -1,7 +1,7 @@
 {
   "name": "codemux",
   "version": "0.1.0",
-  "description": "",
+  "description": "The Agentic Development Environment for Builders",
   "type": "module",
   "scripts": {
     "postinstall": "bash scripts/patch-agent-browser.sh",
@@ -18,7 +18,7 @@
     "cli": "cargo run --manifest-path src-tauri/Cargo.toml --",
     "build:cli": "cargo build --manifest-path src-tauri/Cargo.toml && cp src-tauri/target/debug/codemux ~/.local/bin/codemux"
   },
-  "license": "MIT",
+  "license": "Elastic-2.0",
   "dependencies": {
     "@codemirror/commands": "^6.10.3",
     "@codemirror/lang-css": "^6.3.1",

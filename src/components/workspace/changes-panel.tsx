@@ -1032,7 +1032,7 @@ export function ChangesPanel({ workspace }: Props) {
     const cli = config?.ai_resolver_cli ?? "claude";
     const model = config?.ai_resolver_model ?? null;
     const strategy = config?.ai_resolver_strategy ?? "smart_merge";
-    const target = branchInfo?.branch === "main" ? "main" : "main"; // TODO: detect target from PR or config
+    const target = "main"; // TODO: detect actual target branch
     startResolution(workspace.workspace_id, cwd, target, cli, model, strategy);
   };
 

@@ -46,7 +46,7 @@ These work in specific UI contexts.
 
 | Shortcut | Action | Context | Source |
 |----------|--------|---------|--------|
-| Enter | Navigate to URL | Browser address bar focused | Browser pane (TODO) |
+| Enter | Navigate to URL | Browser address bar focused | `BrowserToolbar.tsx` |
 | Enter / Space | Activate workspace | Workspace row focused | `sidebar-workspace-row.tsx` |
 | Enter / Space | Activate pane | Pane header focused | `PaneNode.tsx` |
 | Enter | Activate tab | Tab focused via keyboard | `tab-bar.tsx` |

@@ -26,6 +26,9 @@ src-tauri/.codemux/
 # Local editor/IDE folders
 .vscode/
 
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
 # Environment files (keep template)
 .env
 .env.*

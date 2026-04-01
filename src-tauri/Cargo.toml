@@ -1,8 +1,11 @@
 [package]
 name = "codemux"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "The Agentic Development Environment for Builders"
+authors = ["Zeus-Deus"]
+license = "Elastic-2.0"
+repository = "https://github.com/Zeus-Deus/codemux"
+homepage = "https://codemux.org"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
