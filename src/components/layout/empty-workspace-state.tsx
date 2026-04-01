@@ -134,7 +134,7 @@ export function EmptyWorkspaceState() {
           <ActionRow
             icon={<Search className="h-4 w-4" />}
             label="Search Files"
-            keys={["Ctrl", "P"]}
+            keys={["Ctrl", "Shift", "P"]}
             onClick={handleSearchFiles}
           />
         </div>

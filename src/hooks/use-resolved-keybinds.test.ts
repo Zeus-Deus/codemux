@@ -26,10 +26,10 @@ describe("resolveKeybinds", () => {
 
   it("detects conflicts when two actions share a combo", () => {
     const result = resolveKeybinds({
-      commandPalette: "Ctrl+P", // conflicts with fileSearch default
+      commandPalette: "Ctrl+Shift+P", // conflicts with fileSearch default
     });
     expect(result.conflicts.length).toBeGreaterThan(0);
-    const conflict = result.conflicts.find((c) => c.combo === "Ctrl+P");
+    const conflict = result.conflicts.find((c) => c.combo === "Ctrl+Shift+P");
     expect(conflict).toBeDefined();
     expect(conflict!.ids).toContain("commandPalette");
     expect(conflict!.ids).toContain("fileSearch");
@@ -102,7 +102,7 @@ describe("resolveKeybinds", () => {
       const fs = result.keybindMap.get("fileSearch")!;
       expect(cp.activeKeys).toBe("Ctrl+K");
       expect(cp.isCustom).toBe(false);
-      expect(fs.activeKeys).toBe("Ctrl+P");
+      expect(fs.activeKeys).toBe("Ctrl+Shift+P");
       expect(fs.isCustom).toBe(false);
     });
   });

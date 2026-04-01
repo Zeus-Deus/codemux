@@ -27,7 +27,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "blockF5Reload", label: "Block F5 reload", category: "general", defaultKeys: "F5", description: "Prevents accidental app reload" },
 
   // ── Search ──
-  { id: "fileSearch", label: "Find file by name", category: "search", defaultKeys: "Ctrl+P" },
+  { id: "fileSearch", label: "Find file by name", category: "search", defaultKeys: "Ctrl+Shift+P" },
   { id: "contentSearch", label: "Search in files", category: "search", defaultKeys: "Ctrl+Shift+F" },
 
   // ── Workspaces ──
