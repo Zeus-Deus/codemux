@@ -42,7 +42,7 @@ export function SidebarOpenflowSection() {
         <ChevronRight
           className={`h-3 w-3 shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
         />
-        <span>OpenFlow</span>
+        <span>OpenFlow <span className="normal-case tracking-normal font-normal text-[10px] text-sidebar-foreground/40">(beta)</span></span>
         <span className="flex-1" />
         {openflowWorkspaces.length > 0 && (
           <span className="text-[10px] font-semibold tabular-nums text-muted-foreground">
