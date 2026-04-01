@@ -33,6 +33,21 @@ pub mod terminal;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Set WebKitGTK env vars before any GTK/Tauri initialization.
+    // WEBKIT_DISABLE_DMABUF_RENDERER: fixes "Could not create GBM EGL display" crash
+    // on certain GPU/driver combos.
+    // GDK_BACKEND: forces Wayland-native when available, preventing XWayland fallback
+    // (which triggers unintended Hyprland window rules on AppImage builds).
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
+            unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
+        }
+        if std::env::var("GDK_BACKEND").is_err() {
+            unsafe { std::env::set_var("GDK_BACKEND", "wayland,x11") };
+        }
+    }
+
     #[cfg(debug_assertions)]
     {
         use std::time::SystemTime;
@@ -45,7 +60,7 @@ pub fn run() {
             start
         ));
     }
-    
+
     tauri::Builder::default()
         // This plugin should run before the rest of the app setup so duplicate
         // launches are intercepted before a second GUI is created.
