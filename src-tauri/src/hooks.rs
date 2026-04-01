@@ -531,13 +531,13 @@ mod tests {
     fn merge_preserves_existing_hooks() {
         let script = "/home/test/.codemux/hooks/notify.sh";
 
-        // Simulate existing settings with a Superset hook
+        // Simulate existing settings with an external hook
         let mut settings = serde_json::json!({
             "effortLevel": "high",
             "hooks": {
                 "UserPromptSubmit": [{
                     "matcher": "*",
-                    "hooks": [{"type": "command", "command": "superset-notify.sh"}]
+                    "hooks": [{"type": "command", "command": "external-notify.sh"}]
                 }]
             }
         });
@@ -580,13 +580,13 @@ mod tests {
         // Verify: effortLevel preserved
         assert_eq!(settings["effortLevel"], "high");
 
-        // Verify: Superset hook still present in UserPromptSubmit
+        // Verify: external hook still present in UserPromptSubmit
         let ups = settings["hooks"]["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 2, "should have superset + codemux hooks");
+        assert_eq!(ups.len(), 2, "should have external + codemux hooks");
         assert!(ups[0]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains("superset"));
+            .contains("external"));
 
         // Verify: codemux hook has correct format
         assert_eq!(ups[1]["matcher"], "");
@@ -602,14 +602,14 @@ mod tests {
 
     #[test]
     fn unregister_removes_codemux_hooks_only() {
-        // Simulate settings with mixed Superset + Codemux hooks
+        // Simulate settings with mixed external + Codemux hooks
         let mut settings = serde_json::json!({
             "effortLevel": "high",
             "hooks": {
                 "UserPromptSubmit": [
                     {
                         "matcher": "*",
-                        "hooks": [{"type": "command", "command": "superset-notify.sh"}]
+                        "hooks": [{"type": "command", "command": "external-notify.sh"}]
                     },
                     {
                         "matcher": "",
@@ -625,7 +625,7 @@ mod tests {
                 "PostToolUse": [
                     {
                         "matcher": "*",
-                        "hooks": [{"type": "command", "command": "superset-notify.sh"}]
+                        "hooks": [{"type": "command", "command": "external-notify.sh"}]
                     }
                 ]
             }
@@ -649,15 +649,15 @@ mod tests {
 
         let hooks = settings["hooks"].as_object().unwrap();
 
-        // UserPromptSubmit: superset entry remains, codemux entry removed
+        // UserPromptSubmit: external entry remains, codemux entry removed
         let ups = hooks["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(ups.len(), 1);
-        assert!(ups[0]["hooks"][0]["command"].as_str().unwrap().contains("superset"));
+        assert!(ups[0]["hooks"][0]["command"].as_str().unwrap().contains("external"));
 
         // Stop: was codemux-only, should be removed entirely
         assert!(!hooks.contains_key("Stop"), "Stop should be removed (was codemux-only)");
 
-        // PostToolUse: superset-only, untouched
+        // PostToolUse: external-only, untouched
         let ptu = hooks["PostToolUse"].as_array().unwrap();
         assert_eq!(ptu.len(), 1);
     }
@@ -711,7 +711,7 @@ mod tests {
         // Non-codemux entry
         let other = serde_json::json!({
             "matcher": "*",
-            "hooks": [{"type": "command", "command": "superset-notify.sh"}]
+            "hooks": [{"type": "command", "command": "external-notify.sh"}]
         });
         assert!(!entry_contains_codemux_hook(&other));
     }

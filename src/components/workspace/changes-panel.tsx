@@ -1466,7 +1466,7 @@ export function ChangesPanel({ workspace }: Props) {
     <>
     <TooltipProvider>
       <div className="flex h-full flex-col">
-        {/* Toolbar row — above commit area, matches Superset layout */}
+        {/* Toolbar row — above commit area */}
         <div className="flex items-center gap-0.5 px-2 py-1.5">
           {/* Base branch selector */}
           {remoteBranches.length > 1 ? (

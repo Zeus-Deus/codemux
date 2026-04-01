@@ -35,7 +35,7 @@ interface Props {
   title: string;
 }
 
-// Static ANSI palette — Superset Ember warm-tinted colors
+// Static ANSI palette — Ember warm-tinted colors
 const ANSI_COLORS = {
   black: "#151110",
   red: "#dc6b6b",

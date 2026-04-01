@@ -1,6 +1,6 @@
 ---
 name: codemux-features
-description: Use when implementing new ADE features for Codemux — tasks system, MCP server, settings panel, notification sounds, custom keybinds, session persistence, browser DevTools, or any feature inspired by competing ADEs like Superset, cmux, Conductor, or Emdash. Also use when asked to add a feature from another ADE or make Codemux competitive with other tools.
+description: Use when implementing new ADE features for Codemux — tasks system, MCP server, settings panel, notification sounds, custom keybinds, session persistence, browser DevTools, or any feature inspired by competing ADEs. Also use when asked to add a feature from another ADE or make Codemux competitive with other tools.
 ---
 
 # Codemux ADE Feature Implementation Guide
@@ -17,10 +17,7 @@ For OpenFlow orchestration patterns, read `docs/features/openflow.md` and `docs/
 
 2. **Work in branches.** Create a feature branch for any significant new feature. Name it `feature/<feature-name>`.
 
-3. **Reference open source competitors.** Superset and cmux are open source. When implementing a feature they have, you MAY clone their repo to `/tmp` for reference:
-   - `gh repo clone superset-sh/superset /tmp/superset-ref` (Electron + TypeScript)
-   - `gh repo clone manaflow-ai/cmux /tmp/cmux-ref` (Swift + libghostty)
-   Inspect their implementation for ideas, then adapt to Codemux's Tauri + Rust + React + Tailwind + shadcn architecture. Do not copy code directly — understand the approach and reimplement it.
+3. **Research before building.** Before implementing a feature that other ADEs have, research how similar tools approach it. Understand the pattern, then reimplement it for Codemux's Tauri + Rust + React + Tailwind + shadcn architecture. Do not copy code from other projects.
 
 4. **Backend-first.** Codemux's architecture is backend-state-driven. Implement features in Rust first (state, commands, persistence), then expose via Tauri commands, then build the React UI. The frontend is a view of backend truth.
 
@@ -77,7 +74,7 @@ Configuration:
 - Generate `.mcp.json` in workspace directories so agents auto-discover the Codemux MCP server
 - Support `claude mcp add codemux` style registration
 
-**Reference:** Superset's MCP server exposes tasks, workspaces, devices, and AI session management. Check their MCP docs and `apps/api/src/trpc/routers/` for implementation structure.
+**Reference:** Study existing MCP server implementations in other ADEs for patterns around exposing tasks, workspaces, and session management.
 
 ---
 
@@ -149,31 +146,9 @@ Frontend (React):
 
 ---
 
-## Open Source Reference Repos
+## Research Pattern
 
-When implementing any feature above, these repos can be cloned to `/tmp` for implementation reference:
-
-| Repo | Stack | Best for referencing |
-|------|-------|---------------------|
-| `superset-sh/superset` | Electron, TypeScript, React | Diff viewer, worktrees, port detection, presets, setup/teardown, MCP server |
-| `manaflow-ai/cmux` | Swift, libghostty | Browser automation depth, notification system, pane/surface hierarchy |
-| `nicepkg/emdash` | Electron, TypeScript | Best-of-N comparison, issue tracker integration |
-
-Usage pattern:
-```bash
-# Clone for reference (do NOT modify)
-gh repo clone superset-sh/superset /tmp/superset-ref --depth 1
-
-# Inspect specific feature
-find /tmp/superset-ref -name "*.ts" | xargs grep -l "worktree" | head -20
-# or
-find /tmp/superset-ref -name "*.ts" | xargs grep -l "diff" | head -20
-
-# Clean up when done
-rm -rf /tmp/superset-ref
-```
-
-Always adapt patterns to Codemux's architecture (Tauri + Rust backend + React frontend), never transplant code from a different framework.
+When implementing features that other ADEs have solved, research their approach before building. Understand the design decisions, then reimplement for Codemux's architecture (Tauri + Rust backend + React frontend). Never transplant code from a different framework.
 
 ---
 

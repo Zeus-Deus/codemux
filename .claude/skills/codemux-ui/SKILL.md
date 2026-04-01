@@ -15,7 +15,7 @@ Apply these standards to new code and incremental improvements. Do not mass-refa
 
 Codemux is a Linux-first ADE (Agentic Development Environment). The UI wraps terminal panes where CLI agents do the real work. The shell (sidebar, pane headers, status indicators, notifications) should feel professional, clean, and calm — like a well-designed control room.
 
-Reference products for the visual feel: Superset (superset.sh), cmux (cmux.com), Conductor (conductor.build). These apps use neutral dark backgrounds with small, intentional color accents.
+Reference products for the visual feel: modern ADE terminals and developer tools. These apps use neutral dark backgrounds with small, intentional color accents.
 
 Principles:
 - **neutral base, accent pops** — the app shell is always dark neutral; theme colors appear only in small, intentional places
