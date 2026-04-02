@@ -1,6 +1,6 @@
 [package]
 name = "codemux"
-version = "0.1.7"
+version = "0.1.8"
 description = "The Agentic Development Environment for Builders"
 authors = ["Zeus-Deus"]
 license = "Elastic-2.0"
