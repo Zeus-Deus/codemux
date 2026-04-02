@@ -643,6 +643,12 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
             },
         };
 
+        // Send terminal reset sequences to xterm.js via the IPC channel
+        // before tearing down the session. This restores xterm.js to a clean
+        // state after apps that enable mouse tracking, alt screen, etc.
+        const TERMINAL_RESET: &[u8] = b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
+        queue_or_send_output(&wait_sessions, &wait_session_id, TERMINAL_RESET.to_vec());
+
         with_session_runtime(
             &wait_sessions,
             &wait_session_id,
@@ -1454,6 +1460,10 @@ pub fn spawn_pty_for_agent(
             "agent_exited session_id={} state={:?}",
             wait_session_id, payload.state
         ));
+
+        // Send terminal reset sequences to xterm.js before tearing down.
+        const TERMINAL_RESET: &[u8] = b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
+        queue_or_send_output(&wait_sessions, &wait_session_id, TERMINAL_RESET.to_vec());
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);
 
