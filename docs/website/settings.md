@@ -78,7 +78,7 @@ Settings configured here are stored in the database. File-based config (`.codemu
 
 ## Shortcuts
 
-A read-only reference of all keyboard shortcuts grouped by category. See [Keyboard Shortcuts](keyboard-shortcuts.md) for the full list.
+A read-only reference of all keyboard shortcuts grouped by category. See [Keyboard Shortcuts](/keyboard-shortcuts) for the full list.
 
 ## Agent
 
@@ -96,12 +96,12 @@ A read-only reference of all keyboard shortcuts grouped by category. See [Keyboa
 | Section | Category | Synced |
 |---------|----------|--------|
 | Account | Personal | No (auth state) |
-| Appearance | Personal | Partial |
+| Appearance | Personal | Yes |
 | Notifications | Personal | Yes |
-| Shortcuts | Personal | No (read-only reference) |
+| Shortcuts | Personal | Yes |
 | Editor | Editor & Workflow | Yes |
-| Terminal | Editor & Workflow | Yes |
+| Terminal | Editor & Workflow | Partial (scrollback limit and cursor style sync; color theme and font family are machine-local) |
 | Presets | Editor & Workflow | No (local) |
 | Projects | Editor & Workflow | No (local) |
-| Git | Editor & Workflow | Yes |
+| Git | Editor & Workflow | Partial (default base branch syncs; AI commit message and merge resolver settings are machine-local) |
 | Agent | Editor & Workflow | No (local) |
