@@ -1,3 +1,4 @@
+use crate::git::ensure_git_exclude;
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -543,6 +544,7 @@ fn save_index(snapshot: &ProjectIndexSnapshot) -> Result<(), String> {
             dir.display()
         )
     })?;
+    ensure_git_exclude(&root, ".codemux");
     let path = index_path(&root);
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|error| format!("Failed to serialize project index: {error}"))?;

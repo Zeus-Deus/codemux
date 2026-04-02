@@ -1,3 +1,4 @@
+use crate::git::ensure_git_exclude;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -196,6 +197,9 @@ fn save_snapshot(snapshot: &ObservabilitySnapshot) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create observability dir: {error}"))?;
+    }
+    if let Some(workspace_dir) = path.parent().and_then(|p| p.parent()) {
+        ensure_git_exclude(workspace_dir, ".codemux");
     }
 
     let json = serde_json::to_string_pretty(snapshot)

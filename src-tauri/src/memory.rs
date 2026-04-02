@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::git::ensure_git_exclude;
 use crate::project::current_project_root;
 
 const PROJECT_MEMORY_SCHEMA_VERSION: u32 = 1;
@@ -249,6 +250,7 @@ fn save_project_memory(snapshot: &ProjectMemorySnapshot) -> Result<(), String> {
             dir.display()
         )
     })?;
+    ensure_git_exclude(&root, ".codemux");
     let path = project_memory_path(&root);
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|error| format!("Failed to serialize project memory: {error}"))?;

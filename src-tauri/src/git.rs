@@ -1223,6 +1223,77 @@ fn parse_ahead_behind(output: &str) -> (u32, u32) {
     }
 }
 
+/// Add `entry` to `.git/info/exclude` so git ignores it without modifying `.gitignore`.
+///
+/// Works for both normal repositories (`.git` is a directory) and worktrees
+/// (`.git` is a file containing `gitdir: ...`) by resolving to the main
+/// repo's `.git/info/exclude`.
+///
+/// Uses a process-wide cache to avoid repeated filesystem checks after the
+/// entry has been written once for a given (workspace, entry) pair.
+///
+/// Silently returns on any failure (not a git repo, parse error, I/O error).
+pub fn ensure_git_exclude(workspace_dir: &Path, entry: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    static DONE: std::sync::LazyLock<Mutex<HashSet<(PathBuf, String)>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashSet::new()));
+
+    let key = (workspace_dir.to_path_buf(), entry.to_string());
+    {
+        let set = DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if set.contains(&key) {
+            return;
+        }
+    }
+
+    let git_path = workspace_dir.join(".git");
+
+    let git_dir = if git_path.is_dir() {
+        git_path
+    } else if git_path.is_file() {
+        // Worktree: .git file contains "gitdir: /path/to/main/.git/worktrees/<name>"
+        let content = match std::fs::read_to_string(&git_path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let gitdir = match content.strip_prefix("gitdir: ") {
+            Some(s) => s.trim(),
+            None => return,
+        };
+        // Navigate up from .git/worktrees/<name> to .git/
+        match PathBuf::from(gitdir).parent().and_then(|p| p.parent()) {
+            Some(dot_git) => dot_git.to_path_buf(),
+            None => return,
+        }
+    } else {
+        return;
+    };
+
+    let info_dir = git_dir.join("info");
+    let _ = std::fs::create_dir_all(&info_dir);
+    let exclude_path = info_dir.join("exclude");
+
+    let already_present = if let Ok(content) = std::fs::read_to_string(&exclude_path) {
+        if content.lines().any(|line| line.trim() == entry) {
+            true
+        } else {
+            let prefix = if content.ends_with('\n') { "" } else { "\n" };
+            let _ = std::fs::write(&exclude_path, format!("{content}{prefix}{entry}\n"));
+            false
+        }
+    } else {
+        let _ = std::fs::write(&exclude_path, format!("{entry}\n"));
+        false
+    };
+
+    // Cache the result so concurrent/repeated calls skip filesystem I/O.
+    let _ = already_present;
+    let mut set = DONE.lock().unwrap_or_else(|e| e.into_inner());
+    set.insert(key);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3121,5 +3192,84 @@ C  source.txt -> copy.txt";
         let (_dir, repo) = setup_test_repo();
         let result = get_commit_files(&repo, "deadbeefdeadbeef");
         assert!(result.is_err(), "invalid hash should return error");
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_git_exclude tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ensure_git_exclude_creates_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        std::fs::write(git_info.join("exclude"), "*.log\n").unwrap();
+
+        ensure_git_exclude(dir.path(), ".codemux");
+
+        let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
+        assert!(content.contains("*.log"));
+        assert!(content.contains(".codemux"));
+    }
+
+    #[test]
+    fn test_ensure_git_exclude_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_info = dir.path().join(".git").join("info");
+        std::fs::create_dir_all(&git_info).unwrap();
+        std::fs::write(git_info.join("exclude"), ".codemux\n").unwrap();
+
+        ensure_git_exclude(dir.path(), ".codemux");
+        ensure_git_exclude(dir.path(), ".codemux");
+
+        let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
+        assert_eq!(content.matches(".codemux").count(), 1);
+    }
+
+    #[test]
+    fn test_ensure_git_exclude_no_git_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        // No .git at all — should not crash or create anything
+        ensure_git_exclude(dir.path(), ".codemux");
+        assert!(!dir.path().join(".git").exists());
+    }
+
+    #[test]
+    fn test_ensure_git_exclude_creates_info_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        // .git/ exists but no info/ subdir
+
+        ensure_git_exclude(dir.path(), ".codemux");
+
+        let content =
+            std::fs::read_to_string(dir.path().join(".git/info/exclude")).unwrap();
+        assert!(content.contains(".codemux"));
+    }
+
+    #[test]
+    fn test_ensure_git_exclude_worktree() {
+        let main_repo = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+
+        // Set up main repo's .git directory structure
+        let main_git = main_repo.path().join(".git");
+        let wt_gitdir = main_git.join("worktrees").join("feat");
+        std::fs::create_dir_all(&wt_gitdir).unwrap();
+        std::fs::create_dir_all(main_git.join("info")).unwrap();
+
+        // Worktree has a .git file pointing to the main repo
+        std::fs::write(
+            worktree.path().join(".git"),
+            format!("gitdir: {}", wt_gitdir.display()),
+        )
+        .unwrap();
+
+        ensure_git_exclude(worktree.path(), ".codemux");
+
+        // Exclude entry should land in the main repo's .git/info/exclude
+        let content =
+            std::fs::read_to_string(main_git.join("info/exclude")).unwrap();
+        assert!(content.contains(".codemux"));
     }
 }

@@ -840,7 +840,7 @@ pub fn upsert_mcp_config(workspace_dir: &Path, workspace_id: &str) {
         }
     }
 
-    ensure_git_exclude(workspace_dir);
+    crate::git::ensure_git_exclude(workspace_dir, ".mcp.json");
 }
 
 /// Remove the "codemux" entry from `.mcp.json` on workspace close.
@@ -875,29 +875,6 @@ pub fn remove_mcp_config(workspace_dir: &Path) {
         let _ = std::fs::remove_file(&mcp_path);
     } else if let Ok(json) = serde_json::to_string_pretty(&config) {
         let _ = std::fs::write(&mcp_path, json);
-    }
-}
-
-/// Add `.mcp.json` to `.git/info/exclude` so git ignores it without modifying `.gitignore`.
-fn ensure_git_exclude(workspace_dir: &Path) {
-    let git_dir = workspace_dir.join(".git");
-    if !git_dir.is_dir() {
-        return;
-    }
-
-    let info_dir = git_dir.join("info");
-    let _ = std::fs::create_dir_all(&info_dir);
-    let exclude_path = info_dir.join("exclude");
-    let entry = ".mcp.json";
-
-    if let Ok(content) = std::fs::read_to_string(&exclude_path) {
-        if content.lines().any(|line| line.trim() == entry) {
-            return;
-        }
-        let prefix = if content.ends_with('\n') { "" } else { "\n" };
-        let _ = std::fs::write(&exclude_path, format!("{content}{prefix}{entry}\n"));
-    } else {
-        let _ = std::fs::write(&exclude_path, format!("{entry}\n"));
     }
 }
 
@@ -1251,7 +1228,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Git exclude tests
+    // Git exclude tests (shared function lives in crate::git)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1261,7 +1238,7 @@ mod tests {
         std::fs::create_dir_all(&git_info).unwrap();
         std::fs::write(git_info.join("exclude"), "*.log\n").unwrap();
 
-        ensure_git_exclude(&dir);
+        crate::git::ensure_git_exclude(&dir, ".mcp.json");
 
         let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
         assert!(content.contains("*.log"));
@@ -1277,8 +1254,8 @@ mod tests {
         std::fs::create_dir_all(&git_info).unwrap();
         std::fs::write(git_info.join("exclude"), ".mcp.json\n").unwrap();
 
-        ensure_git_exclude(&dir);
-        ensure_git_exclude(&dir);
+        crate::git::ensure_git_exclude(&dir, ".mcp.json");
+        crate::git::ensure_git_exclude(&dir, ".mcp.json");
 
         let content = std::fs::read_to_string(git_info.join("exclude")).unwrap();
         assert_eq!(content.matches(".mcp.json").count(), 1);
@@ -1290,7 +1267,7 @@ mod tests {
     fn git_exclude_no_git_dir_noop() {
         let dir = test_dir("git_exclude_nogit");
         // No .git dir — should not crash
-        ensure_git_exclude(&dir);
+        crate::git::ensure_git_exclude(&dir, ".mcp.json");
 
         cleanup(&dir);
     }
