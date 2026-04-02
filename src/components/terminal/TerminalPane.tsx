@@ -258,7 +258,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     const term = new Terminal({
       fontFamily: getTerminalFontFamily(),
       theme: buildThemeFromCSS(),
-      convertEol: true,
+      convertEol: false,
       cursorBlink: true,
       cursorWidth: 2,
       lineHeight: 1.15,
