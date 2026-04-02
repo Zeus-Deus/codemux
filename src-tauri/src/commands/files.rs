@@ -8,6 +8,7 @@ pub struct FileEntry {
     pub path: String,
     pub is_dir: bool,
     pub size: Option<u64>,
+    pub is_gitignored: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,17 +71,15 @@ pub fn list_directory(path: String, show_hidden: Option<bool>) -> Result<Vec<Fil
     ];
 
     for (name, entry_path, is_dir, size) in raw {
-        if ignored.contains(&name) {
-            continue;
-        }
         if is_dir && SKIP_DIRS.contains(&name.as_str()) {
             continue;
         }
         entries.push(FileEntry {
-            name,
+            name: name.clone(),
             path: entry_path.to_string_lossy().to_string(),
             is_dir,
             size,
+            is_gitignored: ignored.contains(&name),
         });
     }
 

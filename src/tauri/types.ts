@@ -712,4 +712,5 @@ export interface FileEntry {
   path: string;
   is_dir: boolean;
   size: number | null;
+  is_gitignored: boolean;
 }
