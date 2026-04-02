@@ -484,6 +484,12 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let mut cmd = CommandBuilder::new(shell.clone());
     cmd.cwd(cwd);
 
+    // Declare terminal capabilities — Codemux is the terminal emulator, so it
+    // must advertise what it supports.  Without these, CLI tools launched from a
+    // desktop shortcut (no parent terminal) lose ANSI color output.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+
     let snapshot = app_state.snapshot();
     let active_workspace_id = snapshot.active_workspace_id.0.clone();
     cmd.env("CODEMUX", "1");
@@ -1091,6 +1097,10 @@ pub fn spawn_pty_for_agent(
         cmd.arg(arg);
     }
     cmd.cwd(cwd);
+
+    // Declare terminal capabilities (see spawn_pty_for_session for rationale).
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
 
     // Standard Codemux env vars.
     cmd.env("CODEMUX", "1");
