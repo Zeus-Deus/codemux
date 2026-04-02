@@ -20,6 +20,8 @@ pub struct UserSettings {
     pub keyboard: KeyboardSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
+    #[serde(default)]
+    pub file_tree: FileTreeSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -100,6 +102,12 @@ impl Default for NotificationSettings {
             desktop_enabled: true,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct FileTreeSettings {
+    #[serde(default)]
+    pub show_hidden_files: bool,
 }
 
 fn default_theme() -> String {
@@ -346,6 +354,7 @@ mod tests {
         assert!(s.keyboard.shortcuts.is_empty());
         assert!(s.notifications.sound_enabled);
         assert!(s.notifications.desktop_enabled);
+        assert!(!s.file_tree.show_hidden_files);
     }
 
     #[test]
@@ -454,6 +463,9 @@ mod tests {
                 sound_enabled: false,
                 desktop_enabled: false,
             },
+            file_tree: FileTreeSettings {
+                show_hidden_files: true,
+            },
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -464,6 +476,7 @@ mod tests {
         assert_eq!(back.appearance.terminal_font_size, 18.5);
         assert_eq!(back.editor.default_ide.as_deref(), Some("cursor"));
         assert_eq!(back.terminal.scrollback_limit, 2000);
+        assert!(back.file_tree.show_hidden_files);
         assert_eq!(back.terminal.cursor_style, "underline");
         assert_eq!(back.git.default_base_branch, "develop");
         assert_eq!(back.keyboard.shortcuts.len(), 2);

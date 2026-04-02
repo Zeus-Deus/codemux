@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   git: { default_base_branch: "main" },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
+  file_tree: { show_hidden_files: false },
 };
 
 export interface SyncedSettingsState {
@@ -159,3 +160,6 @@ export const selectDesktopNotificationsEnabled = (s: SyncedSettingsState): boole
 
 export const selectKeyboardShortcuts = (s: SyncedSettingsState): Record<string, string> =>
   s.settings.keyboard.shortcuts;
+
+export const selectShowHiddenFiles = (s: SyncedSettingsState): boolean =>
+  s.settings.file_tree.show_hidden_files;

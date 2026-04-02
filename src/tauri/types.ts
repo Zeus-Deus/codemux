@@ -28,6 +28,10 @@ export interface NotificationSyncSettings {
   desktop_enabled: boolean;
 }
 
+export interface FileTreeSyncSettings {
+  show_hidden_files: boolean;
+}
+
 export interface UserSettings {
   appearance: AppearanceSettings;
   editor: EditorSettings;
@@ -35,6 +39,7 @@ export interface UserSettings {
   git: GitSyncSettings;
   keyboard: KeyboardSettings;
   notifications: NotificationSyncSettings;
+  file_tree: FileTreeSyncSettings;
 }
 
 // ── Auth ──

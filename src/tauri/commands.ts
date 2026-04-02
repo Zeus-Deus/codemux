@@ -739,8 +739,8 @@ export const searchFileNames = (path: string, query: string, maxResults: number)
 export const revealInFileManager = (path: string) =>
   invoke<void>("reveal_in_file_manager", { path });
 
-export const listDirectory = (path: string) =>
-  invoke<FileEntry[]>("list_directory", { path });
+export const listDirectory = (path: string, showHidden?: boolean) =>
+  invoke<FileEntry[]>("list_directory", { path, showHidden });
 
 export const readFile = (path: string) =>
   invoke<string>("read_file", { path });

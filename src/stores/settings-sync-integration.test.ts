@@ -38,6 +38,7 @@ const FULL_CUSTOM: UserSettings = {
   git: { default_base_branch: "develop" },
   keyboard: { shortcuts: { "ctrl+s": "save", "ctrl+p": "palette" } },
   notifications: { sound_enabled: false, desktop_enabled: false },
+  file_tree: { show_hidden_files: true },
 };
 
 // ── Setup ──

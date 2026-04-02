@@ -33,6 +33,7 @@ const DARK_SETTINGS: UserSettings = {
   git: { default_base_branch: "develop" },
   keyboard: { shortcuts: { "ctrl+s": "save" } },
   notifications: { sound_enabled: false, desktop_enabled: true },
+  file_tree: { show_hidden_files: true },
 };
 
 describe("synced-settings-store", () => {

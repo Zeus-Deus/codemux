@@ -20,8 +20,9 @@ pub struct SearchResult {
 }
 
 #[tauri::command]
-pub fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
+pub fn list_directory(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEntry>, String> {
     let dir = Path::new(&path);
+    let show_hidden = show_hidden.unwrap_or(false);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {path}"));
     }
@@ -33,8 +34,12 @@ pub fn list_directory(path: String) -> Result<Vec<FileEntry>, String> {
     let mut raw: Vec<(String, std::path::PathBuf, bool, Option<u64>)> = Vec::new();
     for entry in read_dir.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        // Skip hidden files/dirs starting with '.'
-        if name.starts_with('.') {
+        // Always hide .git directory regardless of show_hidden
+        if name == ".git" {
+            continue;
+        }
+        // Skip hidden files/dirs starting with '.' unless show_hidden is set
+        if !show_hidden && name.starts_with('.') {
             continue;
         }
         let entry_path = entry.path();
