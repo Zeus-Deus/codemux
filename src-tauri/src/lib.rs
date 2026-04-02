@@ -260,16 +260,15 @@ pub fn run() {
                 }
             }
 
-            // On Hyprland, xdg-desktop-portal-gtk file dialogs and file managers
-            // tile by default. Inject window rules to float them.
-            for rule in [
-                "float on, center on, size 800 600, match:class ^(xdg-desktop-portal-gtk)$",
-                "float on, center on, size 900 600, match:class ^(org.gnome.Nautilus|thunar|nemo|org.kde.dolphin|pcmanfm)$",
-            ] {
-                let _ = std::process::Command::new("hyprctl")
-                    .args(["keyword", "windowrule", rule])
-                    .output();
-            }
+            // On Hyprland, xdg-desktop-portal-gtk file dialogs tile by default.
+            // Inject a window rule to float them.
+            let _ = std::process::Command::new("hyprctl")
+                .args([
+                    "keyword",
+                    "windowrule",
+                    "float on, center on, size 800 600, match:class ^(xdg-desktop-portal-gtk)$",
+                ])
+                .output();
 
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
