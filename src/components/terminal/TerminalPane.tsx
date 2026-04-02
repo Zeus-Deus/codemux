@@ -144,9 +144,10 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         ? data
         : ptyDecoderRef.current.decode(data);
 
-    if (str.includes("\x1b[?u")) {
-      writeToPty(sessionIdRef.current, "\x1b[?0u").catch(console.error);
-    }
+    // nvim and other apps send \x1b[?u to query Kitty keyboard protocol support.
+    // We do NOT respond — responding \x1b[?0u causes nvim to enter Kitty mode,
+    // but xterm.js doesn't encode keys in Kitty format, breaking all input.
+    // The push/pop tracking below is kept for future Kitty support.
 
     const pushes = (str.match(/\x1b\[>[0-9]+u/g) ?? []).length;
     const pops = (str.match(/\x1b\[<u/g) ?? []).length;
