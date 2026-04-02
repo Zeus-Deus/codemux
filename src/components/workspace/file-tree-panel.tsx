@@ -43,7 +43,7 @@ function TreeNode({
       <div>
         <Button
           variant="ghost"
-          className="w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs"
+          className={`w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs ${entry.is_gitignored ? "opacity-50" : ""}`}
           style={{ paddingLeft: `${8 + depth * 16}px` }}
           onClick={() => onToggleDir(entry.path)}
         >
@@ -85,7 +85,7 @@ function TreeNode({
   return (
     <Button
       variant="ghost"
-      className="w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs"
+      className={`w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs ${entry.is_gitignored ? "opacity-50" : ""}`}
       style={{ paddingLeft: `${8 + depth * 16}px` }}
       onClick={() => onClickFile(entry.path)}
     >
