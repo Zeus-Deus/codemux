@@ -576,6 +576,58 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             serde_json::to_value(indexing::search_index(&store, query, limit))
                 .map_err(|error| error.to_string())
         }
+        "list_github_issues" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let repo_path = resolve_control_repo_path(app, &state, &request.params);
+            let search = request.params.get("search").and_then(Value::as_str);
+            crate::github::list_github_issues(std::path::Path::new(&repo_path), search)
+                .and_then(|issues| serde_json::to_value(issues).map_err(|e| e.to_string()))
+        }
+        "get_github_issue" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let repo_path = resolve_control_repo_path(app, &state, &request.params);
+            let number = request.params.get("number").and_then(Value::as_u64)
+                .ok_or_else(|| "Missing required parameter: number".to_string());
+            number.and_then(|n| {
+                crate::github::get_github_issue(std::path::Path::new(&repo_path), n)
+                    .and_then(|issue| serde_json::to_value(issue).map_err(|e| e.to_string()))
+            })
+        }
+        "link_workspace_issue" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| state.active_workspace_cwd().map(|(id, _)| id))
+                .ok_or_else(|| "No workspace_id and no active workspace".to_string());
+            let number = request.params.get("number").and_then(Value::as_u64)
+                .ok_or_else(|| "Missing required parameter: number".to_string());
+            workspace_id.and_then(|ws_id| {
+                number.and_then(|num| {
+                    let cwd = {
+                        let snap = state.snapshot();
+                        snap.workspaces.iter()
+                            .find(|w| w.workspace_id.0 == ws_id)
+                            .map(|ws| ws.project_root.clone().unwrap_or_else(|| ws.cwd.clone()))
+                            .ok_or_else(|| format!("No workspace found: {ws_id}"))
+                    };
+                    cwd.and_then(|cwd| {
+                        crate::github::get_github_issue(std::path::Path::new(&cwd), num)
+                            .map(|issue| {
+                                let title = issue.title.clone();
+                                let linked = crate::github::LinkedIssue {
+                                    number: issue.number,
+                                    title: issue.title,
+                                    state: issue.state,
+                                    labels: issue.labels,
+                                };
+                                state.link_workspace_issue(&ws_id, linked);
+                                crate::state::emit_app_state(app);
+                                serde_json::json!({ "linked": true, "issue_number": num, "title": title })
+                            })
+                    })
+                })
+            })
+        }
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 
@@ -593,4 +645,23 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             error: Some(error),
         },
     }
+}
+
+/// Resolve the repo path for control socket commands.
+/// Checks `repo_path` param first, then falls back to active workspace's project_root/cwd.
+fn resolve_control_repo_path(
+    _app: &AppHandle,
+    state: &State<'_, AppStateStore>,
+    params: &Value,
+) -> String {
+    if let Some(path) = params.get("repo_path").and_then(Value::as_str) {
+        return path.to_string();
+    }
+    if let Some((ws_id, _)) = state.active_workspace_cwd() {
+        let snap = state.snapshot();
+        if let Some(ws) = snap.workspaces.iter().find(|w| w.workspace_id.0 == ws_id) {
+            return ws.project_root.clone().unwrap_or_else(|| ws.cwd.clone());
+        }
+    }
+    ".".to_string()
 }

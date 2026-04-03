@@ -47,6 +47,9 @@ vi.mock("@/tauri/commands", () => ({
   checkGithubRepo: vi.fn().mockResolvedValue(false),
   listPullRequests: vi.fn().mockResolvedValue([]),
   pickFilesDialog: vi.fn().mockResolvedValue([]),
+  suggestIssueBranchName: vi.fn().mockResolvedValue("feature/92-backend-endpoints"),
+  linkWorkspaceIssue: vi.fn().mockResolvedValue(undefined),
+  listGithubIssues: vi.fn().mockResolvedValue([]),
 }));
 
 import {
@@ -87,6 +90,7 @@ function makeWs(overrides: WsOverrides = {}) {
     pr_number: null,
     pr_state: null,
     pr_url: null,
+    linked_issue: null,
     tabs: [],
     active_tab_id: "",
     active_surface_id: "",

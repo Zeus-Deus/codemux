@@ -310,6 +310,8 @@ pub struct WorkspaceSnapshot {
     #[serde(default)]
     pub pr_url: Option<String>,
     #[serde(default)]
+    pub linked_issue: Option<crate::github::LinkedIssue>,
+    #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
     pub active_tab_id: String,
@@ -579,6 +581,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -700,6 +703,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![],
@@ -784,6 +788,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -936,6 +941,32 @@ impl AppStateStore {
         {
             workspace.worktree_path = Some(worktree_path);
             workspace.title = title;
+        }
+    }
+
+    pub fn link_workspace_issue(
+        &self,
+        workspace_id: &str,
+        linked_issue: crate::github::LinkedIssue,
+    ) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.linked_issue = Some(linked_issue);
+        }
+    }
+
+    pub fn unlink_workspace_issue(&self, workspace_id: &str) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.linked_issue = None;
         }
     }
 
@@ -2473,6 +2504,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {

@@ -28,6 +28,11 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: BrowserCommand,
     },
+    /// GitHub issue operations
+    Issue {
+        #[command(subcommand)]
+        command: IssueCommand,
+    },
     /// List all available codemux commands and capabilities
     Capabilities,
     /// Start MCP server (JSON-RPC over stdio)
@@ -86,6 +91,29 @@ pub enum MemoryCommand {
         session: Option<String>,
         #[arg(long = "tag")]
         tags: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum IssueCommand {
+    /// List open GitHub issues for the current workspace's repo
+    List {
+        /// Search query (searches title and body)
+        #[arg(long)]
+        search: Option<String>,
+        /// Issue state filter: open, closed, or all
+        #[arg(long, default_value = "open")]
+        state: String,
+    },
+    /// View a specific GitHub issue
+    View {
+        /// Issue number
+        number: u64,
+    },
+    /// Link a GitHub issue to the active workspace
+    Link {
+        /// Issue number
+        number: u64,
     },
 }
 
@@ -213,6 +241,78 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     send_control_request(ControlRequest {
                         command: "search_index".into(),
                         params: json!({ "query": query, "limit": limit }),
+                    })
+                    .await?
+                }
+            };
+
+            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
+            Ok(true)
+        }
+        Some(CommandSet::Issue { command }) => {
+            let response = match command {
+                IssueCommand::List { search, state: _state } => {
+                    let params = if let Some(ref q) = search {
+                        json!({ "search": q })
+                    } else {
+                        json!({})
+                    };
+                    let response = send_control_request(ControlRequest {
+                        command: "list_github_issues".into(),
+                        params,
+                    })
+                    .await?;
+                    // Pretty-print as table
+                    if let Some(data) = &response.data {
+                        if let Some(issues) = data.as_array() {
+                            if issues.is_empty() {
+                                println!("No issues found.");
+                            } else {
+                                for issue in issues {
+                                    let num = issue["number"].as_u64().unwrap_or(0);
+                                    let title = issue["title"].as_str().unwrap_or("");
+                                    let state_str = issue["state"].as_str().unwrap_or("Open");
+                                    println!("#{:<6} {:8} {}", num, state_str, title);
+                                }
+                            }
+                            return Ok(true);
+                        }
+                    }
+                    response
+                }
+                IssueCommand::View { number } => {
+                    let response = send_control_request(ControlRequest {
+                        command: "get_github_issue".into(),
+                        params: json!({ "number": number }),
+                    })
+                    .await?;
+                    if let Some(data) = &response.data {
+                        let title = data["title"].as_str().unwrap_or("");
+                        let state_str = data["state"].as_str().unwrap_or("Open");
+                        let url = data["url"].as_str().unwrap_or("");
+                        let body = data["body"].as_str().unwrap_or("(no body)");
+                        let labels: Vec<&str> = data["labels"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(Value::as_str).collect())
+                            .unwrap_or_default();
+
+                        println!("#{} — {} [{}]", number, title, state_str);
+                        if !url.is_empty() {
+                            println!("{}", url);
+                        }
+                        if !labels.is_empty() {
+                            println!("Labels: {}", labels.join(", "));
+                        }
+                        println!();
+                        println!("{}", body);
+                        return Ok(true);
+                    }
+                    response
+                }
+                IssueCommand::Link { number } => {
+                    send_control_request(ControlRequest {
+                        command: "link_workspace_issue".into(),
+                        params: json!({ "number": number }),
                     })
                     .await?
                 }
@@ -371,6 +471,14 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                             "build": { "description": "Build/rebuild search index" },
                             "status": { "description": "Show index status" },
                             "search": { "args": "<query>", "description": "Search indexed code" }
+                        }
+                    },
+                    "issue": {
+                        "description": "GitHub issue operations",
+                        "subcommands": {
+                            "list": { "args": "[--search <query>]", "description": "List open issues for the current workspace's repo" },
+                            "view": { "args": "<number>", "description": "View a specific GitHub issue" },
+                            "link": { "args": "<number>", "description": "Link a GitHub issue to the active workspace" }
                         }
                     },
                     "status": { "description": "Show Codemux app status" },

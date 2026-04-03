@@ -49,6 +49,7 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
     pr_number: null,
     pr_state: null,
     pr_url: null,
+    linked_issue: null,
     tabs: [],
     active_tab_id: "",
     active_surface_id: "",
@@ -162,5 +163,45 @@ describe("SidebarWorkspaceRow", () => {
     );
     expect(screen.getByText("+10")).toBeInTheDocument();
     expect(screen.getByText("−3")).toBeInTheDocument();
+  });
+
+  it("shows linked issue number when linked_issue is present", () => {
+    const ws = makeWorkspace({
+      linked_issue: { number: 92, title: "Backend endpoints", state: "Open", labels: [] },
+    });
+    render(
+      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+    );
+    expect(screen.getByText("#92")).toBeInTheDocument();
+  });
+
+  it("does NOT show linked issue when linked_issue is null", () => {
+    const ws = makeWorkspace({ linked_issue: null });
+    const { container } = render(
+      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+    );
+    // No issue number should appear
+    expect(container.textContent).not.toMatch(/#\d+/);
+  });
+
+  it("shows green dot for open issues and muted dot for closed", () => {
+    const wsOpen = makeWorkspace({
+      linked_issue: { number: 10, title: "Open issue", state: "Open", labels: [] },
+    });
+    const { container: c1 } = render(
+      <SidebarWorkspaceRow workspace={wsOpen} isActive={false} />,
+    );
+    const openDot = c1.querySelector(".bg-success");
+    expect(openDot).toBeInTheDocument();
+
+    const wsClosed = makeWorkspace({
+      workspace_id: "ws-closed",
+      linked_issue: { number: 11, title: "Closed issue", state: "Closed", labels: [] },
+    });
+    const { container: c2 } = render(
+      <SidebarWorkspaceRow workspace={wsClosed} isActive={false} />,
+    );
+    const closedDot = c2.querySelector(".bg-muted-foreground");
+    expect(closedDot).toBeInTheDocument();
   });
 });

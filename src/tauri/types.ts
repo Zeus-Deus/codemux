@@ -455,6 +455,25 @@ export interface DeploymentInfo {
   created_at: string;
 }
 
+export type IssueState = "Open" | "Closed";
+
+export interface GitHubIssue {
+  number: number;
+  title: string;
+  state: IssueState;
+  labels: string[];
+  assignees: string[];
+  url: string;
+  body: string | null;
+}
+
+export interface LinkedIssue {
+  number: number;
+  title: string;
+  state: IssueState;
+  labels: string[];
+}
+
 export type GhStatus =
   | { status: "NotInstalled" }
   | { status: "NotAuthenticated" }
@@ -509,6 +528,7 @@ export interface WorkspaceSnapshot {
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;
+  linked_issue: LinkedIssue | null;
   tabs: TabSnapshot[];
   active_tab_id: string;
   active_surface_id: string;

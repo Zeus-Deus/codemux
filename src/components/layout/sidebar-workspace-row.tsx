@@ -361,6 +361,21 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                       #{workspace.pr_number}
                     </Badge>
                   )}
+                  {workspace.linked_issue && (
+                    <span className="inline-flex items-center gap-1 shrink-0">
+                      <span
+                        className={cn(
+                          "size-1.5 rounded-full",
+                          workspace.linked_issue.state === "Open"
+                            ? "bg-success"
+                            : "bg-muted-foreground",
+                        )}
+                      />
+                      <span className="text-[10px] tabular-nums">
+                        #{workspace.linked_issue.number}
+                      </span>
+                    </span>
+                  )}
                 </div>
               )}
             </div>

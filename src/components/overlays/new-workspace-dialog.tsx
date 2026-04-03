@@ -15,9 +15,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -31,15 +28,16 @@ import {
   Loader2,
   ArrowUp,
   ChevronDown,
-  Plus,
   Check,
   Paperclip,
   X,
+  CircleDot,
 } from "lucide-react";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
+import { IssuePickerPanel } from "@/components/github/issue-picker";
 import {
   listBranches,
   listWorktrees,
@@ -57,8 +55,10 @@ import {
   checkGithubRepo,
   listPullRequests,
   pickFilesDialog,
+  suggestIssueBranchName,
+  linkWorkspaceIssue,
 } from "@/tauri/commands";
-import type { TerminalPreset, WorktreeInfo, PullRequestInfo } from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, PullRequestInfo, GitHubIssue } from "@/tauri/types";
 
 interface Props {
   open: boolean;
@@ -90,6 +90,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   );
   const [baseBranch, setBaseBranch] = useState("main");
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [linkedIssue, setLinkedIssue] = useState<GitHubIssue | null>(null);
+  const [issuePickerOpen, setIssuePickerOpen] = useState(false);
 
   // Data state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
@@ -103,6 +105,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [ghAvailable, setGhAvailable] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const issuePickerRef = useRef<HTMLDivElement>(null);
 
   // Reset state when dialog opens
   const prevOpenRef = useRef(false);
@@ -115,6 +118,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setSelectedAgentId(lastSelectedAgentId || "builtin-claude");
     setBaseBranch("main");
     setAttachments([]);
+    setLinkedIssue(null);
+    setIssuePickerOpen(false);
   }
   prevOpenRef.current = open;
 
@@ -213,6 +218,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return Array.from(set).sort();
   }, [localBranches, remoteBranches]);
 
+  // Find a workspace_id for the current project (needed by issue picker to resolve repo)
+  const projectWorkspaceId = useMemo(() => {
+    if (!appState || !projectDir) return null;
+    const ws = appState.workspaces.find(
+      (w) => w.project_root === projectDir || w.cwd === projectDir,
+    );
+    return ws?.workspace_id ?? null;
+  }, [appState, projectDir]);
+
+  // Whether the issue picker is available (needs gh + a GitHub repo)
+  const isGithubRepo = ghAvailable;
+
   // Selected agent preset
   const selectedAgent = useMemo(
     () => presets.find((p) => p.id === selectedAgentId) ?? null,
@@ -226,6 +243,22 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     ta.style.height = "auto";
     ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 40), 192)}px`;
   };
+
+  const handleIssueSelect = useCallback(
+    async (issue: GitHubIssue) => {
+      setLinkedIssue(issue);
+      // Auto-fill branch name if empty
+      if (!branchName.trim()) {
+        try {
+          const suggested = await suggestIssueBranchName(issue.number, issue.title);
+          setBranchName(suggested);
+        } catch {
+          // Non-blocking — user can type their own
+        }
+      }
+    },
+    [branchName],
+  );
 
   const handleSubmit = useCallback(async () => {
     if (!projectDir) return;
@@ -315,6 +348,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         projectDir.split("/").filter(Boolean).pop() || projectDir;
       dbAddRecentProject(projectDir, pName).catch(console.error);
 
+      // Link issue to the new workspace (non-blocking)
+      if (linkedIssue) {
+        linkWorkspaceIssue(wsId, linkedIssue.number).catch(console.error);
+      }
+
       removePendingWorkspace(tempId);
       await activateWorkspace(wsId);
     } catch (err) {
@@ -334,11 +372,24 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     branchWorkspaceMap,
     worktrees,
     currentBranch,
+    linkedIssue,
     onOpenChange,
     addPendingWorkspace,
     removePendingWorkspace,
     failPendingWorkspace,
   ]);
+
+  // Close issue picker on click outside it (within the dialog)
+  useEffect(() => {
+    if (!issuePickerOpen) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (issuePickerRef.current && !issuePickerRef.current.contains(e.target as Node)) {
+        setIssuePickerOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [issuePickerOpen]);
 
   // Handle Ctrl+Enter
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -352,7 +403,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="sm:max-w-[560px] max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-hidden"
+        className="sm:max-w-[560px] max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-visible"
         onKeyDown={handleKeyDown}
       >
         <DialogHeader className="sr-only">
@@ -379,7 +430,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         </div>
 
         {/* Center: prompt textarea with embedded controls */}
-        <div className="px-3 pt-2 pb-3">
+        <div className="relative px-3 pt-2 pb-3">
           <div className="rounded-2xl border border-border bg-muted overflow-hidden">
             <Textarea
               ref={textareaRef}
@@ -390,9 +441,29 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               rows={1}
             />
 
-            {/* Attachment chips */}
-            {attachments.length > 0 && (
+            {/* Attachment chips + linked issue chip */}
+            {(attachments.length > 0 || linkedIssue) && (
               <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+                {/* Linked issue chip */}
+                {linkedIssue && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-[11px] text-muted-foreground">
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-full shrink-0",
+                        linkedIssue.state === "Open" ? "bg-success" : "bg-muted-foreground",
+                      )}
+                    />
+                    <span className="font-mono tabular-nums">#{linkedIssue.number}</span>
+                    <span className="max-w-[180px] truncate">{linkedIssue.title}</span>
+                    <button
+                      type="button"
+                      className="ml-0.5 rounded-full p-0.5 hover:bg-foreground/10 transition-colors"
+                      onClick={() => setLinkedIssue(null)}
+                    >
+                      <X className="h-2.5 w-2.5" />
+                    </button>
+                  </span>
+                )}
                 {attachments.map((file) => (
                   <span
                     key={file}
@@ -459,20 +530,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
-              <div className="flex items-center gap-1.5">
-                {/* "+" menu button — attach files, link PR */}
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
+              <div className="flex items-center gap-1">
+                {/* Attach files */}
+                <Tooltip>
+                  <TooltipTrigger asChild>
                     <button
                       type="button"
-                      className="inline-flex size-8 items-center justify-center rounded-full border border-border bg-muted/60 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
-                    >
-                      <Plus className="h-4 w-4" />
-                    </button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-[220px]">
-                    <DropdownMenuItem
-                      className="text-xs"
+                      aria-label="Attach files"
+                      className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
                       onClick={async () => {
                         const files = await pickFilesDialog("Attach files");
                         if (files.length > 0) {
@@ -483,56 +548,81 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         }
                       }}
                     >
-                      <Paperclip className="mr-2 h-3.5 w-3.5" />
-                      Add attachment
-                    </DropdownMenuItem>
+                      <Paperclip className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top">Attach files</TooltipContent>
+                </Tooltip>
 
-                    {/* Link pull request — sub-menu with PR list */}
-                    <DropdownMenuSub>
-                      <DropdownMenuSubTrigger className="text-xs">
-                        <GitPullRequest className="mr-2 h-3.5 w-3.5" />
-                        Link pull request
-                      </DropdownMenuSubTrigger>
-                      <DropdownMenuSubContent className="w-[260px] max-h-[240px] overflow-y-auto">
-                        {!ghAvailable ? (
-                          <DropdownMenuItem disabled className="text-xs text-muted-foreground">
-                            GitHub CLI not available
-                          </DropdownMenuItem>
-                        ) : openPrs.length === 0 ? (
-                          <DropdownMenuItem disabled className="text-xs text-muted-foreground">
-                            No open pull requests
-                          </DropdownMenuItem>
-                        ) : (
-                          openPrs.map((pr) => (
-                            <DropdownMenuItem
-                              key={pr.number}
-                              className="text-xs gap-2"
-                              disabled={!pr.head_branch}
-                              onClick={() => {
-                                if (pr.head_branch) setBranchName(pr.head_branch);
-                              }}
-                            >
-                              <div className="min-w-0 flex-1">
-                                <div className="truncate">{pr.title}</div>
-                                <div className="text-[10px] text-muted-foreground flex items-center gap-1">
-                                  <span>#{pr.number}</span>
-                                  {pr.head_branch && (
-                                    <>
-                                      <span className="opacity-40">-</span>
-                                      <span className="truncate font-mono">{pr.head_branch}</span>
-                                    </>
-                                  )}
-                                </div>
+                {/* Link pull request */}
+                {ghAvailable && (
+                  <DropdownMenu>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            aria-label="Link pull request"
+                            className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                          >
+                            <GitPullRequest className="h-4 w-4" />
+                          </button>
+                        </DropdownMenuTrigger>
+                      </TooltipTrigger>
+                      <TooltipContent side="top">Link pull request</TooltipContent>
+                    </Tooltip>
+                    <DropdownMenuContent align="end" className="w-[260px] max-h-[240px] overflow-y-auto">
+                      {openPrs.length === 0 ? (
+                        <DropdownMenuItem disabled className="text-xs text-muted-foreground">
+                          No open pull requests
+                        </DropdownMenuItem>
+                      ) : (
+                        openPrs.map((pr) => (
+                          <DropdownMenuItem
+                            key={pr.number}
+                            className="text-xs gap-2"
+                            disabled={!pr.head_branch}
+                            onClick={() => {
+                              if (pr.head_branch) setBranchName(pr.head_branch);
+                            }}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate">{pr.title}</div>
+                              <div className="text-[10px] text-muted-foreground flex items-center gap-1">
+                                <span>#{pr.number}</span>
+                                {pr.head_branch && (
+                                  <>
+                                    <span className="opacity-40">-</span>
+                                    <span className="truncate font-mono">{pr.head_branch}</span>
+                                  </>
+                                )}
                               </div>
-                            </DropdownMenuItem>
-                          ))
-                        )}
-                      </DropdownMenuSubContent>
-                    </DropdownMenuSub>
-                  </DropdownMenuContent>
-                </DropdownMenu>
+                            </div>
+                          </DropdownMenuItem>
+                        ))
+                      )}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
 
-                {/* Submit button — circular icon, muted style */}
+                {/* Link issue */}
+                {isGithubRepo && !linkedIssue && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label="Link issue"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        onClick={() => setIssuePickerOpen(true)}
+                      >
+                        <CircleDot className="h-4 w-4" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">Link issue</TooltipContent>
+                  </Tooltip>
+                )}
+
+                {/* Submit */}
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <button
@@ -550,6 +640,22 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               </div>
             </div>
           </div>
+
+          {/* Issue picker — absolute within the relative textarea area, floats below */}
+          {issuePickerOpen && projectDir && (
+            <div
+              ref={issuePickerRef}
+              className="absolute right-0 top-full mt-1 z-50 w-[320px] rounded-lg border border-border bg-popover shadow-lg overflow-hidden animate-in fade-in-0 zoom-in-95 duration-150"
+            >
+              <IssuePickerPanel
+                workspaceId={projectWorkspaceId ?? undefined}
+                projectPath={projectDir}
+                open={issuePickerOpen}
+                onSelect={handleIssueSelect}
+                onClose={() => setIssuePickerOpen(false)}
+              />
+            </div>
+          )}
         </div>
 
         {/* Bottom row: project + branch pickers as muted pills */}
@@ -634,6 +740,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             Ctrl+Enter to create
           </span>
         </div>
+
       </DialogContent>
     </Dialog>
   );

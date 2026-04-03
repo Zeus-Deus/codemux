@@ -15,6 +15,7 @@ import type {
   EditorInfo,
   FileEntry,
   GhStatus,
+  GitHubIssue,
   GitBranchInfo,
   GitDiffStat,
   GitFileStatus,
@@ -294,6 +295,29 @@ export const submitPrReview = (path: string, prNumber: number, event: string, bo
 
 export const getPrDeployments = (path: string, prNumber: number) =>
   invoke<DeploymentInfo[]>("get_pr_deployments", { path, prNumber });
+
+// ── GitHub Issues ──
+
+export const listGithubIssues = (workspaceId: string, search?: string) =>
+  invoke<GitHubIssue[]>("list_github_issues", { workspaceId, search });
+
+export const listGithubIssuesByPath = (path: string, search?: string) =>
+  invoke<GitHubIssue[]>("list_github_issues_by_path", { path, search });
+
+export const getGithubIssue = (workspaceId: string, issueNumber: number) =>
+  invoke<GitHubIssue>("get_github_issue", { workspaceId, issueNumber });
+
+export const linkWorkspaceIssue = (workspaceId: string, issueNumber: number) =>
+  invoke("link_workspace_issue", { workspaceId, issueNumber });
+
+export const unlinkWorkspaceIssue = (workspaceId: string) =>
+  invoke("unlink_workspace_issue", { workspaceId });
+
+export const refreshWorkspaceIssue = (workspaceId: string) =>
+  invoke("refresh_workspace_issue", { workspaceId });
+
+export const suggestIssueBranchName = (issueNumber: number, issueTitle: string) =>
+  invoke<string>("suggest_issue_branch_name", { issueNumber, issueTitle });
 
 // ── Database ──
 

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestInfo {
@@ -159,6 +160,268 @@ pub fn gh_available() -> bool {
 
 pub fn is_github_repo(repo_path: &Path) -> bool {
     run_gh_optional(repo_path, &["repo", "view", "--json", "url"]).is_some()
+}
+
+// ── GitHub Issues ──
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IssueState {
+    Open,
+    Closed,
+}
+
+impl IssueState {
+    fn from_str(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "CLOSED" => IssueState::Closed,
+            _ => IssueState::Open,
+        }
+    }
+}
+
+impl std::fmt::Display for IssueState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IssueState::Open => write!(f, "open"),
+            IssueState::Closed => write!(f, "closed"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitHubIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: IssueState,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
+    pub url: String,
+    #[serde(default)]
+    pub body: Option<String>,
+}
+
+/// Cached display data for a workspace's linked issue.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkedIssue {
+    pub number: u64,
+    pub title: String,
+    pub state: IssueState,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+const MAX_ISSUE_BODY_BYTES: usize = 50 * 1024; // 50 KB
+const ISSUE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Run `gh` with a timeout. Returns Err if the process doesn't finish in time.
+fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    let mut child = Command::new("gh")
+        .args(args)
+        .current_dir(repo_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run gh: {e}"))?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = child.stdout.take().map(|mut s| {
+                    let mut buf = String::new();
+                    std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                    buf
+                }).unwrap_or_default();
+
+                if !status.success() {
+                    let stderr = child.stderr.take().map(|mut s| {
+                        let mut buf = String::new();
+                        std::io::Read::read_to_string(&mut s, &mut buf).ok();
+                        buf
+                    }).unwrap_or_default();
+                    return Err(format!(
+                        "gh {} failed: {}",
+                        args.first().unwrap_or(&""),
+                        stderr.trim()
+                    ));
+                }
+                return Ok(stdout.trim_end().to_string());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("gh command timed out after {}s", timeout.as_secs()));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("Failed to wait for gh: {e}")),
+        }
+    }
+}
+
+pub fn list_github_issues(
+    repo_path: &Path,
+    search: Option<&str>,
+) -> Result<Vec<GitHubIssue>, String> {
+    if !gh_available() {
+        return Err("gh CLI is not installed".into());
+    }
+    match check_gh_status() {
+        GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
+        GhStatus::NotAuthenticated => return Err("gh CLI is not authenticated. Run: gh auth login".into()),
+        GhStatus::Authenticated { .. } => {}
+    }
+
+    let json_fields = "number,title,state,labels,assignees,url";
+
+    let output = if let Some(query) = search {
+        run_gh_timed(
+            repo_path,
+            &[
+                "issue", "list",
+                "--search", query,
+                "--state", "all",
+                "--limit", "20",
+                "--json", json_fields,
+            ],
+            ISSUE_FETCH_TIMEOUT,
+        )?
+    } else {
+        run_gh_timed(
+            repo_path,
+            &[
+                "issue", "list",
+                "--state", "open",
+                "--limit", "50",
+                "--json", json_fields,
+            ],
+            ISSUE_FETCH_TIMEOUT,
+        )?
+    };
+
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse issues JSON: {e}"))?;
+
+    let arr = v.as_array().ok_or("Expected JSON array from gh issue list")?;
+    Ok(arr.iter().map(parse_issue_json).collect())
+}
+
+pub fn get_github_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, String> {
+    if !gh_available() {
+        return Err("gh CLI is not installed".into());
+    }
+
+    let number_str = number.to_string();
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "issue", "view", &number_str,
+            "--json", "number,title,state,labels,assignees,url,body",
+        ],
+        ISSUE_FETCH_TIMEOUT,
+    )?;
+
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse issue JSON: {e}"))?;
+
+    let mut issue = parse_issue_json(&v);
+
+    // Populate body (truncated to 50KB)
+    if let Some(body) = v["body"].as_str() {
+        let truncated = if body.len() > MAX_ISSUE_BODY_BYTES {
+            let mut end = MAX_ISSUE_BODY_BYTES;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…\n\n[Body truncated at 50KB]", &body[..end])
+        } else {
+            body.to_string()
+        };
+        issue.body = Some(truncated);
+    }
+
+    Ok(issue)
+}
+
+fn parse_issue_json(v: &serde_json::Value) -> GitHubIssue {
+    let labels = v["labels"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l["name"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let assignees = v["assignees"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a["login"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    GitHubIssue {
+        number: v["number"].as_u64().unwrap_or(0),
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        state: IssueState::from_str(v["state"].as_str().unwrap_or("OPEN")),
+        labels,
+        assignees,
+        url: v["url"].as_str().unwrap_or("").to_string(),
+        body: None,
+    }
+}
+
+/// Generate a branch name suggestion from an issue.
+/// Format: `{number}-{kebab-title}` (max ~60 chars for the title portion).
+pub fn suggest_branch_name(number: u64, title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+
+    // Collapse multiple hyphens and trim
+    let mut collapsed = String::new();
+    let mut prev_hyphen = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen && !collapsed.is_empty() {
+                collapsed.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            collapsed.push(c);
+            prev_hyphen = false;
+        }
+    }
+
+    // Trim trailing hyphens
+    let trimmed = collapsed.trim_end_matches('-');
+
+    // Truncate title portion to ~60 chars, break at word boundary
+    let max_title_len = 60;
+    let title_slug = if trimmed.len() > max_title_len {
+        let truncated = &trimmed[..max_title_len];
+        // Find last hyphen to break at word boundary
+        if let Some(pos) = truncated.rfind('-') {
+            &truncated[..pos]
+        } else {
+            truncated
+        }
+    } else {
+        trimmed
+    };
+
+    format!("feature/{number}-{title_slug}")
 }
 
 pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
@@ -598,5 +861,217 @@ mod tests {
         }"#;
         let pr: PullRequestInfo = serde_json::from_str(json).unwrap();
         assert_eq!(pr.number, 7);
+    }
+
+    // ── Issue tests ──
+
+    #[test]
+    fn test_parse_issue_json() {
+        let json = r#"{
+            "number": 92,
+            "title": "Backend endpoints voor prospectielijst",
+            "state": "OPEN",
+            "url": "https://github.com/user/repo/issues/92",
+            "labels": [{"name": "enhancement"}, {"name": "backend"}],
+            "assignees": [{"login": "zeus"}]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let issue = parse_issue_json(&v);
+        assert_eq!(issue.number, 92);
+        assert_eq!(issue.title, "Backend endpoints voor prospectielijst");
+        assert_eq!(issue.state, IssueState::Open);
+        assert_eq!(issue.labels, vec!["enhancement", "backend"]);
+        assert_eq!(issue.assignees, vec!["zeus"]);
+        assert!(issue.body.is_none());
+    }
+
+    #[test]
+    fn test_parse_issue_closed() {
+        let json = r#"{
+            "number": 10,
+            "title": "Fix login",
+            "state": "CLOSED",
+            "url": "https://github.com/u/r/issues/10",
+            "labels": [],
+            "assignees": []
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let issue = parse_issue_json(&v);
+        assert_eq!(issue.state, IssueState::Closed);
+    }
+
+    #[test]
+    fn test_parse_issue_minimal() {
+        let json = r#"{
+            "number": 1,
+            "title": "Bug",
+            "state": "OPEN",
+            "url": "https://github.com/u/r/issues/1"
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let issue = parse_issue_json(&v);
+        assert_eq!(issue.number, 1);
+        assert!(issue.labels.is_empty());
+        assert!(issue.assignees.is_empty());
+    }
+
+    #[test]
+    fn test_parse_issue_list() {
+        let json = r#"[
+            {"number": 1, "url": "https://github.com/u/r/issues/1", "state": "OPEN", "title": "A", "labels": [], "assignees": []},
+            {"number": 2, "url": "https://github.com/u/r/issues/2", "state": "CLOSED", "title": "B", "labels": [{"name": "bug"}], "assignees": []}
+        ]"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let issues: Vec<GitHubIssue> = v.as_array().unwrap().iter().map(parse_issue_json).collect();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].state, IssueState::Open);
+        assert_eq!(issues[1].state, IssueState::Closed);
+        assert_eq!(issues[1].labels, vec!["bug"]);
+    }
+
+    #[test]
+    fn test_issue_serialization_roundtrip() {
+        let issue = GitHubIssue {
+            number: 42,
+            title: "Test issue".into(),
+            state: IssueState::Open,
+            labels: vec!["bug".into()],
+            assignees: vec!["user1".into()],
+            url: "https://github.com/u/r/issues/42".into(),
+            body: Some("Issue body".into()),
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        let deserialized: GitHubIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.number, 42);
+        assert_eq!(deserialized.state, IssueState::Open);
+        assert_eq!(deserialized.body.as_deref(), Some("Issue body"));
+    }
+
+    #[test]
+    fn test_linked_issue_serialization_roundtrip() {
+        let linked = LinkedIssue {
+            number: 99,
+            title: "Feature request".into(),
+            state: IssueState::Closed,
+            labels: vec!["feature".into(), "ui".into()],
+        };
+        let json = serde_json::to_string(&linked).unwrap();
+        let deserialized: LinkedIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.number, 99);
+        assert_eq!(deserialized.state, IssueState::Closed);
+        assert_eq!(deserialized.labels, vec!["feature", "ui"]);
+    }
+
+    #[test]
+    fn test_suggest_branch_name_basic() {
+        assert_eq!(
+            suggest_branch_name(92, "Backend endpoints voor prospectielijst"),
+            "feature/92-backend-endpoints-voor-prospectielijst"
+        );
+    }
+
+    #[test]
+    fn test_suggest_branch_name_special_chars() {
+        assert_eq!(
+            suggest_branch_name(5, "Fix: login page (500 error) & redirect"),
+            "feature/5-fix-login-page-500-error-redirect"
+        );
+    }
+
+    #[test]
+    fn test_suggest_branch_name_unicode() {
+        // Unicode alphanumeric chars are preserved by is_alphanumeric()
+        assert_eq!(
+            suggest_branch_name(10, "Über die Straße gehen"),
+            "feature/10-über-die-straße-gehen"
+        );
+    }
+
+    #[test]
+    fn test_suggest_branch_name_long_title() {
+        let long_title = "This is a very long issue title that should be truncated to keep the branch name reasonable and not exceed filesystem limits";
+        let result = suggest_branch_name(123, long_title);
+        assert!(result.starts_with("feature/123-"));
+        // Title portion should be at most ~60 chars
+        let title_part = result.strip_prefix("feature/123-").unwrap();
+        assert!(title_part.len() <= 60, "Title portion too long: {}", title_part);
+        // Should break at word boundary
+        assert!(!result.ends_with('-'));
+    }
+
+    #[test]
+    fn test_suggest_branch_name_consecutive_special_chars() {
+        assert_eq!(
+            suggest_branch_name(1, "fix---multiple   spaces...and!!!dots"),
+            "feature/1-fix-multiple-spaces-and-dots"
+        );
+    }
+
+    #[test]
+    fn test_issue_state_display() {
+        assert_eq!(IssueState::Open.to_string(), "open");
+        assert_eq!(IssueState::Closed.to_string(), "closed");
+    }
+
+    #[test]
+    fn test_issue_state_from_str() {
+        assert_eq!(IssueState::from_str("OPEN"), IssueState::Open);
+        assert_eq!(IssueState::from_str("open"), IssueState::Open);
+        assert_eq!(IssueState::from_str("CLOSED"), IssueState::Closed);
+        assert_eq!(IssueState::from_str("closed"), IssueState::Closed);
+        assert_eq!(IssueState::from_str("unknown"), IssueState::Open);
+    }
+
+    #[test]
+    fn test_issue_body_truncation_respects_char_boundaries() {
+        // Build a body that exceeds the limit with a multi-byte char at the boundary
+        let body_content = "a".repeat(50 * 1024) + "é"; // 'é' is 2 bytes, pushes past 50KB
+        assert!(body_content.len() > MAX_ISSUE_BODY_BYTES);
+
+        let json = serde_json::json!({
+            "number": 1,
+            "title": "Test",
+            "state": "OPEN",
+            "url": "https://github.com/u/r/issues/1",
+            "body": body_content,
+            "labels": [],
+            "assignees": []
+        });
+
+        // Simulate what get_github_issue does for truncation
+        let body = json["body"].as_str().unwrap();
+        let truncated = if body.len() > MAX_ISSUE_BODY_BYTES {
+            let mut end = MAX_ISSUE_BODY_BYTES;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…\n\n[Body truncated at 50KB]", &body[..end])
+        } else {
+            body.to_string()
+        };
+        // Must not panic and must be valid UTF-8
+        assert!(truncated.len() > 0);
+        assert!(truncated.ends_with("[Body truncated at 50KB]"));
+    }
+
+    #[test]
+    fn test_issue_state_serde_json_format() {
+        // Verify that IssueState serializes as simple strings matching the TypeScript type
+        let open = serde_json::to_string(&IssueState::Open).unwrap();
+        assert_eq!(open, "\"Open\"");
+        let closed = serde_json::to_string(&IssueState::Closed).unwrap();
+        assert_eq!(closed, "\"Closed\"");
+        // And deserializes back
+        let parsed: IssueState = serde_json::from_str("\"Open\"").unwrap();
+        assert_eq!(parsed, IssueState::Open);
+    }
+
+    #[test]
+    fn test_linked_issue_defaults_for_missing_fields() {
+        // Simulate deserializing persisted data that has no linked_issue field
+        let json = r#"{"number": 1, "title": "T", "state": "Open"}"#;
+        let linked: LinkedIssue = serde_json::from_str(json).unwrap();
+        assert_eq!(linked.number, 1);
+        assert!(linked.labels.is_empty()); // default empty vec
     }
 }

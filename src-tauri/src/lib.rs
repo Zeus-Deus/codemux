@@ -315,13 +315,31 @@ pub fn run() {
                         let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
                         state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions, changed_files);
 
-                        // Only fetch PR info if gh CLI is available
+                        // Only fetch PR/issue info if gh CLI is available
                         if github::gh_available() {
                             let pr_info = github::get_branch_pr(&path).ok().flatten();
                             let pr_number = pr_info.as_ref().map(|p| p.number);
                             let pr_state = pr_info.as_ref().map(|p| p.state.clone());
                             let pr_url = pr_info.as_ref().map(|p| p.url.clone());
                             state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+
+                            // Refresh linked issue state (lightweight: only if workspace has one)
+                            let issue_number = {
+                                let snap = state.snapshot();
+                                snap.workspaces.iter()
+                                    .find(|w| w.workspace_id.0 == workspace_id)
+                                    .and_then(|w| w.linked_issue.as_ref().map(|li| li.number))
+                            };
+                            if let Some(num) = issue_number {
+                                if let Ok(issue) = github::get_github_issue(&path, num) {
+                                    state.link_workspace_issue(&workspace_id, github::LinkedIssue {
+                                        number: issue.number,
+                                        title: issue.title,
+                                        state: issue.state,
+                                        labels: issue.labels,
+                                    });
+                                }
+                            }
                         }
 
                         // Single emit after both git and PR info are updated
@@ -580,6 +598,13 @@ pub fn run() {
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
             commands::get_pr_deployments,
+            commands::list_github_issues,
+            commands::list_github_issues_by_path,
+            commands::get_github_issue,
+            commands::link_workspace_issue,
+            commands::unlink_workspace_issue,
+            commands::refresh_workspace_issue,
+            commands::suggest_issue_branch_name,
             commands::detect_package_manager,
             commands::get_detected_ports,
             commands::kill_port,
