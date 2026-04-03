@@ -5,8 +5,12 @@ import { IssueDetailPopover } from "./issue-detail-popover";
 import type { LinkedIssue, GitHubIssue } from "@/tauri/types";
 
 const mockGetGithubIssue = vi.fn();
+const mockOpenUrl = vi.fn();
 vi.mock("@/tauri/commands", () => ({
   getGithubIssue: (...args: unknown[]) => mockGetGithubIssue(...args),
+}));
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mockOpenUrl(...args),
 }));
 
 const flush = () => act(() => new Promise((r) => setTimeout(r, 10)));
@@ -116,8 +120,7 @@ describe("IssueDetailPopover", () => {
     expect(popover.textContent).toContain("Add dark mode");
   });
 
-  it("opens GitHub URL via window.open", async () => {
-    const openSpy = vi.spyOn(window, "open").mockImplementation(() => null);
+  it("opens GitHub URL via openUrl", async () => {
     const { view } = renderPopover();
     clickTrigger(view);
     await flush();
@@ -126,11 +129,9 @@ describe("IssueDetailPopover", () => {
     const openBtn = within(popover).getByText("Open on GitHub");
     fireEvent.click(openBtn);
 
-    expect(openSpy).toHaveBeenCalledWith(
+    expect(mockOpenUrl).toHaveBeenCalledWith(
       "https://github.com/org/repo/issues/104",
-      "_blank",
     );
-    openSpy.mockRestore();
   });
 
   it("click on chip does NOT propagate to parent", async () => {

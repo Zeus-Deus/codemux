@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CircleDot, CircleCheck, ExternalLink } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { getGithubIssue } from "@/tauri/commands";
 import type { LinkedIssue, GitHubIssue } from "@/tauri/types";
 
@@ -143,7 +144,7 @@ export function IssueDetailPopover({ workspaceId, issue }: Props) {
                   variant="ghost"
                   size="sm"
                   className="w-full justify-center gap-1.5 text-xs"
-                  onClick={() => window.open(fullIssue.url, "_blank")}
+                  onClick={() => openUrl(fullIssue.url)}
                 >
                   <ExternalLink className="h-3 w-3" />
                   Open on GitHub
