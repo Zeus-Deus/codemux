@@ -1,4 +1,4 @@
-use crate::browser::BrowserManager;
+use crate::agent_browser::AgentBrowserManager;
 use crate::config::{
     read_shell_appearance_or_default,
     read_theme_colors_or_default,
@@ -559,7 +559,7 @@ pub fn close_workspace(
         let cli_name = agent_session.cli_session_name.clone();
         let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
-            let manager: State<'_, crate::agent_browser::AgentBrowserManager> = app_handle.state();
+            let manager: State<'_, AgentBrowserManager> = app_handle.state();
             if let Err(error) = manager.close(&cli_name).await {
                 eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
             }
@@ -652,19 +652,9 @@ pub fn close_pane(
     }
 
     if let Some(browser_id) = removed_browser_id {
-        if state.is_agent_browser_session(&browser_id) {
-            // Agent session: detach pane reference, keep process alive
-            state.detach_agent_browser_from_pane(&browser_id);
-        } else {
-            // User session: kill Chromium process as before
-            let app_handle = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let manager: State<'_, BrowserManager> = app_handle.state();
-                if let Err(error) = manager.close_browser(&browser_id).await {
-                    eprintln!("[BROWSER] Failed to close browser {browser_id}: {error}");
-                }
-            });
-        }
+        // User explicitly closed this browser pane — mark dismissed so the agent
+        // won't immediately reopen it on the next browser_navigate call.
+        state.detach_agent_browser_from_pane(&browser_id, true);
     }
 
     crate::state::emit_app_state(&app);
@@ -866,14 +856,9 @@ pub fn close_tab(
         .ok();
     }
 
-    if let Some(browser_id) = result.removed_browser_id {
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let manager: State<'_, BrowserManager> = app_handle.state();
-            if let Err(error) = manager.close_browser(&browser_id.0).await {
-                eprintln!("[BROWSER] Failed to close browser {}: {error}", browser_id.0);
-            }
-        });
+    for browser_id in &result.removed_browser_ids {
+        // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
+        state.detach_agent_browser_from_pane(&browser_id.0, false);
     }
 
     crate::state::emit_app_state(&app);

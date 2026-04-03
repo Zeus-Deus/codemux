@@ -101,7 +101,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_accessibility_snapshot",
-            description: "Get the accessibility tree with clickable ref IDs like [ref=e4]. PREFERRED for clicking: pass the ref as the selector to browser_click (e.g. selector=\"@e4\"). Refs use Playwright's full actionability pipeline (auto-wait, auto-scroll, retry) and are more reliable than CSS selectors or coordinates.",
+            description: "Get the accessibility tree with clickable ref IDs like [ref=e4]. PREFERRED for clicking: pass the ref as the selector to browser_click (e.g. selector=\"@e4\"). Refs use the browser's full actionability pipeline (auto-wait, auto-scroll, retry) and are more reliable than CSS selectors or coordinates.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -109,7 +109,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "browser_click",
-            description: "Click an element. Accepts a snapshot ref like \"@e4\" (most reliable — uses Playwright auto-wait and retry) or a CSS selector. Always call browser_accessibility_snapshot first and use refs when possible. Only fall back to browser_click_at with coordinates if selectors fail due to bot detection.",
+            description: "Click an element. Accepts a snapshot ref like \"@e4\" (most reliable — uses auto-wait and retry) or a CSS selector. Always call browser_accessibility_snapshot first and use refs when possible. Only fall back to browser_click_at with coordinates if selectors fail due to bot detection.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -234,6 +234,40 @@ fn register_tools() -> Vec<McpTool> {
                     "y": { "type": "number", "description": "Optional: click here first" }
                 },
                 "required": ["text"]
+            }),
+        },
+        // -- Browser info tools (v0.24.0) --
+        McpTool {
+            name: "browser_get_styles",
+            description: "Get the computed CSS styles for an element. Returns all CSS properties and their computed values. Use snapshot refs (e.g. \"@e4\") or CSS selectors.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "Snapshot ref (e.g. \"@e4\") or CSS selector" }
+                },
+                "required": ["selector"]
+            }),
+        },
+        McpTool {
+            name: "browser_wait",
+            description: "Wait for an element to appear or specific text to be visible on the page. Useful after navigation or dynamic content loading.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector or snapshot ref to wait for" },
+                    "text": { "type": "string", "description": "Wait for this text to appear on the page (alternative to selector)" }
+                }
+            }),
+        },
+        McpTool {
+            name: "browser_evaluate",
+            description: "Execute JavaScript in the browser page and return the result. Use for custom DOM queries, data extraction, or page manipulation.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string", "description": "JavaScript expression or IIFE to evaluate" }
+                },
+                "required": ["script"]
             }),
         },
         // -- Workspace tools --
@@ -538,6 +572,33 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             if let Some(x) = arguments.get("x").and_then(Value::as_f64) { action["x"] = json!(x); }
             if let Some(y) = arguments.get("y").and_then(Value::as_f64) { action["y"] = json!(y); }
             call_socket("browser_automation", json!({ "workspace_id": &workspace_id, "action": action })).await
+        }
+
+        // -- Browser info tools (v0.24.0) --
+        "browser_get_styles" => {
+            let selector = arguments.get("selector").and_then(Value::as_str).unwrap_or_default();
+            call_socket("browser_automation", json!({
+                "workspace_id": &workspace_id,
+                "action": { "kind": "get_styles", "selector": selector }
+            })).await
+        }
+        "browser_wait" => {
+            let selector = arguments.get("selector").and_then(Value::as_str);
+            let text = arguments.get("text").and_then(Value::as_str);
+            let mut action = json!({ "kind": "wait" });
+            if let Some(sel) = selector { action["selector"] = json!(sel); }
+            if let Some(t) = text { action["text"] = json!(t); }
+            call_socket("browser_automation", json!({
+                "workspace_id": &workspace_id,
+                "action": action
+            })).await
+        }
+        "browser_evaluate" => {
+            let script = arguments.get("script").and_then(Value::as_str).unwrap_or_default();
+            call_socket("browser_automation", json!({
+                "workspace_id": &workspace_id,
+                "action": { "kind": "eval", "script": script }
+            })).await
         }
 
         // -- Workspace tools --
@@ -910,7 +971,7 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 29);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -924,6 +985,10 @@ mod tests {
         assert!(names.contains(&"git_diff"));
         assert!(names.contains(&"git_stage"));
         assert!(names.contains(&"git_commit"));
+        // v0.24.0 browser info tools
+        assert!(names.contains(&"browser_get_styles"));
+        assert!(names.contains(&"browser_wait"));
+        assert!(names.contains(&"browser_evaluate"));
         assert!(names.contains(&"git_push"));
     }
 
@@ -1023,7 +1088,7 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 26);
+        assert_eq!(tools.len(), 29);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

@@ -58,7 +58,7 @@ The repo structure is clean and domain-split:
 - Notification click-to-focus on Wayland and mako still needs deeper D-Bus or native handling
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
-- The legacy Chromium/CDP runtime still exists in-tree, but the canonical visible browser path is `agent-browser`
+- Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
 
 ## React Frontend Status
 

@@ -1,5 +1,4 @@
 use crate::agent_browser::{AgentBrowserManager, BrowserAutomationResult};
-use crate::browser::BrowserManager;
 use crate::state::AppStateStore;
 use std::path::PathBuf;
 use tauri::State;
@@ -110,69 +109,6 @@ pub fn browser_set_loading_state(
     state.set_browser_loading_state(&browser_id, is_loading, error)?;
     crate::state::emit_app_state(&app);
     Ok(())
-}
-
-#[tauri::command]
-pub async fn browser_spawn(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-) -> Result<String, String> {
-    manager.spawn_browser(browser_id).await?;
-    Ok("Browser spawned".to_string())
-}
-
-#[tauri::command]
-pub async fn browser_navigate(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-    url: String,
-) -> Result<String, String> {
-    manager.navigate(&browser_id, &url).await
-}
-
-#[tauri::command]
-pub async fn browser_screenshot(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-) -> Result<String, String> {
-    manager.screenshot(&browser_id).await
-}
-
-#[tauri::command]
-pub async fn browser_click(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-    x: f64,
-    y: f64,
-) -> Result<String, String> {
-    manager.click(&browser_id, x, y).await
-}
-
-#[tauri::command]
-pub async fn browser_type(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-    text: String,
-) -> Result<String, String> {
-    manager.type_text(&browser_id, &text).await
-}
-
-#[tauri::command]
-pub async fn browser_close(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-) -> Result<(), String> {
-    manager.close_browser(&browser_id).await
-}
-
-#[tauri::command]
-pub async fn browser_resize_viewport(
-    manager: State<'_, BrowserManager>,
-    browser_id: String,
-    width: u32,
-    height: u32,
-) -> Result<(), String> {
-    manager.resize_viewport(&browser_id, width, height).await
 }
 
 #[tauri::command]

@@ -6,7 +6,6 @@ pub mod auth;
 pub mod branch_name;
 pub mod mcp_server;
 pub mod agent_browser;
-pub mod browser;
 pub mod cli;
 pub mod commands;
 pub mod database;
@@ -89,7 +88,6 @@ pub fn run() {
             }
         }))
         .manage(state::AppStateStore::default())
-        .manage(browser::BrowserManager::new())
         .manage(agent_browser::AgentBrowserManager::new())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
@@ -482,13 +480,6 @@ pub fn run() {
             commands::browser_history_forward,
             commands::browser_reload,
             commands::browser_set_loading_state,
-            commands::browser_spawn,
-            commands::browser_navigate,
-            commands::browser_screenshot,
-            commands::browser_click,
-            commands::browser_type,
-            commands::browser_close,
-            commands::browser_resize_viewport,
             commands::agent_browser_spawn,
             commands::agent_browser_run,
             commands::agent_browser_close,

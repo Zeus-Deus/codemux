@@ -1,4 +1,4 @@
-use crate::browser::BrowserManager;
+use crate::agent_browser::AgentBrowserManager;
 use crate::openflow::adapters::claude::ClaudeAdapter;
 use crate::openflow::adapters::opencode::OpenCodeAdapter;
 use crate::openflow::adapters::AgentAdapter;
@@ -744,7 +744,7 @@ async fn run_single_cycle(
     runtime: &OpenFlowRuntimeStore,
     agent_store: &AgentSessionStore,
     pty_state: &crate::terminal::PtyState,
-    browser_manager: &BrowserManager,
+    browser_manager: &AgentBrowserManager,
     run_id: &str,
 ) -> Result<OrchestratorTriggerResult, String> {
     let current_phase_str = runtime.get_run_phase(run_id)?;
@@ -1425,49 +1425,37 @@ async fn run_single_cycle(
 
         let builder_verified_live = if matches!(phase, OrchestratorPhase::Executing) && builder_all_done {
             if let Some(app_url) = assigned_app_url.as_deref() {
-                let verify_browser_id = format!("openflow-verify-{}", run_id);
-                match browser_manager.spawn_browser(verify_browser_id.clone()).await {
+                let verify_session = format!("openflow-verify-{}", run_id);
+                match browser_manager.run_command(&verify_session, "open", serde_json::json!({ "url": app_url })).await {
                     Ok(_) => {
-                        match browser_manager.navigate(&verify_browser_id, app_url).await {
-                            Ok(_) => {
-                                #[cfg(debug_assertions)]
-                                crate::diagnostics::stderr_line(&format!(
-                                    "[DEBUG] Browser verification succeeded: app is live at {}",
-                                    app_url
-                                ));
-                                let _ = browser_manager.close_browser(&verify_browser_id).await;
-                                true
-                            }
-                            Err(e) => {
-                                #[cfg(debug_assertions)]
-                                crate::diagnostics::stderr_line(&format!(
-                                    "[DEBUG] Browser verification failed: app not accessible at {} - {}",
-                                    app_url, e
-                                ));
-                                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                                let _ = Orchestrator::write_to_comm_log(
-                                    run_id,
-                                    &format!("[{}] [SYSTEM] BROWSER_CHECK_FAILED: App not accessible at {} - {}", ts, app_url, e),
-                                );
-                                // Relay failure to orchestrator so it doesn't declare RUN COMPLETE
-                                if let Some(ref orch) = orchestrator_session {
-                                    let _ = write_raw_to_session(
-                                        pty_state,
-                                        &orch.session_id,
-                                        &format!("WARNING: Browser check failed — app is NOT accessible at {}. Assign a builder or debugger to fix the dev server before declaring RUN COMPLETE.", app_url),
-                                    );
-                                }
-                                let _ = browser_manager.close_browser(&verify_browser_id).await;
-                                false
-                            }
-                        }
+                        #[cfg(debug_assertions)]
+                        crate::diagnostics::stderr_line(&format!(
+                            "[DEBUG] Browser verification succeeded: app is live at {}",
+                            app_url
+                        ));
+                        let _ = browser_manager.close(&verify_session).await;
+                        true
                     }
                     Err(e) => {
                         #[cfg(debug_assertions)]
                         crate::diagnostics::stderr_line(&format!(
-                            "[DEBUG] Browser verification spawn failed: {}",
-                            e
+                            "[DEBUG] Browser verification failed: app not accessible at {} - {}",
+                            app_url, e
                         ));
+                        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                        let _ = Orchestrator::write_to_comm_log(
+                            run_id,
+                            &format!("[{}] [SYSTEM] BROWSER_CHECK_FAILED: App not accessible at {} - {}", ts, app_url, e),
+                        );
+                        // Relay failure to orchestrator so it doesn't declare RUN COMPLETE
+                        if let Some(ref orch) = orchestrator_session {
+                            let _ = write_raw_to_session(
+                                pty_state,
+                                &orch.session_id,
+                                &format!("WARNING: Browser check failed — app is NOT accessible at {}. Assign a builder or debugger to fix the dev server before declaring RUN COMPLETE.", app_url),
+                            );
+                        }
+                        let _ = browser_manager.close(&verify_session).await;
                         false
                     }
                 }
@@ -1700,7 +1688,7 @@ pub async fn trigger_orchestrator_cycle(
     runtime: State<'_, OpenFlowRuntimeStore>,
     agent_store: State<'_, AgentSessionStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
-    browser_manager: State<'_, BrowserManager>,
+    browser_manager: State<'_, AgentBrowserManager>,
     run_id: String,
     _offset: Option<usize>,
 ) -> Result<OrchestratorTriggerResult, String> {
@@ -1715,7 +1703,7 @@ pub async fn run_orchestration_loop(app: tauri::AppHandle, run_id: String) {
     let runtime = app.state::<OpenFlowRuntimeStore>();
     let agent_store = app.state::<AgentSessionStore>();
     let pty_state = app.state::<crate::terminal::PtyState>();
-    let browser_manager = app.state::<BrowserManager>();
+    let browser_manager = app.state::<AgentBrowserManager>();
 
     // Get the wake/stop handles via public accessor
     let (wake, stop): (std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<std::sync::atomic::AtomicBool>) = {
