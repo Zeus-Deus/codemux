@@ -50,6 +50,18 @@ vi.mock("@/tauri/commands", () => ({
   suggestIssueBranchName: vi.fn().mockResolvedValue("feature/92-backend-endpoints"),
   linkWorkspaceIssue: vi.fn().mockResolvedValue(undefined),
   listGithubIssues: vi.fn().mockResolvedValue([]),
+  getGithubIssue: vi.fn().mockResolvedValue({
+    number: 92, title: "Backend endpoints", state: "Open",
+    labels: ["enhancement"], assignees: ["zeus"],
+    url: "https://github.com/u/r/issues/92",
+    body: "Implement the backend endpoints.",
+  }),
+  getGithubIssueByPath: vi.fn().mockResolvedValue({
+    number: 92, title: "Backend endpoints", state: "Open",
+    labels: ["enhancement"], assignees: ["zeus"],
+    url: "https://github.com/u/r/issues/92",
+    body: "Implement the backend endpoints.",
+  }),
 }));
 
 import {
@@ -431,5 +443,51 @@ describe("Project directory auto-fill", () => {
     await waitFor(() => {
       expect(checkIsGitRepo).toHaveBeenCalledWith("/home/user/myapp");
     });
+  });
+});
+
+// ── Prompt injection tests ──
+
+import { buildPromptWithIssueContext } from "./new-workspace-dialog";
+
+describe("buildPromptWithIssueContext", () => {
+  const issue = { number: 92, title: "Backend endpoints", state: "Open" as const, labels: ["enhancement", "backend"] };
+
+  it("prepends issue context when issue is provided", () => {
+    const result = buildPromptWithIssueContext("fix the bug", issue, "Full issue description here.");
+    expect(result).toContain("Issue #92: Backend endpoints");
+    expect(result).toContain("Status: Open");
+    expect(result).toContain("Labels: enhancement, backend");
+    expect(result).toContain("Full issue description here.");
+    expect(result).toContain("fix the bug");
+    // Context comes before user prompt
+    expect(result.indexOf("Issue #92")).toBeLessThan(result.indexOf("fix the bug"));
+  });
+
+  it("returns raw prompt when no issue", () => {
+    const result = buildPromptWithIssueContext("fix the bug", null, null);
+    expect(result).toBe("fix the bug");
+  });
+
+  it("includes title/number/labels but omits body when body is null", () => {
+    const result = buildPromptWithIssueContext("fix it", issue, null);
+    expect(result).toContain("Issue #92: Backend endpoints");
+    expect(result).toContain("Labels: enhancement, backend");
+    expect(result).not.toContain("Description:");
+    expect(result).toContain("fix it");
+  });
+
+  it("truncates body at 10000 chars with [truncated] marker", () => {
+    const longBody = "x".repeat(15000);
+    const result = buildPromptWithIssueContext("task", issue, longBody);
+    expect(result).toContain("...[truncated]");
+    // The body portion should be at most 10000 chars + marker
+    expect(result).not.toContain("x".repeat(10001));
+  });
+
+  it("omits labels line when labels array is empty", () => {
+    const noLabels = { ...issue, labels: [] as string[] };
+    const result = buildPromptWithIssueContext("task", noLabels, "body");
+    expect(result).not.toContain("Labels:");
   });
 });

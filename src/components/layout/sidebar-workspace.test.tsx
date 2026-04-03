@@ -14,6 +14,10 @@ vi.mock("@/tauri/commands", () => ({
   openInEditor: vi.fn().mockResolvedValue(undefined),
   dbGetUiState: vi.fn().mockResolvedValue(null),
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
+  getGithubIssue: vi.fn().mockResolvedValue({
+    number: 92, title: "Test", state: "Open", labels: [], assignees: [],
+    url: "https://github.com/u/r/issues/92", body: null,
+  }),
 }));
 
 // Mock stores

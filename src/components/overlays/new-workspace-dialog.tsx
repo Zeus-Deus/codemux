@@ -57,8 +57,41 @@ import {
   pickFilesDialog,
   suggestIssueBranchName,
   linkWorkspaceIssue,
+  getGithubIssue,
+  getGithubIssueByPath,
 } from "@/tauri/commands";
-import type { TerminalPreset, WorktreeInfo, PullRequestInfo, GitHubIssue } from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
+
+const ISSUE_BODY_MAX_CHARS = 10_000;
+
+/** Build a prompt with issue context prepended. Exported for testing. */
+export function buildPromptWithIssueContext(
+  userPrompt: string,
+  issue: Pick<LinkedIssue, "number" | "title" | "state" | "labels"> | null,
+  issueBody: string | null,
+): string {
+  if (!issue) return userPrompt;
+
+  const lines: string[] = [
+    "The following GitHub issue is linked to this workspace:",
+    "",
+    `Issue #${issue.number}: ${issue.title}`,
+    `Status: ${issue.state}`,
+  ];
+  if (issue.labels.length > 0) {
+    lines.push(`Labels: ${issue.labels.join(", ")}`);
+  }
+  if (issueBody) {
+    const truncated =
+      issueBody.length > ISSUE_BODY_MAX_CHARS
+        ? issueBody.slice(0, ISSUE_BODY_MAX_CHARS) + "\n...[truncated]"
+        : issueBody;
+    lines.push("", "Description:", truncated);
+  }
+  lines.push("", "---", "");
+
+  return lines.join("\n") + userPrompt;
+}
 
 interface Props {
   open: boolean;
@@ -266,10 +299,26 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const handleSubmit = useCallback(async () => {
     if (!projectDir) return;
 
-    // Build full prompt with attachments
-    const fullPrompt = attachments.length > 0
+    // Build user prompt with attachments
+    let userPrompt = attachments.length > 0
       ? `${prompt.trim()}\n\nAttached files:\n${attachments.map((f) => `- ${f}`).join("\n")}`
       : prompt.trim();
+
+    // Inject linked issue context into prompt
+    if (linkedIssue) {
+      let issueBody: string | null = null;
+      try {
+        const full = projectWorkspaceId
+          ? await getGithubIssue(projectWorkspaceId, linkedIssue.number)
+          : await getGithubIssueByPath(projectDir, linkedIssue.number);
+        issueBody = full.body ?? null;
+      } catch {
+        // Non-blocking: proceed without body
+      }
+      userPrompt = buildPromptWithIssueContext(userPrompt, linkedIssue, issueBody);
+    }
+
+    const fullPrompt = userPrompt;
 
     // Close dialog immediately (optimistic)
     onOpenChange(false);
@@ -376,6 +425,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     worktrees,
     currentBranch,
     linkedIssue,
+    projectWorkspaceId,
     onOpenChange,
     addPendingWorkspace,
     removePendingWorkspace,

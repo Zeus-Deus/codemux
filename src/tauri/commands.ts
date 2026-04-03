@@ -304,6 +304,9 @@ export const listGithubIssues = (workspaceId: string, search?: string) =>
 export const listGithubIssuesByPath = (path: string, search?: string) =>
   invoke<GitHubIssue[]>("list_github_issues_by_path", { path, search });
 
+export const getGithubIssueByPath = (path: string, issueNumber: number) =>
+  invoke<GitHubIssue>("get_github_issue_by_path", { path, issueNumber });
+
 export const getGithubIssue = (workspaceId: string, issueNumber: number) =>
   invoke<GitHubIssue>("get_github_issue", { workspaceId, issueNumber });
 

@@ -167,6 +167,15 @@ pub fn list_github_issues_by_path(
     crate::github::list_github_issues(Path::new(&path), search.as_deref())
 }
 
+/// Get a single issue by repo path directly (no workspace needed).
+#[tauri::command]
+pub fn get_github_issue_by_path(
+    path: String,
+    issue_number: u64,
+) -> Result<GitHubIssue, String> {
+    crate::github::get_github_issue(Path::new(&path), issue_number)
+}
+
 #[tauri::command]
 pub fn suggest_issue_branch_name(issue_number: u64, issue_title: String) -> Result<String, String> {
     Ok(crate::github::suggest_branch_name(issue_number, &issue_title))
