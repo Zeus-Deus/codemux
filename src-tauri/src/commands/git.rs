@@ -101,6 +101,11 @@ pub fn list_branches(path: String, remote: bool) -> Result<Vec<String>, String> 
 }
 
 #[tauri::command]
+pub fn list_branches_detailed(path: String) -> Result<Vec<crate::git::BranchDetail>, String> {
+    crate::git::git_list_branches_detailed(Path::new(&path))
+}
+
+#[tauri::command]
 pub fn get_base_branch_diff(path: String, base_branch: String) -> Result<BaseBranchDiff, String> {
     crate::git::git_diff_base_branch(Path::new(&path), &base_branch)
 }

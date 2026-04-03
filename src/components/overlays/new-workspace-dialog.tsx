@@ -8,8 +8,6 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Textarea } from "@/components/ui/textarea";
 import {
   DropdownMenu,
@@ -17,15 +15,14 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { BranchPicker } from "./branch-picker";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import {
-  GitBranch,
   GitPullRequest,
-  Loader2,
   ArrowUp,
   ChevronDown,
   Check,
@@ -40,6 +37,7 @@ import { ProjectPicker } from "./project-picker";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
 import {
   listBranches,
+  listBranchesDetailed,
   listWorktrees,
   getGitBranchInfo,
   createWorkspace,
@@ -60,7 +58,7 @@ import {
   getGithubIssue,
   getGithubIssueByPath,
 } from "@/tauri/commands";
-import type { TerminalPreset, WorktreeInfo, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
 
 const ISSUE_BODY_MAX_CHARS = 10_000;
 
@@ -131,6 +129,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
   const [localBranches, setLocalBranches] = useState<string[]>([]);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
+  const [detailedBranches, setDetailedBranches] = useState<BranchDetail[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
@@ -166,26 +166,31 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setIsGitRepo(null);
     setLocalBranches([]);
     setRemoteBranches([]);
+    setDetailedBranches([]);
+    setBranchesLoading(true);
     setPrBranches(new Set());
 
     checkIsGitRepo(projectDir).then((isRepo) => {
       if (cancelled) return;
       setIsGitRepo(isRepo);
-      if (!isRepo) return;
+      if (!isRepo) { setBranchesLoading(false); return; }
 
       Promise.all([
         listBranches(projectDir, false).catch(() => []),
         listBranches(projectDir, true).catch(() => []),
+        listBranchesDetailed(projectDir).catch(() => []),
         listWorktrees(projectDir).catch(() => []),
         getGitBranchInfo(projectDir).catch(() => ({
           branch: null,
           ahead: 0,
           behind: 0,
         })),
-      ]).then(([local, remote, wt, info]) => {
+      ]).then(([local, remote, detailed, wt, info]) => {
         if (cancelled) return;
         setLocalBranches(local);
         setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
+        setDetailedBranches(detailed);
+        setBranchesLoading(false);
         setWorktrees(wt);
         setCurrentBranch(info.branch);
         setBaseBranch(info.branch ?? "main");
@@ -726,73 +731,32 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
           {/* Base branch picker */}
           {isGitRepo !== false && (
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 gap-1.5 rounded-full bg-muted/60 px-3 text-xs text-muted-foreground hover:bg-muted hover:text-foreground"
-                  disabled={allBranches.length === 0}
-                >
-                  <GitBranch className="h-3 w-3" />
-                  <span className="max-w-[100px] truncate">{baseBranch}</span>
-                  <ChevronDown className="h-2.5 w-2.5 opacity-40" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent
-                align="start"
-                className="max-h-[240px] w-[240px] overflow-y-auto"
-              >
-                {allBranches.map((branch) => {
-                  const isDefault =
-                    branch === "main" || branch === "master";
-                  const hasWs = branchWorkspaceMap.has(branch);
-                  const hasPr = prBranches.has(branch);
-                  return (
-                    <DropdownMenuItem
-                      key={branch}
-                      onClick={() => setBaseBranch(branch)}
-                      className={cn(
-                        "text-xs gap-2",
-                        baseBranch === branch && "bg-accent",
-                      )}
-                    >
-                      <span className="truncate flex-1">{branch}</span>
-                      {hasPr && (
-                        <Badge
-                          variant="secondary"
-                          className="text-[9px] px-1 py-0 bg-purple-500/15 text-purple-400 border-purple-500/20"
-                        >
-                          PR
-                        </Badge>
-                      )}
-                      {isDefault && (
-                        <Badge
-                          variant="secondary"
-                          className="text-[9px] px-1 py-0"
-                        >
-                          default
-                        </Badge>
-                      )}
-                      {hasWs && (
-                        <Badge
-                          variant="outline"
-                          className="text-[9px] px-1 py-0"
-                        >
-                          open
-                        </Badge>
-                      )}
-                    </DropdownMenuItem>
-                  );
-                })}
-                {allBranches.length === 0 && (
-                  <DropdownMenuItem disabled className="text-xs">
-                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
-                    Loading...
-                  </DropdownMenuItem>
-                )}
-              </DropdownMenuContent>
-            </DropdownMenu>
+            <BranchPicker
+              baseBranch={baseBranch}
+              branches={detailedBranches}
+              worktrees={worktrees}
+              branchWorkspaceMap={branchWorkspaceMap}
+              prBranches={prBranches}
+              currentBranch={currentBranch}
+              loading={branchesLoading}
+              onSelectBase={setBaseBranch}
+              onOpenWorkspace={(wsId) => {
+                onOpenChange(false);
+                activateWorkspace(wsId).catch(console.error);
+              }}
+              onImportWorktree={(path, branch) => {
+                onOpenChange(false);
+                importWorktreeWorkspace(path, branch, "single")
+                  .then((wsId) => activateWorkspace(wsId))
+                  .catch(console.error);
+              }}
+              onCreateOnCurrent={() => {
+                onOpenChange(false);
+                createWorkspace(projectDir)
+                  .then((wsId) => activateWorkspace(wsId))
+                  .catch(console.error);
+              }}
+            />
           )}
 
           <span className="ml-auto text-[10px] text-muted-foreground/40 select-none">

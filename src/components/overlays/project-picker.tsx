@@ -153,7 +153,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
       <PopoverContent className="w-60 p-0" align="start">
         <Command>
           <CommandInput placeholder="Search projects..." className="h-8" />
-          <CommandList className="max-h-72">
+          <CommandList className="max-h-72" onWheel={(e) => e.stopPropagation()}>
             <CommandEmpty>No projects found.</CommandEmpty>
             {projectGroups.length > 0 && (
               <CommandGroup heading="Active">

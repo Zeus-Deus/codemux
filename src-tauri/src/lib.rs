@@ -564,6 +564,7 @@ pub fn run() {
             commands::git_push_changes,
             commands::get_git_branch_info,
             commands::list_branches,
+            commands::list_branches_detailed,
             commands::create_worktree,
             commands::remove_worktree,
             commands::list_worktrees,

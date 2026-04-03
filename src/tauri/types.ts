@@ -388,6 +388,13 @@ export interface EditorInfo {
   command: string;
 }
 
+export interface BranchDetail {
+  name: string;
+  last_commit_unix: number;
+  is_local: boolean;
+  is_remote: boolean;
+}
+
 export interface WorktreeInfo {
   path: string;
   branch: string | null;

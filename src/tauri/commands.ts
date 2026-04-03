@@ -9,6 +9,7 @@ import type {
   AuthResponse,
   AuthUser,
   BaseBranchDiff,
+  BranchDetail,
   CheckInfo,
   CliToolInfo,
   CommLogEntry,
@@ -440,6 +441,9 @@ export const getCommitFiles = (path: string, hash: string) =>
 
 export const listBranches = (path: string, remote: boolean) =>
   invoke<string[]>("list_branches", { path, remote });
+
+export const listBranchesDetailed = (path: string) =>
+  invoke<BranchDetail[]>("list_branches_detailed", { path });
 
 export const listWorktrees = (path: string) =>
   invoke<WorktreeInfo[]>("list_worktrees", { path });

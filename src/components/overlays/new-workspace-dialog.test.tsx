@@ -11,6 +11,7 @@ import type { AppStateSnapshot } from "@/tauri/types";
 
 vi.mock("@/tauri/commands", () => ({
   listBranches: vi.fn().mockResolvedValue([]),
+  listBranchesDetailed: vi.fn().mockResolvedValue([]),
   checkIsGitRepo: vi.fn().mockResolvedValue(true),
   listWorktrees: vi.fn().mockResolvedValue([]),
   getGitBranchInfo: vi

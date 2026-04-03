@@ -1020,6 +1020,14 @@ pub fn abort_merge_into_base(
 // ---- Worktree operations ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchDetail {
+    pub name: String,
+    pub last_commit_unix: i64,
+    pub is_local: bool,
+    pub is_remote: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
     pub path: String,
     pub branch: Option<String>,
@@ -1055,6 +1063,79 @@ pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, 
             }
         })
         .collect();
+    Ok(branches)
+}
+
+pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>, String> {
+    use std::collections::HashMap;
+
+    let output = run_git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)\t%(committerdate:unix)",
+            "refs/heads/",
+            "refs/remotes/origin/",
+        ],
+    )?;
+
+    let mut map: HashMap<String, BranchDetail> = HashMap::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let (raw_name, timestamp_str) = match line.split_once('\t') {
+            Some(pair) => pair,
+            None => continue,
+        };
+
+        // Determine if local or remote ref
+        let is_remote = raw_name.starts_with("origin/");
+        let name = if is_remote {
+            raw_name.strip_prefix("origin/").unwrap_or(raw_name)
+        } else {
+            raw_name
+        };
+
+        // Skip HEAD pointers
+        if name.contains("HEAD") {
+            continue;
+        }
+
+        let timestamp: i64 = timestamp_str.trim().parse().unwrap_or(0);
+
+        match map.get_mut(name) {
+            Some(existing) => {
+                // Merge: mark both flags, keep the newer timestamp
+                if is_remote {
+                    existing.is_remote = true;
+                } else {
+                    existing.is_local = true;
+                }
+                if timestamp > existing.last_commit_unix {
+                    existing.last_commit_unix = timestamp;
+                }
+            }
+            None => {
+                map.insert(
+                    name.to_string(),
+                    BranchDetail {
+                        name: name.to_string(),
+                        last_commit_unix: timestamp,
+                        is_local: !is_remote,
+                        is_remote,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut branches: Vec<BranchDetail> = map.into_values().collect();
+    branches.sort_by(|a, b| b.last_commit_unix.cmp(&a.last_commit_unix));
+
     Ok(branches)
 }
 
@@ -1504,6 +1585,110 @@ C  source.txt -> copy.txt";
         let branches = git_list_branches(&repo, false).expect("list local");
         assert!(branches.contains(&"alpha".to_string()));
         assert!(branches.contains(&"beta".to_string()));
+    }
+
+    #[test]
+    fn test_list_branches_detailed_basic() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["branch", "feature-a"]).expect("create feature-a");
+        run_git(&repo, &["branch", "feature-b"]).expect("create feature-b");
+
+        let branches = git_list_branches_detailed(&repo).expect("list detailed");
+        assert!(branches.len() >= 3, "should have main/master + 2 features, got {}", branches.len());
+
+        let feature_a = branches.iter().find(|b| b.name == "feature-a").expect("feature-a present");
+        assert!(feature_a.is_local, "feature-a should be local");
+        assert!(!feature_a.is_remote, "feature-a should not be remote");
+        assert!(feature_a.last_commit_unix > 0, "timestamp should be positive");
+    }
+
+    #[test]
+    fn test_list_branches_detailed_single_branch() {
+        let (_dir, repo) = setup_test_repo();
+
+        let branches = git_list_branches_detailed(&repo).expect("list detailed");
+        assert_eq!(branches.len(), 1, "should have only the default branch");
+
+        let default = &branches[0];
+        assert!(default.is_local);
+        assert!(!default.is_remote);
+        assert!(default.last_commit_unix > 0);
+    }
+
+    #[test]
+    fn test_list_branches_detailed_dedup_local_and_remote() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Create a local branch, push it so it exists both locally and as remote tracking
+        run_git(&local, &["checkout", "-b", "shared-branch"]).expect("create branch");
+        std::fs::write(local.join("shared.txt"), "content").expect("write");
+        run_git(&local, &["add", "shared.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "shared commit"],
+        ).expect("commit");
+        run_git(&local, &["push", "-u", "origin", "shared-branch"]).expect("push");
+
+        let branches = git_list_branches_detailed(&local).expect("list detailed");
+        let shared: Vec<&BranchDetail> = branches.iter().filter(|b| b.name == "shared-branch").collect();
+        assert_eq!(shared.len(), 1, "should be deduplicated to one entry, got {}", shared.len());
+        assert!(shared[0].is_local, "should be marked local");
+        assert!(shared[0].is_remote, "should be marked remote");
+    }
+
+    #[test]
+    fn test_list_branches_detailed_sorted_by_recency() {
+        let (_dir, repo) = setup_test_repo();
+
+        // Create branches with commits at different times
+        run_git(&repo, &["checkout", "-b", "old-branch"]).expect("create old");
+        std::fs::write(repo.join("old.txt"), "old").expect("write");
+        run_git(&repo, &["add", "old.txt"]).expect("add");
+        run_git(
+            &repo,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "old"],
+        ).expect("commit old");
+
+        // Sleep briefly so timestamps differ
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        run_git(&repo, &["checkout", "-b", "new-branch"]).expect("create new");
+        std::fs::write(repo.join("new.txt"), "new").expect("write");
+        run_git(&repo, &["add", "new.txt"]).expect("add");
+        run_git(
+            &repo,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "new"],
+        ).expect("commit new");
+
+        let branches = git_list_branches_detailed(&repo).expect("list detailed");
+        let new_idx = branches.iter().position(|b| b.name == "new-branch").expect("new-branch present");
+        let old_idx = branches.iter().position(|b| b.name == "old-branch").expect("old-branch present");
+        assert!(new_idx < old_idx, "new-branch should come before old-branch (sorted by recency)");
+    }
+
+    #[test]
+    fn test_list_branches_detailed_remote_only() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Create a branch on remote only (push from local, then delete local branch)
+        run_git(&local, &["checkout", "-b", "remote-only"]).expect("create branch");
+        std::fs::write(local.join("remote.txt"), "content").expect("write");
+        run_git(&local, &["add", "remote.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "remote commit"],
+        ).expect("commit");
+        run_git(&local, &["push", "-u", "origin", "remote-only"]).expect("push");
+
+        // Switch back and delete local branch
+        let _ = run_git(&local, &["checkout", "master"])
+            .or_else(|_| run_git(&local, &["checkout", "main"]));
+        run_git(&local, &["branch", "-D", "remote-only"]).expect("delete local");
+
+        let branches = git_list_branches_detailed(&local).expect("list detailed");
+        let remote_only = branches.iter().find(|b| b.name == "remote-only").expect("remote-only present");
+        assert!(!remote_only.is_local, "should not be local");
+        assert!(remote_only.is_remote, "should be remote");
     }
 
     #[test]
