@@ -92,6 +92,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [attachments, setAttachments] = useState<string[]>([]);
   const [linkedIssue, setLinkedIssue] = useState<GitHubIssue | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = useState(false);
+  const [branchAutoFilled, setBranchAutoFilled] = useState(false);
 
   // Data state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
@@ -120,6 +121,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setAttachments([]);
     setLinkedIssue(null);
     setIssuePickerOpen(false);
+    setBranchAutoFilled(false);
   }
   prevOpenRef.current = open;
 
@@ -247,17 +249,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const handleIssueSelect = useCallback(
     async (issue: GitHubIssue) => {
       setLinkedIssue(issue);
-      // Auto-fill branch name if empty
-      if (!branchName.trim()) {
+      // Auto-fill branch name if empty or if current name was auto-filled from a previous issue
+      if (!branchName.trim() || branchAutoFilled) {
         try {
           const suggested = await suggestIssueBranchName(issue.number, issue.title);
           setBranchName(suggested);
+          setBranchAutoFilled(true);
         } catch {
           // Non-blocking — user can type their own
         }
       }
     },
-    [branchName],
+    [branchName, branchAutoFilled],
   );
 
   const handleSubmit = useCallback(async () => {
@@ -423,7 +426,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           />
           <Input
             value={branchName}
-            onChange={(e) => setBranchName(e.target.value)}
+            onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
             placeholder="branch name"
             className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
           />
@@ -458,7 +461,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     <button
                       type="button"
                       className="ml-0.5 rounded-full p-0.5 hover:bg-foreground/10 transition-colors"
-                      onClick={() => setLinkedIssue(null)}
+                      onClick={() => {
+                        setLinkedIssue(null);
+                        if (branchAutoFilled) {
+                          setBranchName("");
+                          setBranchAutoFilled(false);
+                        }
+                      }}
                     >
                       <X className="h-2.5 w-2.5" />
                     </button>
