@@ -124,6 +124,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [linkedIssue, setLinkedIssue] = useState<GitHubIssue | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = useState(false);
   const [branchAutoFilled, setBranchAutoFilled] = useState(false);
+  const [branchMode, setBranchMode] = useState<"create_new" | "open_existing">("create_new");
+  const [openExistingBranch, setOpenExistingBranch] = useState<string | null>(null);
 
   // Data state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
@@ -155,6 +157,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setLinkedIssue(null);
     setIssuePickerOpen(false);
     setBranchAutoFilled(false);
+    setBranchMode("create_new");
+    setOpenExistingBranch(null);
   }
   prevOpenRef.current = open;
 
@@ -288,7 +292,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     async (issue: GitHubIssue) => {
       setLinkedIssue(issue);
       // Auto-fill branch name if empty or if current name was auto-filled from a previous issue
-      if (!branchName.trim() || branchAutoFilled) {
+      if (branchMode === "create_new" && (!branchName.trim() || branchAutoFilled)) {
         try {
           const suggested = await suggestIssueBranchName(issue.number, issue.title);
           setBranchName(suggested);
@@ -298,8 +302,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
     },
-    [branchName, branchAutoFilled],
+    [branchName, branchAutoFilled, branchMode],
   );
+
+  const handleOpenExisting = useCallback((branch: string) => {
+    setBranchMode("open_existing");
+    setOpenExistingBranch(branch);
+    setBranchName("");
+  }, []);
 
   const handleSubmit = useCallback(async () => {
     if (!projectDir) return;
@@ -331,7 +341,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     // Generate a temporary ID for the pending workspace
     const tempId = crypto.randomUUID();
     const displayName =
-      workspaceName || prompt.slice(0, 40) || branchName || "New workspace";
+      workspaceName || prompt.slice(0, 40) || openExistingBranch || branchName || "New workspace";
 
     addPendingWorkspace({
       id: tempId,
@@ -341,6 +351,48 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     });
 
     try {
+      // Open existing branch mode — skip branch generation
+      if (branchMode === "open_existing" && openExistingBranch) {
+        const existingWsId = branchWorkspaceMap.get(openExistingBranch);
+        if (existingWsId) {
+          await activateWorkspace(existingWsId);
+          removePendingWorkspace(tempId);
+          return;
+        }
+
+        let wsId: string;
+        const orphan = worktrees.find(
+          (wt) =>
+            wt.branch === openExistingBranch ||
+            wt.branch === `refs/heads/${openExistingBranch}`,
+        );
+
+        if (orphan) {
+          wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
+        } else if (openExistingBranch === currentBranch) {
+          wsId = await createWorkspace(projectDir);
+        } else {
+          wsId = await createWorktreeWorkspace(
+            projectDir,
+            openExistingBranch,
+            false,
+            "single",
+            null,
+            fullPrompt || null,
+            selectedAgentId,
+          );
+        }
+
+        const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
+        dbAddRecentProject(projectDir, pName).catch(console.error);
+        if (linkedIssue) {
+          linkWorkspaceIssue(wsId, linkedIssue.number).catch(console.error);
+        }
+        removePendingWorkspace(tempId);
+        await activateWorkspace(wsId);
+        return;
+      }
+
       // Determine branch name
       let resolvedBranch = branchName.trim();
       let isNewBranch = true;
@@ -426,6 +478,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     selectedAgentId,
     baseBranch,
     allBranches,
+    branchMode,
+    openExistingBranch,
     branchWorkspaceMap,
     worktrees,
     currentBranch,
@@ -479,12 +533,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             placeholder="Workspace name (optional)"
             className="h-6 text-xs flex-1 border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-muted-foreground placeholder:text-muted-foreground/40"
           />
-          <Input
-            value={branchName}
-            onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
-            placeholder="branch name"
-            className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
-          />
+          {branchMode === "create_new" ? (
+            <Input
+              value={branchName}
+              onChange={(e) => { setBranchName(e.target.value); setBranchAutoFilled(false); }}
+              placeholder="branch name"
+              className="h-6 text-xs w-[140px] border-0 bg-transparent dark:bg-transparent px-0 shadow-none focus-visible:ring-0 text-right font-mono text-muted-foreground placeholder:text-muted-foreground/40"
+            />
+          ) : (
+            <span className="h-6 text-xs text-right font-mono text-muted-foreground/60 flex items-center truncate max-w-[180px]">
+              on {openExistingBranch}
+            </span>
+          )}
         </div>
 
         {/* Center: prompt textarea with embedded controls */}
@@ -732,14 +792,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           {/* Base branch picker */}
           {isGitRepo !== false && (
             <BranchPicker
-              baseBranch={baseBranch}
+              baseBranch={openExistingBranch || baseBranch}
               branches={detailedBranches}
               worktrees={worktrees}
               branchWorkspaceMap={branchWorkspaceMap}
               prBranches={prBranches}
               currentBranch={currentBranch}
               loading={branchesLoading}
-              onSelectBase={setBaseBranch}
+              onSelectBase={(branch) => {
+                setBaseBranch(branch);
+                setBranchMode("create_new");
+                setOpenExistingBranch(null);
+              }}
               onOpenWorkspace={(wsId) => {
                 onOpenChange(false);
                 activateWorkspace(wsId).catch(console.error);
@@ -756,6 +820,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   .then((wsId) => activateWorkspace(wsId))
                   .catch(console.error);
               }}
+              onOpenExisting={handleOpenExisting}
+              isOpenMode={branchMode === "open_existing"}
             />
           )}
 

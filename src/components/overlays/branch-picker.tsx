@@ -19,6 +19,7 @@ import {
   ArrowUpRight,
   FolderGit,
   ChevronDown,
+  CornerDownRight,
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -54,6 +55,8 @@ interface BranchPickerProps {
   onOpenWorkspace: (workspaceId: string) => void;
   onImportWorktree: (path: string, branch: string) => void;
   onCreateOnCurrent: () => void;
+  onOpenExisting: (branch: string) => void;
+  isOpenMode?: boolean;
 }
 
 export function BranchPicker({
@@ -68,6 +71,8 @@ export function BranchPicker({
   onOpenWorkspace,
   onImportWorktree,
   onCreateOnCurrent,
+  onOpenExisting,
+  isOpenMode,
 }: BranchPickerProps) {
   const [open, setOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
@@ -138,18 +143,34 @@ export function BranchPicker({
       return;
     }
 
-    // Default — select as base branch for new worktree
-    onSelectBase(branch.name);
+    // Default branch (main/master) — fork is the primary action
+    const isDefault = branch.name === "main" || branch.name === "master";
+    if (isDefault) {
+      onSelectBase(branch.name);
+      setOpen(false);
+      return;
+    }
+
+    // Other branches — open existing is the primary action
+    onOpenExisting(branch.name);
     setOpen(false);
   };
 
-  // Handle "Create" action (Ctrl+Enter or explicit button)
-  const handleCreateAction = (
+  // Handle secondary action (Ctrl+Enter or explicit button)
+  const handleSecondaryAction = (
     e: React.MouseEvent | React.KeyboardEvent,
     branch: BranchDetail,
   ) => {
     e.stopPropagation();
-    onSelectBase(branch.name);
+    const isDefault = branch.name === "main" || branch.name === "master";
+    const hasWorkspace = branchWorkspaceMap.has(branch.name);
+    const hasWt = !!findWorktree(branch.name);
+    // "Open" is only valid when the branch has no worktree yet
+    if (isDefault && !hasWorkspace && !hasWt) {
+      onOpenExisting(branch.name);
+    } else {
+      onSelectBase(branch.name);
+    }
     setOpen(false);
   };
 
@@ -160,7 +181,7 @@ export function BranchPicker({
           type="button"
           className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
         >
-          <GitBranch className="h-3 w-3" />
+          {isOpenMode ? <CornerDownRight className="h-3 w-3" /> : <GitBranch className="h-3 w-3" />}
           <span className="max-w-[120px] truncate">{baseBranch}</span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
         </button>
@@ -170,9 +191,13 @@ export function BranchPicker({
           shouldFilter={false}
           onKeyDown={(e) => {
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
-              // Ctrl+Enter → Create action on the currently highlighted item
-              // cmdk doesn't expose the active item directly, so we handle
-              // this via the button's own keyboard handler per row
+              e.preventDefault();
+              const active = e.currentTarget.querySelector<HTMLElement>('[data-selected="true"]');
+              const name = active?.getAttribute("data-value");
+              if (name) {
+                const branch = branches.find((b) => b.name === name);
+                if (branch) handleSecondaryAction(e, branch);
+              }
             }
           }}
         >
@@ -241,7 +266,6 @@ export function BranchPicker({
                     .map((branch) => {
                       const wsId = branchWorkspaceMap.get(branch.name);
                       const wt = findWorktree(branch.name);
-                      const isCurrent = branch.name === currentBranch;
                       const hasOpenWorkspace = !!wsId;
                       const hasWorktree = !!wt;
                       const hasPr = prBranches.has(branch.name);
@@ -249,12 +273,12 @@ export function BranchPicker({
                         branch.name === "main" ||
                         branch.name === "master";
 
-                      // Determine which actions to show
-                      const showOpen =
-                        hasOpenWorkspace || hasWorktree || isCurrent;
-                      const showCreate =
-                        !hasOpenWorkspace &&
-                        (!isCurrent || hasWorktree);
+                      // Determine action labels based on branch state
+                      const hasAnyWorktree = hasOpenWorkspace || hasWorktree;
+                      const primaryLabel = hasOpenWorkspace ? "Focus"
+                        : (isDefault && !hasAnyWorktree) ? "Fork"
+                        : "Open";
+                      const secondaryLabel = (!hasAnyWorktree && isDefault) ? "Open" : "Fork";
 
                       return (
                         <CommandItem
@@ -292,6 +316,14 @@ export function BranchPicker({
                               PR
                             </Badge>
                           )}
+                          {hasOpenWorkspace && (
+                            <Badge
+                              variant="secondary"
+                              className="text-[9px] px-1 py-0 shrink-0 bg-success/10 text-success border-success/20"
+                            >
+                              active
+                            </Badge>
+                          )}
 
                           {/* Timestamp — hidden when action buttons show (always hidden on default branch) */}
                           {!isDefault && (
@@ -305,31 +337,25 @@ export function BranchPicker({
                             "items-center gap-1 shrink-0",
                             isDefault ? "flex" : "hidden group-hover/row:flex",
                           )}>
-                            {showOpen && (
-                              <button
-                                type="button"
-                                className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handlePrimaryAction(branch);
-                                }}
-                              >
-                                Open
-                                <kbd className="opacity-50">↵</kbd>
-                              </button>
-                            )}
-                            {showCreate && (
-                              <button
-                                type="button"
-                                className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
-                                onClick={(e) => handleCreateAction(e, branch)}
-                              >
-                                {showOpen ? "+ Create" : "Create"}
-                                <kbd className="opacity-50">
-                                  {showOpen ? "⌃↵" : "↵"}
-                                </kbd>
-                              </button>
-                            )}
+                            <button
+                              type="button"
+                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-foreground text-background hover:bg-foreground/90 transition-colors"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handlePrimaryAction(branch);
+                              }}
+                            >
+                              {primaryLabel}
+                              <kbd className="opacity-50">↵</kbd>
+                            </button>
+                            <button
+                              type="button"
+                              className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors"
+                              onClick={(e) => handleSecondaryAction(e, branch)}
+                            >
+                              {secondaryLabel}
+                              <kbd className="opacity-50">⌃↵</kbd>
+                            </button>
                           </span>
                         </CommandItem>
                       );
