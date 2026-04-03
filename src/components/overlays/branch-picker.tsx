@@ -43,31 +43,36 @@ function formatRelativeTime(unixSeconds: number): string {
 
 type FilterMode = "all" | "worktrees";
 
+// Stable defaults for optional Map/Set props (avoids new allocations per render)
+const EMPTY_BRANCH_MAP = new Map<string, string>();
+const EMPTY_PR_SET = new Set<string>();
+
 interface BranchPickerProps {
   baseBranch: string;
   branches: BranchDetail[];
-  worktrees: WorktreeInfo[];
-  branchWorkspaceMap: Map<string, string>;
-  prBranches: Set<string>;
-  currentBranch: string | null;
   loading: boolean;
   onSelectBase: (branch: string) => void;
-  onOpenWorkspace: (workspaceId: string) => void;
-  onImportWorktree: (path: string, branch: string) => void;
-  onCreateOnCurrent: () => void;
-  onOpenExisting: (branch: string) => void;
+  /** When workspace-aware callbacks are omitted, the picker runs in base-only selection mode */
+  worktrees?: WorktreeInfo[];
+  branchWorkspaceMap?: Map<string, string>;
+  prBranches?: Set<string>;
+  currentBranch?: string | null;
+  onOpenWorkspace?: (workspaceId: string) => void;
+  onImportWorktree?: (path: string, branch: string) => void;
+  onCreateOnCurrent?: () => void;
+  onOpenExisting?: (branch: string) => void;
   isOpenMode?: boolean;
 }
 
 export function BranchPicker({
   baseBranch,
   branches,
-  worktrees,
-  branchWorkspaceMap,
-  prBranches,
-  currentBranch,
   loading,
   onSelectBase,
+  worktrees = [],
+  branchWorkspaceMap = EMPTY_BRANCH_MAP,
+  prBranches = EMPTY_PR_SET,
+  currentBranch = null,
   onOpenWorkspace,
   onImportWorktree,
   onCreateOnCurrent,
@@ -77,6 +82,9 @@ export function BranchPicker({
   const [open, setOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
+
+  // Base-only mode: no workspace context, simplified UI with single "Select" action
+  const baseOnly = !onOpenWorkspace;
 
   // Reset state when popover closes
   const handleOpenChange = (next: boolean) => {
@@ -120,10 +128,16 @@ export function BranchPicker({
 
   // Handle primary action on a branch row (Enter key or click)
   const handlePrimaryAction = (branch: BranchDetail) => {
+    if (baseOnly) {
+      onSelectBase(branch.name);
+      setOpen(false);
+      return;
+    }
+
     const wsId = branchWorkspaceMap.get(branch.name);
     if (wsId) {
       // Workspace is open — switch to it
-      onOpenWorkspace(wsId);
+      onOpenWorkspace?.(wsId);
       setOpen(false);
       return;
     }
@@ -131,14 +145,14 @@ export function BranchPicker({
     const wt = findWorktree(branch.name);
     if (wt) {
       // Worktree exists but no workspace — import it
-      onImportWorktree(wt.path, branch.name);
+      onImportWorktree?.(wt.path, branch.name);
       setOpen(false);
       return;
     }
 
     if (branch.name === currentBranch) {
       // Current branch — create workspace on existing checkout
-      onCreateOnCurrent();
+      onCreateOnCurrent?.();
       setOpen(false);
       return;
     }
@@ -152,7 +166,7 @@ export function BranchPicker({
     }
 
     // Other branches — open existing is the primary action
-    onOpenExisting(branch.name);
+    onOpenExisting?.(branch.name);
     setOpen(false);
   };
 
@@ -167,7 +181,7 @@ export function BranchPicker({
     const hasWt = !!findWorktree(branch.name);
     // "Open" is only valid when the branch has no worktree yet
     if (isDefault && !hasWorkspace && !hasWt) {
-      onOpenExisting(branch.name);
+      onOpenExisting?.(branch.name);
     } else {
       onSelectBase(branch.name);
     }
@@ -189,7 +203,7 @@ export function BranchPicker({
       <PopoverContent className="w-[380px] p-0" align="start">
         <Command
           shouldFilter={false}
-          onKeyDown={(e) => {
+          onKeyDown={baseOnly ? undefined : (e) => {
             if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
               e.preventDefault();
               const active = e.currentTarget.querySelector<HTMLElement>('[data-selected="true"]');
@@ -208,8 +222,8 @@ export function BranchPicker({
             onValueChange={setSearch}
           />
 
-          {/* Tab bar */}
-          <div className="flex items-center gap-0.5 mx-2 mt-1 mb-1 rounded-md bg-muted/40 p-0.5">
+          {/* Tab bar — hidden in base-only mode */}
+          {!baseOnly && <div className="flex items-center gap-0.5 mx-2 mt-1 mb-1 rounded-md bg-muted/40 p-0.5">
             <button
               type="button"
               className={cn(
@@ -236,7 +250,7 @@ export function BranchPicker({
               Worktrees{" "}
               <span className="text-[10px] opacity-60">{worktreeCount}</span>
             </button>
-          </div>
+          </div>}
 
           <CommandList
             className="max-h-[340px] overflow-y-auto [scrollbar-width:thin]"
@@ -275,10 +289,14 @@ export function BranchPicker({
 
                       // Determine action labels based on branch state
                       const hasAnyWorktree = hasOpenWorkspace || hasWorktree;
-                      const primaryLabel = hasOpenWorkspace ? "Focus"
+                      const primaryLabel = baseOnly ? "Select"
+                        : hasOpenWorkspace ? "Focus"
                         : (isDefault && !hasAnyWorktree) ? "Fork"
                         : "Open";
                       const secondaryLabel = (!hasAnyWorktree && isDefault) ? "Open" : "Fork";
+
+                      // In base-only mode, all rows use hover-reveal; in full mode, default branch always shows actions
+                      const alwaysShowActions = !baseOnly && isDefault;
 
                       return (
                         <CommandItem
@@ -325,17 +343,17 @@ export function BranchPicker({
                             </Badge>
                           )}
 
-                          {/* Timestamp — hidden when action buttons show (always hidden on default branch) */}
-                          {!isDefault && (
+                          {/* Timestamp — visible at rest, hidden on hover to make room for actions */}
+                          {!alwaysShowActions && (
                             <span className="text-[11px] text-muted-foreground/60 tabular-nums shrink-0 group-hover/row:hidden">
                               {formatRelativeTime(branch.last_commit_unix)}
                             </span>
                           )}
 
-                          {/* Action buttons — always visible on default branch, hover-reveal on others */}
+                          {/* Action buttons */}
                           <span className={cn(
                             "items-center gap-1 shrink-0",
-                            isDefault ? "flex" : "hidden group-hover/row:flex",
+                            alwaysShowActions ? "flex" : "hidden group-hover/row:flex",
                           )}>
                             <button
                               type="button"
@@ -348,14 +366,14 @@ export function BranchPicker({
                               {primaryLabel}
                               <kbd className="opacity-50">↵</kbd>
                             </button>
-                            <button
+                            {!baseOnly && <button
                               type="button"
                               className="inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors"
                               onClick={(e) => handleSecondaryAction(e, branch)}
                             >
                               {secondaryLabel}
                               <kbd className="opacity-50">⌃↵</kbd>
-                            </button>
+                            </button>}
                           </span>
                         </CommandItem>
                       );

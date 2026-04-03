@@ -20,21 +20,16 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import {
   GitBranch,
   ChevronRight,
   ChevronLeft,
   ChevronDown,
   Check,
 } from "lucide-react";
+import { BranchPicker } from "./branch-picker";
 import { useUIStore } from "@/stores/ui-store";
 import {
-  listBranches,
+  listBranchesDetailed,
   listWorktrees,
   getDefaultBranch,
   generateBranchName,
@@ -48,7 +43,7 @@ import {
   dbAddRecentProject,
   getPresets,
 } from "@/tauri/commands";
-import type { WorktreeInfo, DetectedSetup } from "@/tauri/types";
+import type { WorktreeInfo, DetectedSetup, BranchDetail } from "@/tauri/types";
 
 type Step = "workspace" | "setup";
 type SetupMode = "checklist" | "custom";
@@ -69,7 +64,6 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const [generatedBranch, setGeneratedBranch] = useState("");
   const [branchEdited, setBranchEdited] = useState(false);
   const [baseBranch, setBaseBranch] = useState("main");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   // ── Step 2 state ──
   const [setupMode, setSetupMode] = useState<SetupMode>("checklist");
@@ -86,7 +80,8 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
 
   // ── Data state ──
-  const [allBranches, setAllBranches] = useState<string[]>([]);
+  const [detailedBranches, setDetailedBranches] = useState<BranchDetail[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(true);
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [showImportConfirm, setShowImportConfirm] = useState(false);
@@ -110,20 +105,18 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   // ── Load data on mount ──
   useEffect(() => {
     let cancelled = false;
+    setBranchesLoading(true);
 
     Promise.all([
-      listBranches(projectDir, false).catch(() => []),
-      listBranches(projectDir, true).catch(() => []),
+      listBranchesDetailed(projectDir).catch(() => []),
       listWorktrees(projectDir).catch(() => []),
       getDefaultBranch(projectDir).catch(() => "main"),
       detectPackageManager(projectDir).catch(() => []),
       getPresets().catch(() => ({ presets: [], bar_visible: false, default_preset_id: null })),
-    ]).then(([local, remote, wt, defBranch, detected, presetSnap]) => {
+    ]).then(([detailed, wt, defBranch, detected, presetSnap]) => {
       if (cancelled) return;
-      const branches = Array.from(
-        new Set([...local, ...remote.map((b) => b.replace(/^origin\//, ""))]),
-      ).sort();
-      setAllBranches(branches);
+      setDetailedBranches(detailed);
+      setBranchesLoading(false);
       setWorktrees(wt);
       setBaseBranch(defBranch);
       setActions(detected.map((d) => ({ ...d, checked: d.enabled })));
@@ -398,7 +391,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                   />
                 </div>
 
-                {/* Branch name — editable */}
+                {/* Branch name — editable, with inline base branch picker */}
                 <div className="rounded-md border border-border/60 bg-card/40 px-3 py-1.5 text-sm">
                   <div className="flex items-center gap-2 text-muted-foreground">
                     <GitBranch className="h-3.5 w-3.5 shrink-0" />
@@ -410,69 +403,14 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
                       className="flex-1 min-w-0 bg-transparent font-mono text-sm text-muted-foreground placeholder:text-muted-foreground/40 outline-none"
                     />
                     <span className="text-muted-foreground/50 shrink-0">from</span>
-                    <span className="font-mono shrink-0">{baseBranch}</span>
+                    <BranchPicker
+                      baseBranch={baseBranch}
+                      branches={detailedBranches}
+                      loading={branchesLoading}
+                      onSelectBase={setBaseBranch}
+                    />
                   </div>
                 </div>
-
-                {/* Advanced options */}
-                <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-                  <CollapsibleTrigger className="flex items-center gap-1.5 text-xs text-muted-foreground/80 hover:text-muted-foreground transition-colors py-1">
-                    <ChevronDown
-                      className={cn(
-                        "h-3 w-3 transition-transform duration-200",
-                        !advancedOpen && "-rotate-90",
-                      )}
-                    />
-                    Advanced options
-                  </CollapsibleTrigger>
-                  <CollapsibleContent>
-                    <div className="pt-3 space-y-2">
-                      <span className="text-xs font-medium text-muted-foreground">
-                        Base branch
-                      </span>
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <Button
-                            variant="outline"
-                            className="w-full h-10 justify-between font-normal"
-                          >
-                            <span className="flex items-center gap-2 truncate">
-                              <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                              <span className="truncate font-mono text-sm">
-                                {baseBranch}
-                              </span>
-                              {(baseBranch === "main" || baseBranch === "master") && (
-                                <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                                  default
-                                </span>
-                              )}
-                            </span>
-                            <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
-                          </Button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent className="max-h-[240px] w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto">
-                          {allBranches.map((branch) => (
-                            <DropdownMenuItem
-                              key={branch}
-                              onClick={() => setBaseBranch(branch)}
-                              className={cn(
-                                "text-xs gap-2",
-                                baseBranch === branch && "bg-accent",
-                              )}
-                            >
-                              <span className="truncate flex-1">{branch}</span>
-                              {(branch === "main" || branch === "master") && (
-                                <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                                  default
-                                </span>
-                              )}
-                            </DropdownMenuItem>
-                          ))}
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </div>
-                  </CollapsibleContent>
-                </Collapsible>
 
                 {/* Continue button */}
                 <div className="flex justify-end">
