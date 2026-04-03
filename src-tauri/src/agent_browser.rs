@@ -242,11 +242,19 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
     let command = match action {
         "open_url" | "open" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
+            // Navigate, wait for page load, then restart screencast so the
+            // streaming WebSocket sends frames from the new page. Without the
+            // stream disable/enable cycle, the CDP screencast stays attached
+            // to the old page target after cross-origin navigation.
             format!(
-                "{bin} open {url} --session {s} && {bin} wait --load load --session {s}",
+                "{bin} open {url} --session {s} && \
+                 {bin} wait --load load --session {s} && \
+                 {bin} stream disable --session {s} && \
+                 {bin} stream enable --port {port} --session {s}",
                 bin = bin,
                 url = shell_quote(url),
                 s = session,
+                port = DEFAULT_STREAM_PORT,
             )
         }
         "screenshot" => format!("{} screenshot --session {}", bin, session),
@@ -616,15 +624,16 @@ mod tests {
     }
 
     #[test]
-    fn build_command_open_chains_wait_load() {
+    fn build_command_open_chains_wait_and_stream_restart() {
         let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
         let bin = resolve_binary();
         assert!(cmd.starts_with(&bin), "Command should start with resolved binary: {}", cmd);
         assert!(cmd.contains("--session test-session"));
         assert!(cmd.contains("https://example.com"));
-        // Must chain wait --load load after open
-        assert!(cmd.contains("&& "), "Open command should chain wait: {}", cmd);
-        assert!(cmd.contains("wait --load load"), "Open command should wait for load event: {}", cmd);
+        // Must chain: open → wait → stream disable → stream enable
+        assert!(cmd.contains("wait --load load"), "Should wait for load event: {}", cmd);
+        assert!(cmd.contains("stream disable"), "Should restart screencast: {}", cmd);
+        assert!(cmd.contains("stream enable"), "Should restart screencast: {}", cmd);
     }
 
     #[test]
