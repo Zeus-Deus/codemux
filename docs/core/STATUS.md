@@ -31,6 +31,7 @@ The repo structure is clean and domain-split:
 - IDE integration (detect editors, open workspace, Ctrl+Shift+E)
 - Command palette (Ctrl+K, fuzzy search across all actions)
 - PR integration (create, view, checks, merge via gh CLI, auth status check)
+- GitHub issue integration (link issues to workspaces, issue picker in creation dialog, sidebar display with detail popover, auto-branch naming from issue, prompt auto-injection of issue context, CLI `codemux issue list/view/link`, control socket commands)
 - Setup/teardown scripts (.codemux/config.json)
 - Workspace creation from branch with layout + preset selection
 - Notifications with D-Bus, Hyprland focus, attention badges

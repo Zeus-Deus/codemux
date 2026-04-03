@@ -39,6 +39,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
 - PR integration: `docs/features/pr-integration.md`
+- GitHub issues: `docs/plans/github-issues-gap-analysis.md`
 - Search: `docs/features/search.md`
 - Notifications: `docs/features/notifications.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`

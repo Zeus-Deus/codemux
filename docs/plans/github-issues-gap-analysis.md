@@ -424,11 +424,12 @@ Rationale:
 - Workspace creation with worktree support
 - Background PR refresh loop
 - Workspace state persistence with PR fields
-- **Phase 1 complete**: GitHub issue types (`GitHubIssue`, `LinkedIssue`, `IssueState`), issue fetching (`list_github_issues`, `get_github_issue`), workspace issue linking/unlinking/refresh, auto-branch name suggestion, Tauri commands (6 new), control socket commands (3 new), CLI subcommands (`codemux issue list/view/link`), frontend TypeScript types and command wrappers, background refresh for linked issue state
+- **Phase 1 complete**: GitHub issue types (`GitHubIssue`, `LinkedIssue`, `IssueState`), issue fetching (`list_github_issues`, `get_github_issue`), workspace issue linking/unlinking/refresh, auto-branch name suggestion (`feature/{number}-{slug}`), Tauri commands (8 total including path-based variants), control socket commands (3), CLI subcommands (`codemux issue list/view/link`), frontend TypeScript types and command wrappers, background refresh for linked issue state, 10s timeout on `gh` commands via `run_gh_timed`
+- **Phase 2 complete**: Issue picker in workspace creation dialog (searchable, fuzzy filter, debounced server search, keyboard navigation, skeleton loading), toolbar icon buttons (attach, PR, issue, submit), linked issue chip with auto-branch naming and auto-fill tracking (unlink/switch clears correctly), linked issue badge on sidebar workspace rows, post-creation linking via `linkWorkspaceIssue`
+- **Phase 3 complete**: Issue detail popover on sidebar (click `#number` to view full issue — title, labels, assignees, scrollable body, "Open on GitHub" via Tauri openUrl), prompt auto-injection (linked issue context prepended to agent prompt at workspace creation, body truncated at 10K chars, graceful degradation on fetch failure), `buildPromptWithIssueContext` pure function
 
 ## Notes
 
-- Superset treats issues as ephemeral creation-time context (no persistence). We should do better by persisting the link in workspace state, enabling sidebar display and ongoing state tracking.
-- The existing PR integration is the architectural template — issue support follows the same patterns (Rust types → Tauri commands → React components → workspace state).
-- Phase 1-2 (backend + picker UI) is the minimum viable feature and should ship together.
-- Phase 3 (context injection) makes the feature significantly more useful for AI agent workflows.
+- Superset treats issues as ephemeral creation-time context (no persistence). Codemux goes further by persisting the link in workspace state, showing it on the sidebar, and providing a detail popover.
+- The existing PR integration was the architectural template — issue support follows the same patterns (Rust types → Tauri commands → React components → workspace state).
+- OpenFlow issue injection is deferred — the OpenFlow dialog creates its own workspace and has no linked issue concept yet.
