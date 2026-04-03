@@ -1,5 +1,5 @@
 import { useCallback, useRef, useEffect } from "react";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
@@ -87,6 +87,18 @@ export function WorkspaceMain() {
       : null,
   );
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
+
+  // Auto-dismiss onboarding when a workspace is created through any path ("+", CLI, etc.)
+  const allWorkspaces = useAppStore((s) => s.appState?.workspaces ?? []);
+  useEffect(() => {
+    if (!onboardingProjectDir) return;
+    const count = allWorkspaces.filter(
+      (ws) => ws.project_root === onboardingProjectDir || ws.cwd === onboardingProjectDir,
+    ).length;
+    if (count > 1) {
+      setOnboardingProjectDir(null);
+    }
+  }, [onboardingProjectDir, allWorkspaces, setOnboardingProjectDir]);
 
   if (!activeWorkspace) return null;
 
