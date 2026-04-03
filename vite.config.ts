@@ -16,6 +16,12 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    // xterm.js ships pre-minified; esbuild double-minification mangles its
+    // internal variable references (ReferenceError in _innerWrite → parse →
+    // requestMode). Safe to disable for a Tauri app — JS loads from disk.
+    minify: false,
+  },
   clearScreen: false,
   server: {
     port: 1420,
