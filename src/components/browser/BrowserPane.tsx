@@ -324,18 +324,20 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       connectWS();
     })();
 
-    // Frame liveness check: if no frame arrives for 5s while live,
+    // Frame liveness check: if no frame arrives for 30s while live,
     // close the WebSocket to trigger reconnection via onclose handler.
+    // CDP screencast only sends frames on visual change — static pages
+    // legitimately produce few frames, so use a generous timeout.
     const livenessInterval = setInterval(() => {
       if (!active) return;
       if (statusRef.current === "live" && lastFrameTimeRef.current > 0) {
-        const stale = Date.now() - lastFrameTimeRef.current > 5000;
+        const stale = Date.now() - lastFrameTimeRef.current > 30000;
         if (stale && wsRef.current?.readyState === WebSocket.OPEN) {
-          console.warn("[browser] Frame timeout — reconnecting");
+          console.warn("[browser] Frame timeout (30s) — reconnecting");
           wsRef.current.close();
         }
       }
-    }, 2000);
+    }, 5000);
 
     return () => {
       active = false;

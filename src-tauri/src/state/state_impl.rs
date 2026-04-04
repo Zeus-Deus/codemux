@@ -2857,10 +2857,10 @@ fn current_time_ms() -> u64 {
 
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    // Don't prepend https:// if the URL already has any scheme
+    if trimmed.contains("://") || trimmed.starts_with("data:") || trimmed.starts_with("about:") {
         return trimmed.to_string();
     }
-
     format!("https://{trimmed}")
 }
 

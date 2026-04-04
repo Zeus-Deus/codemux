@@ -25,7 +25,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
   }, [currentUrl]);
 
   const navigate = async (url: string) => {
-    const normalized = url.startsWith("http") ? url : `https://${url}`;
+    const normalized = url.includes("://") || url.startsWith("data:") || url.startsWith("about:") ? url : `https://${url}`;
     setNavigating(true);
     try {
       await agentBrowserRun(cmdId, "open", { url: normalized });
