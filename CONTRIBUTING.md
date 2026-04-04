@@ -115,7 +115,7 @@ These are not required to build or run Codemux but enable additional features. A
 - **WebKit2GTK version**: Must be 4.1 specifically, not 4.0 or 6.0. The package name varies by distro.
 - **Wayland GPU rendering**: `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set automatically in `tauri:dev` scripts. If you see GPU errors, this is the fix.
 - **X11 fallback**: Some Wayland compositors need `GDK_BACKEND=x11`. Use `npm run tauri:dev:x11`.
-- **postinstall patches**: `npm install` runs `scripts/patch-agent-browser.sh` to patch the `agent-browser` package for Codemux-specific keyboard and viewport handling. If browser input breaks after a package update, delete `node_modules` and reinstall.
+- **agent-browser sidecar**: The `agent-browser` binary is bundled as a Tauri sidecar. Run `bash scripts/copy-agent-browser.sh` after `npm install` to copy it into `src-tauri/binaries/`. If browser automation breaks after a package update, re-run the copy script.
 - **Stale CLI binary**: `npm run build:cli` copies the binary to `~/.local/bin/codemux`. This can shadow the dev build if you forget it's there. Remove it with `rm ~/.local/bin/codemux` when you don't need it.
 - **`.mcp.json` is auto-generated**: Codemux writes `.mcp.json` per-workspace at runtime with the current binary path. It's in `.gitignore` — never commit or manually edit it.
 - **Auth in dev mode**: If the auth API (`api.codemux.org`) is unreachable, the app auto-bypasses auth with a dev placeholder user. No account needed for local development. To point to a local auth API, set `CODEMUX_API_URL=http://localhost:3000`.

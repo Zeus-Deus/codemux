@@ -550,27 +550,6 @@ export const browserSetLoadingState = (
 ) =>
   invoke("browser_set_loading_state", { browserId, isLoading, error });
 
-export const browserSpawn = (browserId: string) =>
-  invoke<string>("browser_spawn", { browserId });
-
-export const browserNavigate = (browserId: string, url: string) =>
-  invoke<string>("browser_navigate", { browserId, url });
-
-export const browserScreenshot = (browserId: string) =>
-  invoke<string>("browser_screenshot", { browserId });
-
-export const browserClick = (browserId: string, x: number, y: number) =>
-  invoke<string>("browser_click", { browserId, x, y });
-
-export const browserType = (browserId: string, text: string) =>
-  invoke<string>("browser_type", { browserId, text });
-
-export const browserClose = (browserId: string) =>
-  invoke("browser_close", { browserId });
-
-export const browserResizeViewport = (browserId: string, width: number, height: number) =>
-  invoke("browser_resize_viewport", { browserId, width, height });
-
 export const agentBrowserSpawn = (browserId: string) =>
   invoke("agent_browser_spawn", { browserId });
 

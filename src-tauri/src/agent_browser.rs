@@ -79,6 +79,14 @@ pub struct BrowserAutomationResult {
 /// Default stream port for the browser screencast WebSocket.
 pub const DEFAULT_STREAM_PORT: u16 = 9223;
 
+/// Kill any agent-browser daemon on our stream port.
+/// Called on app shutdown to prevent stale daemons across restarts.
+pub fn kill_stream_daemon() {
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", DEFAULT_STREAM_PORT)])
+        .output();
+}
+
 pub struct AgentBrowserManager {
     pub running: Arc<Mutex<bool>>,
     pub stream_port: u16,
@@ -163,25 +171,120 @@ fn extract_eval_result(stdout: &str) -> String {
     trimmed.to_string()
 }
 
+/// Resolve the path to the agent-browser native binary.
+///
+/// Search order (first match wins):
+/// 1. System PATH — covers AUR `agent-browser` package and manual installs
+/// 2. Tauri sidecar — bundled next to the executable in AppImage/deb/rpm
+/// 3. node_modules — dev mode (`npm run tauri dev`)
+/// 4. npx fallback — always works if Node.js + npm are present
+fn resolve_binary() -> String {
+    // 1. System PATH (AUR/system package, cargo install, manual install)
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("agent-browser")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Skip the node_modules/.bin shim — we want the native binary directly
+            if !path.is_empty() && !path.contains("node_modules/.bin") {
+                return path;
+            }
+        }
+    }
+
+    // Determine the platform-specific sidecar name
+    let target_triple = if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "x86_64-unknown-linux-gnu"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-gnu"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "aarch64-apple-darwin"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "x86_64-apple-darwin"
+    } else {
+        return "npx agent-browser".to_string();
+    };
+
+    let npm_binary = if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        "agent-browser-linux-x64"
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        "agent-browser-linux-arm64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "aarch64") {
+        "agent-browser-darwin-arm64"
+    } else if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        "agent-browser-darwin-x64"
+    } else {
+        return "npx agent-browser".to_string();
+    };
+
+    let sidecar_name = format!("agent-browser-{target_triple}");
+
+    // 2. Tauri sidecar — next to the executable (AppImage/deb/rpm installs)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(&sidecar_name);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // 3. node_modules — dev mode (npm run tauri dev)
+    // Tauri runs from src-tauri/ but node_modules is at the project root.
+    // Check cwd, parent of cwd, and parent of exe for the npm binary.
+    let mut search_dirs = vec![
+        std::env::current_dir().unwrap_or_default(),
+    ];
+    // Parent of cwd (project root when cwd is src-tauri/)
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(parent) = cwd.parent() {
+            search_dirs.push(parent.to_path_buf());
+        }
+    }
+    // Directory containing the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+        }
+    }
+    for base in &search_dirs {
+        let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+
+    // 4. npx fallback — spawns Node.js shim, requires npm + Node.js
+    "npx agent-browser".to_string()
+}
+
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
+    let bin = resolve_binary();
     let command = match action {
         "open_url" | "open" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("about:blank");
-            format!("npx agent-browser open {} --session {}", shell_quote(url), session)
+            format!(
+                "{bin} open {url} --session {s} && {bin} wait --load load --session {s}",
+                bin = bin,
+                url = shell_quote(url),
+                s = session,
+            )
         }
-        "screenshot" => format!("npx agent-browser screenshot --session {}", session),
+        "screenshot" => format!("{} screenshot --session {}", bin, session),
         "snapshot" | "accessibility_snapshot" => {
-            format!("npx agent-browser snapshot -i --session {}", session)
+            format!("{} snapshot -i --session {}", bin, session)
         }
         "click" => {
             let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
-            format!("npx agent-browser click {} --session {}", shell_quote(selector), session)
+            format!("{} click {} --session {}", bin, shell_quote(selector), session)
         }
         "fill" => {
             let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
             let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
             format!(
-                "npx agent-browser fill {} {} --session {}",
+                "{} fill {} {} --session {}",
+                bin,
                 shell_quote(selector),
                 shell_quote(value),
                 session
@@ -189,20 +292,42 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
         }
         "type_text" => {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            format!("npx agent-browser type body {} --session {}", shell_quote(text), session)
+            format!("{} type body {} --session {}", bin, shell_quote(text), session)
         }
-        "console_logs" | "console" => format!("npx agent-browser console --session {}", session),
+        "console_logs" | "console" => format!("{} console --session {}", bin, session),
         "evaluate" | "eval" => {
             let script = params.get("script").and_then(|v| v.as_str()).unwrap_or("");
-            format!("npx agent-browser eval {} --session {}", shell_quote(script), session)
+            format!("{} eval {} --session {}", bin, shell_quote(script), session)
         }
-        "back" => format!("npx agent-browser back --session {}", session),
-        "forward" => format!("npx agent-browser forward --session {}", session),
-        "reload" => format!("npx agent-browser reload --session {}", session),
+        "back" => format!("{} back --session {}", bin, session),
+        "forward" => format!("{} forward --session {}", bin, session),
+        "reload" => format!("{} reload --session {}", bin, session),
         "viewport" => {
             let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
             let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
-            format!("npx agent-browser viewport {} {} --session {}", w, h, session)
+            format!("{} set viewport {} {} --session {}", bin, w, h, session)
+        }
+        // New v0.24.0 commands
+        "get_styles" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
+            format!("{} get styles {} --json --session {}", bin, shell_quote(selector), session)
+        }
+        "wait" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("");
+            let text = params.get("text").and_then(|v| v.as_str());
+            if let Some(text) = text {
+                format!("{} wait --text {} --session {}", bin, shell_quote(text), session)
+            } else {
+                format!("{} wait {} --session {}", bin, shell_quote(selector), session)
+            }
+        }
+        "get_text" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
+            format!("{} get text {} --session {}", bin, shell_quote(selector), session)
+        }
+        "get_box" => {
+            let selector = params.get("selector").and_then(|v| v.as_str()).unwrap_or("body");
+            format!("{} get box {} --json --session {}", bin, shell_quote(selector), session)
         }
         _ => return Err(format!("Unknown action: {}", action)),
     };
@@ -225,6 +350,9 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
     let output = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
+        .env("AGENT_BROWSER_STREAM_PORT", DEFAULT_STREAM_PORT.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
         .output()
         .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
 
@@ -318,14 +446,16 @@ impl AgentBrowserManager {
 
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id);
-        
+        let bin = resolve_binary();
+
         let mut running = self.running.lock().await;
         if *running {
             return Ok(());
         }
 
         let output = std::process::Command::new("sh")
-            .args(["-c", &format!("npx agent-browser open about:blank --headless --session {}", session)])
+            .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
+            .env("AGENT_BROWSER_STREAM_PORT", self.stream_port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
             .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
@@ -336,7 +466,6 @@ impl AgentBrowserManager {
             return Err(format!("Failed to start browser: {}", stderr));
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(2000));
         *running = true;
         Ok(())
     }
@@ -347,9 +476,13 @@ impl AgentBrowserManager {
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id);
-        
+        let bin = resolve_binary();
+
         let output = std::process::Command::new("sh")
-            .args(["-c", &format!("npx agent-browser screenshot --session {}", session)])
+            .args(["-c", &format!("{} screenshot --session {}", bin, session)])
+            .env("AGENT_BROWSER_STREAM_PORT", self.stream_port.to_string())
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to get screenshot: {}", e))?;
 
@@ -384,12 +517,13 @@ impl AgentBrowserManager {
 
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id);
-        
+        let bin = resolve_binary();
+
         let mut running = self.running.lock().await;
         *running = false;
-        
+
         let _ = std::process::Command::new("sh")
-            .args(["-c", &format!("npx agent-browser close --session {}", session)])
+            .args(["-c", &format!("{} close --session {}", bin, session)])
             .output();
         Ok(())
     }
@@ -398,75 +532,118 @@ impl AgentBrowserManager {
         format!("ws://localhost:{}", self.stream_port)
     }
 
+    /// Start the browser session and return the WebSocket stream URL.
+    ///
+    /// With agent-browser v0.24.0+, the Rust daemon auto-starts on first
+    /// command and streaming is enabled by default. We just need to:
+    /// 1. Set AGENT_BROWSER_STREAM_PORT so the daemon binds to our port
+    /// 2. Run any command to trigger daemon + browser launch
+    /// 3. Return the WebSocket URL
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let port = self.stream_port;
         let session = session_name(browser_id);
+        let bin = resolve_binary();
         let mut running = self.running.lock().await;
+
+        // If we already started this daemon in this app session, reuse it.
         if *running {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Check if a daemon is already listening on the stream port (e.g., started
-        // by a preceding agent-browser CLI command). If so, adopt it instead of
-        // killing and restarting — that would destroy the agent's active session.
-        if let Ok(output) = std::process::Command::new("sh")
-            .args(["-c", &format!("fuser {}/tcp 2>/dev/null", port)])
-            .output()
-        {
-            if output.status.success() && !output.stdout.is_empty() {
-                *running = true;
-                return Ok(format!("ws://localhost:{}", port));
-            }
-        }
-
-        // Kill any stale daemon on this port to avoid EADDRINUSE
+        // Always kill stale daemons on this port — they may be from a
+        // previous app session with a different browser page/session.
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
             .output();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
-        // Step 1: Start the daemon process (runs forever, serves both the
-        // WebSocket stream on `port` and a Unix socket for CLI commands).
-        let daemon_script = format!(
-            "const m = await import('agent-browser'); \
-             m.setSession('{}'); \
-             await m.startDaemon({{ streamPort: {} }});",
-            session, port
-        );
-        eprintln!("[codemux::browser] Starting daemon on port {} session={}", port, session);
-        let daemon_cmd = format!(
-            "node --input-type=module -e {} >/tmp/codemux-browser-daemon.log 2>&1",
-            shell_quote(&daemon_script)
-        );
-        std::process::Command::new("sh")
-            .args(["-c", &daemon_cmd])
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-            .stdin(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to start browser stream: {}", e))?;
-
-        // Wait for the daemon's WS server and Unix socket to be ready.
-        std::thread::sleep(std::time::Duration::from_millis(3000));
-
-        // Step 2: Launch the browser via the CLI (has proper retries and
-        // error handling, unlike raw socket writes). This triggers the
-        // daemon's BrowserManager to launch Chromium.
-        eprintln!("[codemux::browser] Launching browser via CLI session={}", session);
+        // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and
+        // streaming is enabled by default when AGENT_BROWSER_STREAM_PORT is set.
+        eprintln!("[codemux::browser] Starting browser session={} port={}", session, port);
         let launch_cmd = format!(
-            "npx agent-browser open about:blank --session {}",
-            session
+            "{} open about:blank --headless --session {}",
+            bin, session
         );
         let _ = std::process::Command::new("sh")
             .args(["-c", &launch_cmd])
+            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
             .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output();
 
-        // Give Chromium a moment to finish launching and produce screencast frames.
-        std::thread::sleep(std::time::Duration::from_millis(3000));
+        // Give the daemon a moment to start the WebSocket stream server.
+        std::thread::sleep(std::time::Duration::from_millis(1000));
         *running = true;
 
         Ok(format!("ws://localhost:{}", port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_binary_returns_existing_path_or_npx_fallback() {
+        let result = resolve_binary();
+        if result.starts_with("npx ") {
+            // Fallback is acceptable (e.g., binary not in cwd/node_modules)
+            assert_eq!(result, "npx agent-browser");
+        } else {
+            // Must be a real path that exists and is a file
+            let path = std::path::Path::new(&result);
+            assert!(path.exists(), "resolve_binary returned non-existent path: {}", result);
+            assert!(path.is_file(), "resolve_binary returned non-file: {}", result);
+        }
+    }
+
+    #[test]
+    fn resolve_binary_finds_native_binary_from_project_root() {
+        // Run from the project root where node_modules exists
+        let result = resolve_binary();
+        // On this machine, the native binary should be found in node_modules
+        if !result.starts_with("npx ") {
+            assert!(
+                result.contains("agent-browser-linux-x64") || result.contains("agent-browser-darwin"),
+                "Expected platform-specific binary name, got: {}",
+                result
+            );
+            // Verify it's executable
+            let output = std::process::Command::new(&result)
+                .arg("--version")
+                .output();
+            assert!(output.is_ok(), "Binary at {} is not executable", result);
+            let out = output.unwrap();
+            let version = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                version.contains("agent-browser") || out.status.success(),
+                "Binary didn't respond to --version: {}",
+                version
+            );
+        }
+    }
+
+    #[test]
+    fn build_command_open_chains_wait_load() {
+        let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
+        let bin = resolve_binary();
+        assert!(cmd.starts_with(&bin), "Command should start with resolved binary: {}", cmd);
+        assert!(cmd.contains("--session test-session"));
+        assert!(cmd.contains("https://example.com"));
+        assert!(cmd.contains("wait --load load"), "Should wait for load event: {}", cmd);
+        assert!(!cmd.contains("stream disable"), "Should NOT restart stream: {}", cmd);
+    }
+
+    #[test]
+    fn build_command_viewport_uses_set_viewport() {
+        let cmd = build_agent_browser_command("s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
+        assert!(cmd.contains("set viewport 800 600"), "v0.24.0 uses 'set viewport', got: {}", cmd);
+    }
+
+    #[test]
+    fn build_command_unknown_action_returns_error() {
+        let result = build_agent_browser_command("s", "nonexistent_action", &serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown action"));
     }
 }

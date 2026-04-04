@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
@@ -19,8 +19,13 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
   const [urlInput, setUrlInput] = useState(currentUrl);
   const [navigating, setNavigating] = useState(false);
 
+  // Sync URL bar when currentUrl prop changes (e.g., agent navigation).
+  useEffect(() => {
+    setUrlInput(currentUrl);
+  }, [currentUrl]);
+
   const navigate = async (url: string) => {
-    const normalized = url.startsWith("http") ? url : `https://${url}`;
+    const normalized = url.includes("://") || url.startsWith("data:") || url.startsWith("about:") ? url : `https://${url}`;
     setNavigating(true);
     try {
       await agentBrowserRun(cmdId, "open", { url: normalized });

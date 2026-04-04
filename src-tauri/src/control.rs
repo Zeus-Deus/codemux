@@ -424,10 +424,21 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                     }
                 }
 
-                // Track URL on the agent session for reconnection.
+                // Track URL on the agent session for reconnection, and sync
+                // to the browser_sessions entry so the frontend URL bar updates.
                 if action_kind == "open" {
                     if let Some(url) = params.get("url").and_then(Value::as_str) {
                         let _ = state.update_agent_browser_url(&workspace_id, url.to_string());
+                        // Re-read the session to get the current browser_id (may have
+                        // been set by attach_agent_browser_to_pane in the create block).
+                        let current_session = state.resolve_agent_browser_session(
+                            &workspace_id,
+                            agent_browser.stream_port,
+                        );
+                        if let Some(bid) = current_session.browser_id.as_ref() {
+                            let _ = state.update_browser_url(&bid.0, url.to_string());
+                        }
+                        crate::state::emit_app_state(&app);
                     }
                 }
 

@@ -4,9 +4,9 @@
   "version": "0.1.9",
   "identifier": "com.codemux.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -29,6 +29,9 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": "all",
+    "externalBin": [
+      "binaries/agent-browser"
+    ],
     "linux": {
       "deb": {
         "files": {

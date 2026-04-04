@@ -1588,10 +1588,12 @@ impl AppStateStore {
     }
 
     /// Unlink a pane from its agent browser session but keep the session alive.
-    /// Sets user_dismissed so auto-creation won't immediately reopen the pane.
+    /// When `dismissed` is true, prevents auto-recreation on next browser_navigate
+    /// (use for explicit user close). When false, the agent can reopen the pane.
     pub fn detach_agent_browser_from_pane(
         &self,
         browser_id: &str,
+        dismissed: bool,
     ) -> Option<AgentBrowserSession> {
         let mut snapshot = self.inner.lock().unwrap();
         let session = snapshot
@@ -1600,7 +1602,9 @@ impl AppStateStore {
             .find(|s| s.browser_id.as_ref().map(|b| b.0.as_str()) == Some(browser_id))?;
         session.pane_id = None;
         session.browser_id = None;
-        session.user_dismissed = true;
+        if dismissed {
+            session.user_dismissed = true;
+        }
         Some(session.clone())
     }
 
@@ -2085,9 +2089,15 @@ impl AppStateStore {
 
         // Collect resources to clean up
         let mut removed_sessions: Vec<SessionId> = vec![];
-        let removed_browser_id = tab.browser_id.clone();
+        let mut removed_browser_ids: Vec<BrowserId> = vec![];
 
-        // If terminal tab, remove its surface and collect session IDs
+        // Tab-level browser ID (for dedicated browser tabs)
+        if let Some(ref bid) = tab.browser_id {
+            removed_browser_ids.push(bid.clone());
+        }
+
+        // If terminal tab, remove its surface and collect session + browser IDs
+        // from the pane tree (browser panes are embedded in splits, not on the tab).
         if let Some(ref surface_id) = tab.surface_id {
             if let Some(surface_index) = workspace
                 .surfaces
@@ -2096,6 +2106,7 @@ impl AppStateStore {
             {
                 let surface = workspace.surfaces.remove(surface_index);
                 collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
+                collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
             }
         }
 
@@ -2121,8 +2132,8 @@ impl AppStateStore {
                 .retain(|s| s.session_id != *session_id);
         }
 
-        // Remove browser session from snapshot
-        if let Some(ref browser_id) = removed_browser_id {
+        // Remove browser sessions from snapshot
+        for browser_id in &removed_browser_ids {
             snapshot
                 .browser_sessions
                 .retain(|b| b.browser_id != *browser_id);
@@ -2130,7 +2141,7 @@ impl AppStateStore {
 
         Ok(CloseTabResult {
             removed_sessions,
-            removed_browser_id,
+            removed_browser_ids,
         })
     }
 
@@ -2270,7 +2281,7 @@ impl AppStateStore {
 
 pub struct CloseTabResult {
     pub removed_sessions: Vec<SessionId>,
-    pub removed_browser_id: Option<BrowserId>,
+    pub removed_browser_ids: Vec<BrowserId>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
@@ -2280,6 +2291,18 @@ fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionI
         PaneNodeSnapshot::Split { children, .. } => {
             for child in children {
                 collect_session_ids_from_tree(child, out);
+            }
+        }
+    }
+}
+
+fn collect_browser_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<BrowserId>) {
+    match node {
+        PaneNodeSnapshot::Browser { browser_id, .. } => out.push(browser_id.clone()),
+        PaneNodeSnapshot::Terminal { .. } => {}
+        PaneNodeSnapshot::Split { children, .. } => {
+            for child in children {
+                collect_browser_ids_from_tree(child, out);
             }
         }
     }
@@ -2834,10 +2857,10 @@ fn current_time_ms() -> u64 {
 
 fn normalize_url(url: &str) -> String {
     let trimmed = url.trim();
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+    // Don't prepend https:// if the URL already has any scheme
+    if trimmed.contains("://") || trimmed.starts_with("data:") || trimmed.starts_with("about:") {
         return trimmed.to_string();
     }
-
     format!("https://{trimmed}")
 }
 
@@ -3850,7 +3873,7 @@ mod tests {
 
         // Detach
         let detached = store
-            .detach_agent_browser_from_pane(&browser_id.0)
+            .detach_agent_browser_from_pane(&browser_id.0, true)
             .unwrap();
         assert!(detached.pane_id.is_none());
         assert!(detached.browser_id.is_none());
@@ -3893,7 +3916,7 @@ mod tests {
             .unwrap();
 
         // Detach before close (simulates what close_pane command does)
-        store.detach_agent_browser_from_pane(&browser_id.0);
+        store.detach_agent_browser_from_pane(&browser_id.0, true);
 
         // close_pane removes BrowserSessionSnapshot but agent session survives
         store.close_pane(&pane_id.0).unwrap();
@@ -3950,9 +3973,101 @@ mod tests {
             .unwrap();
 
         // Detach ws1 only
-        store.detach_agent_browser_from_pane(&browser_id1.0);
+        store.detach_agent_browser_from_pane(&browser_id1.0, true);
 
         assert!(store.find_detached_agent_browser(&ws1_id.0).is_some());
         assert!(store.find_detached_agent_browser(&ws2_id.0).is_none());
+    }
+
+    // ── Dismissed vs non-dismissed detach tests ──
+
+    #[test]
+    fn detach_dismissed_true_sets_user_dismissed() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        store.detach_agent_browser_from_pane(&browser_id.0, true);
+
+        let snap = store.snapshot();
+        assert!(snap.agent_browser_sessions[0].user_dismissed);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_none());
+    }
+
+    #[test]
+    fn detach_dismissed_false_does_not_set_user_dismissed() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        store.detach_agent_browser_from_pane(&browser_id.0, false);
+
+        let snap = store.snapshot();
+        assert!(!snap.agent_browser_sessions[0].user_dismissed);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_none());
+    }
+
+    #[test]
+    fn after_non_dismissed_detach_pane_can_be_auto_created() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        // Tab close: dismissed=false
+        store.detach_agent_browser_from_pane(&browser_id.0, false);
+
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        let should_create = session.pane_id.is_none() && !session.user_dismissed;
+        assert!(should_create, "Pane should be auto-creatable after non-dismissed detach");
+    }
+
+    #[test]
+    fn after_dismissed_detach_pane_cannot_be_auto_created() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        // User close: dismissed=true
+        store.detach_agent_browser_from_pane(&browser_id.0, true);
+
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        let should_create = session.pane_id.is_none() && !session.user_dismissed;
+        assert!(!should_create, "Pane should NOT be auto-creatable after dismissed detach");
     }
 }

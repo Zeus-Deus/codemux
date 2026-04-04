@@ -59,6 +59,8 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const frameCountRef = useRef(0);
+  const lastFrameTimeRef = useRef(0);
+  const lastInspectorMoveRef = useRef(0);
 
   // Read initial URL from browser session state (set by ports section or other callers)
   const browserSession = useAppStore(
@@ -82,14 +84,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const currentUrlRef = useRef(currentUrl);
   currentUrlRef.current = currentUrl;
 
-  // Sync URL from state changes (e.g., browserOpenUrl called after mount)
+  // Sync URL display from state changes (agent navigation, browserOpenUrl).
+  // Does NOT re-navigate — the agent or CLI already performed the navigation.
+  // Only updates the URL bar display.
   useEffect(() => {
     const stateUrl = browserSession?.current_url;
     if (stateUrl && stateUrl !== currentUrl) {
       setCurrentUrl(stateUrl);
-      if (statusRef.current === "live") {
-        agentBrowserRun(effectiveSessionId, "open", { url: stateUrl }).catch(console.error);
-      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [browserSession?.current_url]);
@@ -214,6 +215,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
             const msg = JSON.parse(event.data);
             if (msg.type === "frame") {
               frameCountRef.current++;
+              lastFrameTimeRef.current = Date.now();
               if (statusRef.current !== "live") {
                 setStatus("live");
                 // Skip navigation on reconnect — the agent's browser is already showing the right page.
@@ -299,11 +301,15 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
         ws.onclose = () => {
           if (!active) return;
-          // Auto-reconnect if we haven't received frames yet
-          if (statusRef.current !== "live" && retries < maxRetries) {
+          // Auto-reconnect regardless of current status — handles both
+          // initial connection failures and mid-stream disconnects.
+          if (retries < maxRetries) {
             retries++;
+            if (statusRef.current === "live") {
+              setStatus("connecting");
+            }
             setTimeout(connectWS, 1500);
-          } else if (statusRef.current !== "live") {
+          } else {
             setStatus("error");
             setErrorMsg("Failed to connect to browser stream");
           }
@@ -313,8 +319,24 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       connectWS();
     })();
 
+    // Frame liveness check: if no frame arrives for 30s while live,
+    // close the WebSocket to trigger reconnection via onclose handler.
+    // CDP screencast only sends frames on visual change — static pages
+    // legitimately produce few frames, so use a generous timeout.
+    const livenessInterval = setInterval(() => {
+      if (!active) return;
+      if (statusRef.current === "live" && lastFrameTimeRef.current > 0) {
+        const stale = Date.now() - lastFrameTimeRef.current > 30000;
+        if (stale && wsRef.current?.readyState === WebSocket.OPEN) {
+          console.warn("[browser] Frame timeout (30s) — reconnecting");
+          wsRef.current.close();
+        }
+      }
+    }, 5000);
+
     return () => {
       active = false;
+      clearInterval(livenessInterval);
       // Close WebSocket on cleanup so the stream server's client count resets.
       // On StrictMode remount, the daemon is already running (*running = true),
       // so startBrowserStream returns instantly and a fresh WS connects.
@@ -388,6 +410,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (!inspectorActiveRef.current && e.buttons === 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // Throttle mouseMoved to 10/sec during inspector to avoid flooding
+    // the stream WebSocket with CDP events (causes frame starvation).
+    if (inspectorActiveRef.current) {
+      const now = Date.now();
+      if (now - lastInspectorMoveRef.current < 100) return;
+      lastInspectorMoveRef.current = now;
+    }
     const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
