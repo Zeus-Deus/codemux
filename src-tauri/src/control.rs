@@ -376,11 +376,21 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
             // Resolve the CLI session name to use for agent-browser commands.
             let cli_session_name = if !workspace_id.is_empty() {
+                // Allocate a unique stream port for this workspace.
+                let stream_port = agent_browser.allocate_port(&workspace_id).await
+                    .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
+
+
                 // Workspace-scoped path: find or create agent session for this workspace.
                 let agent_session = state.resolve_agent_browser_session(
                     &workspace_id,
-                    agent_browser.stream_port,
+                    stream_port,
                 );
+
+                // Register the same port under cli_session_name so that
+                // start_stream(cli_session_name) and close(cli_session_name) find it.
+
+                agent_browser.ensure_port(&agent_session.cli_session_name, stream_port).await;
 
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
                 let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;
@@ -433,7 +443,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                         // been set by attach_agent_browser_to_pane in the create block).
                         let current_session = state.resolve_agent_browser_session(
                             &workspace_id,
-                            agent_browser.stream_port,
+                            stream_port,
                         );
                         if let Some(bid) = current_session.browser_id.as_ref() {
                             let _ = state.update_browser_url(&bid.0, url.to_string());
@@ -466,11 +476,16 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 resolve_browser_id(&app, "default")
             };
 
+            // Get the port for this session (already allocated above or in start_stream).
+            // Try cli_session_name first (key used by start_stream/close), then workspace_id.
+            let vision_port = agent_browser.get_port(&cli_session_name).await
+                .or(agent_browser.get_port(&workspace_id).await)
+                .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
+
             let result = match action_kind.as_str() {
                 // Tier 2: coordinate-based CDP tools via stream WebSocket
                 "click_at" | "type_at" | "scroll_at" | "key_press" | "drag" => {
-                    let stream_port = agent_browser.stream_port;
-                    crate::stream_input::handle_vision_action(stream_port, &action_kind, params, &cli_session_name)
+                    crate::stream_input::handle_vision_action(vision_port, &action_kind, params, &cli_session_name)
                         .await
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }

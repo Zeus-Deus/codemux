@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::Mutex;
 
 /// Stealth Chromium flags that reduce bot detection fingerprinting.
@@ -78,18 +79,31 @@ pub struct BrowserAutomationResult {
 
 /// Default stream port for the browser screencast WebSocket.
 pub const DEFAULT_STREAM_PORT: u16 = 9223;
+/// Maximum stream port (inclusive). Ports 9223–9299 are reserved.
+const MAX_STREAM_PORT: u16 = 9299;
 
-/// Kill any agent-browser daemon on our stream port.
+/// Kill all agent-browser daemon processes.
 /// Called on app shutdown to prevent stale daemons across restarts.
-pub fn kill_stream_daemon() {
+pub fn kill_stream_daemons() {
     let _ = std::process::Command::new("sh")
-        .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", DEFAULT_STREAM_PORT)])
+        .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
         .output();
 }
 
+/// Per-session stream state.
+struct StreamSession {
+    port: u16,
+    running: bool,
+}
+
 pub struct AgentBrowserManager {
-    pub running: Arc<Mutex<bool>>,
-    pub stream_port: u16,
+    /// Atomic counter for the next port to try allocating.
+    next_port: AtomicU16,
+    /// Per-session state keyed by session identifier (workspace_id or cli_session_name).
+    sessions: Mutex<HashMap<String, StreamSession>>,
+    /// Serializes start_stream calls to prevent concurrent daemon launches
+    /// from racing (e.g., React StrictMode double-mount, pane remount + agent action).
+    start_lock: Mutex<()>,
 }
 
 fn session_name(browser_id: &str) -> &str {
@@ -345,12 +359,12 @@ fn make_request_id() -> String {
     )
 }
 
-fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
+fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
     let output = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
-        .env("AGENT_BROWSER_STREAM_PORT", DEFAULT_STREAM_PORT.to_string())
+        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
         .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
         .output()
@@ -426,8 +440,8 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     })
 }
 
-pub fn run_cli_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
-    execute_agent_browser_action(browser_id, action, params)
+pub fn run_cli_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
+    execute_agent_browser_action(browser_id, action, params, stream_port)
 }
 
 impl Default for AgentBrowserManager {
@@ -439,23 +453,96 @@ impl Default for AgentBrowserManager {
 impl AgentBrowserManager {
     pub fn new() -> Self {
         Self {
-            running: Arc::new(Mutex::new(false)),
-            stream_port: DEFAULT_STREAM_PORT,
+            next_port: AtomicU16::new(DEFAULT_STREAM_PORT),
+            sessions: Mutex::new(HashMap::new()),
+            start_lock: Mutex::new(()),
         }
+    }
+
+    /// Create a new manager and kill stale daemons from previous app runs.
+    /// Uses both process-name matching and port-based cleanup to handle
+    /// daemons that survive pkill (shared daemon, different session name, etc.).
+    pub fn new_with_cleanup() -> Self {
+        kill_stream_daemons();
+        // Also kill by port — pkill may miss daemons with unexpected command lines.
+        for port in DEFAULT_STREAM_PORT..=DEFAULT_STREAM_PORT + 10 {
+            let _ = std::process::Command::new("sh")
+                .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
+                .output();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        Self::new()
+    }
+
+    /// Allocate a unique stream port for the given session key.
+    /// Returns the existing port if already allocated, or assigns the next
+    /// available port in the range [DEFAULT_STREAM_PORT, MAX_STREAM_PORT].
+    ///
+    /// Does NOT check if the port is free — start_stream uses fuser -k to
+    /// reclaim ports occupied by stale daemons. A try-bind check here would
+    /// skip our own stale daemon's port, causing the agent-browser CLI to
+    /// reuse the stale daemon while BrowserPane connects to the wrong port.
+    pub async fn allocate_port(&self, session_key: &str) -> Result<u16, String> {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get(session_key) {
+
+            return Ok(s.port);
+        }
+
+        // Assign the next port from the counter, skipping ports owned by other sessions.
+        let range_size = MAX_STREAM_PORT - DEFAULT_STREAM_PORT + 1;
+        for _ in 0..range_size {
+            let port = self.next_port.fetch_add(1, Ordering::Relaxed);
+            // Wrap around if we've gone past the range
+            if port > MAX_STREAM_PORT {
+                self.next_port.store(DEFAULT_STREAM_PORT, Ordering::Relaxed);
+                continue;
+            }
+            // Check no other session already owns this port
+            if sessions.values().any(|s| s.port == port) {
+                continue;
+            }
+
+            sessions.insert(session_key.to_string(), StreamSession {
+                port,
+                running: false,
+            });
+            return Ok(port);
+        }
+        Err("All browser stream ports (9223-9299) are in use".to_string())
+    }
+
+    /// Return the port allocated for a session, if any.
+    pub async fn get_port(&self, session_key: &str) -> Option<u16> {
+        self.sessions.lock().await.get(session_key).map(|s| s.port)
+    }
+
+    /// Register an alias key for an already-allocated port.
+    /// Used so that both workspace_id and cli_session_name map to the same port.
+    pub async fn ensure_port(&self, session_key: &str, port: u16) {
+
+        let mut sessions = self.sessions.lock().await;
+        sessions.entry(session_key.to_string()).or_insert(StreamSession {
+            port,
+            running: false,
+        });
     }
 
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id);
         let bin = resolve_binary();
+        let port = self.allocate_port(browser_id).await?;
 
-        let mut running = self.running.lock().await;
-        if *running {
-            return Ok(());
+        {
+            let sessions = self.sessions.lock().await;
+            if sessions.get(browser_id).map_or(false, |s| s.running) {
+                return Ok(());
+            }
         }
 
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
-            .env("AGENT_BROWSER_STREAM_PORT", self.stream_port.to_string())
+            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
             .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
@@ -466,28 +553,35 @@ impl AgentBrowserManager {
             return Err(format!("Failed to start browser: {}", stderr));
         }
 
-        *running = true;
+        self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
         Ok(())
     }
 
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
-        execute_agent_browser_action(browser_id, action, params)
+        let port = self.allocate_port(browser_id).await?;
+        // Mark running BEFORE the blocking CLI call. The CLI auto-starts the
+        // daemon on first invocation, so it's effectively "running" as soon as
+        // we call it. Setting this early prevents a concurrent start_stream
+        // (from BrowserPane mounting) from killing the daemon mid-command.
+        self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
+        execute_agent_browser_action(browser_id, action, params, port)
     }
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id);
         let bin = resolve_binary();
+        let port = self.allocate_port(browser_id).await?;
 
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("{} screenshot --session {}", bin, session)])
-            .env("AGENT_BROWSER_STREAM_PORT", self.stream_port.to_string())
+            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
             .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to get screenshot: {}", e))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        
+
         // Parse the screenshot path from output like "Screenshot saved to /path/to/file.png"
         // Strip ANSI codes (escape sequences like \x1b[32m)
         let mut clean = String::new();
@@ -501,17 +595,17 @@ impl AgentBrowserManager {
                 clean.push(c);
             }
         }
-        
+
         if let Some(path_start) = clean.find("Screenshot saved to ") {
             let path = clean[path_start + 19..].trim();
-            
+
             // Read the file and convert to base64
             if let Ok(data) = std::fs::read(path) {
                 let base64 = base64_encode(&data);
                 return Ok(format!("data:image/png;base64,{}", base64));
             }
         }
-        
+
         Ok(clean)
     }
 
@@ -519,8 +613,12 @@ impl AgentBrowserManager {
         let session = session_name(browser_id);
         let bin = resolve_binary();
 
-        let mut running = self.running.lock().await;
-        *running = false;
+        // Kill the daemon on this session's port before closing
+        if let Some(s) = self.sessions.lock().await.remove(browser_id) {
+            let _ = std::process::Command::new("sh")
+                .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", s.port)])
+                .output();
+        }
 
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("{} close --session {}", bin, session)])
@@ -528,30 +626,46 @@ impl AgentBrowserManager {
         Ok(())
     }
 
-    pub fn get_stream_url(&self) -> String {
-        format!("ws://localhost:{}", self.stream_port)
-    }
-
     /// Start the browser session and return the WebSocket stream URL.
     ///
     /// With agent-browser v0.24.0+, the Rust daemon auto-starts on first
     /// command and streaming is enabled by default. We just need to:
-    /// 1. Set AGENT_BROWSER_STREAM_PORT so the daemon binds to our port
-    /// 2. Run any command to trigger daemon + browser launch
-    /// 3. Return the WebSocket URL
+    /// 1. Allocate a unique port for this session
+    /// 2. Set AGENT_BROWSER_STREAM_PORT so the daemon binds to our port
+    /// 3. Run any command to trigger daemon + browser launch
+    /// 4. Return the WebSocket URL
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
-        let port = self.stream_port;
         let session = session_name(browser_id);
         let bin = resolve_binary();
-        let mut running = self.running.lock().await;
 
-        // If we already started this daemon in this app session, reuse it.
-        if *running {
-            return Ok(format!("ws://localhost:{}", port));
+        // Serialize start_stream calls. The old code held a single Mutex<bool>
+        // across the entire operation (including sleeps). Without this, concurrent
+        // callers (React StrictMode double-mount, pane remount + agent action)
+        // both see running=false and race to start/kill the daemon.
+        let _start_guard = self.start_lock.lock().await;
+
+        // Re-check running under the start_lock — a prior call may have finished.
+        if let Some(port) = self.get_port(browser_id).await {
+            let sessions = self.sessions.lock().await;
+            if sessions.get(browser_id).map_or(false, |s| s.running) {
+
+                return Ok(format!("ws://localhost:{}", port));
+            }
         }
 
-        // Always kill stale daemons on this port — they may be from a
-        // previous app session with a different browser page/session.
+        // Close any stale daemon for this session name (from a previous app run)
+        // BEFORE allocating a port. Otherwise allocate_port's try-bind sees the
+        // stale daemon's port as occupied, skips it, and allocates a different port.
+        // The agent-browser CLI would then reuse the stale daemon (by session name)
+        // while BrowserPane connects to the newly allocated (empty) port.
+
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)])
+            .output();
+
+        let port = self.allocate_port(browser_id).await?;
+
+        // Kill any other process on the allocated port (non-agent-browser services).
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
             .output();
@@ -573,7 +687,7 @@ impl AgentBrowserManager {
 
         // Give the daemon a moment to start the WebSocket stream server.
         std::thread::sleep(std::time::Duration::from_millis(1000));
-        *running = true;
+        self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
 
         Ok(format!("ws://localhost:{}", port))
     }
@@ -645,5 +759,51 @@ mod tests {
         let result = build_agent_browser_command("s", "nonexistent_action", &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown action"));
+    }
+
+    #[tokio::test]
+    async fn two_sessions_get_different_ports() {
+        let mgr = AgentBrowserManager::new();
+        let p1 = mgr.allocate_port("workspace-a").await.unwrap();
+        let p2 = mgr.allocate_port("workspace-b").await.unwrap();
+        assert_ne!(p1, p2, "Two workspaces must get different ports");
+        assert!(p1 >= DEFAULT_STREAM_PORT && p1 <= MAX_STREAM_PORT);
+        assert!(p2 >= DEFAULT_STREAM_PORT && p2 <= MAX_STREAM_PORT);
+    }
+
+    #[tokio::test]
+    async fn allocate_port_is_idempotent() {
+        let mgr = AgentBrowserManager::new();
+        let p1 = mgr.allocate_port("workspace-x").await.unwrap();
+        let p2 = mgr.allocate_port("workspace-x").await.unwrap();
+        assert_eq!(p1, p2, "Same session key must return same port");
+    }
+
+    #[tokio::test]
+    async fn ports_never_collide() {
+        let mgr = AgentBrowserManager::new();
+        let mut ports = std::collections::HashSet::new();
+        // Allocate 10 sessions — all should get unique ports
+        for i in 0..10 {
+            let port = mgr.allocate_port(&format!("ws-{}", i)).await.unwrap();
+            assert!(
+                ports.insert(port),
+                "Port {} was already assigned to another session",
+                port,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn close_releases_session() {
+        let mgr = AgentBrowserManager::new();
+        let p = mgr.allocate_port("ws-close-test").await.unwrap();
+        assert!(mgr.get_port("ws-close-test").await.is_some());
+        let _ = mgr.close("ws-close-test").await;
+        assert!(mgr.get_port("ws-close-test").await.is_none(), "Session should be removed after close");
+        // Port range still works after release
+        let p2 = mgr.allocate_port("ws-close-test-2").await.unwrap();
+        assert!(p2 >= DEFAULT_STREAM_PORT && p2 <= MAX_STREAM_PORT);
+        assert_ne!(p, p2, "New allocation should skip the (possibly still in-use) released port");
     }
 }

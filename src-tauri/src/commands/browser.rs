@@ -138,13 +138,6 @@ pub async fn agent_browser_close(
 }
 
 #[tauri::command]
-pub fn agent_browser_get_stream_url(
-    manager: State<'_, AgentBrowserManager>,
-) -> Result<String, String> {
-    Ok(manager.get_stream_url())
-}
-
-#[tauri::command]
 pub async fn start_browser_stream(
     manager: State<'_, AgentBrowserManager>,
     browser_id: String,

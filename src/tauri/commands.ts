@@ -559,9 +559,6 @@ export const agentBrowserRun = (browserId: string, action: string, params: unkno
 export const agentBrowserClose = (browserId: string) =>
   invoke("agent_browser_close", { browserId });
 
-export const agentBrowserGetStreamUrl = () =>
-  invoke<string>("agent_browser_get_stream_url");
-
 export const agentBrowserScreenshot = (browserId: string) =>
   invoke<string>("agent_browser_screenshot", { browserId });
 

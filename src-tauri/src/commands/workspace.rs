@@ -554,15 +554,22 @@ pub fn close_workspace(
         crate::mcp_server::remove_mcp_config(Path::new(cwd));
     }
 
-    // Close agent browser CLI session for this workspace
-    if let Some(agent_session) = state.find_detached_agent_browser(&workspace_id) {
-        let cli_name = agent_session.cli_session_name.clone();
+    // Close agent browser CLI session for this workspace.
+    // Release port entries for both cli_session_name and workspace_id keys.
+    {
+        let cli_name = state.find_detached_agent_browser(&workspace_id)
+            .map(|s| s.cli_session_name.clone());
+        let ws_id = workspace_id.clone();
         let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
             let manager: State<'_, AgentBrowserManager> = app_handle.state();
-            if let Err(error) = manager.close(&cli_name).await {
-                eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
+            if let Some(cli) = cli_name {
+                if let Err(error) = manager.close(&cli).await {
+                    eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
+                }
             }
+            // Also remove the workspace_id port entry (may be a separate HashMap key).
+            let _ = manager.close(&ws_id).await;
         });
     }
 

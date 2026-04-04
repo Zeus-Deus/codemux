@@ -88,7 +88,7 @@ pub fn run() {
             }
         }))
         .manage(state::AppStateStore::default())
-        .manage(agent_browser::AgentBrowserManager::new())
+        .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
         .manage(openflow::OpenFlowRuntimeStore::default())
         .manage(openflow::AgentSessionStore::default())
@@ -483,7 +483,6 @@ pub fn run() {
             commands::agent_browser_spawn,
             commands::agent_browser_run,
             commands::agent_browser_close,
-            commands::agent_browser_get_stream_url,
             commands::agent_browser_screenshot,
             commands::start_browser_stream,
             commands::get_browser_data_size,
@@ -635,7 +634,7 @@ pub fn run() {
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
                 // Kill agent-browser daemons so they don't persist across restarts.
-                agent_browser::kill_stream_daemon();
+                agent_browser::kill_stream_daemons();
             }
         });
 }
