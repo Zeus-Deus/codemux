@@ -79,6 +79,14 @@ pub struct BrowserAutomationResult {
 /// Default stream port for the browser screencast WebSocket.
 pub const DEFAULT_STREAM_PORT: u16 = 9223;
 
+/// Kill any agent-browser daemon on our stream port.
+/// Called on app shutdown to prevent stale daemons across restarts.
+pub fn kill_stream_daemon() {
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", DEFAULT_STREAM_PORT)])
+        .output();
+}
+
 pub struct AgentBrowserManager {
     pub running: Arc<Mutex<bool>>,
     pub stream_port: u16,
@@ -340,7 +348,6 @@ fn make_request_id() -> String {
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
-    eprintln!("[BROWSER DEBUG] execute: action={} session={} cmd={}", action, session, &shell_cmd[..shell_cmd.len().min(200)]);
     let output = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
         .env("AGENT_BROWSER_STREAM_PORT", DEFAULT_STREAM_PORT.to_string())
@@ -536,30 +543,15 @@ impl AgentBrowserManager {
         let port = self.stream_port;
         let session = session_name(browser_id);
         let bin = resolve_binary();
-        eprintln!("[BROWSER DEBUG] start_stream: browser_id={} session={} port={} bin={}", browser_id, session, port, bin);
         let mut running = self.running.lock().await;
 
-        // Check if a daemon is actually listening on the stream port.
-        let port_alive = std::process::Command::new("sh")
-            .args(["-c", &format!("fuser {}/tcp 2>/dev/null", port)])
-            .output()
-            .map(|o| o.status.success() && !o.stdout.is_empty())
-            .unwrap_or(false);
-
-        if *running && port_alive {
+        // If we already started this daemon in this app session, reuse it.
+        if *running {
             return Ok(format!("ws://localhost:{}", port));
         }
 
-        // Daemon is alive but we didn't know — adopt it.
-        if port_alive && !*running {
-            *running = true;
-            return Ok(format!("ws://localhost:{}", port));
-        }
-
-        // Daemon died or never started — reset flag and (re)start.
-        *running = false;
-
-        // Kill any stale process on this port to avoid EADDRINUSE
+        // Always kill stale daemons on this port — they may be from a
+        // previous app session with a different browser page/session.
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
             .output();

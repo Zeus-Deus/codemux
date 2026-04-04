@@ -88,7 +88,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   // Only updates the URL bar display.
   useEffect(() => {
     const stateUrl = browserSession?.current_url;
-    console.log("[BROWSER DEBUG] URL effect: stateUrl=", stateUrl, "currentUrl=", currentUrl, "changed=", stateUrl !== currentUrl);
     if (stateUrl && stateUrl !== currentUrl) {
       setCurrentUrl(stateUrl);
     }
@@ -165,7 +164,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       frameCountRef.current = 0;
 
       const streamSessionId = browserSession?.agent_session_name ?? browserId;
-      console.log("[BROWSER DEBUG] startBrowserStream: streamSessionId=", streamSessionId, "browserId=", browserId, "agent_session_name=", browserSession?.agent_session_name);
 
       let streamUrl: string;
       try {
@@ -190,7 +188,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         if (!active) return;
         setStatus(retries === 0 ? "connecting" : "waiting");
 
-        console.log("[BROWSER DEBUG] connecting WS to:", streamUrl, "retry:", retries);
         ws = new WebSocket(streamUrl);
         wsRef.current = ws;
 
@@ -218,9 +215,6 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
             if (msg.type === "frame") {
               frameCountRef.current++;
               lastFrameTimeRef.current = Date.now();
-              if (frameCountRef.current <= 5 || frameCountRef.current % 20 === 0) {
-                console.log("[BROWSER DEBUG] frame #" + frameCountRef.current + " size=" + (msg.data?.length ?? 0));
-              }
               if (statusRef.current !== "live") {
                 setStatus("live");
                 // Skip navigation on reconnect — the agent's browser is already showing the right page.

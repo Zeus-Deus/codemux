@@ -630,6 +630,12 @@ pub fn run() {
             commands::reset_synced_settings,
             commands::get_package_format,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Kill agent-browser daemons so they don't persist across restarts.
+                agent_browser::kill_stream_daemon();
+            }
+        });
 }
