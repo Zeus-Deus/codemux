@@ -83,14 +83,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const currentUrlRef = useRef(currentUrl);
   currentUrlRef.current = currentUrl;
 
-  // Sync URL from state changes (e.g., browserOpenUrl called after mount)
+  // Sync URL display from state changes (agent navigation, browserOpenUrl).
+  // Does NOT re-navigate — the agent or CLI already performed the navigation.
+  // Only updates the URL bar display.
   useEffect(() => {
     const stateUrl = browserSession?.current_url;
     if (stateUrl && stateUrl !== currentUrl) {
       setCurrentUrl(stateUrl);
-      if (statusRef.current === "live") {
-        agentBrowserRun(effectiveSessionId, "open", { url: stateUrl }).catch(console.error);
-      }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [browserSession?.current_url]);
