@@ -60,6 +60,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const frameCountRef = useRef(0);
   const lastFrameTimeRef = useRef(0);
+  const lastInspectorMoveRef = useRef(0);
 
   // Read initial URL from browser session state (set by ports section or other callers)
   const browserSession = useAppStore(
@@ -409,6 +410,13 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     if (!inspectorActiveRef.current && e.buttons === 0) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // Throttle mouseMoved to 10/sec during inspector to avoid flooding
+    // the stream WebSocket with CDP events (causes frame starvation).
+    if (inspectorActiveRef.current) {
+      const now = Date.now();
+      if (now - lastInspectorMoveRef.current < 100) return;
+      lastInspectorMoveRef.current = now;
+    }
     const { x, y } = mapCoordinates(e, canvas, viewportRef.current, drawInfoRef.current);
     sendInput({
       type: "input_mouse",
