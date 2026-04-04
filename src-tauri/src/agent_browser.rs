@@ -172,7 +172,10 @@ fn extract_eval_result(stdout: &str) -> String {
 /// 4. npx fallback — always works if Node.js + npm are present
 fn resolve_binary() -> String {
     // 1. System PATH (AUR/system package, cargo install, manual install)
-    if let Ok(output) = std::process::Command::new("which").arg("agent-browser").output() {
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("agent-browser")
+        .output()
+    {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             // Skip the node_modules/.bin shim — we want the native binary directly
@@ -220,13 +223,24 @@ fn resolve_binary() -> String {
     }
 
     // 3. node_modules — dev mode (npm run tauri dev)
-    for base in &[
+    // Tauri runs from src-tauri/ but node_modules is at the project root.
+    // Check cwd, parent of cwd, and parent of exe for the npm binary.
+    let mut search_dirs = vec![
         std::env::current_dir().unwrap_or_default(),
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_default(),
-    ] {
+    ];
+    // Parent of cwd (project root when cwd is src-tauri/)
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(parent) = cwd.parent() {
+            search_dirs.push(parent.to_path_buf());
+        }
+    }
+    // Directory containing the executable
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_dirs.push(dir.to_path_buf());
+        }
+    }
+    for base in &search_dirs {
         let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
         if candidate.exists() {
             return candidate.to_string_lossy().to_string();
@@ -326,6 +340,7 @@ fn make_request_id() -> String {
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
+    eprintln!("[BROWSER DEBUG] execute: action={} session={} cmd={}", action, session, &shell_cmd[..shell_cmd.len().min(200)]);
     let output = std::process::Command::new("sh")
         .args(["-c", &shell_cmd])
         .env("AGENT_BROWSER_STREAM_PORT", DEFAULT_STREAM_PORT.to_string())
@@ -521,6 +536,7 @@ impl AgentBrowserManager {
         let port = self.stream_port;
         let session = session_name(browser_id);
         let bin = resolve_binary();
+        eprintln!("[BROWSER DEBUG] start_stream: browser_id={} session={} port={} bin={}", browser_id, session, port, bin);
         let mut running = self.running.lock().await;
 
         // Check if a daemon is actually listening on the stream port.

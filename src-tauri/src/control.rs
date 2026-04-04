@@ -384,6 +384,11 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
                 let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;
+                eprintln!(
+                    "[BROWSER DEBUG] dispatch: ws={} action={} session={} pane_id={:?} user_dismissed={} should_create={}",
+                    workspace_id, action_kind, agent_session.cli_session_name,
+                    agent_session.pane_id.as_ref().map(|p| &p.0), agent_session.user_dismissed, should_create
+                );
 
                 if should_create {
                     let target_pane_id = {
