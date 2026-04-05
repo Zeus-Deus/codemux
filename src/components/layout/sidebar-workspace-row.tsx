@@ -27,6 +27,7 @@ import {
   renameWorkspace,
   detectEditors,
   openInEditor,
+  runWorkspaceSetup,
 } from "@/tauri/commands";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
@@ -207,6 +208,11 @@ function WorkspaceContextMenuItems({
         disabled={!workspace.git_branch}
       >
         Copy branch name
+      </ContextMenuItem>
+      <ContextMenuItem
+        onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
+      >
+        Re-run Setup
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={onRemoveRequest}>

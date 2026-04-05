@@ -68,7 +68,35 @@ Commands have access to:
 | `CODEMUX_WORKSPACE_PATH` | Workspace/worktree directory path |
 | `CODEMUX_WORKSPACE_NAME` | Workspace title |
 | `CODEMUX_WORKSPACE_ID` | Workspace ID |
-| `COMPOSE_PROJECT_NAME` | Auto-set to project folder name (prevents Docker container collisions across worktrees) |
+| `CODEMUX_BRANCH` | Git branch name (when available) |
+| `CODEMUX_PORT` | Stable base port for this workspace (hash-derived from workspace ID in range 3100–6499, 10-port stride). Deterministic across re-runs and unaffected by other workspace creation/deletion. |
+
+### .codemuxinclude (Gitignored File Copy)
+
+A `.codemuxinclude` file in the project root (committed to git) specifies gitignored files that should be copied from the main worktree to new worktrees. Uses gitignore-style patterns.
+
+Example `.codemuxinclude`:
+```
+.env
+.env.*
+.claude/settings.local.json
+config/master.key
+```
+
+How it works:
+- On worktree creation (and re-run setup), Codemux runs `git ls-files --others --ignored --exclude-from=.codemuxinclude` in the main worktree
+- Matching files are copied (not symlinked) to the new worktree, preserving directory structure
+- This runs before setup commands, so setup scripts can reference the copied files
+
+### Re-run Setup
+
+Setup can be re-run on an existing workspace:
+- **Context menu**: Right-click workspace in sidebar > "Re-run Setup"
+- **Tauri command**: `run_workspace_setup(workspaceId)`
+- **Socket API**: `{"command": "rerun_setup", "workspace_id": "..."}`
+- **CLI**: `codemux workspace rerun-setup [workspace-id]`
+
+Re-run executes the full pipeline: `.codemuxinclude` file copy, then setup commands.
 
 ### Run Command Behavior
 
@@ -101,7 +129,9 @@ The "Configure" button opens Settings > Projects. Dismiss persists per-project.
 - Settings > Projects UI for configuring scripts without editing JSON
 - Sidebar setup banner prompting users to configure scripts
 - `Ctrl+Shift+G` keyboard shortcut and command palette entry for run command
-- `CODEMUX_WORKSPACE_PATH` and `COMPOSE_PROJECT_NAME` environment variables
+- `CODEMUX_WORKSPACE_PATH`, `CODEMUX_BRANCH`, `CODEMUX_PORT` environment variables
+- `.codemuxinclude` file for copying gitignored files to worktrees
+- Re-run setup via context menu, Tauri command, socket API, and CLI
 - DB-stored project scripts via `get_project_scripts` / `set_project_scripts` Tauri commands
 - Unit tests for config reading, git root resolution, worktree fallback, and DB roundtrip
 
@@ -110,15 +140,16 @@ The "Configure" button opens Settings > Projects. Dismiss persists per-project.
 - Sequential execution only (no parallel command execution)
 - No config merging (workspace-level config fully overrides repo-level config)
 - No timeout on individual commands (a hanging command blocks the setup thread)
-- No socket/CLI command to trigger setup or teardown externally
-- Setup runs once on creation; no automatic re-run on config file changes
+- Setup runs once on creation; no automatic re-run on config file changes (manual re-run available)
 
 ## Important Touch Points
 
 - `src-tauri/src/config/workspace_config.rs` — config struct, reader, git root resolver, `read_effective_config`
 - `src-tauri/src/database.rs` — `ProjectScripts` struct, DB get/set methods
-- `src-tauri/src/scripts.rs` — setup/teardown/run execution with events
+- `src-tauri/src/scripts.rs` — setup/teardown/run execution, `.codemuxinclude` processing, port allocation
 - `src-tauri/src/commands/workspace.rs` — lifecycle hooks, `run_project_dev_command`, Tauri commands
+- `src-tauri/src/control.rs` — `rerun_setup` socket command
+- `src-tauri/src/cli.rs` — `codemux workspace rerun-setup` CLI command
 - `src-tauri/src/commands/database.rs` — `get_project_scripts`, `set_project_scripts` commands
 - `src/components/settings/settings-view.tsx` — Projects section UI
 - `src/components/layout/sidebar-setup-banner.tsx` — setup prompt banner
@@ -131,5 +162,4 @@ The "Configure" button opens Settings > Projects. Dismiss persists per-project.
 - Commit `.codemux/config.json` to share setup with your team
 - Use shell scripts for complex logic: `{"setup": [".codemux/setup.sh"]}`
 - Setup failure does not prevent workspace use — the workspace is fully created, PTYs are running
-- `COMPOSE_PROJECT_NAME` prevents Docker container/volume collisions across worktrees
 - Use the Settings UI for personal scripts, `.codemux/config.json` for team-shared scripts

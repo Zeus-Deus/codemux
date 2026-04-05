@@ -10,6 +10,8 @@ pub struct WorkspaceConfig {
     pub teardown: Vec<String>,
     #[serde(default)]
     pub run: Option<String>,
+    #[serde(default)]
+    pub worktree_includes: Vec<String>,
 }
 
 /// Find the git repository root by walking up from `path`.
@@ -88,6 +90,7 @@ pub fn read_effective_config(
         setup: scripts.setup,
         teardown: scripts.teardown,
         run: scripts.run,
+        worktree_includes: scripts.worktree_includes,
     })
 }
 
@@ -249,6 +252,7 @@ mod tests {
             setup: vec!["db-setup-cmd".into()],
             teardown: vec!["db-teardown-cmd".into()],
             run: Some("db-run-cmd".into()),
+            ..Default::default()
         };
         let dir = tempfile::tempdir().unwrap();
         db.set_project_scripts(&dir.path().to_string_lossy(), &db_scripts)

@@ -225,6 +225,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
               setup,
               teardown,
               run: null,
+              worktree_includes: [],
             });
           }
         }

@@ -32,6 +32,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Auth system: `docs/features/auth.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
+- Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md`
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - MCP server: `docs/features/mcp-server.md`
@@ -48,7 +49,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Control and automation work: `docs/reference/CONTROL.md`
 - Docs cleanup and recovery work: `docs/reference/DOCS_REINDEX.md`
 - Agent behavior rules: `AGENTS.md`
-- Website docs: `docs/website/index.md` (workspaces, projects, terminal, agent status, settings, etc.)
+- Website docs: https://docs.codemux.org — source lives in ~/projects/codemux-sitev2/ (Next.js + Fumadocs). New doc pages go in the content/docs/ directory of that repo.
 
 ## Update Rules
 

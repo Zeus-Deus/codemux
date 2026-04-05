@@ -20,7 +20,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
     let branch_info = crate::git::git_branch_info(repo_path).ok();
@@ -979,6 +979,7 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 // ---- Setup/teardown scripts ----
 
 /// Spawn setup scripts in a background thread so workspace creation isn't blocked.
+/// Runs the full pipeline: .codemuxinclude file copy + setup commands.
 fn spawn_setup_scripts(
     app: &tauri::AppHandle,
     state: &AppStateStore,
@@ -986,27 +987,28 @@ fn spawn_setup_scripts(
     workspace_id: &str,
     workspace_path: &Path,
 ) {
-    // Pre-resolve config AND root path on the calling thread.
-    // The root path must be resolved here (not in the spawned thread) because
-    // find_git_root may race with worktree setup when called after the 500ms delay.
-    let config =
-        crate::config::workspace_config::read_effective_config(workspace_path, db);
-    let config = match config {
-        Some(c) if !c.setup.is_empty() => c,
-        _ => return,
-    };
-
+    // Pre-resolve root path on the calling thread to avoid race conditions.
     let root_path = crate::scripts::resolve_root_path(workspace_path);
 
-    let ws_title = {
+    let config =
+        crate::config::workspace_config::read_effective_config(workspace_path, db);
+    let setting_patterns = config
+        .as_ref()
+        .map(|c| c.worktree_includes.clone())
+        .unwrap_or_default();
+
+    let (ws_title, ws_branch) = {
         let snapshot = state.snapshot();
-        snapshot
+        let ws = snapshot
             .workspaces
             .iter()
-            .find(|w| w.workspace_id.0 == workspace_id)
-            .map(|w| w.title.clone())
-            .unwrap_or_default()
+            .find(|w| w.workspace_id.0 == workspace_id);
+        let title = ws.map(|w| w.title.clone()).unwrap_or_default();
+        let branch = ws.and_then(|w| w.git_branch.clone());
+        (title, branch)
     };
+    let port = crate::scripts::allocate_workspace_port(workspace_id);
+
     let ws_path = workspace_path.to_path_buf();
     let ws_id = workspace_id.to_string();
     let app2 = app.clone();
@@ -1014,10 +1016,34 @@ fn spawn_setup_scripts(
     std::thread::spawn(move || {
         // Wait for frontend to mount the overlay and register event listeners
         std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Err(e) = crate::scripts::run_setup_scripts_with_config(
-            &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
-        ) {
-            eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
+
+        // Step 1: Process worktree includes (file → setting → defaults)
+        match crate::scripts::process_worktree_includes(&root_path, &ws_path, &setting_patterns) {
+            Ok(result) => {
+                let _ = app2.emit(
+                    "worktree-includes-applied",
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "source": result.source,
+                        "copied": result.copied,
+                    }),
+                );
+            }
+            Err(e) => {
+                eprintln!("[codemux::scripts] worktree includes error for workspace {ws_id}: {e}");
+            }
+        }
+
+        // Step 2: Run setup commands
+        if let Some(config) = config {
+            if !config.setup.is_empty() {
+                if let Err(e) = crate::scripts::run_setup_scripts_with_config(
+                    &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
+                    ws_branch.as_deref(), Some(port),
+                ) {
+                    eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
+                }
+            }
         }
     });
 }
@@ -1028,22 +1054,32 @@ pub fn get_workspace_config(path: String) -> Option<WorkspaceConfig> {
 }
 
 #[tauri::command]
+pub fn has_codemuxinclude(path: String) -> bool {
+    let root = crate::scripts::resolve_root_path(Path::new(&path));
+    root.join(".codemuxinclude").exists()
+}
+
+#[tauri::command]
 pub fn run_workspace_setup(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
-    let (cwd, title) = {
+    let (cwd, title, branch) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-        (ws.cwd.clone(), ws.title.clone())
+        (ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone())
     };
-    crate::scripts::run_setup_scripts(Path::new(&cwd), &title, &workspace_id, &app, Some(&db))
+    let port = crate::scripts::allocate_workspace_port(&workspace_id);
+    crate::scripts::run_setup_scripts(
+        Path::new(&cwd), &title, &workspace_id, &app, Some(&db),
+        branch.as_deref(), Some(port),
+    )
 }
 
 #[tauri::command]

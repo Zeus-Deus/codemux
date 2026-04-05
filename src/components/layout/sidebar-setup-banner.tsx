@@ -98,7 +98,8 @@ export function SidebarSetupBanner() {
           </div>
           <p className="text-xs font-semibold text-foreground">Setup scripts</p>
           <p className="text-[11px] text-muted-foreground mt-0.5">
-            Automate workspace setup for {projectName}
+            Automate workspace setup for {projectName} with setup scripts
+            and <code className="font-mono text-[10px] bg-muted/50 px-0.5 rounded">.codemuxinclude</code>
           </p>
           <Button
             variant="outline"

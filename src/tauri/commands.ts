@@ -235,6 +235,9 @@ export const closeWorkspaceWithWorktree = (
 export const getWorkspaceConfig = (path: string) =>
   invoke<WorkspaceConfig | null>("get_workspace_config", { path });
 
+export const hasCodemuxinclude = (path: string) =>
+  invoke<boolean>("has_codemuxinclude", { path });
+
 export const runWorkspaceSetup = (workspaceId: string) =>
   invoke<void>("run_workspace_setup", { workspaceId });
 

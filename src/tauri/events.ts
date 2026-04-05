@@ -59,6 +59,17 @@ export const onWorkspaceSetupFailed = (
 ): Promise<UnlistenFn> =>
   listen<WorkspaceSetupFailed>("workspace-setup-failed", (e) => cb(e.payload));
 
+export interface WorktreeIncludesApplied {
+  workspace_id: string;
+  source: "file" | "setting" | "defaults";
+  copied: string[];
+}
+
+export const onWorktreeIncludesApplied = (
+  cb: EventCallback<WorktreeIncludesApplied>,
+): Promise<UnlistenFn> =>
+  listen<WorktreeIncludesApplied>("worktree-includes-applied", (e) => cb(e.payload));
+
 export const onOpenflowCycle = (
   cb: EventCallback<OrchestratorTriggerResult>,
 ): Promise<UnlistenFn> =>

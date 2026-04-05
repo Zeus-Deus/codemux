@@ -68,6 +68,7 @@ import {
   getProjectScripts,
   setProjectScripts,
   getWorkspaceConfig,
+  hasCodemuxinclude,
   getBrowserDataSize,
   clearBrowserCookies,
   clearAllBrowserData,
@@ -572,7 +573,9 @@ export function SettingsView() {
   const [setupScripts, setSetupScripts] = useState("");
   const [teardownScripts, setTeardownScripts] = useState("");
   const [runCommand, setRunCommand] = useState("");
+  const [worktreeIncludes, setWorktreeIncludes] = useState("");
   const [hasConfigFile, setHasConfigFile] = useState(false);
+  const [hasIncludeFile, setHasIncludeFile] = useState(false);
 
   const setDefaultEditor = (v: string) => {
     updateSyncedSetting("editor", "default_ide", v).catch(console.error);
@@ -597,23 +600,27 @@ export function SettingsView() {
         setSetupScripts(scripts.setup.join("\n"));
         setTeardownScripts(scripts.teardown.join("\n"));
         setRunCommand(scripts.run ?? "");
+        setWorktreeIncludes(scripts.worktree_includes.join("\n"));
       } else {
         setSetupScripts("");
         setTeardownScripts("");
         setRunCommand("");
+        setWorktreeIncludes("");
       }
     }).catch(console.error);
     getWorkspaceConfig(projectRoot).then((config) => {
       setHasConfigFile(config !== null);
     }).catch(console.error);
+    hasCodemuxinclude(projectRoot).then(setHasIncludeFile).catch(() => setHasIncludeFile(false));
   }, [activeSection, projectRoot]);
 
-  const saveProjectScripts = (setup: string, teardown: string, run: string) => {
+  const saveProjectSettings = () => {
     if (!projectRoot) return;
     setProjectScripts(projectRoot, {
-      setup: setup.trim() ? setup.trim().split("\n").filter((l) => l.trim()) : [],
-      teardown: teardown.trim() ? teardown.trim().split("\n").filter((l) => l.trim()) : [],
-      run: run.trim() || null,
+      setup: setupScripts.trim() ? setupScripts.trim().split("\n").filter((l) => l.trim()) : [],
+      teardown: teardownScripts.trim() ? teardownScripts.trim().split("\n").filter((l) => l.trim()) : [],
+      run: runCommand.trim() || null,
+      worktree_includes: worktreeIncludes.trim() ? worktreeIncludes.trim().split("\n").filter((l) => l.trim()) : [],
     }).catch(console.error);
   };
 
@@ -1070,6 +1077,31 @@ export function SettingsView() {
             )}
             <div className="space-y-6">
               <div>
+                <label className="text-sm font-medium">Worktree Includes</label>
+                <p className="text-sm text-muted-foreground mb-2">
+                  Files matching these patterns are copied from the main project into new worktrees. One pattern per line.
+                </p>
+                {hasIncludeFile && (
+                  <div className="mb-2 rounded-md border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+                    This project has a <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.codemuxinclude</code> file — those patterns take priority over settings below.
+                  </div>
+                )}
+                <Textarea
+                  className="font-mono text-sm min-h-[80px]"
+                  placeholder={".env\n.env.*\n.env.local"}
+                  value={worktreeIncludes}
+                  onChange={(e) => setWorktreeIncludes(e.target.value)}
+                  onBlur={saveProjectSettings}
+                />
+                <p className="text-xs text-muted-foreground mt-1.5">
+                  Create a <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.codemuxinclude</code> file
+                  in your project root to share patterns with your team.
+                  When empty, defaults to <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
+                  <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground">Learn more</a>
+                </p>
+              </div>
+              <Separator />
+              <div>
                 <label className="text-sm font-medium">Setup</label>
                 <p className="text-sm text-muted-foreground mb-2">
                   Runs when a new workspace is created. One command per line.
@@ -1079,7 +1111,7 @@ export function SettingsView() {
                   placeholder="e.g. npm install"
                   value={setupScripts}
                   onChange={(e) => setSetupScripts(e.target.value)}
-                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                  onBlur={saveProjectSettings}
                 />
               </div>
               <div>
@@ -1092,7 +1124,7 @@ export function SettingsView() {
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
                   onChange={(e) => setTeardownScripts(e.target.value)}
-                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                  onBlur={saveProjectSettings}
                 />
               </div>
               <div>
@@ -1105,7 +1137,7 @@ export function SettingsView() {
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   onChange={(e) => setRunCommand(e.target.value)}
-                  onBlur={() => saveProjectScripts(setupScripts, teardownScripts, runCommand)}
+                  onBlur={saveProjectSettings}
                 />
               </div>
               <Separator />
@@ -1113,16 +1145,10 @@ export function SettingsView() {
                 <p className="font-medium text-foreground">Environment variables</p>
                 <p><code className="font-mono text-xs">$CODEMUX_ROOT_PATH</code> — main repo root</p>
                 <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_PATH</code> — workspace/worktree directory</p>
-                <p><code className="font-mono text-xs">$COMPOSE_PROJECT_NAME</code> — auto-set to project folder name</p>
+                <p><code className="font-mono text-xs">$CODEMUX_BRANCH</code> — workspace branch name</p>
+                <p><code className="font-mono text-xs">$CODEMUX_PORT</code> — allocated port for this workspace</p>
                 <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_NAME</code> — workspace title</p>
                 <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_ID</code> — workspace ID</p>
-              </div>
-              <div className="rounded-md border border-border bg-muted/50 px-4 py-3 text-sm text-muted-foreground">
-                <p className="font-medium text-foreground mb-1">Docker Compose with worktrees</p>
-                <p>
-                  Codemux automatically sets <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">COMPOSE_PROJECT_NAME</code> to
-                  your project folder name so all worktrees share the same Docker containers and volumes.
-                </p>
               </div>
             </div>
           </div>

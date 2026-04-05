@@ -3,6 +3,8 @@ import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { AppShell } from "@/components/layout/app-shell";
+import { Toaster } from "@/components/ui/sonner";
+import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
@@ -31,7 +33,13 @@ function App() {
     return <LoginScreen />;
   }
 
-  return <AppShell />;
+  return (
+    <>
+      <AppShell />
+      <UpdateToast />
+      <Toaster />
+    </>
+  );
 }
 
 export default App;

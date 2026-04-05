@@ -36,6 +36,8 @@ pub struct ProjectScripts {
     pub teardown: Vec<String>,
     #[serde(default)]
     pub run: Option<String>,
+    #[serde(default)]
+    pub worktree_includes: Vec<String>,
 }
 
 fn database_path() -> Option<PathBuf> {
@@ -1055,6 +1057,7 @@ mod tests {
             setup: vec!["npm install".into(), "cp .env.example .env".into()],
             teardown: vec!["docker compose down".into()],
             run: Some("npm run dev".into()),
+            ..Default::default()
         };
         db.set_project_scripts("/home/user/my-project", &scripts)
             .unwrap();
@@ -1079,6 +1082,7 @@ mod tests {
             setup: vec!["npm install".into()],
             teardown: vec![],
             run: None,
+            ..Default::default()
         };
         db.set_project_scripts("/project", &scripts).unwrap();
 
@@ -1086,6 +1090,7 @@ mod tests {
             setup: vec!["yarn install".into()],
             teardown: vec!["echo bye".into()],
             run: Some("yarn dev".into()),
+            ..Default::default()
         };
         db.set_project_scripts("/project", &updated).unwrap();
 

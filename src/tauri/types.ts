@@ -678,12 +678,14 @@ export interface WorkspaceConfig {
   setup: string[];
   teardown: string[];
   run: string | null;
+  worktree_includes: string[];
 }
 
 export interface ProjectScripts {
   setup: string[];
   teardown: string[];
   run: string | null;
+  worktree_includes: string[];
 }
 
 export interface DetectedSetup {

@@ -97,7 +97,7 @@ Codemux registers hooks in `~/.claude/settings.json` on startup to track Claude 
 - `Stop` — Agent finished
 - `PermissionRequest` — Agent needs input
 
-The hooks call `~/.codemux/hooks/notify.sh`, which sends an HTTP request to Codemux's local hook server. This powers the [agent status indicators](docs/website/agent-status.md) (amber/red/green dots in the sidebar and tab bar).
+The hooks call `~/.codemux/hooks/notify.sh`, which sends an HTTP request to Codemux's local hook server. This powers the agent status indicators (amber/red/green dots in the sidebar and tab bar).
 
 **If you see Claude Code settings errors**, check `~/.claude/settings.json` for Codemux entries under the `hooks` key. Codemux only modifies the `hooks` section and preserves all other settings.
 
@@ -111,6 +111,7 @@ The hooks are safe when Codemux isn't running — the notification script checks
 4. When asked to "test in browser" or "check the website", use `codemux browser open <url>`
 5. Get a snapshot before interacting so you know what elements exist
 6. Use explicit selectors — don't guess element presence
+7. **Never** write website/marketing documentation in this repo — the public docs site (https://docs.codemux.org) lives in `~/projects/codemux-sitev2/` (Next.js + Fumadocs). New or updated doc pages go in `content/docs/` of that repo as `.mdx` files.
 
 ## Discovering Commands
 

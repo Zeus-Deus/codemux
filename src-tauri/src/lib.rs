@@ -608,6 +608,7 @@ pub fn run() {
             commands::set_preset_bar_visible,
             commands::apply_preset,
             commands::get_workspace_config,
+            commands::has_codemuxinclude,
             commands::run_workspace_setup,
             commands::run_project_dev_command,
             commands::list_directory,
