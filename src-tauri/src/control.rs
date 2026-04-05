@@ -654,6 +654,29 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 })
             })
         }
+        "rerun_setup" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| state.active_workspace_cwd().map(|(id, _)| id))
+                .ok_or_else(|| "No workspace_id and no active workspace".to_string());
+            workspace_id.and_then(|ws_id| {
+                let (cwd, title, branch) = {
+                    let snapshot = state.snapshot();
+                    let ws = snapshot.workspaces.iter()
+                        .find(|w| w.workspace_id.0 == ws_id)
+                        .ok_or_else(|| format!("No workspace found for {ws_id}"))?;
+                    Ok::<_, String>((ws.cwd.clone(), ws.title.clone(), ws.git_branch.clone()))
+                }?;
+                let port = crate::scripts::allocate_workspace_port(&ws_id);
+                crate::scripts::run_setup_scripts(
+                    std::path::Path::new(&cwd), &title, &ws_id, app, Some(&db),
+                    branch.as_deref(), Some(port),
+                )?;
+                Ok(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
+            })
+        }
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 

@@ -33,10 +33,24 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: IssueCommand,
     },
+    /// Workspace operations
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
+    },
     /// List all available codemux commands and capabilities
     Capabilities,
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
+}
+
+#[derive(Subcommand)]
+pub enum WorkspaceCommand {
+    /// Re-run setup scripts (.codemuxinclude + setup commands) for a workspace
+    RerunSetup {
+        /// Workspace ID (defaults to active workspace)
+        workspace_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -437,6 +451,25 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
             Ok(true)
         }
+        Some(CommandSet::Workspace { command }) => {
+            let response = match command {
+                WorkspaceCommand::RerunSetup { workspace_id } => {
+                    let mut params = json!({});
+                    if let Some(id) = workspace_id {
+                        params["workspace_id"] = json!(id);
+                    } else if let Ok(id) = std::env::var("CODEMUX_WORKSPACE_ID") {
+                        params["workspace_id"] = json!(id);
+                    }
+                    send_control_request(ControlRequest {
+                        command: "rerun_setup".into(),
+                        params,
+                    })
+                    .await?
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
+            Ok(true)
+        }
         Some(CommandSet::Mcp) => {
             crate::mcp_server::run_mcp_server().await?;
             Ok(true)
@@ -479,6 +512,12 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                             "list": { "args": "[--search <query>]", "description": "List open issues for the current workspace's repo" },
                             "view": { "args": "<number>", "description": "View a specific GitHub issue" },
                             "link": { "args": "<number>", "description": "Link a GitHub issue to the active workspace" }
+                        }
+                    },
+                    "workspace": {
+                        "description": "Workspace operations",
+                        "subcommands": {
+                            "rerun-setup": { "args": "[workspace-id]", "description": "Re-run setup (.codemuxinclude + scripts) for a workspace" }
                         }
                     },
                     "status": { "description": "Show Codemux app status" },
