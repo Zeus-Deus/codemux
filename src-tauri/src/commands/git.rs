@@ -66,6 +66,30 @@ pub fn git_fetch_changes(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn git_fetch_prune(path: String) -> Result<(), String> {
+    use std::time::Duration;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("git")
+            .args(["fetch", "--prune"])
+            .current_dir(&path)
+            .output(),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(format!("git fetch --prune failed: {}", stderr.trim()))
+        }
+        Ok(Err(e)) => Err(format!("Failed to run git fetch: {e}")),
+        Err(_) => Err("git fetch timed out after 10 seconds".to_string()),
+    }
+}
+
+#[tauri::command]
 pub fn git_stash_push(path: String, include_untracked: bool) -> Result<(), String> {
     crate::git::git_stash_push(Path::new(&path), include_untracked)
 }

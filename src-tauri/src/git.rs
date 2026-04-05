@@ -1139,6 +1139,27 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
     Ok(branches)
 }
 
+/// Find the remote tracking ref for a branch (e.g. `origin/main` for `main`).
+/// Returns `None` if no remote ref exists. Only checks `origin` remote
+/// (consistent with the rest of the codebase).
+pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
+    // Already a remote or absolute ref — return as-is
+    if branch.starts_with("origin/") || branch.starts_with("refs/") {
+        return Some(branch.to_string());
+    }
+    let remote_ref = format!("origin/{branch}");
+    if run_git(
+        repo_path,
+        &["rev-parse", "--verify", &format!("refs/remotes/{remote_ref}")],
+    )
+    .is_ok()
+    {
+        Some(remote_ref)
+    } else {
+        None
+    }
+}
+
 pub fn git_create_worktree(
     repo_path: &Path,
     branch: &str,
@@ -1169,13 +1190,25 @@ pub fn git_create_worktree(
     let path_str = worktree_path.to_string_lossy().to_string();
 
     if new_branch {
+        // Resolve base: prefer origin/<base> so new branches start from the
+        // latest remote commit, not a potentially stale local ref.
+        let resolved_base = base.map(|b| find_remote_ref(repo_path, b).unwrap_or_else(|| b.to_string()));
         let mut args = vec!["worktree", "add", "-b", branch, &path_str];
-        if let Some(b) = base {
-            args.push(b);
+        if let Some(ref b) = resolved_base {
+            args.push(b.as_str());
         }
         run_git(repo_path, &args)?;
     } else {
-        run_git(repo_path, &["worktree", "add", &path_str, branch])?;
+        // Open existing branch: if the branch has a remote counterpart, use -B
+        // to reset the local branch to the remote tip, avoiding stale checkouts.
+        if let Some(remote_ref) = find_remote_ref(repo_path, branch) {
+            run_git(
+                repo_path,
+                &["worktree", "add", "-B", branch, &path_str, &remote_ref],
+            )?;
+        } else {
+            run_git(repo_path, &["worktree", "add", &path_str, branch])?;
+        }
     }
 
     Ok(path_str)
@@ -3456,5 +3489,159 @@ C  source.txt -> copy.txt";
         let content =
             std::fs::read_to_string(main_git.join("info/exclude")).unwrap();
         assert!(content.contains(".codemux"));
+    }
+
+    // ---- find_remote_ref / worktree ref resolution tests ----
+
+    #[test]
+    fn test_find_remote_ref_returns_none_for_local_only() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["branch", "local-only"]).expect("create branch");
+        assert!(find_remote_ref(&repo, "local-only").is_none());
+    }
+
+    #[test]
+    fn test_find_remote_ref_returns_origin_for_remote_branch() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+        // Push a branch to origin
+        run_git(&local, &["checkout", "-b", "feat-remote"]).expect("create branch");
+        std::fs::write(local.join("feat.txt"), "content").expect("write");
+        run_git(&local, &["add", "feat.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "feat"],
+        ).expect("commit");
+        run_git(&local, &["push", "-u", "origin", "feat-remote"]).expect("push");
+
+        let result = find_remote_ref(&local, "feat-remote");
+        assert_eq!(result, Some("origin/feat-remote".to_string()));
+    }
+
+    #[test]
+    fn test_find_remote_ref_passthrough_already_prefixed() {
+        let (_dir, repo) = setup_test_repo();
+        // Already has origin/ prefix — return as-is (even if ref doesn't exist)
+        let result = find_remote_ref(&repo, "origin/some-branch");
+        assert_eq!(result, Some("origin/some-branch".to_string()));
+    }
+
+    #[test]
+    fn test_find_remote_ref_branch_with_slashes() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+        run_git(&local, &["checkout", "-b", "feature/auth/oauth"]).expect("create branch");
+        std::fs::write(local.join("oauth.txt"), "content").expect("write");
+        run_git(&local, &["add", "oauth.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "oauth"],
+        ).expect("commit");
+        run_git(&local, &["push", "-u", "origin", "feature/auth/oauth"]).expect("push");
+
+        let result = find_remote_ref(&local, "feature/auth/oauth");
+        assert_eq!(result, Some("origin/feature/auth/oauth".to_string()));
+    }
+
+    #[test]
+    fn test_worktree_new_branch_uses_remote_base() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Advance origin/master by pushing from a second clone-like setup:
+        // just push a new commit on master directly
+        run_git(&local, &["checkout", "-b", "dev-base"]).expect("create base");
+        std::fs::write(local.join("base.txt"), "base content").expect("write");
+        run_git(&local, &["add", "base.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "base"],
+        ).expect("commit");
+        run_git(&local, &["push", "-u", "origin", "dev-base"]).expect("push");
+
+        // Go back to default branch
+        let _ = run_git(&local, &["checkout", "master"])
+            .or_else(|_| run_git(&local, &["checkout", "main"]));
+
+        // Create worktree with dev-base as base — should resolve to origin/dev-base
+        let wt = git_create_worktree(&local, "from-dev", true, Some("dev-base"))
+            .expect("create worktree");
+        // The worktree should have base.txt (from origin/dev-base)
+        assert!(PathBuf::from(&wt).join("base.txt").exists(), "should inherit from remote base");
+        git_remove_worktree(Path::new(&wt), Some("from-dev"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_new_branch_local_only_base_works() {
+        let (_dir, repo) = setup_test_repo();
+        // Create a local-only base branch
+        run_git(&repo, &["checkout", "-b", "local-base"]).expect("create base");
+        std::fs::write(repo.join("local.txt"), "local").expect("write");
+        run_git(&repo, &["add", "local.txt"]).expect("add");
+        run_git(
+            &repo,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "local"],
+        ).expect("commit");
+        let _ = run_git(&repo, &["checkout", "master"])
+            .or_else(|_| run_git(&repo, &["checkout", "main"]));
+
+        let wt = git_create_worktree(&repo, "from-local", true, Some("local-base"))
+            .expect("create worktree");
+        assert!(PathBuf::from(&wt).join("local.txt").exists(), "should inherit from local base");
+        git_remove_worktree(Path::new(&wt), Some("from-local"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_open_existing_prefers_remote_ref() {
+        let (_dir, local, remote) = setup_test_repo_with_remote();
+
+        // Create branch and push it
+        run_git(&local, &["checkout", "-b", "stale-branch"]).expect("create branch");
+        std::fs::write(local.join("v1.txt"), "v1").expect("write v1");
+        run_git(&local, &["add", "v1.txt"]).expect("add");
+        run_git(
+            &local,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "v1"],
+        ).expect("commit v1");
+        run_git(&local, &["push", "-u", "origin", "stale-branch"]).expect("push");
+
+        // Simulate remote advancing: push a new commit from a separate clone
+        let tmp = TempDir::new().expect("tmp");
+        let clone2 = tmp.path().join("clone2");
+        run_git(
+            tmp.path(),
+            &["clone", remote.to_str().unwrap(), clone2.to_str().unwrap()],
+        ).expect("clone2");
+        run_git(&clone2, &["checkout", "stale-branch"]).expect("checkout");
+        std::fs::write(clone2.join("v2.txt"), "v2").expect("write v2");
+        run_git(&clone2, &["add", "v2.txt"]).expect("add");
+        run_git(
+            &clone2,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "v2"],
+        ).expect("commit v2");
+        run_git(&clone2, &["push"]).expect("push v2");
+
+        // Fetch in original repo so origin/stale-branch is updated but local is behind
+        run_git(&local, &["fetch"]).expect("fetch");
+        let _ = run_git(&local, &["checkout", "master"])
+            .or_else(|_| run_git(&local, &["checkout", "main"]));
+
+        // Open existing: should get v2.txt from origin/stale-branch
+        let wt = git_create_worktree(&local, "stale-branch", false, None)
+            .expect("create worktree");
+        assert!(
+            PathBuf::from(&wt).join("v2.txt").exists(),
+            "worktree should have remote's v2.txt, not stale local"
+        );
+        git_remove_worktree(Path::new(&wt), Some("stale-branch"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_open_existing_local_only_works() {
+        let (_dir, repo) = setup_test_repo();
+        run_git(&repo, &["branch", "local-feat"]).expect("create branch");
+
+        let wt = git_create_worktree(&repo, "local-feat", false, None)
+            .expect("create worktree");
+        let info = git_branch_info(Path::new(&wt)).expect("branch info");
+        assert_eq!(info.branch.as_deref(), Some("local-feat"));
+        git_remove_worktree(Path::new(&wt), Some("local-feat"), true).expect("cleanup");
     }
 }

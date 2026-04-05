@@ -13,6 +13,7 @@ vi.mock("@/tauri/commands", () => ({
   listBranches: vi.fn().mockResolvedValue([]),
   listBranchesDetailed: vi.fn().mockResolvedValue([]),
   checkIsGitRepo: vi.fn().mockResolvedValue(true),
+  gitFetchPrune: vi.fn().mockResolvedValue(undefined),
   listWorktrees: vi.fn().mockResolvedValue([]),
   getGitBranchInfo: vi
     .fn()
@@ -68,6 +69,7 @@ vi.mock("@/tauri/commands", () => ({
 import {
   listBranches,
   checkIsGitRepo,
+  gitFetchPrune,
   createWorktreeWorkspace,
   activateWorkspace,
   generateBranchName,
@@ -490,5 +492,54 @@ describe("buildPromptWithIssueContext", () => {
     const noLabels = { ...issue, labels: [] as string[] };
     const result = buildPromptWithIssueContext("task", noLabels, "body");
     expect(result).not.toContain("Labels:");
+  });
+});
+
+// ── Fetch before branch listing tests ──
+
+describe("Fetch before branch listing", () => {
+  it("calls gitFetchPrune before listing branches", async () => {
+    setAppState("/path/to/project");
+    (listBranches as Mock).mockResolvedValue(["main"]);
+
+    renderDialog(true);
+
+    await waitFor(() => {
+      expect(gitFetchPrune).toHaveBeenCalledWith("/path/to/project");
+    });
+
+    // Branches should still be listed after fetch
+    await waitFor(() => {
+      expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
+      expect(listBranches).toHaveBeenCalledWith("/path/to/project", true);
+    });
+  });
+
+  it("still lists branches when fetch fails (no network)", async () => {
+    setAppState("/path/to/project");
+    (gitFetchPrune as Mock).mockRejectedValue(new Error("network error"));
+    (listBranches as Mock).mockResolvedValue(["main", "dev"]);
+
+    renderDialog(true);
+
+    // Even though fetch failed, branches should load from local refs
+    await waitFor(() => {
+      expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
+      expect(listBranches).toHaveBeenCalledWith("/path/to/project", true);
+    });
+  });
+
+  it("still lists branches when fetch times out", async () => {
+    setAppState("/path/to/project");
+    (gitFetchPrune as Mock).mockRejectedValue(
+      new Error("git fetch timed out after 10 seconds"),
+    );
+    (listBranches as Mock).mockResolvedValue(["main"]);
+
+    renderDialog(true);
+
+    await waitFor(() => {
+      expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
+    });
   });
 });

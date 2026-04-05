@@ -427,6 +427,9 @@ export const gitPullChanges = (path: string) =>
 export const gitFetchChanges = (path: string) =>
   invoke("git_fetch_changes", { path });
 
+export const gitFetchPrune = (path: string) =>
+  invoke("git_fetch_prune", { path });
+
 export const gitStashPush = (path: string, includeUntracked: boolean) =>
   invoke("git_stash_push", { path, includeUntracked });
 

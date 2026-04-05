@@ -468,6 +468,7 @@ pub fn run() {
             commands::reorder_tabs,
             commands::git_pull_changes,
             commands::git_fetch_changes,
+            commands::git_fetch_prune,
             commands::git_stash_push,
             commands::git_stash_pop,
             commands::get_commit_files,

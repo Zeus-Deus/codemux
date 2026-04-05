@@ -40,6 +40,7 @@ import {
   listBranchesDetailed,
   listWorktrees,
   getGitBranchInfo,
+  gitFetchPrune,
   createWorkspace,
   createWorktreeWorkspace,
   importWorktreeWorkspace,
@@ -179,25 +180,32 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       setIsGitRepo(isRepo);
       if (!isRepo) { setBranchesLoading(false); return; }
 
-      Promise.all([
-        listBranches(projectDir, false).catch(() => []),
-        listBranches(projectDir, true).catch(() => []),
-        listBranchesDetailed(projectDir).catch(() => []),
-        listWorktrees(projectDir).catch(() => []),
-        getGitBranchInfo(projectDir).catch(() => ({
-          branch: null,
-          ahead: 0,
-          behind: 0,
-        })),
-      ]).then(([local, remote, detailed, wt, info]) => {
+      // Fetch remote refs first so branch list and commits are current.
+      // Fail gracefully — stale local refs are still usable.
+      const fetchDone = gitFetchPrune(projectDir).catch(() => {});
+
+      fetchDone.then(() => {
         if (cancelled) return;
-        setLocalBranches(local);
-        setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
-        setDetailedBranches(detailed);
-        setBranchesLoading(false);
-        setWorktrees(wt);
-        setCurrentBranch(info.branch);
-        setBaseBranch(info.branch ?? "main");
+        return Promise.all([
+          listBranches(projectDir, false).catch(() => []),
+          listBranches(projectDir, true).catch(() => []),
+          listBranchesDetailed(projectDir).catch(() => []),
+          listWorktrees(projectDir).catch(() => []),
+          getGitBranchInfo(projectDir).catch(() => ({
+            branch: null,
+            ahead: 0,
+            behind: 0,
+          })),
+        ]).then(([local, remote, detailed, wt, info]) => {
+          if (cancelled) return;
+          setLocalBranches(local);
+          setRemoteBranches(remote.map((b) => b.replace(/^origin\//, "")));
+          setDetailedBranches(detailed);
+          setBranchesLoading(false);
+          setWorktrees(wt);
+          setCurrentBranch(info.branch);
+          setBaseBranch(info.branch ?? "main");
+        });
       });
 
       // Fetch open PRs for branch badges and "+" menu (non-blocking)
