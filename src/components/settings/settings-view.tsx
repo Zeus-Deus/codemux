@@ -904,6 +904,13 @@ export function SettingsView() {
               )}
             </div>
 
+            <p className="text-xs text-muted-foreground mt-3 px-1">
+              Agents in Codemux terminals automatically receive workspace context.{" "}
+              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground transition-colors">
+                Learn how to configure it for your tools
+              </a>
+            </p>
+
             {/* Editor sheet — renders via portal, not inline */}
             <PresetEditorSheet
               preset={selectedPreset}
