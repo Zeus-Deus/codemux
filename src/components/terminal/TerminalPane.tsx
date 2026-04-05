@@ -4,6 +4,15 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
+import {
+  KITTY_FUNCTIONAL_KEYS,
+  BACKSPACE_CODEPOINT,
+  csiUModifier,
+  csiUSequence,
+  scanKittySequences,
+  applyKittyStack,
+  kittyFlags,
+} from "@/lib/kitty-keyboard";
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
@@ -114,6 +123,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
+  const kittyStackRef = useRef<number[]>([]);
   const kittyLevelRef = useRef(0);
   const pendingPtyWrites = useRef<Uint8Array[]>([]);
   const ptyWriteFrameRef = useRef<number | null>(null);
@@ -144,17 +154,26 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         ? data
         : ptyDecoderRef.current.decode(data);
 
-    // nvim and other apps send \x1b[?u to query Kitty keyboard protocol support.
-    // We do NOT respond — responding \x1b[?0u causes nvim to enter Kitty mode,
-    // but xterm.js doesn't encode keys in Kitty format, breaking all input.
-    // The push/pop tracking below is kept for future Kitty support.
+    const scan = scanKittySequences(str);
 
-    const pushes = (str.match(/\x1b\[>[0-9]+u/g) ?? []).length;
-    const pops = (str.match(/\x1b\[<u/g) ?? []).length;
-    kittyLevelRef.current = Math.max(
-      0,
-      kittyLevelRef.current + pushes - pops,
+    // Respond to Kitty keyboard protocol query (\x1b[?u) with current flags.
+    // Apps (Claude Code, nvim, etc.) send this to check if the terminal
+    // supports enhanced key reporting before pushing Kitty mode.
+    if (scan.hasQuery) {
+      writeToPty(
+        sessionIdRef.current,
+        `\x1b[?${kittyFlags(kittyStackRef.current)}u`,
+      ).catch(console.error);
+    }
+
+    // Apply push/pop/reset. DA query from a new shell resets stale state.
+    kittyStackRef.current = applyKittyStack(
+      kittyStackRef.current,
+      scan.pushValues,
+      scan.popCount,
+      scan.hasDAQuery,
     );
+    kittyLevelRef.current = kittyFlags(kittyStackRef.current);
   }, []);
 
   // ── PTY output batching ──
@@ -275,6 +294,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
     termRef.current = term;
     fitAddonRef.current = fitAddon;
+    kittyStackRef.current = [];
     kittyLevelRef.current = 0;
 
     // ── Custom key handler ──
@@ -295,16 +315,29 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
           return true; // let the key pass through to the terminal
         }
       }
-      // Shift+Enter
-      if (ev.shiftKey && ev.key === "Enter") {
-        if (kittyLevelRef.current > 0) {
-          if (ev.type === "keydown") {
-            writeToPty(sid, "\x1b[13;2u").catch(console.error);
+      // App-level shortcuts — must fire BEFORE CSI u encoding so that
+      // Ctrl+K (command palette) etc. are never sent to the terminal.
+      if (isAppShortcut(ev)) return false;
+      // Modern terminals unconditionally send CSI u for modified
+      // functional keys (Enter, Tab, Space). This lets CLI apps like
+      // Claude Code distinguish Shift+Enter from Enter without
+      // requiring Kitty protocol negotiation.
+      // Backspace is only CSI-u-encoded when Kitty mode is active so
+      // that backward-kill-word (Ctrl+Backspace → \x17) still works
+      // in plain shells.
+      {
+        const codepoint = KITTY_FUNCTIONAL_KEYS.get(ev.key);
+        const mod = csiUModifier(ev);
+        if (codepoint !== undefined && mod > 1) {
+          const isBackspace = codepoint === BACKSPACE_CODEPOINT;
+          if (!isBackspace || kittyLevelRef.current > 0) {
+            if (ev.type === "keydown") {
+              writeToPty(sid, csiUSequence(codepoint, mod)).catch(console.error);
+            }
+            ev.preventDefault?.();
+            return false;
           }
-          ev.preventDefault?.();
-          return false;
         }
-        return true;
       }
       // Terminal-level shortcuts (resolved from keybind registry)
       const overrides = useSyncedSettingsStore.getState().settings.keyboard.shortcuts;
@@ -338,8 +371,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         ev.preventDefault?.();
         return false;
       }
-      // App-level shortcuts — let them bubble to window handlers
-      if (isAppShortcut(ev)) return false;
       return true;
     });
 
@@ -484,6 +515,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       window.removeEventListener("resize", windowResize);
 
       fitAddonRef.current = null;
+      kittyStackRef.current = [];
       kittyLevelRef.current = 0;
       term.dispose();
       termRef.current = null;

@@ -524,6 +524,8 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     // desktop shortcut (no parent terminal) lose ANSI color output.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "codemux");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
     let snapshot = app_state.snapshot();
     let active_workspace_id = snapshot.active_workspace_id.0.clone();
@@ -1158,6 +1160,8 @@ pub fn spawn_pty_for_agent(
     // Declare terminal capabilities (see spawn_pty_for_session for rationale).
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    cmd.env("TERM_PROGRAM", "codemux");
+    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
     // Standard Codemux env vars.
     cmd.env("CODEMUX", "1");
