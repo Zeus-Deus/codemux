@@ -59,6 +59,7 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
+- Feature docs exist for all major subsystems: auth, browser, changes panel, file editor, GitHub issues, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, search, settings sync, setup-teardown, terminal, worktree setup
 
 ## React Frontend Status
 
@@ -95,4 +96,4 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (browser, openflow, mcp-server, file-editor, merge-resolver, changes-panel, pr-integration, search, notifications, auth, settings-sync, setup-teardown)
+- `docs/features/*` for subsystem detail (auth, browser, changes-panel, file-editor, github-issues, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, search, settings-sync, setup-teardown, terminal, worktree-setup)

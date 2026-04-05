@@ -38,7 +38,7 @@ Rust owns the durable app domain and runtime integration.
 - OpenFlow runtime: `src-tauri/src/openflow/`
 - socket control server: `src-tauri/src/control.rs`
 - CLI entrypoint: `src-tauri/src/cli.rs`
-- browser runtimes: `src-tauri/src/agent_browser.rs`, `src-tauri/src/browser.rs`
+- browser runtime: `src-tauri/src/agent_browser.rs` (agent-browser v0.24.0, pure Rust, direct CDP)
 - Tauri command modules: `src-tauri/src/commands/`
 
 ## Command Surface
@@ -64,13 +64,13 @@ Workspace and browser socket commands are routed through the same Rust helper im
 
 ## Browser Architecture
 
-The current canonical browser path is `agent-browser`.
+The canonical browser path is `agent-browser` v0.24.0 (pure Rust, direct CDP).
 
 - visible browser pane control uses `agent_browser_*` commands
 - CLI browser commands use the same `agent-browser` execution helpers
 - socket `browser_automation` uses the `AgentBrowserManager`
 
-`src-tauri/src/browser.rs` still exists as the legacy Chromium/CDP-backed runtime. It is kept as an internal alternate path, but it is not the primary browser path used by the current pane UI.
+The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
 
 ## Auth & Settings Sync
 

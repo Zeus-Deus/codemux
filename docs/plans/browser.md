@@ -23,9 +23,9 @@
 
 - `src/components/browser/BrowserPane.tsx`
 - `src/components/browser/BrowserToolbar.tsx`
+- `src/components/browser/InspectorPanel.tsx`
 - `src/stores/app-store.ts`
 - `src-tauri/src/agent_browser.rs`
-- `src-tauri/src/browser.rs`
 - `src-tauri/src/cli.rs`
 - `src-tauri/src/commands/browser.rs`
 - `docs/reference/CONTROL.md`
@@ -33,7 +33,10 @@
 
 ## Already Landed
 
-- `agent-browser`-backed browser session exists
-- CLI browser commands exist
-- the visible pane and CLI share session state
-- the browser pane works well enough for agent-guided validation
+- `agent-browser` v0.24.0 (pure Rust, direct CDP) — Playwright/Node.js path removed
+- stealth Chromium flags and realistic user-agent spoofing
+- per-workspace browser sessions with dynamic stream ports (9223-9299)
+- browser reconnection on pane recreation
+- CLI browser commands sharing the same session
+- browser data management in Settings (clear cookies, clear all data)
+- inspector panel for web content debugging
