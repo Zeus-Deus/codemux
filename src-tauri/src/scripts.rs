@@ -34,8 +34,9 @@ struct SetupComplete {
     workspace_id: String,
 }
 
-/// Build the common environment variables for setup/teardown/run scripts.
-fn script_env(
+/// Build the common environment variables for setup/teardown/run scripts
+/// and terminal PTY sessions.
+pub fn script_env(
     workspace_path: &Path,
     root_path: &Path,
     branch: Option<&str>,

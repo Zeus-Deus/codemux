@@ -427,6 +427,41 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Build worktree environment variables and dynamic agent context for a PTY session.
+/// Used by both `spawn_pty_for_session()` and `spawn_pty_for_agent()` to ensure
+/// consistent env var injection across user shells and agent processes.
+fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, String)> {
+    let root = ws.project_root.clone().unwrap_or_else(|| {
+        crate::scripts::resolve_root_path(std::path::Path::new(&ws.cwd))
+            .to_string_lossy()
+            .to_string()
+    });
+    let port = crate::scripts::allocate_workspace_port(&ws.workspace_id.0);
+
+    let mut vars: Vec<(String, String)> = crate::scripts::script_env(
+        std::path::Path::new(&ws.cwd),
+        std::path::Path::new(&root),
+        ws.git_branch.as_deref(),
+        Some(port),
+    )
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+
+    vars.push(("CODEMUX_WORKSPACE_NAME".to_string(), ws.title.clone()));
+    vars.push((
+        "CODEMUX_AGENT_CONTEXT".to_string(),
+        crate::agent_context::build_agent_context(
+            Some(&ws.title),
+            ws.worktree_path.as_deref(),
+            ws.git_branch.as_deref(),
+            Some(&root),
+        ),
+    ));
+
+    vars
+}
+
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
@@ -492,14 +527,30 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     let snapshot = app_state.snapshot();
     let active_workspace_id = snapshot.active_workspace_id.0.clone();
+    let active_ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == active_workspace_id);
+
     cmd.env("CODEMUX", "1");
     cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
-    cmd.env("CODEMUX_WORKSPACE_ID", active_workspace_id);
+    cmd.env("CODEMUX_WORKSPACE_ID", &active_workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
     cmd.env("CODEMUX_SESSION_ID", session_id.clone());
     cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
     cmd.env("BROWSER", "codemux browser open");
-    cmd.env("CODEMUX_AGENT_CONTEXT", crate::agent_context::CODEMUX_AGENT_CONTEXT);
+
+    // Worktree environment variables and dynamic agent context
+    if let Some(ws) = active_ws {
+        for (key, val) in workspace_pty_env(ws) {
+            cmd.env(&key, val);
+        }
+    } else {
+        cmd.env(
+            "CODEMUX_AGENT_CONTEXT",
+            crate::agent_context::build_agent_context(None, None, None, None),
+        );
+    }
 
     // Inject pane ID and hook server port for agent status notifications
     if let Some(pane_id) = snapshot.workspaces.iter().find_map(|ws| {
@@ -1115,7 +1166,25 @@ pub fn spawn_pty_for_agent(
     cmd.env("CODEMUX_SURFACE_ID", &session_id);
     cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
     cmd.env("BROWSER", "codemux browser open");
-    cmd.env("CODEMUX_AGENT_CONTEXT", crate::agent_context::CODEMUX_AGENT_CONTEXT);
+
+    // Worktree environment variables and dynamic agent context
+    {
+        let ws_snapshot = app_state.snapshot();
+        if let Some(ws) = ws_snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            for (key, val) in workspace_pty_env(ws) {
+                cmd.env(&key, val);
+            }
+        } else {
+            cmd.env(
+                "CODEMUX_AGENT_CONTEXT",
+                crate::agent_context::build_agent_context(None, None, None, None),
+            );
+        }
+    }
 
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
@@ -1676,5 +1745,155 @@ mod tests {
         // to see EOF and exit.
         drop(writer);
         reader_handle.join().expect("reader thread panicked");
+    }
+
+    // -- workspace_pty_env tests -------------------------------------------------
+
+    fn test_workspace(
+        id: &str,
+        title: &str,
+        cwd: &str,
+        git_branch: Option<&str>,
+        worktree_path: Option<&str>,
+        project_root: Option<&str>,
+    ) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId(id.to_string()),
+            title: title.to_string(),
+            workspace_type: WorkspaceType::Standard,
+            cwd: cwd.to_string(),
+            git_branch: git_branch.map(String::from),
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: None,
+            worktree_path: worktree_path.map(String::from),
+            project_root: project_root.map(String::from),
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            tabs: Vec::new(),
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: Vec::new(),
+        }
+    }
+
+    fn env_map(ws: &crate::state::WorkspaceSnapshot) -> std::collections::HashMap<String, String> {
+        workspace_pty_env(ws).into_iter().collect()
+    }
+
+    #[test]
+    fn pty_env_sets_worktree_vars() {
+        let ws = test_workspace(
+            "ws-123",
+            "my-feature",
+            "/home/user/.codemux/worktrees/repo/my-feature",
+            Some("feat/my-feature"),
+            Some("/home/user/.codemux/worktrees/repo/my-feature"),
+            Some("/home/user/projects/repo"),
+        );
+        let m = env_map(&ws);
+
+        assert_eq!(m["CODEMUX_ROOT_PATH"], "/home/user/projects/repo");
+        assert_eq!(
+            m["CODEMUX_WORKSPACE_PATH"],
+            "/home/user/.codemux/worktrees/repo/my-feature"
+        );
+        assert_eq!(m["CODEMUX_BRANCH"], "feat/my-feature");
+        assert!(m.contains_key("CODEMUX_PORT"));
+        assert_eq!(m["CODEMUX_WORKSPACE_NAME"], "my-feature");
+    }
+
+    #[test]
+    fn pty_env_omits_branch_when_none() {
+        let ws = test_workspace(
+            "ws-456",
+            "main",
+            "/home/user/projects/repo",
+            None,
+            None,
+            Some("/home/user/projects/repo"),
+        );
+        let m = env_map(&ws);
+
+        assert!(!m.contains_key("CODEMUX_BRANCH"));
+        assert_eq!(m["CODEMUX_ROOT_PATH"], "/home/user/projects/repo");
+        assert_eq!(m["CODEMUX_WORKSPACE_PATH"], "/home/user/projects/repo");
+    }
+
+    #[test]
+    fn pty_env_resolves_root_from_cwd_when_project_root_missing() {
+        // When project_root is None, resolve_root_path falls back to cwd
+        // if no .git directory is found.
+        let ws = test_workspace("ws-789", "test-ws", "/tmp/no-git-here", None, None, None);
+        let m = env_map(&ws);
+
+        assert_eq!(m["CODEMUX_ROOT_PATH"], "/tmp/no-git-here");
+    }
+
+    #[test]
+    fn pty_env_port_is_deterministic() {
+        let ws1 = test_workspace("ws-abc", "ws", "/tmp", None, None, None);
+        let ws2 = test_workspace("ws-abc", "ws", "/tmp", None, None, None);
+        let m1 = env_map(&ws1);
+        let m2 = env_map(&ws2);
+
+        assert_eq!(m1["CODEMUX_PORT"], m2["CODEMUX_PORT"]);
+    }
+
+    #[test]
+    fn pty_env_agent_context_contains_workspace_info() {
+        let ws = test_workspace(
+            "ws-123",
+            "analyze-db",
+            "/home/zeus/.codemux/worktrees/proj/analyze-db",
+            Some("analyze-db"),
+            Some("/home/zeus/.codemux/worktrees/proj/analyze-db"),
+            Some("/home/zeus/projects/proj"),
+        );
+        let m = env_map(&ws);
+        let ctx = &m["CODEMUX_AGENT_CONTEXT"];
+
+        assert!(ctx.contains("Your workspace: analyze-db"));
+        assert!(ctx.contains("Your worktree: /home/zeus/.codemux/worktrees/proj/analyze-db"));
+        assert!(ctx.contains("Your branch: analyze-db"));
+        assert!(ctx.contains("Main repo root: /home/zeus/projects/proj"));
+        assert!(ctx.contains("Do NOT create additional git worktrees"));
+    }
+
+    #[test]
+    fn pty_env_agent_context_omits_worktree_when_not_worktree() {
+        let ws = test_workspace(
+            "ws-456",
+            "main",
+            "/home/user/projects/repo",
+            Some("main"),
+            None,
+            Some("/home/user/projects/repo"),
+        );
+        let m = env_map(&ws);
+        let ctx = &m["CODEMUX_AGENT_CONTEXT"];
+
+        assert!(ctx.contains("Your workspace: main"));
+        assert!(!ctx.contains("Your worktree:"));
+        assert!(ctx.contains("Your branch: main"));
+        assert!(ctx.contains("codemux browser"));
+    }
+
+    #[test]
+    fn pty_env_always_includes_agent_context() {
+        // Even with minimal workspace info, CODEMUX_AGENT_CONTEXT is present
+        let ws = test_workspace("ws-min", "ws", "/tmp", None, None, None);
+        let m = env_map(&ws);
+
+        assert!(m.contains_key("CODEMUX_AGENT_CONTEXT"));
+        assert!(m["CODEMUX_AGENT_CONTEXT"].contains("Codemux"));
+        assert!(m["CODEMUX_AGENT_CONTEXT"].contains("codemux browser"));
     }
 }
