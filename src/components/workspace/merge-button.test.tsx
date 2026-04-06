@@ -38,6 +38,12 @@ const mockListBranches = vi.fn().mockResolvedValue(["main", "develop"]);
 const mockCheckClaudeAvailable = vi.fn().mockResolvedValue(false);
 const mockContinueMerge = vi.fn().mockResolvedValue(undefined);
 const mockAbortMerge = vi.fn().mockResolvedValue(undefined);
+const mockMergeIntoBase = vi.fn().mockResolvedValue({ status: "merged", source_branch: "feat/my-feature", temp_branch: null, conflicted_files: [] });
+const mockCompleteMergeIntoBase = vi.fn().mockResolvedValue(undefined);
+const mockAbortMergeIntoBase = vi.fn().mockResolvedValue(undefined);
+const mockActivateWorkspace = vi.fn().mockResolvedValue(undefined);
+const mockCloseWorkspace = vi.fn().mockResolvedValue("ws-1");
+const mockCreateWorkspace = vi.fn().mockResolvedValue("ws-new");
 
 vi.mock("@/tauri/commands", () => ({
   getGitStatus: (...args: unknown[]) => mockGetGitStatus(...args),
@@ -63,6 +69,16 @@ vi.mock("@/tauri/commands", () => ({
   getBaseBranchDiff: (...args: unknown[]) => mockGetBaseBranchDiff(...args),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
   listBranches: (...args: unknown[]) => mockListBranches(...args),
+  mergeIntoBase: (...args: unknown[]) => mockMergeIntoBase(...args),
+  completeMergeIntoBase: (...args: unknown[]) => mockCompleteMergeIntoBase(...args),
+  abortMergeIntoBase: (...args: unknown[]) => mockAbortMergeIntoBase(...args),
+  activateWorkspace: (...args: unknown[]) => mockActivateWorkspace(...args),
+  closeWorkspace: (...args: unknown[]) => mockCloseWorkspace(...args),
+  createWorkspace: (...args: unknown[]) => mockCreateWorkspace(...args),
+  gitFetchChanges: vi.fn().mockResolvedValue(undefined),
+  gitStashPush: vi.fn().mockResolvedValue(undefined),
+  gitStashPop: vi.fn().mockResolvedValue(undefined),
+  getCommitFiles: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/stores/diff-store", () => ({
@@ -76,11 +92,21 @@ vi.mock("@/stores/diff-store", () => ({
   }),
 }));
 
+let mockAppStoreState: Record<string, unknown> = {
+  appState: {
+    config: { ai_commit_message_enabled: false },
+    workspaces: [],
+  },
+};
+
 vi.mock("@/stores/app-store", () => ({
   useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) => {
-    const state = { appState: { config: { ai_commit_message_enabled: false } } };
-    return selector(state);
+    return selector(mockAppStoreState);
   }),
+}));
+
+vi.mock("@/lib/toast", () => ({
+  toast: { success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }));
 
 vi.mock("@/stores/ai-commit-store", () => ({
@@ -109,6 +135,7 @@ vi.mock("@/stores/ai-merge-store", () => ({
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { ChangesPanel } from "./changes-panel";
+import { toast as mockToast } from "@/lib/toast";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 function flushPromises() {
@@ -175,6 +202,12 @@ beforeEach(() => {
   mockGetDefaultBranch.mockResolvedValue("main");
   mockListBranches.mockResolvedValue(["main", "develop"]);
   mockCheckClaudeAvailable.mockResolvedValue(false);
+  mockAppStoreState = {
+    appState: {
+      config: { ai_commit_message_enabled: false },
+      workspaces: [],
+    },
+  };
 });
 
 describe("Merge button in Against section", () => {
@@ -403,5 +436,267 @@ describe("Against section and merge button visibility on base branch", () => {
     await flushPromises();
 
     expect(screen.getByText("Against main")).toBeInTheDocument();
+  });
+});
+
+// ── Post-merge workspace cleanup tests ──
+
+const mainWorkspace = {
+  workspace_id: "ws-main",
+  title: "Main",
+  workspace_type: "standard" as const,
+  cwd: "/home/user/project",
+  git_branch: "main",
+  git_ahead: 0,
+  git_behind: 0,
+  git_additions: 0,
+  git_deletions: 0,
+  git_changed_files: 0,
+  notification_count: 0,
+  latest_agent_state: null,
+  worktree_path: null,
+  project_root: "/home/user/project",
+  pr_number: null,
+  pr_state: null,
+  pr_url: null,
+  linked_issue: null,
+  tabs: [],
+  active_tab_id: "tab-1",
+  active_surface_id: "surface-1",
+  surfaces: [],
+};
+
+/** Open the "Merge into base" dialog, check "Delete branch", and confirm. */
+async function triggerMergeIntoBaseWithDelete(user: ReturnType<typeof userEvent.setup>) {
+  // Find the ArrowUpToLine button (merge-into icon) in the Against section
+  const mergeIntoBtn = document.querySelector(".lucide-arrow-up-to-line")?.closest("button");
+  expect(mergeIntoBtn).toBeTruthy();
+  await user.click(mergeIntoBtn!);
+
+  // Dialog should appear — check the "Delete branch" checkbox
+  const checkbox = await screen.findByRole("checkbox");
+  await user.click(checkbox);
+
+  // Click the confirm button in the dialog
+  const confirmBtn = screen.getByRole("button", { name: /Merge into main/ });
+  await user.click(confirmBtn);
+}
+
+/** Open the "Merge into base" dialog and confirm WITHOUT checking delete. */
+async function triggerMergeIntoBaseNoDelete(user: ReturnType<typeof userEvent.setup>) {
+  const mergeIntoBtn = document.querySelector(".lucide-arrow-up-to-line")?.closest("button");
+  expect(mergeIntoBtn).toBeTruthy();
+  await user.click(mergeIntoBtn!);
+
+  // Do NOT check the delete checkbox — just confirm
+  const confirmBtn = await screen.findByRole("button", { name: /Merge into main/ });
+  await user.click(confirmBtn);
+}
+
+describe("Post-merge workspace cleanup", () => {
+  it("after merge+delete, activates main workspace if exists", async () => {
+    const user = userEvent.setup();
+
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        workspaces: [mockWorkspace, mainWorkspace],
+      },
+    };
+
+    mockMergeIntoBase.mockResolvedValue({
+      status: "merged",
+      source_branch: "feat/my-feature",
+      temp_branch: null,
+      conflicted_files: [],
+    });
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseWithDelete(user);
+
+    await waitFor(() => {
+      expect(mockMergeIntoBase).toHaveBeenCalledWith("/home/user/project", "main", true);
+    });
+
+    await waitFor(() => {
+      expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-main");
+    });
+
+    await waitFor(() => {
+      expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-1", false);
+    });
+
+    expect(mockToast.success).toHaveBeenCalledWith(
+      expect.stringContaining("Merged into main"),
+    );
+  });
+
+  it("after merge+delete, creates main workspace if none exists", async () => {
+    const user = userEvent.setup();
+
+    // Only the feature workspace exists — no main workspace
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        workspaces: [mockWorkspace],
+      },
+    };
+
+    mockMergeIntoBase.mockResolvedValue({
+      status: "merged",
+      source_branch: "feat/my-feature",
+      temp_branch: null,
+      conflicted_files: [],
+    });
+    mockCreateWorkspace.mockResolvedValue("ws-created");
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseWithDelete(user);
+
+    await waitFor(() => {
+      expect(mockCreateWorkspace).toHaveBeenCalledWith("/home/user/project");
+    });
+
+    await waitFor(() => {
+      expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-created");
+    });
+  });
+
+  it("after merge without delete, stays on feature workspace", async () => {
+    const user = userEvent.setup();
+
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        workspaces: [mockWorkspace, mainWorkspace],
+      },
+    };
+
+    mockMergeIntoBase.mockResolvedValue({
+      status: "merged",
+      source_branch: "feat/my-feature",
+      temp_branch: null,
+      conflicted_files: [],
+    });
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseNoDelete(user);
+
+    await waitFor(() => {
+      expect(mockMergeIntoBase).toHaveBeenCalledWith("/home/user/project", "main", false);
+    });
+
+    // Should NOT activate or close any workspace
+    expect(mockActivateWorkspace).not.toHaveBeenCalled();
+    expect(mockCloseWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("after merge+delete, handles createWorkspace failure gracefully", async () => {
+    const user = userEvent.setup();
+
+    // No main workspace — force createWorkspace path
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        workspaces: [mockWorkspace],
+      },
+    };
+
+    mockMergeIntoBase.mockResolvedValue({
+      status: "merged",
+      source_branch: "feat/my-feature",
+      temp_branch: null,
+      conflicted_files: [],
+    });
+    mockCreateWorkspace.mockRejectedValue("disk full");
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseWithDelete(user);
+
+    await waitFor(() => {
+      expect(mockToast.error).toHaveBeenCalledWith(
+        expect.stringContaining("Could not create workspace"),
+      );
+    });
+
+    // Feature workspace should NOT be closed (fallback to detached HEAD)
+    expect(mockCloseWorkspace).not.toHaveBeenCalled();
+    expect(mockActivateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("after conflict resolution+delete, same cleanup flow", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        workspaces: [mockWorkspace, mainWorkspace],
+      },
+    };
+
+    // Merge returns conflicts
+    mockMergeIntoBase.mockResolvedValue({
+      status: "conflicts",
+      source_branch: "feat/my-feature",
+      temp_branch: "merge/feat-my-feature-into-main-123",
+      conflicted_files: [{ path: "shared.txt", conflict_type: "both_modified" }],
+    });
+
+    // Start with is_merging: false so the button is enabled,
+    // then switch to true after merge is triggered (simulates temp branch merge state)
+    let mergeTriggered = false;
+    mockGetMergeState.mockImplementation(() => {
+      if (!mergeTriggered) {
+        return Promise.resolve({ is_merging: false, is_rebasing: false, merge_head: null, conflicted_files: [] });
+      }
+      return Promise.resolve({ is_merging: true, is_rebasing: false, merge_head: "abc", conflicted_files: [] });
+    });
+
+    // No conflicted files in working tree (conflicts already resolved)
+    mockGetGitStatus.mockResolvedValue([]);
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseWithDelete(user);
+
+    await waitFor(() => {
+      expect(mockMergeIntoBase).toHaveBeenCalled();
+    });
+
+    // Now merge is triggered — getMergeState should return is_merging: true
+    mergeTriggered = true;
+
+    // Advance timer to trigger poll cycle → re-fetch merge state → isMerging becomes true
+    await act(async () => { vi.advanceTimersByTime(11000); });
+    await flushPromises();
+
+    // Banner: isMerging + mergeIntoBaseState + no conflicts → "Complete Merge" button
+    const completeBtn = await screen.findByText(/Complete Merge into main/);
+    await user.click(completeBtn);
+
+    await waitFor(() => {
+      expect(mockCompleteMergeIntoBase).toHaveBeenCalledWith(
+        "/home/user/project",
+        "main",
+        "merge/feat-my-feature-into-main-123",
+        "feat/my-feature",
+        true,
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-main");
+    });
+
+    await waitFor(() => {
+      expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-1", false);
+    });
+
+    vi.useRealTimers();
   });
 });
