@@ -41,6 +41,7 @@ import {
   UserCircle,
   LogOut,
   Globe,
+  RotateCcw,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -85,7 +86,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "browser" | "shortcuts" | "notifications";
+type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -110,6 +111,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "git", label: "Git", icon: GitBranch },
       { id: "agent", label: "Agent", icon: Bot },
       { id: "browser", label: "Browser", icon: Globe },
+      { id: "session_restore", label: "Session Restore", icon: RotateCcw },
     ],
   },
 ];
@@ -1192,6 +1194,61 @@ export function SettingsView() {
                     // TODO: wire to actual desktop notification system when implemented
                     updateSyncedSetting("notifications", "desktop_enabled", checked).catch(console.error);
                   }}
+                />
+              </SettingRow>
+            </div>
+          </div>
+        );
+
+      case "session_restore":
+        return (
+          <div>
+            <SectionHeader
+              title="Session Restore"
+              description="Restore terminal scrollback and agent sessions when reopening Codemux."
+            />
+            <div className="space-y-1">
+              <SettingRow
+                label="Enable session restore"
+                description="Save and restore terminal scrollback across app restarts."
+              >
+                <Switch
+                  checked={syncedSettings.session_restore.enabled}
+                  onCheckedChange={(checked) => {
+                    updateSyncedSetting("session_restore", "enabled", checked).catch(console.error);
+                  }}
+                />
+              </SettingRow>
+              <Separator />
+              <SettingRow
+                label="Scrollback lines"
+                description={`${syncedSettings.session_restore.scrollback_lines.toLocaleString()} lines saved per terminal pane.`}
+              >
+                <Slider
+                  value={[syncedSettings.session_restore.scrollback_lines]}
+                  onValueChange={([v]) => {
+                    updateSyncedSetting("session_restore", "scrollback_lines", v).catch(console.error);
+                  }}
+                  min={1000}
+                  max={50000}
+                  step={1000}
+                  className="w-36"
+                />
+              </SettingRow>
+              <Separator />
+              <SettingRow
+                label="Max disk usage"
+                description={`${syncedSettings.session_restore.max_total_mb} MB maximum for all saved scrollback.`}
+              >
+                <Slider
+                  value={[syncedSettings.session_restore.max_total_mb]}
+                  onValueChange={([v]) => {
+                    updateSyncedSetting("session_restore", "max_total_mb", v).catch(console.error);
+                  }}
+                  min={10}
+                  max={500}
+                  step={10}
+                  className="w-36"
                 />
               </SettingRow>
             </div>

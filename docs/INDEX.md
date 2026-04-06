@@ -43,6 +43,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system: `docs/features/terminal.md`
 - Terminal presets: `docs/features/presets.md`
+- Session persistence: `docs/features/session-persistence.md`
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Notifications: `docs/features/notifications.md`

@@ -735,6 +735,61 @@ export const attachPtyOutput = (
 export const getTerminalStatus = (sessionId: string) =>
   invoke<TerminalStatusPayload>("get_terminal_status", { sessionId });
 
+// ── Session Restore ──
+
+export interface ScrollbackPayload {
+  pane_id: string;
+  session_id: string;
+  workspace_id: string;
+  working_directory: string;
+  original_command: string | null;
+  cols: number;
+  rows: number;
+  data: string;
+  adapter_captures: Record<string, string>;
+  adapter_id: string | null;
+  alternate_buffer: boolean;
+}
+
+export interface ScrollbackMeta {
+  pane_id: string;
+  session_id: string;
+  workspace_id: string;
+  working_directory: string;
+  original_command: string | null;
+  cols: number;
+  rows: number;
+  adapter_captures: Record<string, string>;
+  adapter_id: string | null;
+  alternate_buffer: boolean;
+  saved_at: number;
+}
+
+export interface ScrollbackRestore {
+  data: string;
+  meta: ScrollbackMeta;
+}
+
+export const saveTerminalScrollback = (payload: ScrollbackPayload) =>
+  invoke("save_terminal_scrollback", { payload });
+
+export const getTerminalScrollback = (workspaceId: string, paneId: string) =>
+  invoke<ScrollbackRestore | null>("get_terminal_scrollback", { workspaceId, paneId });
+
+export const cacheTerminalScrollback = (payload: ScrollbackPayload) =>
+  invoke("cache_terminal_scrollback", { payload });
+
+export const uncacheTerminalScrollback = (sessionId: string) =>
+  invoke("uncache_terminal_scrollback", { sessionId });
+
+export const flushScrollbackCache = () =>
+  invoke<number>("flush_scrollback_cache");
+
+// ── Debug ──
+
+export const debugLog = (message: string) =>
+  invoke("debug_log", { message }).catch(() => {});
+
 // ── Search / Files ──
 
 export const searchInFiles = (

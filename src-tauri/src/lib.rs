@@ -1,4 +1,4 @@
-use tauri::Manager;
+use tauri::{Emitter, Listener, Manager};
 
 pub mod agent_context;
 pub mod ai;
@@ -24,11 +24,51 @@ pub mod ports;
 pub mod presets;
 pub mod project;
 pub mod scripts;
+pub mod scrollback;
+pub mod session_adapters;
 pub mod settings_sync;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
+
+/// Save window dimensions and position to SQLite before close.
+fn save_window_state(handle: &tauri::AppHandle) {
+    let db: tauri::State<'_, database::DatabaseStore> = handle.state();
+    if let Some(w) = handle.get_webview_window("main") {
+        let sf = w.scale_factor().unwrap_or(1.0);
+
+        if let Ok(size) = w.outer_size() {
+            let lw = size.width as f64 / sf;
+            let lh = size.height as f64 / sf;
+
+            let fills_monitor = w
+                .current_monitor()
+                .ok()
+                .flatten()
+                .map_or(false, |m| {
+                    let mw = m.size().width as f64 / sf;
+                    let mh = m.size().height as f64 / sf;
+                    lw + 100.0 >= mw && lh + 100.0 >= mh
+                });
+
+            if fills_monitor {
+                db.delete_ui_state("window_width").ok();
+                db.delete_ui_state("window_height").ok();
+            } else {
+                db.set_ui_state("window_width", &lw.to_string()).ok();
+                db.set_ui_state("window_height", &lh.to_string()).ok();
+            }
+        }
+
+        if let Ok(pos) = w.outer_position() {
+            let lx = (pos.x as f64 / sf) as i32;
+            let ly = (pos.y as f64 / sf) as i32;
+            db.set_ui_state("window_x", &lx.to_string()).ok();
+            db.set_ui_state("window_y", &ly.to_string()).ok();
+        }
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -94,6 +134,8 @@ pub fn run() {
         .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
+        .manage(session_adapters::AdapterState::new())
+        .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
@@ -164,6 +206,35 @@ pub fn run() {
                 }
             }
 
+            // Clean up orphan scrollback dirs and enforce disk limit
+            {
+                let state: tauri::State<'_, state::AppStateStore> = handle.state();
+                let ws_ids: Vec<String> = state
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .map(|w| w.workspace_id.0.clone())
+                    .collect();
+                let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
+                if !removed.is_empty() {
+                    eprintln!(
+                        "[codemux::scrollback] Cleaned up {} orphan scrollback dirs",
+                        removed.len()
+                    );
+                }
+                // Enforce disk limit from settings
+                let max_mb = settings_sync::load_cache()
+                    .map(|s| s.session_restore.max_total_mb)
+                    .unwrap_or(100);
+                let freed = scrollback::enforce_disk_limit(max_mb as u64 * 1024 * 1024);
+                if freed > 0 {
+                    eprintln!(
+                        "[codemux::scrollback] Freed {} bytes to stay under {max_mb}MB limit",
+                        freed
+                    );
+                }
+            }
+
             // Restore window size from SQLite
             {
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
@@ -212,52 +283,79 @@ pub fn run() {
                 }
             }
 
-            // Save window state on close
+            // Save window state and serialize terminal buffers on close
             {
                 let close_handle = handle.clone();
+                let close_in_progress = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if let Some(window) = app.get_webview_window("main") {
+                    let cip = close_in_progress.clone();
                     window.on_window_event(move |event| {
-                        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
-                            let db: tauri::State<'_, database::DatabaseStore> = close_handle.state();
-                            if let Some(w) = close_handle.get_webview_window("main") {
-                                let sf = w.scale_factor().unwrap_or(1.0);
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            // Prevent re-entry: if we already initiated the close sequence,
+                            // let the window close normally this time.
+                            if cip.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                                return;
+                            }
 
-                                if let Ok(size) = w.outer_size() {
-                                    // Convert physical → logical for DPI-safe persistence
-                                    let lw = size.width as f64 / sf;
-                                    let lh = size.height as f64 / sf;
+                            // Save window dimensions
+                            save_window_state(&close_handle);
 
-                                    // Skip saving if the window fills the monitor
-                                    // (tiled/maximized). Tiling WMs don't reliably
-                                    // report is_maximized(), so compare against monitor
-                                    // dimensions instead.
-                                    let fills_monitor = w.current_monitor().ok().flatten().map_or(false, |m| {
-                                        let mw = m.size().width as f64 / sf;
-                                        let mh = m.size().height as f64 / sf;
-                                        lw + 100.0 >= mw && lh + 100.0 >= mh
+                            // Check if session restore is enabled
+                            let session_restore_enabled = {
+                                let cache = settings_sync::load_cache();
+                                cache
+                                    .map(|s| s.session_restore.enabled)
+                                    .unwrap_or(true)
+                            };
+
+                            if session_restore_enabled {
+                                // Prevent the window from closing immediately —
+                                // we need to ask the frontend to serialize terminal buffers.
+                                api.prevent_close();
+
+                                let async_handle = close_handle.clone();
+                                let async_cip = cip.clone();
+                                tauri::async_runtime::spawn(async move {
+                                    // Emit event for the frontend to serialize buffers
+                                    let _ = async_handle.emit("serialize-terminal-buffers", ());
+
+                                    // Wait for the frontend to signal completion, or timeout after 3s.
+                                    // The frontend will emit "scrollback-serialization-complete" when done.
+                                    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+                                    let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+
+                                    let listen_handle = async_handle.clone();
+                                    let listener = listen_handle.listen("scrollback-serialization-complete", move |_| {
+                                        if let Some(tx) = tx.lock().unwrap().take() {
+                                            let _ = tx.send(());
+                                        }
                                     });
 
-                                    if fills_monitor {
-                                        // Clear stale tiled dimensions so the restore
-                                        // path falls back to the tauri.conf.json default.
-                                        db.delete_ui_state("window_width").ok();
-                                        db.delete_ui_state("window_height").ok();
-                                    } else {
-                                        db.set_ui_state("window_width", &lw.to_string()).ok();
-                                        db.set_ui_state("window_height", &lh.to_string()).ok();
-                                    }
-                                }
+                                    let _ = tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        rx,
+                                    ).await;
 
-                                if let Ok(pos) = w.outer_position() {
-                                    let lx = (pos.x as f64 / sf) as i32;
-                                    let ly = (pos.y as f64 / sf) as i32;
-                                    db.set_ui_state("window_x", &lx.to_string()).ok();
-                                    db.set_ui_state("window_y", &ly.to_string()).ok();
-                                }
+                                    async_handle.unlisten(listener);
+
+                                    // Flush layout state
+                                    let app_state: tauri::State<'_, state::AppStateStore> = async_handle.state();
+                                    state::flush_persisted_state(&app_state);
+
+                                    // Now actually close the window. The re-entry guard
+                                    // ensures this CloseRequested passes through.
+                                    if let Some(w) = async_handle.get_webview_window("main") {
+                                        let _ = w.destroy();
+                                    }
+
+                                    // Reset flag in case destroy failed
+                                    async_cip.store(false, std::sync::atomic::Ordering::Release);
+                                });
+                            } else {
+                                // Session restore disabled — close immediately
+                                let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
+                                state::flush_persisted_state(&app_state);
                             }
-                            // Flush any pending debounced state write before exit
-                            let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
-                            state::flush_persisted_state(&app_state);
                         }
                     });
                 }
@@ -630,6 +728,16 @@ pub fn run() {
             commands::update_setting,
             commands::reset_synced_settings,
             commands::get_package_format,
+            commands::debug_log,
+            commands::clear_adapter_captures,
+            scrollback::save_terminal_scrollback,
+            scrollback::get_terminal_scrollback,
+            scrollback::cache_terminal_scrollback,
+            scrollback::uncache_terminal_scrollback,
+            scrollback::flush_scrollback_cache,
+            session_adapters::validate_resume,
+            session_adapters::get_adapter_info,
+            session_adapters::get_scanner_captures,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

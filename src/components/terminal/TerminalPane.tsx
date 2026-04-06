@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { SerializeAddon } from "@xterm/addon-serialize";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -27,8 +28,14 @@ import {
   attachPtyOutput,
   getTerminalStatus,
   clearAgentStatus,
+  getTerminalScrollback,
+  cacheTerminalScrollback,
+  uncacheTerminalScrollback,
+  debugLog,
   Channel,
+  type ScrollbackPayload,
 } from "@/tauri/commands";
+import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { useAppStore } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
@@ -122,7 +129,11 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const serializeAddonRef = useRef<SerializeAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
+  // Adapter captures from the scrollback restore — persists across tab switches
+  // even when the pane state (layout.json) doesn't have them.
+  const restoredCapturesRef = useRef<Record<string, string>>({});
   const kittyStackRef = useRef<number[]>([]);
   const kittyLevelRef = useRef(0);
   const pendingPtyWrites = useRef<Uint8Array[]>([]);
@@ -289,11 +300,14 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     });
 
     const fitAddon = new FitAddon();
+    const serializeAddon = new SerializeAddon();
     term.loadAddon(fitAddon);
+    term.loadAddon(serializeAddon);
     term.open(containerEl);
 
     termRef.current = term;
     fitAddonRef.current = fitAddon;
+    serializeAddonRef.current = serializeAddon;
     kittyStackRef.current = [];
     kittyLevelRef.current = 0;
 
@@ -409,9 +423,98 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     });
     dataDisposableRef.current = dataDisposable;
 
+    // ── Scrollback serialization helper ──
+    // Shared between the live-serialize registry (on close) and the unmount
+    // cache path (on tab/workspace switch).
+    const buildScrollbackPayload = (): ScrollbackPayload | null => {
+      const t = termRef.current;
+      const sa = serializeAddonRef.current;
+      if (!t || !sa) return null;
+
+      const appState = useAppStore.getState().appState;
+      if (!appState) return null;
+
+      const session = appState.terminal_sessions.find(
+        (s) => s.session_id === sid,
+      );
+      if (!session) return null;
+
+      const workspace = appState.workspaces.find((ws) =>
+        ws.surfaces.some((surf) => {
+          const json = JSON.stringify(surf.root);
+          return json.includes(sid);
+        }),
+      );
+
+      // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.)
+      const isAlternateBuffer = t.buffer.active.type === "alternate";
+
+      const scrollbackLines = useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
+      const data = sa.serialize({ scrollback: scrollbackLines });
+
+      return {
+        pane_id: paneId ?? sid,
+        session_id: sid,
+        workspace_id: workspace?.workspace_id ?? "",
+        working_directory: session.cwd,
+        original_command: session.original_command,
+        cols: session.cols,
+        rows: session.rows,
+        data,
+        adapter_captures: {
+          ...restoredCapturesRef.current,
+          ...(session.adapter_captures ?? {}),
+        },
+        adapter_id: null,
+        alternate_buffer: isAlternateBuffer,
+      };
+    };
+
+    // Register for live serialization on close
+    const unregisterSerialize = registerTerminalForSerialize(sid, buildScrollbackPayload);
+
+    // Clear any stale cached scrollback for this session (we're live now)
+    uncacheTerminalScrollback(sid).catch(() => {});
+
     // ── Attach PTY session ──
+    //
+    // Restore scrollback, then attach PTY output and fit the pane.
     let cancelled = false;
+
     (async () => {
+      try {
+        const appState = useAppStore.getState().appState;
+        const workspace = appState?.workspaces.find((ws) =>
+          ws.surfaces.some((surf) => {
+            const json = JSON.stringify(surf.root);
+            return json.includes(sid);
+          }),
+        );
+        const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
+
+        if (restoreEnabled && workspace && paneId) {
+          const scrollback = await getTerminalScrollback(workspace.workspace_id, paneId);
+          debugLog(`[session-debug] SCROLLBACK_FETCH: sid=${sid}, pane=${paneId}, found=${!!scrollback}, cancelled=${cancelled}`);
+          if (scrollback && !cancelled) {
+            const { meta } = scrollback;
+            // Cache captures from scrollback metadata — these survive tab switches
+            // even when layout.json doesn't persist adapter_captures.
+            if (meta.adapter_captures && Object.keys(meta.adapter_captures).length > 0) {
+              restoredCapturesRef.current = meta.adapter_captures;
+            }
+            debugLog(`[session-debug] SCROLLBACK_META: adapter_id=${meta.adapter_id}, captures=${JSON.stringify(meta.adapter_captures)}, alt_buf=${meta.alternate_buffer}`);
+
+            if (!meta.alternate_buffer && scrollback.data) {
+              term.write(scrollback.data);
+              term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");
+            }
+          }
+        }
+      } catch {
+        // Scrollback restore failed — continue with fresh pane
+      }
+
+      // Attach PTY — never blocked by adapter checks
       try {
         const status = await getTerminalStatus(sid);
         if (cancelled) return;
@@ -445,7 +548,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         return;
       }
 
-      // Initial size sync
       fitAddon.fit();
       if (term.cols > 0 && term.rows > 0) {
         resizePty(sid, term.cols, term.rows).catch(console.error);
@@ -514,6 +616,18 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
       window.removeEventListener("resize", windowResize);
 
+      // Cache scrollback BEFORE disposing xterm — the serialize addon needs
+      // the live terminal buffer. This covers tab switches and workspace switches.
+      const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
+      if (restoreEnabled) {
+        const payload = buildScrollbackPayload();
+        if (payload && payload.data) {
+          cacheTerminalScrollback(payload).catch(() => {});
+        }
+      }
+
+      unregisterSerialize();
+      serializeAddonRef.current = null;
       fitAddonRef.current = null;
       kittyStackRef.current = [];
       kittyLevelRef.current = 0;
@@ -567,7 +681,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       />
       <div
         ref={statusOverlayRef}
-        className="terminal-overlay starting absolute inset-0 flex items-center justify-center p-4 bg-background/90"
+        className="terminal-overlay starting absolute inset-0 z-0 flex items-center justify-center p-4 bg-background/90"
         style={{ display: statusRef.current.state === "ready" ? "none" : "flex" }}
       >
         <div className="w-full max-w-[440px] p-4 border border-border rounded-sm bg-card">

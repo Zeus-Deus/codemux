@@ -647,7 +647,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codemux"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -662,6 +662,7 @@ dependencies = [
  "notify-rust",
  "portable-pty",
  "rand 0.8.5",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

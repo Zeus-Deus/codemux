@@ -185,6 +185,14 @@ pub struct TerminalSessionSnapshot {
     pub state: TerminalSessionState,
     pub last_message: Option<String>,
     pub exit_code: Option<u32>,
+    /// The command that was written to this terminal (e.g. from a preset).
+    /// Used by the session adapter system for resume detection.
+    #[serde(default)]
+    pub original_command: Option<String>,
+    /// Adapter-captured metadata (e.g. Claude session UUID from hooks).
+    /// Written immediately when hooks fire, so each pane has its own data.
+    #[serde(default)]
+    pub adapter_captures: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -632,6 +640,8 @@ impl AppStateStore {
             state: TerminalSessionState::Starting,
             last_message: Some("Preparing agent session".into()),
             exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
         });
 
         let workspace = snapshot
@@ -746,6 +756,8 @@ impl AppStateStore {
                 state: TerminalSessionState::Starting,
                 last_message: Some("Preparing shell session".into()),
                 exit_code: None,
+                original_command: None,
+                adapter_captures: Default::default(),
             });
             session_ids.push(session_id);
         }
@@ -1201,6 +1213,8 @@ impl AppStateStore {
             state: TerminalSessionState::Starting,
             last_message: Some("Preparing shell session".into()),
             exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
         });
 
         if let Some(workspace) = snapshot
@@ -1274,6 +1288,8 @@ impl AppStateStore {
             state: TerminalSessionState::Starting,
             last_message: Some("Preparing shell session".into()),
             exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
         });
 
         let workspace = snapshot
@@ -1806,6 +1822,55 @@ impl AppStateStore {
         false
     }
 
+    pub fn update_terminal_session_command(&self, session: &str, command: String) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(terminal) = snapshot
+            .terminal_sessions
+            .iter_mut()
+            .find(|terminal| terminal.session_id.0 == session)
+        {
+            terminal.original_command = Some(command);
+            return true;
+        }
+        false
+    }
+
+    /// Store an adapter capture key-value pair on a terminal session.
+    /// Called immediately when hooks fire so each pane owns its own data.
+    pub fn set_terminal_adapter_capture(&self, session: &str, key: &str, value: &str) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(terminal) = snapshot
+            .terminal_sessions
+            .iter_mut()
+            .find(|terminal| terminal.session_id.0 == session)
+        {
+            terminal.adapter_captures.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    /// Get all adapter captures for a terminal session.
+    pub fn get_terminal_adapter_captures(&self, session: &str) -> std::collections::HashMap<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .terminal_sessions
+            .iter()
+            .find(|terminal| terminal.session_id.0 == session)
+            .map(|t| t.adapter_captures.clone())
+            .unwrap_or_default()
+    }
+
+    /// Clear all adapter captures for a terminal session (e.g. when user clicks "Start fresh").
+    pub fn clear_terminal_adapter_captures(&self, session: &str) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(terminal) = snapshot
+            .terminal_sessions
+            .iter_mut()
+            .find(|terminal| terminal.session_id.0 == session)
+        {
+            terminal.adapter_captures.clear();
+        }
+    }
+
     pub fn update_terminal_session_size(&self, session: &str, cols: u16, rows: u16) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
@@ -1991,6 +2056,8 @@ impl AppStateStore {
                     state: TerminalSessionState::Starting,
                     last_message: None,
                     exit_code: None,
+                    original_command: None,
+                    adapter_captures: Default::default(),
                 });
 
                 new_session_id = Some(session_id);
@@ -2561,6 +2628,8 @@ fn default_app_state() -> AppStateSnapshot {
             state: TerminalSessionState::Starting,
             last_message: Some("Preparing shell session".into()),
             exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
         }],
         browser_sessions: vec![],
         agent_browser_sessions: vec![],

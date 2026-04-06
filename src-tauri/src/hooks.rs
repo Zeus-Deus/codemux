@@ -56,12 +56,25 @@ pub fn start_hook_server(app: AppHandle) -> u16 {
 
                 let event_type = params.get("eventType").copied().unwrap_or("");
                 let session_id = params.get("sessionId").copied().unwrap_or("");
+                let agent_session_id = params.get("agentSessionId").copied().unwrap_or("");
 
                 if event_type.is_empty() || session_id.is_empty() {
                     let _ = stream.write_all(
                         b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
                     );
                     return;
+                }
+
+                // Always store the agent session ID — it reflects the CURRENT
+                // session running in this pane.
+                if !agent_session_id.is_empty() {
+                    eprintln!("[session-debug] HOOK: codemux_sid={session_id}, event={event_type}, claude_sid={agent_session_id}");
+                    let state: tauri::State<'_, AppStateStore> = app.state();
+                    state.set_terminal_adapter_capture(
+                        session_id,
+                        "claude_session_id",
+                        agent_session_id,
+                    );
                 }
 
                 let status = match map_event_type(event_type) {
@@ -274,13 +287,21 @@ const HOOK_SCRIPT: &str = r#"#!/bin/sh
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 
 EVENT_TYPE="${1:-}"
-
-# Claude Code passes hook event name as $1
 [ -z "$EVENT_TYPE" ] && exit 0
 
-curl -s --connect-timeout 1 --max-time 2 \
-  "http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}" \
-  >/dev/null 2>&1 || true &
+# Claude Code passes JSON on stdin with session_id.
+# Extract it if jq is available; fall back gracefully if not.
+AGENT_SID=""
+if command -v jq >/dev/null 2>&1; then
+  AGENT_SID=$(cat | jq -r '.session_id // empty' 2>/dev/null)
+fi
+
+URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
+if [ -n "$AGENT_SID" ]; then
+  URL="${URL}&agentSessionId=${AGENT_SID}"
+fi
+
+curl -s --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1 || true &
 exit 0
 "#;
 

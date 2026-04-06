@@ -34,6 +34,7 @@ const DARK_SETTINGS: UserSettings = {
   keyboard: { shortcuts: { "ctrl+s": "save" } },
   notifications: { sound_enabled: false, desktop_enabled: true },
   file_tree: { show_hidden_files: true },
+  session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
 };
 
 describe("synced-settings-store", () => {

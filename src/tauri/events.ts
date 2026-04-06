@@ -1,4 +1,4 @@
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export type { UnlistenFn };
 import type {
@@ -24,6 +24,12 @@ export const onThemeChanged = (cb: EventCallback<ThemeColors>): Promise<Unlisten
 
 export const onTerminalStatus = (cb: EventCallback<TerminalStatusPayload>): Promise<UnlistenFn> =>
   listen<TerminalStatusPayload>("terminal-status", (e) => cb(e.payload));
+
+export const onSerializeTerminalBuffers = (cb: EventCallback<null>): Promise<UnlistenFn> =>
+  listen<null>("serialize-terminal-buffers", () => cb(null));
+
+export const emitScrollbackSerializationComplete = () =>
+  emit("scrollback-serialization-complete");
 
 export interface WorkspaceSetupProgress {
   workspace_id: string;

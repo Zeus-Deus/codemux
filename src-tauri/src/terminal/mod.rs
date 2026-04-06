@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 
 use crate::project::current_project_root;
+use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
 static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
@@ -108,6 +109,11 @@ pub struct SessionRuntime {
     pub pending_output: VecDeque<Vec<u8>>,
     pub last_status: TerminalStatusPayload,
     pub child_pid: Option<u32>,
+    pub skip_preset_launch: bool,
+    /// Optional full launch command for restored sessions.
+    /// When present, the preset readiness helper injects this command instead
+    /// of the normal preset command.
+    pub resume_command: Option<String>,
 }
 
 impl SessionRuntime {
@@ -124,6 +130,8 @@ impl SessionRuntime {
                 exit_code: None,
             },
             child_pid: None,
+            skip_preset_launch: false,
+            resume_command: None,
         }
     }
 }
@@ -161,6 +169,44 @@ fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
         TerminalLifecycleState::Exited => TerminalSessionState::Exited,
         TerminalLifecycleState::Failed => TerminalSessionState::Failed,
     }
+}
+
+fn build_resume_launch_command(original_command: &str, resume_args: &str) -> String {
+    let original = original_command.trim();
+    let args = resume_args.trim();
+
+    if original.is_empty() {
+        return args.to_string();
+    }
+    if args.is_empty() {
+        return original.to_string();
+    }
+
+    format!("{original} {args}")
+}
+
+fn resolve_resume_command(
+    snapshot: &crate::state::AppStateSnapshot,
+    meta: &crate::scrollback::ScrollbackMeta,
+    adapter_state: &crate::session_adapters::AdapterState,
+) -> Option<String> {
+    let original_command = meta.original_command.clone().or_else(|| {
+        snapshot
+            .terminal_sessions
+            .iter()
+            .find(|session| session.session_id.0 == meta.session_id)
+            .and_then(|session| session.original_command.clone())
+    })?;
+
+    let adapter_id = meta
+        .adapter_id
+        .clone()
+        .or_else(|| adapter_state.match_adapter_id_for_command(&original_command))?;
+
+    let adapter_match = adapter_state.get_adapter_match(&adapter_id, &meta.adapter_captures)?;
+    let resume_args = adapter_match.resume_args?;
+
+    Some(build_resume_launch_command(&original_command, &resume_args))
 }
 
 fn with_session_runtime<T>(
@@ -334,9 +380,7 @@ fn batched_reader_loop(
                 let data = &buf[..n];
                 pre_read_hook(data);
                 batch.extend_from_slice(data);
-                if batch.len() >= PTY_BATCH_SIZE
-                    || last_flush.elapsed() >= PTY_BATCH_INTERVAL
-                {
+                if batch.len() >= PTY_BATCH_SIZE || last_flush.elapsed() >= PTY_BATCH_INTERVAL {
                     flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
                 }
             }
@@ -405,9 +449,7 @@ struct ChildGuard {
 
 impl ChildGuard {
     fn new(child: Box<dyn portable_pty::Child + Send + Sync>) -> Self {
-        Self {
-            child: Some(child),
-        }
+        Self { child: Some(child) }
     }
 
     /// Take ownership of the child, disarming the guard.
@@ -554,13 +596,46 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         );
     }
 
-    // Inject pane ID and hook server port for agent status notifications
-    if let Some(pane_id) = snapshot.workspaces.iter().find_map(|ws| {
+    // Inject pane ID and hook server port for agent status notifications.
+    // Also detect restored sessions so preset auto-launch can be skipped and
+    // the full resume command can be injected later.
+    let mut auto_resume_command: Option<String> = None;
+    if let Some((_ws_id, pane_id)) = snapshot.workspaces.iter().find_map(|ws| {
         ws.surfaces
             .iter()
             .find_map(|s| crate::state::find_terminal_pane_id(&s.root, &session_id))
+            .map(|pane_id| (ws.workspace_id.0.clone(), pane_id.0))
     }) {
-        cmd.env("CODEMUX_PANE_ID", pane_id.0);
+        cmd.env("CODEMUX_PANE_ID", &pane_id);
+    }
+
+    let session_restore_enabled = settings_sync::load_cache()
+        .map(|s| s.session_restore.enabled)
+        .unwrap_or(true);
+    if session_restore_enabled {
+        if let Some(adapter_state) = app.try_state::<crate::session_adapters::AdapterState>() {
+            if let Some((ws_id, pane_id, meta)) =
+                crate::scrollback::find_scrollback_meta_for_session(&session_id)
+            {
+                cmd.env("CODEMUX_PANE_ID", &pane_id);
+                if let Some(resume_command) =
+                    resolve_resume_command(&snapshot, &meta, &adapter_state)
+                {
+                    eprintln!(
+                        "[codemux::terminal] Skipping auto-launch for {session_id}: restored session found at {ws_id}/{pane_id}"
+                    );
+                    auto_resume_command = Some(resume_command);
+                } else {
+                    eprintln!(
+                        "[codemux::terminal] Restored session metadata found for {session_id} at {ws_id}/{pane_id} but no resume command could be built"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[codemux::terminal] No scrollback metadata found for restored session {session_id}"
+                );
+            }
+        }
     }
     if let Some(port) = crate::hooks::hook_port() {
         cmd.env("CODEMUX_HOOK_PORT", port.to_string());
@@ -653,8 +728,21 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
             runtime.writer = Some(writer);
             runtime.master = Some(pty_pair.master);
             runtime.child_pid = child_pid;
+            runtime.skip_preset_launch = auto_resume_command.is_some();
+            runtime.resume_command = auto_resume_command.clone();
         },
     );
+
+    if let Some(command) = auto_resume_command {
+        let sessions_for_command = sessions.clone();
+        let session_id_for_command = session_id.clone();
+        crate::commands::presets::write_command_when_ready(
+            sessions_for_command,
+            session_id_for_command,
+            command,
+            120,
+        );
+    }
 
     emit_terminal_status(
         &app,
@@ -667,10 +755,57 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         },
     );
 
+    // Wire up the session adapter output scanner if this session has an original_command.
+    let adapter_clone: Option<crate::session_adapters::AdapterState> = app
+        .try_state::<crate::session_adapters::AdapterState>()
+        .map(|s| s.inner().clone());
+    let snapshot = app_state.snapshot();
+    let original_cmd = snapshot
+        .terminal_sessions
+        .iter()
+        .find(|s| s.session_id.0 == session_id)
+        .and_then(|s| s.original_command.clone());
+
+    // Only create a scanner (and the per-byte hook) when a preset command was used.
+    // Plain shell panes get no scanner and a no-op hook — zero overhead in the hot path.
+    let has_scanner = if let (Some(ref adapter), Some(ref cmd)) = (&adapter_clone, &original_cmd) {
+        adapter.start_scanner(&session_id, cmd).is_some()
+    } else {
+        false
+    };
+
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let scanner_session_id = session_id.clone();
+    let mut line_buf = Vec::<u8>::new();
+
     std::thread::spawn(move || {
-        batched_reader_loop(&mut reader, poll_fd, &read_sessions, &read_session_id, |_| {});
+        batched_reader_loop(
+            &mut reader,
+            poll_fd,
+            &read_sessions,
+            &read_session_id,
+            |data: &[u8]| {
+                if !has_scanner {
+                    return;
+                }
+                let Some(ref adapter) = adapter_clone else {
+                    return;
+                };
+
+                // Feed bytes into line buffer, scan complete lines
+                for &byte in data {
+                    if byte == b'\n' {
+                        let line = String::from_utf8_lossy(&line_buf);
+                        let clean = strip_ansi_codes(&line);
+                        adapter.scan_line(&scanner_session_id, &clean);
+                        line_buf.clear();
+                    } else if byte != b'\r' {
+                        line_buf.push(byte);
+                    }
+                }
+            },
+        );
     });
 
     let wait_app = app.clone();
@@ -699,7 +834,8 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         // Send terminal reset sequences to xterm.js via the IPC channel
         // before tearing down the session. This restores xterm.js to a clean
         // state after apps that enable mouse tracking, alt screen, etc.
-        const TERMINAL_RESET: &[u8] = b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
+        const TERMINAL_RESET: &[u8] =
+            b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
         queue_or_send_output(&wait_sessions, &wait_session_id, TERMINAL_RESET.to_vec());
 
         with_session_runtime(
@@ -1036,11 +1172,7 @@ pub fn resize_pty(
 /// where an agent was processing — the agent stops but stays alive,
 /// so the PTY exit cleanup never fires.
 #[tauri::command]
-pub fn clear_agent_status(
-    session_id: String,
-    app_state: State<'_, AppStateStore>,
-    app: AppHandle,
-) {
+pub fn clear_agent_status(session_id: String, app_state: State<'_, AppStateStore>, app: AppHandle) {
     app_state.clear_transient_pane_status_by_session(&session_id);
     state::emit_app_state(&app);
 }
@@ -1381,12 +1513,8 @@ pub fn spawn_pty_for_agent(
                             })
                         {
                             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let entry = format!(
-                                "[{}] [{}] {}\n",
-                                timestamp,
-                                role.to_uppercase(),
-                                trimmed
-                            );
+                            let entry =
+                                format!("[{}] [{}] {}\n", timestamp, role.to_uppercase(), trimmed);
                             comm_log_buffer.push(entry);
                             if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
                                 || comm_last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
@@ -1535,7 +1663,8 @@ pub fn spawn_pty_for_agent(
         ));
 
         // Send terminal reset sequences to xterm.js before tearing down.
-        const TERMINAL_RESET: &[u8] = b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
+        const TERMINAL_RESET: &[u8] =
+            b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
         queue_or_send_output(&wait_sessions, &wait_session_id, TERMINAL_RESET.to_vec());
 
         emit_terminal_status(&wait_app, &wait_sessions, payload);
@@ -1564,9 +1693,15 @@ mod tests {
             runtime.last_status.state = TerminalLifecycleState::Failed;
         });
 
-        assert!(result.is_none(), "should not create entry for non-existent session");
+        assert!(
+            result.is_none(),
+            "should not create entry for non-existent session"
+        );
         let guard = sessions.lock().unwrap();
-        assert!(!guard.contains_key("ghost-session"), "no ghost entry should exist");
+        assert!(
+            !guard.contains_key("ghost-session"),
+            "no ghost entry should exist"
+        );
     }
 
     #[test]
@@ -1588,7 +1723,10 @@ mod tests {
         );
 
         let guard = sessions.lock().unwrap();
-        assert!(guard.contains_key("new-session"), "Starting should create entry");
+        assert!(
+            guard.contains_key("new-session"),
+            "Starting should create entry"
+        );
     }
 
     #[test]
@@ -1596,9 +1734,14 @@ mod tests {
         let pty_state = PtyState::default();
         let sessions = pty_state.sessions.clone();
 
-        with_session_runtime(&sessions, "sess-1", || SessionRuntime::new("sess-1"), |runtime| {
-            runtime.child_pid = Some(12345);
-        });
+        with_session_runtime(
+            &sessions,
+            "sess-1",
+            || SessionRuntime::new("sess-1"),
+            |runtime| {
+                runtime.child_pid = Some(12345);
+            },
+        );
         assert_eq!(pty_state.get_session_pids().len(), 1);
 
         // Simulate cleanup: update status then remove
@@ -1607,7 +1750,10 @@ mod tests {
         });
         remove_session_runtime(&sessions, "sess-1");
 
-        assert!(pty_state.get_session_pids().is_empty(), "no stale pids after cleanup");
+        assert!(
+            pty_state.get_session_pids().is_empty(),
+            "no stale pids after cleanup"
+        );
     }
 
     #[test]
@@ -1652,7 +1798,10 @@ mod tests {
         flush_pty_batch(&sessions, "sess", &mut batch, &mut last_flush);
 
         assert!(batch.is_empty(), "batch should be cleared after flush");
-        assert!(last_flush.elapsed() < Duration::from_millis(100), "last_flush should be recent");
+        assert!(
+            last_flush.elapsed() < Duration::from_millis(100),
+            "last_flush should be recent"
+        );
 
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("sess").unwrap();
@@ -1671,10 +1820,17 @@ mod tests {
 
         flush_pty_batch(&sessions, "sess", &mut batch, &mut last_flush);
 
-        assert_eq!(last_flush, original_time, "last_flush should not change on empty batch");
+        assert_eq!(
+            last_flush, original_time,
+            "last_flush should not change on empty batch"
+        );
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("sess").unwrap();
-        assert_eq!(runtime.pending_output.len(), 0, "no output should be queued");
+        assert_eq!(
+            runtime.pending_output.len(),
+            0,
+            "no output should be queued"
+        );
     }
 
     /// Verify that data written to a PTY appears in pending_output within
@@ -1685,7 +1841,12 @@ mod tests {
         use portable_pty::{native_pty_system, PtySize};
 
         let sessions = make_sessions();
-        with_session_runtime(&sessions, "test-pty", || SessionRuntime::new("test-pty"), |_| {});
+        with_session_runtime(
+            &sessions,
+            "test-pty",
+            || SessionRuntime::new("test-pty"),
+            |_| {},
+        );
 
         // Open a real PTY pair.
         let pty_system = native_pty_system();
@@ -1727,7 +1888,10 @@ mod tests {
             let runtime = guard.get("test-pty").unwrap();
             !runtime.pending_output.is_empty()
         };
-        assert!(found, "data should appear in pending_output within PTY_BATCH_INTERVAL + margin");
+        assert!(
+            found,
+            "data should appear in pending_output within PTY_BATCH_INTERVAL + margin"
+        );
 
         // Verify the content includes our payload.
         let content = {

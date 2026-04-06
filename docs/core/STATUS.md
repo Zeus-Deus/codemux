@@ -50,7 +50,7 @@ The repo structure is clean and domain-split:
 - Browser pane: screenshot-driven, functional but lower fidelity than native
 - OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
 - AI merge resolver: backend and frontend working, needs testing depth and live validation
-- Session persistence: layout persists, scrollback lost on restart
+- Session persistence: scrollback saved/restored on close/open, adapter-based auto-resume for CLI tools (Claude Code)
 - Browser automation depth: basic commands work, missing wait conditions and DOM inspection
 
 ## Known Constraints

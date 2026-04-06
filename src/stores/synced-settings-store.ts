@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
+  session_restore: { enabled: true, scrollback_lines: 10_000, max_total_mb: 100 },
 };
 
 export interface SyncedSettingsState {

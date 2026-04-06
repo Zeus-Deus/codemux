@@ -39,6 +39,7 @@ const FULL_CUSTOM: UserSettings = {
   keyboard: { shortcuts: { "ctrl+s": "save", "ctrl+p": "palette" } },
   notifications: { sound_enabled: false, desktop_enabled: false },
   file_tree: { show_hidden_files: true },
+  session_restore: { enabled: false, scrollback_lines: 5000, max_total_mb: 50 },
 };
 
 // ── Setup ──

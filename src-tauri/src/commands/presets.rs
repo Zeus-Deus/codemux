@@ -13,9 +13,7 @@ use crate::terminal;
 use crate::terminal::PtyState;
 
 #[tauri::command]
-pub fn get_presets(
-    presets: State<'_, PresetStoreState>,
-) -> Result<PresetStoreSnapshot, String> {
+pub fn get_presets(presets: State<'_, PresetStoreState>) -> Result<PresetStoreSnapshot, String> {
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     Ok(snapshot_from_store(&store))
 }
@@ -230,7 +228,9 @@ pub fn apply_preset(
     let commands = if preset.commands.is_empty() {
         vec![String::new()]
     } else {
-        preset.commands.iter()
+        preset
+            .commands
+            .iter()
             .map(|cmd| crate::agent_context::inject_agent_context(cmd))
             .collect()
     };
@@ -251,6 +251,7 @@ pub fn apply_preset(
                 .join(" && ");
 
             if !combined.is_empty() {
+                state.update_terminal_session_command(&session_id, combined.clone());
                 write_command_to_pty(&sessions_arc, &session_id, &combined);
             }
         }
@@ -270,14 +271,13 @@ pub fn apply_preset(
                         .unwrap_or_else(|| active_pane.clone())
                 };
 
-                let session_id = state.split_pane(
-                    &target_pane,
-                    crate::state::SplitDirection::Horizontal,
-                )?;
+                let session_id =
+                    state.split_pane(&target_pane, crate::state::SplitDirection::Horizontal)?;
 
                 terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                 if !command.is_empty() {
+                    state.update_terminal_session_command(&session_id.0, command.clone());
                     let sessions = sessions_arc.clone();
                     let sid = session_id.0.clone();
                     let cmd = command.clone();
@@ -304,6 +304,7 @@ pub fn apply_preset(
 
             if !combined.is_empty() {
                 for sid in session_ids {
+                    state.update_terminal_session_command(&sid, combined.clone());
                     let sessions = sessions_arc.clone();
                     let cmd = combined.clone();
                     write_command_when_ready(sessions, sid, cmd, 120);
@@ -313,10 +314,8 @@ pub fn apply_preset(
         _ => {
             // "new_tab" — create one tab per command
             for command in &commands {
-                let (tab_id, session_id) = state.create_tab(
-                    &workspace_id,
-                    crate::state::TabKind::Terminal,
-                )?;
+                let (tab_id, session_id) =
+                    state.create_tab(&workspace_id, crate::state::TabKind::Terminal)?;
 
                 // Name the tab after the preset and set its icon
                 let _ = state.rename_tab(&workspace_id, &tab_id, preset.name.clone());
@@ -326,6 +325,7 @@ pub fn apply_preset(
                     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                     if !command.is_empty() {
+                        state.update_terminal_session_command(&session_id.0, command.clone());
                         let sessions = sessions_arc.clone();
                         let sid = session_id.0.clone();
                         let cmd = command.clone();
@@ -341,10 +341,7 @@ pub fn apply_preset(
 }
 
 /// Get the active terminal session ID for a specific workspace.
-fn active_session_for_workspace(
-    state: &AppStateStore,
-    workspace_id: &str,
-) -> Option<String> {
+fn active_session_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
     let snapshot = state.snapshot();
     let workspace = snapshot
         .workspaces
@@ -354,15 +351,11 @@ fn active_session_for_workspace(
         .surfaces
         .iter()
         .find(|s| s.surface_id == workspace.active_surface_id)?;
-    crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id)
-        .map(|sid| sid.0)
+    crate::state::session_id_for_pane(&surface.root, &surface.active_pane_id).map(|sid| sid.0)
 }
 
 /// Get the active pane ID for a specific workspace.
-fn active_pane_for_workspace(
-    state: &AppStateStore,
-    workspace_id: &str,
-) -> Option<String> {
+fn active_pane_for_workspace(state: &AppStateStore, workspace_id: &str) -> Option<String> {
     let snapshot = state.snapshot();
     let workspace = snapshot
         .workspaces
@@ -442,9 +435,34 @@ fn wait_and_write_command(
     }
 
     if !writer_found {
-        eprintln!(
-            "[codemux::presets] Timeout waiting for PTY writer for session {session_id}"
-        );
+        eprintln!("[codemux::presets] Timeout waiting for PTY writer for session {session_id}");
+        return;
+    }
+
+    let command_to_write = {
+        let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .get_mut(session_id)
+            .map(|rt| {
+                if let Some(resume_command) = rt.resume_command.take() {
+                    if rt.skip_preset_launch {
+                        eprintln!(
+                            "[codemux::presets] Skipping auto-launch for {session_id}: resumable session"
+                        );
+                    }
+                    return resume_command;
+                }
+                if rt.skip_preset_launch {
+                    eprintln!(
+                        "[codemux::presets] Resumable session for {session_id} had no resume command; falling back to normal launch"
+                    );
+                }
+                command.to_string()
+            })
+            .unwrap_or_else(|| command.to_string())
+    };
+
+    if command_to_write.is_empty() {
         return;
     }
 
@@ -503,7 +521,7 @@ fn wait_and_write_command(
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
-            let _ = writer.write_all(command.as_bytes());
+            let _ = writer.write_all(command_to_write.as_bytes());
             let _ = writer.write_all(b"\n");
             let _ = writer.flush();
         }
@@ -588,7 +606,10 @@ mod tests {
         producer.join().unwrap();
 
         // Should have detected quiet and fired, not hit the 5s timeout
-        assert!(elapsed < std::time::Duration::from_secs(2), "should detect quiet quickly, took {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should detect quiet quickly, took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -602,8 +623,14 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Should have taken approximately 5s (the hard timeout)
-        assert!(elapsed >= std::time::Duration::from_secs(4), "should wait near full timeout, took {elapsed:?}");
-        assert!(elapsed < std::time::Duration::from_secs(7), "should not exceed timeout significantly");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "should wait near full timeout, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(7),
+            "should not exceed timeout significantly"
+        );
     }
 
     #[test]
@@ -620,6 +647,49 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Should timeout waiting for writer (~5s)
-        assert!(elapsed >= std::time::Duration::from_secs(4), "should wait for writer timeout");
+        assert!(
+            elapsed >= std::time::Duration::from_secs(4),
+            "should wait for writer timeout"
+        );
+    }
+
+    #[test]
+    fn test_resume_command_overrides_original_command() {
+        let sessions = make_sessions();
+        insert_session_with_writer(&sessions, "sess");
+
+        {
+            let mut guard = sessions.lock().unwrap();
+            let runtime = guard.get_mut("sess").unwrap();
+            runtime.skip_preset_launch = true;
+            runtime.resume_command = Some("claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\" --resume abc-123".into());
+        }
+
+        let sessions_clone = sessions.clone();
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut guard = sessions_clone.lock().unwrap();
+            let runtime = guard.get_mut("sess").unwrap();
+            runtime.pending_output.push_back(vec![b'$', b' ']);
+        });
+
+        wait_and_write_command(
+            &sessions,
+            "sess",
+            "claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\"",
+            80,
+        );
+
+        producer.join().unwrap();
+
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("sess").unwrap();
+        let writer = runtime.writer.as_ref().unwrap();
+        let writer_ptr = writer.as_ref() as *const dyn Write as *const Vec<u8>;
+        let written = unsafe { &*writer_ptr };
+        assert_eq!(
+            written,
+            b"claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\" --resume abc-123\n"
+        );
     }
 }

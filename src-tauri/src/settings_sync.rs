@@ -22,6 +22,8 @@ pub struct UserSettings {
     pub notifications: NotificationSettings,
     #[serde(default)]
     pub file_tree: FileTreeSettings,
+    #[serde(default)]
+    pub session_restore: SessionRestoreSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -110,6 +112,26 @@ pub struct FileTreeSettings {
     pub show_hidden_files: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct SessionRestoreSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: u32,
+    #[serde(default = "default_max_total_mb")]
+    pub max_total_mb: u32,
+}
+
+impl Default for SessionRestoreSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scrollback_lines: default_scrollback_lines(),
+            max_total_mb: default_max_total_mb(),
+        }
+    }
+}
+
 fn default_theme() -> String {
     "system".into()
 }
@@ -127,6 +149,12 @@ fn default_base_branch() -> String {
 }
 fn default_true() -> bool {
     true
+}
+fn default_scrollback_lines() -> u32 {
+    10_000
+}
+fn default_max_total_mb() -> u32 {
+    100
 }
 
 // ── Local Cache ─────────────────────────────────────────────────
@@ -466,6 +494,11 @@ mod tests {
             file_tree: FileTreeSettings {
                 show_hidden_files: true,
             },
+            session_restore: SessionRestoreSettings {
+                enabled: false,
+                scrollback_lines: 5000,
+                max_total_mb: 50,
+            },
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -483,6 +516,9 @@ mod tests {
         assert_eq!(back.keyboard.shortcuts.get("ctrl+s").unwrap(), "save");
         assert!(!back.notifications.sound_enabled);
         assert!(!back.notifications.desktop_enabled);
+        assert!(!back.session_restore.enabled);
+        assert_eq!(back.session_restore.scrollback_lines, 5000);
+        assert_eq!(back.session_restore.max_total_mb, 50);
     }
 
     /// Patching one section preserves all other sections when round-tripped through cache.

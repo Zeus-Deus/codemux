@@ -134,6 +134,20 @@ pub fn get_observability_snapshot(
 }
 
 #[tauri::command]
+pub fn debug_log(message: String) {
+    eprintln!("{message}");
+}
+
+#[tauri::command]
+pub fn clear_adapter_captures(
+    app_state: State<'_, crate::state::AppStateStore>,
+    session_id: String,
+) -> Result<(), String> {
+    app_state.clear_terminal_adapter_captures(&session_id);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn add_structured_log(
     store: State<'_, ObservabilityStore>,
     source: String,

@@ -32,6 +32,12 @@ export interface FileTreeSyncSettings {
   show_hidden_files: boolean;
 }
 
+export interface SessionRestoreSettings {
+  enabled: boolean;
+  scrollback_lines: number;
+  max_total_mb: number;
+}
+
 export interface UserSettings {
   appearance: AppearanceSettings;
   editor: EditorSettings;
@@ -40,6 +46,7 @@ export interface UserSettings {
   keyboard: KeyboardSettings;
   notifications: NotificationSyncSettings;
   file_tree: FileTreeSyncSettings;
+  session_restore: SessionRestoreSettings;
 }
 
 // ── Auth ──
@@ -74,6 +81,8 @@ export interface TerminalSessionSnapshot {
   state: "starting" | "ready" | "exited" | "failed";
   last_message: string | null;
   exit_code: number | null;
+  original_command: string | null;
+  adapter_captures: Record<string, string>;
 }
 
 export interface TerminalStatusPayload {

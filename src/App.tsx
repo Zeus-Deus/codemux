@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useAuthEvents } from "@/hooks/use-auth-events";
+import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { AppShell } from "@/components/layout/app-shell";
 import { Toaster } from "@/components/ui/sonner";
 import { UpdateToast } from "@/components/update/update-toast";
@@ -28,6 +29,7 @@ function App() {
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
+  useScrollbackSerializer();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;
