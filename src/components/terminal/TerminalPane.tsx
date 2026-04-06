@@ -31,7 +31,6 @@ import {
   getTerminalScrollback,
   cacheTerminalScrollback,
   uncacheTerminalScrollback,
-  debugLog,
   Channel,
   type ScrollbackPayload,
 } from "@/tauri/commands";
@@ -494,7 +493,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
         if (restoreEnabled && workspace && paneId) {
           const scrollback = await getTerminalScrollback(workspace.workspace_id, paneId);
-          debugLog(`[session-debug] SCROLLBACK_FETCH: sid=${sid}, pane=${paneId}, found=${!!scrollback}, cancelled=${cancelled}`);
           if (scrollback && !cancelled) {
             const { meta } = scrollback;
             // Cache captures from scrollback metadata — these survive tab switches
@@ -502,8 +500,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
             if (meta.adapter_captures && Object.keys(meta.adapter_captures).length > 0) {
               restoredCapturesRef.current = meta.adapter_captures;
             }
-            debugLog(`[session-debug] SCROLLBACK_META: adapter_id=${meta.adapter_id}, captures=${JSON.stringify(meta.adapter_captures)}, alt_buf=${meta.alternate_buffer}`);
-
             if (!meta.alternate_buffer && scrollback.data) {
               term.write(scrollback.data);
               term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");

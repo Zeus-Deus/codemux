@@ -68,7 +68,6 @@ pub fn start_hook_server(app: AppHandle) -> u16 {
                 // Always store the agent session ID — it reflects the CURRENT
                 // session running in this pane.
                 if !agent_session_id.is_empty() {
-                    eprintln!("[session-debug] HOOK: codemux_sid={session_id}, event={event_type}, claude_sid={agent_session_id}");
                     let state: tauri::State<'_, AppStateStore> = app.state();
                     state.set_terminal_adapter_capture(
                         session_id,

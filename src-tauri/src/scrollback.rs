@@ -381,13 +381,8 @@ fn enrich_with_adapter_captures(
     adapter_state: &crate::session_adapters::AdapterState,
     app_state: &crate::state::AppStateStore,
 ) {
-    let incoming = payload.adapter_captures.clone();
     // Source 1: pane-level captures (from hook callbacks during the active session).
     let pane_captures = app_state.get_terminal_adapter_captures(&payload.session_id);
-    eprintln!(
-        "[session-debug] ENRICH: sid={}, incoming={:?}, pane_state={:?}",
-        payload.session_id, incoming, pane_captures
-    );
     if !pane_captures.is_empty() {
         payload.adapter_captures.extend(pane_captures);
     }
@@ -416,15 +411,7 @@ pub fn save_terminal_scrollback(
     adapter_state: tauri::State<'_, crate::session_adapters::AdapterState>,
     mut payload: ScrollbackPayload,
 ) -> Result<(), String> {
-    eprintln!(
-        "[session-debug] LIVE_SAVE: sid={}, pane={}, ws={}",
-        payload.session_id, payload.pane_id, payload.workspace_id
-    );
     enrich_with_adapter_captures(&mut payload, &adapter_state, &app_state);
-    eprintln!(
-        "[session-debug] LIVE_SAVE final: adapter_id={:?}, captures={:?}",
-        payload.adapter_id, payload.adapter_captures
-    );
     save_scrollback(&payload)
 }
 
@@ -434,11 +421,6 @@ pub fn get_terminal_scrollback(
     pane_id: String,
 ) -> Result<Option<ScrollbackRestore>, String> {
     let result = load_scrollback(&workspace_id, &pane_id);
-    if let Some(ref r) = result {
-        eprintln!("[session-debug] RESTORE: ws={workspace_id}, pane={pane_id}, adapter_id={:?}, captures={:?}", r.meta.adapter_id, r.meta.adapter_captures);
-    } else {
-        eprintln!("[session-debug] RESTORE: ws={workspace_id}, pane={pane_id}, NOT FOUND");
-    }
     Ok(result)
 }
 
@@ -450,15 +432,7 @@ pub fn cache_terminal_scrollback(
     adapter_state: tauri::State<'_, crate::session_adapters::AdapterState>,
     mut payload: ScrollbackPayload,
 ) -> Result<(), String> {
-    eprintln!(
-        "[session-debug] CACHE: sid={}, pane={}, ws={}",
-        payload.session_id, payload.pane_id, payload.workspace_id
-    );
     enrich_with_adapter_captures(&mut payload, &adapter_state, &app_state);
-    eprintln!(
-        "[session-debug] CACHE final: adapter_id={:?}, captures={:?}",
-        payload.adapter_id, payload.adapter_captures
-    );
     let session_id = payload.session_id.clone();
     cache.put(&session_id, payload);
     Ok(())
@@ -480,13 +454,8 @@ pub fn uncache_terminal_scrollback(
 #[tauri::command]
 pub fn flush_scrollback_cache(cache: tauri::State<'_, ScrollbackCache>) -> Result<u32, String> {
     let entries = cache.take_all();
-    eprintln!("[session-debug] FLUSH_CACHE: {} entries", entries.len());
     let mut saved = 0u32;
     for payload in entries {
-        eprintln!(
-            "[session-debug] FLUSH_ENTRY: sid={}, pane={}, adapter_id={:?}, captures={:?}",
-            payload.session_id, payload.pane_id, payload.adapter_id, payload.adapter_captures
-        );
         if !payload.data.is_empty() {
             if let Err(e) = save_scrollback(&payload) {
                 eprintln!("[codemux::scrollback] Failed to flush cached scrollback: {e}");
