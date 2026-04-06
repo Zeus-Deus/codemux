@@ -104,9 +104,8 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
               <span className="truncate max-w-[120px]">{preset.name}</span>
             </Button>
           </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>
-            {preset.description && <div>{preset.description}</div>}
-            <div className="text-muted-foreground">Click to open in new tab · Shift+click to split here</div>
+          <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+            Shift+click to split
           </TooltipContent>
         </Tooltip>
       ))}
