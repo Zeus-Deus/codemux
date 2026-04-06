@@ -20,11 +20,12 @@ Presets are stored in SQLite via the database layer. Five builtin presets ship b
 - toggle bar visibility (Settings > Presets or command palette)
 - builtin presets: Claude Code, Codex, OpenCode, Gemini, Shell
 - custom preset creation with name, description, commands, working directory, icon
-- launch mode: new tab or split pane
+- launch mode: new tab or split pane (Shift+click on preset bar button opens in split pane)
 - auto-run on workspace creation or new tab
 - pin/unpin presets to control bar visibility
 - preset editor in Settings > Presets (full CRUD)
 - default preset selection
+- agent context injection: preset commands for supported tools (Claude, Codex, Pi, Gemini) are automatically wrapped with `$CODEMUX_AGENT_CONTEXT` so agents receive Codemux-aware instructions at launch
 
 ## Builtin Presets
 

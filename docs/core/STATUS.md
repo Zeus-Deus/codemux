@@ -43,15 +43,15 @@ The repo structure is clean and domain-split:
 - Neutral dark shell theming with Omarchy accent sync
 - Sans-serif shell chrome, monospace terminals
 - Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
-- MCP server exposing 26 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
+- MCP server exposing 29 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
+- Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
 
 ## Partial / Being Hardened
 
 - Browser pane: screenshot-driven, functional but lower fidelity than native
 - OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
 - AI merge resolver: backend and frontend working, needs testing depth and live validation
-- Session persistence: scrollback saved/restored on close/open, adapter-based auto-resume for CLI tools (Claude Code)
-- Browser automation depth: basic commands work, missing wait conditions and DOM inspection
+- Browser automation depth: DOM commands, coordinate commands, and OS-level input work; wait conditions and JS evaluation added in v0.24.0
 
 ## Known Constraints
 
@@ -59,7 +59,7 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
-- Feature docs exist for all major subsystems: auth, browser, changes panel, file editor, GitHub issues, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, search, settings sync, setup-teardown, terminal, worktree setup
+- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, file editor, GitHub issues, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, search, session persistence, settings sync, setup-teardown, terminal, worktree setup
 
 ## React Frontend Status
 
@@ -83,7 +83,7 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 - Synced settings (per-user server-synced with offline cache)
 - Semantic theming: shadcn oklch dark mode + custom --success/--danger/--warning tokens
 - Terminal theme reads dynamically from CSS variables via MutationObserver
-- Tauri bridge: 80+ typed command wrappers, 8 event helpers, all types ported
+- Tauri bridge: 120+ typed command wrappers, 12 event helpers, all types ported
 
 ### Remaining Gaps
 
@@ -96,4 +96,4 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, browser, changes-panel, file-editor, github-issues, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, search, settings-sync, setup-teardown, terminal, worktree-setup)
+- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, file-editor, github-issues, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, search, session-persistence, settings-sync, setup-teardown, terminal, worktree-setup)

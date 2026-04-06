@@ -45,20 +45,23 @@
 ## Immediate Priority Order
 
 1. Harden OpenFlow reliability and intervention flow
-2. Add tasks system (Linear/GitHub issue integration)
-3. Improve browser pane fidelity (wait conditions, DOM inspection, DevTools)
-4. Add notification sound playback
-5. Add memory drawer UI
-6. Add context menus on workspace rows, sections, and panes
-7. Add custom keybind editor
-8. Linux release packaging and polish
-9. Cross-platform preparation (macOS, Windows)
+2. Add notification sound playback
+3. Add memory drawer UI
+4. Add context menus on workspace rows, sections, and panes
+5. Linux release packaging and polish
+6. Cross-platform preparation (macOS, Windows)
 
 ## Recently Completed
 
+- Session persistence: terminal scrollback save/restore and adapter-based resume
+- GitHub issue integration (link issues to workspaces, issue picker, auto-branch naming)
+- Browser wait conditions, JS evaluation, and CSS style inspection (MCP tools, 26→29)
+- Custom keybind editor in Settings
+- Agent context injection for preset launches (Claude, Codex, Pi, Gemini)
+- Auto-update system (AppImage in-app update, toast notification)
 - Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
 - AI merge conflict resolver with temp-branch safety model
-- MCP server for agent self-orchestration (26 tools via JSON-RPC 2.0)
+- MCP server for agent self-orchestration (29 tools via JSON-RPC 2.0)
 - Settings panel (keyboard shortcuts, appearance, project scripts)
 - Auth system (GitHub OAuth, email/password, email verification)
 - Synced settings (per-user server-synced with offline cache)

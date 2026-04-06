@@ -26,7 +26,7 @@ On startup, Codemux can automatically write its MCP server config into `~/.claud
 
 Most tools delegate to the Codemux control socket (`$XDG_RUNTIME_DIR/codemux.sock`), reusing the same Rust helper implementations as the Tauri command layer and CLI. Git tools shell out to `git` in the workspace directory. The workspace is resolved from `CODEMUX_WORKSPACE_ID` env var.
 
-## Tools (26)
+## Tools (29)
 
 ### Browser — Tier 1: DOM-based (7)
 
@@ -56,6 +56,14 @@ Most tools delegate to the Codemux control socket (`$XDG_RUNTIME_DIR/codemux.soc
 |------|-------------|
 | `browser_click_os` | Click via ydotool (bypasses anti-bot) |
 | `browser_type_os` | Type via ydotool (bypasses anti-bot) |
+
+### Browser — Info & Evaluation (3)
+
+| Tool | Description |
+|------|-------------|
+| `browser_get_styles` | Get computed CSS styles for an element by selector |
+| `browser_wait` | Wait for an element (by selector) or text to appear on the page |
+| `browser_evaluate` | Execute arbitrary JavaScript in the browser and return the result |
 
 ### Workspace (3)
 
@@ -91,7 +99,7 @@ Most tools delegate to the Codemux control socket (`$XDG_RUNTIME_DIR/codemux.soc
 
 ## What Works Today
 
-- Full MCP server with 26 tools over stdio transport
+- Full MCP server with 29 tools over stdio transport
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace and pane control for agent self-orchestration
 - Git operations scoped to the agent's workspace directory

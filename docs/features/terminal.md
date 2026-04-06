@@ -29,10 +29,11 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 
 ## Current Constraints
 
-- scrollback is lost on app restart (sessions are not persisted)
-- no session save/restore (layout persists, terminal content does not)
 - no split-pane multiplexing within a single PTY (splits are separate sessions)
 - no inline image rendering (sixel/iTerm2 protocols)
+- scrollback persistence is plain text only (no image content from sixel/iTerm2)
+
+Note: terminal scrollback is saved and restored across app restarts. See `docs/features/session-persistence.md` for the full persistence and adapter system.
 
 ## Important Touch Points
 

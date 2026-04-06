@@ -40,3 +40,4 @@
 - CLI browser commands sharing the same session
 - browser data management in Settings (clear cookies, clear all data)
 - inspector panel for web content debugging
+- v0.24.0 info and evaluation tools: `browser_wait`, `browser_evaluate`, `browser_get_styles`

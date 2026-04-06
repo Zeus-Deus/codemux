@@ -34,13 +34,18 @@ codemux browser open <url>
 
 Opens a URL in the browser pane. Always use this instead of `xdg-open` or `open`.
 
-### Get Accessibility Snapshot
+### Get Snapshot
 
 ```bash
 codemux browser snapshot [browser_id]
+codemux browser snapshot --dom [browser_id]
 ```
 
-Returns the page's accessibility tree. Use this to discover what elements exist before clicking or filling. The `browser_id` is optional (defaults to the active browser).
+Without `--dom`: returns the page's accessibility tree.
+
+With `--dom`: returns interactive DOM elements with CSS selectors and bounding boxes (useful for coordinate-based actions).
+
+Use this to discover what elements exist before clicking or filling. The `browser_id` is optional (defaults to the active browser).
 
 ### Click an Element
 
@@ -193,6 +198,79 @@ Get console output.
 
 ```json
 {"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"console"}}}
+```
+
+#### click_at
+
+Click at viewport coordinates (left, right, or double click).
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"click_at","x":500,"y":300,"click_type":"left"}}}
+```
+
+#### type_at
+
+Type text, optionally at specific coordinates. If `x`/`y` omitted, types at current focus.
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"type_at","text":"hello","x":500,"y":300}}}
+```
+
+#### scroll_at
+
+Scroll at coordinates in a direction (up/down/left/right).
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"scroll_at","x":500,"y":300,"direction":"down","amount":3}}}
+```
+
+#### key_press
+
+Send a key press (Enter, Tab, Escape, ArrowDown, etc.).
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"key_press","key":"Enter"}}}
+```
+
+#### drag
+
+Drag from one point to another.
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"drag","start_x":100,"start_y":200,"end_x":400,"end_y":200}}}
+```
+
+#### click_os
+
+Click via ydotool (OS-level, bypasses anti-bot detection).
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"click_os","x":500,"y":300}}}
+```
+
+#### type_os
+
+Type via ydotool (OS-level, bypasses anti-bot detection).
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"type_os","text":"hello"}}}
+```
+
+#### get_styles
+
+Get computed CSS styles for an element.
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"get_styles","selector":"#main"}}}
+```
+
+#### wait
+
+Wait for an element or text to appear on the page.
+
+```json
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"wait","selector":"#loaded"}}}
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"wait","text":"Success"}}}
 ```
 
 ### Create a Browser Pane (Socket)

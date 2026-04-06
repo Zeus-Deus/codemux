@@ -47,6 +47,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Notifications: `docs/features/notifications.md`
+- Auto-update: `docs/features/auto-update.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`

@@ -23,7 +23,7 @@ The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYVW). State managemen
 - terminal integration: `src/components/terminal/TerminalPane.tsx` (xterm.js + PTY via Tauri Channel)
 - React hooks: `src/hooks/` (useTauriEvent, useAppStateInit, useKeyboardShortcuts, useThemeColors)
 - zustand stores: `src/stores/` (app-store.ts for AppStateSnapshot, ui-store.ts for local UI state)
-- Tauri bridge: `src/tauri/commands.ts` (80+ typed invoke wrappers), `src/tauri/events.ts` (8 event helpers), `src/tauri/types.ts` (all shared types)
+- Tauri bridge: `src/tauri/commands.ts` (120+ typed invoke wrappers), `src/tauri/events.ts` (12 event helpers), `src/tauri/types.ts` (all shared types)
 - CSS variables: `src/globals.css` (oklch color tokens in :root and .dark, custom --success/--danger/--warning)
 
 The frontend talks to Rust through typed wrappers in `src/tauri/commands.ts` plus the `app-state-changed` event stream. Components never import from `@tauri-apps/api` directly.

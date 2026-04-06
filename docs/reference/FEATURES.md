@@ -111,7 +111,9 @@
 ## Persistence
 
 - Full workspace layout persists across restarts (tabs, pane trees, surfaces, titles)
-- Terminal sessions are respawned on restart (fresh shell, layout preserved)
+- Terminal scrollback saved to disk on close and restored on open (including inactive tabs)
+- Adapter-based session resume for CLI tools (Claude Code `--resume`/`--continue` via hook-captured session IDs)
+- Alternate screen buffer detection — TUI panes get clean shells instead of garbled content
 - Browser sessions restored with URL history
 - Notification state persisted
 - Notification sound preference persisted
@@ -140,7 +142,7 @@
 
 ## MCP Server
 
-- JSON-RPC 2.0 MCP server over stdio transport (26 tools)
+- JSON-RPC 2.0 MCP server over stdio transport (29 tools)
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace, pane, notification, and git tools for agent self-orchestration
 - Auto-configuration for Claude Code and Claude Desktop
@@ -160,7 +162,7 @@
 - `src/components/terminal/TerminalPane.tsx` — xterm.js terminal with PTY connection
 - `src/components/ui/` — shadcn primitives (sidebar, tabs, resizable, etc.)
 - `src/stores/app-store.ts` — zustand global state from Tauri backend
-- `src/tauri/commands.ts` — typed Tauri invoke wrappers (80+ commands)
+- `src/tauri/commands.ts` — typed Tauri invoke wrappers (120+ commands)
 - `src/hooks/use-keyboard-shortcuts.ts` — global keyboard shortcuts
 - `src-tauri/src/state/state_impl.rs` — Backend state management
 - `src-tauri/src/commands/workspace.rs` — Tauri command handlers
