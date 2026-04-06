@@ -530,7 +530,11 @@ function PresetEditorSheet({
           ) : (
             <div />
           )}
-          <Button size="sm" onClick={() => onOpenChange(false)}>
+          <Button
+            size="sm"
+            className="bg-foreground text-background hover:bg-foreground/90"
+            onClick={() => onOpenChange(false)}
+          >
             Done
           </Button>
         </SheetFooter>
