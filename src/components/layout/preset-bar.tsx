@@ -45,10 +45,9 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
 
   const pinnedPresets = presetStore.presets.filter((p) => p.pinned);
 
-  const handleLaunch = (preset: TerminalPreset) => {
-    applyPreset(workspaceId, preset.id, preset.launch_mode).catch(
-      console.error,
-    );
+  const handleLaunch = (preset: TerminalPreset, e: React.MouseEvent) => {
+    const mode = e.shiftKey ? "split_pane" as const : undefined;
+    applyPreset(workspaceId, preset.id, mode).catch(console.error);
   };
 
   const handleToggleBar = (checked: boolean) => {
@@ -99,17 +98,16 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
               variant="ghost"
               size="xs"
               className="gap-1.5 shrink-0"
-              onClick={() => handleLaunch(preset)}
+              onClick={(e) => handleLaunch(preset, e)}
             >
               <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
               <span className="truncate max-w-[120px]">{preset.name}</span>
             </Button>
           </TooltipTrigger>
-          {preset.description && (
-            <TooltipContent side="bottom" sideOffset={4}>
-              {preset.description}
-            </TooltipContent>
-          )}
+          <TooltipContent side="bottom" sideOffset={4}>
+            {preset.description && <div>{preset.description}</div>}
+            <div className="text-muted-foreground">Click to open in new tab · Shift+click to split here</div>
+          </TooltipContent>
         </Tooltip>
       ))}
 

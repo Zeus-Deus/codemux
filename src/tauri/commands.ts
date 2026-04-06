@@ -704,9 +704,9 @@ export const setPresetPinned = (id: string, pinned: boolean) =>
 export const applyPreset = (
   workspaceId: string,
   presetId: string,
-  launchMode: LaunchMode,
+  overrideMode?: LaunchMode,
 ) =>
-  invoke("apply_preset", { workspaceId, presetId, launchMode });
+  invoke("apply_preset", { workspaceId, presetId, overrideMode });
 
 export const setPresetBarVisible = (visible: boolean) =>
   invoke("set_preset_bar_visible", { visible });
