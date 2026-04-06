@@ -81,7 +81,11 @@ import {
   gitStashPush,
   gitStashPop,
   getCommitFiles,
+  activateWorkspace,
+  closeWorkspace,
+  createWorkspace,
 } from "@/tauri/commands";
+import { toast } from "@/lib/toast";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -947,6 +951,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
 
   const config = useAppStore((s) => s.appState?.config);
+  const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
   const aiEnabled = config?.ai_commit_message_enabled ?? true;
 
   const generation = useAiCommitStore((s) => s.getGeneration(workspace.workspace_id));
@@ -1247,6 +1252,41 @@ export function ChangesPanel({ workspace }: Props) {
   const [showMergeIntoDialog, setShowMergeIntoDialog] = useState(false);
   const [mergeIntoDeleteBranch, setMergeIntoDeleteBranch] = useState(false);
 
+  /** After merge+delete, switch to the main workspace and close the dead feature workspace. */
+  const transitionToBaseWorkspace = useCallback(async (targetBranch: string) => {
+    const projectRoot = workspace.project_root ?? workspace.cwd;
+    const currentWsId = workspace.workspace_id;
+
+    // Find an existing workspace on the base branch in the same project
+    const baseWs = workspaces.find(
+      (ws) => ws.git_branch === targetBranch
+        && ws.workspace_id !== currentWsId
+        && (ws.project_root === projectRoot || ws.cwd === projectRoot),
+    );
+
+    let targetWsId: string | null = baseWs?.workspace_id ?? null;
+
+    if (!targetWsId) {
+      // No workspace for base branch — create one at the project root
+      try {
+        targetWsId = await createWorkspace(projectRoot);
+      } catch (err) {
+        toast.error(`Could not create workspace for ${targetBranch}: ${err}`);
+        return; // Don't close current workspace — better to stay on detached HEAD
+      }
+    }
+
+    await activateWorkspace(targetWsId);
+    toast.success(`Merged into ${targetBranch} — switched workspace`);
+
+    // Close the dead feature workspace (UI-only, worktree already gone)
+    try {
+      await closeWorkspace(currentWsId, false);
+    } catch {
+      // Non-blocking — workspace will just linger in sidebar
+    }
+  }, [workspace, workspaces]);
+
   const handleMergeIntoBase = async () => {
     if (busy || isMerging) return;
     setBusyAction("merge");
@@ -1259,6 +1299,10 @@ export function ChangesPanel({ workspace }: Props) {
       if (result.status === "already_up_to_date") {
         setMergeSuccess(`Already up to date — nothing to merge into ${baseBranch}`);
       } else if (result.status === "merged") {
+        if (mergeIntoDeleteBranch) {
+          await transitionToBaseWorkspace(baseBranch);
+          return; // workspace is closing — skip refresh
+        }
         setMergeSuccess(`Successfully merged ${result.source_branch} into ${baseBranch}`);
       } else if (result.status === "conflicts" && result.temp_branch) {
         setMergeIntoBaseState({
@@ -1290,6 +1334,11 @@ export function ChangesPanel({ workspace }: Props) {
         mergeIntoBaseState.sourceBranch,
         mergeIntoBaseState.deleteSourceAfter,
       );
+      if (mergeIntoBaseState.deleteSourceAfter) {
+        setMergeIntoBaseState(null);
+        await transitionToBaseWorkspace(mergeIntoBaseState.baseBranch);
+        return; // workspace is closing — skip refresh
+      }
       setMergeSuccess(`Successfully merged ${mergeIntoBaseState.sourceBranch} into ${mergeIntoBaseState.baseBranch}`);
       setMergeIntoBaseState(null);
       refresh();
