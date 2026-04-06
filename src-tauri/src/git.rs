@@ -854,6 +854,36 @@ pub struct MergeIntoBaseResult {
     pub conflicted_files: Vec<ConflictFile>,
 }
 
+/// After `update-ref`, the worktree where `base_branch` is checked out still has
+/// stale files on disk.  Find that worktree via `git worktree list --porcelain`
+/// and run `reset --hard HEAD` to sync its working tree.
+/// Failures are silently ignored — the ref update already succeeded and stale
+/// files are annoying but not data-loss.
+fn refresh_base_worktree(repo_path: &Path, base_branch: &str) {
+    let output = match run_git(repo_path, &["worktree", "list", "--porcelain"]) {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+
+    let target_ref = format!("refs/heads/{}", base_branch);
+    let mut current_path: Option<&str> = None;
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current_path = Some(path);
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if branch == target_ref {
+                if let Some(path) = current_path {
+                    let _ = run_git(Path::new(path), &["reset", "--hard", "HEAD"]);
+                    return;
+                }
+            }
+        } else if line.is_empty() {
+            current_path = None;
+        }
+    }
+}
+
 /// Safely merge the current branch into a base branch using a temporary resolver branch.
 /// Main is NEVER modified until the merge is proven clean.
 pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch: bool) -> Result<MergeIntoBaseResult, String> {
@@ -933,6 +963,7 @@ pub fn merge_into_base(repo_path: &Path, base_branch: &str, delete_source_branch
         }
         let temp_commit = run_git(repo_path, &["rev-parse", &temp_branch])?;
         run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
+        refresh_base_worktree(repo_path, base_branch);
 
         if delete_source_branch {
             // Delete source while still on temp (can't delete a checked-out branch)
@@ -1015,6 +1046,7 @@ pub fn complete_merge_into_base(
     }
     let temp_commit = run_git(repo_path, &["rev-parse", temp_branch])?;
     run_git(repo_path, &["update-ref", &format!("refs/heads/{}", base_branch), temp_commit.trim()])?;
+    refresh_base_worktree(repo_path, base_branch);
 
     if delete_source_branch {
         // Delete source while still on temp (can't delete a checked-out branch)
@@ -3273,6 +3305,54 @@ C  source.txt -> copy.txt";
         // Main in the parent repo also reflects the update
         let parent_log = run_git(&repo, &["log", "--oneline", "-1"]).unwrap();
         assert!(parent_log.contains("Merge feature into"), "parent should see merge: {}", parent_log);
+
+        // Main worktree files on disk must reflect the merged content (not stale)
+        let on_disk = std::fs::read_to_string(repo.join("feature.txt")).unwrap();
+        assert_eq!(on_disk, "worktree work", "main worktree file must match merged content");
+    }
+
+    #[test]
+    fn test_merge_into_base_worktree_main_files_updated() {
+        let (_dir, repo, wt) = setup_worktree_merge_scenario();
+        let main = main_branch(&repo);
+
+        // Create a file on main first so we can verify it changes
+        std::fs::write(repo.join("shared.txt"), "original from main").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared"]).unwrap();
+
+        // Pull into worktree, modify, and add a new file
+        run_git(&wt, &["merge", main]).unwrap();
+        std::fs::write(wt.join("shared.txt"), "updated by feature").unwrap();
+        std::fs::write(wt.join("new-feature.txt"), "brand new file").unwrap();
+        run_git(&wt, &["add", "."]).unwrap();
+        run_git(&wt, &["commit", "-m", "feature changes"]).unwrap();
+
+        // Verify main worktree still has old content before merge
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "original from main",
+        );
+        assert!(!repo.join("new-feature.txt").exists());
+
+        let result = merge_into_base(&wt, main, false).unwrap();
+        assert_eq!(result.status, "merged");
+
+        // After merge, main worktree files on disk must reflect merged content
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt")).unwrap(),
+            "updated by feature",
+            "shared.txt in main worktree must have merged content",
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("new-feature.txt")).unwrap(),
+            "brand new file",
+            "new-feature.txt must appear in main worktree after merge",
+        );
+
+        // Git status in main worktree must be clean (no fake unstaged changes)
+        let main_status = git_status(&repo).unwrap();
+        assert!(main_status.is_empty(), "main worktree must be clean after merge, got: {:?}", main_status);
     }
 
     #[test]

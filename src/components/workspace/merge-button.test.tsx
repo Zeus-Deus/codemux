@@ -699,4 +699,60 @@ describe("Post-merge workspace cleanup", () => {
 
     vi.useRealTimers();
   });
+
+  it("after merge+delete, selects main workspace from same project only", async () => {
+    const user = userEvent.setup();
+
+    // Project A main workspace — different project, also on "main"
+    const projectAMainWs = {
+      ...mainWorkspace,
+      workspace_id: "ws-projectA-main",
+      title: "Project A Main",
+      cwd: "/home/user/projectA",
+      project_root: "/home/user/projectA",
+      git_branch: "main",
+    };
+
+    // Project B main workspace — same project as current feature workspace
+    const projectBMainWs = {
+      ...mainWorkspace,
+      workspace_id: "ws-projectB-main",
+      title: "Project B Main",
+      cwd: "/home/user/project",
+      project_root: "/home/user/project",
+      git_branch: "main",
+    };
+
+    // Current feature workspace is in project B
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false },
+        // Project A's main appears first — must NOT be selected
+        workspaces: [projectAMainWs, mockWorkspace, projectBMainWs],
+      },
+    };
+
+    mockMergeIntoBase.mockResolvedValue({
+      status: "merged",
+      source_branch: "feat/my-feature",
+      temp_branch: null,
+      conflicted_files: [],
+    });
+
+    renderPanel();
+    await flushPromises();
+    await triggerMergeIntoBaseWithDelete(user);
+
+    await waitFor(() => {
+      expect(mockMergeIntoBase).toHaveBeenCalledWith("/home/user/project", "main", true);
+    });
+
+    await waitFor(() => {
+      // Must activate project B's main workspace, NOT project A's
+      expect(mockActivateWorkspace).toHaveBeenCalledWith("ws-projectB-main");
+    });
+
+    // Project A's workspace must NOT have been activated
+    expect(mockActivateWorkspace).not.toHaveBeenCalledWith("ws-projectA-main");
+  });
 });

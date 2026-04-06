@@ -1261,7 +1261,7 @@ export function ChangesPanel({ workspace }: Props) {
     const baseWs = workspaces.find(
       (ws) => ws.git_branch === targetBranch
         && ws.workspace_id !== currentWsId
-        && (ws.project_root === projectRoot || ws.cwd === projectRoot),
+        && (ws.project_root ?? ws.cwd) === projectRoot,
     );
 
     let targetWsId: string | null = baseWs?.workspace_id ?? null;
