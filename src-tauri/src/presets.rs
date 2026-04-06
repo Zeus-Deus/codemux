@@ -112,6 +112,19 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_new_tab: false,
         },
         TerminalPreset {
+            id: "builtin-pi".into(),
+            name: "Pi".into(),
+            description: Some("Launch Pi coding agent".into()),
+            commands: vec!["pi".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("pi".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+        },
+        TerminalPreset {
             id: "builtin-shell".into(),
             name: "Shell".into(),
             description: Some("Open a new shell".into()),
@@ -235,7 +248,7 @@ mod tests {
     #[test]
     fn default_store_has_all_builtins() {
         let store = default_store();
-        assert_eq!(store.presets.len(), 5);
+        assert_eq!(store.presets.len(), 6);
         assert!(store.bar_visible);
         assert!(store.presets.iter().all(|p| p.is_builtin));
     }
@@ -244,7 +257,7 @@ mod tests {
     fn load_presets_returns_defaults_on_missing_file() {
         let db = DatabaseStore::new_in_memory();
         let store = load_presets(&db);
-        assert_eq!(store.presets.len(), 5);
+        assert_eq!(store.presets.len(), 6);
         assert!(store.bar_visible);
     }
 
@@ -257,7 +270,7 @@ mod tests {
 
         let loaded = load_presets(&db);
         assert!(!loaded.bar_visible);
-        assert_eq!(loaded.presets.len(), 5);
+        assert_eq!(loaded.presets.len(), 6);
     }
 
     #[test]
@@ -270,7 +283,7 @@ mod tests {
 
         // Load should re-add missing builtins
         let loaded = load_presets(&db);
-        assert_eq!(loaded.presets.len(), 5);
+        assert_eq!(loaded.presets.len(), 6);
     }
 
     fn make_custom_preset(id: &str, name: &str) -> TerminalPreset {
@@ -384,14 +397,14 @@ mod tests {
         let mut store = default_store();
         store.presets.push(make_custom_preset("custom-1", "To Delete"));
         save_presets(&db, &store).unwrap();
-        assert_eq!(load_presets(&db).presets.len(), 6);
+        assert_eq!(load_presets(&db).presets.len(), 7);
 
         let mut loaded = load_presets(&db);
         loaded.presets.retain(|p| p.id != "custom-1");
         save_presets(&db, &loaded).unwrap();
 
         let reloaded = load_presets(&db);
-        assert_eq!(reloaded.presets.len(), 5); // only builtins remain
+        assert_eq!(reloaded.presets.len(), 6); // only builtins remain
         assert!(reloaded.presets.iter().all(|p| p.is_builtin));
     }
 

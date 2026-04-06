@@ -231,7 +231,7 @@ pub fn apply_preset(
         preset
             .commands
             .iter()
-            .map(|cmd| crate::agent_context::inject_agent_context(cmd))
+            .map(|cmd| crate::agent_context::inject_agent_context(cmd, &workspace_id))
             .collect()
     };
 

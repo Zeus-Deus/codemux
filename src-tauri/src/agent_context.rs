@@ -64,14 +64,29 @@ pub fn build_agent_context(
 ///
 /// The context is passed via the `$CODEMUX_AGENT_CONTEXT` env var (set on all PTY sessions).
 /// Shell double-quote expansion handles multiline text correctly.
-pub fn inject_agent_context(command: &str) -> String {
+///
+/// Gemini CLI has no CLI flag — it reads `GEMINI_SYSTEM_MD` pointing to a file. For Gemini,
+/// we prefix the command with an inline write that dumps `$CODEMUX_AGENT_CONTEXT` to a temp
+/// file and sets the env var, so the file is only created when Gemini actually launches.
+pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
     let binary = command.split_whitespace().next().unwrap_or("");
     match binary {
         "claude" => {
             format!("{command} --system-prompt \"$CODEMUX_AGENT_CONTEXT\"")
         }
-        // Other agents: extend as their system prompt flags are known.
-        // "codex" | "gemini" | "opencode" => ...
+        "codex" => {
+            format!("{command} -c instructions=\"$CODEMUX_AGENT_CONTEXT\"")
+        }
+        "pi" => {
+            format!("{command} --append-system-prompt \"$CODEMUX_AGENT_CONTEXT\"")
+        }
+        "gemini" => {
+            let path = format!("/tmp/codemux-{workspace_id}-gemini-system.md");
+            format!(
+                "printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > {path} && GEMINI_SYSTEM_MD={path} {command}"
+            )
+        }
+        // OpenCode: no CLI injection mechanism available.
         _ => command.to_string(),
     }
 }
@@ -149,7 +164,7 @@ mod tests {
 
     #[test]
     fn inject_claude_adds_system_prompt() {
-        let result = inject_agent_context("claude --dangerously-skip-permissions");
+        let result = inject_agent_context("claude --dangerously-skip-permissions", "ws-1");
         assert_eq!(
             result,
             "claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\""
@@ -158,25 +173,25 @@ mod tests {
 
     #[test]
     fn inject_unknown_agent_unchanged() {
-        let result = inject_agent_context("codex --full-auto");
-        assert_eq!(result, "codex --full-auto");
+        let result = inject_agent_context("vim main.rs", "ws-1");
+        assert_eq!(result, "vim main.rs");
     }
 
     #[test]
     fn inject_empty_command_unchanged() {
-        let result = inject_agent_context("");
+        let result = inject_agent_context("", "ws-1");
         assert_eq!(result, "");
     }
 
     #[test]
     fn inject_shell_command_unchanged() {
-        let result = inject_agent_context("ls -la");
+        let result = inject_agent_context("ls -la", "ws-1");
         assert_eq!(result, "ls -la");
     }
 
     #[test]
     fn inject_claude_with_p_flag() {
-        let result = inject_agent_context("claude -p test");
+        let result = inject_agent_context("claude -p test", "ws-1");
         assert!(result.contains("--system-prompt"));
         assert!(result.starts_with("claude -p test"));
     }
@@ -185,7 +200,47 @@ mod tests {
     fn inject_claude_already_has_system_prompt() {
         // Presets don't have --system-prompt, but if somehow one does,
         // we still append (no dedup needed — double system prompts are fine).
-        let result = inject_agent_context("claude --system-prompt \"existing\"");
+        let result = inject_agent_context("claude --system-prompt \"existing\"", "ws-1");
         assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
+    }
+
+    #[test]
+    fn inject_codex_adds_instructions() {
+        let result = inject_agent_context("codex --full-auto", "ws-1");
+        assert_eq!(
+            result,
+            "codex --full-auto -c instructions=\"$CODEMUX_AGENT_CONTEXT\""
+        );
+    }
+
+    #[test]
+    fn inject_pi_adds_append_system_prompt() {
+        let result = inject_agent_context("pi", "ws-1");
+        assert_eq!(
+            result,
+            "pi --append-system-prompt \"$CODEMUX_AGENT_CONTEXT\""
+        );
+    }
+
+    #[test]
+    fn inject_pi_with_flags() {
+        let result = inject_agent_context("pi --model sonnet", "ws-1");
+        assert!(result.starts_with("pi --model sonnet"));
+        assert!(result.contains("--append-system-prompt"));
+    }
+
+    #[test]
+    fn inject_gemini_writes_file_and_sets_env() {
+        let result = inject_agent_context("gemini --yolo", "test-ws-gemini");
+        // Should prefix with inline file write + env var, then the original command
+        assert!(result.contains("GEMINI_SYSTEM_MD=/tmp/codemux-test-ws-gemini-gemini-system.md"));
+        assert!(result.ends_with("gemini --yolo"));
+        assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
+    }
+
+    #[test]
+    fn inject_opencode_unchanged() {
+        let result = inject_agent_context("opencode", "ws-1");
+        assert_eq!(result, "opencode");
     }
 }

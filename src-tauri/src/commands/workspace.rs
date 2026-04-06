@@ -296,7 +296,7 @@ pub fn create_worktree_workspace(
                 preset
                     .commands
                     .iter()
-                    .map(|cmd| crate::agent_context::inject_agent_context(cmd))
+                    .map(|cmd| crate::agent_context::inject_agent_context(cmd, &workspace_id.0))
                     .collect()
             };
 
