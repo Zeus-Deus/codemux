@@ -171,6 +171,20 @@ fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
     }
 }
 
+/// Pick the best CWD for a restored PTY session.  Prefers the scrollback
+/// metadata's `working_directory` when it is non-empty and still exists on
+/// disk, so that CWD-scoped tools (`claude --resume`) find their sessions.
+/// Falls back to `fallback` otherwise.
+fn resolve_session_cwd(scrollback_working_dir: &str, fallback: &str) -> String {
+    if !scrollback_working_dir.is_empty()
+        && std::path::Path::new(scrollback_working_dir).is_dir()
+    {
+        scrollback_working_dir.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
 fn build_resume_launch_command(original_command: &str, resume_args: &str) -> String {
     let original = original_command.trim();
     let args = resume_args.trim();
@@ -634,6 +648,13 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
             if let Some((ws_id, pane_id, meta)) =
                 crate::scrollback::find_scrollback_meta_for_session(&session_id)
             {
+                // Override CWD with the original working directory so CWD-scoped
+                // tools (e.g. `claude --resume`) find their sessions.
+                let effective_cwd = resolve_session_cwd(
+                    &meta.working_directory,
+                    &session_working_dir(&app_state, &session_id),
+                );
+                cmd.cwd(&effective_cwd);
                 cmd.env("CODEMUX_PANE_ID", &pane_id);
                 if let Some(resume_command) =
                     resolve_resume_command(&snapshot, &meta, &adapter_state)
@@ -2277,5 +2298,29 @@ mod tests {
         let env_a = env_map(owner_a);
         assert_eq!(env_a["CODEMUX_WORKSPACE_PATH"], "/home/user/projects/repo");
         assert_eq!(env_a["CODEMUX_BRANCH"], "main");
+    }
+
+    // ── resolve_session_cwd tests ─────────────────────────────────
+
+    #[test]
+    fn resolve_session_cwd_uses_scrollback_dir_when_exists() {
+        // /tmp always exists on any system
+        let result = resolve_session_cwd("/tmp", "/fallback");
+        assert_eq!(result, "/tmp");
+    }
+
+    #[test]
+    fn resolve_session_cwd_falls_back_when_dir_missing() {
+        let result = resolve_session_cwd(
+            "/nonexistent/worktree/that/was/deleted",
+            "/home/fallback",
+        );
+        assert_eq!(result, "/home/fallback");
+    }
+
+    #[test]
+    fn resolve_session_cwd_falls_back_on_empty_string() {
+        let result = resolve_session_cwd("", "/home/fallback");
+        assert_eq!(result, "/home/fallback");
     }
 }
