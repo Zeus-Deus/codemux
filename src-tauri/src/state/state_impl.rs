@@ -4139,4 +4139,75 @@ mod tests {
         let should_create = session.pane_id.is_none() && !session.user_dismissed;
         assert!(!should_create, "Pane should NOT be auto-creatable after dismissed detach");
     }
+
+    #[test]
+    fn preset_workspace_reuses_default_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Single,
+        );
+
+        // Workspace starts with exactly 1 default "Terminal" tab.
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert_eq!(ws.tabs.len(), 1);
+        assert_eq!(ws.tabs[0].title, "Terminal");
+        assert!(ws.tabs[0].icon.is_none());
+
+        // --- Single-command preset: reuse the default tab ---
+        let default_tab_id = ws.tabs[0].tab_id.clone();
+        let default_session = collect_terminal_sessions(&ws.surfaces)
+            .into_iter()
+            .next()
+            .expect("default tab should have a terminal session");
+        drop(snap);
+
+        // Rename + set icon on the existing tab (mirrors workspace.rs reuse path).
+        store
+            .rename_tab(&ws_id.0, &default_tab_id, "Claude Code".into())
+            .unwrap();
+        store
+            .set_tab_icon(&ws_id.0, &default_tab_id, Some("claude".into()))
+            .unwrap();
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert_eq!(ws.tabs.len(), 1, "single-command preset should reuse the default tab");
+        assert_eq!(ws.tabs[0].title, "Claude Code");
+        assert_eq!(ws.tabs[0].icon.as_deref(), Some("claude"));
+
+        // Session ID should be unchanged.
+        let session_after = collect_terminal_sessions(&ws.surfaces)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(default_session, session_after, "session ID must be stable after rename");
+        drop(snap);
+
+        // --- Multi-command preset: second command creates a new tab ---
+        let (new_tab_id, new_session) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create_tab for second command should succeed");
+        store
+            .rename_tab(&ws_id.0, &new_tab_id, "Claude Code".into())
+            .unwrap();
+        store
+            .set_tab_icon(&ws_id.0, &new_tab_id, Some("claude".into()))
+            .unwrap();
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert_eq!(ws.tabs.len(), 2, "two-command preset should produce exactly 2 tabs");
+        assert_ne!(
+            ws.tabs[0].tab_id, ws.tabs[1].tab_id,
+            "tabs should have distinct IDs"
+        );
+        assert!(new_session.is_some(), "new tab should have its own session");
+        assert_ne!(
+            default_session,
+            new_session.unwrap().0,
+            "new tab session must differ from the reused default"
+        );
+    }
 }

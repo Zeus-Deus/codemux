@@ -307,44 +307,68 @@ pub fn create_worktree_workspace(
 
             let sessions_arc = pty_state.sessions.clone();
 
-            for command in &commands {
-                let tab_result = state.create_tab(&workspace_id.0, TabKind::Terminal);
-                if let Ok((tab_id, session_id)) = tab_result {
-                    let _ = state.rename_tab(&workspace_id.0, &tab_id, preset.name.clone());
-                    let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
+            // Grab the default tab's ID and session so the first preset command
+            // reuses it instead of creating a duplicate tab.
+            let default_tab: Option<(String, String)> = {
+                let snap = state.snapshot();
+                snap.workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == workspace_id.0)
+                    .and_then(|w| {
+                        let tab = w.tabs.first()?;
+                        let session = crate::state::collect_terminal_sessions(&w.surfaces)
+                            .into_iter()
+                            .next()?;
+                        Some((tab.tab_id.clone(), session))
+                    })
+            };
 
-                    if let Some(session_id) = session_id {
-                        terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
-
-                        if !command.is_empty() {
-                            let (cmd, needs_pty_injection) =
-                                crate::branch_name::prepare_agent_command(
-                                    &preset.id,
-                                    command,
-                                    initial_prompt.as_deref(),
-                                );
-
-                            let sessions = sessions_arc.clone();
-                            let sid = session_id.0.clone();
-                            super::presets::write_command_when_ready(
-                                sessions.clone(),
-                                sid.clone(),
-                                cmd,
-                                120,
-                            );
-
-                            // For agents that need PTY injection, write prompt after agent starts
-                            // using a longer settle time for agent TUI initialization.
-                            if needs_pty_injection {
-                                if let Some(ref prompt) = initial_prompt {
-                                    super::presets::write_command_when_ready(
-                                        sessions_arc.clone(),
-                                        session_id.0.clone(),
-                                        prompt.clone(),
-                                        1500,
-                                    );
-                                }
+            for (i, command) in commands.iter().enumerate() {
+                // Reuse the default terminal tab for the first preset command;
+                // create new tabs only for additional commands.
+                let (tab_id, session_id) = if i == 0 && default_tab.is_some() {
+                    let (tid, sid) = default_tab.as_ref().unwrap();
+                    (tid.clone(), sid.clone())
+                } else {
+                    match state.create_tab(&workspace_id.0, TabKind::Terminal) {
+                        Ok((tid, sid)) => {
+                            if let Some(ref s) = sid {
+                                terminal::spawn_pty_for_session(app.clone(), s.0.clone());
                             }
+                            (tid, sid.map(|s| s.0).unwrap_or_default())
+                        }
+                        Err(_) => continue,
+                    }
+                };
+
+                let _ = state.rename_tab(&workspace_id.0, &tab_id, preset.name.clone());
+                let _ = state.set_tab_icon(&workspace_id.0, &tab_id, preset.icon.clone());
+
+                if !session_id.is_empty() && !command.is_empty() {
+                    let (cmd, needs_pty_injection) =
+                        crate::branch_name::prepare_agent_command(
+                            &preset.id,
+                            command,
+                            initial_prompt.as_deref(),
+                        );
+
+                    super::presets::write_command_when_ready(
+                        sessions_arc.clone(),
+                        session_id.clone(),
+                        cmd,
+                        120,
+                    );
+
+                    // For agents that need PTY injection, write prompt after agent starts
+                    // using a longer settle time for agent TUI initialization.
+                    if needs_pty_injection {
+                        if let Some(ref prompt) = initial_prompt {
+                            super::presets::write_command_when_ready(
+                                sessions_arc.clone(),
+                                session_id,
+                                prompt.clone(),
+                                1500,
+                            );
                         }
                     }
                 }
