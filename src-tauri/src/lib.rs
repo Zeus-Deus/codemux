@@ -338,8 +338,12 @@ pub fn run() {
 
                                     async_handle.unlisten(listener);
 
-                                    // Flush layout state
+                                    // Refresh scrollback metadata for sessions that were
+                                    // never re-serialized by the frontend (inactive workspaces).
                                     let app_state: tauri::State<'_, state::AppStateStore> = async_handle.state();
+                                    scrollback::refresh_stale_scrollback_metadata(&app_state);
+
+                                    // Flush layout state
                                     state::flush_persisted_state(&app_state);
 
                                     // Now actually close the window. The re-entry guard
@@ -354,6 +358,7 @@ pub fn run() {
                             } else {
                                 // Session restore disabled — close immediately
                                 let app_state: tauri::State<'_, state::AppStateStore> = close_handle.state();
+                                scrollback::refresh_stale_scrollback_metadata(&app_state);
                                 state::flush_persisted_state(&app_state);
                             }
                         }
@@ -375,6 +380,12 @@ pub fn run() {
             observability.increment_metric("startup_count");
             observability.log("app", observability::LogLevel::Info, "Codemux startup".into(), vec![]);
             config::watch_theme_file(handle.clone());
+
+            // Hook server must be running BEFORE PTYs spawn so that restored
+            // sessions get CODEMUX_HOOK_PORT in their environment.
+            hooks::start_hook_server(app.handle().clone());
+            hooks::register_claude_code_hooks();
+
             terminal::spawn_missing_ptys(handle);
 
             // Initialize the project index from the active workspace's CWD.
@@ -390,8 +401,6 @@ pub fn run() {
             }
 
             control::spawn_control_server(app.handle().clone());
-            hooks::start_hook_server(app.handle().clone());
-            hooks::register_claude_code_hooks();
 
             // Periodically refresh git info for the active workspace
             let git_handle = app.handle().clone();

@@ -405,6 +405,55 @@ fn enrich_with_adapter_captures(
     }
 }
 
+/// Refresh scrollback metadata files with fresh adapter captures from the
+/// in-memory snapshot.  Called during the close sequence so that sessions whose
+/// panes were never mounted (inactive workspaces) still get up-to-date captures
+/// written to disk.  Only the metadata sidecar is touched — scrollback content
+/// is left as-is.
+pub fn refresh_stale_scrollback_metadata(store: &crate::state::AppStateStore) {
+    let snapshot = store.snapshot();
+    for session in &snapshot.terminal_sessions {
+        let captures = &session.adapter_captures;
+        if captures.is_empty() {
+            continue;
+        }
+        // Locate the existing metadata file for this session on disk.
+        let Some((ws_id, pane_id, mut meta)) =
+            find_scrollback_meta_for_session(&session.session_id.0)
+        else {
+            continue;
+        };
+        // Merge snapshot captures into the metadata (snapshot wins on conflict).
+        let mut changed = false;
+        for (key, value) in captures {
+            if meta.adapter_captures.get(key) != Some(value) {
+                meta.adapter_captures
+                    .insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            continue;
+        }
+        let path = meta_path(&ws_id, &pane_id);
+        match serde_json::to_string_pretty(&meta) {
+            Ok(json) => {
+                if let Err(e) = fs::write(&path, json) {
+                    eprintln!(
+                        "[codemux::scrollback] Failed to refresh metadata for {}/{}: {e}",
+                        ws_id, pane_id
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[codemux::scrollback] Failed to serialize refreshed metadata: {e}"
+                );
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub fn save_terminal_scrollback(
     app_state: tauri::State<'_, crate::state::AppStateStore>,
@@ -563,14 +612,16 @@ mod tests {
 
     #[test]
     fn find_scrollback_meta_for_session_works() {
-        let ws = format!("test-ws-find-{}", std::process::id());
-        let payload = test_payload(&ws, "pane-1");
+        let pid = std::process::id();
+        let ws = format!("test-ws-find-{pid}");
+        let sid = format!("sess-find-{pid}");
+        let payload = test_payload_with_session(&ws, "pane-1", &sid);
         save_scrollback(&payload).unwrap();
 
-        let found = find_scrollback_meta_for_session("sess-1").unwrap();
+        let found = find_scrollback_meta_for_session(&sid).unwrap();
         assert_eq!(found.0, payload.workspace_id);
         assert_eq!(found.1, "pane-1");
-        assert_eq!(found.2.session_id, "sess-1");
+        assert_eq!(found.2.session_id, sid);
 
         remove_workspace_scrollback(&ws);
     }
@@ -686,6 +737,143 @@ mod tests {
         // Both panes should now be on disk
         assert!(load_scrollback(&ws, "pane-1").is_some());
         assert!(load_scrollback(&ws, "pane-2").is_some());
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    // ── Bug 3: refresh_stale_scrollback_metadata tests ────────────
+
+    /// Build a test payload with a unique session ID to avoid collisions when
+    /// `find_scrollback_meta_for_session` scans all workspace directories.
+    fn test_payload_with_session(ws: &str, pane: &str, session_id: &str) -> ScrollbackPayload {
+        ScrollbackPayload {
+            pane_id: pane.into(),
+            session_id: session_id.into(),
+            workspace_id: ws.into(),
+            working_directory: "/tmp".into(),
+            original_command: Some("claude --dangerously-skip-permissions".into()),
+            cols: 120,
+            rows: 40,
+            data: "test scrollback content\r\nline 2\r\n".into(),
+            adapter_captures: HashMap::new(),
+            adapter_id: None,
+            alternate_buffer: false,
+        }
+    }
+
+    fn store_with_session(ws_id: &str, session_id: &str, captures: HashMap<String, String>) -> crate::state::AppStateStore {
+        use crate::state::*;
+        let store = AppStateStore::default();
+        let mut snap = store.snapshot();
+        snap.terminal_sessions.push(TerminalSessionSnapshot {
+            session_id: SessionId(session_id.into()),
+            title: "test".into(),
+            shell: None,
+            cwd: "/tmp".into(),
+            cols: 120,
+            rows: 40,
+            state: TerminalSessionState::Ready,
+            last_message: None,
+            exit_code: None,
+            original_command: Some("claude".into()),
+            adapter_captures: captures,
+        });
+        snap.active_workspace_id = WorkspaceId(ws_id.into());
+        store.replace_snapshot(snap);
+        store
+    }
+
+    #[test]
+    fn refresh_updates_stale_adapter_captures() {
+        let pid = std::process::id();
+        let ws = format!("test-ws-rfrsh-upd-{pid}");
+        let sid = format!("sess-rfrsh-upd-{pid}");
+
+        // Save scrollback with old capture
+        let mut payload = test_payload_with_session(&ws, "pane-1", &sid);
+        payload.adapter_captures.insert("claude_session_id".into(), "old-uuid".into());
+        save_scrollback(&payload).unwrap();
+
+        // Build store where the snapshot has a fresh capture
+        let mut captures = HashMap::new();
+        captures.insert("claude_session_id".into(), "new-uuid".into());
+        let store = store_with_session(&ws, &sid, captures);
+
+        refresh_stale_scrollback_metadata(&store);
+
+        // Verify metadata on disk was updated
+        let restored = load_scrollback(&ws, "pane-1").unwrap();
+        assert_eq!(
+            restored.meta.adapter_captures.get("claude_session_id").unwrap(),
+            "new-uuid"
+        );
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    #[test]
+    fn refresh_keeps_existing_when_snapshot_has_no_captures() {
+        let pid = std::process::id();
+        let ws = format!("test-ws-rfrsh-keep-{pid}");
+        let sid = format!("sess-rfrsh-keep-{pid}");
+
+        // Save scrollback with existing capture
+        let mut payload = test_payload_with_session(&ws, "pane-1", &sid);
+        payload.adapter_captures.insert("claude_session_id".into(), "old-uuid".into());
+        save_scrollback(&payload).unwrap();
+
+        // Store with empty captures — simulates dead PTY
+        let store = store_with_session(&ws, &sid, HashMap::new());
+
+        refresh_stale_scrollback_metadata(&store);
+
+        // Old capture should be preserved (not wiped)
+        let restored = load_scrollback(&ws, "pane-1").unwrap();
+        assert_eq!(
+            restored.meta.adapter_captures.get("claude_session_id").unwrap(),
+            "old-uuid"
+        );
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    #[test]
+    fn refresh_skips_sessions_without_scrollback_on_disk() {
+        // Store has a session but no scrollback file exists — should not crash
+        let mut captures = HashMap::new();
+        captures.insert("claude_session_id".into(), "uuid".into());
+        let store = store_with_session("nonexistent-ws", "sess-no-disk", captures);
+
+        // Should complete without error
+        refresh_stale_scrollback_metadata(&store);
+    }
+
+    #[test]
+    fn refresh_no_write_when_captures_already_match() {
+        let pid = std::process::id();
+        let ws = format!("test-ws-rfrsh-noop-{pid}");
+        let sid = format!("sess-rfrsh-noop-{pid}");
+
+        // Save with captures that already match the snapshot
+        let mut payload = test_payload_with_session(&ws, "pane-1", &sid);
+        payload.adapter_captures.insert("claude_session_id".into(), "same-uuid".into());
+        save_scrollback(&payload).unwrap();
+
+        let original_meta_json = std::fs::read_to_string(meta_path(&ws, "pane-1")).unwrap();
+        let original: ScrollbackMeta = serde_json::from_str(&original_meta_json).unwrap();
+        let original_saved_at = original.saved_at;
+
+        // Store with identical captures
+        let mut captures = HashMap::new();
+        captures.insert("claude_session_id".into(), "same-uuid".into());
+        let store = store_with_session(&ws, &sid, captures);
+
+        refresh_stale_scrollback_metadata(&store);
+
+        // saved_at should NOT have changed (no write occurred)
+        let after_meta_json = std::fs::read_to_string(meta_path(&ws, "pane-1")).unwrap();
+        let after: ScrollbackMeta = serde_json::from_str(&after_meta_json).unwrap();
+        assert_eq!(after.saved_at, original_saved_at);
 
         remove_workspace_scrollback(&ws);
     }

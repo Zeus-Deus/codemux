@@ -430,6 +430,19 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     None
 }
 
+/// Find the workspace that owns a terminal session by walking each workspace's
+/// pane tree.  Returns `None` for orphaned sessions (no workspace references them).
+fn find_owning_workspace<'a>(
+    snapshot: &'a crate::state::AppStateSnapshot,
+    session_id: &str,
+) -> Option<&'a crate::state::WorkspaceSnapshot> {
+    snapshot.workspaces.iter().find(|ws| {
+        ws.surfaces
+            .iter()
+            .any(|s| crate::state::find_terminal_pane_id(&s.root, session_id).is_some())
+    })
+}
+
 fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -> String {
     app_state
         .snapshot()
@@ -570,26 +583,30 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
 
     let snapshot = app_state.snapshot();
-    let active_workspace_id = snapshot.active_workspace_id.0.clone();
-    let active_ws = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == active_workspace_id);
+
+    // Find the workspace that owns this session by walking each workspace's
+    // pane tree.  Orphaned sessions (no workspace references them) get only
+    // session-level env vars — no workspace-specific injection, to avoid
+    // silently using the wrong workspace's context.
+    let owning_ws = find_owning_workspace(&snapshot, &session_id);
 
     cmd.env("CODEMUX", "1");
     cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
-    cmd.env("CODEMUX_WORKSPACE_ID", &active_workspace_id);
     cmd.env("CODEMUX_SURFACE_ID", session_id.clone());
     cmd.env("CODEMUX_SESSION_ID", session_id.clone());
     cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
     cmd.env("BROWSER", "codemux browser open");
 
-    // Worktree environment variables and dynamic agent context
-    if let Some(ws) = active_ws {
+    if let Some(ws) = owning_ws {
+        cmd.env("CODEMUX_WORKSPACE_ID", &ws.workspace_id.0);
         for (key, val) in workspace_pty_env(ws) {
             cmd.env(&key, val);
         }
     } else {
+        eprintln!(
+            "[codemux::terminal] No owning workspace found for session {session_id}; \
+             skipping workspace env injection"
+        );
         cmd.env(
             "CODEMUX_AGENT_CONTEXT",
             crate::agent_context::build_agent_context(None, None, None, None),
@@ -2063,5 +2080,202 @@ mod tests {
         assert!(m.contains_key("CODEMUX_AGENT_CONTEXT"));
         assert!(m["CODEMUX_AGENT_CONTEXT"].contains("Codemux"));
         assert!(m["CODEMUX_AGENT_CONTEXT"].contains("codemux browser"));
+    }
+
+    // ── Bug 1: find_owning_workspace tests ────────────────────────
+
+    /// Build a workspace with a single terminal pane in its surface tree.
+    fn test_workspace_with_pane(
+        id: &str,
+        title: &str,
+        cwd: &str,
+        git_branch: Option<&str>,
+        worktree_path: Option<&str>,
+        project_root: Option<&str>,
+        session_id: &str,
+    ) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        let mut ws = test_workspace(id, title, cwd, git_branch, worktree_path, project_root);
+        ws.surfaces = vec![SurfaceSnapshot {
+            surface_id: SurfaceId(format!("surf-{id}")),
+            title: "Terminal".into(),
+            root: PaneNodeSnapshot::Terminal {
+                pane_id: PaneId(format!("pane-{session_id}")),
+                session_id: SessionId(session_id.into()),
+                title: "shell".into(),
+            },
+            active_pane_id: PaneId(format!("pane-{session_id}")),
+        }];
+        ws
+    }
+
+    fn test_snapshot(
+        active_id: &str,
+        workspaces: Vec<crate::state::WorkspaceSnapshot>,
+    ) -> crate::state::AppStateSnapshot {
+        use crate::state::*;
+        AppStateSnapshot {
+            schema_version: 1,
+            active_workspace_id: WorkspaceId(active_id.into()),
+            workspaces,
+            terminal_sessions: Vec::new(),
+            browser_sessions: Vec::new(),
+            persistence: PersistenceSchema {
+                schema_version: 1,
+                stores_layout_metadata: true,
+                stores_terminal_metadata: true,
+                stores_live_process_state: false,
+            },
+            config: CodemuxConfigSnapshot {
+                config_version: 1,
+                default_shell: None,
+                theme_source: "system".into(),
+                linux_first: false,
+                notification_sound_enabled: false,
+                ai_commit_message_enabled: false,
+                ai_commit_message_model: None,
+                ai_resolver_enabled: false,
+                ai_resolver_cli: None,
+                ai_resolver_model: None,
+                ai_resolver_strategy: "smart_merge".into(),
+            },
+            detected_ports: Vec::new(),
+            notifications: Vec::new(),
+            pane_statuses: std::collections::HashMap::new(),
+            agent_browser_sessions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_owning_workspace_returns_correct_workspace() {
+        let ws_a = test_workspace_with_pane(
+            "ws-a", "ws-a", "/a", None, None, None, "sess-a",
+        );
+        let ws_b = test_workspace_with_pane(
+            "ws-b", "ws-b", "/b", Some("feat"), Some("/b"), Some("/repo"), "sess-b",
+        );
+        let snapshot = test_snapshot("ws-a", vec![ws_a, ws_b]);
+
+        // Session in workspace B should resolve to workspace B, not active workspace A
+        let owner = find_owning_workspace(&snapshot, "sess-b");
+        assert!(owner.is_some());
+        assert_eq!(owner.unwrap().workspace_id.0, "ws-b");
+
+        // Session in workspace A
+        let owner_a = find_owning_workspace(&snapshot, "sess-a");
+        assert!(owner_a.is_some());
+        assert_eq!(owner_a.unwrap().workspace_id.0, "ws-a");
+    }
+
+    #[test]
+    fn find_owning_workspace_returns_none_for_orphan() {
+        let ws_a = test_workspace_with_pane(
+            "ws-a", "ws-a", "/a", None, None, None, "sess-a",
+        );
+        let snapshot = test_snapshot("ws-a", vec![ws_a]);
+
+        assert!(find_owning_workspace(&snapshot, "sess-orphan").is_none());
+    }
+
+    #[test]
+    fn find_owning_workspace_handles_empty_surfaces() {
+        let ws = test_workspace("ws-empty", "empty", "/e", None, None, None);
+        let snapshot = test_snapshot("ws-empty", vec![ws]);
+
+        // Workspace has no surfaces at all
+        assert!(find_owning_workspace(&snapshot, "sess-any").is_none());
+    }
+
+    #[test]
+    fn find_owning_workspace_searches_split_panes() {
+        use crate::state::*;
+        let mut ws = test_workspace("ws-split", "split", "/s", None, None, None);
+        // Nested: split > split > terminal (3 levels deep)
+        ws.surfaces = vec![SurfaceSnapshot {
+            surface_id: SurfaceId("surf-split".into()),
+            title: "Terminal".into(),
+            root: PaneNodeSnapshot::Split {
+                pane_id: PaneId("split-root".into()),
+                direction: SplitDirection::Horizontal,
+                child_sizes: vec![0.5, 0.5],
+                children: vec![
+                    PaneNodeSnapshot::Split {
+                        pane_id: PaneId("split-inner".into()),
+                        direction: SplitDirection::Vertical,
+                        child_sizes: vec![0.5, 0.5],
+                        children: vec![
+                            PaneNodeSnapshot::Terminal {
+                                pane_id: PaneId("pane-deep".into()),
+                                session_id: SessionId("sess-deep".into()),
+                                title: "deep".into(),
+                            },
+                            PaneNodeSnapshot::Terminal {
+                                pane_id: PaneId("pane-1".into()),
+                                session_id: SessionId("sess-1".into()),
+                                title: "left-bottom".into(),
+                            },
+                        ],
+                    },
+                    PaneNodeSnapshot::Terminal {
+                        pane_id: PaneId("pane-2".into()),
+                        session_id: SessionId("sess-2".into()),
+                        title: "right".into(),
+                    },
+                ],
+            },
+            active_pane_id: PaneId("pane-1".into()),
+        }];
+        let snapshot = test_snapshot("ws-split", vec![ws]);
+
+        // Deeply nested terminal (split > split > terminal) is reachable
+        assert!(find_owning_workspace(&snapshot, "sess-deep").is_some());
+        assert!(find_owning_workspace(&snapshot, "sess-1").is_some());
+        assert!(find_owning_workspace(&snapshot, "sess-2").is_some());
+        assert!(find_owning_workspace(&snapshot, "sess-3").is_none());
+    }
+
+    #[test]
+    fn owning_workspace_env_vars_use_correct_workspace() {
+        // The actual bug scenario: workspace A is active, session belongs to workspace B.
+        // Verify env vars come from workspace B, not workspace A.
+        let ws_a = test_workspace_with_pane(
+            "ws-a",
+            "main-ws",
+            "/home/user/projects/repo",
+            Some("main"),
+            None,
+            Some("/home/user/projects/repo"),
+            "sess-a",
+        );
+        let ws_b = test_workspace_with_pane(
+            "ws-b",
+            "feature-ws",
+            "/home/user/.codemux/worktrees/repo/feature",
+            Some("feat/feature"),
+            Some("/home/user/.codemux/worktrees/repo/feature"),
+            Some("/home/user/projects/repo"),
+            "sess-b",
+        );
+        let snapshot = test_snapshot("ws-a", vec![ws_a, ws_b]);
+
+        // Look up workspace B's session
+        let owner = find_owning_workspace(&snapshot, "sess-b").unwrap();
+        assert_eq!(owner.workspace_id.0, "ws-b");
+
+        // Verify env vars come from workspace B
+        let env = env_map(owner);
+        assert_eq!(
+            env["CODEMUX_WORKSPACE_PATH"],
+            "/home/user/.codemux/worktrees/repo/feature"
+        );
+        assert_eq!(env["CODEMUX_BRANCH"], "feat/feature");
+        assert_eq!(env["CODEMUX_ROOT_PATH"], "/home/user/projects/repo");
+        assert_eq!(env["CODEMUX_WORKSPACE_NAME"], "feature-ws");
+
+        // Verify workspace A would produce different values
+        let owner_a = find_owning_workspace(&snapshot, "sess-a").unwrap();
+        let env_a = env_map(owner_a);
+        assert_eq!(env_a["CODEMUX_WORKSPACE_PATH"], "/home/user/projects/repo");
+        assert_eq!(env_a["CODEMUX_BRANCH"], "main");
     }
 }
