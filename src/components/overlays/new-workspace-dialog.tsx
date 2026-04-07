@@ -30,6 +30,7 @@ import {
   X,
   CircleDot,
 } from "lucide-react";
+import { toast } from "@/lib/toast";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -56,7 +57,6 @@ import {
   pickFilesDialog,
   suggestIssueBranchName,
   linkWorkspaceIssue,
-  getGithubIssue,
   getGithubIssueByPath,
 } from "@/tauri/commands";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
@@ -327,13 +327,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       ? `${prompt.trim()}\n\nAttached files:\n${attachments.map((f) => `- ${f}`).join("\n")}`
       : prompt.trim();
 
-    // Inject linked issue context into prompt
+    // Inject linked issue context into prompt.
+    // Always use path-based lookup to avoid stale workspace resolution.
     if (linkedIssue) {
       let issueBody: string | null = null;
       try {
-        const full = projectWorkspaceId
-          ? await getGithubIssue(projectWorkspaceId, linkedIssue.number)
-          : await getGithubIssueByPath(projectDir, linkedIssue.number);
+        const full = await getGithubIssueByPath(projectDir, linkedIssue.number);
         issueBody = full.body ?? null;
       } catch {
         // Non-blocking: proceed without body
@@ -394,7 +393,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
         dbAddRecentProject(projectDir, pName).catch(console.error);
         if (linkedIssue) {
-          linkWorkspaceIssue(wsId, linkedIssue.number).catch(console.error);
+          try {
+            await linkWorkspaceIssue(wsId, linkedIssue.number);
+          } catch (linkErr) {
+            console.error("Failed to link issue:", linkErr);
+            toast.warning("Workspace created but issue linking failed. You can re-link from the workspace.");
+          }
         }
         removePendingWorkspace(tempId);
         await activateWorkspace(wsId);
@@ -465,9 +469,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         projectDir.split("/").filter(Boolean).pop() || projectDir;
       dbAddRecentProject(projectDir, pName).catch(console.error);
 
-      // Link issue to the new workspace (non-blocking)
+      // Link issue to the new workspace
       if (linkedIssue) {
-        linkWorkspaceIssue(wsId, linkedIssue.number).catch(console.error);
+        try {
+          await linkWorkspaceIssue(wsId, linkedIssue.number);
+        } catch (linkErr) {
+          console.error("Failed to link issue:", linkErr);
+          toast.warning("Workspace created but issue linking failed. You can re-link from the workspace.");
+        }
       }
 
       removePendingWorkspace(tempId);
@@ -492,7 +501,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     worktrees,
     currentBranch,
     linkedIssue,
-    projectWorkspaceId,
     onOpenChange,
     addPendingWorkspace,
     removePendingWorkspace,

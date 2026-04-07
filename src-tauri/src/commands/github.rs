@@ -182,6 +182,8 @@ pub fn suggest_issue_branch_name(issue_number: u64, issue_title: String) -> Resu
 }
 
 /// Resolve workspace cwd from workspace_id (or fall back to project_root).
+/// Validates the returned path is inside a git repository to avoid using
+/// stale or incorrect project_root values from ghost workspaces.
 fn resolve_workspace_cwd(state: &AppStateStore, workspace_id: &str) -> Result<String, String> {
     let snapshot = state.snapshot();
     let ws = snapshot
@@ -189,9 +191,23 @@ fn resolve_workspace_cwd(state: &AppStateStore, workspace_id: &str) -> Result<St
         .iter()
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("No workspace found: {workspace_id}"))?;
+
     // Prefer project_root (main repo) since `gh issue` needs the main repo, not a worktree.
-    Ok(ws
-        .project_root
-        .clone()
-        .unwrap_or_else(|| ws.cwd.clone()))
+    // But validate it's actually a git repo — ghost workspaces can have stale project_root.
+    if let Some(ref root) = ws.project_root {
+        if crate::config::workspace_config::find_git_root(std::path::Path::new(root)).is_some() {
+            return Ok(root.clone());
+        }
+    }
+
+    // Fall back to cwd if project_root is missing or invalid
+    let cwd = &ws.cwd;
+    if crate::config::workspace_config::find_git_root(std::path::Path::new(cwd)).is_some() {
+        return Ok(cwd.clone());
+    }
+
+    Err(format!(
+        "Workspace {workspace_id} has no valid git repository path (project_root: {:?}, cwd: {})",
+        ws.project_root, ws.cwd
+    ))
 }

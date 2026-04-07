@@ -253,6 +253,11 @@ pub fn create_worktree_workspace(
         _ => return Err(format!("Unsupported layout: {layout}")),
     };
 
+    // Validate repo_path is a git repository before creating anything
+    if crate::config::workspace_config::find_git_root(Path::new(&repo_path)).is_none() {
+        return Err(format!("Not a git repository: {repo_path}"));
+    }
+
     let worktree_path =
         crate::git::git_create_worktree(Path::new(&repo_path), &branch, new_branch, base.as_deref())?;
     let wt_path_buf = PathBuf::from(&worktree_path);

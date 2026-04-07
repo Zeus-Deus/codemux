@@ -1233,10 +1233,9 @@ pub fn git_create_worktree(
     new_branch: bool,
     base: Option<&str>,
 ) -> Result<String, String> {
-    let git_root = crate::config::workspace_config::find_git_root(repo_path);
+    let git_root = crate::config::workspace_config::find_git_root(repo_path)
+        .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
     let repo_name = git_root
-        .as_deref()
-        .unwrap_or(repo_path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());

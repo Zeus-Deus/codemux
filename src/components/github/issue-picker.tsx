@@ -94,10 +94,19 @@ export function IssuePickerPanel({
   const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const fetchIssues = useCallback(
-    (search?: string) => {
-      if (workspaceId) return listGithubIssues(workspaceId, search);
+    async (search?: string): Promise<GitHubIssue[]> => {
+      // Try workspace-based lookup first, fall back to path-based if it fails
+      // (e.g. workspace has stale project_root pointing to a non-repo directory)
+      if (workspaceId) {
+        try {
+          return await listGithubIssues(workspaceId, search);
+        } catch (err) {
+          if (projectPath) return listGithubIssuesByPath(projectPath, search);
+          throw err;
+        }
+      }
       if (projectPath) return listGithubIssuesByPath(projectPath, search);
-      return Promise.reject("No workspace or project path");
+      throw new Error("No workspace or project path");
     },
     [workspaceId, projectPath],
   );
