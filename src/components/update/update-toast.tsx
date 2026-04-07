@@ -53,7 +53,7 @@ export function UpdateToast() {
             <p className="text-xs text-muted-foreground mb-3">
               Restart to apply v{updateVersion}
             </p>
-            <Button size="sm" className="w-full" onClick={installAndRestart}>
+            <Button size="sm" className="w-full bg-foreground text-background hover:bg-foreground/90" onClick={installAndRestart}>
               Restart Now
             </Button>
           </div>
@@ -69,13 +69,13 @@ export function UpdateToast() {
           </p>
           <div className="flex gap-2">
             {canAutoUpdate ? (
-              <Button size="sm" className="flex-1" onClick={startDownload}>
+              <Button size="sm" className="flex-1 bg-foreground text-background hover:bg-foreground/90" onClick={startDownload}>
                 Install &amp; Restart
               </Button>
             ) : (
               <Button
                 size="sm"
-                className="flex-1"
+                className="flex-1 bg-foreground text-background hover:bg-foreground/90"
                 onClick={() =>
                   openUrl(
                     `https://github.com/Zeus-Deus/codemux/releases/tag/v${updateVersion}`,
