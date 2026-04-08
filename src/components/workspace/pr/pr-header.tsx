@@ -98,7 +98,7 @@ export function PrHeader({ pr }: Props) {
           href={pr.url}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex items-center gap-1 text-[10px] text-primary hover:underline"
+          className="inline-flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground"
           onClick={(e) => {
             e.preventDefault();
             window.open(pr.url, "_blank");

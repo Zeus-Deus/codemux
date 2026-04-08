@@ -70,8 +70,8 @@ export function PrMergeControls({ pr, cwd, onRefresh }: Props) {
         </Select>
         <Button
           size="xs"
-          className="text-xs h-7"
-          variant={confirmMerge ? "destructive" : "default"}
+          variant={confirmMerge ? "destructive" : "ghost"}
+          className={confirmMerge ? "text-xs h-7" : "text-xs h-7 bg-foreground text-background hover:bg-foreground/90"}
           disabled={merging || pr.mergeable === "CONFLICTING"}
           onClick={handleMerge}
         >
