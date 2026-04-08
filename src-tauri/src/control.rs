@@ -315,6 +315,24 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             )
             .map(|session_id| serde_json::json!({ "session_id": session_id }))
         }
+        "apply_preset" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let pty_state: State<'_, crate::terminal::PtyState> = app.state();
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let preset_id = request.params.get("preset_id").and_then(Value::as_str).unwrap_or_default().to_string();
+            let override_mode = request.params.get("override_mode").and_then(Value::as_str).map(String::from);
+            crate::commands::presets::apply_preset(
+                app.clone(),
+                state,
+                pty_state,
+                presets,
+                workspace_id,
+                preset_id,
+                override_mode,
+            )
+            .map(|()| serde_json::json!({ "ok": true }))
+        }
         "create_browser_pane" => {
             let state: State<'_, AppStateStore> = app.state();
             let pane_id = request.params.get("pane_id").and_then(Value::as_str).unwrap_or_default();

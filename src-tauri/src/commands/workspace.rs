@@ -352,6 +352,8 @@ pub fn create_worktree_workspace(
                             initial_prompt.as_deref(),
                         );
 
+                    state.update_terminal_session_command(&session_id, command.clone());
+
                     super::presets::write_command_when_ready(
                         sessions_arc.clone(),
                         session_id.clone(),
