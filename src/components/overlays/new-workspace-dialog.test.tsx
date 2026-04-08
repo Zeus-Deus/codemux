@@ -70,6 +70,7 @@ import {
   listBranches,
   checkIsGitRepo,
   gitFetchPrune,
+  getGitBranchInfo,
   createWorktreeWorkspace,
   activateWorkspace,
   generateBranchName,
@@ -541,5 +542,29 @@ describe("Fetch before branch listing", () => {
     await waitFor(() => {
       expect(listBranches).toHaveBeenCalledWith("/path/to/project", false);
     });
+  });
+});
+
+describe("Default base branch", () => {
+  it("defaults to main even when repo checkout is on a PR branch", async () => {
+    setAppState("/path/to/project");
+    (getGitBranchInfo as Mock).mockResolvedValue({
+      branch: "feature-pr-branch",
+      ahead: 2,
+      behind: 0,
+    });
+
+    renderDialog(true);
+
+    // Wait for branch data to load
+    await waitFor(() => {
+      expect(getGitBranchInfo).toHaveBeenCalledWith("/path/to/project");
+    });
+
+    // The branch picker button should show "main", not the repo's current branch
+    const dialog = await screen.findByRole("dialog");
+    const branchPicker = within(dialog).getByText("main");
+    expect(branchPicker).toBeInTheDocument();
+    expect(within(dialog).queryByText("feature-pr-branch")).not.toBeInTheDocument();
   });
 });

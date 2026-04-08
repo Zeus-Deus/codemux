@@ -155,6 +155,18 @@ pub fn shell_escape_for_double_quotes(s: &str) -> String {
         .replace('$', "\\$")
         .replace('`', "\\`")
         .replace('!', "\\!")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Escape a string for safe embedding in `$'...'` (ANSI-C quoted) shell arguments.
+/// Unlike double-quote escaping, `$'...'` interprets `\n` as a real newline,
+/// so multi-line prompts are preserved correctly.
+pub fn shell_escape_for_ansi_c_quotes(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// Build the agent launch command, optionally embedding the prompt.
@@ -170,16 +182,16 @@ pub fn prepare_agent_command(
         _ => return (base_command.to_string(), false),
     };
 
-    let escaped = shell_escape_for_double_quotes(prompt);
+    let escaped = shell_escape_for_ansi_c_quotes(prompt);
 
     match preset_id {
         "builtin-claude" => {
-            // Claude CLI: append prompt as initial message argument
-            (format!("{base_command} \"{escaped}\""), false)
+            // Claude CLI: append prompt as ANSI-C quoted argument (preserves newlines)
+            (format!("{base_command} $'{escaped}'"), false)
         }
         "builtin-codex" => {
             // Codex: prompt as positional argument
-            (format!("{base_command} \"{escaped}\""), false)
+            (format!("{base_command} $'{escaped}'"), false)
         }
         _ => {
             // Gemini, OpenCode, custom: inject prompt via PTY after startup
@@ -298,6 +310,21 @@ mod tests {
             Some("fix the login bug"),
         );
         assert!(cmd.contains("fix the login bug"));
+        assert!(cmd.contains("$'"));
+        assert!(!via_pty);
+    }
+
+    #[test]
+    fn prepare_claude_with_multiline_prompt() {
+        let (cmd, via_pty) = prepare_agent_command(
+            "builtin-claude",
+            "claude --dangerously-skip-permissions",
+            Some("Issue #42: broken\nStatus: Open\n\n---\nFix it"),
+        );
+        // Uses $'...' ANSI-C quoting so bash interprets \n as real newlines
+        assert!(cmd.starts_with("claude --dangerously-skip-permissions $'"));
+        assert!(cmd.contains("\\n"));
+        assert!(!cmd.contains('\n')); // no literal newline bytes in the command
         assert!(!via_pty);
     }
 
@@ -324,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_quotes() {
+    fn shell_escape_double_quotes() {
         assert_eq!(
             shell_escape_for_double_quotes(r#"say "hello""#),
             r#"say \"hello\""#
@@ -332,10 +359,72 @@ mod tests {
     }
 
     #[test]
-    fn shell_escape_dollar() {
+    fn shell_escape_double_dollar() {
         assert_eq!(
             shell_escape_for_double_quotes("use $HOME"),
             "use \\$HOME"
         );
+    }
+
+    #[test]
+    fn shell_escape_double_newlines() {
+        assert_eq!(
+            shell_escape_for_double_quotes("line1\nline2\nline3"),
+            "line1\\nline2\\nline3"
+        );
+    }
+
+    #[test]
+    fn shell_escape_double_carriage_return() {
+        assert_eq!(
+            shell_escape_for_double_quotes("line1\r\nline2"),
+            "line1\\r\\nline2"
+        );
+    }
+
+    #[test]
+    fn ansi_c_escape_single_quotes() {
+        assert_eq!(
+            shell_escape_for_ansi_c_quotes("it's a test"),
+            "it\\'s a test"
+        );
+    }
+
+    #[test]
+    fn ansi_c_escape_newlines() {
+        assert_eq!(
+            shell_escape_for_ansi_c_quotes("line1\nline2\nline3"),
+            "line1\\nline2\\nline3"
+        );
+    }
+
+    #[test]
+    fn ansi_c_escape_preserves_dollar_and_backtick() {
+        // $'...' does not expand $vars or `backticks`, so they need no escaping
+        assert_eq!(
+            shell_escape_for_ansi_c_quotes("use $HOME and `cmd`"),
+            "use $HOME and `cmd`"
+        );
+    }
+
+    #[test]
+    fn ansi_c_escape_backslash_before_newline() {
+        // Existing backslash must be escaped BEFORE newline replacement
+        // Input: literal \ then newline then text
+        assert_eq!(
+            shell_escape_for_ansi_c_quotes("path\\\nline2"),
+            "path\\\\\\nline2"
+        );
+        // bash $'path\\\\\\nline2' → path\ + newline + line2
+    }
+
+    #[test]
+    fn ansi_c_escape_multiline_issue_prompt() {
+        let prompt = "Issue #42: Backend broken\nStatus: Open\n\nDescription:\nThe API returns 500\n\n---\nFix the bug";
+        let escaped = shell_escape_for_ansi_c_quotes(prompt);
+        assert!(!escaped.contains('\n')); // no literal newline bytes
+        assert!(escaped.contains("\\n")); // escaped newlines present
+        assert!(escaped.contains("Issue #42"));
+        assert!(escaped.contains("Fix the bug"));
     }
 }

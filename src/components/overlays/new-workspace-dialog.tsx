@@ -204,7 +204,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           setBranchesLoading(false);
           setWorktrees(wt);
           setCurrentBranch(info.branch);
-          setBaseBranch(info.branch ?? "main");
         });
       });
 
