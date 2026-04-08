@@ -37,6 +37,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - MCP server: `docs/features/mcp-server.md`
 - File editor: `docs/features/file-editor.md`
+- File tree: `docs/features/file-tree.md`
 - Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
 - PR integration: `docs/features/pr-integration.md`
@@ -46,6 +47,9 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Session persistence: `docs/features/session-persistence.md`
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`
+- Command palette: `docs/features/command-palette.md`
+- Workspace creation: `docs/features/workspace-creation.md`
+- IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`

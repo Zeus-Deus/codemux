@@ -23,7 +23,8 @@
 - Multiple tabs per workspace (Terminal, Browser, Changes)
 - Terminal tabs each get their own independent pane surface with split support
 - Browser tabs open a full-pane embedded browser
-- Changes/Diff tabs (placeholder — viewer coming soon)
+- Diff tabs with unified and split views, syntax highlighting, and section filtering
+- Editor tabs with CodeMirror 6, language detection, and markdown preview
 - Add tab via "+" dropdown or keyboard shortcuts (Ctrl+T, Ctrl+Shift+B, Ctrl+Shift+D)
 - Close tabs with X button or Ctrl+W (cannot close the last tab)
 - Switch tabs by clicking or Ctrl+1 through Ctrl+9
@@ -147,6 +148,40 @@
 - Workspace, pane, notification, and git tools for agent self-orchestration
 - Auto-configuration for Claude Code and Claude Desktop
 - Launched via `codemux mcp`
+
+## Command Palette
+
+- Ctrl+K opens fuzzy-search overlay with all major actions
+- Action groups: Workspaces, Panes, Tabs, Search, View, Navigation
+- Dynamic workspace switching entries
+- Keybind hints shown inline, reflecting user customizations
+- Quick access to split, close, search, settings, and MCP regeneration
+
+## Workspace Creation
+
+- Multi-step creation dialog with task description, branch selection, and agent preset
+- AI-generated branch names from task description
+- GitHub issue linking with auto-branch naming and prompt context injection
+- PR linking with branch auto-fill
+- File attachments appended to agent prompt
+- Project onboarding flow with package manager detection and setup script configuration
+- Orphan worktree detection and import
+
+## IDE Integration
+
+- Auto-detect installed editors (VS Code, Cursor, VSCodium, Zed, IntelliJ, GoLand, WebStorm, Sublime Text)
+- Title bar launcher button with default editor and dropdown for all detected editors
+- Workspace context menu "Open in Editor" entry
+- Default editor preference synced across devices
+
+## File Tree
+
+- Right sidebar panel showing workspace directory structure
+- Lazy-loaded directory expansion with caching
+- File type icons and size display
+- Gitignored items shown with reduced opacity
+- Hidden files toggle (persisted in settings)
+- Click to open files in built-in editor
 
 ## CLI / Socket Control
 

@@ -16,8 +16,9 @@ PR data is fetched from GitHub through `gh` CLI commands routed via Rust (`src-t
 
 ## What Works Today
 
+- PR creation from panel when no PR exists for the current branch (title, body, base branch, draft toggle)
 - PR header with number, title, state (draft/open/merged/closed), source and target branches, addition/deletion stats, review decision badge, external link to GitHub
-- Review management: approve, request changes, or comment with textarea
+- Review submission: approve, request changes, or comment with textarea
 - Check status display: pass/fail summary with individual check names, status icons, and clickable detail links
 - Deployment info: environment names, state badges (success/pending/failure), preview links
 - Merge controls: squash merge, create merge commit, or rebase merge with dual-confirmation safety
@@ -28,7 +29,6 @@ PR data is fetched from GitHub through `gh` CLI commands routed via Rust (`src-t
 
 - Requires `gh` CLI to be installed and authenticated
 - No inline PR diff view (diffs are in the Changes panel)
-- No PR creation from the panel (creation is via command palette or terminal)
 - Review comments are displayed but cannot be replied to inline
 - No draft PR promotion UI
 

@@ -37,10 +37,16 @@ UserSettings
   git
     default_base_branch: string (default: "main")
   keyboard
-    shortcuts: Record<string, string> (default: {}, not yet UI-editable)
+    shortcuts: Record<string, string> (default: {}, editable via Settings > Shortcuts)
   notifications
     sound_enabled: boolean     (default: true)
     desktop_enabled: boolean   (default: true)
+  file_tree
+    show_hidden_files: boolean (default: false)
+  session_restore
+    enabled: boolean           (default: true)
+    scrollback_lines: number   (default: 5000)
+    max_total_mb: number       (default: 50)
 ```
 
 ### Offline Cache
@@ -89,12 +95,14 @@ Opened via the settings button or command palette. Sections:
 | Account | Personal | Email, name (read-only), sign out | No (auth state) |
 | Appearance | Personal | Theme, font, radius (display-only) | Partial |
 | Notifications | Personal | Sound toggle, desktop toggle | Yes |
-| Shortcuts | Personal | Shortcut reference (read-only display) | No |
+| Shortcuts | Personal | Keybind editor with recording, conflict detection, reset | Yes (via keyboard.shortcuts) |
 | Editor | Editor & Workflow | Default IDE dropdown | Yes |
 | Terminal | Editor & Workflow | Scrollback limit, cursor style | Yes |
 | Presets | Editor & Workflow | Terminal preset management | No (local) |
 | Projects | Editor & Workflow | Setup/teardown/run scripts | No (local) |
 | Git | Editor & Workflow | Default base branch | Yes |
+| File Tree | Editor & Workflow | Show hidden files toggle | Yes |
+| Session Restore | Editor & Workflow | Enable/disable, scrollback lines, disk limit | Yes |
 | Agent | Editor & Workflow | AI commit/resolver config | No (local) |
 
 ## What Works Today
@@ -112,7 +120,7 @@ Opened via the settings button or command palette. Sections:
 ## Current Constraints
 
 - `flush_dirty()` exists but is not called on any automatic trigger (no online-transition flush)
-- Keyboard shortcuts struct syncs but has no UI editor
+- Keyboard shortcuts sync across devices but conflict detection is per-machine only
 - Patch operations do not have offline fallback (will fail if network unavailable)
 - No conflict resolution between devices — last write wins
 - No settings versioning or migration strategy yet
