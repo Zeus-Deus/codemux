@@ -58,6 +58,7 @@ import {
   suggestIssueBranchName,
   linkWorkspaceIssue,
   getGithubIssueByPath,
+  applyPreset,
 } from "@/tauri/commands";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
 
@@ -367,15 +368,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
 
         let wsId: string;
+        let agentHandled = false;
         const orphan = worktrees.find(
           (wt) =>
             wt.branch === openExistingBranch ||
             wt.branch === `refs/heads/${openExistingBranch}`,
         );
 
+        const isDefaultOpen = openExistingBranch === "main" || openExistingBranch === "master";
         if (orphan) {
           wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
-        } else if (openExistingBranch === currentBranch) {
+        } else if (openExistingBranch === currentBranch && isDefaultOpen) {
           wsId = await createWorkspace(projectDir);
         } else {
           wsId = await createWorktreeWorkspace(
@@ -387,6 +390,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             fullPrompt || null,
             selectedAgentId,
           );
+          agentHandled = true;
+        }
+
+        // Launch agent for paths that don't handle it internally
+        if (!agentHandled && selectedAgentId && fullPrompt) {
+          await applyPreset(wsId, selectedAgentId, "current_terminal", fullPrompt);
         }
 
         const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
@@ -432,9 +441,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       }
 
       let wsId: string;
+      let agentHandled = false;
 
-      // Current branch: open as workspace directly
-      if (resolvedBranch === currentBranch && !isNewBranch) {
+      // Default branch (main/master): open as workspace directly.
+      // Feature branches always get a proper worktree — even if currently
+      // checked out (git_create_worktree will switch the main repo away).
+      const isDefault = resolvedBranch === "main" || resolvedBranch === "master";
+      if (resolvedBranch === currentBranch && !isNewBranch && isDefault) {
         wsId = await createWorkspace(projectDir);
       } else {
         // Check for orphan worktree
@@ -460,7 +473,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             fullPrompt || null,
             selectedAgentId,
           );
+          agentHandled = true;
         }
+      }
+
+      // Launch agent for paths that don't handle it internally
+      if (!agentHandled && selectedAgentId && fullPrompt) {
+        await applyPreset(wsId, selectedAgentId, "current_terminal", fullPrompt);
       }
 
       // Track as recent project
@@ -481,6 +500,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       removePendingWorkspace(tempId);
       await activateWorkspace(wsId);
     } catch (err) {
+      toast.error(String(err));
       failPendingWorkspace(tempId, String(err));
       // Auto-remove failed entry after 5 seconds
       setTimeout(() => removePendingWorkspace(tempId), 5000);

@@ -193,6 +193,7 @@ pub fn apply_preset(
     workspace_id: String,
     preset_id: String,
     override_mode: Option<String>,
+    initial_prompt: Option<String>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -243,16 +244,46 @@ pub fn apply_preset(
             let session_id = active_session_for_workspace(&state, &workspace_id)
                 .ok_or_else(|| "No active terminal session in workspace".to_string())?;
 
-            let combined = commands
-                .iter()
-                .filter(|c| !c.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(" && ");
+            if initial_prompt.is_some() {
+                // Agent launch with prompt: rename tab, embed prompt in command
+                let snap = state.snapshot();
+                if let Some(ws) = snap.workspaces.iter().find(|w| w.workspace_id.0 == workspace_id) {
+                    let _ = state.rename_tab(&workspace_id, &ws.active_tab_id, preset.name.clone());
+                    let _ = state.set_tab_icon(&workspace_id, &ws.active_tab_id, preset.icon.clone());
+                }
 
-            if !combined.is_empty() {
-                state.update_terminal_session_command(&session_id, combined.clone());
-                write_command_to_pty(&sessions_arc, &session_id, &combined);
+                for command in &commands {
+                    if command.is_empty() { continue; }
+                    let (cmd, needs_pty_injection) =
+                        crate::branch_name::prepare_agent_command(
+                            &preset_id,
+                            command,
+                            initial_prompt.as_deref(),
+                        );
+                    state.update_terminal_session_command(&session_id, command.clone());
+                    write_command_when_ready(
+                        sessions_arc.clone(), session_id.clone(), cmd, 120,
+                    );
+                    if needs_pty_injection {
+                        if let Some(ref prompt) = initial_prompt {
+                            write_command_when_ready(
+                                sessions_arc.clone(), session_id.clone(), prompt.clone(), 1500,
+                            );
+                        }
+                    }
+                }
+            } else {
+                let combined = commands
+                    .iter()
+                    .filter(|c| !c.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(" && ");
+
+                if !combined.is_empty() {
+                    state.update_terminal_session_command(&session_id, combined.clone());
+                    write_command_to_pty(&sessions_arc, &session_id, &combined);
+                }
             }
         }
         "split_pane" => {

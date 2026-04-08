@@ -322,6 +322,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             let workspace_id = request.params.get("workspace_id").and_then(Value::as_str).unwrap_or_default().to_string();
             let preset_id = request.params.get("preset_id").and_then(Value::as_str).unwrap_or_default().to_string();
             let override_mode = request.params.get("override_mode").and_then(Value::as_str).map(String::from);
+            let initial_prompt = request.params.get("initial_prompt").and_then(Value::as_str).map(String::from);
             crate::commands::presets::apply_preset(
                 app.clone(),
                 state,
@@ -330,6 +331,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 workspace_id,
                 preset_id,
                 override_mode,
+                initial_prompt,
             )
             .map(|()| serde_json::json!({ "ok": true }))
         }

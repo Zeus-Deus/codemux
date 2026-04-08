@@ -1207,6 +1207,23 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
 }
 
 /// Find the remote tracking ref for a branch (e.g. `origin/main` for `main`).
+/// Find the default branch for the repo (main, master, etc.).
+fn find_default_branch(repo_path: &Path) -> Option<String> {
+    // Try origin/HEAD first
+    if let Ok(output) = run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        if let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/") {
+            return Some(branch.to_string());
+        }
+    }
+    // Fallback: try main, then master
+    for candidate in &["main", "master"] {
+        if run_git(repo_path, &["rev-parse", "--verify", *candidate]).is_ok() {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
 /// Returns `None` if no remote ref exists. Only checks `origin` remote
 /// (consistent with the rest of the codebase).
 pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
@@ -1265,6 +1282,18 @@ pub fn git_create_worktree(
         }
         run_git(repo_path, &args)?;
     } else {
+        // If the branch is currently checked out in the main repo, switch the
+        // main repo to the default branch first so the worktree can claim it.
+        let current = run_git_permissive(repo_path, &["branch", "--show-current"]);
+        if current == branch {
+            let default = find_default_branch(repo_path).ok_or_else(|| {
+                format!("Branch '{branch}' is already checked out. Could not find a default branch to switch to.")
+            })?;
+            run_git(repo_path, &["checkout", &default]).map_err(|e| {
+                format!("Cannot switch repo to '{default}' before creating worktree: {e}")
+            })?;
+        }
+
         // Open existing branch: if the branch has a remote counterpart, use -B
         // to reset the local branch to the remote tip, avoiding stale checkouts.
         if let Some(remote_ref) = find_remote_ref(repo_path, branch) {
