@@ -22,6 +22,7 @@ const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
 const mockGetPrDeployments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
 const mockCreatePullRequest = vi.fn().mockResolvedValue(undefined);
+const mockGetDefaultBranch = vi.fn().mockResolvedValue("main");
 
 vi.mock("@/tauri/commands", () => ({
   checkGhStatus: (...args: unknown[]) => mockCheckGhStatus(...args),
@@ -34,6 +35,7 @@ vi.mock("@/tauri/commands", () => ({
   getPrDeployments: (...args: unknown[]) => mockGetPrDeployments(...args),
   listBranches: (...args: unknown[]) => mockListBranches(...args),
   createPullRequest: (...args: unknown[]) => mockCreatePullRequest(...args),
+  getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
 }));
 
 // Mock sub-components to keep tests focused on PrPanel logic
@@ -43,6 +45,7 @@ vi.mock("./pr/pr-reviews", () => ({ PrReviews: () => <div data-testid="pr-review
 vi.mock("./pr/pr-review-actions", () => ({ PrReviewActions: () => <div data-testid="pr-review-actions" /> }));
 vi.mock("./pr/pr-deployments", () => ({ PrDeployments: () => <div data-testid="pr-deployments" /> }));
 vi.mock("./pr/pr-merge-controls", () => ({ PrMergeControls: () => <div data-testid="pr-merge-controls" /> }));
+vi.mock("./pr/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
 
 import { PrPanel } from "./pr-panel";
 import type { WorkspaceSnapshot, PullRequestInfo } from "@/tauri/types";
@@ -117,6 +120,7 @@ beforeEach(() => {
   mockGetPrReviewComments.mockResolvedValue([]);
   mockGetPrInlineComments.mockResolvedValue([]);
   mockGetPrDeployments.mockResolvedValue([]);
+  mockGetDefaultBranch.mockResolvedValue("main");
 });
 
 afterEach(() => {
@@ -315,5 +319,64 @@ describe("error state", () => {
     await waitFor(() => {
       expect(screen.getByText(/gh pr view failed/)).toBeInTheDocument();
     });
+  });
+});
+
+// ── Base branch detection → IncomingPrsView ──
+
+describe("incoming PRs on base branch", () => {
+  it("renders IncomingPrsView when on default branch with no PR", async () => {
+    mockGetDefaultBranch.mockResolvedValue("main");
+    render(<PrPanel workspace={makeWorkspace({ git_branch: "main" })} />);
+    await flushPromises();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("incoming-prs-view")).toBeInTheDocument();
+    });
+    expect(screen.queryByText("No pull request for this branch")).not.toBeInTheDocument();
+  });
+
+  it("renders NoPrView when on feature branch (not default)", async () => {
+    mockGetDefaultBranch.mockResolvedValue("main");
+    render(<PrPanel workspace={makeWorkspace({ git_branch: "feat/my-feature" })} />);
+    await flushPromises();
+
+    await waitFor(() => {
+      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
+  });
+
+  it("renders NoPrView when git_branch is null (detached HEAD)", async () => {
+    mockGetDefaultBranch.mockResolvedValue("main");
+    render(<PrPanel workspace={makeWorkspace({ git_branch: null })} />);
+    await flushPromises();
+
+    await waitFor(() => {
+      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
+  });
+
+  it("renders NoPrView when getDefaultBranch fails", async () => {
+    mockGetDefaultBranch.mockRejectedValue(new Error("git error"));
+    render(<PrPanel workspace={makeWorkspace({ git_branch: "main" })} />);
+    await flushPromises();
+
+    await waitFor(() => {
+      expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    });
+  });
+
+  it("still renders PrView when on default branch with existing PR", async () => {
+    mockGetDefaultBranch.mockResolvedValue("main");
+    mockGetBranchPullRequest.mockResolvedValue(mockPr);
+    render(<PrPanel workspace={makeWorkspace({ git_branch: "main", pr_number: 42, pr_state: "OPEN" })} />);
+    await flushPromises();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("pr-header")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
   });
 });

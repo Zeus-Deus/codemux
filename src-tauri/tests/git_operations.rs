@@ -580,7 +580,7 @@ fn list_branches_includes_created() {
 #[test]
 fn worktree_operations_independent() {
     let (_dir, repo) = create_test_repo();
-    let wt_path_str = git_create_worktree(&repo, "wt-indep", true, None).expect("create wt");
+    let wt_path_str = git_create_worktree(&repo, "wt-indep", true, None, None).expect("create wt");
     let wt_path = PathBuf::from(&wt_path_str);
 
     // Commit in worktree
@@ -601,7 +601,7 @@ fn worktree_operations_independent() {
 #[test]
 fn worktree_status_isolated() {
     let (_dir, repo) = create_test_repo();
-    let wt_path_str = git_create_worktree(&repo, "wt-iso", true, None).expect("create wt");
+    let wt_path_str = git_create_worktree(&repo, "wt-iso", true, None, None).expect("create wt");
     let wt_path = PathBuf::from(&wt_path_str);
 
     // Create untracked file in worktree
@@ -626,7 +626,7 @@ fn worktree_status_isolated() {
 #[test]
 fn worktree_commit_not_in_other_log() {
     let (_dir, repo) = create_test_repo();
-    let wt_path_str = git_create_worktree(&repo, "wt-log", true, None).expect("create wt");
+    let wt_path_str = git_create_worktree(&repo, "wt-log", true, None, None).expect("create wt");
     let wt_path = PathBuf::from(&wt_path_str);
 
     // Commit in worktree

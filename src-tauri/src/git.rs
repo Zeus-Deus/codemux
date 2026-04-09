@@ -1249,6 +1249,7 @@ pub fn git_create_worktree(
     branch: &str,
     new_branch: bool,
     base: Option<&str>,
+    pr_number: Option<u32>,
 ) -> Result<String, String> {
     let git_root = crate::config::workspace_config::find_git_root(repo_path)
         .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
@@ -1296,12 +1297,25 @@ pub fn git_create_worktree(
 
         // Open existing branch: if the branch has a remote counterpart, use -B
         // to reset the local branch to the remote tip, avoiding stale checkouts.
+        // If not found locally, fetch it from origin first (common for PR branches
+        // that were never pulled, or fork PRs that need pull/<n>/head).
+        if find_remote_ref(repo_path, branch).is_none() {
+            // Try direct branch fetch (same-repo PRs / remote branches)
+            if run_git(repo_path, &["fetch", "origin", &format!("{branch}:{branch}")]).is_err() {
+                // Fork PRs: branch lives under pull/<number>/head on origin
+                if let Some(pr_num) = pr_number {
+                    let refspec = format!("pull/{pr_num}/head:{branch}");
+                    let _ = run_git(repo_path, &["fetch", "origin", &refspec]);
+                }
+            }
+        }
         if let Some(remote_ref) = find_remote_ref(repo_path, branch) {
             run_git(
                 repo_path,
                 &["worktree", "add", "-B", branch, &path_str, &remote_ref],
             )?;
         } else {
+            // Branch exists locally after fetch (or was already local)
             run_git(repo_path, &["worktree", "add", &path_str, branch])?;
         }
     }
@@ -1641,7 +1655,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_create_and_remove_worktree() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "feature-test", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "feature-test", true, None, None).expect("create worktree");
         assert!(PathBuf::from(&wt_path).exists(), "worktree dir should exist");
 
         let branches = git_list_branches(&repo, false).expect("list branches");
@@ -1659,7 +1673,7 @@ C  source.txt -> copy.txt";
         let (_dir, repo) = setup_test_repo();
         run_git(&repo, &["branch", "existing-branch"]).expect("create branch");
 
-        let wt_path = git_create_worktree(&repo, "existing-branch", false, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "existing-branch", false, None, None).expect("create worktree");
         assert!(PathBuf::from(&wt_path).exists());
 
         let info = git_branch_info(Path::new(&wt_path)).expect("branch info");
@@ -1680,7 +1694,7 @@ C  source.txt -> copy.txt";
             .or_else(|_| run_git(&repo, &["checkout", "main"]));
 
         // Create worktree based on develop
-        let wt_path = git_create_worktree(&repo, "feature-from-dev", true, Some("develop")).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "feature-from-dev", true, Some("develop"), None).expect("create worktree");
         // The worktree should have dev.txt (inherited from develop)
         assert!(PathBuf::from(&wt_path).join("dev.txt").exists(), "should have develop's file");
 
@@ -1690,8 +1704,8 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_list_worktrees() {
         let (_dir, repo) = setup_test_repo();
-        let wt1 = git_create_worktree(&repo, "wt-one", true, None).expect("create wt1");
-        let wt2 = git_create_worktree(&repo, "wt-two", true, None).expect("create wt2");
+        let wt1 = git_create_worktree(&repo, "wt-one", true, None, None).expect("create wt1");
+        let wt2 = git_create_worktree(&repo, "wt-two", true, None, None).expect("create wt2");
 
         let worktrees = git_list_worktrees(&repo).expect("list worktrees");
         assert!(worktrees.len() >= 3, "should have main + 2 worktrees, got {}", worktrees.len());
@@ -1870,7 +1884,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_preserves_main() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "temp-branch", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "temp-branch", true, None, None).expect("create worktree");
         git_remove_worktree(Path::new(&wt_path), Some("main"), true).expect("remove with main as branch arg");
 
         // main should still exist (it was the branch arg but is protected)
@@ -2149,7 +2163,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_git_operations_in_worktree() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path_str = git_create_worktree(&repo, "wt-ops-test", true, None).expect("create worktree");
+        let wt_path_str = git_create_worktree(&repo, "wt-ops-test", true, None, None).expect("create worktree");
         let wt_path = PathBuf::from(&wt_path_str);
 
         // Write a file in the worktree
@@ -2199,14 +2213,14 @@ C  source.txt -> copy.txt";
         let (_dir, repo) = setup_test_repo();
 
         // Create first worktree
-        let wt1_path = git_create_worktree(&repo, "wt-first", true, None)
+        let wt1_path = git_create_worktree(&repo, "wt-first", true, None, None)
             .expect("create first worktree");
         let wt1 = PathBuf::from(&wt1_path);
         assert!(wt1.exists(), "first worktree should exist");
 
         // Now create a second worktree from INSIDE the first worktree
         // This simulates: user's active workspace is a worktree, they create another
-        let wt2_path = git_create_worktree(&wt1, "wt-second", true, None)
+        let wt2_path = git_create_worktree(&wt1, "wt-second", true, None, None)
             .expect("create second worktree from inside first");
         let wt2 = PathBuf::from(&wt2_path);
         assert!(wt2.exists(), "second worktree should exist");
@@ -2239,7 +2253,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_worktree_branch_with_slashes_sanitized() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "feature/deep/nested", true, None)
+        let wt_path = git_create_worktree(&repo, "feature/deep/nested", true, None, None)
             .expect("create worktree for branch with slashes");
 
         // Slashes in branch name should be replaced with hyphens in directory name
@@ -2261,7 +2275,7 @@ C  source.txt -> copy.txt";
         run_git(&path, &["init"]).expect("git init");
         // No commits — behavior may vary by git version but should not crash
 
-        let result = git_create_worktree(&path, "new-branch", true, None);
+        let result = git_create_worktree(&path, "new-branch", true, None, None);
         // Either succeeds (modern git) or returns Err (older git) — just don't crash
         if let Ok(wt_path) = &result {
             let _ = std::fs::remove_dir_all(wt_path);
@@ -2271,7 +2285,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_delete_workspace_removes_branch() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "test-delete-me", true, None)
+        let wt_path = git_create_worktree(&repo, "test-delete-me", true, None, None)
             .expect("create worktree");
 
         let branches_before = git_list_branches(&repo, false).expect("list before");
@@ -2287,7 +2301,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_close_workspace_keeps_branch() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "test-keep-me", true, None)
+        let wt_path = git_create_worktree(&repo, "test-keep-me", true, None, None)
             .expect("create worktree");
 
         let branches_before = git_list_branches(&repo, false).expect("list before");
@@ -2308,7 +2322,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_clean_no_force() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "clean-wt", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "clean-wt", true, None, None).expect("create worktree");
 
         // Clean worktree should be removable without force
         git_remove_worktree(Path::new(&wt_path), Some("clean-wt"), false).expect("should succeed on clean worktree");
@@ -2318,7 +2332,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_blocks_dirty() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "dirty-wt", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "dirty-wt", true, None, None).expect("create worktree");
 
         // Create uncommitted changes in the worktree
         std::fs::write(PathBuf::from(&wt_path).join("dirty.txt"), "unsaved work").expect("write");
@@ -2336,7 +2350,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_force_overrides_dirty() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "force-dirty-wt", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "force-dirty-wt", true, None, None).expect("create worktree");
 
         // Create uncommitted changes
         std::fs::write(PathBuf::from(&wt_path).join("dirty.txt"), "unsaved work").expect("write");
@@ -2349,7 +2363,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_no_upstream_allowed() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "no-upstream-wt", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "no-upstream-wt", true, None, None).expect("create worktree");
 
         // Commit something in the worktree (no upstream configured)
         run_git(Path::new(&wt_path), &["-c", "user.name=Test", "-c", "user.email=test@test.com",
@@ -2363,7 +2377,7 @@ C  source.txt -> copy.txt";
     #[test]
     fn test_remove_worktree_no_upstream_clean_allows_delete() {
         let (_dir, repo) = setup_test_repo();
-        let wt_path = git_create_worktree(&repo, "local-only-wt", true, None).expect("create worktree");
+        let wt_path = git_create_worktree(&repo, "local-only-wt", true, None, None).expect("create worktree");
 
         // Clean working tree, no upstream — force=false should succeed (lenient policy)
         git_remove_worktree(Path::new(&wt_path), Some("local-only-wt"), false).expect("clean local-only worktree should be deletable without force");
@@ -3301,7 +3315,7 @@ C  source.txt -> copy.txt";
     fn setup_worktree_merge_scenario() -> (TempDir, PathBuf, PathBuf) {
         let (_dir, repo) = setup_test_repo();
         git_config(&repo);
-        let wt_path_str = git_create_worktree(&repo, "feature", true, None)
+        let wt_path_str = git_create_worktree(&repo, "feature", true, None, None)
             .expect("create worktree");
         git_config(&PathBuf::from(&wt_path_str));
         (_dir, repo, PathBuf::from(wt_path_str))
@@ -3951,7 +3965,7 @@ C  source.txt -> copy.txt";
             .or_else(|_| run_git(&local, &["checkout", "main"]));
 
         // Create worktree with dev-base as base — should resolve to origin/dev-base
-        let wt = git_create_worktree(&local, "from-dev", true, Some("dev-base"))
+        let wt = git_create_worktree(&local, "from-dev", true, Some("dev-base"), None)
             .expect("create worktree");
         // The worktree should have base.txt (from origin/dev-base)
         assert!(PathBuf::from(&wt).join("base.txt").exists(), "should inherit from remote base");
@@ -3972,7 +3986,7 @@ C  source.txt -> copy.txt";
         let _ = run_git(&repo, &["checkout", "master"])
             .or_else(|_| run_git(&repo, &["checkout", "main"]));
 
-        let wt = git_create_worktree(&repo, "from-local", true, Some("local-base"))
+        let wt = git_create_worktree(&repo, "from-local", true, Some("local-base"), None)
             .expect("create worktree");
         assert!(PathBuf::from(&wt).join("local.txt").exists(), "should inherit from local base");
         git_remove_worktree(Path::new(&wt), Some("from-local"), true).expect("cleanup");
@@ -4014,7 +4028,7 @@ C  source.txt -> copy.txt";
             .or_else(|_| run_git(&local, &["checkout", "main"]));
 
         // Open existing: should get v2.txt from origin/stale-branch
-        let wt = git_create_worktree(&local, "stale-branch", false, None)
+        let wt = git_create_worktree(&local, "stale-branch", false, None, None)
             .expect("create worktree");
         assert!(
             PathBuf::from(&wt).join("v2.txt").exists(),
@@ -4028,10 +4042,64 @@ C  source.txt -> copy.txt";
         let (_dir, repo) = setup_test_repo();
         run_git(&repo, &["branch", "local-feat"]).expect("create branch");
 
-        let wt = git_create_worktree(&repo, "local-feat", false, None)
+        let wt = git_create_worktree(&repo, "local-feat", false, None, None)
             .expect("create worktree");
         let info = git_branch_info(Path::new(&wt)).expect("branch info");
         assert_eq!(info.branch.as_deref(), Some("local-feat"));
         git_remove_worktree(Path::new(&wt), Some("local-feat"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_pr_number_fetches_fork_branch() {
+        // Simulate a fork PR: a branch that only exists under refs/pull/<n>/head
+        // on the remote, not as a normal branch.
+        let (_dir, local, remote) = setup_test_repo_with_remote();
+
+        // Create a commit on the remote under refs/pull/42/head (simulating GitHub)
+        let staging = _dir.path().join("staging");
+        run_git(_dir.path(), &["clone", remote.to_str().unwrap(), staging.to_str().unwrap()])
+            .expect("clone staging");
+        std::fs::write(staging.join("pr-file.txt"), "from fork").expect("write");
+        run_git(&staging, &["add", "pr-file.txt"]).expect("add");
+        run_git(
+            &staging,
+            &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "-m", "fork PR"],
+        ).expect("commit");
+        // Push to a PR ref on the bare remote
+        run_git(&staging, &["push", "origin", "HEAD:refs/pull/42/head"]).expect("push PR ref");
+
+        // Verify: local has no branch "fork-branch" and no origin/fork-branch
+        assert!(find_remote_ref(&local, "fork-branch").is_none());
+
+        // Without pr_number, this should fail
+        let _ = run_git(&local, &["checkout", "master"])
+            .or_else(|_| run_git(&local, &["checkout", "main"]));
+        let result = git_create_worktree(&local, "fork-branch", false, None, None);
+        assert!(result.is_err(), "should fail without pr_number for unfetched branch");
+
+        // With pr_number, it should fetch from pull/42/head and succeed
+        let wt = git_create_worktree(&local, "fork-branch", false, None, Some(42))
+            .expect("create worktree with pr_number");
+        assert!(
+            PathBuf::from(&wt).join("pr-file.txt").exists(),
+            "worktree should have the fork PR's file"
+        );
+        git_remove_worktree(Path::new(&wt), Some("fork-branch"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn test_worktree_pr_number_not_needed_for_same_repo_branch() {
+        // Branch exists on origin — should work with or without pr_number
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Create and push a branch on origin
+        run_git(&local, &["branch", "same-repo-feat"]).expect("create branch");
+        run_git(&local, &["push", "origin", "same-repo-feat"]).expect("push branch");
+        let _ = run_git(&local, &["checkout", "master"])
+            .or_else(|_| run_git(&local, &["checkout", "main"]));
+
+        let wt = git_create_worktree(&local, "same-repo-feat", false, None, None)
+            .expect("should work without pr_number for origin branch");
+        git_remove_worktree(Path::new(&wt), Some("same-repo-feat"), true).expect("cleanup");
     }
 }

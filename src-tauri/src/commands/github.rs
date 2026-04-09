@@ -43,6 +43,14 @@ pub fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequest
 }
 
 #[tauri::command]
+pub fn list_incoming_prs(
+    path: String,
+    base_branch: String,
+) -> Result<Vec<crate::github::IncomingPrItem>, String> {
+    crate::github::list_incoming_prs(Path::new(&path), &base_branch)
+}
+
+#[tauri::command]
 pub fn merge_pull_request(path: String, pr_number: u32, method: String) -> Result<(), String> {
     crate::github::merge_pull_request(Path::new(&path), pr_number, &method)
 }
@@ -176,10 +184,14 @@ pub fn refresh_workspace_pr(
     };
 
     let pr_info = crate::github::get_branch_pr(Path::new(&cwd))?;
-    let pr_number = pr_info.as_ref().map(|p| p.number);
-    let pr_state = pr_info.as_ref().map(|p| p.state.clone());
-    let pr_url = pr_info.as_ref().map(|p| p.url.clone());
-    state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+    // Only overwrite if we found a PR — don't clear a pr_number that was
+    // explicitly set during PR-checkout (fork branches where gh can't resolve).
+    if pr_info.is_some() {
+        let pr_number = pr_info.as_ref().map(|p| p.number);
+        let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+        let pr_url = pr_info.as_ref().map(|p| p.url.clone());
+        state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+    }
     crate::state::emit_app_state(&app);
     Ok(())
 }

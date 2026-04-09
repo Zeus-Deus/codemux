@@ -242,6 +242,7 @@ pub fn create_worktree_workspace(
     layout: String,
     initial_prompt: Option<String>,
     agent_preset_id: Option<String>,
+    pr_number: Option<u32>,
 ) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
@@ -259,7 +260,7 @@ pub fn create_worktree_workspace(
     }
 
     let worktree_path =
-        crate::git::git_create_worktree(Path::new(&repo_path), &branch, new_branch, base.as_deref())?;
+        crate::git::git_create_worktree(Path::new(&repo_path), &branch, new_branch, base.as_deref(), pr_number)?;
     let wt_path_buf = PathBuf::from(&worktree_path);
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
 
@@ -267,6 +268,10 @@ pub fn create_worktree_workspace(
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
 
     populate_git_info(&state, &workspace_id.0, &wt_path_buf);
+
+    if let Some(pr_num) = pr_number {
+        state.update_workspace_pr_info(&workspace_id.0, Some(pr_num), None, None);
+    }
 
     let snapshot = state.snapshot();
     let session_ids = snapshot

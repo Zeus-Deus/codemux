@@ -145,8 +145,8 @@ pub fn get_default_branch(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn create_worktree(path: String, branch: String, new_branch: bool, base: Option<String>) -> Result<String, String> {
-    crate::git::git_create_worktree(Path::new(&path), &branch, new_branch, base.as_deref())
+pub fn create_worktree(path: String, branch: String, new_branch: bool, base: Option<String>, pr_number: Option<u32>) -> Result<String, String> {
+    crate::git::git_create_worktree(Path::new(&path), &branch, new_branch, base.as_deref(), pr_number)
 }
 
 #[tauri::command]

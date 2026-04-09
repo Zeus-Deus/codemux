@@ -30,6 +30,28 @@ pub struct PullRequestInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncomingPrItem {
+    pub number: u32,
+    pub title: String,
+    pub author: String,
+    #[serde(alias = "headRefName", default)]
+    pub head_branch: Option<String>,
+    #[serde(alias = "isDraft", default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub additions: Option<u32>,
+    #[serde(default)]
+    pub deletions: Option<u32>,
+    #[serde(alias = "reviewDecision", default)]
+    pub review_decision: Option<String>,
+    /// Summarized from statusCheckRollup: "success", "failure", "pending", or None
+    pub checks_status: Option<String>,
+    #[serde(alias = "updatedAt", default)]
+    pub updated_at: Option<String>,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckInfo {
     pub name: String,
     #[serde(alias = "state")]
@@ -482,6 +504,25 @@ pub fn list_pull_requests(
     Ok(arr.iter().map(parse_pr_json).collect())
 }
 
+pub fn list_incoming_prs(
+    repo_path: &Path,
+    base_branch: &str,
+) -> Result<Vec<IncomingPrItem>, String> {
+    let v = run_gh_json(
+        repo_path,
+        &[
+            "pr", "list",
+            "--base", base_branch,
+            "--state", "open",
+            "--limit", "50",
+            "--json", "number,title,author,headRefName,isDraft,updatedAt,additions,deletions,reviewDecision,statusCheckRollup,url",
+        ],
+    )?;
+
+    let arr = v.as_array().ok_or("Expected JSON array from gh pr list")?;
+    Ok(arr.iter().map(parse_incoming_pr_json).collect())
+}
+
 pub fn merge_pull_request(
     repo_path: &Path,
     pr_number: u32,
@@ -715,6 +756,48 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
         review_decision: v["reviewDecision"].as_str().map(|s| s.to_string()),
         checks_passing: None, // populated separately via get_pr_checks
         updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+    }
+}
+
+fn summarize_checks_status(v: &serde_json::Value) -> Option<String> {
+    let checks = v.as_array()?;
+    if checks.is_empty() {
+        return None;
+    }
+    let mut has_pending = false;
+    for check in checks {
+        let state = check["state"].as_str().unwrap_or("");
+        let conclusion = check["conclusion"].as_str().unwrap_or("");
+        let effective = if conclusion.is_empty() { state } else { conclusion };
+        match effective.to_uppercase().as_str() {
+            "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STALE" => {
+                return Some("failure".to_string());
+            }
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+            _ => has_pending = true,
+        }
+    }
+    Some(if has_pending { "pending".to_string() } else { "success".to_string() })
+}
+
+fn parse_incoming_pr_json(v: &serde_json::Value) -> IncomingPrItem {
+    let author = v["author"]["login"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+
+    IncomingPrItem {
+        number: v["number"].as_u64().unwrap_or(0) as u32,
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        author,
+        head_branch: v["headRefName"].as_str().map(|s| s.to_string()),
+        is_draft: v["isDraft"].as_bool().unwrap_or(false),
+        additions: v["additions"].as_u64().map(|n| n as u32),
+        deletions: v["deletions"].as_u64().map(|n| n as u32),
+        review_decision: v["reviewDecision"].as_str().map(|s| s.to_string()),
+        checks_status: summarize_checks_status(&v["statusCheckRollup"]),
+        updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+        url: v["url"].as_str().unwrap_or("").to_string(),
     }
 }
 
@@ -1073,5 +1156,96 @@ mod tests {
         let linked: LinkedIssue = serde_json::from_str(json).unwrap();
         assert_eq!(linked.number, 1);
         assert!(linked.labels.is_empty()); // default empty vec
+    }
+
+    #[test]
+    fn test_parse_incoming_pr_json_full_fields() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "number": 27,
+            "title": "Add user settings page",
+            "author": {"login": "alice"},
+            "headRefName": "feat/settings",
+            "isDraft": false,
+            "updatedAt": "2026-04-08T12:00:00Z",
+            "additions": 110,
+            "deletions": 26,
+            "reviewDecision": "APPROVED",
+            "statusCheckRollup": [
+                {"name": "CI", "state": "SUCCESS", "conclusion": "SUCCESS"}
+            ],
+            "url": "https://github.com/test/repo/pull/27"
+        }"#).unwrap();
+
+        let item = parse_incoming_pr_json(&json);
+        assert_eq!(item.number, 27);
+        assert_eq!(item.title, "Add user settings page");
+        assert_eq!(item.author, "alice");
+        assert_eq!(item.head_branch.as_deref(), Some("feat/settings"));
+        assert!(!item.is_draft);
+        assert_eq!(item.additions, Some(110));
+        assert_eq!(item.deletions, Some(26));
+        assert_eq!(item.review_decision.as_deref(), Some("APPROVED"));
+        assert_eq!(item.checks_status.as_deref(), Some("success"));
+        assert_eq!(item.updated_at.as_deref(), Some("2026-04-08T12:00:00Z"));
+        assert_eq!(item.url, "https://github.com/test/repo/pull/27");
+    }
+
+    #[test]
+    fn test_parse_incoming_pr_json_minimal_fields() {
+        let json: serde_json::Value = serde_json::from_str(r#"{
+            "number": 1,
+            "title": "Fix bug",
+            "author": {"login": "bob"},
+            "url": ""
+        }"#).unwrap();
+
+        let item = parse_incoming_pr_json(&json);
+        assert_eq!(item.number, 1);
+        assert_eq!(item.author, "bob");
+        assert_eq!(item.head_branch, None);
+        assert!(!item.is_draft);
+        assert_eq!(item.additions, None);
+        assert_eq!(item.deletions, None);
+        assert_eq!(item.review_decision, None);
+        assert_eq!(item.checks_status, None);
+    }
+
+    #[test]
+    fn test_summarize_checks_status_all_success() {
+        let v: serde_json::Value = serde_json::from_str(r#"[
+            {"state": "SUCCESS", "conclusion": "SUCCESS"},
+            {"state": "COMPLETED", "conclusion": "NEUTRAL"}
+        ]"#).unwrap();
+        assert_eq!(summarize_checks_status(&v).as_deref(), Some("success"));
+    }
+
+    #[test]
+    fn test_summarize_checks_status_failure() {
+        let v: serde_json::Value = serde_json::from_str(r#"[
+            {"state": "SUCCESS", "conclusion": "SUCCESS"},
+            {"state": "COMPLETED", "conclusion": "FAILURE"}
+        ]"#).unwrap();
+        assert_eq!(summarize_checks_status(&v).as_deref(), Some("failure"));
+    }
+
+    #[test]
+    fn test_summarize_checks_status_pending() {
+        let v: serde_json::Value = serde_json::from_str(r#"[
+            {"state": "SUCCESS", "conclusion": "SUCCESS"},
+            {"state": "PENDING", "conclusion": ""}
+        ]"#).unwrap();
+        assert_eq!(summarize_checks_status(&v).as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn test_summarize_checks_status_empty() {
+        let v: serde_json::Value = serde_json::from_str("[]").unwrap();
+        assert_eq!(summarize_checks_status(&v), None);
+    }
+
+    #[test]
+    fn test_summarize_checks_status_null() {
+        let v = serde_json::Value::Null;
+        assert_eq!(summarize_checks_status(&v), None);
     }
 }

@@ -28,6 +28,7 @@ import {
   getPrDeployments,
   listBranches,
   refreshWorkspacePr,
+  getDefaultBranch,
 } from "@/tauri/commands";
 import type {
   WorkspaceSnapshot,
@@ -44,6 +45,7 @@ import { PrReviews } from "./pr/pr-reviews";
 import { PrReviewActions } from "./pr/pr-review-actions";
 import { PrDeployments } from "./pr/pr-deployments";
 import { PrMergeControls } from "./pr/pr-merge-controls";
+import { IncomingPrsView } from "./pr/incoming-prs-view";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -379,6 +381,15 @@ export function PrPanel({ workspace }: Props) {
   const [deployments, setDeployments] = useState<DeploymentInfo[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
+  const [incomingRefreshKey, setIncomingRefreshKey] = useState(0);
+
+  const isBaseBranch = defaultBranch != null && workspace.git_branch === defaultBranch;
+
+  // Detect default branch
+  useEffect(() => {
+    getDefaultBranch(cwd).then(setDefaultBranch).catch(() => setDefaultBranch(null));
+  }, [cwd]);
 
   // Auth init — uses module-level cache with TTL
   useEffect(() => {
@@ -464,6 +475,11 @@ export function PrPanel({ workspace }: Props) {
 
   const handleRefresh = useCallback(async () => {
     setFetchError(null);
+    if (!hasPr && isBaseBranch) {
+      // On base branch — refresh incoming PR list
+      setIncomingRefreshKey((k) => k + 1);
+      return;
+    }
     if (!hasPr) {
       // No PR known — re-discover via backend (gh pr view)
       setDetailLoading(true);
@@ -484,7 +500,7 @@ export function PrPanel({ workspace }: Props) {
     }
     // PR exists — re-fetch full details
     fetchDetails();
-  }, [hasPr, cwd, workspace.workspace_id, fetchDetails]);
+  }, [hasPr, isBaseBranch, cwd, workspace.workspace_id, fetchDetails]);
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
     setPr(newPr);
@@ -536,7 +552,7 @@ export function PrPanel({ workspace }: Props) {
   }
 
   return (
-    <ScrollArea className="h-full">
+    <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
       <div className="flex items-center justify-end px-3 pt-2">
         <Button
           size="xs"
@@ -569,6 +585,13 @@ export function PrPanel({ workspace }: Props) {
         />
       ) : hasPr && !pr ? (
         <PrSkeleton />
+      ) : isBaseBranch ? (
+        <IncomingPrsView
+          cwd={cwd}
+          baseBranch={defaultBranch!}
+          projectRoot={workspace.project_root ?? workspace.cwd}
+          refreshKey={incomingRefreshKey}
+        />
       ) : (
         <NoPrView
           cwd={cwd}

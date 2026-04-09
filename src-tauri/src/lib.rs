@@ -429,10 +429,16 @@ pub fn run() {
                                     None
                                 }
                             };
-                            let pr_number = pr_info.as_ref().map(|p| p.number);
-                            let pr_state = pr_info.as_ref().map(|p| p.state.clone());
-                            let pr_url = pr_info.as_ref().map(|p| p.url.clone());
-                            state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+                            // Only update PR info if we found a PR, or if none was
+                            // previously set.  This prevents the background refresh from
+                            // wiping a pr_number that was explicitly stored during
+                            // PR-checkout (fork branches where `gh pr view` can't resolve).
+                            if pr_info.is_some() {
+                                let pr_number = pr_info.as_ref().map(|p| p.number);
+                                let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+                                let pr_url = pr_info.as_ref().map(|p| p.url.clone());
+                                state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+                            }
 
                             // Refresh linked issue state (lightweight: only if workspace has one)
                             let issue_number = {
@@ -697,6 +703,7 @@ pub fn run() {
             commands::get_branch_pull_request,
             commands::create_pull_request,
             commands::list_pull_requests,
+            commands::list_incoming_prs,
             commands::merge_pull_request,
             commands::get_pull_request_checks,
             commands::get_pr_review_comments,

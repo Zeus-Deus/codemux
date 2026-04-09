@@ -33,6 +33,7 @@ import type {
   ProjectMemorySnapshot,
   ProjectMemoryUpdate,
   PullRequestInfo,
+  IncomingPrItem,
   ReviewComment,
   InlineReviewComment,
   DeploymentInfo,
@@ -200,6 +201,7 @@ export const createWorktreeWorkspace = (
   base?: string | null,
   initialPrompt?: string | null,
   agentPresetId?: string | null,
+  prNumber?: number | null,
 ) =>
   invoke<string>("create_worktree_workspace", {
     repoPath,
@@ -209,6 +211,7 @@ export const createWorktreeWorkspace = (
     layout,
     initialPrompt: initialPrompt ?? null,
     agentPresetId: agentPresetId ?? null,
+    prNumber: prNumber ?? null,
   });
 
 export const generateBranchName = (prompt: string, projectPath: string) =>
@@ -281,6 +284,9 @@ export const createPullRequest = (
 
 export const listPullRequests = (path: string, state: string) =>
   invoke<PullRequestInfo[]>("list_pull_requests", { path, state });
+
+export const listIncomingPrs = (path: string, baseBranch: string) =>
+  invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 
 export const mergePullRequest = (path: string, prNumber: number, method: string) =>
   invoke("merge_pull_request", { path, prNumber, method });

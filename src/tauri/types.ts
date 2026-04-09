@@ -434,6 +434,20 @@ export interface PullRequestInfo {
   updated_at: string | null;
 }
 
+export interface IncomingPrItem {
+  number: number;
+  title: string;
+  author: string;
+  head_branch: string | null;
+  is_draft: boolean;
+  additions: number | null;
+  deletions: number | null;
+  review_decision: string | null;
+  checks_status: string | null;
+  updated_at: string | null;
+  url: string;
+}
+
 export interface CheckInfo {
   name: string;
   status: string;
