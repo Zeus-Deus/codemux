@@ -27,6 +27,7 @@ import {
   getPrInlineComments,
   getPrDeployments,
   listBranches,
+  refreshWorkspacePr,
 } from "@/tauri/commands";
 import type {
   WorkspaceSnapshot,
@@ -48,9 +49,44 @@ interface Props {
   workspace: WorkspaceSnapshot;
 }
 
-// ── Module-level caches ──
-let ghStatusCache: GhStatus | null = null;
-const repoCheckCache = new Map<string, boolean>();
+// ── Module-level caches with TTL ──
+export const CACHE_TTL_MS = 60_000;
+
+interface CacheEntry<T> { value: T; ts: number; }
+
+let ghStatusCache: CacheEntry<GhStatus> | null = null;
+const repoCheckCache = new Map<string, CacheEntry<boolean>>();
+
+export function getCachedGhStatus(): GhStatus | null {
+  if (!ghStatusCache || Date.now() - ghStatusCache.ts > CACHE_TTL_MS) {
+    ghStatusCache = null;
+    return null;
+  }
+  return ghStatusCache.value;
+}
+
+export function setCachedGhStatus(value: GhStatus): void {
+  ghStatusCache = { value, ts: Date.now() };
+}
+
+export function getCachedRepoCheck(key: string): boolean | undefined {
+  const entry = repoCheckCache.get(key);
+  if (!entry || Date.now() - entry.ts > CACHE_TTL_MS) {
+    repoCheckCache.delete(key);
+    return undefined;
+  }
+  return entry.value;
+}
+
+export function setCachedRepoCheck(key: string, value: boolean): void {
+  repoCheckCache.set(key, { value, ts: Date.now() });
+}
+
+/** Reset all caches — for tests only. */
+export function _resetCaches(): void {
+  ghStatusCache = null;
+  repoCheckCache.clear();
+}
 
 // ── Helpers ──
 
@@ -328,12 +364,12 @@ export function PrPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const hasPr = workspace.pr_number != null;
 
-  const [ghStatus, setGhStatus] = useState<GhStatus | null>(ghStatusCache);
+  const [ghStatus, setGhStatus] = useState<GhStatus | null>(getCachedGhStatus());
   const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(
-    repoCheckCache.get(cwd) ?? null,
+    getCachedRepoCheck(cwd) ?? null,
   );
   const [initialLoading, setInitialLoading] = useState(
-    ghStatusCache === null || !repoCheckCache.has(cwd),
+    getCachedGhStatus() === null || getCachedRepoCheck(cwd) === undefined,
   );
 
   const [pr, setPr] = useState<PullRequestInfo | null>(null);
@@ -342,16 +378,17 @@ export function PrPanel({ workspace }: Props) {
   const [inlineComments, setInlineComments] = useState<InlineReviewComment[]>([]);
   const [deployments, setDeployments] = useState<DeploymentInfo[]>([]);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
 
-  // Auth init — uses module-level cache
+  // Auth init — uses module-level cache with TTL
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        let status = ghStatusCache;
+        let status = getCachedGhStatus();
         if (!status) {
           status = await checkGhStatus();
-          ghStatusCache = status;
+          setCachedGhStatus(status);
         }
         if (cancelled) return;
         setGhStatus(status);
@@ -361,10 +398,10 @@ export function PrPanel({ workspace }: Props) {
           return;
         }
 
-        let isRepo = repoCheckCache.get(cwd);
+        let isRepo = getCachedRepoCheck(cwd);
         if (isRepo === undefined) {
           isRepo = await checkGithubRepo(cwd);
-          repoCheckCache.set(cwd, isRepo);
+          setCachedRepoCheck(cwd, isRepo);
         }
         if (cancelled) return;
         setIsGithubRepo(isRepo);
@@ -391,20 +428,23 @@ export function PrPanel({ workspace }: Props) {
     }
     setDetailLoading(true);
     try {
+      setFetchError(null);
       const prNum = workspace.pr_number!;
       const [prInfo, prChecks, prReviews, prInline, prDeploys] = await Promise.all([
         getBranchPullRequest(cwd),
-        getPullRequestChecks(cwd).catch(() => [] as CheckInfo[]),
-        getPrReviewComments(cwd).catch(() => [] as ReviewComment[]),
-        getPrInlineComments(cwd, prNum).catch(() => [] as InlineReviewComment[]),
-        getPrDeployments(cwd, prNum).catch(() => [] as DeploymentInfo[]),
+        getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
+        getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
+        getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
+        getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
       ]);
       setPr(prInfo);
       setChecks(prChecks);
       setReviews(prReviews);
       setInlineComments(prInline);
       setDeployments(prDeploys);
-    } catch {
+    } catch (err) {
+      console.warn("[pr-panel] fetchDetails failed:", err);
+      setFetchError(String(err));
       setPr(null);
       setChecks([]);
       setReviews([]);
@@ -422,18 +462,38 @@ export function PrPanel({ workspace }: Props) {
     fetchDetails();
   }, [fetchDetails, initialLoading, ghStatus, isGithubRepo]);
 
-  const handleRefresh = () => {
+  const handleRefresh = useCallback(async () => {
+    setFetchError(null);
+    if (!hasPr) {
+      // No PR known — re-discover via backend (gh pr view)
+      setDetailLoading(true);
+      try {
+        // Bust caches so auth/repo re-check on next render cycle
+        ghStatusCache = null;
+        repoCheckCache.delete(cwd);
+        await refreshWorkspacePr(workspace.workspace_id);
+        // State update flows via app-state-changed → re-render.
+        // If PR found, hasPr becomes true → useEffect triggers fetchDetails.
+      } catch (err) {
+        console.warn("[pr-panel] refresh_workspace_pr failed:", err);
+        setFetchError(String(err));
+      } finally {
+        setDetailLoading(false);
+      }
+      return;
+    }
+    // PR exists — re-fetch full details
     fetchDetails();
-  };
+  }, [hasPr, cwd, workspace.workspace_id, fetchDetails]);
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
     setPr(newPr);
     const prNum = newPr.number;
     Promise.all([
-      getPullRequestChecks(cwd).catch(() => [] as CheckInfo[]),
-      getPrReviewComments(cwd).catch(() => [] as ReviewComment[]),
-      getPrInlineComments(cwd, prNum).catch(() => [] as InlineReviewComment[]),
-      getPrDeployments(cwd, prNum).catch(() => [] as DeploymentInfo[]),
+      getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
+      getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
+      getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
+      getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
     ]).then(([c, r, ic, d]) => {
       setChecks(c);
       setReviews(r);
@@ -491,6 +551,12 @@ export function PrPanel({ workspace }: Props) {
           />
         </Button>
       </div>
+      {fetchError && (
+        <div className="mx-3 mb-1 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
+          <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
+          <span className="break-words">{fetchError}</span>
+        </div>
+      )}
       {hasPr && pr ? (
         <PrView
           pr={pr}

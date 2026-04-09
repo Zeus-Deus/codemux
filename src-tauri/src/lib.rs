@@ -422,7 +422,13 @@ pub fn run() {
 
                         // Only fetch PR/issue info if gh CLI is available
                         if github::gh_available() {
-                            let pr_info = github::get_branch_pr(&path).ok().flatten();
+                            let pr_info = match github::get_branch_pr(&path) {
+                                Ok(info) => info,
+                                Err(e) => {
+                                    eprintln!("[codemux::github] Failed to fetch PR info for {}: {e}", cwd);
+                                    None
+                                }
+                            };
                             let pr_number = pr_info.as_ref().map(|p| p.number);
                             let pr_state = pr_info.as_ref().map(|p| p.state.clone());
                             let pr_url = pr_info.as_ref().map(|p| p.url.clone());
@@ -704,6 +710,7 @@ pub fn run() {
             commands::link_workspace_issue,
             commands::unlink_workspace_issue,
             commands::refresh_workspace_issue,
+            commands::refresh_workspace_pr,
             commands::suggest_issue_branch_name,
             commands::detect_package_manager,
             commands::get_detected_ports,

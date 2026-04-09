@@ -158,6 +158,32 @@ pub fn refresh_workspace_issue(
     Ok(())
 }
 
+#[tauri::command]
+pub fn refresh_workspace_pr(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<(), String> {
+    let cwd = {
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found: {workspace_id}"))?;
+        // Match frontend logic: worktree_path ?? cwd (pr-panel.tsx:328)
+        ws.worktree_path.clone().unwrap_or_else(|| ws.cwd.clone())
+    };
+
+    let pr_info = crate::github::get_branch_pr(Path::new(&cwd))?;
+    let pr_number = pr_info.as_ref().map(|p| p.number);
+    let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+    let pr_url = pr_info.as_ref().map(|p| p.url.clone());
+    state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
 /// List issues by repo path directly (no workspace needed — for use before workspace exists).
 #[tauri::command]
 pub fn list_github_issues_by_path(

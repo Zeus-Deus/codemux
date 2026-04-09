@@ -323,6 +323,9 @@ export const unlinkWorkspaceIssue = (workspaceId: string) =>
 export const refreshWorkspaceIssue = (workspaceId: string) =>
   invoke("refresh_workspace_issue", { workspaceId });
 
+export const refreshWorkspacePr = (workspaceId: string) =>
+  invoke("refresh_workspace_pr", { workspaceId });
+
 export const suggestIssueBranchName = (issueNumber: number, issueTitle: string) =>
   invoke<string>("suggest_issue_branch_name", { issueNumber, issueTitle });
 
