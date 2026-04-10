@@ -332,7 +332,7 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"div">) {
       className={cn(
         "absolute inset-y-0 z-20 hidden w-1 cursor-col-resize sm:flex",
         "group-data-[side=left]:right-0 group-data-[side=right]:left-0",
-        "bg-transparent hover:bg-primary/20 data-[dragging=true]:bg-primary/30 transition-colors",
+        "bg-transparent hover:bg-foreground/20 data-[dragging=true]:bg-foreground/30 transition-colors",
         className
       )}
       {...props}

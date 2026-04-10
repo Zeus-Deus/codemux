@@ -62,7 +62,7 @@ function RightPanelResizer() {
   return (
     <div
       ref={handleRef}
-      className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-primary/20 data-[dragging=true]:bg-primary/30 transition-colors"
+      className="w-1 shrink-0 cursor-col-resize bg-transparent hover:bg-foreground/20 data-[dragging=true]:bg-foreground/30 transition-colors"
       onPointerDown={startResize}
       role="separator"
       aria-orientation="vertical"
