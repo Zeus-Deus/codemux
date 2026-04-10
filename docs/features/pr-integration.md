@@ -25,6 +25,20 @@ PR data is fetched from GitHub through `gh` CLI commands routed via Rust (`src-t
 - Conflict detection and "Resolve with AI" entry point
 - Collapsible sections with item counts
 
+## Incoming PRs View
+
+The PR panel includes an incoming PRs list that shows all open pull requests targeting the repo's base branch. Each PR row displays:
+
+- PR number, title, author, and head branch
+- Draft badge for draft PRs
+- Review decision indicator (Approved, Changes Requested)
+- CI checks status (success/failure/pending icons)
+- Addition/deletion stats and relative timestamp
+- Hover actions: "View" opens PR on GitHub, "Checkout" creates a worktree workspace from the PR branch (or switches to an existing workspace if one already tracks that branch)
+- PR number is passed through to workspace creation for sidebar badge display
+
+The view fetches up to 50 PRs via `gh pr list` and shows a "View all on GitHub" link when the limit is reached.
+
 ## Current Constraints
 
 - Requires `gh` CLI to be installed and authenticated
@@ -40,5 +54,6 @@ PR data is fetched from GitHub through `gh` CLI commands routed via Rust (`src-t
 - `src/components/workspace/pr/pr-review-actions.tsx` — review submission
 - `src/components/workspace/pr/pr-checks.tsx` — CI check status
 - `src/components/workspace/pr/pr-deployments.tsx` — deployment status
+- `src/components/workspace/pr/incoming-prs-view.tsx` — incoming PRs list
 - `src-tauri/src/github.rs` — GitHub data fetching via gh CLI
 - `src-tauri/src/commands/github.rs` — Tauri GitHub commands

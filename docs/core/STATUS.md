@@ -30,7 +30,7 @@ The repo structure is clean and domain-split:
 - Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini)
 - IDE integration (detect editors, open workspace, Ctrl+Shift+E)
 - Command palette (Ctrl+K, fuzzy search across all actions)
-- PR integration (create, view, checks, merge via gh CLI, auth status check)
+- PR integration (create, view, checks, merge via gh CLI, auth status check, incoming PRs list with fork checkout)
 - GitHub issue integration (link issues to workspaces, issue picker in creation dialog, sidebar display with detail popover, auto-branch naming from issue, prompt auto-injection of issue context, CLI `codemux issue list/view/link`, control socket commands)
 - Setup/teardown scripts (.codemux/config.json)
 - Workspace creation from branch with layout + preset selection
@@ -59,7 +59,7 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
-- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, command palette, file editor, file tree, GitHub issues, IDE integration, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, search, session persistence, settings sync, setup-teardown, terminal, workspace creation, worktree setup
+- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, file editor, file tree, GitHub issues, IDE integration, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
 
 ## React Frontend Status
 
@@ -96,4 +96,4 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, command-palette, file-editor, file-tree, github-issues, ide-integration, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, search, session-persistence, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
+- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, file-editor, file-tree, github-issues, ide-integration, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)

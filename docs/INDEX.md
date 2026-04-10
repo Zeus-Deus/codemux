@@ -30,6 +30,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 ## Current Entry Points
 
 - Auth system: `docs/features/auth.md`
+- Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
@@ -47,6 +48,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Session persistence: `docs/features/session-persistence.md`
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`
+- Code indexing: `docs/features/code-indexing.md`
+- Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
 - Workspace creation: `docs/features/workspace-creation.md`
 - IDE integration: `docs/features/ide-integration.md`

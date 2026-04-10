@@ -16,7 +16,8 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
 | Ctrl+B | Toggle sidebar | Collapse/expand the left sidebar |
-| Ctrl+P | Find file by name | File name search overlay (via fd/find) |
+| Ctrl+, | Open settings | Opens the settings panel |
+| Ctrl+Shift+P | Find file by name | File name search overlay (via fd/find) |
 | Ctrl+Shift+F | Search in files | Keyword search across workspace files (via rg/grep) |
 | Ctrl+] | Next workspace | Cycles through sidebar workspace list |
 | Ctrl+[ | Previous workspace | |
@@ -26,8 +27,6 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Ctrl+1 through Ctrl+9 | Jump to tab by position | Tab 1 = leftmost |
 | Ctrl+Shift+D | Split active pane right | Horizontal split |
 | Ctrl+Shift+W | Close active pane | |
-| Ctrl+Shift+J | Focus next pane | |
-| Ctrl+Shift+K | Focus previous pane | |
 
 ## Terminal Shortcuts
 
@@ -59,6 +58,7 @@ These work in specific UI contexts.
 
 ## Important Touch Points
 
+- `src/lib/keybind-registry.ts` — canonical keybind definitions and categories
 - `src/hooks/use-keyboard-shortcuts.ts` — global shortcuts (Ctrl+Shift+D, Ctrl+T, Ctrl+W, Ctrl+Shift+G, etc.)
 - `src/lib/app-shortcuts.ts` — shortcut interception list (blocks keys from reaching xterm.js)
 - `src/components/terminal/TerminalPane.tsx` — `customKeyEventHandler()` (terminal shortcuts)

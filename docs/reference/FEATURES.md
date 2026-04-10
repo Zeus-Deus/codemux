@@ -46,7 +46,7 @@
 - Split panes horizontally or vertically from pane header buttons
 - Resize splits by dragging the handle between panes
 - Resize active pane via keyboard (Ctrl+Alt+arrow keys or Ctrl+Alt+H/J/K/L)
-- Cycle between panes with Ctrl+Shift+J/K or Ctrl+H/L
+- Cycle between panes via command palette (Focus Next Pane / Focus Previous Pane)
 - Drag pane headers to swap panes (visual drop target highlighting)
 - Close panes from header X button
 - Add browser pane alongside a terminal pane from header "+" button
@@ -92,13 +92,12 @@
 
 ## Project Memory
 
-- Project brief, current goal, and current focus fields
-- Constraints list (one per line)
-- Tabbed memory drawer in sidebar (Brief, Goal, Notes)
+- Project brief, current goal, current focus, and constraints fields
 - Entry types: pinned context, decisions, next steps, session summaries
-- Memory stats showing counts per category
-- Handoff packet generator with suggested prompt for next session
-- Persisted to `.codemux/memory.json` in project root
+- CLI access: `codemux memory show`, `codemux memory set`, `codemux memory add`
+- Handoff packet generator: `codemux handoff`
+- Persisted to `.codemux/project-memory.json` in project root
+- No frontend drawer/panel UI yet (backend and CLI only)
 
 ## Theming
 
@@ -131,6 +130,33 @@
 - Custom dark theme matching Codemux shell
 - File tree with `.gitignore` awareness and common directory exclusion
 - 2 MB file size limit, UTF-8 only, binary file detection
+
+## Changes Panel
+
+- Right sidebar panel showing git diff for current workspace
+- Stage/unstage individual files or all changes
+- Commit with message editor
+- Push to remote
+- AI commit message generation
+- Opens diff tabs with unified and split views
+
+## PR Integration
+
+- Right sidebar PR panel with header, reviews, checks, deployments, and merge controls
+- PR creation with title, body, base branch, and draft toggle
+- Review submission: approve, request changes, or comment
+- Merge controls: squash, merge commit, or rebase with dual-confirmation
+- Incoming PRs list with fork checkout into worktree workspaces
+- PR badge display in sidebar workspace rows
+
+## GitHub Issues
+
+- Link issues to workspaces from creation dialog
+- Issue picker with search
+- Auto-branch naming from issue title and number
+- Prompt auto-injection of issue context for agents
+- Sidebar display with detail popover
+- CLI: `codemux issue list/view/link`
 
 ## AI Merge Resolver
 
@@ -182,6 +208,30 @@
 - Gitignored items shown with reduced opacity
 - Hidden files toggle (persisted in settings)
 - Click to open files in built-in editor
+
+## Search
+
+- File name search (Ctrl+Shift+P) via fd/find with fuzzy matching
+- Content search (Ctrl+Shift+F) via rg/grep across workspace files
+- Results displayed in overlay with file path, line number, and match preview
+- Click to open result in built-in editor or jump to terminal
+
+## Code Indexing
+
+- Local full-text search index at `.codemux/project-memory.json`
+- 40-line file chunking with symbol extraction
+- Automatic file watching with debounced rebuild
+- CLI access: `codemux index build`, `codemux index status`, `codemux index search`
+- 512 KB per-file limit, 50 MB total index cap
+- Supports 20+ file extensions (rs, ts, tsx, js, jsx, py, go, java, etc.)
+
+## Settings Panel
+
+- Centralized configuration overlay (Ctrl+,)
+- 12 sections: Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore
+- Keyboard shortcut editor with conflict detection and search
+- Server-synced settings with offline cache
+- Workspace-level project config (setup/teardown scripts, worktree includes)
 
 ## CLI / Socket Control
 
