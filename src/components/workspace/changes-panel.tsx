@@ -2106,7 +2106,7 @@ export function ChangesPanel({ workspace }: Props) {
         </label>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={handleMergeIntoBase} className="bg-foreground text-background hover:bg-foreground/90">
+          <AlertDialogAction variant="ghost" onClick={handleMergeIntoBase} className="bg-foreground text-background hover:bg-foreground/90">
             Merge into {baseBranch}
           </AlertDialogAction>
         </AlertDialogFooter>
