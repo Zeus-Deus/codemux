@@ -18,32 +18,49 @@ pub fn build_agent_context(
             .to_string(),
     );
 
+    let has_worktree = worktree_path.is_some();
+
     let mut info_lines = Vec::new();
     if let Some(name) = workspace_name {
         info_lines.push(format!("Your workspace: {name}"));
     }
     if let Some(path) = worktree_path {
-        info_lines.push(format!("Your worktree: {path}"));
+        info_lines.push(format!("Your working directory: {path}"));
     }
     if let Some(b) = branch {
         info_lines.push(format!("Your branch: {b}"));
     }
     if let Some(root) = root_path {
-        info_lines.push(format!("Main repo root: {root}"));
+        if has_worktree {
+            info_lines.push(format!("Original repo (reference only): {root}"));
+        } else {
+            info_lines.push(format!("Project root: {root}"));
+        }
     }
     if !info_lines.is_empty() {
         sections.push(info_lines.join("\n"));
     }
 
-    sections.push(
-        "Rules:\n\
-         - Do NOT create additional git worktrees (no -w flag, no git worktree add). \
-         Codemux manages worktree lifecycle.\n\
-         - Do NOT use system browsers, headless chromium, puppeteer, or grim. \
-         Use Codemux browser commands instead.\n\
-         - Use `codemux` CLI commands for workspace and browser operations."
-            .to_string(),
+    let mut rules = Vec::new();
+    if has_worktree {
+        rules.push(
+            "- Your working directory is your project root. \
+             Run all build, test, and execute commands here.",
+        );
+        rules.push(
+            "- Do NOT cd to the original repo path — it has a different branch checked out.",
+        );
+    }
+    rules.push(
+        "- Do NOT create additional git worktrees (no -w flag, no git worktree add). \
+         Codemux manages worktree lifecycle.",
     );
+    rules.push(
+        "- Do NOT use system browsers, headless chromium, puppeteer, or grim. \
+         Use Codemux browser commands instead.",
+    );
+    rules.push("- Use `codemux` CLI commands for workspace and browser operations.");
+    sections.push(format!("Rules:\n{}", rules.join("\n")));
 
     sections.push(
         "Available browser commands:\n\
@@ -104,9 +121,9 @@ mod tests {
             Some("/home/user/projects/repo"),
         );
         assert!(ctx.contains("Your workspace: my-feature"));
-        assert!(ctx.contains("Your worktree: /home/user/.codemux/worktrees/repo/my-feature"));
+        assert!(ctx.contains("Your working directory: /home/user/.codemux/worktrees/repo/my-feature"));
         assert!(ctx.contains("Your branch: feat/my-feature"));
-        assert!(ctx.contains("Main repo root: /home/user/projects/repo"));
+        assert!(ctx.contains("Original repo (reference only): /home/user/projects/repo"));
         assert!(ctx.contains("codemux browser"));
         assert!(ctx.contains("Do NOT create additional git worktrees"));
     }
@@ -132,9 +149,9 @@ mod tests {
             Some("/home/user/projects/repo"),
         );
         assert!(ctx.contains("Your workspace: main"));
-        assert!(!ctx.contains("Your worktree:"));
+        assert!(!ctx.contains("Your working directory:"));
         assert!(ctx.contains("Your branch: main"));
-        assert!(ctx.contains("Main repo root: /home/user/projects/repo"));
+        assert!(ctx.contains("Project root: /home/user/projects/repo"));
     }
 
     #[test]
@@ -142,7 +159,7 @@ mod tests {
         let ctx = build_agent_context(Some("ws"), None, None, Some("/root"));
         assert!(ctx.contains("Your workspace: ws"));
         assert!(!ctx.contains("Your branch:"));
-        assert!(ctx.contains("Main repo root: /root"));
+        assert!(ctx.contains("Project root: /root"));
     }
 
     #[test]
@@ -160,6 +177,31 @@ mod tests {
         let ctx = build_agent_context(None, None, None, None);
         assert!(ctx.contains("Do NOT create additional git worktrees"));
         assert!(ctx.contains("Do NOT use system browsers"));
+    }
+
+    #[test]
+    fn build_context_worktree_has_do_not_cd_rule() {
+        let ctx = build_agent_context(
+            Some("my-feature"),
+            Some("/home/user/.codemux/worktrees/repo/my-feature"),
+            Some("feat/my-feature"),
+            Some("/home/user/projects/repo"),
+        );
+        assert!(ctx.contains("Do NOT cd to the original repo path"));
+        assert!(ctx.contains("Your working directory is your project root"));
+    }
+
+    #[test]
+    fn build_context_no_worktree_omits_do_not_cd_rule() {
+        let ctx = build_agent_context(
+            Some("main"),
+            None,
+            Some("main"),
+            Some("/home/user/projects/repo"),
+        );
+        assert!(!ctx.contains("Do NOT cd to the original repo path"));
+        assert!(!ctx.contains("Your working directory is your project root"));
+        assert!(!ctx.contains("Original repo (reference only)"));
     }
 
     #[test]

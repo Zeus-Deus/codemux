@@ -2067,10 +2067,11 @@ mod tests {
         let ctx = &m["CODEMUX_AGENT_CONTEXT"];
 
         assert!(ctx.contains("Your workspace: analyze-db"));
-        assert!(ctx.contains("Your worktree: /home/zeus/.codemux/worktrees/proj/analyze-db"));
+        assert!(ctx.contains("Your working directory: /home/zeus/.codemux/worktrees/proj/analyze-db"));
         assert!(ctx.contains("Your branch: analyze-db"));
-        assert!(ctx.contains("Main repo root: /home/zeus/projects/proj"));
+        assert!(ctx.contains("Original repo (reference only): /home/zeus/projects/proj"));
         assert!(ctx.contains("Do NOT create additional git worktrees"));
+        assert!(ctx.contains("Do NOT cd to the original repo path"));
     }
 
     #[test]
