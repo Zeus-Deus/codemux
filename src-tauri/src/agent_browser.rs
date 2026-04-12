@@ -223,7 +223,17 @@ fn extract_eval_result(stdout: &str) -> String {
 /// 3. node_modules — dev mode (`npm run tauri dev`)
 /// 4. npx fallback — always works if Node.js + npm are present
 fn resolve_binary() -> String {
-    // 1. System PATH (AUR/system package, cargo install, manual install)
+    // 1. System PATH (AUR/system package, cargo install, manual install).
+    //
+    // Unix-only: `which` is a Unix tool, and Git Bash on Windows has
+    // different extension-handling semantics — on `windows-latest` CI it
+    // was returning paths without the `.exe` suffix that looked valid but
+    // pointed at non-existent files, breaking downstream callers. The
+    // Windows story for `agent-browser` discovery is tracked under the
+    // "Agent Integration" blocker in docs/plans/windows-support.md — for
+    // now, Windows falls through to the Tauri sidecar lookup and then
+    // the `npx agent-browser` fallback.
+    #[cfg(unix)]
     if let Ok(output) = std::process::Command::new("which")
         .arg("agent-browser")
         .output()
@@ -735,6 +745,12 @@ mod tests {
         }
     }
 
+    // Structurally Linux/macOS only: the assertion hardcodes
+    // `agent-browser-linux-x64` / `agent-browser-darwin` binary names.
+    // Windows needs its own version once `resolve_binary()` grows a
+    // Windows target-triple branch — tracked under the "Agent
+    // Integration" blocker in docs/plans/windows-support.md.
+    #[cfg(unix)]
     #[test]
     fn resolve_binary_finds_native_binary_from_project_root() {
         // Run from the project root where node_modules exists

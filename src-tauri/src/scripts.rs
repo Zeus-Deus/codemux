@@ -432,6 +432,15 @@ mod tests {
     use super::*;
     use std::fs;
 
+    // Bash-subprocess round-trip: spawn `sh -c 'echo -n "$VAR" > file'`, then
+    // read the file back. Unix-only because (1) `sh` is not universally
+    // available on Windows, (2) on windows-latest Git Bash *is* on PATH but
+    // Windows-style tempdir paths contain backslashes that bash interprets as
+    // escape sequences, silently breaking the `>` redirect. The sibling test
+    // `test_env_vars_do_not_include_compose_project_name` covers the same
+    // `script_env()` function with a pure-Rust in-memory check that runs on
+    // both platforms.
+    #[cfg(unix)]
     #[test]
     fn test_env_vars_include_workspace_path() {
         let workspace_dir = tempfile::tempdir().unwrap();

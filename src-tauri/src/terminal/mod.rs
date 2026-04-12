@@ -2382,9 +2382,14 @@ mod tests {
 
     #[test]
     fn resolve_session_cwd_uses_scrollback_dir_when_exists() {
-        // /tmp always exists on any system
-        let result = resolve_session_cwd("/tmp", "/fallback");
-        assert_eq!(result, "/tmp");
+        // Use the platform temp dir as the "known-to-exist" path — `/tmp`
+        // exists on Unix but not on Windows, and `std::env::temp_dir()`
+        // resolves correctly on both (e.g. `/tmp` on Linux,
+        // `C:\Users\<user>\AppData\Local\Temp` on Windows).
+        let temp = std::env::temp_dir();
+        let temp_str = temp.to_string_lossy().into_owned();
+        let result = resolve_session_cwd(&temp_str, "/fallback");
+        assert_eq!(result, temp_str);
     }
 
     #[test]
