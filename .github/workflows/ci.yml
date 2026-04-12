@@ -114,5 +114,17 @@ jobs:
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
+      - name: Configure git identity for tests
+        # Several tests in src-tauri/src/git.rs spin up a fixture repo and
+        # shell out to `git commit`. GitHub runners have git installed but
+        # no default user.email/user.name, so `git commit` refuses to run
+        # unless we provide a throwaway identity here. Works on both Linux
+        # and Windows runners — git reads --global from %USERPROFILE% on
+        # Windows and $HOME on Linux.
+        shell: bash
+        run: |
+          git config --global user.email "ci@codemux.dev"
+          git config --global user.name "Codemux CI"
+
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
