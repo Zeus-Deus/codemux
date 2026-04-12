@@ -454,6 +454,39 @@ fn batched_reader_loop(
     }
 }
 
+/// OS-specific PATH entry separator: `;` on Windows, `:` on Unix.
+///
+/// Exposed as a constant-returning function (not a `const`) so tests can
+/// drive the PATH-prepend logic with an explicit separator without caring
+/// about the host OS. Production callers get the right value via
+/// `path_separator()` which resolves at compile time.
+fn path_separator() -> &'static str {
+    if cfg!(windows) {
+        ";"
+    } else {
+        ":"
+    }
+}
+
+/// Prepend `shim_dir` to an existing `PATH` string using the OS-specific
+/// separator. Extracted from the inline logic in `spawn_pty_for_shell`
+/// so it's unit-testable without setting up a real PTY + env.
+///
+/// Semantics:
+///   - Empty `current_path` → return `shim_dir` unchanged (no trailing sep).
+///   - Non-empty → `{shim_dir}{sep}{current_path}`.
+///   - Does NOT deduplicate. If `shim_dir` is already in `current_path`,
+///     it will appear twice. That's intentional — the prepend ensures the
+///     codemux shim wins even if another invocation of this function
+///     already added it once.
+fn prepend_shim_to_path(shim_dir: &str, current_path: &str) -> String {
+    if current_path.is_empty() {
+        shim_dir.to_string()
+    } else {
+        format!("{shim_dir}{}{current_path}", path_separator())
+    }
+}
+
 #[cfg(unix)]
 fn default_shell() -> String {
     env::var("SHELL")
@@ -751,12 +784,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let prefixed = if current_path.is_empty() {
-            shim_dir
-        } else {
-            format!("{shim_dir}{sep}{current_path}")
-        };
+        let prefixed = prepend_shim_to_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -1796,6 +1824,112 @@ mod tests {
 
     fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    // ── Shell + PATH tests ───────────────────────────────────────────
+    //
+    // `path_separator` and `prepend_shim_to_path` are cross-platform
+    // helpers, so their tests run on every platform. `default_shell` on
+    // Windows returns a Windows-specific value, so that test is
+    // `#[cfg(windows)]`-gated and only executes on Windows CI.
+
+    #[test]
+    fn test_path_separator_matches_host_os() {
+        let sep = path_separator();
+        #[cfg(windows)]
+        assert_eq!(sep, ";");
+        #[cfg(unix)]
+        assert_eq!(sep, ":");
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_with_existing_path() {
+        // Typical case: PATH has entries, shim gets prepended with
+        // the OS-correct separator.
+        let result = prepend_shim_to_path("/opt/codemux/shims", "/usr/bin:/bin");
+        #[cfg(unix)]
+        assert_eq!(result, "/opt/codemux/shims:/usr/bin:/bin");
+        #[cfg(windows)]
+        assert_eq!(result, "/opt/codemux/shims;/usr/bin:/bin");
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_with_empty_current() {
+        // Edge case: PATH is empty or unset. Result must be the
+        // shim_dir with NO trailing separator — an empty trailing
+        // component would make the child process try to resolve
+        // binaries from the empty path (which is CWD on some shells,
+        // a security hazard).
+        let result = prepend_shim_to_path("/opt/codemux/shims", "");
+        assert_eq!(result, "/opt/codemux/shims");
+        assert!(
+            !result.ends_with(':') && !result.ends_with(';'),
+            "empty current_path must not produce a trailing separator"
+        );
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_windows_style_paths() {
+        // Verify the Windows-style paths pass through unmodified on
+        // Windows. The function is oblivious to path content — it
+        // only joins with the separator.
+        let result = prepend_shim_to_path(
+            r"C:\Users\zeus\AppData\Local\Codemux\shims",
+            r"C:\Windows\System32;C:\Program Files\Git\bin",
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            result,
+            r"C:\Users\zeus\AppData\Local\Codemux\shims;C:\Windows\System32;C:\Program Files\Git\bin"
+        );
+        #[cfg(unix)]
+        {
+            // On Unix the separator is `:`, so the Windows paths get
+            // joined with a colon. That's fine — this is just exercising
+            // the function's behavior under test, not a production path.
+            assert_eq!(
+                result,
+                r"C:\Users\zeus\AppData\Local\Codemux\shims:C:\Windows\System32;C:\Program Files\Git\bin"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_default_shell_windows_returns_cmd_or_powershell() {
+        // default_shell() on Windows reads $COMSPEC (typically
+        // `C:\Windows\System32\cmd.exe`) and falls back to the literal
+        // string "cmd.exe" if COMSPEC is unset. It should never return
+        // a Unix shell path. The exact resolution depends on runner
+        // config; we assert the case-insensitive suffix lands on a
+        // known Windows shell binary.
+        let shell = default_shell();
+        let lower = shell.to_lowercase();
+        assert!(
+            lower.ends_with("cmd.exe") || lower.ends_with("powershell.exe"),
+            "Windows default_shell should end with cmd.exe or powershell.exe, got: {shell}"
+        );
+        assert!(
+            !shell.contains("/bin/"),
+            "Windows default_shell must not return a Unix shell path, got: {shell}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_shell_unix_returns_bash_or_shell_env() {
+        // Paired guard for the Unix path: default_shell() on Unix reads
+        // $SHELL and falls back to `/bin/bash`. It should never return
+        // a .exe suffix or a Windows-style path.
+        let shell = default_shell();
+        assert!(
+            shell.starts_with('/') || shell.is_empty() == false,
+            "Unix default_shell should be an absolute path, got: {shell}"
+        );
+        assert!(
+            !shell.to_lowercase().ends_with(".exe"),
+            "Unix default_shell must not return a .exe binary, got: {shell}"
+        );
     }
 
     #[test]

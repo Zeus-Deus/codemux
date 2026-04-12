@@ -164,7 +164,12 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
     // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
     let uid = unsafe { libc::getuid() };
-    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}"));
+    // This whole function is `#[cfg(unix)]` — the hardcoded /tmp path is
+    // reachable only on Unix and matches the XDG fallback convention
+    // for systems that don't set XDG_RUNTIME_DIR. The tmp-literal-ok
+    // marker tells the meta-test in agent_context.rs that this is
+    // intentional and not a Windows regression.
+    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}")); // tmp-literal-ok
     if fallback_dir.exists() {
         // Verify the existing directory is owned by us and has safe permissions.
         use std::os::unix::fs::MetadataExt;
@@ -205,23 +210,44 @@ pub fn control_socket_path() -> Option<PathBuf> {
     Some(fallback_dir.join("codemux.sock"))
 }
 
-#[cfg(windows)]
-pub fn control_socket_path() -> Option<PathBuf> {
-    // Named pipes on Windows live in the `\\.\pipe\` virtual namespace and
-    // inherit the creating user's security descriptor by default — so no
-    // ownership or permission bookkeeping is required here.
-    let username = std::env::var("USERNAME")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "default".to_string());
-    // Sanitize: strip anything that isn't alphanumeric/underscore/dash so we
-    // never produce an invalid pipe name if USERNAME contains a stray space
-    // or separator.
-    let sanitized: String = username
+/// Build the Windows named-pipe path for the given username.
+///
+/// Extracted from `control_socket_path()` so tests can drive it with
+/// arbitrary usernames without touching the process-global `USERNAME`
+/// env var (which would race with parallel test execution).
+///
+/// The pipe lives under the `\\.\pipe\` virtual namespace — no filesystem
+/// ownership or permission bookkeeping is required because named pipes
+/// inherit the creating user's security descriptor by default.
+///
+/// Sanitization rule: anything that isn't alphanumeric / underscore /
+/// dash is replaced with `_`. This guarantees we never emit an invalid
+/// pipe name even if the username contains spaces, separators, or any
+/// of the Windows-forbidden filename characters (`\ / : * ? " < > |`).
+/// Empty or whitespace-only inputs fall back to `default` so the result
+/// always has a non-empty user segment.
+///
+/// Not cfg-gated — pure string manipulation, safe to compile and test
+/// on every platform. Only `control_socket_path()` on Windows actually
+/// calls it at runtime.
+#[allow(dead_code)] // only called from the Windows branch of control_socket_path
+fn build_pipe_path(username: &str) -> PathBuf {
+    let base = if username.trim().is_empty() {
+        "default".to_string()
+    } else {
+        username.to_string()
+    };
+    let sanitized: String = base
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
         .collect();
-    Some(PathBuf::from(format!(r"\\.\pipe\codemux-{sanitized}")))
+    PathBuf::from(format!(r"\\.\pipe\codemux-{sanitized}"))
+}
+
+#[cfg(windows)]
+pub fn control_socket_path() -> Option<PathBuf> {
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    Some(build_pipe_path(&username))
 }
 
 /// Blocking check: is another Codemux control server currently listening?
@@ -953,6 +979,111 @@ mod tests {
             assert!(
                 display.starts_with(r"\\.\pipe\codemux-"),
                 "windows control path must live under \\\\.\\pipe\\codemux-, got {display:?}"
+            );
+        }
+    }
+
+    // ----- Cross-platform pipe path tests --------------------------------
+    //
+    // `build_pipe_path` is pure string manipulation and not cfg-gated, so
+    // these tests run on every platform. They assert the sanitization
+    // contract that `control_socket_path()` on Windows relies on — we
+    // don't want to depend on the process-global `USERNAME` env var in
+    // tests because parallel cargo test runs would race.
+
+    #[test]
+    fn test_named_pipe_path_format() {
+        // Typical Windows username — already pipe-name-safe.
+        let path = build_pipe_path("alice");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-alice");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_spaces() {
+        // Windows lets users have spaces in their account names
+        // (e.g. "John Smith"). Spaces are invalid in pipe names —
+        // must be replaced with underscores.
+        let path = build_pipe_path("John Smith");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-John_Smith");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_special_chars() {
+        // Punctuation and separators that appear in real AD/domain
+        // usernames (e.g. `DOMAIN\user`, `user@host`, `user.name`).
+        // Every non-[A-Za-z0-9_-] char gets replaced with underscore.
+        let path = build_pipe_path(r"DOMAIN\john.smith");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-DOMAIN_john_smith");
+
+        let path = build_pipe_path("user@host");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-user_host");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_empty_or_whitespace() {
+        // Empty USERNAME (unlikely but possible if env is stripped)
+        // must fall back to "default" so the pipe still has a valid
+        // non-empty user segment.
+        let path = build_pipe_path("");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+
+        let path = build_pipe_path("   ");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+
+        let path = build_pipe_path("\t\n");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+    }
+
+    #[test]
+    fn test_named_pipe_path_preserves_underscores_and_dashes() {
+        // These are the two punctuation characters explicitly allowed
+        // by the sanitization rule — they should pass through unchanged.
+        let path = build_pipe_path("test-user_42");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-test-user_42");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_unicode() {
+        // Windows allows Unicode usernames (CJK, accented Latin, etc.).
+        // `char::is_alphanumeric` accepts Unicode letters, so these
+        // characters pass through. If a future change needs to restrict
+        // to ASCII, this test will fail and flag the break.
+        let path = build_pipe_path("用户");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-用户");
+
+        let path = build_pipe_path("müller");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-müller");
+    }
+
+    #[test]
+    fn test_named_pipe_path_never_panics_on_pathological_input() {
+        // Single call on a handful of pathological inputs — must not
+        // panic and must produce a parsable pipe path. We don't assert
+        // on the exact output; just that the function returns cleanly.
+        let long_input = "a".repeat(1024);
+        let pathological = [
+            "\x00",
+            "\x00\x01\x02",
+            "////",
+            "\\\\\\\\",
+            long_input.as_str(),
+        ];
+        for input in pathological {
+            let path = build_pipe_path(input);
+            let display = path.to_string_lossy().into_owned();
+            assert!(
+                display.starts_with(r"\\.\pipe\codemux-"),
+                "pipe path from pathological input {input:?} must still have the codemux- prefix, got {display:?}"
             );
         }
     }

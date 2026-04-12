@@ -99,20 +99,53 @@ pub fn kill_stream_daemons() {
     }
 }
 
+/// Pure parser: given raw `netstat -ano` stdout, return the set of PIDs
+/// owning a TCP LISTENING socket on the exact `port`.
+///
+/// Lives at the top of the module (not inside the `#[cfg(windows)]` block
+/// of `kill_process_on_port`) so tests can drive it with hardcoded
+/// fixtures on any platform. The filter is done in Rust rather than via
+/// `findstr :{port}` so we can:
+///   - Handle both IPv4 (`0.0.0.0:9223`) and IPv6 (`[::]:9223`) rows.
+///   - Match the port EXACTLY — `findstr :9223` would also match `:92230`,
+///     `:92231`, etc. and kill the wrong process. We compare `port_str`
+///     as a parsed u16 to avoid the substring trap.
+///   - Skip non-LISTENING states (ESTABLISHED, TIME_WAIT) even when they
+///     happen to reference the same port.
+#[allow(dead_code)] // only called from the Windows branch below
+fn pids_listening_on_port(netstat_stdout: &str, port: u16) -> std::collections::HashSet<u32> {
+    let mut pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for line in netstat_stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 {
+            continue;
+        }
+        if fields[0] != "TCP" || fields[3] != "LISTENING" {
+            continue;
+        }
+        let Some(port_str) = fields[1].rsplit(':').next() else {
+            continue;
+        };
+        let Ok(listen_port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if listen_port != port {
+            continue;
+        }
+        if let Ok(pid) = fields[4].parse::<u32>() {
+            pids.insert(pid);
+        }
+    }
+    pids
+}
+
 /// Kill any process bound to the given TCP port. Used to reclaim stale
 /// agent-browser daemon ports from previous app runs.
 fn kill_process_on_port(port: u16) {
     #[cfg(windows)]
     {
-        // Parse `netstat -ano` for rows with `TCP <local>:<port> ... LISTENING <pid>`
-        // and then `taskkill /PID {pid} /F` each owning PID. We do the filter in
-        // Rust (rather than piping through `findstr :{port}`) so we can tolerate
-        // both IPv4 (`0.0.0.0:9223`) and IPv6 (`[::]:9223`) rows uniformly and
-        // skip unrelated ports that happen to contain the port number as a
-        // substring (e.g. `:92230`).
-        //
-        // CREATE_NO_WINDOW suppresses a console flash each time kill_process_on_port
-        // runs (startup, port allocation, session close).
+        // CREATE_NO_WINDOW suppresses a console flash each time
+        // kill_process_on_port runs (startup, port allocation, session close).
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -132,28 +165,7 @@ fn kill_process_on_port(port: u16) {
         }
 
         let stdout = String::from_utf8_lossy(&netstat.stdout);
-        let mut pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for line in stdout.lines() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 5 {
-                continue;
-            }
-            if fields[0] != "TCP" || fields[3] != "LISTENING" {
-                continue;
-            }
-            let Some(port_str) = fields[1].rsplit(':').next() else {
-                continue;
-            };
-            let Ok(listen_port) = port_str.parse::<u16>() else {
-                continue;
-            };
-            if listen_port != port {
-                continue;
-            }
-            if let Ok(pid) = fields[4].parse::<u32>() {
-                pids.insert(pid);
-            }
-        }
+        let pids = pids_listening_on_port(&stdout, port);
 
         for pid in pids {
             let _ = std::process::Command::new("taskkill")
@@ -895,5 +907,104 @@ mod tests {
         let p2 = mgr.allocate_port("ws-close-test-2").await.unwrap();
         assert!(p2 >= DEFAULT_STREAM_PORT && p2 <= MAX_STREAM_PORT);
         assert_ne!(p, p2, "New allocation should skip the (possibly still in-use) released port");
+    }
+
+    // ── pids_listening_on_port (Windows netstat parser) ──────────────
+    //
+    // These tests are NOT cfg-gated — the parser is a pure string
+    // function that can run on any platform. They verify the exact-match
+    // semantics that made us avoid `findstr :{port}` in the first place.
+
+    /// Fixture matching the shape agent-browser daemons produce when
+    /// they bind to their stream ports (9223..=9299). Includes:
+    /// - our target port 9223 with pid 11111
+    /// - a substring-lookalike :92230 (would match `findstr :9223`)
+    /// - a non-LISTENING row on :9223 (should be ignored)
+    /// - unrelated rows
+    const KILL_NETSTAT_FIXTURE: &str = "\
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:9223         0.0.0.0:0              LISTENING       11111
+  TCP    0.0.0.0:92230          0.0.0.0:0              LISTENING       22222
+  TCP    127.0.0.1:9223         192.168.1.1:55555      ESTABLISHED     33333
+  TCP    [::]:9223              [::]:0                 LISTENING       44444
+  TCP    0.0.0.0:9000           0.0.0.0:0              LISTENING       55555
+  UDP    0.0.0.0:5353           *:*                                    66666
+";
+
+    #[test]
+    fn test_pids_listening_on_port_happy_path() {
+        let pids = pids_listening_on_port(KILL_NETSTAT_FIXTURE, 9223);
+        // 9223 has two LISTENING rows: IPv4 (pid 11111) + IPv6 (pid 44444).
+        // :92230 (22222), ESTABLISHED (33333), and :9000 (55555) must NOT match.
+        assert_eq!(pids.len(), 2, "got: {pids:?}");
+        assert!(pids.contains(&11111), "should include IPv4 LISTENING pid");
+        assert!(pids.contains(&44444), "should include IPv6 LISTENING pid");
+        assert!(!pids.contains(&22222), "must NOT match :92230 substring");
+        assert!(
+            !pids.contains(&33333),
+            "must NOT match ESTABLISHED state on port 9223"
+        );
+        assert!(!pids.contains(&55555), "must NOT match :9000");
+    }
+
+    #[test]
+    fn test_pids_listening_on_port_exact_match_no_substring_trap() {
+        // Regression guard: `findstr :9223` would match both 9223 and
+        // 92230 / 92231. Our parser compares the parsed u16, so
+        // substring collisions are impossible.
+        let fixture = "\
+  TCP    0.0.0.0:92230   0.0.0.0:0  LISTENING  1
+  TCP    0.0.0.0:92231   0.0.0.0:0  LISTENING  2
+  TCP    0.0.0.0:9223    0.0.0.0:0  LISTENING  3
+";
+        let pids = pids_listening_on_port(fixture, 9223);
+        assert_eq!(pids.len(), 1);
+        assert!(pids.contains(&3));
+    }
+
+    #[test]
+    fn test_pids_listening_on_port_no_match_returns_empty() {
+        // Port 9999 appears nowhere in the fixture.
+        let pids = pids_listening_on_port(KILL_NETSTAT_FIXTURE, 9999);
+        assert!(pids.is_empty());
+
+        // Empty input.
+        let pids = pids_listening_on_port("", 9223);
+        assert!(pids.is_empty());
+    }
+
+    #[test]
+    fn test_pids_listening_on_port_ipv4_only() {
+        // IPv4-only case — real netstat on some Windows versions only
+        // emits an IPv4 row when the socket is bound with AF_INET.
+        let fixture = "  TCP    0.0.0.0:9223   0.0.0.0:0  LISTENING  7777\n";
+        let pids = pids_listening_on_port(fixture, 9223);
+        assert_eq!(pids.len(), 1);
+        assert!(pids.contains(&7777));
+    }
+
+    #[test]
+    fn test_pids_listening_on_port_ipv6_only() {
+        let fixture = "  TCP    [::]:9223   [::]:0  LISTENING  8888\n";
+        let pids = pids_listening_on_port(fixture, 9223);
+        assert_eq!(pids.len(), 1);
+        assert!(pids.contains(&8888));
+    }
+
+    #[test]
+    fn test_pids_listening_on_port_never_panics() {
+        // Garbage inputs — must not panic.
+        let _ = pids_listening_on_port("\x00\x01\x02", 9223);
+        let _ = pids_listening_on_port("TCP", 9223);
+        let _ = pids_listening_on_port(
+            "  TCP    0.0.0.0:99999  0.0.0.0:0  LISTENING  1234\n",
+            9223,
+        );
+        let _ = pids_listening_on_port(
+            "  TCP    0.0.0.0:9223  0.0.0.0:0  LISTENING  999999999999999\n",
+            9223,
+        );
     }
 }

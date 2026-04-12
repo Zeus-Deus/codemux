@@ -289,4 +289,142 @@ mod tests {
         let result = inject_agent_context("opencode", "ws-1");
         assert_eq!(result, "opencode");
     }
+
+    /// Regression guard: the Gemini injection path MUST resolve its temp
+    /// file via `std::env::temp_dir()` — never a hardcoded `/tmp/`. On
+    /// Linux `std::env::temp_dir()` typically returns `/tmp/`, so a
+    /// hardcoded `/tmp/` would silently "work" locally but break on
+    /// Windows (where `%TEMP%` is under `C:\Users\...\AppData\Local\Temp`).
+    ///
+    /// The test asserts the generated shell command contains the OS-
+    /// appropriate temp dir as a prefix of the gemini-system-md path.
+    #[test]
+    fn test_gemini_context_path_is_cross_platform() {
+        let result = inject_agent_context("gemini", "test-ws-xplat");
+
+        // Build what the expected temp path SHOULD look like on this OS.
+        let expected_temp = std::env::temp_dir()
+            .join("codemux-test-ws-xplat-gemini-system.md")
+            .to_string_lossy()
+            .into_owned();
+
+        assert!(
+            result.contains(&expected_temp),
+            "gemini injection must reference {expected_temp:?}, got {result:?}",
+        );
+
+        // On Windows, std::env::temp_dir() must NOT start with /tmp/.
+        // On Linux it typically DOES, so this check is only meaningful
+        // on Windows — it's harmless on Linux.
+        #[cfg(windows)]
+        {
+            // Build the forbidden prefix at runtime so the literal
+            // "/tmp/" never appears in the source file — otherwise the
+            // sibling meta-test `test_no_hardcoded_tmp_paths_in_modified_sources`
+            // would flag this assertion as a regression.
+            let unix_tmp_prefix = format!("/{}/", "tmp");
+            assert!(
+                !expected_temp.starts_with(&unix_tmp_prefix),
+                "on Windows the temp dir must never be under /tmp, got {expected_temp:?}",
+            );
+        }
+
+        // The file name component is the same on every platform.
+        assert!(result.contains("codemux-test-ws-xplat-gemini-system.md"));
+    }
+
+    /// Meta-test: grep the source files we modified for Windows support
+    /// against regressions that would reintroduce hardcoded Unix-temp-dir
+    /// paths for **codemux-specific** artifacts in non-comment code.
+    ///
+    /// This is a "soft" check — we can't AST-parse Rust from a unit test
+    /// without pulling in heavyweight deps, so we do a line-level grep
+    /// that strips trailing `//` comments before matching, then looks
+    /// for the literal pattern `"<slash>tmp<slash>codemux`. That narrow
+    /// pattern catches the actual regressions we care about (the
+    /// Gemini system prompt, control socket fallback, diagnostics log,
+    /// CLI shim dir — all of which used to be `/tmp/codemux-*`) without
+    /// flagging unrelated test fixtures that happen to use `/tmp/` as
+    /// a placeholder workspace CWD.
+    ///
+    /// **Suppression**: to allow a legitimate Unix-only hardcoded
+    /// `/tmp/codemux-*` path (e.g. inside `#[cfg(unix)]` code where the
+    /// XDG fallback is Unix-specific by definition), add the trailing
+    /// marker comment `// tmp-literal-ok` to the offending line. The
+    /// meta-test won't flag any line whose body contains that marker.
+    ///
+    /// The forbidden pattern is built at runtime from constituent parts
+    /// so this test source file doesn't contain the literal pattern
+    /// itself — otherwise the test would flag its own source.
+    #[test]
+    fn test_no_hardcoded_tmp_paths_in_modified_sources() {
+        // Files we audited and updated during the Windows support pass.
+        // When a new file gets touched for Windows, add it here.
+        let files = [
+            "src/agent_context.rs",
+            "src/agent_browser.rs",
+            "src/commands/mod.rs",
+            "src/commands/browser.rs",
+            "src/control.rs",
+            "src/diagnostics.rs",
+            "src/git.rs",
+            "src/terminal/mod.rs",
+            "src/ports.rs",
+        ];
+
+        // Construct the forbidden literal at runtime: a double-quote
+        // followed by `/tmp/codemux`. Any source line that contains
+        // this exact byte sequence is almost certainly a hardcoded
+        // codemux-specific temp path and should use std::env::temp_dir()
+        // instead.
+        //
+        // Split into parts so the source file of THIS test never
+        // contains the full literal — otherwise the test would
+        // trivially flag its own source.
+        let needle = format!("{}{}{}{}{}", '"', '/', "tmp", '/', "codemux");
+        // Suppression marker — also built at runtime so greps for
+        // "tmp-literal-ok" don't match THIS test's implementation.
+        let ok_marker = format!("{}-{}-{}", "tmp", "literal", "ok");
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+        for rel in files {
+            let path = std::path::Path::new(manifest_dir).join(rel);
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                // File might not exist yet — skip rather than fail.
+                // (CI runs this test; if a file is missing, the other
+                //  tests for that module will fail too and that's a
+                //  clearer signal.)
+                continue;
+            };
+
+            for (lineno, line) in content.lines().enumerate() {
+                // If the line carries a suppression marker anywhere,
+                // skip it entirely. The marker lives in the comment
+                // tail; authors put it there when a unix-only code
+                // path legitimately needs a hardcoded codemux temp path.
+                if line.contains(&ok_marker) {
+                    continue;
+                }
+
+                // Strip single-line trailing comments before matching.
+                let comment_start = line.find("//");
+                let code_part = match comment_start {
+                    Some(idx) => &line[..idx],
+                    None => line,
+                };
+
+                if code_part.contains(&needle) {
+                    panic!(
+                        "regression: hardcoded unix codemux temp path found in non-comment code\n\
+                         file: {rel}\n\
+                         line {}: {line}\n\
+                         use std::env::temp_dir().join(\"codemux-...\") instead — hardcoded unix paths break Windows\n\
+                         (if this is inside #[cfg(unix)] code, add `// {ok_marker}` at end of line)",
+                        lineno + 1,
+                    );
+                }
+            }
+        }
+    }
 }
