@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { WindowChrome } from "@/components/layout/window-chrome";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
@@ -1262,8 +1263,11 @@ export function SettingsView() {
   };
 
   return (
-    <div className="flex h-screen flex-col bg-background">
-      {/* Header */}
+    <div className="relative flex h-screen flex-col bg-background">
+      <WindowChrome />
+      {/* Header — h-12 (48px) is taller than the 28px WindowChrome strip,
+          so the Back button's hit area sits below the controls and the
+          window controls retain a clear click target on the right. */}
       <div className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4">
         <Button
           variant="ghost"

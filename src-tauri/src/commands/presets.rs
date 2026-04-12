@@ -559,20 +559,22 @@ fn wait_and_write_command(
     }
 }
 
-/// Check whether a command's binary exists on the system via `which`.
+/// Check whether a command's binary exists on `PATH` for the current user.
 /// Returns true for empty commands (e.g. the Shell preset).
+///
+/// Uses the `which` crate (cross-platform PATH walk) instead of shelling out
+/// to the `which` Unix binary. The shellout version returned `false` for every
+/// command on Windows because `which.exe` is not part of cmd.exe — Windows
+/// users hitting "Apply preset" got an unhelpful "<binary> is not installed"
+/// error for binaries that were actually installed and on PATH. The crate-based
+/// implementation walks `PATH` directly with the right separator and executable
+/// extension semantics on each platform.
 fn command_binary_exists(command: &str) -> bool {
     let binary = command.split_whitespace().next().unwrap_or("");
     if binary.is_empty() {
         return true;
     }
-    std::process::Command::new("which")
-        .arg(binary)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    which::which(binary).is_ok()
 }
 
 #[cfg(test)]

@@ -14,6 +14,75 @@ Findings are organized by severity. File:line references point at the current st
 
 ---
 
+## First Real Windows Smoke Test (2026-04-12)
+
+First end-to-end run of Codemux on a real Windows machine. Three issues found, three follow-up fixes landed in the same session.
+
+### Bug 1 — Runaway terminal spawning (CRITICAL, fixed)
+
+**Symptom**: After signing in and opening a project, the app spawned ~23 ConPTY children in seconds, the IPC thread froze, and the user had to force-close.
+
+**Root cause** is a stack of three composing failures, all of which have now been addressed:
+
+1. **Startup PTY hydration spawned every persisted session, not just the active workspace's.** `terminal::spawn_missing_ptys` walked the full `terminal_sessions` snapshot and called `spawn_pty_for_session` for each entry up to `MAX_STARTUP_SESSIONS = 50`. On Linux this is microsecond-cheap and invisible; on Windows ConPTY init is hundreds of milliseconds per child, so a saved state with N sessions blocked the synchronous Tauri IPC thread for ~N × 300ms during startup. After repeated force-closes (each leaving more orphan sessions in the persisted state) the user landed on ~23 ghosts and the app froze on next boot.
+2. **A TOCTOU race in `spawn_pty_for_session` and `spawn_pty_for_agent`.** The historic "is this session already running?" check (`writer.is_some() || master.is_some()`) released the `PtyState::sessions` lock before doing the slow ConPTY init, then re-took it 100+ms later to insert the populated `SessionRuntime`. On Windows that 100ms window was wide enough that startup hydration and user-driven workspace creation could both pass the check for the same session id and double-spawn — leaking the first ConPTY child to no-one.
+3. **Preset application was unreachable on Windows.** `command_binary_exists` shelled out to the Unix `which` binary which is not present on `cmd.exe`, so every preset binary check returned `false` and `apply_preset` errored out with a misleading `"<binary> is not installed"`. Not a cause of the spawn flood, but a separate Windows-blocking bug discovered during the same investigation.
+
+**Fixes (this session)**:
+
+- **Fix 1a — Active-workspace-only startup hydration.** `spawn_missing_ptys` now resolves `snapshot.active_workspace_id` and calls a new `spawn_missing_ptys_for_workspace` helper for ONLY that workspace. Sessions for inactive workspaces stay on disk-only until the user activates that workspace. The `activate_workspace` and `cycle_workspace` Tauri commands now also call `spawn_missing_ptys_for_workspace` for their newly-activated workspace, so switching workspaces lazily materializes the PTYs of the destination. Idempotent thanks to Fix 1b. If the persisted `active_workspace_id` is empty (fresh install or all workspaces deleted) `spawn_missing_ptys` is now a no-op and the next user-driven action spawns its own PTY. — `src-tauri/src/terminal/mod.rs:spawn_missing_ptys` + new `spawn_missing_ptys_for_workspace`, `src-tauri/src/commands/workspace.rs:activate_workspace` + `cycle_workspace`.
+- **Fix 1b — Atomic spawn reservation closes the TOCTOU race.** `SessionRuntime` gained an `is_spawning: bool` field. New `try_reserve_session_spawn(sessions, session_id)` helper acquires the `PtyState::sessions` mutex once, atomically inserts a `SessionRuntime { is_spawning: true, .. }` placeholder if the entry doesn't already have a writer/master/in-flight reservation, and returns `true` only if it won the race. Both `spawn_pty_for_session` and `spawn_pty_for_agent` now call this at the top of the function and bail with `return` if it returns `false`. Every error early-return path calls `remove_session_runtime` to drop the placeholder so retries (e.g. `restart_terminal_session`) work; the success path clears `is_spawning = false` inside the existing `with_session_runtime` closure that populates `writer`/`master`. — `src-tauri/src/terminal/mod.rs:SessionRuntime` + `try_reserve_session_spawn` + `is_session_spawn_active` + `spawn_pty_for_session` + `spawn_pty_for_agent`.
+- **Fix 1c — Cross-platform binary check via `which` crate.** `command_binary_exists` in `src-tauri/src/commands/presets.rs` now calls `which::which(binary).is_ok()` instead of shelling out. Added `which = "6"` to `src-tauri/Cargo.toml`. The crate walks `PATH` directly with the right separator and executable extension semantics on each platform — `which.exe` is no longer needed on `cmd.exe`. Unblocks preset application on Windows entirely.
+- **Tests added (9, all run on every platform):**
+  - `try_reserve_session_spawn_first_caller_wins`
+  - `try_reserve_session_spawn_second_caller_loses_while_in_flight`
+  - `try_reserve_session_spawn_succeeds_again_after_runtime_removed`
+  - `try_reserve_session_spawn_blocks_when_writer_already_set`
+  - `try_reserve_session_spawn_only_one_winner_under_thread_race` (16-thread race smoke test)
+  - `is_session_spawn_active_reflects_lifecycle_states`
+  - `collect_workspace_session_ids_returns_only_target_workspace`
+  - `collect_workspace_session_ids_returns_empty_for_unknown_workspace`
+  - `collect_workspace_session_ids_walks_split_panes`
+
+**Explicitly NOT done in this pass** (see follow-ups below):
+
+- **Phantom runtime re-insert race**. The waiter thread's `with_session_runtime` call after a child exit can re-insert an empty `SessionRuntime` if `terminate_pty_session` removed the entry first. With the spawn-reservation gate this is now harmless on the spawn side (the next `spawn_pty_for_session` will see `writer/master = None && is_spawning = false` and reserve cleanly), but it's still latent and worth a follow-up if we hit any session-state-machine weirdness.
+- **Windows `batched_reader_loop` blocking-read placeholder**. Still does plain blocking `reader.read()` with no timeout (`src-tauri/src/terminal/mod.rs:442-475`). Documented as a v1 placeholder pending the Tokio-based reader rewrite. Not part of this session — it's a separate optimization tracked in the PTY Layer section below.
+- **Sync-IPC `create_worktree_workspace`**. The Tauri commands that spawn PTYs are still synchronous, so a slow ConPTY init during a layout-of-N workspace creation still blocks the IPC thread for the duration. With Fix 1a in place this is bounded by the layout size (`single` = 1, `eight` = 8), not 23+, so the freeze is no longer catastrophic. Async refactor remains a follow-up.
+
+### Bug 2 — Missing window controls on full-screen views (UX, fixed)
+
+**Symptom**: On Windows, the app window had no close/minimize/maximize buttons until the user opened a project. Login screen, empty state, settings view, and new-project screen all rendered without any way to control the window.
+
+**Root cause**: `tauri.conf.json` sets `"decorations": false` (Codemux paints its own title bar). The `WindowControls` cluster lived inside `src/components/layout/title-bar.tsx`, and `<TitleBar />` was only mounted by `src/components/layout/app-shell.tsx` in the "has workspaces" branch — every other branch (`isLoading`, `showSettings`, `showNewProjectScreen`, `!hasWorkspaces`) returned a different component without the title bar. On Linux + Hyprland this was invisible because the WM still decorates floating windows even with `decorations: false`. On Windows the flag is honored.
+
+**Fix**: Extracted `WindowControls` into a new shared `src/components/layout/window-chrome.tsx` and added a `<WindowChrome />` wrapper that combines a full-width `data-tauri-drag-region` strip with the controls anchored to the top-right. The strip is `pointer-events-none` overall with the drag region and the controls each opting back in, so it overlays existing layouts without intercepting clicks on content beneath it. `<WindowChrome />` is now rendered in:
+
+- `src/components/auth/login-screen.tsx` (all four sub-views: signin, signup, forgot-password, verify-email, plus the loading splash)
+- `src/components/layout/empty-state.tsx`
+- `src/components/overlays/new-project-screen.tsx` (Back button bumped to `top-9` to clear the strip)
+- `src/components/settings/settings-view.tsx` (header is `h-12`, taller than the `h-7` strip, so the Back button keeps a clear hit target)
+
+`title-bar.tsx` now imports `WindowControls` from `window-chrome.tsx` instead of duplicating it (DRY) — its existing usage of the cluster is unchanged.
+
+**Test infrastructure update**: `vitest.setup.ts` now globally mocks `@tauri-apps/api/window` because the new `<WindowChrome />` calls `getCurrentWindow()` at mount, which throws under jsdom (`window.__TAURI_INTERNALS__` is undefined). The mock returns a no-op stub that satisfies the type. Five `SettingsPanel.test.tsx` tests started failing the first time after the WindowChrome refactor; the global mock fixes them and is robust against any future test that renders a component using window APIs.
+
+### Bug 3 — Orange button colors on login screen (cosmetic, fixed)
+
+The login screen's `<Button>` instances were using the default variant (`bg-primary` → orange). Replaced className override on four buttons (Sign in / Create account, Send reset link, Back to sign in, I've verified my email) with `bg-foreground text-background hover:bg-foreground/90`. Also fixed the Forgot-password link's `hover:text-primary` (orange on hover) → `hover:text-foreground`. Continue with GitHub button kept as `variant="outline"` (correct for the secondary OAuth action). — `src/components/auth/login-screen.tsx`. **Underlying cause** is that the shadcn Button default variant is orange (`bg-primary`); a follow-up cleanup should change the default itself rather than override per call site. Tracked separately.
+
+### What's still open after this session
+
+The Bug 1 stack has three more layers we deliberately did NOT fix in this pass (out of scope per the user's instructions, but worth re-noting here so they aren't lost):
+
+- Phantom runtime re-insert race in the waiter thread (mitigated by Fix 1b but not eliminated)
+- Tokio-based Windows `batched_reader_loop` (placeholder still shipped — see PTY Layer section)
+- Async `create_worktree_workspace` and friends so PTY spawns don't pin the IPC thread
+
+Plus the broader Windows polish work below this section is unchanged.
+
+---
+
 ## Research Findings
 
 Web research conducted 2026-04-12 on the three unknowns that gate the Windows effort. **TL;DR**: all three are feasible, but `portable-pty 0.9.0` has a known Windows regression we must pin around, and `agent-browser` ships Windows x64 only (no ARM64). All five agent CLIs run natively on Windows.

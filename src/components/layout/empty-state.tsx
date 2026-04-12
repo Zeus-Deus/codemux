@@ -1,5 +1,6 @@
 import { FolderOpen, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { WindowChrome } from "@/components/layout/window-chrome";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useUIStore } from "@/stores/ui-store";
 import wordmark from "@/assets/codemux-wordmark.svg";
@@ -12,6 +13,7 @@ export function EmptyState() {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background">
+      <WindowChrome />
       <div className="flex flex-col items-center">
         {/* Wordmark */}
         <img

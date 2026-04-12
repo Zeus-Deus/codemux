@@ -2,6 +2,7 @@ import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { WindowChrome } from "@/components/layout/window-chrome";
 import {
   ArrowLeft,
   FolderPlus,
@@ -122,8 +123,10 @@ export function NewProjectScreen() {
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col bg-background">
-      {/* Back button */}
-      <div className="absolute top-4 left-4 z-10">
+      <WindowChrome />
+      {/* Back button — pulled below the WindowChrome strip so the window
+          controls keep their click target. */}
+      <div className="absolute top-9 left-4 z-10">
         <Button
           variant="ghost"
           size="sm"

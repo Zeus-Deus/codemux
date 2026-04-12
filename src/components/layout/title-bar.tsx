@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
@@ -12,13 +11,10 @@ import {
   Bug,
   Info,
   LogOut,
-  Minus,
-  Square,
-  Copy,
-  X,
   ChevronDown,
   ExternalLink,
 } from "lucide-react";
+import { WindowControls } from "./window-chrome";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -40,56 +36,6 @@ import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
 import type { EditorInfo } from "@/tauri/types";
-
-// ── Window Controls ──
-
-function WindowControls() {
-  const [isMaximized, setIsMaximized] = useState(false);
-  const appWindow = getCurrentWindow();
-
-  useEffect(() => {
-    appWindow.isMaximized().then(setIsMaximized);
-    const unlisten = appWindow.onResized(() => {
-      appWindow.isMaximized().then(setIsMaximized);
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [appWindow]);
-
-  return (
-    <div className="flex items-center">
-      <button
-        type="button"
-        aria-label="Minimize"
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
-        onClick={() => appWindow.minimize()}
-      >
-        <Minus className="h-3 w-3" />
-      </button>
-      <button
-        type="button"
-        aria-label={isMaximized ? "Restore" : "Maximize"}
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-accent hover:text-foreground"
-        onClick={() => appWindow.toggleMaximize()}
-      >
-        {isMaximized ? (
-          <Copy className="h-3 w-3" />
-        ) : (
-          <Square className="h-2.5 w-2.5" />
-        )}
-      </button>
-      <button
-        type="button"
-        aria-label="Close"
-        className="flex h-7 w-8 items-center justify-center text-muted-foreground transition-colors duration-150 hover:bg-destructive hover:text-destructive-foreground"
-        onClick={() => appWindow.close()}
-      >
-        <X className="h-3.5 w-3.5" />
-      </button>
-    </div>
-  );
-}
 
 // ── Search Trigger ──
 

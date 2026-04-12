@@ -51,6 +51,7 @@ hostname = "0.4"
 url = "2"
 urlencoding = "2"
 regex = "1.12.3"
+which = "6"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

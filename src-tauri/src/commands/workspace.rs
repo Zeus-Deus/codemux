@@ -525,6 +525,13 @@ pub fn activate_workspace(
     workspace_id: String,
 ) -> Result<(), String> {
     if state.activate_workspace(&workspace_id) {
+        // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
+        // sessions for the workspace that was active at last close. Sessions
+        // for any other workspace stay on disk-only until the user activates
+        // them — at which point this branch spawns whatever PTYs aren't
+        // already running. Idempotent thanks to `try_reserve_session_spawn`,
+        // so re-activating the already-active workspace is a no-op.
+        terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id);
         crate::state::emit_app_state(&app);
         db.set_ui_state("active_workspace", &workspace_id).ok();
         Ok(())
@@ -649,6 +656,8 @@ pub fn cycle_workspace(
         .ok_or_else(|| "No workspace navigation target available".to_string())?;
 
     if state.activate_workspace(&workspace_id.0) {
+        // Lazy PTY hydration — same rationale as `activate_workspace`.
+        terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
         crate::state::emit_app_state(&app);
         Ok(workspace_id.0)
     } else {

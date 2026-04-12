@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Github, Loader2, Mail } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { WindowChrome } from "@/components/layout/window-chrome";
 import { useAuthStore } from "@/stores/auth-store";
 import { forgotPassword } from "@/tauri/commands";
 
@@ -26,7 +27,8 @@ export function LoginScreen() {
   // Startup loading state — pulsing logo
   if (isLoading) {
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-background">
+      <div className="relative flex h-screen w-screen items-center justify-center bg-background">
+        <WindowChrome />
         <div className="text-xl font-semibold text-foreground animate-pulse opacity-80">
           codemux
         </div>
@@ -70,8 +72,9 @@ export function LoginScreen() {
   // ─── Verify Email View ───────────────────────────────────────
   if (view === "verify-email") {
     return (
-      <div className="flex flex-col h-screen w-screen bg-background">
-        <div className="h-8 w-full shrink-0" data-tauri-drag-region />
+      <div className="relative flex flex-col h-screen w-screen bg-background">
+        <WindowChrome />
+        <div className="h-8 w-full shrink-0" />
         <div className="flex flex-1 items-center justify-center">
           <div className="flex flex-col items-center w-full max-w-sm px-6">
             <div className="mb-6">
@@ -89,7 +92,7 @@ export function LoginScreen() {
               to verify your account.
             </p>
             <Button
-              className="w-full"
+              className="w-full bg-foreground text-background hover:bg-foreground/90"
               size="lg"
               onClick={() => switchView("signin")}
             >
@@ -111,8 +114,9 @@ export function LoginScreen() {
   // ─── Forgot Password View ───────────────────────────────────
   if (view === "forgot-password") {
     return (
-      <div className="flex flex-col h-screen w-screen bg-background">
-        <div className="h-8 w-full shrink-0" data-tauri-drag-region />
+      <div className="relative flex flex-col h-screen w-screen bg-background">
+        <WindowChrome />
+        <div className="h-8 w-full shrink-0" />
         <div className="flex flex-1 items-center justify-center">
           <div className="flex flex-col items-center w-full max-w-sm px-6">
             <div className="mb-6">
@@ -131,7 +135,7 @@ export function LoginScreen() {
                   If that email exists, we sent a reset link.
                 </p>
                 <Button
-                  className="w-full"
+                  className="w-full bg-foreground text-background hover:bg-foreground/90"
                   size="lg"
                   onClick={() => switchView("signin")}
                 >
@@ -151,7 +155,7 @@ export function LoginScreen() {
                 />
                 <Button
                   type="submit"
-                  className="w-full"
+                  className="w-full bg-foreground text-background hover:bg-foreground/90"
                   size="lg"
                   disabled={resetLoading}
                 >
@@ -179,9 +183,11 @@ export function LoginScreen() {
 
   // ─── Sign In / Sign Up View ─────────────────────────────────
   return (
-    <div className="flex flex-col h-screen w-screen bg-background">
-      {/* Draggable title bar area */}
-      <div className="h-8 w-full shrink-0" data-tauri-drag-region />
+    <div className="relative flex flex-col h-screen w-screen bg-background">
+      <WindowChrome />
+      {/* Top spacer reserves room for the WindowChrome strip overlay so the
+          centered content doesn't visually collide with the controls. */}
+      <div className="h-8 w-full shrink-0" />
 
       <div className="flex flex-1 items-center justify-center">
         <div className="flex flex-col items-center w-full max-w-sm px-6">
@@ -267,7 +273,7 @@ export function LoginScreen() {
               <div className="flex justify-end">
                 <button
                   type="button"
-                  className="text-xs text-muted-foreground hover:text-primary transition-colors"
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
                   onClick={() => switchView("forgot-password")}
                 >
                   Forgot password?
@@ -292,7 +298,7 @@ export function LoginScreen() {
 
             <Button
               type="submit"
-              className="w-full"
+              className="w-full bg-foreground text-background hover:bg-foreground/90"
               size="lg"
               disabled={isSigningIn}
             >

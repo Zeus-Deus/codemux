@@ -122,6 +122,13 @@ pub struct SessionRuntime {
     /// When present, the preset readiness helper injects this command instead
     /// of the normal preset command.
     pub resume_command: Option<String>,
+    /// True from the moment a spawn caller has reserved this session id (under
+    /// the `PtyState::sessions` lock) to the moment the spawn either succeeds
+    /// or fails. While `is_spawning` is true, `is_session_spawn_active` returns
+    /// `true` and concurrent spawn attempts skip — closing the TOCTOU race
+    /// where two callers both passed the "writer/master is None" check while
+    /// the slow ConPTY initialization was in flight on Windows.
+    pub is_spawning: bool,
 }
 
 impl SessionRuntime {
@@ -140,6 +147,7 @@ impl SessionRuntime {
             child_pid: None,
             skip_preset_launch: false,
             resume_command: None,
+            is_spawning: false,
         }
     }
 }
@@ -188,6 +196,52 @@ fn remove_session_runtime(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(session_id)
+}
+
+/// Atomically reserve a session id for a spawn attempt.
+///
+/// Returns `true` if the caller now owns the spawn for this session and must
+/// proceed (and eventually call `clear_spawn_reservation` on every exit path).
+/// Returns `false` if another caller is already spawning, the session is
+/// already running (`writer`/`master` populated), or this call lost the race.
+///
+/// This closes the TOCTOU window between the historical
+/// "is the session already running?" check and the moment the spawned PTY
+/// handles get inserted into the runtime. On Linux the window was tens of
+/// microseconds and never observed in practice; on Windows ConPTY init takes
+/// hundreds of milliseconds and the window was wide enough that startup
+/// session restore would race with user-driven workspace creation and double-
+/// spawn the same session id, leaking children.
+fn try_reserve_session_spawn(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) -> bool {
+    let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    let runtime = guard
+        .entry(session_id.to_string())
+        .or_insert_with(|| SessionRuntime::new(session_id));
+    if runtime.writer.is_some() || runtime.master.is_some() || runtime.is_spawning {
+        return false;
+    }
+    runtime.is_spawning = true;
+    true
+}
+
+/// Check whether a spawn attempt is in flight or already complete for `session_id`.
+///
+/// Used by tests and by `spawn_missing_ptys_for_workspace` to skip sessions
+/// whose runtime is already populated. Acquires the `PtyState::sessions`
+/// mutex; do not hold any other lock across this call.
+#[allow(dead_code)]
+fn is_session_spawn_active(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) -> bool {
+    let guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get(session_id)
+        .map(|rt| rt.writer.is_some() || rt.master.is_some() || rt.is_spawning)
+        .unwrap_or(false)
 }
 
 fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
@@ -732,14 +786,15 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
-    let already_running = sessions
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .map(|runtime| runtime.writer.is_some() || runtime.master.is_some())
-        .unwrap_or(false);
-
-    if already_running {
+    // Atomic reservation: insert a placeholder runtime with `is_spawning = true`
+    // under the `PtyState::sessions` lock so a concurrent spawn attempt for the
+    // same session id sees the marker and bails. The previous "is writer/master
+    // populated?" check released the lock before doing slow ConPTY init, which
+    // on Windows produced a 100ms+ window where startup session restore and
+    // user-driven workspace creation could both pass the check and double-spawn
+    // the same session id, eventually leaking ~23 ConPTY children before the
+    // app froze. See `try_reserve_session_spawn` for the lock ordering.
+    if !try_reserve_session_spawn(&sessions, &session_id) {
         return;
     }
 
@@ -767,12 +822,15 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to open PTY: {error}")),
                     exit_code: None,
                 },
             );
+            // Drop the spawn reservation we took out at the top of this function
+            // so a future retry / restart_terminal_session can re-try.
+            remove_session_runtime(&sessions, &session_id);
             return;
         }
     };
@@ -890,12 +948,15 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to spawn shell {shell}: {error}")),
                     exit_code: None,
                 },
             );
+            // Drop the spawn reservation taken at the top of this function;
+            // see the same pattern at the openpty failure branch above.
+            remove_session_runtime(&sessions, &session_id);
             return;
         }
     };
@@ -988,6 +1049,10 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
             runtime.child_pid = Some(child_pid);
             runtime.skip_preset_launch = auto_resume_command.is_some();
             runtime.resume_command = auto_resume_command.clone();
+            // Spawn complete — clear the reservation marker so the runtime
+            // looks identical to a non-spawning runtime in every downstream
+            // check (terminate_pty_session, restart_terminal_session, etc.).
+            runtime.is_spawning = false;
         },
     );
 
@@ -1115,27 +1180,87 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     });
 }
 
-pub fn spawn_missing_ptys(app: AppHandle) {
+/// Walk a workspace's pane tree and return every terminal session id under it.
+///
+/// Used by `spawn_missing_ptys` (active workspace at startup) and
+/// `spawn_missing_ptys_for_workspace` (lazy spawn when the user activates an
+/// inactive workspace). Returns an empty vec if no workspace matches `workspace_id`.
+fn collect_workspace_session_ids(
+    snapshot: &crate::state::AppStateSnapshot,
+    workspace_id: &str,
+) -> Vec<String> {
+    snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
+        .unwrap_or_default()
+}
+
+/// Spawn PTYs for every terminal session belonging to `workspace_id` that
+/// isn't already running. Used by the lazy-activation path so that when a user
+/// switches workspaces we materialize that workspace's PTYs on demand.
+///
+/// Idempotent: each `spawn_pty_for_session` call is gated by
+/// `try_reserve_session_spawn`, so re-calling this for an already-active
+/// workspace is a cheap no-op.
+pub fn spawn_missing_ptys_for_workspace(app: AppHandle, workspace_id: &str) {
     let app_state: State<'_, AppStateStore> = app.state();
-    let mut session_ids = app_state
-        .snapshot()
-        .terminal_sessions
-        .into_iter()
-        .map(|session| session.session_id.0)
-        .collect::<Vec<_>>();
+    let snapshot = app_state.snapshot();
+    let session_ids = collect_workspace_session_ids(&snapshot, workspace_id);
 
     if session_ids.len() > MAX_STARTUP_SESSIONS {
         eprintln!(
-            "[codemux::terminal] Too many persisted sessions ({}); spawning only the first {}",
+            "[codemux::terminal] Workspace {workspace_id} has {} sessions; \
+             spawning only the first {} to avoid blocking the IPC thread",
             session_ids.len(),
             MAX_STARTUP_SESSIONS
         );
-        session_ids.truncate(MAX_STARTUP_SESSIONS);
     }
 
-    for session_id in session_ids {
+    for session_id in session_ids.into_iter().take(MAX_STARTUP_SESSIONS) {
         spawn_pty_for_session(app.clone(), session_id);
     }
+}
+
+/// Startup PTY hydration. Restores PTY children only for sessions that belong
+/// to the **active** workspace, leaving inactive workspaces' sessions to be
+/// materialized lazily by `spawn_missing_ptys_for_workspace` when the user
+/// switches into them via `activate_workspace`.
+///
+/// **Why active-only.** The previous implementation walked every persisted
+/// `terminal_sessions` entry and called `spawn_pty_for_session` for each, up
+/// to `MAX_STARTUP_SESSIONS = 50`. On Linux this is microsecond-cheap and
+/// invisible. On Windows ConPTY init takes hundreds of milliseconds per
+/// child, so a saved state with N sessions blocked the synchronous IPC
+/// thread for N × ~300ms during startup, producing the observed "23 ConPTY
+/// children spawning at once → app frozen → force-close" failure mode.
+///
+/// **What "active" means at startup.** `state::AppStateStore` loads the
+/// persisted active workspace id from disk during startup, **before** this
+/// function runs (via `lib.rs` setup), so by the time `spawn_missing_ptys`
+/// is called the snapshot's `active_workspace_id` is the same workspace
+/// id the user was on when they last closed the app. If the persisted
+/// active workspace id doesn't resolve to a real workspace (e.g. it was
+/// deleted between sessions, or no workspaces exist yet) we spawn nothing
+/// — the next user-driven action will spawn its own PTY.
+///
+/// Other workspaces' sessions are not lost: their persisted scrollback +
+/// metadata stays on disk, and `spawn_missing_ptys_for_workspace` rehydrates
+/// them on workspace switch.
+pub fn spawn_missing_ptys(app: AppHandle) {
+    let app_state: State<'_, AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    let active_workspace_id = snapshot.active_workspace_id.0.clone();
+
+    if active_workspace_id.is_empty() {
+        // No workspace persisted yet (fresh install, or all workspaces deleted).
+        // The next user-driven workspace creation will spawn its own PTYs via
+        // `create_workspace_with_layout` / `create_worktree_workspace`.
+        return;
+    }
+
+    spawn_missing_ptys_for_workspace(app, &active_workspace_id);
 }
 
 #[tauri::command]
@@ -1525,14 +1650,9 @@ pub fn spawn_pty_for_agent(
     let sessions = terminal_state.sessions.clone();
     let agent_store_inner = agent_store.clone_inner();
 
-    let already_running = sessions
-        .lock()
-        .unwrap()
-        .get(&session_id)
-        .map(|r| r.writer.is_some() || r.master.is_some())
-        .unwrap_or(false);
-
-    if already_running {
+    // Atomic spawn reservation — see `spawn_pty_for_session` for the
+    // TOCTOU-race rationale. Same lock-held placeholder pattern.
+    if !try_reserve_session_spawn(&sessions, &session_id) {
         return;
     }
 
@@ -1543,12 +1663,14 @@ pub fn spawn_pty_for_agent(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some("Agent spawn failed: empty argv".into()),
                     exit_code: None,
                 },
             );
+            // Drop the spawn reservation so a future retry can re-try.
+            remove_session_runtime(&sessions, &session_id);
             return;
         }
     };
@@ -1594,12 +1716,14 @@ pub fn spawn_pty_for_agent(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to open PTY for agent: {error}")),
                     exit_code: None,
                 },
             );
+            // Drop the spawn reservation so a future retry can re-try.
+            remove_session_runtime(&sessions, &session_id);
             return;
         }
     };
@@ -1706,12 +1830,14 @@ pub fn spawn_pty_for_agent(
                 &app,
                 &sessions,
                 TerminalStatusPayload {
-                    session_id,
+                    session_id: session_id.clone(),
                     state: TerminalLifecycleState::Failed,
                     message: Some(format!("Failed to spawn agent {executable}: {error}")),
                     exit_code: None,
                 },
             );
+            // Drop the spawn reservation so a future retry can re-try.
+            remove_session_runtime(&sessions, &session_id);
             return;
         }
     };
@@ -1795,6 +1921,9 @@ pub fn spawn_pty_for_agent(
             runtime.writer = Some(writer);
             runtime.master = Some(pty_pair.master);
             runtime.child_pid = Some(child_pid);
+            // Spawn complete — clear the reservation marker. See the same
+            // pattern at the end of `spawn_pty_for_session`.
+            runtime.is_spawning = false;
         },
     );
 
@@ -2793,6 +2922,210 @@ mod tests {
     fn resolve_session_cwd_falls_back_on_empty_string() {
         let result = resolve_session_cwd("", "/home/fallback");
         assert_eq!(result, "/home/fallback");
+    }
+
+    // ── Spawn-reservation TOCTOU tests (Bug 1b) ───────────────────
+
+    fn make_spawn_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn try_reserve_session_spawn_first_caller_wins() {
+        let sessions = make_spawn_sessions();
+        assert!(
+            try_reserve_session_spawn(&sessions, "sess-1"),
+            "first reservation must succeed"
+        );
+        // The reservation must be visible as is_spawning under the lock.
+        assert!(is_session_spawn_active(&sessions, "sess-1"));
+    }
+
+    #[test]
+    fn try_reserve_session_spawn_second_caller_loses_while_in_flight() {
+        let sessions = make_spawn_sessions();
+        assert!(try_reserve_session_spawn(&sessions, "race-id"));
+        // Second caller for the same session must observe the placeholder
+        // and bail. Without this guarantee, two concurrent
+        // `spawn_pty_for_session` callers would both pass the historic
+        // "writer/master is None" check and both spawn ConPTY children for
+        // the same session id — the exact bug we're closing.
+        assert!(
+            !try_reserve_session_spawn(&sessions, "race-id"),
+            "second reservation while in flight must lose"
+        );
+    }
+
+    #[test]
+    fn try_reserve_session_spawn_succeeds_again_after_runtime_removed() {
+        // The error early-return paths in spawn_pty_for_session call
+        // remove_session_runtime to drop the placeholder. After that, the
+        // next caller must be able to reserve again so a real retry / restart
+        // path works.
+        let sessions = make_spawn_sessions();
+        assert!(try_reserve_session_spawn(&sessions, "retry-id"));
+        // Simulate the error early-return cleanup.
+        remove_session_runtime(&sessions, "retry-id");
+        assert!(
+            try_reserve_session_spawn(&sessions, "retry-id"),
+            "post-cleanup retry must succeed"
+        );
+    }
+
+    #[test]
+    fn try_reserve_session_spawn_blocks_when_writer_already_set() {
+        // Once a session is fully running (writer/master populated, is_spawning
+        // cleared) a fresh `spawn_pty_for_session` call MUST also lose the
+        // reservation race so we never double-spawn.
+        let sessions = make_spawn_sessions();
+        with_session_runtime(
+            &sessions,
+            "running-id",
+            || SessionRuntime::new("running-id"),
+            |rt| {
+                // Use a no-op Write impl as a stand-in for a real PTY writer.
+                struct NoopWriter;
+                impl std::io::Write for NoopWriter {
+                    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                        Ok(buf.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                rt.writer = Some(Box::new(NoopWriter));
+                rt.is_spawning = false;
+            },
+        );
+        assert!(
+            !try_reserve_session_spawn(&sessions, "running-id"),
+            "reservation against a fully-running session must lose"
+        );
+    }
+
+    #[test]
+    fn try_reserve_session_spawn_only_one_winner_under_thread_race() {
+        // Smoke-test the lock semantics: 16 threads all race to reserve the
+        // same session id. Exactly one must win.
+        let sessions = make_spawn_sessions();
+        let session_id = "thread-race".to_string();
+        let mut handles = Vec::new();
+        let winners = Arc::new(Mutex::new(0u32));
+        for _ in 0..16 {
+            let s = sessions.clone();
+            let id = session_id.clone();
+            let w = winners.clone();
+            handles.push(std::thread::spawn(move || {
+                if try_reserve_session_spawn(&s, &id) {
+                    *w.lock().unwrap() += 1;
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let winner_count = *winners.lock().unwrap();
+        assert_eq!(
+            winner_count, 1,
+            "exactly one of 16 racing threads must win the reservation; got {winner_count}"
+        );
+    }
+
+    #[test]
+    fn is_session_spawn_active_reflects_lifecycle_states() {
+        let sessions = make_spawn_sessions();
+        // No entry → not active.
+        assert!(!is_session_spawn_active(&sessions, "lifecycle"));
+        // Reserved → active.
+        assert!(try_reserve_session_spawn(&sessions, "lifecycle"));
+        assert!(is_session_spawn_active(&sessions, "lifecycle"));
+        // Cleared (success path simulation) → still active because writer/
+        // master would be populated by the real spawn flow. Here we just
+        // clear is_spawning and check the helper still says "active" iff
+        // writer or master is populated. We're not setting them here, so
+        // is_session_spawn_active should now be false.
+        with_session_runtime(
+            &sessions,
+            "lifecycle",
+            || SessionRuntime::new("lifecycle"),
+            |rt| {
+                rt.is_spawning = false;
+            },
+        );
+        assert!(
+            !is_session_spawn_active(&sessions, "lifecycle"),
+            "after clearing is_spawning with writer/master still None, the session is not active"
+        );
+    }
+
+    // ── Active-workspace gating tests (Bug 1a) ───────────────────
+
+    #[test]
+    fn collect_workspace_session_ids_returns_only_target_workspace() {
+        let ws_a = test_workspace_with_pane(
+            "ws-a", "a", "/a", None, None, None, "sess-a",
+        );
+        let ws_b = test_workspace_with_pane(
+            "ws-b", "b", "/b", None, None, None, "sess-b",
+        );
+        let snapshot = test_snapshot("ws-a", vec![ws_a, ws_b]);
+
+        let a_ids = collect_workspace_session_ids(&snapshot, "ws-a");
+        let b_ids = collect_workspace_session_ids(&snapshot, "ws-b");
+
+        assert_eq!(a_ids, vec!["sess-a".to_string()]);
+        assert_eq!(b_ids, vec!["sess-b".to_string()]);
+    }
+
+    #[test]
+    fn collect_workspace_session_ids_returns_empty_for_unknown_workspace() {
+        let ws_a = test_workspace_with_pane(
+            "ws-a", "a", "/a", None, None, None, "sess-a",
+        );
+        let snapshot = test_snapshot("ws-a", vec![ws_a]);
+
+        // Misspelled / nonexistent workspace id is the realistic stale-state
+        // case during startup hydration; must return empty rather than
+        // accidentally hydrating a different workspace.
+        let nope = collect_workspace_session_ids(&snapshot, "ws-does-not-exist");
+        assert!(nope.is_empty());
+    }
+
+    #[test]
+    fn collect_workspace_session_ids_walks_split_panes() {
+        use crate::state::*;
+        let mut ws = test_workspace("ws-tree", "t", "/t", None, None, None);
+        ws.surfaces = vec![SurfaceSnapshot {
+            surface_id: SurfaceId("surf".into()),
+            title: "Terminal".into(),
+            root: PaneNodeSnapshot::Split {
+                pane_id: PaneId("split-root".into()),
+                direction: SplitDirection::Horizontal,
+                child_sizes: vec![0.5, 0.5],
+                children: vec![
+                    PaneNodeSnapshot::Terminal {
+                        pane_id: PaneId("p1".into()),
+                        session_id: SessionId("s1".into()),
+                        title: "left".into(),
+                    },
+                    PaneNodeSnapshot::Terminal {
+                        pane_id: PaneId("p2".into()),
+                        session_id: SessionId("s2".into()),
+                        title: "right".into(),
+                    },
+                ],
+            },
+            active_pane_id: PaneId("p1".into()),
+        }];
+        let snapshot = test_snapshot("ws-tree", vec![ws]);
+
+        let ids = collect_workspace_session_ids(&snapshot, "ws-tree");
+        // Order matches the depth-first walk in collect_terminal_sessions;
+        // we just care that BOTH session ids are present so the lazy hydrate
+        // path covers every pane in the workspace.
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"s1".to_string()));
+        assert!(ids.contains(&"s2".to_string()));
     }
 
     // -- process-group kill tests -----------------------------------------------
