@@ -1990,22 +1990,30 @@ mod tests {
         writer.write_all(payload).expect("write failed");
         writer.flush().expect("flush failed");
 
-        // Wait for PTY_BATCH_INTERVAL plus generous margin for thread scheduling
-        // under load (CI, parallel test runs). The key assertion is that the data
-        // arrives WITHOUT another write — not that it arrives in exactly 16ms.
-        let margin = Duration::from_millis(200);
-        std::thread::sleep(PTY_BATCH_INTERVAL + margin);
-
-        // The data should now be in pending_output — flushed by the poll timeout,
-        // NOT requiring another write.
-        let found = {
-            let guard = sessions.lock().unwrap();
-            let runtime = guard.get("test-pty").unwrap();
-            !runtime.pending_output.is_empty()
-        };
+        // Poll for up to `deadline` waiting for the batched reader thread to
+        // flush. The key assertion is that data arrives WITHOUT another write
+        // — not that it arrives in exactly 16ms. Previous iterations used a
+        // single `sleep(PTY_BATCH_INTERVAL + 200ms)` which kept tripping on
+        // loaded CI runners where thread scheduling jitter blew past the
+        // margin. Polling gives fast machines a typical finish time of
+        // ~16-50ms while still tolerating up to 3s of CI jitter — strictly
+        // more headroom than a fixed sleep at no cost to local dev runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            {
+                let guard = sessions.lock().unwrap();
+                let runtime = guard.get("test-pty").unwrap();
+                if !runtime.pending_output.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+        }
         assert!(
             found,
-            "data should appear in pending_output within PTY_BATCH_INTERVAL + margin"
+            "data should appear in pending_output within 3s (PTY_BATCH_INTERVAL = {PTY_BATCH_INTERVAL:?})"
         );
 
         // Verify the content includes our payload.

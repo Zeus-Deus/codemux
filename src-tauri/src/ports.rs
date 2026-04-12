@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-#[cfg(target_os = "linux")]
+// `std::fs` is cross-platform. The Linux-only `/proc/...` scanning helpers are
+// each individually `#[cfg(target_os = "linux")]`, but `load_static_ports()`
+// also reads `.codemux/ports.json` on every platform, so the import must not
+// be gated to linux.
 use std::fs;
 use std::path::Path;
 
