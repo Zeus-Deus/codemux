@@ -26,8 +26,12 @@ src-tauri/.codemux/
 # Local editor/IDE folders
 .vscode/
 
-# Local Claude Code settings (machine-specific permissions)
+# Local Claude Code settings and runtime state (machine-specific).
+# Covers permissions, the ScheduleWakeup lock file, and any other
+# transient files the harness drops under .claude/ during a session.
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
+.claude/*.lock
 
 # Environment files (keep template)
 .env
