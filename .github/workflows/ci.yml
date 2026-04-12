@@ -114,17 +114,28 @@ jobs:
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
-      - name: Configure git identity for tests
+      - name: Configure git identity and line endings for tests
         # Several tests in src-tauri/src/git.rs spin up a fixture repo and
         # shell out to `git commit`. GitHub runners have git installed but
         # no default user.email/user.name, so `git commit` refuses to run
-        # unless we provide a throwaway identity here. Works on both Linux
-        # and Windows runners — git reads --global from %USERPROFILE% on
-        # Windows and $HOME on Linux.
+        # unless we provide a throwaway identity here.
+        #
+        # The `core.autocrlf false` + `core.eol lf` pair disables Git for
+        # Windows's default `autocrlf=true` behavior — without this, git on
+        # Windows rewrites `\n` to `\r\n` on checkout, and tests that write
+        # a file with `\n` then read it back after a git operation fail
+        # with `left: "...\r\n"` vs `right: "...\n"` assertion mismatches.
+        # Linux git already defaults to autocrlf=false, so these lines are
+        # no-ops there.
+        #
+        # Works on both Linux and Windows runners — git --global reads from
+        # $HOME on Linux and %USERPROFILE% on Windows.
         shell: bash
         run: |
           git config --global user.email "ci@codemux.dev"
           git config --global user.name "Codemux CI"
+          git config --global core.autocrlf false
+          git config --global core.eol lf
 
       - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
