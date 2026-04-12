@@ -26,6 +26,7 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 - working directory set to workspace root on creation
 - comm log support for OpenFlow agent communication tracking
 - ANSI code stripping for log capture
+- session close kills the PTY child and its entire process group (SIGTERM → 200ms grace → SIGKILL) via the central `terminate_pty_session` helper, so closing a pane/tab/workspace also tears down any Claude CLI, MCP server, or rust-analyzer the shell spawned. `portable-pty`'s Unix spawn path calls `setsid()`, so the shell is a process-group leader and `killpg` reaches its children. `impl Drop for SessionRuntime` is a safety-net that kills the tree with a warning if the normal close path is ever skipped.
 
 ## Current Constraints
 

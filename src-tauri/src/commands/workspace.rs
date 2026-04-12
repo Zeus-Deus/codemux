@@ -453,7 +453,9 @@ pub fn close_workspace_with_worktree(
 ) -> Result<(), String> {
     let force = force_delete.unwrap_or(false);
 
-    // Get worktree path, branch, and title before closing
+    // Worktree metadata still needs a pre-close snapshot for teardown +
+    // MCP cleanup. Session IDs come from `state.close_workspace`'s result
+    // below — no TOCTOU race with concurrent pane creation.
     let (worktree_path, branch, ws_title) = {
         let snapshot = state.snapshot();
         let ws = snapshot
@@ -486,9 +488,19 @@ pub fn close_workspace_with_worktree(
         crate::mcp_server::remove_mcp_config(Path::new(wt_path));
     }
 
-    state
+    let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    // Kill the PTY child process trees for every session that used to belong
+    // to this workspace. Sessions are returned atomically from the same lock
+    // acquisition that removed the workspace — no TOCTOU race with newly
+    // created panes. Idempotent on the waiter thread (double-remove is a
+    // no-op) so per-session errors cannot bubble.
+    let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
+    for session_id in close_result.removed_sessions {
+        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+    }
 
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
@@ -561,14 +573,16 @@ pub fn close_workspace(
 ) -> Result<String, String> {
     let force = force_delete.unwrap_or(false);
 
-    // Get workspace cwd before closing (needed for teardown and MCP cleanup)
+    // We still need cwd + title for teardown + MCP cleanup before the
+    // state mutation. Session IDs are now obtained from
+    // `state.close_workspace`'s result below — no snapshot race.
     let workspace_cwd = {
         let snapshot = state.snapshot();
-        let ws = snapshot
+        snapshot
             .workspaces
             .iter()
-            .find(|w| w.workspace_id.0 == workspace_id);
-        ws.map(|w| (w.cwd.clone(), w.title.clone()))
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| (w.cwd.clone(), w.title.clone()))
     };
 
     // Run teardown scripts before closing
@@ -609,9 +623,19 @@ pub fn close_workspace(
         });
     }
 
-    let fallback = state.close_workspace(&workspace_id)?;
+    let result = state.close_workspace(&workspace_id)?;
+
+    // Kill the PTY child process trees for every session that used to belong
+    // to this workspace. Sessions are returned atomically from the same lock
+    // acquisition that removed the workspace — no TOCTOU race with newly
+    // created panes.
+    let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
+    for session_id in result.removed_sessions {
+        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+    }
+
     crate::state::emit_app_state(&app);
-    Ok(fallback.0)
+    Ok(result.fallback.0)
 }
 
 #[tauri::command]
@@ -684,14 +708,12 @@ pub fn close_pane(
     let removed = state.close_pane(&pane_id)?;
 
     if let Some(ref session_id) = removed {
+        // Kill the PTY child + its process group. `state.close_pane` already
+        // removed the session from the store, so we go straight to the PTY
+        // helper instead of back through `close_terminal_session` (which
+        // would try to re-remove from the store and fail).
         let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-        crate::terminal::close_terminal_session(
-            app.clone(),
-            terminal_state,
-            state.clone(),
-            session_id.0.clone(),
-        )
-        .ok();
+        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
     if let Some(browser_id) = removed_browser_id {
@@ -899,15 +921,12 @@ pub fn close_tab(
 ) -> Result<(), String> {
     let result = state.close_tab(&workspace_id, &tab_id)?;
 
+    // Kill the PTY child + process group for every terminal session that
+    // was attached to this tab. `state.close_tab` already removed them from
+    // the store, so we go straight to the PTY helper.
+    let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
     for session_id in result.removed_sessions {
-        let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
-        crate::terminal::close_terminal_session(
-            app.clone(),
-            terminal_state.clone(),
-            state.clone(),
-            session_id.0,
-        )
-        .ok();
+        crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
     for browser_id in &result.removed_browser_ids {
