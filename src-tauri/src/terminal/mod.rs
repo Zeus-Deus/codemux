@@ -1977,7 +1977,6 @@ mod tests {
         let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
         let mut writer = pair.master.take_writer().expect("take writer");
-        drop(pair.slave);
 
         // Start the batched reader loop in a background thread.
         let read_sessions = sessions.clone();
@@ -1986,9 +1985,22 @@ mod tests {
         });
 
         // Write a small payload — well below PTY_BATCH_SIZE.
+        //
+        // IMPORTANT: keep `pair.slave` alive until AFTER the write. If we
+        // drop it before the reader thread is scheduled, the PTY master
+        // immediately sees POLLHUP and `poll_read_ready` returns true with
+        // an empty read buffer. `reader.read()` then returns Ok(0) (EOF),
+        // the loop flushes its empty batch and exits via the `Ok(_) =>`
+        // break branch — BEFORE our write ever reaches it. That race is
+        // why this test kept failing on loaded CI runners while passing
+        // locally: fast dev machines hit the write first, slow CI runners
+        // hit the poll first. Dropping the slave after the write
+        // eliminates the race: by the time the slave closes, the reader
+        // has already consumed the payload.
         let payload = b"hello from pty test\r\n";
         writer.write_all(payload).expect("write failed");
         writer.flush().expect("flush failed");
+        drop(pair.slave);
 
         // Poll for up to `deadline` waiting for the batched reader thread to
         // flush. The key assertion is that data arrives WITHOUT another write
