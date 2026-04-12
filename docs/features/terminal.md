@@ -17,7 +17,7 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 ## What Works Today
 
 - multiple concurrent terminal sessions per workspace
-- shell detection (respects `$SHELL`, falls back to `/bin/bash`)
+- shell detection: on Unix, respects `$SHELL` and falls back to `/bin/bash`; on Windows, respects `%COMSPEC%` and falls back to `cmd.exe`
 - PTY resize on pane/window resize
 - xterm.js WebGL renderer with kitty keyboard protocol support
 - terminal theme reads dynamically from CSS variables via MutationObserver
@@ -26,7 +26,7 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 - working directory set to workspace root on creation
 - comm log support for OpenFlow agent communication tracking
 - ANSI code stripping for log capture
-- session close kills the PTY child and its entire process group (SIGTERM → 200ms grace → SIGKILL) via the central `terminate_pty_session` helper, so closing a pane/tab/workspace also tears down any Claude CLI, MCP server, or rust-analyzer the shell spawned. `portable-pty`'s Unix spawn path calls `setsid()`, so the shell is a process-group leader and `killpg` reaches its children. `impl Drop for SessionRuntime` is a safety-net that kills the tree with a warning if the normal close path is ever skipped.
+- session close kills the PTY child and its entire process group via a single `killpg(pid, SIGKILL)` through the central `terminate_pty_session` helper, so closing a pane/tab/workspace also tears down any Claude CLI, MCP server, or rust-analyzer the shell spawned. `portable-pty`'s Unix spawn path calls `setsid()`, so the shell is a process-group leader and `killpg` reaches its children. A previous version did SIGTERM → 200ms grace → SIGKILL; that grace window is exactly the adversarial case for PID recycling (the shell handles SIGTERM and exits in ~50ms, the kernel reuses the PID for an unrelated process, our SIGKILL lands on the wrong process group), so the current code goes straight to SIGKILL and collapses the race to microseconds. `impl Drop for SessionRuntime` is a safety net that kills the tree with a warning if the normal close path is ever skipped.
 
 ## Current Constraints
 

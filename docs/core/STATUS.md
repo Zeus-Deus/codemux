@@ -19,15 +19,16 @@ The repo structure is clean and domain-split:
 
 - Workspace shell, sidebar, workspace sections with color coding and drag-drop
 - Multi-session terminals with xterm.js, WebGL rendering, kitty protocol
-- Tab bar with terminal/browser tab types
+- Tab bar with terminal, browser, editor, and diff tab types
 - Pane splits, resize, drag-swap, close
 - Git worktree-based workspaces (create from new/existing branch, import orphans)
-- Built-in diff viewer / Changes panel (right sidebar, stage/unstage/commit/push)
+- Changes panel in right sidebar (stage/unstage/commit/push, inline per-file diffs, AI commit messages)
+- Full-pane diff viewer tab (unified/split layouts, section filters incl. `against_base`, hunk/file navigation, focus mode)
 - File tree panel (right sidebar, lazy-loaded, opens in built-in editor or external editor)
-- Search: keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+P via fd)
+- Search: keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+Shift+P via fd)
 - Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge)
 - Port detection (auto-scan, sidebar display, open in browser)
-- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini)
+- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini, Pi, Shell)
 - IDE integration (detect editors, open workspace, Ctrl+Shift+E)
 - Command palette (Ctrl+K, fuzzy search across all actions)
 - PR integration (create, view, checks, merge via gh CLI, auth status check, incoming PRs list with fork checkout)
@@ -59,11 +60,11 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
-- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, execution backends, file editor, file tree, GitHub issues, hooks, IDE integration, MCP server, merge resolver, notifications, observability, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
+- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, diff viewer, execution backends, file editor, file tree, GitHub issues, hooks, IDE integration, MCP server, merge resolver, notifications, observability, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
 
 ## Windows Support Foundation
 
-Windows support is in progress on the `feature/windows-support` branch (not yet merged to main). Foundation work has landed and been verified end-to-end via a throwaway test tag against the production release pipeline:
+Windows support foundation has been merged to main (commit `cc9b946`, 19 commits past the `v0.1.19` tag — not yet in a published release). The work was verified end-to-end via a throwaway test tag against the production release pipeline:
 
 - `cfg`-gates cover every Linux-specific code path — the app compiles on `x86_64-pc-windows-msvc` without unsafe `unix` stubs
 - Control socket → named pipe (`\\.\pipe\codemux-{username}`) via `tokio::net::windows::named_pipe`
@@ -74,7 +75,7 @@ Windows support is in progress on the `feature/windows-support` branch (not yet 
 - NSIS installer produced on Windows CI (`--bundles nsis` to skip MSI which needs WiX)
 - 547 Rust tests (+38 from the Windows pass) run on both matrix legs of `ci.yml`
 
-Still gated before merge / release:
+Still gated before a real Windows v1 release:
 - Windows Authenticode code signing — SmartScreen warning expected on unsigned first-install, deferred behind a cert budget decision
 - OpenFlow bash wrapper rewrite — blocks OpenFlow on Windows
 - Tier 3 input injection via Win32 `SendInput` — deferred (Tier 1/2 sufficient for MVP)
@@ -95,7 +96,7 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 - Right panel with Changes panel, File tree, and PR panel tabs
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph
 - Command palette (Ctrl+K) with fuzzy search
-- Search: file name search (Ctrl+P) and content search (Ctrl+Shift+F)
+- Search: file name search (Ctrl+Shift+P) and content search (Ctrl+Shift+F)
 - Browser pane with screenshot-driven rendering and toolbar
 - Workspace drag-and-drop reordering in sidebar
 - Terminal presets bar with quick-launch
@@ -108,7 +109,7 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 ### Remaining Gaps
 
-- Context menus on workspace rows, section headers, and pane headers (Radix primitive exists but not wired up everywhere)
+- Context menus on pane headers (workspace rows, workspace section groups, tabs, changes panel rows, and sidebar ports section already have them)
 - Notification sound playback (toggle exists in settings and state, but no actual audio output)
 - Memory drawer UI (backend memory system exists, no frontend drawer/panel yet)
 - File editor: no LSP integration, no multi-cursor, no rename/delete from editor
@@ -117,5 +118,5 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
+- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, diff-viewer, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
 - `docs/plans/windows-support.md` for the active Windows cross-platform work

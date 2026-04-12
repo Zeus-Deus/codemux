@@ -36,7 +36,7 @@ Rust owns the durable app domain and runtime integration.
 - canonical app state: `src-tauri/src/state/`
 - PTY and terminal lifecycle: `src-tauri/src/terminal/`
 - OpenFlow runtime: `src-tauri/src/openflow/`
-- socket control server: `src-tauri/src/control.rs`
+- control server: `src-tauri/src/control.rs` (Unix socket on Linux/macOS via `tokio::net::UnixListener`, named pipe on Windows via `tokio::net::windows::named_pipe::ServerOptions`)
 - CLI entrypoint: `src-tauri/src/cli.rs`
 - browser runtime: `src-tauri/src/agent_browser.rs` (agent-browser v0.24.0, pure Rust, direct CDP)
 - Tauri command modules: `src-tauri/src/commands/`
@@ -57,10 +57,10 @@ These command names stay stable at the Tauri boundary even when the internal mod
 Codemux exposes three main control paths:
 
 1. frontend `invoke(...)` calls into Tauri commands
-2. local socket control in `src-tauri/src/control.rs`
+2. local IPC (Unix socket on Linux/macOS, named pipe on Windows) in `src-tauri/src/control.rs`
 3. CLI wrappers in `src-tauri/src/cli.rs`
 
-Workspace and browser socket commands are routed through the same Rust helper implementations used by the Tauri command layer so they stay behaviorally aligned.
+The transport is platform-specific (`unix_transport` vs `windows_transport` modules inside `control.rs`) but exposes a single generic `bind` / `accept` / `connect` / `sync_liveness_probe` API, and `handle_client` is generic over `AsyncRead + AsyncWrite + Unpin + Send` so all accept loops stay identical across platforms. Workspace and browser socket commands are routed through the same Rust helper implementations used by the Tauri command layer so they stay behaviorally aligned.
 
 ## Browser Architecture
 

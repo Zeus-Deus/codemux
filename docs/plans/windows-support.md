@@ -1,12 +1,14 @@
 # Windows Support Tracking
 
-Status: In Progress
-Branch: feature/windows-support
+Status: Foundation merged to main (`cc9b946`, 19 commits past `v0.1.19` — not yet in a published release)
+Branch: `feature/windows-support` (merged); `main` now carries all foundation work
 Created: 2026-04-12
 
 ## How to Use This File
 
 This is the master checklist for Windows support. Before working on any Windows-related code, read this file first. After completing an item, check it off and note what was done. This file is the source of truth for what's left.
+
+The foundation (cfg gates, named-pipe control socket, Windows port detection, NSIS bundle config, multi-platform `release.yml`, cross-platform `latest.json` merge, 547 Rust tests green on both Linux and Windows CI) is on `main` as of commit `cc9b946`. What's still open below this line are the non-foundation items — real Windows PTY / worktree / agent-spawn integration tests against a live Windows runner, Authenticode signing, OpenFlow wrapper rewrite, Tier 3 `SendInput` input injection, and the polish follow-ups. None of those gate compiling or running on Windows today; they gate a polished Windows v1 release.
 
 Findings are organized by severity. File:line references point at the current state of `main` as of 2026-04-12 — verify before editing since line numbers drift.
 

@@ -8,7 +8,7 @@
 
 ## What This Feature Is
 
-Codemux provides two search modes: file name search (Ctrl+P) for quickly navigating to files, and content search (Ctrl+Shift+F) for finding text across the project. Both open as overlay dialogs.
+Codemux provides two search modes: file name search (Ctrl+Shift+P) for quickly navigating to files, and content search (Ctrl+Shift+F) for finding text across the project. Both open as overlay dialogs.
 
 ## Current Model
 
@@ -16,7 +16,7 @@ File name search uses `fd` via the `searchFileNames` Tauri command. Content sear
 
 ## What Works Today
 
-- File name search (Ctrl+P): fuzzy file finder with debounced input, opens results in editor tabs
+- File name search (Ctrl+Shift+P): fuzzy file finder with debounced input, opens results in editor tabs
 - Content search (Ctrl+Shift+F): full-text search with regex toggle, case-sensitivity toggle, and match context
 - Result limiting (20 files default for content search)
 - Search results show file paths with match highlighting
@@ -34,6 +34,6 @@ File name search uses `fd` via the `searchFileNames` Tauri command. Content sear
 
 - `src/components/search/file-search-dialog.tsx` — file name search UI
 - `src/components/search/content-search-dialog.tsx` — content search UI
-- `src/hooks/use-keyboard-shortcuts.ts` — Ctrl+P and Ctrl+Shift+F bindings
+- `src/hooks/use-keyboard-shortcuts.ts` — Ctrl+Shift+P and Ctrl+Shift+F bindings
 - `src/tauri/commands.ts` — `searchFileNames`, `searchInFiles` wrappers
 - `src-tauri/src/indexing.rs` — file indexing backend (40-line chunks, file watcher, debounced reindex)

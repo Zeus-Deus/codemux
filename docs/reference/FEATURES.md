@@ -218,7 +218,7 @@
 
 ## Code Indexing
 
-- Local full-text search index at `.codemux/project-memory.json`
+- Local full-text search index at `.codemux/index.json`
 - 40-line file chunking with symbol extraction
 - Automatic file watching with debounced rebuild
 - CLI access: `codemux index build`, `codemux index status`, `codemux index search`
@@ -235,10 +235,10 @@
 
 ## CLI / Socket Control
 
-- Unix socket server at `$XDG_RUNTIME_DIR/codemux.sock`
+- Local IPC transport: Unix socket at `$XDG_RUNTIME_DIR/codemux.sock` (Linux/macOS) or named pipe at `\\.\pipe\codemux-{username}` (Windows)
 - JSON request/response protocol with command routing
-- Single-instance enforcement (checks for existing socket before starting)
-- External tool integration (opencode, claude-cli can send commands via socket)
+- Single-instance enforcement (checks for an already-live listener before starting a new one)
+- External tool integration (opencode, claude-cli, MCP server can send commands via the local transport)
 
 ## Important Touch Points
 
@@ -251,4 +251,4 @@
 - `src/hooks/use-keyboard-shortcuts.ts` — global keyboard shortcuts
 - `src-tauri/src/state/state_impl.rs` — Backend state management
 - `src-tauri/src/commands/workspace.rs` — Tauri command handlers
-- `src-tauri/src/control.rs` — Unix socket control server
+- `src-tauri/src/control.rs` — control server (Unix socket on Linux/macOS, named pipe on Windows)

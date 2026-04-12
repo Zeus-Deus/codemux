@@ -38,6 +38,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - MCP server: `docs/features/mcp-server.md`
 - File editor: `docs/features/file-editor.md`
+- Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
 - Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`

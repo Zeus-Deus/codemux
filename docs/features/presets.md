@@ -12,13 +12,13 @@ Terminal presets are saved command templates that launch with one click from the
 
 ## Current Model
 
-Presets are stored in SQLite via the database layer. Five builtin presets ship by default and are synced on every load. Users can create, edit, delete, pin, and reorder custom presets through Settings > Presets.
+Presets are stored in SQLite via the database layer. Six builtin presets ship by default and are synced on every load. Users can create, edit, delete, pin, and reorder custom presets through Settings > Presets.
 
 ## What Works Today
 
 - quick-launch bar below the tab bar with pinned preset buttons
 - toggle bar visibility (Settings > Presets or command palette)
-- builtin presets: Claude Code, Codex, OpenCode, Gemini, Shell
+- builtin presets: Claude Code, Codex, OpenCode, Gemini, Pi, Shell
 - custom preset creation with name, description, commands, working directory, icon
 - launch mode: new tab or split pane (Shift+click on preset bar button opens in split pane)
 - auto-run on workspace creation or new tab
@@ -35,6 +35,7 @@ Presets are stored in SQLite via the database layer. Five builtin presets ship b
 | Codex | `codex --full-auto` | yes |
 | OpenCode | `opencode` | yes |
 | Gemini | `gemini --yolo` | yes |
+| Pi | `pi` | yes |
 | Shell | (empty — opens default shell) | no |
 
 ## Current Constraints

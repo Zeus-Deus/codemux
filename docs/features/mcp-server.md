@@ -24,7 +24,7 @@ On startup, Codemux can automatically write its MCP server config into `~/.claud
 
 ### Tool Routing
 
-Most tools delegate to the Codemux control socket (`$XDG_RUNTIME_DIR/codemux.sock`), reusing the same Rust helper implementations as the Tauri command layer and CLI. Git tools shell out to `git` in the workspace directory. The workspace is resolved from `CODEMUX_WORKSPACE_ID` env var.
+Most tools delegate to the Codemux control transport (Unix socket at `$XDG_RUNTIME_DIR/codemux.sock` on Linux/macOS, named pipe at `\\.\pipe\codemux-{username}` on Windows), reusing the same Rust helper implementations as the Tauri command layer and CLI. Git tools shell out to `git` in the workspace directory. The workspace is resolved from `CODEMUX_WORKSPACE_ID` env var.
 
 ## Tools (29)
 

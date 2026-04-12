@@ -8,7 +8,8 @@
 
 ## Transport
 
-- socket path: `$XDG_RUNTIME_DIR/codemux.sock`
+- socket path (Linux/macOS): `$XDG_RUNTIME_DIR/codemux.sock` (falls back to `/tmp/codemux-{uid}/codemux.sock` when `XDG_RUNTIME_DIR` is unset)
+- named pipe (Windows): `\\.\pipe\codemux-{username}` (`USERNAME` env var, sanitized to alphanumerics + `_-`)
 - protocol version: `1`
 - transport shape: one JSON request per line, one JSON response per line
 

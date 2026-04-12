@@ -16,7 +16,7 @@
 
 1. Foundations landed in meaningful form: phases 0 through 9.6 established the workspace shell, multi-session terminals, pane management, notifications, browser prototype, CLI and socket control, indexing, and project memory.
 2. Current focus: phases 10 through 15 are about turning that foundation into a trustworthy Linux MVP while hardening OpenFlow.
-3. Parallel track: Phase 18 (Windows support) foundation work is in progress on the `feature/windows-support` branch. The release pipeline, matrix CI, `cfg`-gated code paths, and Windows-specific tests have landed and been verified end-to-end against a throwaway release tag. OpenFlow and Authenticode signing remain gated before a real Windows v1. See `docs/plans/windows-support.md`.
+3. Parallel track: Phase 18 (Windows support) foundation has been merged to `main` (commit `cc9b946`, post-`v0.1.19`). The release pipeline, matrix CI, `cfg`-gated code paths, and Windows-specific tests have landed and been verified end-to-end against a throwaway release tag. OpenFlow-on-Windows and Authenticode signing remain gated before a real Windows v1. See `docs/plans/windows-support.md`.
 4. Later: Phase 17 (macOS) has not been started.
 
 ## Ordered Phases
@@ -45,17 +45,18 @@
 
 ## Immediate Priority Order
 
-1. Merge the Windows support foundation branch to main (blocked on Authenticode signing decision and final OpenFlow disable verification on a live Windows install)
+1. Cut the first release that actually includes Windows binaries (current `main` is 19 commits past `v0.1.19`, which tagged BEFORE the Windows merge — the foundation is in the tree but has never shipped to users)
 2. Harden OpenFlow reliability and intervention flow
 3. Add notification sound playback
 4. Add memory drawer UI
-5. Add context menus on workspace rows, sections, and panes
+5. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
 6. Linux release packaging and polish
 7. macOS support (Phase 17)
 
 ## Recently Completed
 
-- Windows support foundation: cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform release.yml matrix, cross-platform `latest.json` via tauri-action merge, 38 new tests for Windows code paths, verification via throwaway test tag against the live release pipeline (see `docs/plans/windows-support.md`)
+- PTY child process tree cleanup on session close: single `killpg(pid, SIGKILL)` via a central `terminate_pty_session` helper called from every close path. Closes the TOCTOU window that previous SIGTERM→200ms→SIGKILL dance left exposed to PID recycling. Leaked ~20 GiB/day of zombie processes (Claude CLI, MCP servers, rust-analyzer) before the fix; now every close path tears down the whole group. `impl Drop for SessionRuntime` is a safety net that kills the group with a warning if any future refactor skips the normal close path.
+- Windows support foundation merged to main (`cc9b946`): cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform release.yml matrix, cross-platform `latest.json` via tauri-action merge, 38 new tests for Windows code paths, verification via throwaway test tag against the live release pipeline (see `docs/plans/windows-support.md`)
 - Session persistence: terminal scrollback save/restore and adapter-based resume
 - GitHub issue integration (link issues to workspaces, issue picker, auto-branch naming)
 - Browser wait conditions, JS evaluation, and CSS style inspection (MCP tools, 26→29)

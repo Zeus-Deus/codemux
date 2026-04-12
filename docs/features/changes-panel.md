@@ -4,7 +4,7 @@
 - Audience: Anyone working on git integration or the changes panel UI.
 - Authority: Canonical feature-level reality doc.
 - Update when: Staging, commit, merge, or diff behavior changes.
-- Read next: `docs/features/pr-integration.md`, `docs/plans/git-bot.md`
+- Read next: `docs/features/diff-viewer.md`, `docs/features/pr-integration.md`, `docs/plans/git-bot.md`
 
 ## What This Feature Is
 
@@ -35,6 +35,10 @@ The panel reads git state from the Rust backend via Tauri commands (`getGitStatu
 - No interactive rebase UI
 - No blame view
 - Merge conflict inline editing not supported — conflicts go through AI resolver or manual terminal workflow
+
+## Related
+
+The sidebar panel's inline per-file diffs are deliberately compact. For a full-tab diff surface with unified/split layouts, section filtering (`staged`, `unstaged`, `against_base`, `all`), hunk/file navigation, and focus mode, see `docs/features/diff-viewer.md`.
 
 ## Important Touch Points
 

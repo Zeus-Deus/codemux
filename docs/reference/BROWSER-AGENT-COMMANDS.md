@@ -94,13 +94,18 @@ Returns JavaScript console output from the page. Useful for debugging errors.
 
 These actions are available via the Codemux control socket. They cover additional functionality not exposed as CLI subcommands.
 
-Socket path: `/run/user/$UID/codemux.sock`
+Socket path:
+- Linux/macOS: `$XDG_RUNTIME_DIR/codemux.sock` (typically `/run/user/$UID/codemux.sock`), falling back to `/tmp/codemux-{uid}/codemux.sock` when `XDG_RUNTIME_DIR` is unset.
+- Windows: named pipe at `\\.\pipe\codemux-{USERNAME}`. Use a PowerShell client (`[System.IO.Pipes.NamedPipeClientStream]`) or the `codemux` CLI; `nc -U` is Unix-only.
 
 ### General Format
 
 ```bash
+# Linux/macOS
 echo '{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"<action>", ...}}}' | nc -U /run/user/$(id -u)/codemux.sock
 ```
+
+On Windows, prefer the `codemux` CLI wrappers (e.g. `codemux browser open <url>`) or the typed MCP tools — they abstract the named-pipe transport and work identically on every platform.
 
 ### Available Actions
 

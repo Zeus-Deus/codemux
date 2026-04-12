@@ -35,7 +35,7 @@ The tree uses lazy loading — only the root directory is fetched on mount, and 
 - No drag-and-drop for file operations
 - No custom sort order (uses backend listing order)
 - Cannot open files in external editor directly from tree
-- No file search or filter within the tree (use Ctrl+P for file search)
+- No file search or filter within the tree (use Ctrl+Shift+P for file search)
 
 ## Important Touch Points
 
