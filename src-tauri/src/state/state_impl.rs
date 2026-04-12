@@ -1047,7 +1047,7 @@ impl AppStateStore {
         false
     }
 
-    pub fn close_workspace(&self, workspace_id: &str) -> Result<WorkspaceId, String> {
+    pub fn close_workspace(&self, workspace_id: &str) -> Result<CloseWorkspaceResult, String> {
         let mut snapshot = self.inner.lock().unwrap();
 
         if snapshot.workspaces.len() <= 1 {
@@ -1058,12 +1058,12 @@ impl AppStateStore {
                 .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
             let removed = snapshot.workspaces.remove(workspace_index);
-            let removed_session_ids = collect_terminal_sessions(&removed.surfaces);
+            let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
             snapshot
                 .notifications
                 .retain(|notification| notification.workspace_id != removed.workspace_id);
             snapshot.terminal_sessions.retain(|session| {
-                !removed_session_ids
+                !removed_session_id_strings
                     .iter()
                     .any(|id| id == &session.session_id.0)
             });
@@ -1071,7 +1071,13 @@ impl AppStateStore {
                 .agent_browser_sessions
                 .retain(|s| s.workspace_id.0 != workspace_id);
             snapshot.active_workspace_id = WorkspaceId("".into());
-            return Ok(WorkspaceId("".into()));
+            return Ok(CloseWorkspaceResult {
+                fallback: WorkspaceId("".into()),
+                removed_sessions: removed_session_id_strings
+                    .into_iter()
+                    .map(SessionId)
+                    .collect(),
+            });
         }
 
         let workspace_index = snapshot
@@ -1081,12 +1087,12 @@ impl AppStateStore {
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
 
         let removed = snapshot.workspaces.remove(workspace_index);
-        let removed_session_ids = collect_terminal_sessions(&removed.surfaces);
+        let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != removed.workspace_id);
         snapshot.terminal_sessions.retain(|session| {
-            !removed_session_ids
+            !removed_session_id_strings
                 .iter()
                 .any(|id| id == &session.session_id.0)
         });
@@ -1100,7 +1106,13 @@ impl AppStateStore {
             .ok_or_else(|| "No fallback workspace available".to_string())?;
         snapshot.active_workspace_id = fallback_workspace.clone();
 
-        Ok(fallback_workspace)
+        Ok(CloseWorkspaceResult {
+            fallback: fallback_workspace,
+            removed_sessions: removed_session_id_strings
+                .into_iter()
+                .map(SessionId)
+                .collect(),
+        })
     }
 
     pub fn reorder_workspaces(&self, workspace_ids: Vec<String>) -> bool {
@@ -2349,6 +2361,19 @@ impl AppStateStore {
 pub struct CloseTabResult {
     pub removed_sessions: Vec<SessionId>,
     pub removed_browser_ids: Vec<BrowserId>,
+}
+
+/// Return value of `AppStateStore::close_workspace`. Carries both the fallback
+/// workspace id the UI should activate next and the list of terminal sessions
+/// whose PTY children the command layer still needs to kill.
+///
+/// Returning the session ids from the same lock acquisition that removes the
+/// workspace closes the TOCTOU race a command-level snapshot would leave:
+/// if a new pane were created between a pre-close snapshot and the state
+/// mutation, the snapshotted id list would miss it and the PTY would leak.
+pub struct CloseWorkspaceResult {
+    pub fallback: WorkspaceId,
+    pub removed_sessions: Vec<SessionId>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
@@ -3817,7 +3842,7 @@ mod tests {
         let ws_id = snapshot.workspaces[0].workspace_id.0.clone();
         let result = store.close_workspace(&ws_id);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().0, "");
+        assert_eq!(result.unwrap().fallback.0, "");
 
         let after = store.snapshot();
         assert!(after.workspaces.is_empty());
@@ -3850,6 +3875,136 @@ mod tests {
         assert!(after.workspaces.iter().any(|w| w.workspace_id.0 == ws3_id.0));
         // Active workspace should be set to the first remaining
         assert!(!after.active_workspace_id.0.is_empty());
+    }
+
+    /// Regression guard for the PTY child-process leak fix: `close_workspace`
+    /// must return every terminal session that was attached to the workspace
+    /// so the command layer can kill each PTY child process tree. Without
+    /// this atomic return path, the command layer had to snapshot session
+    /// IDs before the state mutation, opening a TOCTOU race where a pane
+    /// created between snapshot and close would leak its PTY.
+    #[test]
+    fn close_workspace_result_contains_session_ids() {
+        let store = AppStateStore::default();
+
+        // Fresh workspace is created with one default session. Split the
+        // active pane twice to reach three terminal sessions without
+        // creating new tabs.
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-test"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        let initial_snapshot = store.snapshot();
+        let workspace = workspace_by_id(&initial_snapshot, &ws_id);
+        let active_pane_id = workspace.surfaces[0].active_pane_id.0.clone();
+
+        let split1 = store
+            .split_pane(&active_pane_id, SplitDirection::Horizontal)
+            .expect("first split should succeed");
+        let split2 = store
+            .split_pane(&active_pane_id, SplitDirection::Vertical)
+            .expect("second split should succeed");
+
+        // Collect the expected session IDs from the live snapshot before close.
+        let expected: Vec<String> = {
+            let snap = store.snapshot();
+            let ws = workspace_by_id(&snap, &ws_id);
+            crate::state::collect_terminal_sessions(&ws.surfaces)
+        };
+        assert_eq!(
+            expected.len(),
+            3,
+            "test setup should have produced exactly 3 terminal sessions \
+             (one default + two splits), got {expected:?}"
+        );
+        assert!(expected.contains(&split1.0), "split1 session should be tracked");
+        assert!(expected.contains(&split2.0), "split2 session should be tracked");
+
+        // Close the workspace and assert the returned removed_sessions
+        // contains exactly the same set (order not guaranteed).
+        let result = store
+            .close_workspace(&ws_id.0)
+            .expect("close should succeed");
+        let returned: std::collections::HashSet<String> = result
+            .removed_sessions
+            .iter()
+            .map(|s| s.0.clone())
+            .collect();
+        let expected_set: std::collections::HashSet<String> =
+            expected.into_iter().collect();
+        assert_eq!(
+            returned, expected_set,
+            "CloseWorkspaceResult.removed_sessions must contain every terminal \
+             session that was attached to the workspace at close time"
+        );
+    }
+
+    /// Regression guard mirroring `close_workspace_result_contains_session_ids`
+    /// for `close_tab`. `CloseTabResult.removed_sessions` is what the
+    /// `close_tab` command hands to `terminate_pty_session` for PTY cleanup;
+    /// if this list ever drops a session the corresponding PTY leaks.
+    #[test]
+    fn close_tab_result_contains_session_ids() {
+        let store = AppStateStore::default();
+
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-tab-test"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // The workspace has a default tab with one session. Create a
+        // second terminal tab, then split its pane so the tab has two
+        // sessions. Close THAT tab — not the default — so we know exactly
+        // which sessions must come back.
+        let (tab_id, first_session_id) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create_tab should succeed");
+        let first_session_id = first_session_id.expect("terminal tab should have a session");
+
+        // Activate the newly created tab so split_pane targets its pane.
+        store
+            .activate_tab(&ws_id.0, &tab_id)
+            .expect("activate_tab should succeed");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        let active_pane_id = ws
+            .surfaces
+            .iter()
+            .find(|s| Some(s.surface_id.clone()) == ws.tabs.iter().find(|t| t.tab_id == tab_id).and_then(|t| t.surface_id.clone()))
+            .expect("new tab should have a surface")
+            .active_pane_id
+            .0
+            .clone();
+
+        let second_session_id = store
+            .split_pane(&active_pane_id, SplitDirection::Horizontal)
+            .expect("split_pane should succeed");
+
+        let expected: std::collections::HashSet<String> = [
+            first_session_id.0.clone(),
+            second_session_id.0.clone(),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = store
+            .close_tab(&ws_id.0, &tab_id)
+            .expect("close_tab should succeed");
+        let returned: std::collections::HashSet<String> = result
+            .removed_sessions
+            .iter()
+            .map(|s| s.0.clone())
+            .collect();
+
+        assert_eq!(
+            returned, expected,
+            "CloseTabResult.removed_sessions must contain every terminal \
+             session that was attached to the tab at close time"
+        );
     }
 
     #[test]
