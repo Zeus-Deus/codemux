@@ -59,7 +59,28 @@ The repo structure is clean and domain-split:
 - Control socket is local-user only and currently unauthenticated
 - Notification sound toggle exists in state, but actual audio playback is not implemented
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
-- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, file editor, file tree, GitHub issues, IDE integration, MCP server, merge resolver, notifications, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
+- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, execution backends, file editor, file tree, GitHub issues, hooks, IDE integration, MCP server, merge resolver, notifications, observability, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
+
+## Windows Support Foundation
+
+Windows support is in progress on the `feature/windows-support` branch (not yet merged to main). Foundation work has landed and been verified end-to-end via a throwaway test tag against the production release pipeline:
+
+- `cfg`-gates cover every Linux-specific code path — the app compiles on `x86_64-pc-windows-msvc` without unsafe `unix` stubs
+- Control socket → named pipe (`\\.\pipe\codemux-{username}`) via `tokio::net::windows::named_pipe`
+- Port detection via `netstat -ano` parser (cross-platform pure function, unit-tested on Linux CI)
+- Agent-browser port reclamation via `netstat -ano` + `taskkill` with exact-port matching
+- OpenFlow disabled at the UI + backend level on Windows (bash wrappers not yet ported) — sidebar shows a greyed-out "OpenFlow is not yet available on Windows" tooltip
+- `release.yml` builds on `[ubuntu-22.04, windows-latest]` with `fail-fast: false`; tauri-action merges both platforms into a single `latest.json` so existing Linux auto-updates keep working AND Windows clients auto-update the same way
+- NSIS installer produced on Windows CI (`--bundles nsis` to skip MSI which needs WiX)
+- 547 Rust tests (+38 from the Windows pass) run on both matrix legs of `ci.yml`
+
+Still gated before merge / release:
+- Windows Authenticode code signing — SmartScreen warning expected on unsigned first-install, deferred behind a cert budget decision
+- OpenFlow bash wrapper rewrite — blocks OpenFlow on Windows
+- Tier 3 input injection via Win32 `SendInput` — deferred (Tier 1/2 sufficient for MVP)
+- Full PTY lifecycle / worktree / agent-spawn integration tests on a live Windows runner
+
+See `docs/plans/windows-support.md` for the complete checklist and status.
 
 ## React Frontend Status
 
@@ -96,4 +117,5 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, file-editor, file-tree, github-issues, ide-integration, mcp-server, merge-resolver, notifications, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
+- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
+- `docs/plans/windows-support.md` for the active Windows cross-platform work

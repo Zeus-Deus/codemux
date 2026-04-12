@@ -53,6 +53,14 @@ import type {
   DetectedSetup,
 } from "./types";
 
+// ── Platform ──
+
+// Returns the Rust target_os string: "linux", "macos", "windows", etc.
+// Used to gate Windows-incompatible features at the UI layer (e.g. OpenFlow's
+// bash wrappers). Safe to call before the rest of the app has initialized.
+export const getPlatform = () =>
+  invoke<string>("get_platform");
+
 // ── Auth ──
 
 export const startOauthFlow = () =>

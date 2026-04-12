@@ -4,11 +4,140 @@ use crate::state::AppStateStore;
 use crate::terminal::PtyState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+
+// ---------------------------------------------------------------------------
+// Transport abstraction
+//
+// The control channel is a line-oriented JSON protocol that needs one of two
+// underlying transports:
+//   * Unix domain sockets at `$XDG_RUNTIME_DIR/codemux.sock` (or a /tmp
+//     fallback) on Linux/macOS.
+//   * Windows named pipes at `\\.\pipe\codemux-{username}` on Windows.
+//
+// Both transports expose the same tiny API (bind, accept, connect, sync
+// liveness probe). The rest of `control.rs` is generic over the concrete
+// stream type using `tokio::io::AsyncRead + AsyncWrite + Unpin`, so command
+// handlers and the dispatch loop never have to know which platform they are
+// running on.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod unix_transport {
+    use std::path::Path;
+    use tokio::net::{UnixListener, UnixStream};
+
+    pub type ServerStream = UnixStream;
+    pub type ClientStream = UnixStream;
+
+    pub struct Listener(UnixListener);
+
+    pub fn bind(path: &Path) -> std::io::Result<Listener> {
+        // Tokio's UnixListener::bind fails if the socket file already exists,
+        // so remove any stale file first. The caller is expected to have
+        // already established, via `sync_liveness_probe`, that no live server
+        // is holding the path.
+        let _ = std::fs::remove_file(path);
+        UnixListener::bind(path).map(Listener)
+    }
+
+    impl Listener {
+        pub async fn accept(&self) -> std::io::Result<ServerStream> {
+            self.0.accept().await.map(|(stream, _)| stream)
+        }
+    }
+
+    pub async fn connect(path: &Path) -> std::io::Result<ClientStream> {
+        UnixStream::connect(path).await
+    }
+
+    /// Blocking probe: does a server respond on this path right now?
+    /// Safe to call from sync contexts (e.g. startup path before the tokio
+    /// runtime exists) because it uses the std networking API.
+    pub fn sync_liveness_probe(path: &Path) -> bool {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+}
+
+#[cfg(windows)]
+mod windows_transport {
+    use std::path::Path;
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+    use tokio::sync::Mutex;
+
+    pub type ServerStream = NamedPipeServer;
+    pub type ClientStream = NamedPipeClient;
+
+    /// Wraps the "current waiting server instance" for a named pipe. Windows
+    /// named pipes consume a server instance on every client connect, so we
+    /// must eagerly create the next instance inside `accept()` before
+    /// returning the connected one to the caller.
+    pub struct Listener {
+        pipe_name: String,
+        pending: Mutex<Option<NamedPipeServer>>,
+    }
+
+    pub fn bind(path: &Path) -> std::io::Result<Listener> {
+        let pipe_name = path.to_string_lossy().into_owned();
+        // `first_pipe_instance(true)` ensures no other process has already
+        // created a pipe with this name — this is the Windows equivalent of
+        // the sync liveness probe done by the caller on Unix.
+        let first = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&pipe_name)?;
+        Ok(Listener {
+            pipe_name,
+            pending: Mutex::new(Some(first)),
+        })
+    }
+
+    impl Listener {
+        pub async fn accept(&self) -> std::io::Result<ServerStream> {
+            let mut guard = self.pending.lock().await;
+            let server = guard.take().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "named pipe listener has no pending server instance",
+                )
+            })?;
+            server.connect().await?;
+            // Eagerly create the next server instance so the listener is
+            // ready to accept another client as soon as this one is handed
+            // to its handler task.
+            let next = ServerOptions::new().create(&self.pipe_name)?;
+            *guard = Some(next);
+            Ok(server)
+        }
+    }
+
+    pub async fn connect(path: &Path) -> std::io::Result<ClientStream> {
+        let pipe_name = path.to_string_lossy().into_owned();
+        ClientOptions::new().open(&pipe_name)
+    }
+
+    /// Blocking probe: does a server respond on this pipe right now?
+    /// Opens the pipe via the std sync API so this is callable before the
+    /// tokio runtime exists.
+    pub fn sync_liveness_probe(path: &Path) -> bool {
+        let pipe_name = path.to_string_lossy().into_owned();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pipe_name)
+            .is_ok()
+    }
+}
+
+#[cfg(unix)]
+use unix_transport as transport;
+#[cfg(windows)]
+use windows_transport as transport;
 
 const CONTROL_PROTOCOL_VERSION: u32 = 1;
 
@@ -27,6 +156,7 @@ pub struct ControlResponse {
     pub error: Option<String>,
 }
 
+#[cfg(unix)]
 pub fn control_socket_path() -> Option<PathBuf> {
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
         return Some(runtime_dir.join("codemux.sock"));
@@ -34,7 +164,12 @@ pub fn control_socket_path() -> Option<PathBuf> {
 
     // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
     let uid = unsafe { libc::getuid() };
-    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}"));
+    // This whole function is `#[cfg(unix)]` — the hardcoded /tmp path is
+    // reachable only on Unix and matches the XDG fallback convention
+    // for systems that don't set XDG_RUNTIME_DIR. The tmp-literal-ok
+    // marker tells the meta-test in agent_context.rs that this is
+    // intentional and not a Windows regression.
+    let fallback_dir = PathBuf::from(format!("/tmp/codemux-{uid}")); // tmp-literal-ok
     if fallback_dir.exists() {
         // Verify the existing directory is owned by us and has safe permissions.
         use std::os::unix::fs::MetadataExt;
@@ -75,6 +210,55 @@ pub fn control_socket_path() -> Option<PathBuf> {
     Some(fallback_dir.join("codemux.sock"))
 }
 
+/// Build the Windows named-pipe path for the given username.
+///
+/// Extracted from `control_socket_path()` so tests can drive it with
+/// arbitrary usernames without touching the process-global `USERNAME`
+/// env var (which would race with parallel test execution).
+///
+/// The pipe lives under the `\\.\pipe\` virtual namespace — no filesystem
+/// ownership or permission bookkeeping is required because named pipes
+/// inherit the creating user's security descriptor by default.
+///
+/// Sanitization rule: anything that isn't alphanumeric / underscore /
+/// dash is replaced with `_`. This guarantees we never emit an invalid
+/// pipe name even if the username contains spaces, separators, or any
+/// of the Windows-forbidden filename characters (`\ / : * ? " < > |`).
+/// Empty or whitespace-only inputs fall back to `default` so the result
+/// always has a non-empty user segment.
+///
+/// Not cfg-gated — pure string manipulation, safe to compile and test
+/// on every platform. Only `control_socket_path()` on Windows actually
+/// calls it at runtime.
+#[allow(dead_code)] // only called from the Windows branch of control_socket_path
+fn build_pipe_path(username: &str) -> PathBuf {
+    let base = if username.trim().is_empty() {
+        "default".to_string()
+    } else {
+        username.to_string()
+    };
+    let sanitized: String = base
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    PathBuf::from(format!(r"\\.\pipe\codemux-{sanitized}"))
+}
+
+#[cfg(windows)]
+pub fn control_socket_path() -> Option<PathBuf> {
+    let username = std::env::var("USERNAME").unwrap_or_default();
+    Some(build_pipe_path(&username))
+}
+
+/// Blocking check: is another Codemux control server currently listening?
+/// Safe to call from sync contexts (e.g. before the Tauri runtime spins up).
+pub fn control_server_is_running() -> bool {
+    match control_socket_path() {
+        Some(path) => transport::sync_liveness_probe(&path),
+        None => false,
+    }
+}
+
 /// Resolve "default" or empty browser_id to the first active browser session's actual ID.
 fn resolve_browser_id(app: &AppHandle, requested: &str) -> String {
     if !requested.is_empty() && requested != "default" {
@@ -92,14 +276,14 @@ fn resolve_browser_id(app: &AppHandle, requested: &str) -> String {
 pub fn spawn_control_server(app: AppHandle) {
     let Some(socket_path) = control_socket_path() else {
         crate::diagnostics::stderr_line(
-            "[codemux::control] XDG_RUNTIME_DIR unavailable, skipping control server",
+            "[codemux::control] Control socket path unavailable, skipping control server",
         );
         #[cfg(debug_assertions)]
         {
             let pid = std::process::id();
             let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
             crate::diagnostics::native_startup_breadcrumb(&format!(
-                "[{}] startup_id={} pid={} component=control outcome=skip_no_xdg_runtime_dir",
+                "[{}] startup_id={} pid={} component=control outcome=skip_no_socket_path",
                 chrono::Local::now().format("%s"),
                 startup_id,
                 pid
@@ -121,29 +305,35 @@ pub fn spawn_control_server(app: AppHandle) {
         ));
     }
 
-    // If a control socket already exists and responds, assume another Codemux
-    // instance is running and do NOT steal the socket or start a second server.
-    if socket_path.exists() {
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&socket_path) {
-            drop(stream);
-            crate::diagnostics::stderr_line(&format!(
-                "[codemux::control] Existing control socket at {:?} is alive; skipping new control server",
-                socket_path
+    // If another Codemux instance is already responding on this transport,
+    // do NOT steal it or start a second server.
+    if transport::sync_liveness_probe(&socket_path) {
+        crate::diagnostics::stderr_line(&format!(
+            "[codemux::control] Existing control endpoint at {:?} is alive; skipping new control server",
+            socket_path
+        ));
+        #[cfg(debug_assertions)]
+        {
+            let pid = std::process::id();
+            let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
+            crate::diagnostics::native_startup_breadcrumb(&format!(
+                "[{}] startup_id={} pid={} component=control outcome=skip_existing_alive socket_path={}",
+                chrono::Local::now().format("%s"),
+                startup_id,
+                pid,
+                socket_path.display()
             ));
-            #[cfg(debug_assertions)]
-            {
-                let pid = std::process::id();
-                let startup_id = std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
-                crate::diagnostics::native_startup_breadcrumb(&format!(
-                    "[{}] startup_id={} pid={} component=control outcome=skip_existing_alive socket_path={}",
-                    chrono::Local::now().format("%s"),
-                    startup_id,
-                    pid,
-                    socket_path.display()
-                ));
-            }
-            return;
-        } else {
+        }
+        return;
+    }
+
+    // Unix only: the socket lives in the filesystem, so we need to create the
+    // parent directory and sweep any stale socket file from a previous crash
+    // before `transport::bind` can succeed. Named pipes on Windows live in
+    // the `\\.\pipe\` namespace and have no filesystem footprint to clean up.
+    #[cfg(unix)]
+    {
+        if socket_path.exists() {
             crate::diagnostics::stderr_line(&format!(
                 "[codemux::control] Existing control socket at {:?} appears stale; replacing it",
                 socket_path
@@ -161,25 +351,23 @@ pub fn spawn_control_server(app: AppHandle) {
                 ));
             }
         }
-    }
 
-    if let Some(parent) = socket_path.parent() {
-        if let Err(error) = fs::create_dir_all(parent) {
-            crate::diagnostics::stderr_line(&format!(
-                "[codemux::control] Failed to create control dir: {error}"
-            ));
-            return;
+        if let Some(parent) = socket_path.parent() {
+            if let Err(error) = fs::create_dir_all(parent) {
+                crate::diagnostics::stderr_line(&format!(
+                    "[codemux::control] Failed to create control dir: {error}"
+                ));
+                return;
+            }
         }
     }
 
-    let _ = fs::remove_file(&socket_path);
-
     tauri::async_runtime::spawn(async move {
-        let listener = match UnixListener::bind(&socket_path) {
+        let listener = match transport::bind(&socket_path) {
             Ok(listener) => listener,
             Err(error) => {
                 crate::diagnostics::stderr_line(&format!(
-                    "[codemux::control] Failed to bind control socket: {error}"
+                    "[codemux::control] Failed to bind control endpoint: {error}"
                 ));
                 #[cfg(debug_assertions)]
                 {
@@ -213,7 +401,7 @@ pub fn spawn_control_server(app: AppHandle) {
 
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(error) = handle_client(app, stream).await {
@@ -234,8 +422,11 @@ pub fn spawn_control_server(app: AppHandle) {
     });
 }
 
-async fn handle_client(app: AppHandle, stream: UnixStream) -> Result<(), String> {
-    let (reader, mut writer) = stream.into_split();
+async fn handle_client<S>(app: AppHandle, stream: S) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let (reader, mut writer) = tokio::io::split(stream);
     let mut lines = BufReader::new(reader).lines();
 
     while let Some(line) = lines
@@ -261,15 +452,16 @@ async fn handle_client(app: AppHandle, stream: UnixStream) -> Result<(), String>
     Ok(())
 }
 
-/// Send a request to the running Codemux control socket and return the response.
+/// Send a request to the running Codemux control endpoint and return the response.
 /// Used by both the CLI and the MCP server to communicate with the Codemux app.
+/// Transparently uses a Unix socket on Linux/macOS and a named pipe on Windows.
 pub async fn send_control_request(request: ControlRequest) -> Result<ControlResponse, String> {
     let socket_path = control_socket_path()
         .ok_or_else(|| "Control socket path unavailable".to_string())?;
-    let stream = tokio::net::UnixStream::connect(socket_path)
+    let stream = transport::connect(&socket_path)
         .await
-        .map_err(|error| format!("Failed to connect to Codemux control socket: {error}"))?;
-    let (reader, mut writer) = stream.into_split();
+        .map_err(|error| format!("Failed to connect to Codemux control endpoint: {error}"))?;
+    let (reader, mut writer) = tokio::io::split(stream);
 
     let payload = serde_json::to_string(&request).map_err(|error| error.to_string())?;
     writer
@@ -733,4 +925,315 @@ fn resolve_control_repo_path(
         }
     }
     ".".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Transport-layer tests
+//
+// These exercise the platform abstraction in `transport` without involving
+// the Tauri runtime or any command handlers — the point is to prove that
+// bind / connect / accept / liveness-probe all work on every supported
+// platform. Higher-level control-command tests would require a real
+// AppHandle, which is out of scope for a unit test.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tiny echo handler used by the round-trip tests: reads one line at a
+    /// time and writes it back unchanged. Mirrors the real `handle_client`
+    /// signature so it exercises the same generic stream bounds.
+    async fn echo_loop<S>(stream: S) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await? {
+            writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_control_socket_path_format() {
+        // `control_socket_path()` should always return *some* path on a
+        // properly-configured system, and that path should match the
+        // platform-specific format documented in the header.
+        let path = control_socket_path().expect("control_socket_path should return a value");
+        let display = path.to_string_lossy().into_owned();
+
+        #[cfg(unix)]
+        {
+            assert!(
+                display.ends_with("codemux.sock"),
+                "unix control path must end with codemux.sock, got {display:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            assert!(
+                display.starts_with(r"\\.\pipe\codemux-"),
+                "windows control path must live under \\\\.\\pipe\\codemux-, got {display:?}"
+            );
+        }
+    }
+
+    // ----- Cross-platform pipe path tests --------------------------------
+    //
+    // `build_pipe_path` is pure string manipulation and not cfg-gated, so
+    // these tests run on every platform. They assert the sanitization
+    // contract that `control_socket_path()` on Windows relies on — we
+    // don't want to depend on the process-global `USERNAME` env var in
+    // tests because parallel cargo test runs would race.
+
+    #[test]
+    fn test_named_pipe_path_format() {
+        // Typical Windows username — already pipe-name-safe.
+        let path = build_pipe_path("alice");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-alice");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_spaces() {
+        // Windows lets users have spaces in their account names
+        // (e.g. "John Smith"). Spaces are invalid in pipe names —
+        // must be replaced with underscores.
+        let path = build_pipe_path("John Smith");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-John_Smith");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_special_chars() {
+        // Punctuation and separators that appear in real AD/domain
+        // usernames (e.g. `DOMAIN\user`, `user@host`, `user.name`).
+        // Every non-[A-Za-z0-9_-] char gets replaced with underscore.
+        let path = build_pipe_path(r"DOMAIN\john.smith");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-DOMAIN_john_smith");
+
+        let path = build_pipe_path("user@host");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-user_host");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_empty_or_whitespace() {
+        // Empty USERNAME (unlikely but possible if env is stripped)
+        // must fall back to "default" so the pipe still has a valid
+        // non-empty user segment.
+        let path = build_pipe_path("");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+
+        let path = build_pipe_path("   ");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+
+        let path = build_pipe_path("\t\n");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-default");
+    }
+
+    #[test]
+    fn test_named_pipe_path_preserves_underscores_and_dashes() {
+        // These are the two punctuation characters explicitly allowed
+        // by the sanitization rule — they should pass through unchanged.
+        let path = build_pipe_path("test-user_42");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-test-user_42");
+    }
+
+    #[test]
+    fn test_named_pipe_path_sanitization_unicode() {
+        // Windows allows Unicode usernames (CJK, accented Latin, etc.).
+        // `char::is_alphanumeric` accepts Unicode letters, so these
+        // characters pass through. If a future change needs to restrict
+        // to ASCII, this test will fail and flag the break.
+        let path = build_pipe_path("用户");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-用户");
+
+        let path = build_pipe_path("müller");
+        let display = path.to_string_lossy().into_owned();
+        assert_eq!(display, r"\\.\pipe\codemux-müller");
+    }
+
+    #[test]
+    fn test_named_pipe_path_never_panics_on_pathological_input() {
+        // Single call on a handful of pathological inputs — must not
+        // panic and must produce a parsable pipe path. We don't assert
+        // on the exact output; just that the function returns cleanly.
+        let long_input = "a".repeat(1024);
+        let pathological = [
+            "\x00",
+            "\x00\x01\x02",
+            "////",
+            "\\\\\\\\",
+            long_input.as_str(),
+        ];
+        for input in pathological {
+            let path = build_pipe_path(input);
+            let display = path.to_string_lossy().into_owned();
+            assert!(
+                display.starts_with(r"\\.\pipe\codemux-"),
+                "pipe path from pathological input {input:?} must still have the codemux- prefix, got {display:?}"
+            );
+        }
+    }
+
+    // ----- Unix-only tests ------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_socket_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("round-trip.sock");
+
+        let listener = transport::bind(&path).expect("bind unix socket");
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            echo_loop(stream).await.expect("echo_loop");
+        });
+
+        // Give the listener a moment to be ready in the runtime.
+        tokio::task::yield_now().await;
+
+        let stream = transport::connect(&path).await.expect("connect client");
+        let (reader, mut writer) = tokio::io::split(stream);
+        writer.write_all(b"hello\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut lines = BufReader::new(reader).lines();
+        let response = lines.next_line().await.unwrap();
+        assert_eq!(response.as_deref(), Some("hello"));
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_liveness_probe_no_server_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("no-server.sock");
+        assert!(
+            !transport::sync_liveness_probe(&path),
+            "probe should report no server at a nonexistent path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_liveness_probe_with_server_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.sock");
+        let listener = transport::bind(&path).expect("bind unix socket");
+
+        // The probe is sync, so run it on a blocking task to avoid tying up
+        // the current single-threaded runtime.
+        let probe_path = path.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            transport::sync_liveness_probe(&probe_path)
+        });
+
+        // Accept exactly one connection (the probe) so the probe's connect
+        // call succeeds and returns true.
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        assert!(probe.await.unwrap(), "probe should detect the server");
+        accept_task.abort();
+    }
+
+    /// The existing fallback-directory logic chmods the parent dir to
+    /// `0o700` on creation. This exercises that branch directly and asserts
+    /// the mode bits come out right. We don't test `control_socket_path`
+    /// itself here because it uses a fixed `/tmp/codemux-{uid}` path that
+    /// another test process might already own.
+    #[cfg(unix)]
+    #[test]
+    fn test_fallback_dir_permission_isolation() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let fallback_dir = tmp.path().join("codemux-fake-uid");
+        std::fs::create_dir(&fallback_dir).unwrap();
+        std::fs::set_permissions(&fallback_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = std::fs::metadata(&fallback_dir).unwrap();
+        // Mask off the file-type bits and compare only the permission bits.
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    }
+
+    // ----- Windows-only tests ---------------------------------------------
+
+    #[cfg(windows)]
+    fn random_pipe_path() -> PathBuf {
+        // Use a per-test pipe name so parallel cargo test runs don't collide.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        PathBuf::from(format!(r"\\.\pipe\codemux-test-{}-{}", std::process::id(), nanos))
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_named_pipe_round_trip() {
+        let path = random_pipe_path();
+
+        let listener = transport::bind(&path).expect("bind named pipe");
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept");
+            echo_loop(stream).await.expect("echo_loop");
+        });
+
+        // Give the listener a moment to be ready.
+        tokio::task::yield_now().await;
+
+        let stream = transport::connect(&path).await.expect("connect client");
+        let (reader, mut writer) = tokio::io::split(stream);
+        writer.write_all(b"hello\n").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut lines = BufReader::new(reader).lines();
+        let response = lines.next_line().await.unwrap();
+        assert_eq!(response.as_deref(), Some("hello"));
+
+        server.abort();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_liveness_probe_no_server_windows() {
+        let path = random_pipe_path();
+        assert!(
+            !transport::sync_liveness_probe(&path),
+            "probe should report no server on an unbound named pipe"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_liveness_probe_with_server_windows() {
+        let path = random_pipe_path();
+        let listener = transport::bind(&path).expect("bind named pipe");
+
+        let probe_path = path.clone();
+        let probe = tokio::task::spawn_blocking(move || {
+            transport::sync_liveness_probe(&probe_path)
+        });
+
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        assert!(probe.await.unwrap(), "probe should detect the server");
+        accept_task.abort();
+    }
 }

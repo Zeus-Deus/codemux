@@ -775,13 +775,21 @@ pub fn notify_attention(
         state.add_notification(session_id, pane_id, message, NotificationLevel::Attention)?;
 
     if desktop.unwrap_or(true) {
-        let _ = Notification::new()
-            .summary("Codemux")
-            .body(&body)
-            .hint(notify_rust::Hint::DesktopEntry("com.codemux.app".to_string()))
-            .hint(notify_rust::Hint::Transient(true))
-            .urgency(notify_rust::Urgency::Critical)
-            .show();
+        // `notify-rust`'s Windows backend (WinRT Toast) does not expose
+        // `.hint()` / `.urgency()` / `notify_rust::Hint::*` — those are
+        // XDG/D-Bus concepts only available when the crate is built for
+        // Unix. On Windows the toast gets priority/grouping from its own
+        // API, so a plain `summary + body + show` is the right degradation.
+        let mut notification = Notification::new();
+        notification.summary("Codemux").body(&body);
+        #[cfg(unix)]
+        {
+            notification
+                .hint(notify_rust::Hint::DesktopEntry("com.codemux.app".to_string()))
+                .hint(notify_rust::Hint::Transient(true))
+                .urgency(notify_rust::Urgency::Critical);
+        }
+        let _ = notification.show();
 
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
@@ -790,9 +798,12 @@ pub fn notify_attention(
             let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
         }
 
-        let _ = std::process::Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", "class:com.codemux.app"])
-            .output();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+                .output();
+        }
     }
 
     crate::state::emit_app_state(&app);

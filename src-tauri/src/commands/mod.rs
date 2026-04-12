@@ -261,6 +261,19 @@ pub async fn pick_files_dialog<R: Runtime>(
     rx.await.map_err(|error| error.to_string())
 }
 
+// ---- Platform info ----
+
+/// Returns the current OS as reported by `std::env::consts::OS`.
+///
+/// Values are the standard Rust target strings: `"linux"`, `"macos"`,
+/// `"windows"`, `"freebsd"`, `"android"`, `"ios"`, etc. The frontend uses this
+/// to gate Windows-incompatible features (e.g., OpenFlow — the bash wrapper
+/// scripts in `openflow::prompts` do not have Windows equivalents yet).
+#[tauri::command]
+pub fn get_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
 // ---- Port management ----
 
 #[tauri::command]
@@ -279,10 +292,17 @@ pub fn kill_port(port: u16) -> Result<(), String> {
         .ok_or_else(|| format!("No process found listening on port {port}"))?;
 
     let pid = target.pid;
-    let output = std::process::Command::new("kill")
-        .args(["-9", &pid.to_string()])
-        .output()
-        .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?;
+    let output = if cfg!(windows) {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
+            .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
+    } else {
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
+    };
 
     if output.status.success() {
         Ok(())

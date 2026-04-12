@@ -1,4 +1,20 @@
 use crate::agent_browser::BrowserAutomationResult;
+
+#[cfg(not(target_os = "linux"))]
+pub async fn handle_os_action(
+    _action: &str,
+    _params: serde_json::Value,
+    _browser_id: &str,
+) -> Result<BrowserAutomationResult, String> {
+    Err("OS input not supported on this platform".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub use linux_impl::handle_os_action;
+
+#[cfg(target_os = "linux")]
+mod linux_impl {
+use super::BrowserAutomationResult;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::process::Command;
@@ -146,6 +162,7 @@ async fn ydotool_type_text(text: &str, delay_ms: u64) -> Result<(), String> {
 // Kernel keycode mapping (linux/input-event-codes.h)
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 fn linux_keycode(name: &str) -> Result<u32, String> {
     Ok(match name.to_lowercase().as_str() {
         "a" => 30, "b" => 48, "c" => 46, "d" => 32, "e" => 18, "f" => 33,
@@ -177,6 +194,7 @@ fn linux_keycode(name: &str) -> Result<u32, String> {
     })
 }
 
+#[allow(dead_code)]
 async fn ydotool_key(key: &str) -> Result<(), String> {
     let parts: Vec<&str> = key.split('+').collect();
     let mut args = Vec::new();
@@ -307,3 +325,5 @@ pub async fn handle_os_action(action: &str, params: Value, browser_id: &str) -> 
         message: Some(text),
     })
 }
+
+} // mod linux_impl

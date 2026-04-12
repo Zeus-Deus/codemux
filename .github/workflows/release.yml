@@ -7,7 +7,19 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-22.04
+    name: release (${{ matrix.os }})
+    strategy:
+      # Never fail-fast — a Windows bundle failure should not cancel the
+      # Linux release. Users depend on the Linux AppImage/deb even if the
+      # Windows NSIS installer is broken for a given tag.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+        # ubuntu-22.04 is pinned (not ubuntu-latest) so the AppImage stays
+        # compatible with the oldest reasonably-supported glibc. When
+        # ubuntu-latest rolls over to 24.04, the AppImage would silently
+        # require a newer glibc and break users on older distros.
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
 
@@ -15,7 +27,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -28,25 +41,117 @@ jobs:
             patchelf \
             libfuse2 \
             file
+        # libfuse2 is required by tauri build's AppImage packager; kept here
+        # (unlike ci.yml which excludes it) because this workflow produces
+        # actual bundles, not just type-checks.
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        # Installs the stable toolchain for whichever OS the job is running
+        # on — MSVC on windows-latest, GNU on ubuntu-22.04. No toolchain
+        # override needed.
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # Per-OS cache key so Linux and Windows release artifacts never
+          # collide in the same cache entry. Matches the convention used
+          # by ci.yml.
+          key: ${{ matrix.os }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22 — GitHub is deprecating Node 20 runners starting
+          # June 2026. See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+          node-version: 22
           cache: npm
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri -> target
 
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build and release
+      - name: Stage agent-browser sidecar binary
+        # `shell: bash` works on both Linux and windows-latest because Git
+        # for Windows (which ships bash.exe) is preinstalled in the runner
+        # image. Pre-staging explicitly — rather than relying on tauri's
+        # beforeBuildCommand to invoke the script — makes failures easier
+        # to diagnose in the logs and matches the pattern established in
+        # ci.yml.
+        shell: bash
+        run: |
+          bash scripts/copy-agent-browser.sh
+          # Sanity-check: the script MUST place a real binary at the expected
+          # path for the current target. A missing file would let tauri build
+          # silently produce an installer with no sidecar, which would fail
+          # at runtime on the user's machine. Fail fast here instead.
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/agent-browser-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/agent-browser-$TARGET" ;;
+          esac
+          if [ ! -s "$DEST" ]; then
+            echo "::error::copy-agent-browser.sh did not produce a non-empty binary at $DEST"
+            echo "::error::Target: $TARGET"
+            ls -la src-tauri/binaries/ || true
+            ls -la node_modules/agent-browser/bin/ || true
+            exit 1
+          fi
+
+      - name: Configure git identity
+        # Some tauri build code paths call `git rev-parse` to embed a commit
+        # hash into the binary metadata. Those calls succeed on a detached
+        # tag checkout, but git also warns on missing user.email/user.name
+        # in some subcommands — preempting that here with a throwaway
+        # identity is cheap and avoids noise in the logs. Works on both
+        # platforms because `git config --global` writes to $HOME on Linux
+        # and %USERPROFILE% on Windows.
+        shell: bash
+        run: |
+          git config --global user.email "release@codemux.dev"
+          git config --global user.name "Codemux Release"
+
+      # ── Multi-platform updater signing notes ─────────────────────────
+      #
+      # Both platforms pass the SAME Ed25519 updater key and both set
+      # `includeUpdaterJson: true`. This works — despite each job
+      # producing its own per-platform signature set — because
+      # `tauri-action`'s `uploadVersionJSON` step (source:
+      # https://github.com/tauri-apps/tauri-action/blob/dev/src/upload-version-json.ts)
+      # is designed to MERGE with any pre-existing `latest.json` on the
+      # release:
+      #
+      #   1. listReleaseAssets() → looks for an existing `latest.json`
+      #   2. If found, downloads it and pre-seeds `versionContent.platforms`
+      #      with the existing `platforms` object
+      #   3. Adds THIS job's platform entries (e.g. `linux-x86_64` or
+      #      `windows-x86_64`) to that object
+      #   4. deleteReleaseAsset() + uploadAssets() the merged file
+      #
+      # The result is a single `latest.json` with both Linux and Windows
+      # entries, which matches the Tauri v2 updater schema:
+      #   https://v2.tauri.app/plugin/updater/
+      #
+      # Race window: if both jobs call listReleaseAssets() before EITHER
+      # has uploaded its `latest.json`, the second upload will clobber
+      # the first (last-writer-wins). In practice the race is unlikely —
+      # ubuntu-22.04 completes the build several minutes before
+      # windows-latest (Rust compile + NSIS bundling are significantly
+      # slower on Windows). Worst case: one release has a stale
+      # `latest.json` missing one platform; users on that platform miss
+      # a single update cycle but are not bricked, and the next release
+      # recovers automatically. We accept this over adding a third
+      # merge-updater job because tauri-action's built-in merge is more
+      # reliable than anything we'd write ourselves.
+      #
+      # The Ed25519 key is cross-platform. The same private key signs
+      # Linux AppImage/deb/rpm and Windows NSIS `.exe` bundles; clients
+      # verify per-platform signatures out of the single `latest.json`.
+      # This is DISTINCT from Windows Authenticode code signing, which
+      # is not yet configured (see Windows step TODO below).
+
+      - name: Build and release (Linux)
+        if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,3 +163,45 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+      - name: Build and release (Windows)
+        if: matrix.os == 'windows-latest'
+        uses: tauri-apps/tauri-action@action-v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Same Ed25519 updater key as the Linux job. Tauri CLI on
+          # Windows uses it to sign the NSIS `.exe` and produce the
+          # matching `.sig` file that tauri-action then references in
+          # the merged `latest.json` under the `windows-x86_64` key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Codemux ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
+          # Now true on Windows — tauri-action will merge this job's
+          # `windows-x86_64` entry into whatever `latest.json` the Linux
+          # job already uploaded. See the long comment above the two
+          # Build and release steps for the merge mechanics and race
+          # analysis.
+          includeUpdaterJson: true
+          # Restrict to the NSIS bundle. `bundle.targets = "all"` in
+          # tauri.conf.json would otherwise build both NSIS and MSI on
+          # Windows, and MSI requires the WiX Toolset which is NOT
+          # preinstalled on windows-latest runners — the MSI step would
+          # fail with "wix not found". NSIS is bundled with tauri-cli and
+          # needs no additional setup.
+          args: --bundles nsis
+          # TODO: Windows code signing — unsigned builds trigger SmartScreen
+          # warning on user machines. To enable, purchase an OV or EV
+          # Authenticode certificate and add:
+          #   "certificateThumbprint": "...",
+          #   "digestAlgorithm": "sha256",
+          #   "timestampUrl": "http://timestamp.digicert.com"
+          # to tauri.conf.json under `bundle.windows`, and surface the
+          # cert via a GitHub secret + signtool step before tauri-action.
+          # Authenticode is DISTINCT from the Ed25519 updater key above
+          # — Authenticode is what Windows SmartScreen checks on install,
+          # Ed25519 is what the Tauri auto-updater checks before applying
+          # an update.

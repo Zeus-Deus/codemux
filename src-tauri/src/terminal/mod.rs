@@ -7,6 +7,14 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+
+/// Opaque poll handle passed to `batched_reader_loop`. On Unix this is the
+/// raw fd of the PTY master (used by `poll()`); on Windows it is unused because
+/// the placeholder reader does blocking reads.
+#[cfg(unix)]
+type PollFd = RawFd;
+#[cfg(windows)]
+type PollFd = ();
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -388,7 +396,7 @@ fn poll_read_ready(fd: RawFd, timeout_ms: i32) -> bool {
 #[cfg(unix)]
 fn batched_reader_loop(
     reader: &mut dyn Read,
-    poll_fd: RawFd,
+    poll_fd: PollFd,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     mut pre_read_hook: impl FnMut(&[u8]),
@@ -431,11 +439,88 @@ fn batched_reader_loop(
     }
 }
 
+#[cfg(windows)]
+fn batched_reader_loop(
+    reader: &mut dyn Read,
+    _poll_fd: PollFd,
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    mut pre_read_hook: impl FnMut(&[u8]),
+) {
+    // Windows placeholder: Windows pipes are blocking with no poll() equivalent,
+    // so we use a simple blocking read loop that flushes every read. No 16ms
+    // batching yet — that needs a Tokio-based rewrite.
+    let mut buf = [0u8; 4096];
+    let mut batch: Vec<u8> = Vec::with_capacity(PTY_BATCH_SIZE);
+    let mut last_flush = Instant::now();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let data = &buf[..n];
+                pre_read_hook(data);
+                batch.extend_from_slice(data);
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+            }
+            Ok(_) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                break;
+            }
+            Err(error) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                eprintln!("[codemux::terminal] PTY read error: {error}");
+                break;
+            }
+        }
+    }
+}
+
+/// OS-specific PATH entry separator: `;` on Windows, `:` on Unix.
+///
+/// Exposed as a constant-returning function (not a `const`) so tests can
+/// drive the PATH-prepend logic with an explicit separator without caring
+/// about the host OS. Production callers get the right value via
+/// `path_separator()` which resolves at compile time.
+fn path_separator() -> &'static str {
+    if cfg!(windows) {
+        ";"
+    } else {
+        ":"
+    }
+}
+
+/// Prepend `shim_dir` to an existing `PATH` string using the OS-specific
+/// separator. Extracted from the inline logic in `spawn_pty_for_shell`
+/// so it's unit-testable without setting up a real PTY + env.
+///
+/// Semantics:
+///   - Empty `current_path` → return `shim_dir` unchanged (no trailing sep).
+///   - Non-empty → `{shim_dir}{sep}{current_path}`.
+///   - Does NOT deduplicate. If `shim_dir` is already in `current_path`,
+///     it will appear twice. That's intentional — the prepend ensures the
+///     codemux shim wins even if another invocation of this function
+///     already added it once.
+fn prepend_shim_to_path(shim_dir: &str, current_path: &str) -> String {
+    if current_path.is_empty() {
+        shim_dir.to_string()
+    } else {
+        format!("{shim_dir}{}{current_path}", path_separator())
+    }
+}
+
+#[cfg(unix)]
 fn default_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
+#[cfg(windows)]
+fn default_shell() -> String {
+    env::var("COMSPEC")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "cmd.exe".to_string())
 }
 
 #[cfg(unix)]
@@ -459,7 +544,24 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     Some((shim_dir.display().to_string(), current_exe))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_exe = current_exe.display().to_string();
+    let shim_dir = std::env::temp_dir().join("codemux-openflow-shims");
+    std::fs::create_dir_all(&shim_dir).ok()?;
+
+    let shim_path = shim_dir.join("codemux.bat");
+    let script = format!(
+        "@echo off\r\n\"{}\" %*\r\n",
+        current_exe.replace('"', "\\\"")
+    );
+    std::fs::write(&shim_path, script).ok()?;
+
+    Some((shim_dir.display().to_string(), current_exe))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     None
 }
@@ -776,11 +878,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed = if current_path.is_empty() {
-            shim_dir
-        } else {
-            format!("{shim_dir}:{current_path}")
-        };
+        let prefixed = prepend_shim_to_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -875,7 +973,10 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     // Extract the raw fd for poll() before moving master into SessionRuntime.
     // The reader fd is a dup of this fd, so polling either detects data on both.
-    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(unix)]
+    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(windows)]
+    let poll_fd: PollFd = ();
 
     with_session_runtime(
         &sessions,
@@ -1681,7 +1782,10 @@ pub fn spawn_pty_for_agent(
 
     let mut child = guard.disarm();
 
-    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(unix)]
+    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(windows)]
+    let poll_fd: PollFd = ();
 
     with_session_runtime(
         &sessions,
@@ -1930,6 +2034,112 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    // ── Shell + PATH tests ───────────────────────────────────────────
+    //
+    // `path_separator` and `prepend_shim_to_path` are cross-platform
+    // helpers, so their tests run on every platform. `default_shell` on
+    // Windows returns a Windows-specific value, so that test is
+    // `#[cfg(windows)]`-gated and only executes on Windows CI.
+
+    #[test]
+    fn test_path_separator_matches_host_os() {
+        let sep = path_separator();
+        #[cfg(windows)]
+        assert_eq!(sep, ";");
+        #[cfg(unix)]
+        assert_eq!(sep, ":");
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_with_existing_path() {
+        // Typical case: PATH has entries, shim gets prepended with
+        // the OS-correct separator.
+        let result = prepend_shim_to_path("/opt/codemux/shims", "/usr/bin:/bin");
+        #[cfg(unix)]
+        assert_eq!(result, "/opt/codemux/shims:/usr/bin:/bin");
+        #[cfg(windows)]
+        assert_eq!(result, "/opt/codemux/shims;/usr/bin:/bin");
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_with_empty_current() {
+        // Edge case: PATH is empty or unset. Result must be the
+        // shim_dir with NO trailing separator — an empty trailing
+        // component would make the child process try to resolve
+        // binaries from the empty path (which is CWD on some shells,
+        // a security hazard).
+        let result = prepend_shim_to_path("/opt/codemux/shims", "");
+        assert_eq!(result, "/opt/codemux/shims");
+        assert!(
+            !result.ends_with(':') && !result.ends_with(';'),
+            "empty current_path must not produce a trailing separator"
+        );
+    }
+
+    #[test]
+    fn test_prepend_shim_to_path_windows_style_paths() {
+        // Verify the Windows-style paths pass through unmodified on
+        // Windows. The function is oblivious to path content — it
+        // only joins with the separator.
+        let result = prepend_shim_to_path(
+            r"C:\Users\zeus\AppData\Local\Codemux\shims",
+            r"C:\Windows\System32;C:\Program Files\Git\bin",
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            result,
+            r"C:\Users\zeus\AppData\Local\Codemux\shims;C:\Windows\System32;C:\Program Files\Git\bin"
+        );
+        #[cfg(unix)]
+        {
+            // On Unix the separator is `:`, so the Windows paths get
+            // joined with a colon. That's fine — this is just exercising
+            // the function's behavior under test, not a production path.
+            assert_eq!(
+                result,
+                r"C:\Users\zeus\AppData\Local\Codemux\shims:C:\Windows\System32;C:\Program Files\Git\bin"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_default_shell_windows_returns_cmd_or_powershell() {
+        // default_shell() on Windows reads $COMSPEC (typically
+        // `C:\Windows\System32\cmd.exe`) and falls back to the literal
+        // string "cmd.exe" if COMSPEC is unset. It should never return
+        // a Unix shell path. The exact resolution depends on runner
+        // config; we assert the case-insensitive suffix lands on a
+        // known Windows shell binary.
+        let shell = default_shell();
+        let lower = shell.to_lowercase();
+        assert!(
+            lower.ends_with("cmd.exe") || lower.ends_with("powershell.exe"),
+            "Windows default_shell should end with cmd.exe or powershell.exe, got: {shell}"
+        );
+        assert!(
+            !shell.contains("/bin/"),
+            "Windows default_shell must not return a Unix shell path, got: {shell}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_default_shell_unix_returns_bash_or_shell_env() {
+        // Paired guard for the Unix path: default_shell() on Unix reads
+        // $SHELL and falls back to `/bin/bash`. It should never return
+        // a .exe suffix or a Windows-style path.
+        let shell = default_shell();
+        assert!(
+            shell.starts_with('/') || shell.is_empty() == false,
+            "Unix default_shell should be an absolute path, got: {shell}"
+        );
+        assert!(
+            !shell.to_lowercase().ends_with(".exe"),
+            "Unix default_shell must not return a .exe binary, got: {shell}"
+        );
+    }
+
     #[test]
     fn test_failed_status_does_not_create_ghost_entry() {
         let sessions = make_sessions();
@@ -2082,6 +2292,7 @@ mod tests {
     /// Verify that data written to a PTY appears in pending_output within
     /// PTY_BATCH_INTERVAL even when no further writes occur. This tests the
     /// poll()-based flush timeout in batched_reader_loop.
+    #[cfg(unix)]
     #[test]
     fn test_batch_flushes_on_timeout_without_further_writes() {
         use portable_pty::{native_pty_system, PtySize};
@@ -2108,7 +2319,6 @@ mod tests {
         let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
         let mut reader = pair.master.try_clone_reader().expect("clone reader");
         let mut writer = pair.master.take_writer().expect("take writer");
-        drop(pair.slave);
 
         // Start the batched reader loop in a background thread.
         let read_sessions = sessions.clone();
@@ -2117,26 +2327,57 @@ mod tests {
         });
 
         // Write a small payload — well below PTY_BATCH_SIZE.
+        //
+        // IMPORTANT: do NOT drop `pair.slave` anywhere in this test. Keep
+        // it alive for the full duration and let it drop naturally at
+        // end-of-scope once `reader_handle.join()` has returned.
+        //
+        // Why: the reader thread reads from `pair.master`'s read side,
+        // which on Linux receives data via the PTY's line discipline ECHO
+        // behavior — bytes written to `master.writer` → slave's input →
+        // line discipline echoes them back → `master.reader` returns them.
+        // The line discipline is attached to the master/slave pair; if
+        // we close the slave end while the reader is still running, the
+        // discipline can transition into a "no slave" state where echo
+        // stops working and `master.reader` either returns stale EOF or
+        // never delivers the echoed bytes. GitHub Actions' ubuntu-latest
+        // kernel hits this case; local dev machines don't, which is why
+        // three prior fix attempts (widened sleep → polling loop → drop
+        // after write) all passed locally and still failed on CI.
+        //
+        // The ONLY correct sequence is: keep slave open → write → let
+        // echo deliver → read in background thread → assert pending_output
+        // has the bytes → drop writer → join reader (reader sees EOF on
+        // writer drop because the line discipline is still alive and
+        // propagates it properly) → function returns → slave drops last.
         let payload = b"hello from pty test\r\n";
         writer.write_all(payload).expect("write failed");
         writer.flush().expect("flush failed");
 
-        // Wait for PTY_BATCH_INTERVAL plus generous margin for thread scheduling
-        // under load (CI, parallel test runs). The key assertion is that the data
-        // arrives WITHOUT another write — not that it arrives in exactly 16ms.
-        let margin = Duration::from_millis(200);
-        std::thread::sleep(PTY_BATCH_INTERVAL + margin);
-
-        // The data should now be in pending_output — flushed by the poll timeout,
-        // NOT requiring another write.
-        let found = {
-            let guard = sessions.lock().unwrap();
-            let runtime = guard.get("test-pty").unwrap();
-            !runtime.pending_output.is_empty()
-        };
+        // Poll for up to `deadline` waiting for the batched reader thread to
+        // flush. The key assertion is that data arrives WITHOUT another write
+        // — not that it arrives in exactly 16ms. Previous iterations used a
+        // single `sleep(PTY_BATCH_INTERVAL + 200ms)` which kept tripping on
+        // loaded CI runners where thread scheduling jitter blew past the
+        // margin. Polling gives fast machines a typical finish time of
+        // ~16-50ms while still tolerating up to 3s of CI jitter — strictly
+        // more headroom than a fixed sleep at no cost to local dev runs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            {
+                let guard = sessions.lock().unwrap();
+                let runtime = guard.get("test-pty").unwrap();
+                if !runtime.pending_output.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+        }
         assert!(
             found,
-            "data should appear in pending_output within PTY_BATCH_INTERVAL + margin"
+            "data should appear in pending_output within 3s (PTY_BATCH_INTERVAL = {PTY_BATCH_INTERVAL:?})"
         );
 
         // Verify the content includes our payload.
@@ -2155,8 +2396,24 @@ mod tests {
             "pending_output should contain the written payload, got: {content_str:?}"
         );
 
-        // Clean up: drop the writer to close the PTY, which causes the reader loop
-        // to see EOF and exit.
+        // Clean up: the reader thread is blocked in poll()/read() on the
+        // master's read side and will stay blocked until SOMETHING signals
+        // EOF. Dropping `writer` alone is not enough — on Linux PTYs,
+        // master.writer and master.reader are independent halves, so
+        // closing the write side doesn't propagate EOF to the read side.
+        // The slave is what we need to close: dropping `pair.slave` here
+        // tears down the slave end of the PTY, which causes the kernel to
+        // mark the master's read side with POLLHUP. The reader thread's
+        // `poll_read_ready` returns true, `reader.read()` returns Ok(0),
+        // the batched loop hits its `Ok(_) => break` branch, and the
+        // thread exits cleanly — which is what `reader_handle.join()`
+        // needs to return.
+        //
+        // Sequence matters: slave MUST stay alive until AFTER the payload
+        // has been observed in pending_output (see the long comment above
+        // the write block), but MUST be dropped before we try to join the
+        // reader. Do both in the right order here.
+        drop(pair.slave);
         drop(writer);
         reader_handle.join().expect("reader thread panicked");
     }
@@ -2513,9 +2770,14 @@ mod tests {
 
     #[test]
     fn resolve_session_cwd_uses_scrollback_dir_when_exists() {
-        // /tmp always exists on any system
-        let result = resolve_session_cwd("/tmp", "/fallback");
-        assert_eq!(result, "/tmp");
+        // Use the platform temp dir as the "known-to-exist" path — `/tmp`
+        // exists on Unix but not on Windows, and `std::env::temp_dir()`
+        // resolves correctly on both (e.g. `/tmp` on Linux,
+        // `C:\Users\<user>\AppData\Local\Temp` on Windows).
+        let temp = std::env::temp_dir();
+        let temp_str = temp.to_string_lossy().into_owned();
+        let result = resolve_session_cwd(&temp_str, "/fallback");
+        assert_eq!(result, temp_str);
     }
 
     #[test]

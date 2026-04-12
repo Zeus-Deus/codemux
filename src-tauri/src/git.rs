@@ -67,6 +67,33 @@ pub struct CommitFileEntry {
     pub status: String,
 }
 
+/// Sanitize a branch name so it can be used as a filesystem directory
+/// component on every supported OS.
+///
+/// Replaces the path-separator characters (`/` and `\`) plus all
+/// Windows-forbidden filename characters (`< > : " | ? *`) with `-`.
+/// Linux would accept most of these (only `/` is forbidden), but worktrees
+/// created on a Linux machine may eventually be synced, checked out, or
+/// listed by a Windows user (e.g. through `codemux workspace export`), so
+/// we apply the Windows-strict rule cross-platform and accept that it's
+/// slightly noisier than strictly necessary on Linux.
+///
+/// Not cfg-gated — same behavior on every platform. The test for this
+/// function runs on every CI matrix leg and catches regressions in the
+/// character set if someone edits it later.
+///
+/// Reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+/// (see "Naming Conventions" — forbidden chars in NTFS/FAT filenames).
+pub(crate) fn sanitize_branch_for_worktree_path(branch: &str) -> String {
+    branch
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '-',
+            _ => c,
+        })
+        .collect()
+}
+
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args)
@@ -1257,8 +1284,10 @@ pub fn git_create_worktree(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    let sanitized_branch = branch.replace('/', "-");
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let sanitized_branch = sanitize_branch_for_worktree_path(branch);
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     let worktree_path = PathBuf::from(&home)
         .join(".codemux")
         .join("worktrees")
@@ -1520,6 +1549,86 @@ pub fn ensure_git_exclude(workspace_dir: &Path, entry: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Branch name sanitization (cross-platform) ─────────────────────
+    //
+    // These tests are deliberately NOT cfg-gated. `sanitize_branch_for_worktree_path`
+    // applies the Windows-strict forbidden-character rule on every
+    // platform, so every CI matrix leg runs the same assertions. If the
+    // rule ever diverges per-OS, this test will fail on one leg and
+    // flag the drift.
+
+    #[test]
+    fn test_sanitize_branch_replaces_forward_slash() {
+        // The classic case: `feat/my-feature` → `feat-my-feature`.
+        assert_eq!(
+            sanitize_branch_for_worktree_path("feat/my-feature"),
+            "feat-my-feature"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_branch_replaces_windows_forbidden_chars() {
+        // Each Windows-forbidden filename character in isolation.
+        // Reference: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+        assert_eq!(sanitize_branch_for_worktree_path("a<b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a>b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a:b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a\"b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a|b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a?b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a*b"), "a-b");
+        assert_eq!(sanitize_branch_for_worktree_path("a\\b"), "a-b");
+    }
+
+    #[test]
+    fn test_sanitize_branch_replaces_multiple_forbidden_chars() {
+        // Realistic pathological case: every forbidden char at once.
+        // Every occurrence becomes a dash; everything else is preserved.
+        // Char-by-char trace:
+        //   f e a t / s u b : n a m e < v 1 > " i d " | ? * \ e n d
+        //   f e a t - s u b - n a m e - v 1 - - i d - - - - - e n d
+        let input = r#"feat/sub:name<v1>"id"|?*\end"#;
+        let output = sanitize_branch_for_worktree_path(input);
+        assert_eq!(output, "feat-sub-name-v1--id-----end");
+        // Sanity: no forbidden char survives.
+        for ch in ['/', '\\', '<', '>', ':', '"', '|', '?', '*'] {
+            assert!(
+                !output.contains(ch),
+                "forbidden char {ch:?} survived sanitization: {output:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_branch_preserves_safe_chars() {
+        // Everything outside the forbidden set passes through unchanged:
+        // alphanumerics, dashes, underscores, dots, and non-ASCII Unicode.
+        let cases = [
+            "main",
+            "release-2024.09.01",
+            "feat_underscore_branch",
+            "bugfix-issue-1234",
+            "v1.0.0-rc.1",
+            "branch.with.dots",
+        ];
+        for case in cases {
+            assert_eq!(
+                sanitize_branch_for_worktree_path(case),
+                case,
+                "safe input {case:?} should pass through unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_branch_empty_and_edge_cases() {
+        assert_eq!(sanitize_branch_for_worktree_path(""), "");
+        assert_eq!(sanitize_branch_for_worktree_path("/"), "-");
+        assert_eq!(sanitize_branch_for_worktree_path("///"), "---");
+        // Only forbidden chars → only dashes.
+        assert_eq!(sanitize_branch_for_worktree_path("<>:\""), "----");
+    }
 
     #[test]
     fn parse_porcelain_status_handles_common_statuses() {

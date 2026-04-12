@@ -15,10 +15,11 @@ pub async fn start_oauth_flow(
 
     // Start localhost callback server
     let auth_arc = std::sync::Arc::new(AuthState::default());
-    // Transfer the CSRF state to the server's state
+    // Transfer the CSRF state to the server's state.
+    // SystemTime (not Instant) — see AuthState::csrf_states for the reasoning.
     {
         let mut states = auth_arc.csrf_states.lock().unwrap();
-        states.insert(csrf_state.clone(), std::time::Instant::now());
+        states.insert(csrf_state.clone(), std::time::SystemTime::now());
     }
 
     let port = crate::auth::start_callback_server(auth_arc, app.clone())?;

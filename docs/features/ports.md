@@ -12,26 +12,35 @@ Codemux automatically detects TCP ports that dev servers open, displays them in 
 
 ## Current Model
 
-The Rust backend parses `/proc/net/tcp` and `/proc/net/tcp6` for listening sockets, resolves owning PIDs via `/proc/*/fd/` symlinks, and maps ports to process names. Results are filtered to exclude system services and Codemux-internal port ranges.
+`detect_listening_ports` dispatches on the host OS:
+
+- **Linux**: parses `/proc/net/tcp` and `/proc/net/tcp6` for `LISTEN`-state sockets, resolves owning PIDs via `/proc/*/fd/` symlinks, and maps them to process names.
+- **Windows**: shells out to `netstat -ano` (with `CREATE_NO_WINDOW` to suppress the console flash) and `tasklist /NH /FO csv`, then parses both via pure cross-platform `parse_netstat_output` / `parse_tasklist_csv` helpers. The parsers are unit-tested on Linux CI so a Windows runner isn't needed to catch parser regressions.
+- **Other platforms**: returns an empty list.
+
+Results are filtered to exclude system services and Codemux-internal port ranges on all platforms.
 
 ## What Works Today
 
-- automatic detection of listening TCP ports owned by the current user
+- automatic detection of listening TCP ports owned by the current user (Linux + Windows)
 - sidebar section showing port number, process name, and optional label
 - open a detected port in the browser pane
-- kill a port's owning process
+- kill a port's owning process (`kill -9` on Unix, `taskkill /PID {pid} /F` on Windows)
 - static port labels via `.codemux/config.json` ports configuration
 - filtering: system ports (22, 80, 443, 5432, 3306, 6379, 27017), Codemux internals (3900-4199, 9222+) are excluded
+- IPv4 + IPv6 dedup on Windows (services that bind to both `0.0.0.0:port` and `[::]:port` show as one entry)
+- exact-port matching (not substring) so a process listening on `:92230` is never confused with `:9223`
 
 ## Current Constraints
 
-- Linux-only (`/proc` filesystem required)
-- polling-based, not event-driven
+- macOS port detection is not implemented (returns empty list) — needs a `lsof`-based or `libproc` backend
+- polling-based, not event-driven (3-second interval)
 - no per-workspace port scoping (shows all user ports globally)
 - UDP ports are not detected
+- Windows parent-PID walk uses `wmic process ... get ParentProcessId`, which is deprecated on Windows 11 24H2+ — the workspace attribution degrades gracefully to "unassigned" when it fails
 
 ## Important Touch Points
 
-- `src-tauri/src/ports.rs` — `detect_listening_ports()`, `PortInfo`, `/proc` parsing, ignored port lists
-- `src-tauri/src/commands/mod.rs` — `get_detected_ports`, `kill_port`
+- `src-tauri/src/ports.rs` — top-level `detect_listening_ports()` dispatch, `PortInfo` struct, cross-platform `parse_netstat_output` / `parse_tasklist_csv` pure parsers, Linux `/proc` helpers, Windows `windows_impl` module with `netstat`/`tasklist`/`wmic` I/O wrappers
+- `src-tauri/src/commands/mod.rs` — `get_detected_ports`, `kill_port` (branches on `cfg!(windows)`)
 - `src/components/layout/sidebar-ports-section.tsx` — sidebar port display and actions

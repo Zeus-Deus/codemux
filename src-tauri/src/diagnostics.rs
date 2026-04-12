@@ -31,10 +31,18 @@ fn native_startup_log_path() -> Option<PathBuf> {
 
 #[cfg(debug_assertions)]
 fn native_global_log_path() -> Option<PathBuf> {
-    let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .or_else(|| Some(std::env::temp_dir()))?;
-    Some(runtime_dir.join("codemux-native-launches.log"))
+    #[cfg(windows)]
+    {
+        let log_dir = dirs::data_local_dir()?.join("Codemux").join("logs");
+        return Some(log_dir.join("codemux-native-launches.log"));
+    }
+    #[cfg(not(windows))]
+    {
+        let runtime_dir = env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| Some(std::env::temp_dir()))?;
+        Some(runtime_dir.join("codemux-native-launches.log"))
+    }
 }
 
 #[cfg(debug_assertions)]

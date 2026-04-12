@@ -11,12 +11,23 @@ import { cn } from "@/lib/utils";
 import { Workflow, ChevronRight, Plus } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { NewRunDialog } from "@/components/openflow/new-run-dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import { usePlatform } from "@/hooks/use-platform";
+
+const WINDOWS_DISABLED_TOOLTIP =
+  "OpenFlow is not yet available on Windows";
 
 export function SidebarOpenflowSection() {
   const appState = useAppStore((s) => s.appState);
   const runtimeSnapshot = useOpenFlowStore((s) => s.runtimeSnapshot);
   const setNewRunDialogOpen = useOpenFlowStore((s) => s.setNewRunDialogOpen);
   const [expanded, setExpanded] = useState(false);
+  const { isWindows } = usePlatform();
 
   const openflowWorkspaces = useMemo(
     () =>
@@ -24,6 +35,49 @@ export function SidebarOpenflowSection() {
       [],
     [appState],
   );
+
+  // Windows path: render a disabled header with a tooltip explaining the gap.
+  // The section stays visible so users know the feature exists and is coming;
+  // toggling expanded state is disabled, the "+" button is disabled, and the
+  // NewRunDialog is not mounted — there's nothing for it to show.
+  if (isWindows) {
+    return (
+      <div className="shrink-0 border-t border-sidebar-border">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <div
+                aria-disabled="true"
+                className="flex w-full items-center gap-1.5 px-3 py-1.5 text-left text-[11px] font-semibold uppercase tracking-wider text-sidebar-foreground/40 select-none cursor-not-allowed"
+              >
+                <ChevronRight className="h-3 w-3 shrink-0 opacity-50" />
+                <span>
+                  OpenFlow{" "}
+                  <span className="normal-case tracking-normal font-normal text-[10px] text-sidebar-foreground/30">
+                    (Windows: coming soon)
+                  </span>
+                </span>
+                <span className="flex-1" />
+                <button
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  className="rounded p-0.5 opacity-40 cursor-not-allowed"
+                  onClick={(e) => e.stopPropagation()}
+                  tabIndex={-1}
+                >
+                  <Plus className="h-3 w-3" />
+                </button>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent side="top" sideOffset={4}>
+              {WINDOWS_DISABLED_TOOLTIP}
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      </div>
+    );
+  }
 
   return (
     <div className="shrink-0 border-t border-sidebar-border">

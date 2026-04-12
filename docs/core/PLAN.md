@@ -16,7 +16,8 @@
 
 1. Foundations landed in meaningful form: phases 0 through 9.6 established the workspace shell, multi-session terminals, pane management, notifications, browser prototype, CLI and socket control, indexing, and project memory.
 2. Current focus: phases 10 through 15 are about turning that foundation into a trustworthy Linux MVP while hardening OpenFlow.
-3. Later: phases 16 through 18 cover cross-platform preparation, then macOS and Windows support.
+3. Parallel track: Phase 18 (Windows support) foundation work is in progress on the `feature/windows-support` branch. The release pipeline, matrix CI, `cfg`-gated code paths, and Windows-specific tests have landed and been verified end-to-end against a throwaway release tag. OpenFlow and Authenticode signing remain gated before a real Windows v1. See `docs/plans/windows-support.md`.
+4. Later: Phase 17 (macOS) has not been started.
 
 ## Ordered Phases
 
@@ -44,15 +45,17 @@
 
 ## Immediate Priority Order
 
-1. Harden OpenFlow reliability and intervention flow
-2. Add notification sound playback
-3. Add memory drawer UI
-4. Add context menus on workspace rows, sections, and panes
-5. Linux release packaging and polish
-6. Cross-platform preparation (macOS, Windows)
+1. Merge the Windows support foundation branch to main (blocked on Authenticode signing decision and final OpenFlow disable verification on a live Windows install)
+2. Harden OpenFlow reliability and intervention flow
+3. Add notification sound playback
+4. Add memory drawer UI
+5. Add context menus on workspace rows, sections, and panes
+6. Linux release packaging and polish
+7. macOS support (Phase 17)
 
 ## Recently Completed
 
+- Windows support foundation: cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform release.yml matrix, cross-platform `latest.json` via tauri-action merge, 38 new tests for Windows code paths, verification via throwaway test tag against the live release pipeline (see `docs/plans/windows-support.md`)
 - Session persistence: terminal scrollback save/restore and adapter-based resume
 - GitHub issue integration (link issues to workspaces, issue picker, auto-branch naming)
 - Browser wait conditions, JS evaluation, and CSS style inspection (MCP tools, 26→29)

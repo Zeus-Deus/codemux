@@ -506,6 +506,14 @@ pub fn spawn_openflow_agents(
     working_directory: String,
     agent_configs: Vec<AgentConfig>,
 ) -> Result<Vec<String>, String> {
+    // OpenFlow depends on bash wrapper scripts (ensure_wrapper_exists /
+    // ensure_claude_wrapper_exists below) that do not have Windows equivalents
+    // yet. The UI already hides/disables the section on Windows; this is the
+    // safety net for CLI or socket-driven callers that bypass the sidebar.
+    if cfg!(windows) {
+        return Err("OpenFlow is not yet available on Windows".to_string());
+    }
+
     let log_path = Orchestrator::comm_log_path(&run_id);
     if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use tauri::Manager;
 
@@ -75,7 +75,18 @@ struct StoredAuth {
 // ── Auth State (managed by Tauri) ────────────────────────────────
 
 pub struct AuthState {
-    pub(crate) csrf_states: Mutex<HashMap<String, Instant>>,
+    /// CSRF state tokens keyed to their creation time. Uses `SystemTime`
+    /// rather than `Instant` because on Windows `Instant` is backed by
+    /// `QueryPerformanceCounter`, and `Instant::now() - Duration::from_secs(600)`
+    /// panics with "overflow when subtracting duration from instant" during
+    /// the first ~10 minutes after VM boot (observed on GitHub Actions
+    /// windows-latest runners when cargo test runs quickly after job setup).
+    /// `SystemTime` is wall-clock and Unix-epoch-based, so subtracting 600s
+    /// from current time (~56 years past epoch) never underflows. Tradeoff:
+    /// `SystemTime` is not monotonic, so NTP adjustments or manual clock
+    /// changes could briefly skew CSRF token validity — acceptable for a
+    /// 10-minute OAuth state token.
+    pub(crate) csrf_states: Mutex<HashMap<String, SystemTime>>,
     callback_port: Mutex<Option<u16>>,
 }
 
@@ -96,10 +107,11 @@ impl AuthState {
         let state = base64_url_encode(&bytes);
 
         let mut states = self.csrf_states.lock().unwrap();
-        // Clean up expired entries (older than 10 minutes)
-        let cutoff = Instant::now() - std::time::Duration::from_secs(600);
+        // Clean up expired entries (older than 10 minutes). See the
+        // csrf_states field comment for why this uses SystemTime.
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(600);
         states.retain(|_, ts| *ts > cutoff);
-        states.insert(state.clone(), Instant::now());
+        states.insert(state.clone(), SystemTime::now());
 
         state
     }
@@ -107,7 +119,7 @@ impl AuthState {
     /// Validate and consume a CSRF state token (one-time use).
     pub fn validate_csrf_state(&self, state: &str) -> bool {
         let mut states = self.csrf_states.lock().unwrap();
-        let cutoff = Instant::now() - std::time::Duration::from_secs(600);
+        let cutoff = SystemTime::now() - std::time::Duration::from_secs(600);
         if let Some(ts) = states.remove(state) {
             ts > cutoff
         } else {
@@ -543,7 +555,11 @@ mod tests {
         let state = AuthState::default();
         {
             let mut states = state.csrf_states.lock().unwrap();
-            let expired = Instant::now() - std::time::Duration::from_secs(660);
+            // 660s > the 600s cutoff used by validate_csrf_state, so this
+            // entry must be treated as expired. SystemTime subtraction is
+            // safe here because current wall-clock time is ~56 years past
+            // the Unix epoch — 660s subtraction never underflows.
+            let expired = SystemTime::now() - std::time::Duration::from_secs(660);
             states.insert("expired-state".into(), expired);
         }
         assert!(!state.validate_csrf_state("expired-state"));
