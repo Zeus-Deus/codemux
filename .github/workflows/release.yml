@@ -111,17 +111,50 @@ jobs:
           git config --global user.email "release@codemux.dev"
           git config --global user.name "Codemux Release"
 
+      # ── Multi-platform updater signing notes ─────────────────────────
+      #
+      # Both platforms pass the SAME Ed25519 updater key and both set
+      # `includeUpdaterJson: true`. This works — despite each job
+      # producing its own per-platform signature set — because
+      # `tauri-action`'s `uploadVersionJSON` step (source:
+      # https://github.com/tauri-apps/tauri-action/blob/dev/src/upload-version-json.ts)
+      # is designed to MERGE with any pre-existing `latest.json` on the
+      # release:
+      #
+      #   1. listReleaseAssets() → looks for an existing `latest.json`
+      #   2. If found, downloads it and pre-seeds `versionContent.platforms`
+      #      with the existing `platforms` object
+      #   3. Adds THIS job's platform entries (e.g. `linux-x86_64` or
+      #      `windows-x86_64`) to that object
+      #   4. deleteReleaseAsset() + uploadAssets() the merged file
+      #
+      # The result is a single `latest.json` with both Linux and Windows
+      # entries, which matches the Tauri v2 updater schema:
+      #   https://v2.tauri.app/plugin/updater/
+      #
+      # Race window: if both jobs call listReleaseAssets() before EITHER
+      # has uploaded its `latest.json`, the second upload will clobber
+      # the first (last-writer-wins). In practice the race is unlikely —
+      # ubuntu-22.04 completes the build several minutes before
+      # windows-latest (Rust compile + NSIS bundling are significantly
+      # slower on Windows). Worst case: one release has a stale
+      # `latest.json` missing one platform; users on that platform miss
+      # a single update cycle but are not bricked, and the next release
+      # recovers automatically. We accept this over adding a third
+      # merge-updater job because tauri-action's built-in merge is more
+      # reliable than anything we'd write ourselves.
+      #
+      # The Ed25519 key is cross-platform. The same private key signs
+      # Linux AppImage/deb/rpm and Windows NSIS `.exe` bundles; clients
+      # verify per-platform signatures out of the single `latest.json`.
+      # This is DISTINCT from Windows Authenticode code signing, which
+      # is not yet configured (see Windows step TODO below).
+
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Tauri's built-in Ed25519 updater signing. Cross-platform —
-          # tauri-action handles key material in pure Rust, no external
-          # bash tooling. Produces `.sig` files alongside each bundle and
-          # the `latest.json` manifest the auto-updater reads. This is
-          # DISTINCT from Windows Authenticode code signing, which is not
-          # configured (see Windows job below).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
@@ -129,13 +162,6 @@ jobs:
           releaseName: "Codemux ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
-          # Only the Linux job publishes `latest.json`. If Windows also
-          # published it, the two jobs would race on the upload and the
-          # winner would overwrite the other's platform entries. Keeping
-          # Linux as the canonical updater source preserves existing
-          # Linux auto-updates; Windows users get a downloadable `.exe`
-          # in the release assets but no auto-update path yet (acceptable
-          # for the initial unsigned Windows release).
           includeUpdaterJson: true
 
       - name: Build and release (Windows)
@@ -143,17 +169,23 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Ed25519 updater key is not needed on Windows for v1 — we're
-          # not publishing a Windows entry in latest.json (see the Linux
-          # job's comment). Omitting the env vars also means tauri won't
-          # generate .sig files for the Windows bundles, keeping the
-          # release assets clean.
+          # Same Ed25519 updater key as the Linux job. Tauri CLI on
+          # Windows uses it to sign the NSIS `.exe` and produce the
+          # matching `.sig` file that tauri-action then references in
+          # the merged `latest.json` under the `windows-x86_64` key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Codemux ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
-          includeUpdaterJson: false
+          # Now true on Windows — tauri-action will merge this job's
+          # `windows-x86_64` entry into whatever `latest.json` the Linux
+          # job already uploaded. See the long comment above the two
+          # Build and release steps for the merge mechanics and race
+          # analysis.
+          includeUpdaterJson: true
           # Restrict to the NSIS bundle. `bundle.targets = "all"` in
           # tauri.conf.json would otherwise build both NSIS and MSI on
           # Windows, and MSI requires the WiX Toolset which is NOT
@@ -169,3 +201,7 @@ jobs:
           #   "timestampUrl": "http://timestamp.digicert.com"
           # to tauri.conf.json under `bundle.windows`, and surface the
           # cert via a GitHub secret + signtool step before tauri-action.
+          # Authenticode is DISTINCT from the Ed25519 updater key above
+          # — Authenticode is what Windows SmartScreen checks on install,
+          # Ed25519 is what the Tauri auto-updater checks before applying
+          # an update.
