@@ -1986,21 +1986,31 @@ mod tests {
 
         // Write a small payload — well below PTY_BATCH_SIZE.
         //
-        // IMPORTANT: keep `pair.slave` alive until AFTER the write. If we
-        // drop it before the reader thread is scheduled, the PTY master
-        // immediately sees POLLHUP and `poll_read_ready` returns true with
-        // an empty read buffer. `reader.read()` then returns Ok(0) (EOF),
-        // the loop flushes its empty batch and exits via the `Ok(_) =>`
-        // break branch — BEFORE our write ever reaches it. That race is
-        // why this test kept failing on loaded CI runners while passing
-        // locally: fast dev machines hit the write first, slow CI runners
-        // hit the poll first. Dropping the slave after the write
-        // eliminates the race: by the time the slave closes, the reader
-        // has already consumed the payload.
+        // IMPORTANT: do NOT drop `pair.slave` anywhere in this test. Keep
+        // it alive for the full duration and let it drop naturally at
+        // end-of-scope once `reader_handle.join()` has returned.
+        //
+        // Why: the reader thread reads from `pair.master`'s read side,
+        // which on Linux receives data via the PTY's line discipline ECHO
+        // behavior — bytes written to `master.writer` → slave's input →
+        // line discipline echoes them back → `master.reader` returns them.
+        // The line discipline is attached to the master/slave pair; if
+        // we close the slave end while the reader is still running, the
+        // discipline can transition into a "no slave" state where echo
+        // stops working and `master.reader` either returns stale EOF or
+        // never delivers the echoed bytes. GitHub Actions' ubuntu-latest
+        // kernel hits this case; local dev machines don't, which is why
+        // three prior fix attempts (widened sleep → polling loop → drop
+        // after write) all passed locally and still failed on CI.
+        //
+        // The ONLY correct sequence is: keep slave open → write → let
+        // echo deliver → read in background thread → assert pending_output
+        // has the bytes → drop writer → join reader (reader sees EOF on
+        // writer drop because the line discipline is still alive and
+        // propagates it properly) → function returns → slave drops last.
         let payload = b"hello from pty test\r\n";
         writer.write_all(payload).expect("write failed");
         writer.flush().expect("flush failed");
-        drop(pair.slave);
 
         // Poll for up to `deadline` waiting for the batched reader thread to
         // flush. The key assertion is that data arrives WITHOUT another write
@@ -2044,8 +2054,24 @@ mod tests {
             "pending_output should contain the written payload, got: {content_str:?}"
         );
 
-        // Clean up: drop the writer to close the PTY, which causes the reader loop
-        // to see EOF and exit.
+        // Clean up: the reader thread is blocked in poll()/read() on the
+        // master's read side and will stay blocked until SOMETHING signals
+        // EOF. Dropping `writer` alone is not enough — on Linux PTYs,
+        // master.writer and master.reader are independent halves, so
+        // closing the write side doesn't propagate EOF to the read side.
+        // The slave is what we need to close: dropping `pair.slave` here
+        // tears down the slave end of the PTY, which causes the kernel to
+        // mark the master's read side with POLLHUP. The reader thread's
+        // `poll_read_ready` returns true, `reader.read()` returns Ok(0),
+        // the batched loop hits its `Ok(_) => break` branch, and the
+        // thread exits cleanly — which is what `reader_handle.join()`
+        // needs to return.
+        //
+        // Sequence matters: slave MUST stay alive until AFTER the payload
+        // has been observed in pending_output (see the long comment above
+        // the write block), but MUST be dropped before we try to join the
+        // reader. Do both in the right order here.
+        drop(pair.slave);
         drop(writer);
         reader_handle.join().expect("reader thread panicked");
     }
