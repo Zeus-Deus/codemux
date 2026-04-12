@@ -79,10 +79,12 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
   - `#[cfg(unix)]`-gated poll syscall with EINTR retry
   - Replace with Tokio async reads; portable-pty returns `Box<dyn Read>` wrappable in async runtime
   - **Partial (2026-04-12)**: unix path untouched; the `RawFd` usage is now typed as `PollFd = RawFd` on unix and `PollFd = ()` on windows so the module compiles on both. Full Tokio rewrite is still outstanding.
+  - **Deferred (2026-04-13)**: Placeholder blocking read loop (see `batched_reader_loop` note below) works for Windows v1. Full Tokio rewrite is an optimization — relevant when we see real Windows throughput regressions, not before.
 - [ ] **`src-tauri/src/terminal/mod.rs:368-412` — `batched_reader_loop(...)`**
   - Batches PTY output every 16ms or 32KB using `poll()`
   - Rewrite with `tokio::select!` on read future + `tokio::time::interval(Duration::from_millis(16))`; preserve 32KB flush threshold and batching semantics
   - **Partial (2026-04-12)**: added a `#[cfg(windows)]` placeholder that does a simple blocking read loop with per-read flushes (no 16ms batching). Sufficient to compile; optimization is still outstanding.
+  - **Deferred (2026-04-13)**: The per-read flush placeholder produces functionally-correct output on Windows at the cost of more flush calls than the 16ms/32KB batching. Acceptable for MVP; revisit when benchmarks show a real bottleneck. The Linux `poll()`-based path is unchanged and remains the optimized route on that platform.
 
 ### Process Management
 
@@ -113,28 +115,37 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 > **Scope:** `src-tauri/src/os_input.rs` is entirely Linux-specific. Every item below needs a `#[cfg(target_os = "windows")]` twin implementation using Win32 `SendInput` (via the `windows` crate or `enigo`).
 >
 > **Compile-gate pass (2026-04-12)**: the entire contents of `os_input.rs` are now inside `#[cfg(target_os = "linux")] mod linux_impl { ... }`, with a non-linux stub for `handle_os_action` that returns `"OS input not supported on this platform"`. The module compiles on Windows — the items below still track the Win32 `SendInput` implementation that will replace the stub.
+>
+> **Deferred (2026-04-13)**: **entire Tier 3 section deferred from Windows v1.** Tier 1 (DOM-based automation via `agent-browser`) and Tier 2 (coordinate-based automation via `stream_input.rs`) are sufficient for Windows MVP. Tier 3 (`SendInput` / viewport→screen conversion / Bezier mouse paths) is a reliability fallback used only when Tier 1/2 both fail, and implementing it on Windows requires adding the `windows` or `enigo` crate plus parallel Win32 key/mouse code — not worth the scope for v1. All 7 items below are deferred with this shared reason; they remain unchecked so `grep "[ ]"` still surfaces them if we revisit Tier 3 later.
 
 - [ ] **`src-tauri/src/os_input.rs:36-63` — ydotool binary + ydotoold daemon availability check (via `systemctl --user is-active`)**
   - Linux-only entry gate for Tier 3 input
   - Windows: replace with Win32 availability check (always true — SendInput is core API); no daemon needed
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1 (see section header note).
 - [ ] **`src-tauri/src/os_input.rs:108-143` — `ydotool_move()`, `ydotool_click_left()`, `ydotool_type_text()` primitives**
   - Shells out to `ydotool` binary
   - Windows: call `SendInput` with `MOUSEINPUT` (move/click) and `KEYBDINPUT` (type) structs via `windows` crate
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1.
 - [ ] **`src-tauri/src/os_input.rs:149-178` — Linux key name → event code map (from `linux/input-event-codes.h`)**
   - "a"=30, "return"=28, etc.
   - Windows: parallel map to VK codes (VK_A=0x41, VK_RETURN=0x0D); consider cross-platform enum
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1.
 - [ ] **`src-tauri/src/os_input.rs:180-215` — `ydotool_key()` modifier chain via keycode:1/keycode:0 press/release**
   - Handles Ctrl+Shift+A style combos
   - Windows: `SendInput` sequence with `KEYEVENTF_KEYUP` for release; same press-hold-release pattern
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1.
 - [ ] **`src-tauri/src/os_input.rs:66-102` — `find_browser_window()` via `hyprctl clients -j`**
   - Gets browser window geometry + Hyprland address
   - Windows: `EnumWindows` + `GetWindowRect` + match on window class name (e.g., "Chrome_WidgetWin_1")
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1.
 - [ ] **`src-tauri/src/os_input.rs:225-257` — `os_click()` viewport→screen conversion + Bezier-smoothed mouse path**
   - High-level click orchestration
   - Keep the Bezier math; swap ydotool primitive calls for Win32 equivalents
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1.
 - [ ] **`src-tauri/src/os_input.rs:277-309` — `handle_os_action()` dispatcher for "click_os" / "type_os"**
   - MCP action router
   - Add `#[cfg(target_os = "windows")]` branch routing to Win32 implementation
+  - **Deferred (2026-04-13)**: Tier 3 not in scope for Windows v1. The existing non-linux stub (returns `"OS input not supported on this platform"`) is the shipping behavior.
 
 ### Desktop Integration
 
@@ -191,15 +202,19 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`src-tauri/src/openflow/prompts.rs:249-404` — `ensure_openflow_wrapper_exists()` generates `#!/bin/bash` wrapper**
   - Uses `set -uo pipefail`, `read -r`, `[[ ]]`, python JSON parsing, `/tmp/openflow-session-*`
   - Generate `.ps1` on Windows (PowerShell has native JSON + `$env:TEMP` + stdin handling); better: refactor to spawn agent directly from Rust, eliminating the wrapper
+  - **Deferred (2026-04-13)**: OpenFlow is disabled on Windows at both the UI layer (sidebar shows greyed-out "OpenFlow is not yet available on Windows" tooltip) and the backend layer (`spawn_openflow_agents` returns `Err("OpenFlow is not yet available on Windows")` on `cfg!(windows)`). The bash wrapper rewrite is only needed once OpenFlow is re-enabled on Windows — tracked as a post-v1 item.
 - [ ] **`src-tauri/src/openflow/prompts.rs:426-600` — `ensure_claude_wrapper_exists()` generates `#!/bin/bash` wrapper**
   - Uses `stty -echo`, `read -r -t 1`, `python3 -c` for JSON, `/tmp/openflow-claude-session-*`
   - Generate `.ps1` on Windows; no `stty` equivalent — use `[Console]::ReadKey()` or buffer differently
+  - **Deferred (2026-04-13)**: OpenFlow disabled on Windows — see note above.
 - [ ] **`src-tauri/src/openflow/prompts.rs:299, 315` — `/tmp/openflow-session-${INSTANCE_ID}-$$` session files**
   - Temp files referenced inside the generated bash wrappers
   - Use `%TEMP%` in generated `.ps1` wrapper; or `std::env::temp_dir()` if refactored to Rust spawn
+  - **Deferred (2026-04-13)**: OpenFlow disabled on Windows — see note above.
 - [ ] **`scripts/check-deps.sh:131-146` — checks `webkit2gtk-4.1` and `gtk-3.0` via `pkg-config`**
   - Would hard-fail on Windows
   - Create `scripts/check-deps.ps1` that skips webkit/gtk and verifies MSVC toolchain + Visual Studio Build Tools + WebView2 runtime
+  - **Deferred (2026-04-13)**: `check-deps.sh` is a contributor dev-setup helper, not called from CI or from the release pipeline. On Windows, dev-setup is documented to use `cargo tauri build` directly without the pre-flight script. A `.ps1` variant is nice-to-have, not required for v1.
 
 ### Build & Distribution
 
@@ -210,6 +225,7 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`src-tauri/tauri.conf.json:6-9` — `beforeBuildCommand` / `beforeDevCommand` invoke `bash scripts/copy-agent-browser.sh`**
   - Hard-codes `bash`
   - Replace with Node.js script (`scripts/copy-agent-browser.mjs`) for true cross-platform, or conditionally invoke a `.ps1` variant
+  - **Deferred (2026-04-13)**: Git for Windows is preinstalled on `windows-latest` CI runners and puts `bash.exe` in `PATH`, so `bash scripts/copy-agent-browser.sh` resolves correctly when Tauri invokes it via `cmd /c "..."` on Windows. Verified end-to-end via a throwaway release tag build that produced a working NSIS `.exe`. A pure Node.js rewrite is cleaner but not required while `shell: bash` works. Revisit if `windows-latest` ever drops Git for Windows, or when we need the script to work outside Git Bash (native PowerShell dev loop).
 - [x] **`.github/workflows/release.yml:10` — `runs-on: ubuntu-22.04` only; installs Linux-only deps (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `libfuse2`)**
   - No Windows build in CI
   - Add matrix: `os: [ubuntu-22.04, windows-latest, macos-latest]`. Windows uses MSVC toolchain (pre-installed on `windows-latest`) and WebView2 runtime (pre-installed on recent Windows images)
@@ -219,24 +235,28 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
   - **What's still explicitly not done**: Windows Authenticode code signing (SmartScreen warning on unsigned first-installs — budget decision, inline TODO comment in the workflow), macOS matrix entry (separate follow-up).
 - [x] **Bump Node 20 → 22 in both `ci.yml` and `release.yml`**
   - **Done (2026-04-12)**: GitHub is deprecating Node 20 runners starting June 2026 per https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/. Both workflows now set `node-version: 22` with an inline link to the deprecation notice.
-- [ ] **`scripts/copy-agent-browser.sh` — bash platform→binary mapping for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, darwin targets**
+- [x] **`scripts/copy-agent-browser.sh` — bash platform→binary mapping for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, darwin targets**
   - No Windows target mapping; bash won't run on Windows without WSL or Git Bash
   - Rewrite as Node.js (`copy-agent-browser.mjs`) for cross-platform, or add `copy-agent-browser.ps1` with win32-x64/arm64 mapping
+  - **Done (2026-04-13)**: the script now maps `x86_64-pc-windows-msvc` → `agent-browser-win32-x64.exe`, and runs successfully on `windows-latest` CI under Git Bash (`shell: bash` step in `release.yml`). The cross-platform Node.js rewrite is deferred (see `tauri.conf.json:6-9` note above) but is no longer blocking Windows support — the bash script itself now has the Windows target mapping.
 
 ### Agent Integration
 
-- [ ] **Verify `agent-browser` upstream publishes a Windows binary** — `src-tauri/src/agent_browser.rs`, `scripts/copy-agent-browser.sh`
+- [x] **Verify `agent-browser` upstream publishes a Windows binary** — `src-tauri/src/agent_browser.rs`, `scripts/copy-agent-browser.sh`
   - Codemux depends on the `agent-browser` Node package; currently published for Linux and macOS only
   - If missing: vendor a Windows Chromium launcher, use system Edge/Chrome via CDP directly, or drop the browser pane from Windows MVP
+  - **Done (2026-04-12)**: Upstream `agent-browser` v0.25.3 publishes `agent-browser-win32-x64.exe` on npm + GitHub releases. `scripts/copy-agent-browser.sh` now maps `x86_64-pc-windows-msvc` → that binary name. Windows ARM64 is NOT published (upstream issue #248); we'll fall back to system Edge via CDP when Windows ARM64 users show up. Full research details in "Research Findings §1" at the top of this file.
 - [ ] **Verify Claude Code CLI flag parity on Windows** — `src-tauri/src/agent_context.rs:88-95`, `src-tauri/src/openflow/adapters/claude.rs`
   - `--system-prompt`, `-p`, `--mcp-config`, etc. must work identically on Windows
   - Hard blocker if any Codemux-relied flag is missing or behaves differently. Test with `claude --version` and compare flag set
 - [ ] **`src-tauri/src/openflow/adapters/claude.rs:1-88` — Claude adapter spawns `SystemPrompts::claude_wrapper_script_path()` bash wrapper**
   - Depends on the bash wrapper generated in `prompts.rs:426-600`
   - Option A: produce `.ps1` wrapper on Windows. Option B: refactor to spawn `claude` directly from Rust with env vars + stdin, eliminating the wrapper entirely (preferred — simpler cross-platform)
+  - **Deferred (2026-04-13)**: OpenFlow disabled on Windows, so the Claude adapter inside OpenFlow never runs there. The direct-spawn Claude preset (outside OpenFlow) does not use this wrapper — it goes through `agent_context::inject_agent_context` which adds `--system-prompt` on argv and does NOT rely on a bash wrapper.
 - [ ] **`src-tauri/src/agent_context.rs:89-92` — Claude injection: `--system-prompt "$CODEMUX_AGENT_CONTEXT"` with shell-style var expansion**
   - cmd.exe uses `%VAR%`, PowerShell uses `$env:VAR` — bare `$VAR` won't expand
   - Verify env is passed via `Command::env()` not via shell string; if spawning goes through a shell, rewrite to pass directly
+  - **Deferred (2026-04-13)**: OpenFlow-side Claude injection is unreachable on Windows (OpenFlow is disabled). The preset-launch Claude path passes `--system-prompt <context>` directly on argv via the terminal preset runner, so bare `$VAR` expansion is not involved. Re-verify this item if OpenFlow is re-enabled on Windows.
 
 ### Windows MVP Disable Strategy — OpenFlow
 
@@ -338,6 +358,7 @@ OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` 
 - [ ] **`scripts/check-deps.sh` — bash-only dependency checker using apt/dnf/pacman detection**
   - Contributor dev-setup
   - Create `scripts/check-deps.ps1` for Windows (verifies Rust MSVC, Node, VS Build Tools, WebView2 runtime)
+  - **Deferred (2026-04-13)**: dev-setup helper, not required for v1. Windows contributors invoke `cargo tauri build` directly; CI does its own toolchain setup via `dtolnay/rust-toolchain@stable`.
 - [ ] **`scripts/vite-wrapper.sh` — bash wrapper using `/dev/tcp`, `ps -o pgid`, `trap` for Vite restart monitoring**
   - Dev-only convenience
   - Acceptable to keep Linux-only; Windows dev uses `tauri dev` directly. Optional future port to Node.js
@@ -351,9 +372,10 @@ OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` 
 - [ ] **`src-tauri/Cargo.toml:36` — `notify-rust = "4"` dependency**
   - Desktop notifications
   - notify-rust has a Windows backend (WinRT Toast); test that `Notification::show()` works without code change
-- [ ] **`src-tauri/src/commands/workspace.rs:756-762` — `Notification::new()` with `.hint(DesktopEntry(...))`, `.hint(Transient(true))`, `.urgency(Critical)`**
+- [x] **`src-tauri/src/commands/workspace.rs:756-762` — `Notification::new()` with `.hint(DesktopEntry(...))`, `.hint(Transient(true))`, `.urgency(Critical)`**
   - Attention notification
   - `DesktopEntry` and `Transient` hints are D-Bus/freedesktop-specific and silently ignored on Windows; `.urgency(Critical)` maps to toast priority. Works but visual behavior differs
+  - **Done (2026-04-12)**: the D-Bus/freedesktop-specific `.hint(DesktopEntry(...))`, `.hint(Transient(true))`, and `.urgency(Critical)` calls are wrapped in `#[cfg(unix)]` so they're no-ops on Windows (part of commit `8c45413` — "fix(ci): gate notify-rust hints/urgency to unix"). On Windows the notification falls through to a plain `Notification::new().summary(...).body(...).show()` which `notify-rust` routes to the WinRT Toast backend.
 
 ### Agent Integration (follow-ups)
 
@@ -363,6 +385,7 @@ OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` 
 - [ ] **`src-tauri/src/openflow/prompts.rs:299, 315` — OpenCode wrapper uses `opencode session list --format json` piped via bash**
   - OpenCode session tracking
   - Verify OpenCode CLI works on Windows; if yes, spawn directly from Rust without shell pipe
+  - **Deferred (2026-04-13)**: OpenFlow disabled on Windows — OpenCode adapter inside OpenFlow never runs there. Re-verify if OpenFlow is re-enabled on Windows.
 - [ ] **Verify other agent CLI Windows availability (opencode, codex, gemini, pi)** — `src-tauri/src/openflow/adapters/*.rs`
   - Each agent has a different Windows story
   - Initial Windows release may ship with Claude Code only; document which agents are supported per release
@@ -372,6 +395,7 @@ OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` 
 - [ ] **No Windows code signing configured anywhere**
   - Users will see Windows SmartScreen warning on first install
   - Options: (a) EV cert (~$300/yr, no warning ever), (b) OV cert (~$100/yr, warning until reputation builds), (c) ship unsigned initially and accept warnings. Once cert is acquired, add `"windows": { "certificateThumbprint": "...", "digestAlgorithm": "sha256", "timestampUrl": "http://timestamp.digicert.com" }` to `tauri.conf.json`
+  - **Deferred (2026-04-13)**: Budget decision — shipping unsigned for v1. SmartScreen warning is expected on first install; `scripts/test-release-pipeline.sh` verifies the `.exe` is produced and downloadable. The `release.yml` Windows step has an inline TODO comment with the exact `tauri.conf.json` fields to add once a cert is acquired. Revisit when SmartScreen friction becomes a real complaint in v1 usage — the AUR-flagged `agent-browser-win32-x64.exe` Defender false-positive (upstream issues #514, #482) is extra motivation to sign eventually, but not a v1 blocker.
 
 ---
 
@@ -416,6 +440,7 @@ OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` 
 - [ ] **`scripts/check-deps.sh:207-218` — ydotool binary + systemd service check**
   - Dev-setup helper
   - Skip on Windows entirely; ydotool is Linux-only
+  - **Deferred (2026-04-13)**: part of the broader `check-deps.ps1` rewrite, which is itself deferred (see Build & Distribution section). The ydotool check will naturally not appear in the Windows variant if/when it's written.
 - [ ] **`src-tauri/src/terminal/mod.rs:594-611` — sets `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=codemux`, `CODEMUX=1`, `CODEMUX_SESSION_ID`, `CODEMUX_WORKSPACE_ID`, `CODEMUX_SURFACE_ID`, `BROWSER=codemux browser open`**
   - PTY child env vars
   - All harmless on Windows ConPTY. Consider detecting `WT_SESSION` for Windows Terminal-specific enhancements later
@@ -525,6 +550,7 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 - [ ] **OpenFlow wrapper execution (PowerShell variant)**
   - If `.ps1` wrapper path is taken for v1: generate the script, run it with a real Claude session, assert session file is created in `%TEMP%`, assert orchestration turn completes
   - If the Rust-direct-spawn path is taken instead: test that path produces the same observable behavior as the Linux wrapper version (equivalence test)
+  - **Deferred (2026-04-13)**: OpenFlow is disabled on Windows (see Shell & Environment section). Integration test becomes relevant only when OpenFlow is re-enabled.
 - [x] **Release pipeline artifact verification**
   - Before merging the feature branch, verify a test tag build produces all expected artifacts (Linux AppImage/deb/rpm, Windows `.exe`, merged `latest.json` containing both `linux-x86_64` and `windows-x86_64` platforms).
   - **Done (2026-04-13)**: added `scripts/test-release-pipeline.sh` as a dev-only verification script. Takes a completed release tag and runs 8 checks: (1) release exists, (2) Linux AppImage + deb present, (3) Windows `.exe` present, (4) `latest.json` present, (5) JSON is valid + version matches tag, (6) CRITICAL `latest.json.platforms` contains BOTH `linux-x86_64` and `windows-x86_64` keys, (7) each platform has a signature field, (8) each platform has an https download URL. Exits 0 on full pass, exits 2 on issues, exits 1 on hard failure (missing release, invalid JSON, etc.). Does NOT build or download bundles — it's a post-tag verification only. Flow: push a throwaway tag (`v0.0.0-test1`) → wait for release.yml CI → run the script → if green, merge the feature branch → delete the test tag + release. Rationale for running it manually on a throwaway tag: the real `release.yml` only triggers on `v*` pushes, so the only way to test the multi-platform `latest.json` merge behavior end-to-end is to actually tag a test build.
@@ -546,22 +572,30 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 
 ### Cross-platform regression
 
-- [ ] **All existing Linux tests must continue passing** — no regressions from new `cfg` gates
-- [ ] **Run full `npm run verify` + `cargo test` on both Linux and Windows in CI** — they are first-class peer platforms after this work lands
+- [x] **All existing Linux tests must continue passing** — no regressions from new `cfg` gates
+  - **Verified (2026-04-13)**: every commit on `feature/windows-support` has run `ci.yml` on both matrix legs. The final commit before the merge-ready state (`eb7838b`) passed 547 Rust tests (470 lib + 65 git + 12 github) + 298 frontend tests on both `ubuntu-latest` and `windows-latest`. No Linux regressions.
+- [x] **Run full `npm run verify` + `cargo test` on both Linux and Windows in CI** — they are first-class peer platforms after this work lands
+  - **Done (2026-04-12)**: `ci.yml` runs `cargo check`, `cargo test`, `npm run check`, `npm run test`, and `npm run build` on a `[ubuntu-latest, windows-latest]` matrix with `fail-fast: false`. Both legs are required for a branch to merge.
 - [ ] **Benchmark parity check**: if any performance-sensitive code path is rewritten (e.g., batched reader), run an existing benchmark on both platforms and record results in the PR. Target: within 10% of Linux baseline on equivalent hardware
+  - **Deferred (2026-04-13)**: the Windows batched reader is currently the per-read flush placeholder, not a real Tokio rewrite, so there's no equivalent-algorithm benchmark to compare against. Relevant only when the Tokio rewrite lands.
 - [ ] **Document Windows-only test skips**: any test gated out on Windows (or vice versa) must include an inline comment explaining why, and ideally a linked tracking issue to un-skip it later
 
 ---
 
 ## Decisions
 
-- [ ] **`portable-pty` version pin on Windows** — research surfaced upstream regression #6783 (`portable-pty 0.9.0 doesn't work on windows`: reader returns garbage output). Options: (a) pin `portable-pty = "=0.8.1"` on the Windows target, (b) ship 0.9.0 and verify the Tokio batched-reader rewrite happens to sidestep the bug, (c) fork and patch. Recommend (a) until #6783 is fixed upstream. **Blocks all Windows PTY work** — decide before writing any Windows PTY code
-- [ ] **Installer format: NSIS vs MSI** — recommend NSIS for v1 (smaller, simpler, no Windows SDK required for CI). MSI is better for enterprise Group Policy deployment; can ship both later via `"targets": ["nsis", "msi"]`
+- [x] **`portable-pty` version pin on Windows** — research surfaced upstream regression #6783 (`portable-pty 0.9.0 doesn't work on windows`: reader returns garbage output). Options: (a) pin `portable-pty = "=0.8.1"` on the Windows target, (b) ship 0.9.0 and verify the Tokio batched-reader rewrite happens to sidestep the bug, (c) fork and patch. Recommend (a) until #6783 is fixed upstream. **Blocks all Windows PTY work** — decide before writing any Windows PTY code
+  - **Decided (2026-04-12)**: Option (a). `src-tauri/Cargo.toml` pins `portable-pty = "0.8"` for all targets (not Windows-specific). Sidesteps #6783 entirely. If we ever need 0.9.x features for Linux, we can split into target-specific pins at that point.
+- [x] **Installer format: NSIS vs MSI** — recommend NSIS for v1 (smaller, simpler, no Windows SDK required for CI). MSI is better for enterprise Group Policy deployment; can ship both later via `"targets": ["nsis", "msi"]`
+  - **Decided (2026-04-12)**: NSIS only for v1, via `args: --bundles nsis` in the Windows step of `release.yml`. MSI requires WiX Toolset which is NOT preinstalled on `windows-latest` runners, and installing it would add CI time for a feature v1 users don't need. Verified end-to-end via `scripts/test-release-pipeline.sh` on a throwaway release tag.
 - [ ] **Code signing: EV ($300/yr) vs OV ($100/yr) vs unsigned initially** — initial release may ship unsigned with SmartScreen warning; EV cert eliminates warnings immediately but is costlier. OV cert is cheaper but builds reputation slowly. **Extra motivation from research**: `agent-browser-win32-x64.exe` (a bundled dependency) is already flagged by Windows Defender (upstream issues #514, #482), so shipping Codemux unsigned on top compounds install friction — signing becomes effectively mandatory for a polished first impression on Windows
+  - **Deferred (2026-04-13)**: Shipping unsigned for Windows v1. Option (c) chosen. Re-decide between EV and OV once we see real install friction from SmartScreen in v1 usage. See the matching `[ ]` item under Degraded → Signing for the implementation TODO.
 - [x] **agent-browser Windows binary** — **Resolved by research**: `agent-browser-win32-x64.exe` is published on npm and GitHub releases (v0.25.3, 2026-04-07). Windows ARM64 is **not** published (upstream issue #248 — Chromium ARM64 availability). Plan: consume the x64 binary for Windows x64 Codemux, fall back to system Edge via CDP (`--remote-debugging-port=9222`) for Windows ARM64 until upstream ships that artifact. See Research Findings §1 for the list of known open Windows bugs to budget around
-- [ ] **Tier 3 input injection** — ship Windows MVP with Tier 1/2 only, or implement `SendInput` from day 1? Tier 3 is a reliability fallback; MVP can ship without
+- [x] **Tier 3 input injection** — ship Windows MVP with Tier 1/2 only, or implement `SendInput` from day 1? Tier 3 is a reliability fallback; MVP can ship without
+  - **Decided (2026-04-13)**: Ship v1 with Tier 1 (DOM-based automation via `agent-browser`) + Tier 2 (coordinate-based automation via `stream_input.rs`) only. Tier 3 / `SendInput` / Win32 input injection is deferred — see the dedicated `Browser Automation / Tier 3 Input Injection` section above for the 7 deferred os_input.rs items. The existing non-linux stub in `os_input.rs` returns `"OS input not supported on this platform"` which is the shipping behavior.
 - [x] **Which agent CLIs to support on Windows v1?** — **Resolved by research**: all five CLIs run natively on Windows. **Claude Code** (native installer via `irm claude.ai/install.ps1 | iex` or winget; requires Git for Windows), **Codex** (npm `@openai/codex` or Rust binary; `-c instructions=` works cross-platform), **Gemini CLI** (npm `@google/gemini-cli`; `GEMINI_SYSTEM_MD` officially documented), **OpenCode** (scoop/choco/npm; **publisher renamed sst → anomalyco** — update any hardcoded URLs), **Pi** (npm `@mariozechner/pi-coding-agent` — this is `pi-mono` by `badlogic`, NOT Inflection AI). Open follow-up: verify OpenCode's env-var injection on native Windows before shipping — upstream recommends WSL and has known native-install rough edges. See Research Findings §3 for install methods and flag-parity matrix
-- [ ] **Default shell on Windows** — `cmd.exe` (always available) vs PowerShell (better UX but requires detection). Recommend `cmd.exe` for v1 with PowerShell via explicit user setting
+- [x] **Default shell on Windows** — `cmd.exe` (always available) vs PowerShell (better UX but requires detection). Recommend `cmd.exe` for v1 with PowerShell via explicit user setting
+  - **Decided (2026-04-12)**: `cmd.exe` for v1. `default_shell()` on Windows reads `COMSPEC` env var (which defaults to `cmd.exe` path) with a literal `"cmd.exe"` fallback. PowerShell detection via `HKLM\SOFTWARE\Microsoft\PowerShell` is a follow-up — users can override via a user setting later.
 
 ---
 

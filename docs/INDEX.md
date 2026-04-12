@@ -46,6 +46,9 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Terminal system: `docs/features/terminal.md`
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
+- Agent hooks: `docs/features/hooks.md`
+- Execution backends / sandboxing: `docs/features/execution.md`
+- Observability (flags, metrics, safety config): `docs/features/observability.md`
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`
@@ -55,6 +58,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
+- Windows cross-platform work: `docs/plans/windows-support.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`
