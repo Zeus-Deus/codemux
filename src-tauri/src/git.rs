@@ -1257,8 +1257,19 @@ pub fn git_create_worktree(
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "repo".to_string());
-    let sanitized_branch = branch.replace('/', "-");
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    // Sanitize: replace `/` and Windows-forbidden filename chars (< > : " | ? *)
+    // with `-` so the branch name is usable as a directory component on every
+    // supported OS.
+    let sanitized_branch: String = branch
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*' => '-',
+            _ => c,
+        })
+        .collect();
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
     let worktree_path = PathBuf::from(&home)
         .join(".codemux")
         .join("worktrees")

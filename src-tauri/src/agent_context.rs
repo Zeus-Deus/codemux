@@ -98,7 +98,10 @@ pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
             format!("{command} --append-system-prompt \"$CODEMUX_AGENT_CONTEXT\"")
         }
         "gemini" => {
-            let path = format!("/tmp/codemux-{workspace_id}-gemini-system.md");
+            let path = std::env::temp_dir()
+                .join(format!("codemux-{workspace_id}-gemini-system.md"))
+                .to_string_lossy()
+                .into_owned();
             format!(
                 "printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > {path} && GEMINI_SYSTEM_MD={path} {command}"
             )
@@ -275,7 +278,8 @@ mod tests {
     fn inject_gemini_writes_file_and_sets_env() {
         let result = inject_agent_context("gemini --yolo", "test-ws-gemini");
         // Should prefix with inline file write + env var, then the original command
-        assert!(result.contains("GEMINI_SYSTEM_MD=/tmp/codemux-test-ws-gemini-gemini-system.md"));
+        assert!(result.contains("GEMINI_SYSTEM_MD="));
+        assert!(result.contains("codemux-test-ws-gemini-gemini-system.md"));
         assert!(result.ends_with("gemini --yolo"));
         assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
     }

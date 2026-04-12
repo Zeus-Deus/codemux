@@ -768,9 +768,12 @@ pub fn notify_attention(
             let _ = window.request_user_attention(Some(tauri::UserAttentionType::Critical));
         }
 
-        let _ = std::process::Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", "class:com.codemux.app"])
-            .output();
+        #[cfg(target_os = "linux")]
+        {
+            let _ = std::process::Command::new("hyprctl")
+                .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+                .output();
+        }
     }
 
     crate::state::emit_app_state(&app);

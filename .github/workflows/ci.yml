@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-flight runs for the same branch when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      # Never fail-fast — we always want to see both Linux and Windows
+      # results, even if one platform regresses. Masking a Windows-only
+      # break with a Linux pass (or vice versa) would defeat the whole
+      # point of having this matrix.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            libssl-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            file
+        # This matches the package list installed in release.yml so the CI
+        # toolchain is a strict subset of what the release pipeline uses.
+        # libfuse2 is excluded — it is only needed by `tauri build`'s
+        # AppImage packager, not by `cargo check` or `cargo test`.
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          # Scope the cache per OS so Linux and Windows artifacts never
+          # collide in the same cache key.
+          key: ${{ matrix.os }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Stage agent-browser sidecar binary
+        shell: bash
+        run: |
+          # tauri-build validates `externalBin` at compile time, so even
+          # `cargo check` fails if src-tauri/binaries/agent-browser-<target>
+          # does not exist. Our existing copy-agent-browser.sh maps the host
+          # target triple to the upstream npm package's pre-built binary.
+          #
+          # Git Bash is preinstalled on windows-latest, so `shell: bash`
+          # works on both platforms without needing a second .ps1 script.
+          bash scripts/copy-agent-browser.sh || true
+
+          # Fallback: if the copy script couldn't find the upstream binary
+          # (e.g. agent-browser's postinstall was skipped on a particular
+          # platform — see upstream issue #549), drop a zero-byte placeholder
+          # at the expected path so tauri-build's externalBin check passes.
+          # CI's job is to verify type-correctness and run unit tests, not
+          # to produce a distributable installer — an empty placeholder is
+          # sufficient for `cargo check` / `cargo test`.
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          mkdir -p src-tauri/binaries
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/agent-browser-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/agent-browser-$TARGET" ;;
+          esac
+          if [ ! -f "$DEST" ]; then
+            echo "[ci] Real agent-browser binary not found at $DEST — creating placeholder"
+            touch "$DEST"
+            chmod +x "$DEST" 2>/dev/null || true
+          fi
+
+      - name: Build frontend
+        # `frontendDist: "../dist"` in tauri.conf.json means tauri-build
+        # wants `dist/` to exist at compile time — build the frontend first.
+        run: npm run build
+
+      - name: TypeScript typecheck
+        run: npm run check
+
+      - name: Frontend tests
+        run: npm run test
+
+      - name: Cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Cargo test
+        run: cargo test --manifest-path src-tauri/Cargo.toml

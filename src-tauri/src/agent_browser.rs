@@ -85,9 +85,39 @@ const MAX_STREAM_PORT: u16 = 9299;
 /// Kill all agent-browser daemon processes.
 /// Called on app shutdown to prevent stale daemons across restarts.
 pub fn kill_stream_daemons() {
-    let _ = std::process::Command::new("sh")
-        .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
-        .output();
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "agent-browser.exe", "/F"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
+            .output();
+    }
+}
+
+/// Kill any process bound to the given TCP port. Used to reclaim stale
+/// agent-browser daemon ports from previous app runs.
+fn kill_process_on_port(port: u16) {
+    #[cfg(windows)]
+    {
+        // TODO: parse `netstat -ano | findstr :{port}` for PIDs and run
+        // `taskkill /PID {pid} /F`. For now, log and skip — the agent-browser
+        // daemon handles most reclamation itself via session name.
+        eprintln!(
+            "[codemux::browser] kill_process_on_port({}) skipped on Windows (not yet implemented)",
+            port
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
+            .output();
+    }
 }
 
 /// Per-session stream state.
@@ -466,9 +496,7 @@ impl AgentBrowserManager {
         kill_stream_daemons();
         // Also kill by port — pkill may miss daemons with unexpected command lines.
         for port in DEFAULT_STREAM_PORT..=DEFAULT_STREAM_PORT + 10 {
-            let _ = std::process::Command::new("sh")
-                .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
-                .output();
+            kill_process_on_port(port);
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
         Self::new()
@@ -615,9 +643,7 @@ impl AgentBrowserManager {
 
         // Kill the daemon on this session's port before closing
         if let Some(s) = self.sessions.lock().await.remove(browser_id) {
-            let _ = std::process::Command::new("sh")
-                .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", s.port)])
-                .output();
+            kill_process_on_port(s.port);
         }
 
         let _ = std::process::Command::new("sh")
@@ -666,9 +692,7 @@ impl AgentBrowserManager {
         let port = self.allocate_port(browser_id).await?;
 
         // Kill any other process on the allocated port (non-agent-browser services).
-        let _ = std::process::Command::new("sh")
-            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
-            .output();
+        kill_process_on_port(port);
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and

@@ -7,6 +7,14 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::io::RawFd;
+
+/// Opaque poll handle passed to `batched_reader_loop`. On Unix this is the
+/// raw fd of the PTY master (used by `poll()`); on Windows it is unused because
+/// the placeholder reader does blocking reads.
+#[cfg(unix)]
+type PollFd = RawFd;
+#[cfg(windows)]
+type PollFd = ();
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -368,7 +376,7 @@ fn poll_read_ready(fd: RawFd, timeout_ms: i32) -> bool {
 #[cfg(unix)]
 fn batched_reader_loop(
     reader: &mut dyn Read,
-    poll_fd: RawFd,
+    poll_fd: PollFd,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     mut pre_read_hook: impl FnMut(&[u8]),
@@ -411,11 +419,55 @@ fn batched_reader_loop(
     }
 }
 
+#[cfg(windows)]
+fn batched_reader_loop(
+    reader: &mut dyn Read,
+    _poll_fd: PollFd,
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    mut pre_read_hook: impl FnMut(&[u8]),
+) {
+    // Windows placeholder: Windows pipes are blocking with no poll() equivalent,
+    // so we use a simple blocking read loop that flushes every read. No 16ms
+    // batching yet — that needs a Tokio-based rewrite.
+    let mut buf = [0u8; 4096];
+    let mut batch: Vec<u8> = Vec::with_capacity(PTY_BATCH_SIZE);
+    let mut last_flush = Instant::now();
+    loop {
+        match reader.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                let data = &buf[..n];
+                pre_read_hook(data);
+                batch.extend_from_slice(data);
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+            }
+            Ok(_) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                break;
+            }
+            Err(error) => {
+                flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+                eprintln!("[codemux::terminal] PTY read error: {error}");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 fn default_shell() -> String {
     env::var("SHELL")
         .ok()
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| "/bin/bash".to_string())
+}
+
+#[cfg(windows)]
+fn default_shell() -> String {
+    env::var("COMSPEC")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "cmd.exe".to_string())
 }
 
 #[cfg(unix)]
@@ -439,7 +491,24 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     Some((shim_dir.display().to_string(), current_exe))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+    let current_exe = std::env::current_exe().ok()?;
+    let current_exe = current_exe.display().to_string();
+    let shim_dir = std::env::temp_dir().join("codemux-openflow-shims");
+    std::fs::create_dir_all(&shim_dir).ok()?;
+
+    let shim_path = shim_dir.join("codemux.bat");
+    let script = format!(
+        "@echo off\r\n\"{}\" %*\r\n",
+        current_exe.replace('"', "\\\"")
+    );
+    std::fs::write(&shim_path, script).ok()?;
+
+    Some((shim_dir.display().to_string(), current_exe))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     None
 }
@@ -682,10 +751,11 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
         let prefixed = if current_path.is_empty() {
             shim_dir
         } else {
-            format!("{shim_dir}:{current_path}")
+            format!("{shim_dir}{sep}{current_path}")
         };
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
@@ -756,7 +826,10 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     // Extract the raw fd for poll() before moving master into SessionRuntime.
     // The reader fd is a dup of this fd, so polling either detects data on both.
-    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(unix)]
+    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(windows)]
+    let poll_fd: PollFd = ();
 
     with_session_runtime(
         &sessions,
@@ -1473,7 +1546,10 @@ pub fn spawn_pty_for_agent(
 
     let mut child = guard.disarm();
 
-    let poll_fd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(unix)]
+    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
+    #[cfg(windows)]
+    let poll_fd: PollFd = ();
 
     with_session_runtime(
         &sessions,
@@ -1874,6 +1950,7 @@ mod tests {
     /// Verify that data written to a PTY appears in pending_output within
     /// PTY_BATCH_INTERVAL even when no further writes occur. This tests the
     /// poll()-based flush timeout in batched_reader_loop.
+    #[cfg(unix)]
     #[test]
     fn test_batch_flushes_on_timeout_without_further_writes() {
         use portable_pty::{native_pty_system, PtySize};

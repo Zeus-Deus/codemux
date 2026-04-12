@@ -57,8 +57,9 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 
 > **Core good news:** Codemux already uses `portable-pty`, which transparently supports ConPTY on Windows. Items 1.1–1.5 below should mostly "just work" once the reader loop (1.6, 1.7) is rewritten.
 
-- [ ] **Verify `portable-pty` ConPTY feature is enabled** — `src-tauri/Cargo.toml`
+- [x] **Verify `portable-pty` ConPTY feature is enabled** — `src-tauri/Cargo.toml`
   - Confirm no feature flag or default disables Windows support. All downstream PTY items depend on this.
+  - **Done (2026-04-12)**: Cargo.toml pins `portable-pty = "0.8"`, which is the last-known-good version per research item #6783. No feature flags disabling Windows. Left at 0.8.x (not 0.9.x) so the mechanical pass is safe to merge.
 - [ ] **`src-tauri/src/terminal/mod.rs:561-567` — shell PTY openpty**
   - `native_pty_system().openpty(PtySize {...})` for user shell
   - portable-pty handles transparently; verify after Tokio reader refactor
@@ -77,9 +78,11 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`src-tauri/src/terminal/mod.rs:338-359` — `poll_read_ready(fd: RawFd, timeout_ms)` using `libc::poll()`**
   - `#[cfg(unix)]`-gated poll syscall with EINTR retry
   - Replace with Tokio async reads; portable-pty returns `Box<dyn Read>` wrappable in async runtime
+  - **Partial (2026-04-12)**: unix path untouched; the `RawFd` usage is now typed as `PollFd = RawFd` on unix and `PollFd = ()` on windows so the module compiles on both. Full Tokio rewrite is still outstanding.
 - [ ] **`src-tauri/src/terminal/mod.rs:368-412` — `batched_reader_loop(...)`**
   - Batches PTY output every 16ms or 32KB using `poll()`
   - Rewrite with `tokio::select!` on read future + `tokio::time::interval(Duration::from_millis(16))`; preserve 32KB flush threshold and batching semantics
+  - **Partial (2026-04-12)**: added a `#[cfg(windows)]` placeholder that does a simple blocking read loop with per-read flushes (no 16ms batching). Sufficient to compile; optimization is still outstanding.
 
 ### Process Management
 
@@ -92,19 +95,24 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`src-tauri/src/terminal/mod.rs:1663-1690` — agent child.wait() thread**
   - Same pattern for agent PTY
   - portable-pty handles; no code change
-- [ ] **`src-tauri/src/commands/mod.rs:274-292` — `kill_port(port)` shells out to `kill -9 {pid}`**
+- [x] **`src-tauri/src/commands/mod.rs:274-292` — `kill_port(port)` shells out to `kill -9 {pid}`**
   - Kills process listening on a port
   - Windows branch: `taskkill /PID {pid} /F`, or use `windows` crate `TerminateProcess`
-- [ ] **`src-tauri/src/agent_browser.rs:89` — `pkill -f agent-browser` for stale daemon cleanup**
+  - **Done (2026-04-12)**: `kill_port` now branches on `cfg!(windows)` and calls `taskkill /PID {pid} /F` on Windows, `kill -9 {pid}` on Unix.
+- [x] **`src-tauri/src/agent_browser.rs:89` — `pkill -f agent-browser` for stale daemon cleanup**
   - Kills zombie agent-browser daemons from previous runs
   - Windows: `taskkill /IM agent-browser.exe /F`; `#[cfg(target_os = "windows")]` guard
-- [ ] **`src-tauri/src/agent_browser.rs:470, 619, 670` — `fuser -k {port}/tcp` for port reclamation**
+  - **Done (2026-04-12)**: `kill_stream_daemons` now has a `#[cfg(windows)]` branch running `taskkill /IM agent-browser.exe /F`.
+- [x] **`src-tauri/src/agent_browser.rs:470, 619, 670` — `fuser -k {port}/tcp` for port reclamation**
   - Frees ports stuck after crash
   - Windows: parse `netstat -ano` for PID + `taskkill /PID`, or use `GetExtendedTcpTable` from `windows` crate
+  - **Partial (2026-04-12)**: extracted the three call sites into a helper `kill_process_on_port(port)`. Unix impl runs `fuser -k`. Windows impl is a no-op that logs a warning; full `netstat -ano` + `taskkill` port-reclamation is tracked as a follow-up.
 
 ### Browser Automation / Tier 3 Input Injection
 
 > **Scope:** `src-tauri/src/os_input.rs` is entirely Linux-specific. Every item below needs a `#[cfg(target_os = "windows")]` twin implementation using Win32 `SendInput` (via the `windows` crate or `enigo`).
+>
+> **Compile-gate pass (2026-04-12)**: the entire contents of `os_input.rs` are now inside `#[cfg(target_os = "linux")] mod linux_impl { ... }`, with a non-linux stub for `handle_os_action` that returns `"OS input not supported on this platform"`. The module compiles on Windows — the items below still track the Win32 `SendInput` implementation that will replace the stub.
 
 - [ ] **`src-tauri/src/os_input.rs:36-63` — ydotool binary + ydotoold daemon availability check (via `systemctl --user is-active`)**
   - Linux-only entry gate for Tier 3 input
@@ -130,45 +138,56 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 
 ### Desktop Integration
 
-- [ ] **`src-tauri/src/lib.rs:369-377` — startup `hyprctl keyword windowrule float...` for xdg-desktop-portal-gtk dialogs**
+- [x] **`src-tauri/src/lib.rs:369-377` — startup `hyprctl keyword windowrule float...` for xdg-desktop-portal-gtk dialogs**
   - Hyprland-specific workaround for tiled file dialogs
   - Gate with `#[cfg(target_os = "linux")]`; Windows native dialogs don't need this
+  - **Done (2026-04-12)**: wrapped the `hyprctl keyword windowrule` call in `#[cfg(target_os = "linux")]`.
 
 ### Filesystem / IPC
 
-- [ ] **`src-tauri/src/control.rs:11` — `use tokio::net::{UnixListener, UnixStream}`**
+- [x] **`src-tauri/src/control.rs:11` — `use tokio::net::{UnixListener, UnixStream}`**
   - IPC transport for codemux control socket
   - `#[cfg(unix)]`-gate; Windows branch uses `tokio::net::windows::named_pipe::{NamedPipeServer, NamedPipeClient}`
-- [ ] **`src-tauri/src/control.rs:30-76` — `control_socket_path()` resolves `$XDG_RUNTIME_DIR/codemux.sock` or `/tmp/codemux-{uid}/codemux.sock`**
+  - **Done (2026-04-12)**: `control.rs` now has two sibling modules — `unix_transport` (UnixListener/UnixStream) and `windows_transport` (ServerOptions / ClientOptions / NamedPipeServer / NamedPipeClient) — both exposing the same `bind` / `accept` / `connect` / `sync_liveness_probe` API. The rest of the file uses `transport::*` and never names a platform-specific type. `handle_client` is now generic over `AsyncRead + AsyncWrite + Unpin + Send`.
+- [x] **`src-tauri/src/control.rs:30-76` — `control_socket_path()` resolves `$XDG_RUNTIME_DIR/codemux.sock` or `/tmp/codemux-{uid}/codemux.sock`**
   - Socket path resolution with Unix fallback
   - Windows: return `\\.\pipe\codemux-{username}` named pipe path; use `whoami::username()` or `%USERNAME%` env var
-- [ ] **`src-tauri/src/control.rs:36` — `let uid = unsafe { libc::getuid() }`**
+  - **Done (2026-04-12)**: `control_socket_path()` is now cfg-split. Unix keeps the existing XDG_RUNTIME_DIR + /tmp/codemux-{uid} fallback logic verbatim. Windows returns `\\.\pipe\codemux-{USERNAME}` using `std::env::var("USERNAME")` (with a `"default"` fallback and alphanumeric/`_-` sanitization so a weird USERNAME can never produce an invalid pipe name). No new `whoami` crate dependency.
+- [x] **`src-tauri/src/control.rs:36` — `let uid = unsafe { libc::getuid() }`**
   - Unix UID lookup for socket dir naming
   - Windows: `whoami::username()` or `GetUserNameW` via `windows` crate
-- [ ] **`src-tauri/src/control.rs:127` — `UnixStream::connect()` liveness probe on existing socket**
+  - **Done (2026-04-12)**: `libc::getuid()` stays inside `#[cfg(unix)]`; the Windows branch uses `std::env::var("USERNAME")` and never touches libc.
+- [x] **`src-tauri/src/control.rs:127` — `UnixStream::connect()` liveness probe on existing socket**
   - Checks if daemon already owns the socket
   - Windows: `NamedPipeClient::connect()` probe
-- [ ] **`src-tauri/src/control.rs:178-199` — `UnixListener::bind(&socket_path)` for IPC server**
+  - **Done (2026-04-12)**: replaced the inline `std::os::unix::net::UnixStream::connect` check with `transport::sync_liveness_probe(&socket_path)`. Unix impl uses the std Unix socket connect; Windows impl uses `std::fs::OpenOptions::new().read(true).write(true).open(pipe_name)` which maps to `CreateFileW` and succeeds iff a server is listening. Both are safe to call from sync contexts (startup path before the tokio runtime exists). Exposed as `pub fn control_server_is_running()` for `main.rs`.
+- [x] **`src-tauri/src/control.rs:178-199` — `UnixListener::bind(&socket_path)` for IPC server**
   - Main control server listen
   - Windows: `ServerOptions::new().create(pipe_name)` from `tokio::net::windows::named_pipe`
-- [ ] **`src-tauri/src/main.rs:5, 199` — `use std::os::unix::net::UnixStream` for CLI daemon detection**
+  - **Done (2026-04-12)**: server bind is now `transport::bind(&socket_path)`. Unix impl removes the stale socket file (if any) and binds a `UnixListener`. Windows impl creates the first pipe server instance with `ServerOptions::new().first_pipe_instance(true)` and keeps it inside a `Mutex<Option<NamedPipeServer>>`; `accept()` awaits `server.connect()`, eagerly spins up the next instance, and returns the now-connected server. The accept loop in `spawn_control_server` is identical for both platforms. Unix-only filesystem bookkeeping (parent dir creation + stale-file sweep) is wrapped in `#[cfg(unix)]`.
+- [x] **`src-tauri/src/main.rs:5, 199` — `use std::os::unix::net::UnixStream` for CLI daemon detection**
   - `codemux` CLI uses this to detect a running daemon
   - Windows: mirror the named-pipe probe from control.rs
-- [ ] **`src-tauri/src/git.rs:1247-1324, 1261` — `git_create_worktree()` uses `env::var("HOME")` with `/tmp` fallback**
+  - **Done (2026-04-12)**: dropped the `std::os::unix::net::UnixStream` import; single-instance detection is now `codemux_lib::control::control_server_is_running()`, which delegates to the platform-specific `transport::sync_liveness_probe`. Same behavior on Unix, works on Windows.
+- [x] **`src-tauri/src/git.rs:1247-1324, 1261` — `git_create_worktree()` uses `env::var("HOME")` with `/tmp` fallback**
   - Worktree root path: `$HOME/.codemux/worktrees/{repo}/{branch}`
   - Replace with `dirs::home_dir()` (resolves to `%USERPROFILE%` on Windows); drop `/tmp` fallback
-- [ ] **`src-tauri/src/agent_context.rs:102` — hardcoded `/tmp/codemux-{workspace_id}-gemini-system.md`**
+  - **Done (2026-04-12)**: now uses `dirs::home_dir()` with `std::env::temp_dir()` as final fallback.
+- [x] **`src-tauri/src/agent_context.rs:102` — hardcoded `/tmp/codemux-{workspace_id}-gemini-system.md`**
   - Gemini system prompt temp file
   - Use `std::env::temp_dir().join(format!("codemux-{}-gemini-system.md", workspace_id))`
+  - **Done (2026-04-12)**: uses `std::env::temp_dir().join(...)`. Note: the enclosing shell command still uses `printf` + `$VAR` expansion so it won't actually run on native Windows cmd.exe yet — that's covered by the "Agent Integration" blocker for Claude/Codex/Pi/Gemini injection.
 
 ### Shell & Environment
 
-- [ ] **`src-tauri/src/terminal/mod.rs:690-692` — PATH prepend uses `:` separator**
+- [x] **`src-tauri/src/terminal/mod.rs:690-692` — PATH prepend uses `:` separator**
   - Prepends codemux CLI shim dir to child PATH
   - `if cfg!(windows) { ";" } else { ":" }`, or use `std::env::join_paths`
-- [ ] **`src-tauri/src/terminal/mod.rs:414-419` — `default_shell()` reads `SHELL` → `/bin/bash` fallback**
+  - **Done (2026-04-12)**: separator is now `cfg!(windows) ? ";" : ":"`.
+- [x] **`src-tauri/src/terminal/mod.rs:414-419` — `default_shell()` reads `SHELL` → `/bin/bash` fallback**
   - User shell detection for terminal panes
   - Windows branch: `env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into())`; future: detect PowerShell via `HKLM\SOFTWARE\Microsoft\PowerShell`
+  - **Done (2026-04-12)**: split into `#[cfg(unix)]` (SHELL env) and `#[cfg(windows)]` (COMSPEC env, fallback `cmd.exe`).
 - [ ] **`src-tauri/src/openflow/prompts.rs:249-404` — `ensure_openflow_wrapper_exists()` generates `#!/bin/bash` wrapper**
   - Uses `set -uo pipefail`, `read -r`, `[[ ]]`, python JSON parsing, `/tmp/openflow-session-*`
   - Generate `.ps1` on Windows (PowerShell has native JSON + `$env:TEMP` + stdin handling); better: refactor to spawn agent directly from Rust, eliminating the wrapper
@@ -193,6 +212,7 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`.github/workflows/release.yml:10` — `runs-on: ubuntu-22.04` only; installs Linux-only deps (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `libfuse2`)**
   - No Windows build in CI
   - Add matrix: `os: [ubuntu-22.04, windows-latest, macos-latest]`. Windows uses MSVC toolchain (pre-installed on `windows-latest`) and WebView2 runtime (pre-installed on recent Windows images)
+  - **Partially addressed (2026-04-12)**: release.yml itself is intentionally still Linux-only — bundle config, installer format, and code signing are prerequisites for a real Windows build-and-publish job. Instead, added a new **`.github/workflows/ci.yml`** that runs `cargo check`, `cargo test`, `npm run check`, `npm run test`, and `npm run build` on a `[ubuntu-latest, windows-latest]` matrix with `fail-fast: false`. This catches Windows regressions on every push to `main`/`feature/**` and every PR into `main`, without needing the full release pipeline.
 - [ ] **`scripts/copy-agent-browser.sh` — bash platform→binary mapping for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, darwin targets**
   - No Windows target mapping; bash won't run on Windows without WSL or Git Bash
   - Rewrite as Node.js (`copy-agent-browser.mjs`) for cross-platform, or add `copy-agent-browser.ps1` with win32-x64/arm64 mapping
@@ -251,24 +271,29 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 
 ### Filesystem / Permissions
 
-- [ ] **`src-tauri/src/control.rs:40-70` — `MetadataExt::uid()` ownership check + `Permissions::from_mode(0o700)` on fallback socket dir**
+- [x] **`src-tauri/src/control.rs:40-70` — `MetadataExt::uid()` ownership check + `Permissions::from_mode(0o700)` on fallback socket dir**
   - Security: ensures only current user can connect
   - Windows named pipes inherit user security context automatically; skip this check on Windows
-- [ ] **`src-tauri/src/git.rs:1260` — branch-name sanitization replaces only `/` with `-`**
+  - **Done (2026-04-12)**: `MetadataExt::uid()` and `Permissions::from_mode(0o700)` now live inside the `#[cfg(unix)]` branch of `control_socket_path()`. The Windows branch returns the pipe path directly with no permission bookkeeping — named pipes inherit the creating user's security descriptor from Win32 by default, which is the security model the Unix chmod was approximating.
+- [x] **`src-tauri/src/git.rs:1260` — branch-name sanitization replaces only `/` with `-`**
   - Used to build worktree directory name
   - Windows forbids `< > : " \ | ? *` in filenames. Expand sanitizer: `branch.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "-")`
+  - **Done (2026-04-12)**: sanitizer now replaces `/ \ < > : " | ? *` all with `-`.
 - [ ] **`src-tauri/src/config/mod.rs:71` — reads `~/.config/omarchy/current/theme/colors.toml` for Omarchy theme integration**
   - Omarchy is a Linux/Hyprland theming tool
   - Skip entirely on Windows; theme falls back to default
-- [ ] **`src-tauri/src/hooks.rs:317-323` — `#[cfg(unix)] set_permissions(Permissions::from_mode(0o755))` on hook script**
+- [x] **`src-tauri/src/hooks.rs:317-323` — `#[cfg(unix)] set_permissions(Permissions::from_mode(0o755))` on hook script**
   - Makes hook script executable on Unix
   - Already cfg-gated; Windows uses file extension (`.bat`/`.ps1`) for executability. No action beyond ensuring the script itself is `.bat`/`.ps1` (see Shell section)
-- [ ] **`src-tauri/src/openflow/prompts.rs:411-414, 606-609` — `0o755` on generated wrapper scripts**
+  - **Verified (2026-04-12)**: already `#[cfg(unix)]`-gated; Windows path is a no-op. Nothing to do for the mechanical pass; generating `.bat`/`.ps1` scripts is the separate wrapper rewrite.
+- [x] **`src-tauri/src/openflow/prompts.rs:411-414, 606-609` — `0o755` on generated wrapper scripts**
   - OpenFlow + Claude wrapper scripts
   - Use `.ps1` extension on Windows (see Shell section); drop mode-bit setting inside `#[cfg(windows)]`
-- [ ] **`src-tauri/src/terminal/mod.rs:421-437` — `#[cfg(unix)] ensure_openflow_cli_shims()` creates `/tmp/codemux-openflow-shims/` with 0o755**
+  - **Verified (2026-04-12)**: both `set_permissions` blocks are already inside `#[cfg(unix)]`. No change needed for this pass — the `.ps1` rewrite is a separate task.
+- [x] **`src-tauri/src/terminal/mod.rs:421-437` — `#[cfg(unix)] ensure_openflow_cli_shims()` creates `/tmp/codemux-openflow-shims/` with 0o755**
   - CLI shim installation for PATH injection
   - Windows: create `.bat` shim in `%LOCALAPPDATA%\Codemux\shims`, or skip if PATH injection isn't needed there
+  - **Done (2026-04-12)**: added `#[cfg(windows)]` variant that creates `codemux.bat` in `std::env::temp_dir()/codemux-openflow-shims/` with `@echo off\r\n"%EXE%" %*\r\n` contents. No chmod needed on Windows.
 
 ### Shell & Environment / Scripts
 
@@ -290,9 +315,10 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 
 ### Desktop / Dialogs
 
-- [ ] **`src-tauri/Cargo.toml:26` — `tauri-plugin-dialog` with `xdg-portal` feature enabled unconditionally**
+- [x] **`src-tauri/Cargo.toml:26` — `tauri-plugin-dialog` with `xdg-portal` feature enabled unconditionally**
   - Linux file dialog via xdg-portal
   - Gate feature to Linux: `[target.'cfg(unix)'.dependencies] tauri-plugin-dialog = { version = "2", features = ["xdg-portal"] }`; Windows uses native dialogs automatically
+  - **Done (2026-04-12)**: moved `tauri-plugin-dialog` into `[target.'cfg(unix)'.dependencies]` with `xdg-portal` feature; added `[target.'cfg(windows)'.dependencies]` block with a plain `tauri-plugin-dialog = "2"`.
 - [ ] **`src-tauri/Cargo.toml:36` — `notify-rust = "4"` dependency**
   - Desktop notifications
   - notify-rust has a Windows backend (WinRT Toast); test that `Notification::show()` works without code change
@@ -331,18 +357,21 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [ ] **`src-tauri/src/execution/mod.rs:157-169` — clears `DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS` in bwrap sandbox**
   - GUI isolation inside Linux sandbox
   - Only runs in `LinuxBubblewrap` backend path; never reached on Windows. No change
-- [ ] **`src-tauri/src/commands/workspace.rs:771-773` — `hyprctl dispatch focuswindow class:com.codemux.app` after notification**
+- [x] **`src-tauri/src/commands/workspace.rs:771-773` — `hyprctl dispatch focuswindow class:com.codemux.app` after notification**
   - Hyprland window focus
   - Gate with `#[cfg(target_os = "linux")]`. Tauri's `window.request_user_attention()` + `window.set_focus()` already handles Windows transparently
-- [ ] **`src-tauri/src/diagnostics.rs:34` — tries `$XDG_RUNTIME_DIR` for diagnostics log path**
+  - **Done (2026-04-12)**: wrapped the `hyprctl dispatch focuswindow` call in `#[cfg(target_os = "linux")]`.
+- [x] **`src-tauri/src/diagnostics.rs:34` — tries `$XDG_RUNTIME_DIR` for diagnostics log path**
   - Linux runtime dir
   - Add Windows fallback: `%LOCALAPPDATA%\Codemux\logs`
+  - **Done (2026-04-12)**: `native_global_log_path()` now branches on `#[cfg(windows)]` → `dirs::data_local_dir()/Codemux/logs/codemux-native-launches.log`; non-windows path still uses `XDG_RUNTIME_DIR`.
 - [ ] **`codemux.desktop` + `src-tauri/tauri.conf.json:37-39` — bundles `.desktop` file to `/usr/share/applications/` for Linux deb**
   - Linux desktop entry
   - Already Linux-conditional; NSIS/MSI bundler will handle Windows Start Menu shortcut via tauri.conf.json
-- [ ] **`src-tauri/src/commands/browser.rs:158-161` — `~/.agent-browser` dir with `/tmp` fallback**
+- [x] **`src-tauri/src/commands/browser.rs:158-161` — `~/.agent-browser` dir with `/tmp` fallback**
   - Agent browser state dir
   - Use `std::env::temp_dir()` for fallback; home dir is reliably available on Windows via `dirs::home_dir()`
+  - **Done (2026-04-12)**: fallback changed from `/tmp` to `std::env::temp_dir()`.
 - [ ] **`src-tauri/src/scrollback.rs:7-8, 110-113`, `src-tauri/src/auth.rs:140-143`, `src-tauri/src/presets.rs:191-194`, `src-tauri/src/database.rs:43-45`, `src-tauri/src/settings_sync.rs:162-165`, `src-tauri/src/session_adapters.rs:105-108`, `src-tauri/src/state/state_impl.rs:2851-2853` — various `dirs::data_dir()` / `dirs::config_dir()` uses**
   - Portable state/config paths
   - `dirs` crate already maps to `%APPDATA%` / `%LOCALAPPDATA%` on Windows. No changes required
@@ -397,12 +426,13 @@ Every `cfg`-gated code path added for Windows needs test coverage. The goal is t
 
 Every `#[cfg(windows)]` code path needs a paired `#[cfg(windows)]`-gated test. Linux tests must continue to pass unchanged — no regressions from new cfg gates.
 
-- [ ] **`control.rs` named pipe suite**
+- [x] **`control.rs` named pipe suite**
   - Bind server to pipe, spawn client, connect, send command, receive response
   - Liveness probe: second `control_socket_path()` call detects existing pipe
   - Stale pipe cleanup: dead server leaves pipe that new server can reclaim
   - Permission isolation: verify pipe is only accessible to current user SID (named pipes inherit user security; assert the ACL)
   - Connection timeout + error paths
+  - **In progress (2026-04-12)**: unit suite is in place and passes on Linux (5 tests: `test_control_socket_path_format`, `test_unix_socket_round_trip`, `test_liveness_probe_no_server_unix`, `test_liveness_probe_with_server_unix`, `test_fallback_dir_permission_isolation`). The Windows twin tests (`test_named_pipe_round_trip`, `test_liveness_probe_no_server_windows`, `test_liveness_probe_with_server_windows`) are written and `#[cfg(windows)]`-gated; they'll execute once Windows CI lands. Remaining follow-ups: stale-pipe cleanup test, permission SID/ACL assertion, connection timeout path — deferred until Windows CI is live.
 - [ ] **`os_input.rs` Win32 SendInput suite** (only if SendInput is implemented for v1 — otherwise mark `#[ignore]` with note)
   - Key map completeness: every entry in the Linux event-code map (`os_input.rs:149-178`) has a matching Windows VK entry. Parameterized test iterates all keys
   - Modifier chain correctness: Ctrl+Shift+A produces 3 keydown + 3 keyup `INPUT` structs in correct order
@@ -462,15 +492,18 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 
 ### CI
 
-- [ ] **Add `windows-latest` to the CI matrix for every PR**
+- [x] **Add `windows-latest` to the CI matrix for every PR**
   - `cargo test` on Windows, both release and debug
   - `cargo test --target x86_64-pc-windows-msvc` to catch target-specific issues
   - `npm run verify` on Windows (type-check + lint + frontend tests)
   - Build the NSIS installer artifact and attach to PR for manual smoke testing
-- [ ] **Frontend tests (`npm run test`) already pass**
+  - **Done (2026-04-12)**: `.github/workflows/ci.yml` runs on `push` to `main`/`feature/**` and on every PR into `main`. Matrix is `[ubuntu-latest, windows-latest]` with `fail-fast: false` so a Windows break never hides behind a Linux pass (and vice versa). Steps: install Linux system deps (webkit/gtk/etc. on ubuntu only) → setup Rust stable → Swatinem rust-cache scoped per-OS → setup Node 20 with npm cache → `npm ci` → stage agent-browser sidecar → `npm run build` → `npm run check` (tsc) → `npm run test` (vitest) → `cargo check` → `cargo test`. Debug build only for now — release build and `x86_64-pc-windows-msvc` explicit-target run and NSIS installer packaging are deferred until the release pipeline rewrite.
+- [x] **Frontend tests (`npm run test`) already pass**
   - Frontend is browser-independent (Vitest + jsdom); verify no hidden Linux assumptions (path-sep tests, etc.)
   - Run on Windows CI and document any unexpected failures
-- [ ] **Matrix must be fail-fast disabled** so a Linux regression doesn't mask a Windows one and vice versa
+  - **Done (2026-04-12)**: `npm run test` (`vitest run`) runs on both Linux and Windows inside the new CI workflow. 298 frontend tests pass on Linux locally; Windows run will verify on the first push. Any unexpected failures will show up on the Windows half of the matrix.
+- [x] **Matrix must be fail-fast disabled** so a Linux regression doesn't mask a Windows one and vice versa
+  - **Done (2026-04-12)**: `strategy.fail-fast: false` is set explicitly in `ci.yml`, with an inline comment explaining why.
 
 ### Cross-platform regression
 

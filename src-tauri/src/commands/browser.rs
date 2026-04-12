@@ -157,7 +157,7 @@ pub async fn agent_browser_screenshot(
 
 fn agent_browser_dir() -> PathBuf {
     dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .unwrap_or_else(|| std::env::temp_dir())
         .join(".agent-browser")
 }
 

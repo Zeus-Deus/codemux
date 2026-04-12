@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::env;
-use std::os::unix::net::UnixStream;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn is_openflow_agent_context() -> bool {
@@ -195,21 +194,19 @@ fn main() {
         }
     }
 
-    if let Some(socket_path) = codemux_lib::control::control_socket_path() {
-        if let Ok(stream) = UnixStream::connect(&socket_path) {
-            drop(stream);
-            codemux_lib::diagnostics::stderr_line(&format!(
-                "[codemux] Existing Codemux instance detected via control socket at {:?}; exiting.",
-                socket_path
-            ));
-            #[cfg(debug_assertions)]
-            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
-                "[{}] startup_id={} outcome=single_instance_exit",
-                chrono_timestamp(),
-                startup_id
-            ));
-            return;
-        }
+    if codemux_lib::control::control_server_is_running() {
+        let socket_path = codemux_lib::control::control_socket_path();
+        codemux_lib::diagnostics::stderr_line(&format!(
+            "[codemux] Existing Codemux instance detected via control endpoint at {:?}; exiting.",
+            socket_path
+        ));
+        #[cfg(debug_assertions)]
+        codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
+            "[{}] startup_id={} outcome=single_instance_exit",
+            chrono_timestamp(),
+            startup_id
+        ));
+        return;
     }
 
     #[cfg(debug_assertions)]
