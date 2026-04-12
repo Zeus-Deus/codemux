@@ -63,7 +63,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Node 22 — GitHub is deprecating Node 20 runners starting
+          # June 2026. See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+          node-version: 22
           cache: npm
 
       - name: Install npm dependencies
