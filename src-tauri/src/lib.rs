@@ -547,6 +547,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_platform,
             commands::get_current_theme,
             commands::get_shell_appearance,
             commands::get_app_state,

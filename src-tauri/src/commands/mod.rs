@@ -261,6 +261,19 @@ pub async fn pick_files_dialog<R: Runtime>(
     rx.await.map_err(|error| error.to_string())
 }
 
+// ---- Platform info ----
+
+/// Returns the current OS as reported by `std::env::consts::OS`.
+///
+/// Values are the standard Rust target strings: `"linux"`, `"macos"`,
+/// `"windows"`, `"freebsd"`, `"android"`, `"ios"`, etc. The frontend uses this
+/// to gate Windows-incompatible features (e.g., OpenFlow — the bash wrapper
+/// scripts in `openflow::prompts` do not have Windows equivalents yet).
+#[tauri::command]
+pub fn get_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
 // ---- Port management ----
 
 #[tauri::command]

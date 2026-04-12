@@ -104,13 +104,63 @@ pub fn kill_stream_daemons() {
 fn kill_process_on_port(port: u16) {
     #[cfg(windows)]
     {
-        // TODO: parse `netstat -ano | findstr :{port}` for PIDs and run
-        // `taskkill /PID {pid} /F`. For now, log and skip — the agent-browser
-        // daemon handles most reclamation itself via session name.
-        eprintln!(
-            "[codemux::browser] kill_process_on_port({}) skipped on Windows (not yet implemented)",
-            port
-        );
+        // Parse `netstat -ano` for rows with `TCP <local>:<port> ... LISTENING <pid>`
+        // and then `taskkill /PID {pid} /F` each owning PID. We do the filter in
+        // Rust (rather than piping through `findstr :{port}`) so we can tolerate
+        // both IPv4 (`0.0.0.0:9223`) and IPv6 (`[::]:9223`) rows uniformly and
+        // skip unrelated ports that happen to contain the port number as a
+        // substring (e.g. `:92230`).
+        //
+        // CREATE_NO_WINDOW suppresses a console flash each time kill_process_on_port
+        // runs (startup, port allocation, session close).
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let Ok(netstat) = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        else {
+            eprintln!(
+                "[codemux::browser] kill_process_on_port({}): failed to spawn netstat",
+                port
+            );
+            return;
+        };
+        if !netstat.status.success() {
+            return;
+        }
+
+        let stdout = String::from_utf8_lossy(&netstat.stdout);
+        let mut pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for line in stdout.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 5 {
+                continue;
+            }
+            if fields[0] != "TCP" || fields[3] != "LISTENING" {
+                continue;
+            }
+            let Some(port_str) = fields[1].rsplit(':').next() else {
+                continue;
+            };
+            let Ok(listen_port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            if listen_port != port {
+                continue;
+            }
+            if let Ok(pid) = fields[4].parse::<u32>() {
+                pids.insert(pid);
+            }
+        }
+
+        for pid in pids {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
     }
     #[cfg(not(windows))]
     {

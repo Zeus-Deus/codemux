@@ -106,7 +106,7 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 - [x] **`src-tauri/src/agent_browser.rs:470, 619, 670` — `fuser -k {port}/tcp` for port reclamation**
   - Frees ports stuck after crash
   - Windows: parse `netstat -ano` for PID + `taskkill /PID`, or use `GetExtendedTcpTable` from `windows` crate
-  - **Partial (2026-04-12)**: extracted the three call sites into a helper `kill_process_on_port(port)`. Unix impl runs `fuser -k`. Windows impl is a no-op that logs a warning; full `netstat -ano` + `taskkill` port-reclamation is tracked as a follow-up.
+  - **Done (2026-04-12)**: `kill_process_on_port(port)` now has a full `#[cfg(windows)]` implementation. Runs `netstat -ano` with `CREATE_NO_WINDOW` (no console flash), parses `TCP <local>:<port> ... LISTENING <pid>` rows (tolerant of both IPv4 `0.0.0.0:9223` and IPv6 `[::]:9223`), then `taskkill /PID <pid> /F` each owning PID. Filtering in Rust (not `findstr :{port}`) avoids false-positives on substring matches like `:92230`. Unix path (`fuser -k`) unchanged.
 
 ### Browser Automation / Tier 3 Input Injection
 
@@ -203,9 +203,10 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 
 ### Build & Distribution
 
-- [ ] **`src-tauri/tauri.conf.json:31` — `bundle.targets = "all"` but only `linux` section configured**
+- [x] **`src-tauri/tauri.conf.json:31` — `bundle.targets = "all"` but only `linux` section configured**
   - No Windows installer config present
   - Add `"windows": { "nsis": { "languages": ["English"], "displayLanguageSelector": false } }`. Recommend NSIS over MSI for v1 — smaller, simpler, no Windows SDK required
+  - **Done (2026-04-12)**: added a `bundle.windows.nsis` section with `languages: ["English"]`, `displayLanguageSelector: false`, and explicit null `installerIcon`/`headerImage`/`sidebarImage` (use Tauri defaults). No code signing yet — that's gated on a budget decision. The release pipeline (`release.yml`) itself is still intentionally Linux-only; this config unblocks the eventual Windows build job so it can produce a `.exe` installer once signing and the release-matrix rewrite land.
 - [ ] **`src-tauri/tauri.conf.json:6-9` — `beforeBuildCommand` / `beforeDevCommand` invoke `bash scripts/copy-agent-browser.sh`**
   - Hard-codes `bash`
   - Replace with Node.js script (`scripts/copy-agent-browser.mjs`) for true cross-platform, or conditionally invoke a `.ps1` variant
@@ -232,21 +233,44 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
   - cmd.exe uses `%VAR%`, PowerShell uses `$env:VAR` — bare `$VAR` won't expand
   - Verify env is passed via `Command::env()` not via shell string; if spawning goes through a shell, rewrite to pass directly
 
+### Windows MVP Disable Strategy — OpenFlow
+
+OpenFlow depends on the bash wrapper scripts generated in `openflow/prompts.rs` (`ensure_wrapper_exists` / `ensure_claude_wrapper_exists`). Those don't have Windows equivalents yet. Rather than ship a broken feature that fails with cryptic wrapper-spawn errors, OpenFlow is disabled at every layer on Windows for v1. Re-enabling is a follow-up blocked on the wrapper rewrite — Option B under the Agent Integration item above (refactor to spawn adapters directly from Rust, eliminating the wrapper entirely, is the preferred path).
+
+- [x] **`src-tauri/src/commands/mod.rs` — new `get_platform()` Tauri command**
+  - Returns `std::env::consts::OS` as a `String`. Enables feature gating from the React frontend without needing per-feature cfg flags.
+  - Wired into `lib.rs` invoke_handler as `commands::get_platform`.
+  - **Done (2026-04-12)**: new module-level command in `commands/mod.rs` just above `get_detected_ports`. Sibling frontend wrapper `getPlatform()` added to `src/tauri/commands.ts`.
+- [x] **`src/hooks/use-platform.ts` — `usePlatform()` React hook**
+  - Module-level cache keyed on first successful resolve (OS doesn't change during a session). In-flight invocations are deduped via a shared promise so N concurrent `usePlatform()` consumers share one IPC round-trip. Failure falls back to an empty string so a broken invoke never hides OpenFlow from Linux users (false-positive Windows detection).
+  - **Done (2026-04-12)**: exposes `{ os, loading, isWindows }`; second + subsequent mounts return the cached value synchronously on the first render.
+- [x] **`src/components/layout/sidebar-openflow-section.tsx` — disabled header on Windows**
+  - Renders a greyed-out header with a `Tooltip` explaining "OpenFlow is not yet available on Windows" when `isWindows`. The `+` button is `disabled` / `aria-disabled`, the expand toggle is removed, and `NewRunDialog` is not mounted at all — nothing to open it from. The section stays visible so Windows users know the feature exists and is coming.
+  - **Done (2026-04-12)**: Windows branch is a completely separate `if (isWindows) return ...` at the top of the component, leaving the Linux code path byte-identical.
+- [x] **`src-tauri/src/commands/openflow.rs:498` — `spawn_openflow_agents` Windows guard**
+  - Safety net for CLI or socket-driven callers that might bypass the UI (e.g. the `codemux` control socket). Early-returns `Err("OpenFlow is not yet available on Windows")` when `cfg!(windows)`, before any wrapper-script creation attempts.
+  - **Done (2026-04-12)**: guard added as the first statement of the command body, with an inline comment pointing at the wrapper dependency and the UI-layer disable.
+
+**Explicitly out of scope for this pass**: no refactoring of `src-tauri/src/openflow/` wrapper scripts, no changes to `release.yml`, no changes to `os_input.rs` (Tier 3 input is deferred). Those remain tracked under their own items above.
+
 ---
 
 ## Degraded (feature broken, app runs)
 
 ### Process / Port Detection
 
-- [ ] **`src-tauri/src/ports.rs:38-63` — `detect_listening_ports()` parses `/proc/net/tcp` and `/proc/net/tcp6`**
+- [x] **`src-tauri/src/ports.rs:38-63` — `detect_listening_ports()` parses `/proc/net/tcp` and `/proc/net/tcp6`**
   - Port discovery for UI
   - Windows: `GetExtendedTcpTable()` via `windows` crate, or accept empty list on Windows (users type port manually)
-- [ ] **`src-tauri/src/ports.rs:120` — `/proc/*/fd/` symlink scan to map sockets → PIDs**
+  - **Done (2026-04-12)**: `detect_listening_ports()` now dispatches on cfg. Linux path uses the existing `/proc/net/tcp` + `/proc/*/fd/` scan unchanged. Windows path (`windows_impl::detect_listening_ports`) shells out to `netstat -ano` with `CREATE_NO_WINDOW` (no console flash — `scan_ports` runs every 3 s, so the suppression flag is non-negotiable), filters for `TCP ... LISTENING` rows, and parses `<local>:<port> <pid>` for both IPv4 `0.0.0.0:135` and IPv6 `[::]:135` addresses. Existing `IGNORED_PORTS` and `is_codemux_internal_port` filters are applied on both platforms.
+- [x] **`src-tauri/src/ports.rs:120` — `/proc/*/fd/` symlink scan to map sockets → PIDs**
   - Owner process attribution for detected ports
   - `GetExtendedTcpTable` returns PID directly; no fd scan needed
-- [ ] **`src-tauri/src/ports.rs:156-166` — `read_ppid()` reads `/proc/{pid}/stat` for parent PID walk**
+  - **Done (2026-04-12)**: the Windows path gets PID directly from `netstat -ano` — no fd scan. Process names come from a single `tasklist /NH /FO csv` call per scan (NOT per port — we build a PID→name `HashMap` once), parsing the first two CSV cells as `name,pid`. Shelling out chose over `GetExtendedTcpTable` to avoid adding the `windows` crate dep for MVP; can swap later if the 3-second-interval `netstat` spawn proves too slow.
+- [x] **`src-tauri/src/ports.rs:156-166` — `read_ppid()` reads `/proc/{pid}/stat` for parent PID walk**
   - Walks up process tree to attribute ports to workspaces
   - Windows: `CreateToolhelp32Snapshot` + `Process32First/Next`
+  - **Done (2026-04-12)**: `read_ppid` now dispatches on cfg. Linux unchanged. Windows implementation shells out to `wmic process where "ProcessId=<pid>" get ParentProcessId /value` and parses the `ParentProcessId=<n>` line. Deliberately avoids `CreateToolhelp32Snapshot` (would require the `windows` crate) — the PPID walk is a nice-to-have for workspace attribution, not a correctness requirement, so `None` is an acceptable graceful degradation. Follow-up: `wmic` is deprecated on Windows 11 24H2+; if this stops working, swap to PowerShell `Get-CimInstance` or add the `windows` crate dep.
 - [ ] **`src-tauri/src/hooks.rs:195-219` — `shell_is_foreground()` reads `/proc/{shell_pid}/stat` for tpgid vs pgrp**
   - Suppresses hook notifications when shell is backgrounded
   - Already has `#[cfg(not(target_os = "linux"))]` stub returning `false`; hook notifications always fire on Windows (acceptable)
