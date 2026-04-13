@@ -589,11 +589,20 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
         "#!/bin/sh\nexec \"{}\" \"$@\"\n",
         current_exe.replace('"', "\\\"")
     );
-    std::fs::write(&shim_path, script).ok()?;
 
-    let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim_path, perms).ok()?;
+    // Skip the rewrite (and the chmod) if the shim already matches what we
+    // would write. This avoids per-spawn disk churn when a workspace
+    // hydrates many sessions at once.
+    let needs_write = match std::fs::read_to_string(&shim_path) {
+        Ok(existing) => existing != script,
+        Err(_) => true,
+    };
+    if needs_write {
+        std::fs::write(&shim_path, &script).ok()?;
+        let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim_path, perms).ok()?;
+    }
 
     Some((shim_dir.display().to_string(), current_exe))
 }
@@ -610,7 +619,17 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
         "@echo off\r\n\"{}\" %*\r\n",
         current_exe.replace('"', "\\\"")
     );
-    std::fs::write(&shim_path, script).ok()?;
+
+    // Skip the rewrite if the shim already matches what we would write.
+    // Avoids per-spawn disk churn on Windows where every session hydration
+    // would otherwise touch %TEMP%.
+    let needs_write = match std::fs::read_to_string(&shim_path) {
+        Ok(existing) => existing != script,
+        Err(_) => true,
+    };
+    if needs_write {
+        std::fs::write(&shim_path, &script).ok()?;
+    }
 
     Some((shim_dir.display().to_string(), current_exe))
 }
@@ -1772,11 +1791,7 @@ pub fn spawn_pty_for_agent(
 
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed_path = if current_path.is_empty() {
-            shim_dir.clone()
-        } else {
-            format!("{shim_dir}:{current_path}")
-        };
+        let prefixed_path = prepend_shim_to_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed_path);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
