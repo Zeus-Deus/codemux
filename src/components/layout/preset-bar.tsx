@@ -25,6 +25,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 import type { PresetStoreSnapshot, TerminalPreset } from "@/tauri/types";
+import { toast } from "@/lib/toast";
 
 interface PresetBarProps {
   workspaceId: string;
@@ -47,7 +48,20 @@ export function PresetBar({ workspaceId }: PresetBarProps) {
 
   const handleLaunch = (preset: TerminalPreset, e: React.MouseEvent) => {
     const mode = e.shiftKey ? "split_pane" as const : undefined;
-    applyPreset(workspaceId, preset.id, mode).catch(console.error);
+    applyPreset(workspaceId, preset.id, mode).catch((err) => {
+      // Backend returns `Err("{binary} is not installed")` (or other strings)
+      // from `apply_preset` when `command_binary_exists` fails. Previously this
+      // was swallowed into `console.error` and the user saw nothing — clicking
+      // a preset for an uninstalled CLI appeared to do nothing at all.
+      const message =
+        typeof err === "string"
+          ? err
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      toast.error(`${preset.name}: ${message}`);
+      console.error("[preset-bar] applyPreset failed:", err);
+    });
   };
 
   const handleToggleBar = (checked: boolean) => {
