@@ -561,6 +561,50 @@ fn prepend_shim_to_path(shim_dir: &str, current_path: &str) -> String {
     }
 }
 
+/// Build the final PATH value passed to a PTY child process.
+///
+/// Always prepends the codemux shim dir so `codemux …` CLI commands work
+/// inside the user's terminal. On Windows, **also** prepends
+/// `%USERPROFILE%\.local\bin` — the install location used by the Claude
+/// Code native installer (`irm https://claude.ai/install.ps1 | iex`) and
+/// every other per-user CLI installer that targets Windows with a POSIX
+/// layout. Codemux's own environment block may miss a freshly-added
+/// `.local\bin` because Windows PATH changes made by installers broadcast
+/// via `WM_SETTINGCHANGE`, which a running process may not pick up. Adding
+/// the directory here ensures that the shell spawned inside the PTY can
+/// find binaries users just installed, regardless of whether Codemux
+/// itself saw the PATH update.
+///
+/// On Unix this is a pass-through to `prepend_shim_to_path` — Unix
+/// installers update `~/.bashrc` / `~/.zshrc`, so the user's login shell
+/// already picks up `.local/bin` via the `PATH` they export from their
+/// rc file. Replicating the prepend on Unix would be redundant at best.
+fn build_child_path(shim_dir: &str, current_path: &str) -> String {
+    let base = prepend_shim_to_path(shim_dir, current_path);
+    #[cfg(windows)]
+    {
+        if let Some(local_bin) = windows_user_local_bin() {
+            return prepend_shim_to_path(&local_bin, &base);
+        }
+    }
+    base
+}
+
+/// Returns `%USERPROFILE%\.local\bin` as a string if `USERPROFILE` is set.
+/// Does NOT verify that the directory exists — the caller only needs the
+/// path string to stuff into PATH, and a non-existent entry in PATH is
+/// harmless (Windows PATH parsing silently skips missing dirs).
+#[cfg(windows)]
+fn windows_user_local_bin() -> Option<String> {
+    std::env::var_os("USERPROFILE").map(|p| {
+        std::path::Path::new(&p)
+            .join(".local")
+            .join("bin")
+            .display()
+            .to_string()
+    })
+}
+
 #[cfg(unix)]
 fn default_shell() -> String {
     env::var("SHELL")
@@ -571,8 +615,42 @@ fn default_shell() -> String {
 
 #[cfg(windows)]
 fn default_shell() -> String {
-    env::var("COMSPEC")
-        .ok()
+    resolve_windows_shell(
+        |cmd| which::which(cmd).ok().map(|p| p.display().to_string()),
+        env::var("COMSPEC").ok(),
+    )
+}
+
+/// Resolve the default Windows shell from a PATH resolver and a COMSPEC
+/// value. Pure function, extracted from `default_shell()` so the fallback
+/// chain can be unit-tested on any platform (Linux CI compiles it under
+/// `cfg(test)`).
+///
+/// Fallback order:
+///   1. `pwsh.exe` — PowerShell 7+, the modern cross-platform shell.
+///      Only present if the user installed it explicitly, but preferred
+///      when available because it ships current language features and
+///      matches the pwsh most users on macOS/Linux already know.
+///   2. `powershell.exe` — Windows PowerShell 5.1, pre-installed on every
+///      supported Windows version (Server 2016+ and Windows 10+). This is
+///      the safe default that should almost always succeed.
+///   3. `COMSPEC` — typically `C:\Windows\System32\cmd.exe`. Honored so
+///      corporate images that point COMSPEC at a custom cmd wrapper still
+///      work on the cmd.exe path.
+///   4. Literal `"cmd.exe"` — last-resort relative name, resolved by
+///      `CreateProcessW` against `PATH` at spawn time.
+#[cfg(any(windows, test))]
+fn resolve_windows_shell<F>(resolve: F, comspec: Option<String>) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(path) = resolve("pwsh") {
+        return path;
+    }
+    if let Some(path) = resolve("powershell") {
+        return path;
+    }
+    comspec
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| "cmd.exe".to_string())
 }
@@ -589,11 +667,20 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
         "#!/bin/sh\nexec \"{}\" \"$@\"\n",
         current_exe.replace('"', "\\\"")
     );
-    std::fs::write(&shim_path, script).ok()?;
 
-    let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&shim_path, perms).ok()?;
+    // Skip the rewrite (and the chmod) if the shim already matches what we
+    // would write. This avoids per-spawn disk churn when a workspace
+    // hydrates many sessions at once.
+    let needs_write = match std::fs::read_to_string(&shim_path) {
+        Ok(existing) => existing != script,
+        Err(_) => true,
+    };
+    if needs_write {
+        std::fs::write(&shim_path, &script).ok()?;
+        let mut perms = std::fs::metadata(&shim_path).ok()?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim_path, perms).ok()?;
+    }
 
     Some((shim_dir.display().to_string(), current_exe))
 }
@@ -610,7 +697,17 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
         "@echo off\r\n\"{}\" %*\r\n",
         current_exe.replace('"', "\\\"")
     );
-    std::fs::write(&shim_path, script).ok()?;
+
+    // Skip the rewrite if the shim already matches what we would write.
+    // Avoids per-spawn disk churn on Windows where every session hydration
+    // would otherwise touch %TEMP%.
+    let needs_write = match std::fs::read_to_string(&shim_path) {
+        Ok(existing) => existing != script,
+        Err(_) => true,
+    };
+    if needs_write {
+        std::fs::write(&shim_path, &script).ok()?;
+    }
 
     Some((shim_dir.display().to_string(), current_exe))
 }
@@ -934,9 +1031,12 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     }
 
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
+    // On Windows, `build_child_path` also prepends `%USERPROFILE%\.local\bin`
+    // so Claude Code and similar per-user installs are discoverable even if
+    // Codemux's own environment missed the installer's PATH broadcast.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed = prepend_shim_to_path(&shim_dir, &current_path);
+        let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -1772,11 +1872,7 @@ pub fn spawn_pty_for_agent(
 
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed_path = if current_path.is_empty() {
-            shim_dir.clone()
-        } else {
-            format!("{shim_dir}:{current_path}")
-        };
+        let prefixed_path = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed_path);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -2231,25 +2327,183 @@ mod tests {
         }
     }
 
+    // ── build_child_path + Windows user-local-bin tests ──────────────
+    //
+    // `build_child_path` is the cross-platform wrapper used by both
+    // `spawn_pty_for_session` and `spawn_pty_for_agent`. On Unix it's
+    // a pass-through to `prepend_shim_to_path`. On Windows it *also*
+    // prepends `%USERPROFILE%\.local\bin` so Claude Code (installed
+    // via `irm claude.ai/install.ps1 | iex`) and similar per-user
+    // CLIs are discoverable even if Codemux's own PATH missed the
+    // installer's `WM_SETTINGCHANGE` broadcast.
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_child_path_unix_is_passthrough() {
+        // On Unix, build_child_path must match prepend_shim_to_path
+        // exactly — there's no additional prepend. Unix installers
+        // update shell rc files, so PATH propagation is handled by
+        // the user's login shell, not by Codemux.
+        let a = build_child_path("/opt/codemux/shims", "/usr/bin:/bin");
+        let b = prepend_shim_to_path("/opt/codemux/shims", "/usr/bin:/bin");
+        assert_eq!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_child_path_unix_empty_current() {
+        // Edge case mirror of the prepend test — no trailing separator
+        // even when the pass-through chain is exercised.
+        let result = build_child_path("/opt/codemux/shims", "");
+        assert_eq!(result, "/opt/codemux/shims");
+    }
+
     #[cfg(windows)]
     #[test]
-    fn test_default_shell_windows_returns_cmd_or_powershell() {
-        // default_shell() on Windows reads $COMSPEC (typically
-        // `C:\Windows\System32\cmd.exe`) and falls back to the literal
-        // string "cmd.exe" if COMSPEC is unset. It should never return
-        // a Unix shell path. The exact resolution depends on runner
-        // config; we assert the case-insensitive suffix lands on a
-        // known Windows shell binary.
+    fn test_build_child_path_windows_prepends_user_local_bin() {
+        // On Windows, the result must START with
+        // `%USERPROFILE%\.local\bin` so that executables installed there
+        // are preferred over anything else on PATH. The next component
+        // is the codemux shim dir (from prepend_shim_to_path). The
+        // remainder is the caller-supplied current_path.
+        let result = build_child_path(r"C:\codemux\shims", r"C:\Windows\System32");
+        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let expected_local_bin = format!(r"{}\.local\bin", user_profile);
+        assert!(
+            result.starts_with(&expected_local_bin),
+            "expected build_child_path to start with {expected_local_bin:?}, got {result:?}",
+        );
+        assert!(
+            result.contains(r"C:\codemux\shims"),
+            "shim dir must be preserved somewhere in the result, got {result:?}",
+        );
+        assert!(
+            result.contains(r"C:\Windows\System32"),
+            "original current_path must be preserved, got {result:?}",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_user_local_bin_uses_userprofile() {
+        // windows_user_local_bin() must resolve USERPROFILE +
+        // `.local\bin` verbatim — no normalization, no extra logic,
+        // just a composed path. We reconstruct what we expect and
+        // verify the helper matches.
+        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let expected = format!(r"{}\.local\bin", user_profile);
+        let actual = windows_user_local_bin().expect("USERPROFILE is set so this must return Some");
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_default_shell_windows_returns_powershell_or_cmd() {
+        // default_shell() on Windows probes PATH for pwsh → powershell
+        // (always pre-installed on Windows 10+ / Server 2016+) and only
+        // falls back to COMSPEC / "cmd.exe" if neither PowerShell binary
+        // is present. On a stock Windows runner the result will almost
+        // always be powershell.exe; on a runner with PowerShell 7 it
+        // will be pwsh.exe. It should never return a Unix shell path.
         let shell = default_shell();
         let lower = shell.to_lowercase();
         assert!(
-            lower.ends_with("cmd.exe") || lower.ends_with("powershell.exe"),
-            "Windows default_shell should end with cmd.exe or powershell.exe, got: {shell}"
+            lower.ends_with("pwsh.exe")
+                || lower.ends_with("powershell.exe")
+                || lower.ends_with("cmd.exe"),
+            "Windows default_shell should end with pwsh.exe, powershell.exe, or cmd.exe, got: {shell}"
         );
         assert!(
             !shell.contains("/bin/"),
             "Windows default_shell must not return a Unix shell path, got: {shell}"
         );
+    }
+
+    // ── resolve_windows_shell fallback chain ─────────────────────────
+    //
+    // These tests exercise the pure-function version of the Windows
+    // shell resolver directly, so they run on every platform (the
+    // function is compiled under `cfg(any(windows, test))`). Each test
+    // injects a fake PATH resolver closure so the fallback order can be
+    // verified without relying on what's actually installed on the
+    // runner.
+
+    #[test]
+    fn test_resolve_windows_shell_prefers_pwsh_when_available() {
+        // When both pwsh and powershell are on PATH, pwsh wins — it's
+        // the newer cross-platform PowerShell.
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "pwsh" => Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
+                "powershell" => Some(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                ),
+                _ => None,
+            },
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Program Files\PowerShell\7\pwsh.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_falls_back_to_powershell_when_pwsh_missing() {
+        // pwsh absent (PowerShell 7 not installed) → pick powershell.exe
+        // (Windows PowerShell 5.1 is always present on modern Windows).
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "powershell" => Some(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                ),
+                _ => None,
+            },
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(
+            result,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_falls_back_to_comspec_when_no_powershell() {
+        // Hypothetical: neither PowerShell nor pwsh on PATH (e.g. a
+        // stripped-down Windows container). Fall back to COMSPEC.
+        let result = resolve_windows_shell(
+            |_| None,
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Windows\System32\cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_final_fallback_to_literal_cmd_exe() {
+        // Last-resort: no PowerShell, no COMSPEC → literal "cmd.exe"
+        // relative name so CreateProcessW can still resolve it.
+        let result = resolve_windows_shell(|_| None, None);
+        assert_eq!(result, "cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_treats_blank_comspec_as_unset() {
+        // COMSPEC set to whitespace is treated as unset — matches the
+        // historic guard in the old default_shell() implementation.
+        let result = resolve_windows_shell(|_| None, Some("   ".to_string()));
+        assert_eq!(result, "cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_pwsh_beats_comspec() {
+        // Even if COMSPEC is set to something weird, pwsh still wins —
+        // the whole point of the refactor is that we prefer modern
+        // shells over cmd.exe whenever available.
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "pwsh" => Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
+                _ => None,
+            },
+            Some(r"C:\some\custom\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Program Files\PowerShell\7\pwsh.exe");
     }
 
     #[cfg(unix)]

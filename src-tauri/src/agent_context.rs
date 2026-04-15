@@ -79,36 +79,101 @@ pub fn build_agent_context(
 /// Transform a preset command to inject the Codemux agent context as a system prompt,
 /// if the command targets a known CLI agent that supports system prompt injection.
 ///
-/// The context is passed via the `$CODEMUX_AGENT_CONTEXT` env var (set on all PTY sessions).
-/// Shell double-quote expansion handles multiline text correctly.
+/// The context is passed via the `CODEMUX_AGENT_CONTEXT` env var (set on all PTY sessions).
+/// The injected command string expands that env var at shell parse time — the **expansion
+/// syntax is platform-specific**:
+///
+/// - **Unix** (bash/zsh/sh/fish): `"$CODEMUX_AGENT_CONTEXT"` — standard POSIX shell expansion
+///   inside double quotes. Works under every mainstream Unix shell.
+/// - **Windows** (PowerShell 5.1+ / PowerShell 7+): `"$env:CODEMUX_AGENT_CONTEXT"` — PowerShell
+///   env-var syntax. Codemux's Windows default shell is now PowerShell (pwsh preferred, then
+///   Windows PowerShell 5.1), so this is the right syntax for the shell actually running.
+///   Note: users who override their shell to `cmd.exe` will get the literal `$env:...` string
+///   as the system prompt (broken) — cmd.exe can't execute the preset command cleanly because
+///   its environment-variable syntax is `%VAR%` AND it can't handle multi-line env vars at all.
+///   Windows users who need agents should stick with the default PowerShell.
 ///
 /// Gemini CLI has no CLI flag — it reads `GEMINI_SYSTEM_MD` pointing to a file. For Gemini,
-/// we prefix the command with an inline write that dumps `$CODEMUX_AGENT_CONTEXT` to a temp
+/// we prefix the command with an inline write that dumps `CODEMUX_AGENT_CONTEXT` to a temp
 /// file and sets the env var, so the file is only created when Gemini actually launches.
+/// The Gemini inline pipeline also needs a PowerShell rewrite on Windows (no `printf`,
+/// no `&&` on PS 5.1, and `GEMINI_SYSTEM_MD=val command` inline-env syntax is Unix-only).
 pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
     let binary = command.split_whitespace().next().unwrap_or("");
     match binary {
         "claude" => {
-            format!("{command} --system-prompt \"$CODEMUX_AGENT_CONTEXT\"")
+            format!(
+                "{command} --system-prompt \"{}\"",
+                agent_context_shell_expansion()
+            )
         }
         "codex" => {
-            format!("{command} -c instructions=\"$CODEMUX_AGENT_CONTEXT\"")
+            format!(
+                "{command} -c instructions=\"{}\"",
+                agent_context_shell_expansion()
+            )
         }
         "pi" => {
-            format!("{command} --append-system-prompt \"$CODEMUX_AGENT_CONTEXT\"")
+            format!(
+                "{command} --append-system-prompt \"{}\"",
+                agent_context_shell_expansion()
+            )
         }
         "gemini" => {
             let path = std::env::temp_dir()
                 .join(format!("codemux-{workspace_id}-gemini-system.md"))
                 .to_string_lossy()
                 .into_owned();
-            format!(
-                "printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > {path} && GEMINI_SYSTEM_MD={path} {command}"
-            )
+            gemini_injection_command(&path, command)
         }
         // OpenCode: no CLI injection mechanism available.
         _ => command.to_string(),
     }
+}
+
+/// Returns the shell-level expansion of the `CODEMUX_AGENT_CONTEXT` env var for
+/// the platform's default shell. Used inside `inject_agent_context` to produce a
+/// preset command string that the running shell will parse correctly. See the
+/// `inject_agent_context` doc comment for the per-platform shell rationale.
+#[cfg(unix)]
+fn agent_context_shell_expansion() -> &'static str {
+    "$CODEMUX_AGENT_CONTEXT"
+}
+
+#[cfg(windows)]
+fn agent_context_shell_expansion() -> &'static str {
+    "$env:CODEMUX_AGENT_CONTEXT"
+}
+
+/// Builds the Gemini pre-command pipeline that writes the agent context to a
+/// temp file and points `GEMINI_SYSTEM_MD` at it, then chains the actual gemini
+/// invocation. Platform-specific because the shell syntax differs between
+/// POSIX shells and PowerShell.
+#[cfg(unix)]
+fn gemini_injection_command(path: &str, command: &str) -> String {
+    // POSIX shell (bash/zsh/sh/fish): `printf` → file redirect → inline env
+    // var → command. `&&` short-circuits if the write fails.
+    format!(
+        "printf '%s' \"$CODEMUX_AGENT_CONTEXT\" > {path} && GEMINI_SYSTEM_MD={path} {command}"
+    )
+}
+
+#[cfg(windows)]
+fn gemini_injection_command(path: &str, command: &str) -> String {
+    // PowerShell (5.1 / 7+): pipe `$env:CODEMUX_AGENT_CONTEXT` into
+    // `Set-Content -NoNewline` so we get the raw env var value with no
+    // trailing newline (matches the `printf '%s'` semantics on Unix). Then
+    // set `$env:GEMINI_SYSTEM_MD` so the next command in the same statement
+    // list inherits it, and invoke gemini. Uses `;` instead of `&&` because
+    // `&&` is PowerShell 7+ only — Windows PowerShell 5.1 (the always-present
+    // fallback) doesn't recognize it.
+    //
+    // Note: on PS 5.1 `Set-Content` defaults to UTF-8-with-BOM; on PS 7+ it
+    // defaults to UTF-8 without BOM. Gemini CLI accepts both, so we don't
+    // force `-Encoding` and instead let each host pick its default.
+    format!(
+        "$env:CODEMUX_AGENT_CONTEXT | Set-Content -Path '{path}' -NoNewline; $env:GEMINI_SYSTEM_MD = '{path}'; {command}"
+    )
 }
 
 #[cfg(test)]
@@ -207,12 +272,28 @@ mod tests {
         assert!(!ctx.contains("Original repo (reference only)"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn inject_claude_adds_system_prompt() {
+    fn inject_claude_adds_system_prompt_unix() {
         let result = inject_agent_context("claude --dangerously-skip-permissions", "ws-1");
         assert_eq!(
             result,
             "claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_claude_adds_system_prompt_windows() {
+        // Windows default shell is PowerShell (pwsh → powershell.exe fallback).
+        // PowerShell env-var expansion uses `$env:VAR` syntax, NOT `$VAR`.
+        // Asserting the POSIX form on Windows would produce a literal
+        // "$CODEMUX_AGENT_CONTEXT" string being passed to claude as the
+        // system prompt — the bug this test guards against.
+        let result = inject_agent_context("claude --dangerously-skip-permissions", "ws-1");
+        assert_eq!(
+            result,
+            "claude --dangerously-skip-permissions --system-prompt \"$env:CODEMUX_AGENT_CONTEXT\""
         );
     }
 
@@ -245,12 +326,16 @@ mod tests {
     fn inject_claude_already_has_system_prompt() {
         // Presets don't have --system-prompt, but if somehow one does,
         // we still append (no dedup needed — double system prompts are fine).
+        // Uses `contains(agent_context_shell_expansion())` so the assertion is
+        // cross-platform: on Unix it checks for `$CODEMUX_AGENT_CONTEXT`, on
+        // Windows for `$env:CODEMUX_AGENT_CONTEXT`.
         let result = inject_agent_context("claude --system-prompt \"existing\"", "ws-1");
-        assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
+        assert!(result.contains(agent_context_shell_expansion()));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn inject_codex_adds_instructions() {
+    fn inject_codex_adds_instructions_unix() {
         let result = inject_agent_context("codex --full-auto", "ws-1");
         assert_eq!(
             result,
@@ -258,12 +343,33 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn inject_pi_adds_append_system_prompt() {
+    fn inject_codex_adds_instructions_windows() {
+        let result = inject_agent_context("codex --full-auto", "ws-1");
+        assert_eq!(
+            result,
+            "codex --full-auto -c instructions=\"$env:CODEMUX_AGENT_CONTEXT\""
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_pi_adds_append_system_prompt_unix() {
         let result = inject_agent_context("pi", "ws-1");
         assert_eq!(
             result,
             "pi --append-system-prompt \"$CODEMUX_AGENT_CONTEXT\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_pi_adds_append_system_prompt_windows() {
+        let result = inject_agent_context("pi", "ws-1");
+        assert_eq!(
+            result,
+            "pi --append-system-prompt \"$env:CODEMUX_AGENT_CONTEXT\""
         );
     }
 
@@ -274,14 +380,36 @@ mod tests {
         assert!(result.contains("--append-system-prompt"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn inject_gemini_writes_file_and_sets_env() {
+    fn inject_gemini_writes_file_and_sets_env_unix() {
+        // Unix pipeline: `printf '%s' "$CODEMUX_AGENT_CONTEXT" > path && GEMINI_SYSTEM_MD=path gemini ...`
         let result = inject_agent_context("gemini --yolo", "test-ws-gemini");
-        // Should prefix with inline file write + env var, then the original command
+        assert!(result.contains("printf '%s'"));
         assert!(result.contains("GEMINI_SYSTEM_MD="));
         assert!(result.contains("codemux-test-ws-gemini-gemini-system.md"));
         assert!(result.ends_with("gemini --yolo"));
         assert!(result.contains("$CODEMUX_AGENT_CONTEXT"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_gemini_writes_file_and_sets_env_windows() {
+        // Windows pipeline uses PowerShell `Set-Content -NoNewline` +
+        // `$env:GEMINI_SYSTEM_MD = 'path'` (inline env-var syntax is
+        // Unix-only; PS needs an explicit assignment statement). The
+        // statements are chained with `;` because `&&` is PowerShell 7+
+        // only and Windows PowerShell 5.1 doesn't recognize it.
+        let result = inject_agent_context("gemini --yolo", "test-ws-gemini");
+        assert!(result.contains("Set-Content"));
+        assert!(result.contains("-NoNewline"));
+        assert!(result.contains("$env:GEMINI_SYSTEM_MD"));
+        assert!(result.contains("$env:CODEMUX_AGENT_CONTEXT"));
+        assert!(result.contains("codemux-test-ws-gemini-gemini-system.md"));
+        assert!(result.ends_with("gemini --yolo"));
+        // Must NOT contain the Unix `printf` form — that would be a
+        // regression to a broken-on-Windows shell command.
+        assert!(!result.contains("printf"));
     }
 
     #[test]

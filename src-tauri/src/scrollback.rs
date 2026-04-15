@@ -497,11 +497,27 @@ pub fn uncache_terminal_scrollback(
     Ok(())
 }
 
-/// Flush all cached scrollback entries to disk. Called during the close
-/// sequence AFTER live panes have been serialized, so that cached (unmounted)
-/// panes also get persisted.
-#[tauri::command]
-pub fn flush_scrollback_cache(cache: tauri::State<'_, ScrollbackCache>) -> Result<u32, String> {
+/// Flush all in-memory cached scrollback entries to disk. Returns the
+/// number of entries successfully written.
+///
+/// Used by two callers: the Tauri command `flush_scrollback_cache`
+/// (frontend-driven, normal close path) and the Windows backend
+/// close-handler backstop in `lib.rs` (added 2026-04-15 to fix the
+/// "terminals start fresh on Windows" symptom).
+///
+/// Idempotent — drains the cache, so calling it twice is safe (the
+/// second call returns 0). Empty-data payloads are silently skipped
+/// (they're useless to restore from) but still removed from the cache.
+///
+/// Cross-platform on purpose: the helper itself has no Windows-only
+/// behavior. Its second caller (the close-handler backstop) is the
+/// thing that's gated to Windows, because that's where the frontend
+/// 3-second serialization timeout actually fires in practice. Linux
+/// IPC is fast enough that the frontend reliably drains the cache
+/// itself before the backend's timeout expires; on Windows slower
+/// Tauri IPC + slower xterm serialization can blow the budget and
+/// leave cached entries unwritten.
+pub fn flush_cache_to_disk(cache: &ScrollbackCache) -> u32 {
     let entries = cache.take_all();
     let mut saved = 0u32;
     for payload in entries {
@@ -513,7 +529,66 @@ pub fn flush_scrollback_cache(cache: tauri::State<'_, ScrollbackCache>) -> Resul
             }
         }
     }
-    Ok(saved)
+    saved
+}
+
+/// Flush all cached scrollback entries to disk. Called during the close
+/// sequence AFTER live panes have been serialized, so that cached (unmounted)
+/// panes also get persisted.
+#[tauri::command]
+pub fn flush_scrollback_cache(cache: tauri::State<'_, ScrollbackCache>) -> Result<u32, String> {
+    Ok(flush_cache_to_disk(&cache))
+}
+
+/// Decides whether startup should run `cleanup_orphan_scrollbacks`.
+///
+/// On Windows, returns false when `layout_loaded` is false. The reason
+/// is that `cleanup_orphan_scrollbacks(&[])` (called with an empty
+/// active-workspace list, which is what `state.clear_workspaces()`
+/// produces) deletes EVERY scrollback dir on disk. Force-close cascade:
+///
+/// 1. User force-closes Codemux on Windows (e.g. from the historic
+///    runaway-spawn freeze, or because the close-handler timeout fired).
+/// 2. The `WindowEvent::CloseRequested` handler never runs, so
+///    `flush_persisted_state` never runs, so `layout.json` is missing.
+/// 3. Next launch: `load_persisted_state()` returns `None`, the setup
+///    code calls `state.clear_workspaces()`, the workspace ID list
+///    is now empty.
+/// 4. The startup cleanup pass calls `cleanup_orphan_scrollbacks(&[])`
+///    and wipes every saved scrollback dir on disk.
+/// 5. Even after the user fixes the original close issue, every
+///    previously-saved terminal is gone forever — terminals "start fresh"
+///    on every launch.
+///
+/// Skipping cleanup when we don't actually know which workspaces are
+/// valid preserves recovery state. The tradeoff is that genuinely
+/// orphaned scrollback (from workspaces deleted between sessions) won't
+/// be cleaned up until a successful load happens — but the
+/// `enforce_disk_limit` pass that runs right after still reclaims space
+/// if the orphans pile up, so this isn't a leak.
+///
+/// On Linux/macOS, returns true regardless. The historical behavior is
+/// preserved verbatim — the cascade isn't observed on Linux in practice
+/// (the close handler is reliable), so the gate is added only where
+/// it's needed.
+///
+/// Implementation note: uses `cfg!(windows)` (a compile-time constant)
+/// instead of a `#[cfg(windows)] { ... }` block-form so that
+/// `layout_loaded` is syntactically referenced on every platform. The
+/// runtime check is constant-folded by the optimizer to the same code
+/// either form would produce, but the syntactic reference silences both
+/// rustc and rust-analyzer `unused_variables` / `unused_assignments`
+/// warnings at the `lib.rs` call site without needing `#[allow]`
+/// plumbing on the caller.
+pub fn should_run_orphan_cleanup(layout_loaded: bool) -> bool {
+    if cfg!(windows) {
+        layout_loaded
+    } else {
+        // Linux/macOS: the historical behavior is preserved verbatim.
+        // `layout_loaded` is referenced in the `if cfg!(windows)` arm
+        // above, so the compiler sees it as used on every platform.
+        true
+    }
 }
 
 // ── Tests ──────────────────────────────────────────────────────
@@ -876,5 +951,195 @@ mod tests {
         assert_eq!(after.saved_at, original_saved_at);
 
         remove_workspace_scrollback(&ws);
+    }
+
+    // ── flush_cache_to_disk tests ─────────────────────────────────
+    //
+    // These test the helper that the Windows close-handler backstop
+    // calls in `lib.rs`. The helper itself is cross-platform; the
+    // backstop call site is `#[cfg(windows)]`. Tests run on every
+    // platform via the cross-platform helper interface.
+
+    #[test]
+    fn flush_cache_to_disk_empty_returns_zero() {
+        // Idempotency guarantee: calling on an empty cache must not
+        // panic and must return 0. This is the post-drain state, so
+        // the backstop calling it after the frontend has already
+        // drained the cache is a documented no-op.
+        let cache = ScrollbackCache::default();
+        assert_eq!(flush_cache_to_disk(&cache), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn flush_cache_to_disk_writes_payloads_to_disk() {
+        let pid = std::process::id();
+        let ws = format!("test-ws-flushcache-{pid}");
+        let cache = ScrollbackCache::default();
+
+        // Two cached entries with non-empty data
+        let mut p1 = test_payload(&ws, "pane-fc-1");
+        p1.session_id = format!("sess-fc-1-{pid}");
+        let mut p2 = test_payload(&ws, "pane-fc-2");
+        p2.session_id = format!("sess-fc-2-{pid}");
+
+        let sid1 = p1.session_id.clone();
+        let sid2 = p2.session_id.clone();
+        cache.put(&sid1, p1);
+        cache.put(&sid2, p2);
+        assert_eq!(cache.len(), 2);
+
+        // Flush the cache through the helper the Windows backstop calls
+        let saved = flush_cache_to_disk(&cache);
+        assert_eq!(saved, 2);
+
+        // Cache must be drained
+        assert_eq!(cache.len(), 0);
+
+        // Both files must exist on disk
+        assert!(load_scrollback(&ws, "pane-fc-1").is_some());
+        assert!(load_scrollback(&ws, "pane-fc-2").is_some());
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    #[test]
+    fn flush_cache_to_disk_drains_so_second_call_returns_zero() {
+        // Regression guard: the helper MUST drain the cache. If a
+        // future refactor switches to non-draining iteration, the
+        // backstop could double-write entries OR (worse) the frontend
+        // and backstop could race. Drain semantics keep both callers
+        // from stepping on each other.
+        let pid = std::process::id();
+        let ws = format!("test-ws-drain-{pid}");
+        let cache = ScrollbackCache::default();
+
+        let mut p = test_payload(&ws, "pane-drain");
+        p.session_id = format!("sess-drain-{pid}");
+        let sid = p.session_id.clone();
+        cache.put(&sid, p);
+
+        assert_eq!(flush_cache_to_disk(&cache), 1);
+        assert_eq!(flush_cache_to_disk(&cache), 0);
+        assert_eq!(cache.len(), 0);
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    #[test]
+    fn flush_cache_to_disk_skips_empty_data_payloads() {
+        // Empty-data payloads are useless to restore from (the xterm
+        // serialize addon would just produce a blank pane). The
+        // helper drains them from the cache but does NOT write them
+        // to disk, so they don't count toward the saved tally.
+        let pid = std::process::id();
+        let ws = format!("test-ws-emptydata-{pid}");
+        let cache = ScrollbackCache::default();
+
+        let mut p = test_payload(&ws, "pane-emptydata");
+        p.session_id = format!("sess-emptydata-{pid}");
+        p.data = String::new();
+        let sid = p.session_id.clone();
+        cache.put(&sid, p);
+
+        let saved = flush_cache_to_disk(&cache);
+        assert_eq!(saved, 0);
+
+        // Cache IS drained even though nothing was written
+        assert_eq!(cache.len(), 0);
+
+        // No file on disk
+        assert!(load_scrollback(&ws, "pane-emptydata").is_none());
+    }
+
+    #[test]
+    fn flush_cache_to_disk_mixed_empty_and_nonempty_counts_only_writes() {
+        // Verifies the per-entry decision: skip empty, write non-empty,
+        // and the returned count reflects only the actual writes.
+        let pid = std::process::id();
+        let ws = format!("test-ws-mixed-{pid}");
+        let cache = ScrollbackCache::default();
+
+        let mut p_empty = test_payload(&ws, "pane-mix-empty");
+        p_empty.session_id = format!("sess-mix-empty-{pid}");
+        p_empty.data = String::new();
+
+        let mut p_nonempty = test_payload(&ws, "pane-mix-data");
+        p_nonempty.session_id = format!("sess-mix-data-{pid}");
+
+        let sid1 = p_empty.session_id.clone();
+        let sid2 = p_nonempty.session_id.clone();
+        cache.put(&sid1, p_empty);
+        cache.put(&sid2, p_nonempty);
+        assert_eq!(cache.len(), 2);
+
+        let saved = flush_cache_to_disk(&cache);
+        assert_eq!(saved, 1, "only the non-empty payload should count");
+
+        // Both removed from cache
+        assert_eq!(cache.len(), 0);
+
+        // Only the non-empty one is on disk
+        assert!(load_scrollback(&ws, "pane-mix-empty").is_none());
+        assert!(load_scrollback(&ws, "pane-mix-data").is_some());
+
+        remove_workspace_scrollback(&ws);
+    }
+
+    // ── should_run_orphan_cleanup gate tests ──────────────────────
+    //
+    // The Windows fix for "terminals start fresh" closes the
+    // force-close cascade by skipping orphan cleanup when the layout
+    // file failed to load. Linux preserves historical behavior.
+
+    #[cfg(windows)]
+    #[test]
+    fn should_run_orphan_cleanup_windows_skips_when_layout_not_loaded() {
+        // The whole point of the Windows gate. layout_loaded=false
+        // means we don't actually know which workspaces are valid,
+        // so cleanup must NOT run — otherwise an empty workspace ID
+        // list would wipe every scrollback dir on disk.
+        assert!(
+            !should_run_orphan_cleanup(false),
+            "Windows must skip orphan cleanup when layout was not loaded; \
+             otherwise cleanup_orphan_scrollbacks(&[]) wipes everything"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn should_run_orphan_cleanup_windows_runs_when_layout_loaded() {
+        // Happy path on Windows: layout loaded, workspace IDs are
+        // trustworthy, cleanup proceeds normally.
+        assert!(
+            should_run_orphan_cleanup(true),
+            "Windows must run orphan cleanup when layout loaded successfully"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn should_run_orphan_cleanup_unix_always_runs_regardless_of_layout() {
+        // Linux/macOS preserves historical behavior. The cascade
+        // isn't observed on Linux in practice (close handler is
+        // reliable), so cleanup runs unconditionally — same as
+        // before this fix.
+        assert!(
+            should_run_orphan_cleanup(false),
+            "Linux must preserve historical behavior — cleanup always runs"
+        );
+        assert!(
+            should_run_orphan_cleanup(true),
+            "Linux must preserve historical behavior — cleanup always runs"
+        );
+    }
+
+    #[test]
+    fn should_run_orphan_cleanup_signature_is_cross_platform() {
+        // Compile-time guard: the signature must accept a bool on
+        // every platform so callers in `lib.rs` can pass `layout_loaded`
+        // without a `cfg`-gated wrapper. Both branches must compile.
+        let _ = should_run_orphan_cleanup(true);
+        let _ = should_run_orphan_cleanup(false);
     }
 }

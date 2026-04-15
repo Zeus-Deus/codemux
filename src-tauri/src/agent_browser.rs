@@ -87,8 +87,14 @@ const MAX_STREAM_PORT: u16 = 9299;
 pub fn kill_stream_daemons() {
     #[cfg(windows)]
     {
+        // CREATE_NO_WINDOW prevents a console flash on app shutdown when we
+        // shell out to taskkill. Same pattern as kill_process_on_port below.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
         let _ = std::process::Command::new("taskkill")
             .args(["/IM", "agent-browser.exe", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
     #[cfg(not(windows))]

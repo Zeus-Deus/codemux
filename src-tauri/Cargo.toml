@@ -28,7 +28,7 @@ serde_json = "1"
 notify = "8.2.0"
 toml = "1.0.3"
 dirs = "6.0.0"
-portable-pty = "0.8"
+portable-pty = { git = "https://github.com/Zeus-Deus/portable-pty", branch = "codemux-0.8.1-no-window" }
 tokio = { version = "1.0", features = ["full"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
