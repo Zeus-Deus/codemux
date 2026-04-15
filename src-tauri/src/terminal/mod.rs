@@ -571,8 +571,42 @@ fn default_shell() -> String {
 
 #[cfg(windows)]
 fn default_shell() -> String {
-    env::var("COMSPEC")
-        .ok()
+    resolve_windows_shell(
+        |cmd| which::which(cmd).ok().map(|p| p.display().to_string()),
+        env::var("COMSPEC").ok(),
+    )
+}
+
+/// Resolve the default Windows shell from a PATH resolver and a COMSPEC
+/// value. Pure function, extracted from `default_shell()` so the fallback
+/// chain can be unit-tested on any platform (Linux CI compiles it under
+/// `cfg(test)`).
+///
+/// Fallback order:
+///   1. `pwsh.exe` — PowerShell 7+, the modern cross-platform shell.
+///      Only present if the user installed it explicitly, but preferred
+///      when available because it ships current language features and
+///      matches the pwsh most users on macOS/Linux already know.
+///   2. `powershell.exe` — Windows PowerShell 5.1, pre-installed on every
+///      supported Windows version (Server 2016+ and Windows 10+). This is
+///      the safe default that should almost always succeed.
+///   3. `COMSPEC` — typically `C:\Windows\System32\cmd.exe`. Honored so
+///      corporate images that point COMSPEC at a custom cmd wrapper still
+///      work on the cmd.exe path.
+///   4. Literal `"cmd.exe"` — last-resort relative name, resolved by
+///      `CreateProcessW` against `PATH` at spawn time.
+#[cfg(any(windows, test))]
+fn resolve_windows_shell<F>(resolve: F, comspec: Option<String>) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(path) = resolve("pwsh") {
+        return path;
+    }
+    if let Some(path) = resolve("powershell") {
+        return path;
+    }
+    comspec
         .filter(|shell| !shell.trim().is_empty())
         .unwrap_or_else(|| "cmd.exe".to_string())
 }
@@ -2248,23 +2282,112 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn test_default_shell_windows_returns_cmd_or_powershell() {
-        // default_shell() on Windows reads $COMSPEC (typically
-        // `C:\Windows\System32\cmd.exe`) and falls back to the literal
-        // string "cmd.exe" if COMSPEC is unset. It should never return
-        // a Unix shell path. The exact resolution depends on runner
-        // config; we assert the case-insensitive suffix lands on a
-        // known Windows shell binary.
+    fn test_default_shell_windows_returns_powershell_or_cmd() {
+        // default_shell() on Windows probes PATH for pwsh → powershell
+        // (always pre-installed on Windows 10+ / Server 2016+) and only
+        // falls back to COMSPEC / "cmd.exe" if neither PowerShell binary
+        // is present. On a stock Windows runner the result will almost
+        // always be powershell.exe; on a runner with PowerShell 7 it
+        // will be pwsh.exe. It should never return a Unix shell path.
         let shell = default_shell();
         let lower = shell.to_lowercase();
         assert!(
-            lower.ends_with("cmd.exe") || lower.ends_with("powershell.exe"),
-            "Windows default_shell should end with cmd.exe or powershell.exe, got: {shell}"
+            lower.ends_with("pwsh.exe")
+                || lower.ends_with("powershell.exe")
+                || lower.ends_with("cmd.exe"),
+            "Windows default_shell should end with pwsh.exe, powershell.exe, or cmd.exe, got: {shell}"
         );
         assert!(
             !shell.contains("/bin/"),
             "Windows default_shell must not return a Unix shell path, got: {shell}"
         );
+    }
+
+    // ── resolve_windows_shell fallback chain ─────────────────────────
+    //
+    // These tests exercise the pure-function version of the Windows
+    // shell resolver directly, so they run on every platform (the
+    // function is compiled under `cfg(any(windows, test))`). Each test
+    // injects a fake PATH resolver closure so the fallback order can be
+    // verified without relying on what's actually installed on the
+    // runner.
+
+    #[test]
+    fn test_resolve_windows_shell_prefers_pwsh_when_available() {
+        // When both pwsh and powershell are on PATH, pwsh wins — it's
+        // the newer cross-platform PowerShell.
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "pwsh" => Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
+                "powershell" => Some(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                ),
+                _ => None,
+            },
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Program Files\PowerShell\7\pwsh.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_falls_back_to_powershell_when_pwsh_missing() {
+        // pwsh absent (PowerShell 7 not installed) → pick powershell.exe
+        // (Windows PowerShell 5.1 is always present on modern Windows).
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "powershell" => Some(
+                    r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+                ),
+                _ => None,
+            },
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(
+            result,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        );
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_falls_back_to_comspec_when_no_powershell() {
+        // Hypothetical: neither PowerShell nor pwsh on PATH (e.g. a
+        // stripped-down Windows container). Fall back to COMSPEC.
+        let result = resolve_windows_shell(
+            |_| None,
+            Some(r"C:\Windows\System32\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Windows\System32\cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_final_fallback_to_literal_cmd_exe() {
+        // Last-resort: no PowerShell, no COMSPEC → literal "cmd.exe"
+        // relative name so CreateProcessW can still resolve it.
+        let result = resolve_windows_shell(|_| None, None);
+        assert_eq!(result, "cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_treats_blank_comspec_as_unset() {
+        // COMSPEC set to whitespace is treated as unset — matches the
+        // historic guard in the old default_shell() implementation.
+        let result = resolve_windows_shell(|_| None, Some("   ".to_string()));
+        assert_eq!(result, "cmd.exe");
+    }
+
+    #[test]
+    fn test_resolve_windows_shell_pwsh_beats_comspec() {
+        // Even if COMSPEC is set to something weird, pwsh still wins —
+        // the whole point of the refactor is that we prefer modern
+        // shells over cmd.exe whenever available.
+        let result = resolve_windows_shell(
+            |cmd| match cmd {
+                "pwsh" => Some(r"C:\Program Files\PowerShell\7\pwsh.exe".to_string()),
+                _ => None,
+            },
+            Some(r"C:\some\custom\cmd.exe".to_string()),
+        );
+        assert_eq!(result, r"C:\Program Files\PowerShell\7\pwsh.exe");
     }
 
     #[cfg(unix)]
