@@ -561,6 +561,50 @@ fn prepend_shim_to_path(shim_dir: &str, current_path: &str) -> String {
     }
 }
 
+/// Build the final PATH value passed to a PTY child process.
+///
+/// Always prepends the codemux shim dir so `codemux …` CLI commands work
+/// inside the user's terminal. On Windows, **also** prepends
+/// `%USERPROFILE%\.local\bin` — the install location used by the Claude
+/// Code native installer (`irm https://claude.ai/install.ps1 | iex`) and
+/// every other per-user CLI installer that targets Windows with a POSIX
+/// layout. Codemux's own environment block may miss a freshly-added
+/// `.local\bin` because Windows PATH changes made by installers broadcast
+/// via `WM_SETTINGCHANGE`, which a running process may not pick up. Adding
+/// the directory here ensures that the shell spawned inside the PTY can
+/// find binaries users just installed, regardless of whether Codemux
+/// itself saw the PATH update.
+///
+/// On Unix this is a pass-through to `prepend_shim_to_path` — Unix
+/// installers update `~/.bashrc` / `~/.zshrc`, so the user's login shell
+/// already picks up `.local/bin` via the `PATH` they export from their
+/// rc file. Replicating the prepend on Unix would be redundant at best.
+fn build_child_path(shim_dir: &str, current_path: &str) -> String {
+    let base = prepend_shim_to_path(shim_dir, current_path);
+    #[cfg(windows)]
+    {
+        if let Some(local_bin) = windows_user_local_bin() {
+            return prepend_shim_to_path(&local_bin, &base);
+        }
+    }
+    base
+}
+
+/// Returns `%USERPROFILE%\.local\bin` as a string if `USERPROFILE` is set.
+/// Does NOT verify that the directory exists — the caller only needs the
+/// path string to stuff into PATH, and a non-existent entry in PATH is
+/// harmless (Windows PATH parsing silently skips missing dirs).
+#[cfg(windows)]
+fn windows_user_local_bin() -> Option<String> {
+    std::env::var_os("USERPROFILE").map(|p| {
+        std::path::Path::new(&p)
+            .join(".local")
+            .join("bin")
+            .display()
+            .to_string()
+    })
+}
+
 #[cfg(unix)]
 fn default_shell() -> String {
     env::var("SHELL")
@@ -987,9 +1031,12 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     }
 
     // Add codemux CLI shim to PATH so `codemux` commands work in user terminals.
+    // On Windows, `build_child_path` also prepends `%USERPROFILE%\.local\bin`
+    // so Claude Code and similar per-user installs are discoverable even if
+    // Codemux's own environment missed the installer's PATH broadcast.
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed = prepend_shim_to_path(&shim_dir, &current_path);
+        let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -1825,7 +1872,7 @@ pub fn spawn_pty_for_agent(
 
     if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed_path = prepend_shim_to_path(&shim_dir, &current_path);
+        let prefixed_path = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed_path);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
@@ -2278,6 +2325,75 @@ mod tests {
                 r"C:\Users\zeus\AppData\Local\Codemux\shims:C:\Windows\System32;C:\Program Files\Git\bin"
             );
         }
+    }
+
+    // ── build_child_path + Windows user-local-bin tests ──────────────
+    //
+    // `build_child_path` is the cross-platform wrapper used by both
+    // `spawn_pty_for_session` and `spawn_pty_for_agent`. On Unix it's
+    // a pass-through to `prepend_shim_to_path`. On Windows it *also*
+    // prepends `%USERPROFILE%\.local\bin` so Claude Code (installed
+    // via `irm claude.ai/install.ps1 | iex`) and similar per-user
+    // CLIs are discoverable even if Codemux's own PATH missed the
+    // installer's `WM_SETTINGCHANGE` broadcast.
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_child_path_unix_is_passthrough() {
+        // On Unix, build_child_path must match prepend_shim_to_path
+        // exactly — there's no additional prepend. Unix installers
+        // update shell rc files, so PATH propagation is handled by
+        // the user's login shell, not by Codemux.
+        let a = build_child_path("/opt/codemux/shims", "/usr/bin:/bin");
+        let b = prepend_shim_to_path("/opt/codemux/shims", "/usr/bin:/bin");
+        assert_eq!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_build_child_path_unix_empty_current() {
+        // Edge case mirror of the prepend test — no trailing separator
+        // even when the pass-through chain is exercised.
+        let result = build_child_path("/opt/codemux/shims", "");
+        assert_eq!(result, "/opt/codemux/shims");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_build_child_path_windows_prepends_user_local_bin() {
+        // On Windows, the result must START with
+        // `%USERPROFILE%\.local\bin` so that executables installed there
+        // are preferred over anything else on PATH. The next component
+        // is the codemux shim dir (from prepend_shim_to_path). The
+        // remainder is the caller-supplied current_path.
+        let result = build_child_path(r"C:\codemux\shims", r"C:\Windows\System32");
+        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let expected_local_bin = format!(r"{}\.local\bin", user_profile);
+        assert!(
+            result.starts_with(&expected_local_bin),
+            "expected build_child_path to start with {expected_local_bin:?}, got {result:?}",
+        );
+        assert!(
+            result.contains(r"C:\codemux\shims"),
+            "shim dir must be preserved somewhere in the result, got {result:?}",
+        );
+        assert!(
+            result.contains(r"C:\Windows\System32"),
+            "original current_path must be preserved, got {result:?}",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_user_local_bin_uses_userprofile() {
+        // windows_user_local_bin() must resolve USERPROFILE +
+        // `.local\bin` verbatim — no normalization, no extra logic,
+        // just a composed path. We reconstruct what we expect and
+        // verify the helper matches.
+        let user_profile = std::env::var("USERPROFILE").expect("USERPROFILE must be set on Windows");
+        let expected = format!(r"{}\.local\bin", user_profile);
+        let actual = windows_user_local_bin().expect("USERPROFILE is set so this must return Some");
+        assert_eq!(actual, expected);
     }
 
     #[cfg(windows)]

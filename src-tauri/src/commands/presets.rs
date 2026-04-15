@@ -569,12 +569,83 @@ fn wait_and_write_command(
 /// error for binaries that were actually installed and on PATH. The crate-based
 /// implementation walks `PATH` directly with the right separator and executable
 /// extension semantics on each platform.
+///
+/// **Windows fallback**: if `which::which` fails, we also check the known
+/// per-user install directory `%USERPROFILE%\.local\bin`. This is the path
+/// where the Claude Code native installer (`irm https://claude.ai/install.ps1 |
+/// iex`) drops `claude.exe` and where other CLI tools that target Windows
+/// with a POSIX-style install layout tend to land. The fallback is necessary
+/// because PATH changes made by installers propagate to running processes
+/// via `WM_SETTINGCHANGE`, which Codemux may miss if it was launched from a
+/// parent process with a stale environment block. A fresh terminal sees the
+/// updated PATH; Codemux's IPC process may not. Without this fallback, users
+/// who installed Claude Code after launching Codemux (a very common timeline)
+/// see an unhelpful "claude is not installed" error for a binary they just
+/// ran successfully in a normal terminal.
 fn command_binary_exists(command: &str) -> bool {
     let binary = command.split_whitespace().next().unwrap_or("");
     if binary.is_empty() {
         return true;
     }
-    which::which(binary).is_ok()
+    if which::which(binary).is_ok() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if find_in_windows_user_local_bin(binary).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the absolute path to `binary` inside `%USERPROFILE%\.local\bin`
+/// if any of the standard Windows executable extensions match an existing
+/// file there. Returns `None` if `USERPROFILE` is unset, the directory
+/// doesn't exist, or no matching file is found.
+///
+/// Tries `binary.exe`, `binary.cmd`, `binary.bat`, `binary.ps1`, and the
+/// extensionless `binary` name (in that order). This list covers every
+/// install shape we've seen for CLI agents on Windows: compiled Rust/Go
+/// binaries (`.exe`), npm wrapper scripts (`.cmd`), legacy DOS batch
+/// files (`.bat`), PowerShell shims (`.ps1`), and Git Bash-style
+/// shebang scripts that Windows can't directly execute but which a
+/// user-configured shell might resolve.
+///
+/// If the caller already supplied an extension (e.g. `"claude.exe"`),
+/// we try the exact name first and skip the extension permutation.
+#[cfg(windows)]
+fn find_in_windows_user_local_bin(binary: &str) -> Option<std::path::PathBuf> {
+    let user_profile = std::env::var_os("USERPROFILE")?;
+    let local_bin = std::path::Path::new(&user_profile)
+        .join(".local")
+        .join("bin");
+    if !local_bin.is_dir() {
+        return None;
+    }
+
+    // If the binary already has an extension, honor it and bail on mismatch —
+    // don't try to "improve" the user's explicit request.
+    if std::path::Path::new(binary).extension().is_some() {
+        let candidate = local_bin.join(binary);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        return None;
+    }
+
+    // Extensionless name — try each known executable extension.
+    for ext in &["exe", "cmd", "bat", "ps1", ""] {
+        let candidate = if ext.is_empty() {
+            local_bin.join(binary)
+        } else {
+            local_bin.join(format!("{binary}.{ext}"))
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -724,5 +795,165 @@ mod tests {
             written,
             b"claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\" --resume abc-123\n"
         );
+    }
+
+    // ── command_binary_exists Windows fallback tests ────────────────
+    //
+    // These tests drive the `find_in_windows_user_local_bin` helper
+    // directly by temporarily pointing `USERPROFILE` at a tempdir we
+    // control, then populating `{tempdir}\.local\bin` with fake
+    // binaries. Setting an env var inside a test is normally a parallel-
+    // execution hazard, but since these tests use `#[serial_test::serial]`-
+    // style serialization via a shared `Mutex` we construct below,
+    // they're safe to run alongside the rest of the suite.
+    //
+    // On non-Windows the fallback is cfg-gated out, so the tests live
+    // inside `#[cfg(windows)]` blocks — they compile only on Windows.
+
+    #[cfg(windows)]
+    mod windows_fallback {
+        use super::super::*;
+        use std::sync::Mutex;
+
+        /// Serialize env-var mutations across tests in this module.
+        /// We're changing USERPROFILE, which is a global env var, so
+        /// concurrent tests could clobber each other without this lock.
+        static USERPROFILE_LOCK: Mutex<()> = Mutex::new(());
+
+        /// RAII guard: sets USERPROFILE to `value` and restores the
+        /// previous value on drop. Panics are caught by the Mutex
+        /// poison handling in the next test — the drop still runs.
+        struct UserProfileGuard {
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl UserProfileGuard {
+            fn set(value: &std::path::Path) -> Self {
+                let previous = std::env::var_os("USERPROFILE");
+                std::env::set_var("USERPROFILE", value);
+                Self { previous }
+            }
+        }
+
+        impl Drop for UserProfileGuard {
+            fn drop(&mut self) {
+                match self.previous.take() {
+                    Some(prev) => std::env::set_var("USERPROFILE", prev),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+            }
+        }
+
+        /// Build a tempdir that looks like `{tempdir}\.local\bin` with
+        /// the given binary filenames created as empty files. Returns
+        /// the tempdir path so the caller can pass it to
+        /// `UserProfileGuard::set`.
+        fn stage_local_bin(binaries: &[&str]) -> tempfile::TempDir {
+            let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+            let local_bin = tempdir.path().join(".local").join("bin");
+            std::fs::create_dir_all(&local_bin).expect("failed to create .local\\bin");
+            for name in binaries {
+                std::fs::write(local_bin.join(name), b"").expect("failed to write stub binary");
+            }
+            tempdir
+        }
+
+        #[test]
+        fn finds_claude_exe_in_user_local_bin() {
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["claude.exe"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude");
+            assert!(
+                result.is_some(),
+                "expected claude.exe in staged .local\\bin to be found",
+            );
+            assert!(result.unwrap().to_string_lossy().ends_with("claude.exe"));
+        }
+
+        #[test]
+        fn finds_claude_cmd_in_user_local_bin() {
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["claude.cmd"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude");
+            assert!(result.is_some());
+            assert!(result.unwrap().to_string_lossy().ends_with("claude.cmd"));
+        }
+
+        #[test]
+        fn prefers_exe_over_cmd_when_both_present() {
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["claude.exe", "claude.cmd", "claude.bat"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude");
+            assert!(result.is_some());
+            // Extension priority: exe > cmd > bat > ps1 > (extensionless)
+            assert!(
+                result.unwrap().to_string_lossy().ends_with("claude.exe"),
+                "exe should win when both exe and cmd are present",
+            );
+        }
+
+        #[test]
+        fn returns_none_when_binary_missing() {
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["codex.exe"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude");
+            assert!(
+                result.is_none(),
+                "looking up `claude` must not match `codex.exe`",
+            );
+        }
+
+        #[test]
+        fn returns_none_when_local_bin_missing() {
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            // NO .local\bin directory created.
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude");
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn honors_explicit_extension() {
+            // If the caller asks for `claude.exe`, we try exactly that
+            // and do NOT permute extensions — respecting the explicit
+            // request.
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["claude.cmd"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            let result = find_in_windows_user_local_bin("claude.exe");
+            assert!(
+                result.is_none(),
+                "explicit claude.exe must not fall through to claude.cmd",
+            );
+        }
+
+        #[test]
+        fn command_binary_exists_integrates_with_fallback() {
+            // End-to-end: command_binary_exists must return true when
+            // the binary is only reachable via the %USERPROFILE%\.local\bin
+            // fallback (not on the process PATH).
+            let _lock = USERPROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let tempdir = stage_local_bin(&["codemux-test-stub.exe"]);
+            let _guard = UserProfileGuard::set(tempdir.path());
+
+            // The stub name is unlikely to exist on any real PATH, so
+            // the only way command_binary_exists returns true is via
+            // the fallback.
+            assert!(
+                command_binary_exists("codemux-test-stub --flag"),
+                "command_binary_exists should find the stub via the .local\\bin fallback",
+            );
+        }
     }
 }
