@@ -8,7 +8,7 @@
 
 ## Current Headline
 
-Codemux is approaching Linux MVP. The workspace shell, terminal management, git integration, and ADE features are real and daily-drivable. OpenFlow and browser pane are still being hardened.
+Codemux is past Linux MVP and shipping Windows binaries. The workspace shell, terminal management, git integration, and ADE features are real and daily-drivable on both Linux and Windows. `v0.1.21` (the latest published release) ships the NSIS `.exe` installer with auto-update wired through the same `latest.json` as Linux. OpenFlow and the browser pane are still being hardened, and OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
 
 The repo structure is clean and domain-split:
 
@@ -62,21 +62,35 @@ The repo structure is clean and domain-split:
 - Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
 - Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, diff viewer, execution backends, file editor, file tree, GitHub issues, hooks, IDE integration, MCP server, merge resolver, notifications, observability, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
 
-## Windows Support Foundation
+## Windows Support
 
-Windows support foundation has been merged to main (commit `cc9b946`, 19 commits past the `v0.1.19` tag — not yet in a published release). The work was verified end-to-end via a throwaway test tag against the production release pipeline:
+Windows support has shipped in `v0.1.20` and `v0.1.21`. The Windows foundation merge (commit `cc9b946`) landed before `v0.1.20` was tagged, so every published release since `v0.1.20` includes the Windows binaries (NSIS `.exe` installer + auto-update). `main` is currently 8 commits past `v0.1.21`, all of them post-release Windows fixes.
+
+What landed in the foundation:
 
 - `cfg`-gates cover every Linux-specific code path — the app compiles on `x86_64-pc-windows-msvc` without unsafe `unix` stubs
 - Control socket → named pipe (`\\.\pipe\codemux-{username}`) via `tokio::net::windows::named_pipe`
-- Port detection via `netstat -ano` parser (cross-platform pure function, unit-tested on Linux CI)
+- Port detection via `netstat -ano` parser (cross-platform pure function, unit-tested on Linux CI) with a Windows system-process name filter (`svchost.exe`, `System`, `lsass.exe`, etc.) so the UI doesn't surface 16+ kernel-owned ports that Linux's `/proc/*/fd/` permission filter naturally hides
 - Agent-browser port reclamation via `netstat -ano` + `taskkill` with exact-port matching
 - OpenFlow disabled at the UI + backend level on Windows (bash wrappers not yet ported) — sidebar shows a greyed-out "OpenFlow is not yet available on Windows" tooltip
 - `release.yml` builds on `[ubuntu-22.04, windows-latest]` with `fail-fast: false`; tauri-action merges both platforms into a single `latest.json` so existing Linux auto-updates keep working AND Windows clients auto-update the same way
 - NSIS installer produced on Windows CI (`--bundles nsis` to skip MSI which needs WiX)
-- 547 Rust tests (+38 from the Windows pass) run on both matrix legs of `ci.yml`
+
+Post-release Windows fixes (between `v0.1.21` and current `main`):
+
+- **`portable-pty` forked** — pinned to `Zeus-Deus/portable-pty` branch `codemux-0.8.1-no-window` (commit `a5022fec`). The fork ORs `CREATE_NO_WINDOW` and uses `STARTF_USESHOWWINDOW + SW_HIDE` in `psuedocon.rs` so terminal sessions stop flashing visible `cmd.exe` console windows on the Windows taskbar (upstream `portable-pty` 0.8.1 omits both flags from `dwCreationFlags`)
+- **PowerShell is now the default Windows shell**, replacing `cmd.exe`. `default_shell()` on Windows now resolves `pwsh` → `powershell` → `COMSPEC` → literal `"cmd.exe"`. The earlier `cmd.exe`-only decision in `docs/plans/windows-support.md` has been superseded — PowerShell ships pre-installed on every supported Windows version (10/11, Server 2016+) so the detection chain almost always succeeds
+- **Agent context injection learned PowerShell env-var syntax** — `$env:CODEMUX_AGENT_CONTEXT` (PowerShell) instead of `$CODEMUX_AGENT_CONTEXT` (POSIX). The previous Unix-only form would have been passed to `claude` as a literal `$CODEMUX_AGENT_CONTEXT` string instead of the expanded context. Affects the Claude / Codex / Pi / Gemini preset wrappers; OpenCode is env-var-only and unaffected. The Gemini path also writes its system-prompt temp file via PowerShell `Set-Content -NoNewline` and sets `$env:GEMINI_SYSTEM_MD` inline
+- **Editor detection rewritten for Windows** — `find_editors()` no longer shells out to a `which` binary (which doesn't exist on Windows). Now uses the `which::which()` Rust crate plus a `#[cfg(windows)]` fallback that probes `%LOCALAPPDATA%\Programs`, `%ProgramFiles%`, and `%ProgramFiles(x86)%` for well-known per-user install paths of VS Code, Cursor, VSCodium, and Zed. JetBrains IDEs stay PATH-only (Toolbox shims live on `PATH` already)
+- **Window controls extracted to a standalone `<WindowChrome />`** — Codemux runs with `decorations: false` so the OS never paints native chrome. The login screen, empty state, settings view, and new-project screen short-circuit `AppShell` BEFORE the title bar mounts, which on Windows left those screens with no way to minimize/maximize/close the app. `<WindowChrome />` wraps the same minimize/maximize/close cluster as `title-bar.tsx` in a draggable strip so every full-screen view exposes window controls. Linux + Hyprland was unaffected because the WM decorates the window itself
+- **Scrollback flush hardened on Windows** — the close handler now waits 10 seconds (Linux/macOS still 3) for the frontend to ack `serialize-terminal-buffers`, and a Windows-only backend backstop (`scrollback::flush_cache_to_disk`) drains any in-memory `ScrollbackCache` entries that the frontend didn't manage to persist before the timeout. Fixes silent scrollback truncation on Windows where slower Tauri IPC + slower xterm serialization for many panes routinely exceeded the old 3-second budget. The cache exists on Linux too but never has anything to flush in practice because the happy-path flush completes well within budget
+- **Preset failure now surfaces as a toast** — `preset-bar.tsx` previously caught `applyPreset` rejections with `.catch(console.error)`, so users who clicked a preset for an uninstalled CLI saw nothing happen. Failures are now routed through the existing sonner toast wrapper (`toast.error("Preset Name: {error}")`) for an 8-second bottom-right notification
+- **Windows preset commands get a `\r` line terminator** instead of `\n` so PowerShell actually executes the typed-in command on submit
+- **Test counts: 607 Rust tests** (530 lib + 65 git_operations + 12 github_operations) and **303 frontend tests** across 22 files, all passing on both `ubuntu-latest` and `windows-latest` CI legs
 
 Still gated before a real Windows v1 release:
-- Windows Authenticode code signing — SmartScreen warning expected on unsigned first-install, deferred behind a cert budget decision
+
+- Windows Authenticode code signing — SmartScreen warning expected on unsigned first-install, deferred behind a cert budget decision (the agent-browser `.exe` is already a Defender false-positive trigger so signing becomes more pressing as install friction reports come in)
 - OpenFlow bash wrapper rewrite — blocks OpenFlow on Windows
 - Tier 3 input injection via Win32 `SendInput` — deferred (Tier 1/2 sufficient for MVP)
 - Full PTY lifecycle / worktree / agent-spawn integration tests on a live Windows runner

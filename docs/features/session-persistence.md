@@ -14,9 +14,20 @@ Session persistence saves terminal scrollback content when Codemux closes and re
 
 ### Scrollback Serialization
 
-On close, the Rust backend emits `serialize-terminal-buffers` to the frontend. Each mounted `TerminalPane` uses `@xterm/addon-serialize` to capture its buffer content. The serialized data is sent back to the backend via `save_terminal_scrollback` and written to `~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.dat` with a JSON metadata sidecar.
+On close, the Rust backend emits `serialize-terminal-buffers` to the frontend. Each mounted `TerminalPane` uses `@xterm/addon-serialize` to capture its buffer content. The serialized data is sent back to the backend via `save_terminal_scrollback` and written to `~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.dat` (Linux) or `%APPDATA%\codemux\scrollback\{workspace_id}\{pane_id}.dat` (Windows) with a JSON metadata sidecar.
 
-The backend waits up to 3 seconds for all panes to report back, then closes regardless.
+The backend waits for the frontend to ack with a `scrollback-serialization-complete` event, then closes regardless. The timeout differs per platform:
+
+- **Linux/macOS**: 3 seconds. Tauri IPC is fast enough that the happy path completes well under budget.
+- **Windows**: 10 seconds. Slower Tauri IPC + slower xterm serialization for many panes can exceed 3s, which silently truncates serialization and leaves panes "fresh" on the next launch. 10s gives enough headroom without making clean closes feel sluggish.
+
+### `ScrollbackCache` Backend Backstop (Windows)
+
+Inactive tabs and workspaces never re-mount their `TerminalPane`, so the frontend serialization dance only sees panes that are currently visible. The backend keeps an in-memory `ScrollbackCache` for sessions that were unmounted during the session (tab/workspace switches), and on Linux that cache is normally drained by the frontend's `flushScrollbackCache` call before the close timeout fires.
+
+On Windows, slower IPC means the cache flush can race the timeout. As a safety net, the close handler runs `scrollback::flush_cache_to_disk(&cache)` after the timeout regardless of whether the frontend completed. The function is idempotent — if the frontend already drained the cache, this returns 0 and is a no-op. The backstop is `#[cfg(windows)]`-gated because Linux IPC is fast enough that the frontend reliably completes the serialization dance well within budget; on Linux the backstop would never have anything to flush in practice, but the cost of running it is so small it could be enabled there too if a similar race ever surfaces.
+
+The cache also runs `refresh_stale_scrollback_metadata()` on close to update sidecar files for sessions that were never re-serialized by the frontend (inactive workspaces).
 
 On open, each pane checks for saved scrollback. If found, the content is written to xterm before the new PTY attaches, followed by a `── session restored ──` separator.
 
@@ -148,18 +159,18 @@ Codemux detects this automatically: if the terminal was in alternate buffer mode
 
 ## Important Touch Points
 
-- `src-tauri/src/scrollback.rs` — scrollback file I/O, cleanup, disk limits
+- `src-tauri/src/scrollback.rs` — scrollback file I/O, cleanup, disk limits, `ScrollbackCache`, `flush_cache_to_disk`, `refresh_stale_scrollback_metadata`
 - `src-tauri/src/session_adapters.rs` — adapter config loading, output scanner, resume commands
-- `src-tauri/src/lib.rs` — close handler (serialize-terminal-buffers event), startup cleanup
+- `src-tauri/src/lib.rs` — close handler (serialize-terminal-buffers event), startup cleanup, `SCROLLBACK_TIMEOUT_SECS` (3s on Unix, 10s on Windows), Windows-only backend backstop
 - `src-tauri/src/terminal/mod.rs` — scanner wiring in PTY read loop
-- `src-tauri/src/settings_sync.rs` — `SessionRestoreSettings` struct
+- `src-tauri/src/settings_sync.rs` — `SessionRestoreSettings` struct (defaults: `enabled=true`, `scrollback_lines=10000`, `max_total_mb=100`)
 - `src-tauri/src/state/state_impl.rs` — `original_command` field on `TerminalSessionSnapshot`
 - `src-tauri/src/commands/presets.rs` — sets `original_command` when applying presets
 - `src/components/terminal/TerminalPane.tsx` — serialize addon and scrollback restore
 - `src/hooks/use-scrollback-serializer.ts` — global serialization coordinator
 - `src/tauri/commands.ts` — scrollback and adapter command wrappers
 - `~/.config/codemux/session-adapters.toml` — user-editable adapter config
-- `~/.local/share/codemux/scrollback/` — scrollback storage on disk
+- `~/.local/share/codemux/scrollback/` (Linux) or `%APPDATA%\codemux\scrollback\` (Windows) — scrollback storage on disk
 
 ## Troubleshooting
 

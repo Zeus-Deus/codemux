@@ -1,16 +1,19 @@
 # Windows Support Tracking
 
-Status: Foundation merged to main (`cc9b946`, 19 commits past `v0.1.19` — not yet in a published release)
-Branch: `feature/windows-support` (merged); `main` now carries all foundation work
+Status: Shipping. Foundation merged in `cc9b946`, released in `v0.1.20` and `v0.1.21`. Currently 8 commits past `v0.1.21` with post-release Windows hardening.
+Branch: `feature/windows-support` (merged); `main` carries all foundation work + post-release fixes
 Created: 2026-04-12
+Last updated: 2026-04-15
 
 ## How to Use This File
 
 This is the master checklist for Windows support. Before working on any Windows-related code, read this file first. After completing an item, check it off and note what was done. This file is the source of truth for what's left.
 
-The foundation (cfg gates, named-pipe control socket, Windows port detection, NSIS bundle config, multi-platform `release.yml`, cross-platform `latest.json` merge, 547 Rust tests green on both Linux and Windows CI) is on `main` as of commit `cc9b946`. What's still open below this line are the non-foundation items — real Windows PTY / worktree / agent-spawn integration tests against a live Windows runner, Authenticode signing, OpenFlow wrapper rewrite, Tier 3 `SendInput` input injection, and the polish follow-ups. None of those gate compiling or running on Windows today; they gate a polished Windows v1 release.
+The foundation (cfg gates, named-pipe control socket, Windows port detection, NSIS bundle config, multi-platform `release.yml`, cross-platform `latest.json` merge, 607 Rust tests green on both Linux and Windows CI) is on `main` as of commit `cc9b946` and was published to users in `v0.1.20` and `v0.1.21`. The post-release hardening pass (commits `82472bd`..`8c0f3e4`, between `v0.1.21` and current `main`) added the PowerShell default shell switch, the `portable-pty` fork for `CREATE_NO_WINDOW` / `SW_HIDE`, the scrollback flush backstop, the editor detection rewrite, the window controls on full-screen views, the Windows system-process port filter, and several smaller fixes. See the "Post-Release Windows Fixes (2026-04-13 → 2026-04-15)" section below for the full list.
 
-Findings are organized by severity. File:line references point at the current state of `main` as of 2026-04-12 — verify before editing since line numbers drift.
+What's still open below this line are the non-foundation items — Authenticode signing, OpenFlow wrapper rewrite, Tier 3 `SendInput` input injection, full PTY lifecycle / worktree / agent-spawn integration tests on a live Windows runner, and the long-tail polish follow-ups. None of those gate compiling or running on Windows today; they gate a fully polished Windows v1.
+
+Findings are organized by severity. File:line references may have drifted since the original 2026-04-12 audit — verify before editing.
 
 ---
 
@@ -80,6 +83,95 @@ The Bug 1 stack has three more layers we deliberately did NOT fix in this pass (
 - Async `create_worktree_workspace` and friends so PTY spawns don't pin the IPC thread
 
 Plus the broader Windows polish work below this section is unchanged.
+
+---
+
+## Post-Release Windows Fixes (2026-04-13 → 2026-04-15)
+
+After `v0.1.20` and `v0.1.21` shipped, real Windows usage exposed a stack of issues that the throwaway-tag verification didn't catch (because it only checked the release pipeline, not actual app behavior). This section tracks the post-release hardening work that landed between `v0.1.21` and current `main` (commits `7378936` through `8c0f3e4`).
+
+### Fix A — `portable-pty` window flash (commits `7378936`, `d86f390`)
+
+**Symptom**: Every PTY spawn flashed a visible `cmd.exe` console window on the Windows taskbar before being attached to the pseudoconsole. Looked like a glitch on every workspace creation; particularly bad for users hydrating multi-pane layouts.
+
+**Root cause**: `portable-pty 0.8.1`'s `psuedocon.rs` passes `0` for `dwCreationFlags` in the `CreateProcessW` call, missing both `CREATE_NO_WINDOW` and `STARTF_USESHOWWINDOW + SW_HIDE`. Tracked upstream as #6946.
+
+**Fix**: Forked `portable-pty` to `Zeus-Deus/portable-pty` branch `codemux-0.8.1-no-window`, commit `a5022fec`. First attempt added `CREATE_NO_WINDOW` alone, but per MSDN that means "the console handle for the application is not set" and conflicts with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` — left `cmd.exe` with null stdio inside the pseudoconsole. Final fix uses `STARTF_USESHOWWINDOW + SW_HIDE` instead, which hides any window that gets created without touching console handle semantics. `Cargo.toml` line 31 now reads `portable-pty = { git = "https://github.com/Zeus-Deus/portable-pty", branch = "codemux-0.8.1-no-window" }`. `Cargo.lock` pins to commit `a5022fec`.
+
+### Fix B — Default shell + agent context PowerShell migration (commits `b26a2e1`, `d5259a9`, `5be56ac`)
+
+**Symptom**: Every Codemux preset for Claude / Codex / Pi / Gemini broke on Windows. The `claude --system-prompt "$CODEMUX_AGENT_CONTEXT"` form expanded under POSIX shells but on `cmd.exe` it became a literal `"$CODEMUX_AGENT_CONTEXT"` string — the agent received the literal text, not the workspace context.
+
+**Root cause**: The 2026-04-12 decision picked `cmd.exe` as the Windows default shell for v1, but the agent context injection layer was hardcoded to POSIX `$VAR` expansion. The two layers were never tested together on Windows.
+
+**Fix**: Two coupled changes:
+
+1. **Default shell** (`b26a2e1`): `default_shell()` on Windows now resolves `pwsh` (PowerShell 7+) → `powershell` (Windows PowerShell 5.1, pre-installed on every supported Windows version) → `COMSPEC` → literal `"cmd.exe"`. Extracted into a pure `resolve_windows_shell(resolve, comspec)` function so the chain is unit-tested on Linux CI.
+2. **Agent context expansion** (`d5259a9`, `5be56ac`): `agent_context::inject_agent_context` now emits `$env:CODEMUX_AGENT_CONTEXT` on Windows and `$CODEMUX_AGENT_CONTEXT` on Unix. Tested via `inject_claude_adds_system_prompt_unix` / `inject_claude_adds_system_prompt_windows` (and matching codex / pi pairs). Gemini's pipeline gets a parallel Windows variant: `Set-Content -NoNewline` writes the temp file, then `$env:GEMINI_SYSTEM_MD = '<path>'` sets the env var inline. The temp file path uses `std::env::temp_dir()` so it lives under `%TEMP%` on Windows instead of `/tmp/`.
+
+Also added `.local\bin` to PATH on Windows in case Claude Code installed there but didn't update PATH (matches the Linux fallback behavior).
+
+### Fix C — Editor detection rewrite (commit `d86f390`)
+
+**Symptom**: The IDE picker on the title bar was empty on Windows. Users with VS Code / Cursor / VSCodium / Zed installed couldn't open their workspace in any external editor.
+
+**Root cause**: `find_editors()` shelled out to a `which` binary which doesn't exist on Windows. Every candidate failed to resolve, so the editor list was empty and the picker hid itself.
+
+**Fix**: Rewrote `resolve_editor_command()` to use the `which::which()` Rust crate (which walks `PATH` with the right executable extension semantics on each OS — `.exe`/`.cmd`/`.bat` via `PATHEXT` on Windows). Added a `#[cfg(windows)]` fallback that probes well-known per-user install paths under `%LOCALAPPDATA%\Programs`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`. JetBrains IDEs stay PATH-only — Toolbox shims live on `PATH` already. `EditorInfo.command` now stores the **full resolved path** so `open_in_editor` spawns the exact `.exe` we detected.
+
+Tests: 5 cross-platform + 3 `#[cfg(windows)]` Rust tests in `workspace.rs` covering happy-path, miss-path, empty-string corner case, well-formed result shape, opt-in dev-machine assertion (`CODEMUX_DEV_MACHINE=1`), and Windows env-var robustness for `windows_install_roots`.
+
+### Fix D — Preset failure feedback (commits `d86f390`, `5be56ac`)
+
+**Symptom**: Clicking a preset for an uninstalled CLI silently did nothing — the error was swallowed by `console.error` so users with no devtools open had no feedback at all.
+
+**Fix**: Routed `applyPreset` rejections through the existing sonner toast wrapper as `toast.error("Preset Name: {error}")` for an 8-second bottom-right notification. Handles string, Error, and unknown rejection shapes. 5 vitest tests in `preset-bar.test.tsx` cover the toast on each rejection shape, no-toast-on-success, and the bonus shift-click split-pane routing.
+
+### Fix E — Windows preset line terminator (commit `5be56ac`)
+
+**Symptom**: Preset commands typed into the terminal didn't execute — the user had to manually press Enter.
+
+**Root cause**: Preset launch typed `command\n` into the terminal, which works on `bash` / `zsh` but not on PowerShell — PowerShell needs `\r` (carriage return) to interpret a line as submitted.
+
+**Fix**: Windows preset commands now use `\r` line terminators; Unix continues to use `\n`.
+
+### Fix F — Scrollback flush hardening (commit `2a5cff2`)
+
+**Symptom**: After closing Codemux on Windows, restored sessions came back as fresh shells — no scrollback. Looked like session persistence was completely broken.
+
+**Root cause**: The close handler emitted `serialize-terminal-buffers` and waited 3 seconds for the frontend to ack via `scrollback-serialization-complete`. On Linux that's well under budget; on Windows, slower Tauri IPC + slower xterm serialization for many panes routinely exceeded 3s, so the timeout fired and the close path tore down the panes before serialization completed. Worse, inactive tabs had their scrollback in the in-memory `ScrollbackCache` — the frontend only flushes panes that are currently mounted, so unmounted-but-saved sessions were lost entirely.
+
+**Fix**: Two layers:
+
+1. **Platform-specific timeout**: `SCROLLBACK_TIMEOUT_SECS` is now 10 on Windows (was 3) and stays 3 on Linux/macOS. `#[cfg(windows)]` const declaration in `lib.rs:359-362`. 10s gives slow IPC enough headroom without making clean closes feel sluggish.
+2. **Backend backstop**: A new `scrollback::flush_cache_to_disk(&cache) -> u32` function drains any in-memory `ScrollbackCache` entries that the frontend didn't manage to persist. Called after the timeout (regardless of whether the frontend completed) in `lib.rs:404-414`. Idempotent — if the frontend already drained the cache, returns 0 and is a no-op. `#[cfg(windows)]`-gated because the timeout fires in practice only on Windows.
+
+Also added `refresh_stale_scrollback_metadata()` to update sidecar metadata for sessions that were never re-serialized by the frontend (inactive workspaces).
+
+The orphan cleanup in `scrollback::run_orphan_cleanup` was guarded so it doesn't accidentally delete scrollback for workspaces that exist but haven't been activated yet on the current run.
+
+### Fix G — Window controls on full-screen views (commit `b26a2e1`)
+
+**Symptom**: Login screen, empty state, settings view, and new-project screen on Windows had no way to minimize / maximize / close the app. Users had to alt+F4.
+
+**Root cause**: Codemux runs with `decorations: false` so the OS never paints native chrome. Window controls lived inside `<TitleBar />`, but `<TitleBar />` only mounts in the "has workspaces" branch of `app-shell.tsx`. Every other branch returned a different component without window controls. Linux + Hyprland was unaffected because the WM decorates the window itself.
+
+**Fix**: Extracted `<WindowControls />` into a new shared `src/components/layout/window-chrome.tsx`. Added a `<WindowChrome />` wrapper that combines a full-width `data-tauri-drag-region` strip with the controls anchored to the top-right. `<WindowChrome />` is now rendered in the login screen (all four sub-views), empty state, new-project screen, and settings view. `vitest.setup.ts` got a global mock for `@tauri-apps/api/window` because `getCurrentWindow()` throws under jsdom.
+
+Also added `core:window:allow-minimize` / `core:window:allow-toggle-maximize` / `core:window:allow-close` permissions to `src-tauri/capabilities/default.json` so the new buttons actually work — they were missing on the Windows-targeted capabilities set.
+
+### Fix H — Windows port detection system process filter (commit `c487f79`)
+
+**Symptom**: The sidebar Ports section on Windows showed 16+ kernel-owned ports (135 RPC, 139 NetBIOS, 445 SMB, 3389 RDP, 5040 Delivery Optimization, etc.) that Linux Codemux never showed.
+
+**Root cause**: Linux's `/proc/*/fd/` permission filter naturally drops sockets owned by `root` / `systemd` / etc. because non-root processes can't read those fd dirs. Windows' `netstat -ano` lists EVERY listening socket regardless of owner, so without an explicit filter the Windows UI was buried in noise.
+
+**Fix**: Added `WINDOWS_SYSTEM_PROCESS_NAMES` constant + `is_windows_system_process()` filter in `ports.rs`. Filters by process name (case-insensitive), not by port number, so the filter is robust against process-relocation. Covers `System` / `Idle` / `smss.exe` / `csrss.exe` / `wininit.exe` / `winlogon.exe` / `services.exe` / `lsass.exe` / `svchost.exe` / `dwm.exe` / `spoolsv.exe` / `SearchIndexer.exe` / `MsMpEng.exe` / `RuntimeBroker.exe` / `dllhost.exe` / `WmiPrvSE.exe` / and ~10 others. User-runnable dev tools (`node.exe`, `python.exe`, browsers, IDE language servers) are intentionally NOT in the filter — only kernel + service-host processes. Added 4+ tests covering happy-path filtering, case-insensitivity, and the constant's invariants.
+
+### Test counts after the post-release pass
+
+- **607 Rust tests** (530 lib unit + 65 git_operations + 12 github_operations) pass on both `ubuntu-latest` and `windows-latest` CI legs
+- **303 frontend tests** across 22 vitest files pass on both platforms
 
 ---
 
@@ -645,6 +737,7 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 
 - [x] **All existing Linux tests must continue passing** — no regressions from new `cfg` gates
   - **Verified (2026-04-13)**: every commit on `feature/windows-support` has run `ci.yml` on both matrix legs. The final commit before the merge-ready state (`eb7838b`) passed 547 Rust tests (470 lib + 65 git + 12 github) + 298 frontend tests on both `ubuntu-latest` and `windows-latest`. No Linux regressions.
+  - **Updated (2026-04-15)**: After the post-release Windows hardening pass (commits between `v0.1.21` and current `main`), test counts have grown to 607 Rust tests (530 lib + 65 git + 12 github) + 303 frontend tests across 22 vitest files. Both matrix legs still green.
 - [x] **Run full `npm run verify` + `cargo test` on both Linux and Windows in CI** — they are first-class peer platforms after this work lands
   - **Done (2026-04-12)**: `ci.yml` runs `cargo check`, `cargo test`, `npm run check`, `npm run test`, and `npm run build` on a `[ubuntu-latest, windows-latest]` matrix with `fail-fast: false`. Both legs are required for a branch to merge.
 - [ ] **Benchmark parity check**: if any performance-sensitive code path is rewritten (e.g., batched reader), run an existing benchmark on both platforms and record results in the PR. Target: within 10% of Linux baseline on equivalent hardware
@@ -657,6 +750,7 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 
 - [x] **`portable-pty` version pin on Windows** — research surfaced upstream regression #6783 (`portable-pty 0.9.0 doesn't work on windows`: reader returns garbage output). Options: (a) pin `portable-pty = "=0.8.1"` on the Windows target, (b) ship 0.9.0 and verify the Tokio batched-reader rewrite happens to sidestep the bug, (c) fork and patch. Recommend (a) until #6783 is fixed upstream. **Blocks all Windows PTY work** — decide before writing any Windows PTY code
   - **Decided (2026-04-12)**: Option (a). `src-tauri/Cargo.toml` pins `portable-pty = "0.8"` for all targets (not Windows-specific). Sidesteps #6783 entirely. If we ever need 0.9.x features for Linux, we can split into target-specific pins at that point.
+  - **Updated (2026-04-13, 2026-04-14)**: Switched from option (a) to option (c) — forked. After v0.1.21 shipped, real-world Windows users hit two related visible-window bugs in `portable-pty 0.8.1`: every PTY spawn flashed a `cmd.exe` console window before the pseudoconsole attached (upstream #6946 — `psuedocon.rs` passes `0` for `dwCreationFlags`, missing `CREATE_NO_WINDOW`), and a follow-up fix using `CREATE_NO_WINDOW` alone broke pseudoconsole stdio attachment on some Windows builds (per MSDN `CREATE_NO_WINDOW` means "the console handle for the application is not set", which conflicts with `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`). Final fix: `Zeus-Deus/portable-pty` branch `codemux-0.8.1-no-window` at commit `a5022fec` uses `STARTF_USESHOWWINDOW + SW_HIDE` instead, which hides any window that gets created without touching console handle semantics. `Cargo.toml` line 31 now reads `portable-pty = { git = "https://github.com/Zeus-Deus/portable-pty", branch = "codemux-0.8.1-no-window" }`. Revisit if upstream #6946 lands a clean fix.
 - [x] **Installer format: NSIS vs MSI** — recommend NSIS for v1 (smaller, simpler, no Windows SDK required for CI). MSI is better for enterprise Group Policy deployment; can ship both later via `"targets": ["nsis", "msi"]`
   - **Decided (2026-04-12)**: NSIS only for v1, via `args: --bundles nsis` in the Windows step of `release.yml`. MSI requires WiX Toolset which is NOT preinstalled on `windows-latest` runners, and installing it would add CI time for a feature v1 users don't need. Verified end-to-end via `scripts/test-release-pipeline.sh` on a throwaway release tag.
 - [ ] **Code signing: EV ($300/yr) vs OV ($100/yr) vs unsigned initially** — initial release may ship unsigned with SmartScreen warning; EV cert eliminates warnings immediately but is costlier. OV cert is cheaper but builds reputation slowly. **Extra motivation from research**: `agent-browser-win32-x64.exe` (a bundled dependency) is already flagged by Windows Defender (upstream issues #514, #482), so shipping Codemux unsigned on top compounds install friction — signing becomes effectively mandatory for a polished first impression on Windows
@@ -667,6 +761,7 @@ Higher-level tests that exercise multiple components end-to-end on Windows.
 - [x] **Which agent CLIs to support on Windows v1?** — **Resolved by research**: all five CLIs run natively on Windows. **Claude Code** (native installer via `irm claude.ai/install.ps1 | iex` or winget; requires Git for Windows), **Codex** (npm `@openai/codex` or Rust binary; `-c instructions=` works cross-platform), **Gemini CLI** (npm `@google/gemini-cli`; `GEMINI_SYSTEM_MD` officially documented), **OpenCode** (scoop/choco/npm; **publisher renamed sst → anomalyco** — update any hardcoded URLs), **Pi** (npm `@mariozechner/pi-coding-agent` — this is `pi-mono` by `badlogic`, NOT Inflection AI). Open follow-up: verify OpenCode's env-var injection on native Windows before shipping — upstream recommends WSL and has known native-install rough edges. See Research Findings §3 for install methods and flag-parity matrix
 - [x] **Default shell on Windows** — `cmd.exe` (always available) vs PowerShell (better UX but requires detection). Recommend `cmd.exe` for v1 with PowerShell via explicit user setting
   - **Decided (2026-04-12)**: `cmd.exe` for v1. `default_shell()` on Windows reads `COMSPEC` env var (which defaults to `cmd.exe` path) with a literal `"cmd.exe"` fallback. PowerShell detection via `HKLM\SOFTWARE\Microsoft\PowerShell` is a follow-up — users can override via a user setting later.
+  - **Superseded (2026-04-15)**: After v0.1.21 shipped, real Windows usage exposed two issues with `cmd.exe`: (1) the agent-context preset wrappers needed POSIX `$VAR` shell expansion which `cmd.exe` doesn't speak (so `claude --system-prompt "$CODEMUX_AGENT_CONTEXT"` was passed as a literal string instead of the expanded context — breaking the entire context injection feature on Windows), and (2) the modern Windows experience for users who actually open a terminal is universally PowerShell, not `cmd.exe`. New chain in `resolve_windows_shell()` (commit `b26a2e1`): try `pwsh.exe` (PowerShell 7+) on `PATH` first, fall back to `powershell.exe` (Windows PowerShell 5.1, pre-installed on every supported Windows version), then `COMSPEC`, then literal `"cmd.exe"`. The agent-context layer (commit `d5259a9`) emits `$env:CODEMUX_AGENT_CONTEXT` instead of `$CODEMUX_AGENT_CONTEXT` on Windows so the new default actually expands the variable. Tested cross-platform via `inject_claude_adds_system_prompt_unix` / `inject_claude_adds_system_prompt_windows` (and the matching codex / pi pairs). Pure functions in `terminal/mod.rs::resolve_windows_shell` and `agent_context::agent_context_shell_expansion` so the fallback chain is unit-tested on Linux CI.
 
 ---
 

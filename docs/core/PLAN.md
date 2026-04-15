@@ -15,8 +15,8 @@
 ## Roadmap At A Glance
 
 1. Foundations landed in meaningful form: phases 0 through 9.6 established the workspace shell, multi-session terminals, pane management, notifications, browser prototype, CLI and socket control, indexing, and project memory.
-2. Current focus: phases 10 through 15 are about turning that foundation into a trustworthy Linux MVP while hardening OpenFlow.
-3. Parallel track: Phase 18 (Windows support) foundation has been merged to `main` (commit `cc9b946`, post-`v0.1.19`). The release pipeline, matrix CI, `cfg`-gated code paths, and Windows-specific tests have landed and been verified end-to-end against a throwaway release tag. OpenFlow-on-Windows and Authenticode signing remain gated before a real Windows v1. See `docs/plans/windows-support.md`.
+2. Current focus: phases 10 through 15 are about hardening OpenFlow and getting the Linux + Windows release pipeline polished for daily use.
+3. Parallel track: Phase 18 (Windows support) is **shipping**. The Windows foundation merged in commit `cc9b946` and shipped in `v0.1.20` and `v0.1.21`. `main` is currently 8 commits past `v0.1.21`, all of them post-release Windows fixes (PowerShell as default shell, portable-pty fork for `CREATE_NO_WINDOW` / `SW_HIDE`, scrollback flush backstop, editor detection rewrite, window controls on full-screen views, system-process port filtering). OpenFlow-on-Windows and Authenticode signing remain gated before a polished Windows v1. See `docs/plans/windows-support.md`.
 4. Later: Phase 17 (macOS) has not been started.
 
 ## Ordered Phases
@@ -45,18 +45,20 @@
 
 ## Immediate Priority Order
 
-1. Cut the first release that actually includes Windows binaries (current `main` is 19 commits past `v0.1.19`, which tagged BEFORE the Windows merge — the foundation is in the tree but has never shipped to users)
+1. Cut the next release (`v0.1.22`) bundling the post-`v0.1.21` Windows fixes (PowerShell default shell, portable-pty fork, scrollback flush backstop, editor detection rewrite, window controls, system-process port filter) — the fixes are in the tree but every Windows user on `v0.1.21` is missing them
 2. Harden OpenFlow reliability and intervention flow
-3. Add notification sound playback
-4. Add memory drawer UI
-5. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
-6. Linux release packaging and polish
-7. macOS support (Phase 17)
+3. Re-enable OpenFlow on Windows by rewriting the bash wrapper scripts in `openflow::prompts` (the only thing currently gating OpenFlow on Windows)
+4. Add notification sound playback
+5. Add memory drawer UI
+6. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
+7. Windows Authenticode code signing — pick OV vs EV certificate once SmartScreen friction starts showing up in user reports
+8. macOS support (Phase 17)
 
 ## Recently Completed
 
+- Windows post-release hardening pass (commits between `v0.1.21` and current `main`): forked `portable-pty` to add `CREATE_NO_WINDOW` + `STARTF_USESHOWWINDOW + SW_HIDE` in `psuedocon.rs` (kills the visible `cmd.exe` flash on every PTY spawn), switched `default_shell()` to prefer PowerShell (`pwsh` → `powershell` → `COMSPEC` → `cmd.exe`), taught `agent_context::inject_agent_context` to emit PowerShell `$env:VAR` syntax for Claude / Codex / Pi / Gemini presets, rewrote `find_editors()` to use the `which::which()` Rust crate plus `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code / Cursor / VSCodium / Zed, extracted `<WindowChrome />` so login / settings / empty-state screens have minimize/maximize/close buttons on Windows, extended the close-handler scrollback flush timeout from 3s to 10s on Windows with a backend `flush_cache_to_disk` backstop for the cache miss case, added a Windows system-process name filter (`svchost.exe`, `System`, `lsass.exe`, etc.) so port detection doesn't surface 16+ kernel ports, routed preset failures through the sonner toast wrapper, and switched Windows preset commands to `\r` line terminators
+- Windows support foundation released in `v0.1.20` and `v0.1.21`: the `cc9b946` merge landed first, then `v0.1.20` / `v0.1.21` shipped to users with cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform `release.yml` matrix, cross-platform `latest.json` via tauri-action merge, and 38 Windows-specific tests
 - PTY child process tree cleanup on session close: single `killpg(pid, SIGKILL)` via a central `terminate_pty_session` helper called from every close path. Closes the TOCTOU window that previous SIGTERM→200ms→SIGKILL dance left exposed to PID recycling. Leaked ~20 GiB/day of zombie processes (Claude CLI, MCP servers, rust-analyzer) before the fix; now every close path tears down the whole group. `impl Drop for SessionRuntime` is a safety net that kills the group with a warning if any future refactor skips the normal close path.
-- Windows support foundation merged to main (`cc9b946`): cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform release.yml matrix, cross-platform `latest.json` via tauri-action merge, 38 new tests for Windows code paths, verification via throwaway test tag against the live release pipeline (see `docs/plans/windows-support.md`)
 - Session persistence: terminal scrollback save/restore and adapter-based resume
 - GitHub issue integration (link issues to workspaces, issue picker, auto-branch naming)
 - Browser wait conditions, JS evaluation, and CSS style inspection (MCP tools, 26→29)

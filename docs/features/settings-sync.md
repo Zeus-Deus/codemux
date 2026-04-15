@@ -45,8 +45,8 @@ UserSettings
     show_hidden_files: boolean (default: false)
   session_restore
     enabled: boolean           (default: true)
-    scrollback_lines: number   (default: 5000)
-    max_total_mb: number       (default: 50)
+    scrollback_lines: number   (default: 10000)
+    max_total_mb: number       (default: 100)
 ```
 
 ### Offline Cache
@@ -88,7 +88,7 @@ Serde default annotations ensure backward compatibility — missing fields deser
 
 ## Settings UI
 
-Opened via the settings button or command palette. Sections:
+Opened via the settings button or command palette. The Settings panel has 12 sections:
 
 | Section | Category | What It Controls | Synced |
 |---------|----------|-----------------|--------|
@@ -97,13 +97,15 @@ Opened via the settings button or command palette. Sections:
 | Notifications | Personal | Sound toggle, desktop toggle | Yes |
 | Shortcuts | Personal | Keybind editor with recording, conflict detection, reset | Yes (via keyboard.shortcuts) |
 | Editor | Editor & Workflow | Default IDE dropdown | Yes |
-| Terminal | Editor & Workflow | Scrollback limit, cursor style | Yes |
+| Terminal | Editor & Workflow | Scrollback limit, cursor style, font size, color theme | Yes |
 | Presets | Editor & Workflow | Terminal preset management | No (local) |
 | Projects | Editor & Workflow | Setup/teardown/run scripts | No (local) |
 | Git | Editor & Workflow | Default base branch | Yes |
-| File Tree | Editor & Workflow | Show hidden files toggle | Yes |
+| Agent | Editor & Workflow | AI commit/resolver config + auto-MCP toggle | No (local except auto-MCP) |
+| Browser | Editor & Workflow | Browser data management (clear cookies / all data) | No |
 | Session Restore | Editor & Workflow | Enable/disable, scrollback lines, disk limit | Yes |
-| Agent | Editor & Workflow | AI commit/resolver config | No (local) |
+
+The `file_tree.show_hidden_files` setting is synced but is **not exposed in the Settings panel** — the toggle lives directly in the right-sidebar file tree panel header (`file-tree-panel.tsx`). It still syncs across devices via `synced-settings-store`.
 
 ## What Works Today
 

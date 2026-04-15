@@ -17,7 +17,9 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 ## What Works Today
 
 - multiple concurrent terminal sessions per workspace
-- shell detection: on Unix, respects `$SHELL` and falls back to `/bin/bash`; on Windows, respects `%COMSPEC%` and falls back to `cmd.exe`
+- shell detection:
+  - **Unix**: respects `$SHELL` and falls back to `/bin/bash`
+  - **Windows**: prefers `pwsh.exe` (PowerShell 7+) when on `PATH`, falls back to `powershell.exe` (Windows PowerShell 5.1, pre-installed on every supported Windows version), then `%COMSPEC%`, then literal `"cmd.exe"`. PowerShell wins because the Windows preset wrappers emit PowerShell `$env:VAR` syntax for context injection — see `agent_context.rs` and `docs/features/presets.md`
 - PTY resize on pane/window resize
 - xterm.js WebGL renderer with kitty keyboard protocol support
 - terminal theme reads dynamically from CSS variables via MutationObserver
@@ -27,6 +29,12 @@ The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a 
 - comm log support for OpenFlow agent communication tracking
 - ANSI code stripping for log capture
 - session close kills the PTY child and its entire process group via a single `killpg(pid, SIGKILL)` through the central `terminate_pty_session` helper, so closing a pane/tab/workspace also tears down any Claude CLI, MCP server, or rust-analyzer the shell spawned. `portable-pty`'s Unix spawn path calls `setsid()`, so the shell is a process-group leader and `killpg` reaches its children. A previous version did SIGTERM → 200ms grace → SIGKILL; that grace window is exactly the adversarial case for PID recycling (the shell handles SIGTERM and exits in ~50ms, the kernel reuses the PID for an unrelated process, our SIGKILL lands on the wrong process group), so the current code goes straight to SIGKILL and collapses the race to microseconds. `impl Drop for SessionRuntime` is a safety net that kills the tree with a warning if the normal close path is ever skipped.
+
+## Windows-Specific Notes
+
+- **`portable-pty` is pinned to a fork** (`Zeus-Deus/portable-pty`, branch `codemux-0.8.1-no-window`). Upstream `portable-pty 0.8.1` omits both `CREATE_NO_WINDOW` and `STARTF_USESHOWWINDOW + SW_HIDE` from `dwCreationFlags` in `psuedocon.rs`, which makes every PTY spawn flash a visible `cmd.exe` console window on the taskbar before being attached to a pseudoconsole. The fork ORs the flags in. Pinning instead of upgrading to 0.9.x avoids the `0.9.0` upstream regression #6783 (reader returns garbage output on Windows).
+- **`spawn_pty_for_agent` PATH joining** uses the cross-platform `prepend_shim_to_path()` helper (`;` separator on Windows, `:` on Unix). A previous version hardcoded `:` and broke shim lookup on Windows.
+- **Preset command line terminator** is `\r` on Windows so PowerShell actually executes the typed-in command on submit (Unix uses `\n`).
 
 ## Current Constraints
 

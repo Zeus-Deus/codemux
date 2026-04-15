@@ -14,20 +14,22 @@ Codemux detects installed code editors on the system and provides "Open in Edito
 
 ### Detection
 
-On first call to `detect_editors()`, the backend checks for each candidate via `which <cmd>`. Results are cached in a static `OnceLock<Vec<EditorInfo>>` for the session lifetime.
+On first call to `detect_editors()`, the backend resolves each candidate via the `which::which()` Rust crate (NOT a shelled-out `which` binary — that wouldn't exist on Windows). On Windows, if `PATH` lookup misses, the resolver falls back to a hardcoded list of well-known per-user install paths under `%LOCALAPPDATA%\Programs`, `%ProgramFiles%`, and `%ProgramFiles(x86)%`. Results are cached in a static `OnceLock<Vec<EditorInfo>>` for the session lifetime.
 
 Detected editors:
 
-| Command | Display Name |
-|---------|-------------|
-| `code` | VS Code |
-| `cursor` | Cursor |
-| `codium` | VSCodium |
-| `zed` | Zed |
-| `idea` | IntelliJ IDEA |
-| `goland` | GoLand |
-| `webstorm` | WebStorm |
-| `sublime_text` | Sublime Text |
+| Command | Display Name | Windows Fallback Paths |
+|---------|-------------|---------------------|
+| `code` | VS Code | `Microsoft VS Code\Code.exe` |
+| `cursor` | Cursor | `cursor\Cursor.exe` |
+| `codium` | VSCodium | `VSCodium\VSCodium.exe` |
+| `zed` | Zed | `Zed\Zed.exe` |
+| `idea` | IntelliJ IDEA | (PATH only — JetBrains Toolbox shims live on `PATH`) |
+| `goland` | GoLand | (PATH only) |
+| `webstorm` | WebStorm | (PATH only) |
+| `sublime_text` | Sublime Text | (PATH only) |
+
+The `EditorInfo.command` field stores the **full resolved path**, not just the command name, so `open_in_editor` can spawn the exact `.exe` we detected — important on Windows where PATH alone is unreliable for per-user installs.
 
 ### Opening
 
@@ -57,7 +59,7 @@ Detected editors:
 
 ## Important Touch Points
 
-- `src-tauri/src/commands/workspace.rs` — `detect_editors()`, `open_in_editor()`, `DETECTED_EDITORS`
+- `src-tauri/src/commands/workspace.rs` — `EDITOR_CANDIDATES`, `WINDOWS_EDITOR_FALLBACKS`, `resolve_editor_command()`, `windows_install_roots()`, `find_editors()`, `detect_editors()`, `open_in_editor()`, `DETECTED_EDITORS`
 - `src/components/layout/title-bar.tsx` — IdeLauncher component
 - `src/components/layout/sidebar-workspace-row.tsx` — context menu integration
 - `src/stores/synced-settings-store.ts` — `editor.default_ide` preference
