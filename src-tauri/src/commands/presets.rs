@@ -399,8 +399,44 @@ fn active_pane_for_workspace(state: &AppStateStore, workspace_id: &str) -> Optio
     Some(surface.active_pane_id.0.clone())
 }
 
+/// Line terminator written to a PTY after a programmatically-injected
+/// command.
+///
+/// **Use CR (0x0D), not LF (0x0A).** This matches the byte that xterm.js
+/// emits when the user physically presses Enter in the terminal — the
+/// Codemux frontend's `term.onData` → `writeToPty` path already sends
+/// `\r` on both Linux and Windows, so writing `\r` here means the
+/// programmatic-injection path and the keystroke path are byte-for-byte
+/// identical.
+///
+/// Why this must be `\r` on Windows:
+///
+/// - On Linux (bash/zsh/fish with readline) the default bindings map
+///   BOTH `C-m` (`\r`) and `C-j` (`\n`) to `accept-line`, so either
+///   byte submits a command. Codemux historically sent `\n` and it
+///   happened to work.
+///
+/// - On Windows (PowerShell 5.1 / PowerShell 7 with PSReadLine), only
+///   `\r` is recognized as the Enter keystroke — ConPTY dispatches
+///   incoming `\r` bytes as `VK_RETURN` key-down events, which
+///   PSReadLine's input handler binds to "submit current input". A
+///   `\n` byte does NOT produce `VK_RETURN`; PSReadLine interprets it
+///   as a soft line-break (equivalent to pressing Shift+Enter in many
+///   shells) and inserts a literal newline into the pending input
+///   buffer. The result is PowerShell displaying the preset command
+///   text followed by a `>>` continuation prompt, waiting for the
+///   user to hit Enter on their keyboard — the preset is typed into
+///   the prompt but never executed. This was the reported Windows
+///   bug that motivated switching from `\n` to `\r`.
+///
+/// Sending `\r` is correct on both platforms: readline's `C-m` binding
+/// handles Linux, and ConPTY's `VK_RETURN` dispatch handles Windows.
+const PTY_COMMAND_TERMINATOR: &[u8] = b"\r";
+
 /// Write a command string to a PTY session's stdin immediately.
-/// Only the raw command text + a newline are written — no serialization.
+/// Only the raw command text + a carriage return are written — no
+/// serialization. See `PTY_COMMAND_TERMINATOR` for the rationale on
+/// why CR is used rather than LF.
 fn write_command_to_pty(
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: &str,
@@ -410,7 +446,7 @@ fn write_command_to_pty(
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
             let _ = writer.write_all(command.as_bytes());
-            let _ = writer.write_all(b"\n");
+            let _ = writer.write_all(PTY_COMMAND_TERMINATOR);
             let _ = writer.flush();
         }
     }
@@ -548,12 +584,17 @@ fn wait_and_write_command(
         overall_start.elapsed()
     );
 
-    // Write the plain command text followed by a newline.
+    // Write the plain command text followed by the PTY command
+    // terminator. See `PTY_COMMAND_TERMINATOR` for why this is CR
+    // (0x0D) and not LF (0x0A) — short version: PSReadLine on Windows
+    // only recognizes CR as the Enter keystroke, and Linux readline
+    // accepts CR too via its `C-m` → `accept-line` binding, so CR is
+    // the right byte on both platforms.
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
             let _ = writer.write_all(command_to_write.as_bytes());
-            let _ = writer.write_all(b"\n");
+            let _ = writer.write_all(PTY_COMMAND_TERMINATOR);
             let _ = writer.flush();
         }
     }
@@ -678,14 +719,39 @@ mod tests {
 
         write_command_to_pty(&sessions, "sess", "echo hello");
 
-        // Verify command was written
+        // Verify command was written — text followed by CR (0x0D),
+        // not LF (0x0A). See `PTY_COMMAND_TERMINATOR` for why CR is
+        // used. Asserting the exact byte catches any regression that
+        // accidentally switches the terminator back to `\n`, which
+        // would re-break the Windows PowerShell preset-launch path.
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("sess").unwrap();
         let writer = runtime.writer.as_ref().unwrap();
         // Downcast to check contents — the writer is a Vec<u8>
         let writer_ptr = writer.as_ref() as *const dyn Write as *const Vec<u8>;
         let written = unsafe { &*writer_ptr };
-        assert_eq!(written, b"echo hello\n");
+        assert_eq!(written, b"echo hello\r");
+    }
+
+    #[test]
+    fn test_pty_command_terminator_is_carriage_return() {
+        // Regression guard: the programmatic preset-injection path
+        // MUST use CR (0x0D) as the Enter keystroke, not LF (0x0A).
+        // See the doc comment on `PTY_COMMAND_TERMINATOR` for the full
+        // rationale. Short version: PSReadLine on Windows only
+        // dispatches `VK_RETURN` for CR; LF is treated as a literal
+        // soft-newline that leaves PowerShell at the `>>` continuation
+        // prompt waiting for the user to hit Enter physically.
+        //
+        // This test exists specifically to break loudly in CI if
+        // someone "fixes" the terminator back to `\n` based on the
+        // intuition that `\n` is "the POSIX newline". Linux accepts
+        // both via readline's C-m / C-j bindings; Windows only accepts
+        // CR via ConPTY's VK_RETURN dispatch.
+        assert_eq!(
+            PTY_COMMAND_TERMINATOR, b"\r",
+            "PTY command terminator must be CR (0x0D) — see doc comment for why"
+        );
     }
 
     #[test]
@@ -791,9 +857,13 @@ mod tests {
         let writer = runtime.writer.as_ref().unwrap();
         let writer_ptr = writer.as_ref() as *const dyn Write as *const Vec<u8>;
         let written = unsafe { &*writer_ptr };
+        // Trailing byte must be CR (0x0D), not LF (0x0A) — see
+        // `PTY_COMMAND_TERMINATOR`. Asserting the exact byte catches
+        // accidental regressions that would re-break the Windows
+        // preset-launch path.
         assert_eq!(
             written,
-            b"claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\" --resume abc-123\n"
+            b"claude --dangerously-skip-permissions --system-prompt \"$CODEMUX_AGENT_CONTEXT\" --resume abc-123\r"
         );
     }
 
