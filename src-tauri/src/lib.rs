@@ -180,6 +180,12 @@ pub fn run() {
             }
 
             let handle = app.handle().clone();
+            // Track whether the persisted layout actually loaded. The
+            // Windows orphan-cleanup gate below uses this to skip the
+            // destructive `cleanup_orphan_scrollbacks(&[])` call after
+            // a force-close cascade. See `scrollback::should_run_orphan_cleanup`
+            // for the full failure-mode write-up.
+            let mut layout_loaded = false;
             if let Some(snapshot) = state::load_persisted_state() {
                 state::restore_session_ids(&snapshot);
                 let stripped = state::strip_openflow_from_snapshot(snapshot);
@@ -187,6 +193,7 @@ pub fn run() {
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
                 state.migrate_project_roots();
+                layout_loaded = true;
             } else {
                 // First launch — no persisted layout exists. Replace the
                 // default_app_state (which creates a CWD workspace) with an
@@ -215,11 +222,29 @@ pub fn run() {
                     .iter()
                     .map(|w| w.workspace_id.0.clone())
                     .collect();
-                let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
-                if !removed.is_empty() {
+
+                // Windows defensive gate: skip orphan cleanup when layout
+                // failed to load. Otherwise `cleanup_orphan_scrollbacks(&[])`
+                // (called with the empty workspace list produced by
+                // `state.clear_workspaces()`) would wipe every saved
+                // scrollback dir on disk — the second half of the
+                // "terminals start fresh on Windows" cascade. On Linux the
+                // gate is a pass-through (always returns true), preserving
+                // historical behavior verbatim. See
+                // `scrollback::should_run_orphan_cleanup` for the full
+                // failure-mode rationale.
+                if scrollback::should_run_orphan_cleanup(layout_loaded) {
+                    let removed = scrollback::cleanup_orphan_scrollbacks(&ws_ids);
+                    if !removed.is_empty() {
+                        eprintln!(
+                            "[codemux::scrollback] Cleaned up {} orphan scrollback dirs",
+                            removed.len()
+                        );
+                    }
+                } else {
                     eprintln!(
-                        "[codemux::scrollback] Cleaned up {} orphan scrollback dirs",
-                        removed.len()
+                        "[codemux::scrollback] Skipping orphan cleanup — layout state was not loaded \
+                         (Windows defensive gate to prevent force-close cascade from wiping scrollback)"
                     );
                 }
                 // Enforce disk limit from settings
@@ -319,8 +344,23 @@ pub fn run() {
                                     // Emit event for the frontend to serialize buffers
                                     let _ = async_handle.emit("serialize-terminal-buffers", ());
 
-                                    // Wait for the frontend to signal completion, or timeout after 3s.
-                                    // The frontend will emit "scrollback-serialization-complete" when done.
+                                    // Wait for the frontend to signal completion, or
+                                    // timeout. The frontend emits
+                                    // `scrollback-serialization-complete` when done.
+                                    //
+                                    // Timeout differs by platform: Linux/macOS IPC is
+                                    // fast enough for 3 seconds to be comfortable. On
+                                    // Windows, slower Tauri IPC + slower xterm
+                                    // serialization for many panes can exceed 3s,
+                                    // which silently truncates serialization and
+                                    // leaves panes "fresh" on the next launch. 10s
+                                    // gives enough headroom without making clean
+                                    // closes feel sluggish.
+                                    #[cfg(windows)]
+                                    const SCROLLBACK_TIMEOUT_SECS: u64 = 10;
+                                    #[cfg(not(windows))]
+                                    const SCROLLBACK_TIMEOUT_SECS: u64 = 3;
+
                                     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
                                     let tx = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
 
@@ -331,12 +371,47 @@ pub fn run() {
                                         }
                                     });
 
-                                    let _ = tokio::time::timeout(
-                                        std::time::Duration::from_secs(3),
+                                    let serialize_result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(SCROLLBACK_TIMEOUT_SECS),
                                         rx,
                                     ).await;
 
                                     async_handle.unlisten(listener);
+
+                                    if serialize_result.is_err() {
+                                        eprintln!(
+                                            "[codemux::lib] Frontend scrollback serialization timed out after {SCROLLBACK_TIMEOUT_SECS}s — \
+                                             cached scrollback may be incomplete on next launch"
+                                        );
+                                    }
+
+                                    // Windows backend backstop: flush any cached
+                                    // scrollback entries that the frontend didn't
+                                    // drain before the timeout. Cached entries come
+                                    // from panes that were unmounted during the
+                                    // session (tab/workspace switches) and exist
+                                    // only in memory until either the frontend
+                                    // calls `flushScrollbackCache` (happy path) or
+                                    // this backstop fires (timeout path).
+                                    //
+                                    // Idempotent: if the frontend already drained
+                                    // the cache, this is a no-op (returns 0).
+                                    //
+                                    // Windows-only because the timeout fires in
+                                    // practice only on Windows. Linux IPC is fast
+                                    // enough that the frontend reliably completes
+                                    // the serialization dance well within budget.
+                                    #[cfg(windows)]
+                                    {
+                                        let cache: tauri::State<'_, scrollback::ScrollbackCache> = async_handle.state();
+                                        let flushed = scrollback::flush_cache_to_disk(&cache);
+                                        if flushed > 0 {
+                                            eprintln!(
+                                                "[codemux::lib] Backend backstop flushed {flushed} cached scrollback entries \
+                                                 after frontend serialization (timeout or partial completion)"
+                                            );
+                                        }
+                                    }
 
                                     // Refresh scrollback metadata for sessions that were
                                     // never re-serialized by the frontend (inactive workspaces).
