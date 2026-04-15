@@ -10,6 +10,110 @@ use std::path::Path;
 /// Ports that are always excluded from detection (system services, databases, Codemux internals).
 const IGNORED_PORTS: &[u16] = &[22, 80, 443, 5432, 3306, 6379, 27017];
 
+/// Process names that are considered Windows system services and should
+/// be filtered out of port detection.
+///
+/// This list is the Windows equivalent of Linux's natural `/proc/*/fd/`
+/// permission filter. On Linux, `linux_detect_listening_ports` walks
+/// `/proc/*/fd/` symlinks to resolve socket inodes to PIDs — and a
+/// non-root process can only read its own user's fd dirs, so sockets
+/// owned by root/systemd/etc. are silently dropped at the inode→PID
+/// resolution step. The Windows path uses `netstat -ano` which lists
+/// EVERY listening socket regardless of owner, so without an explicit
+/// filter the UI would show 16+ system ports (135 RPC, 139 NetBIOS,
+/// 445 SMB, etc.) that Linux Codemux never shows.
+///
+/// Filtering by process name (not by port number) matches the user's
+/// stated preference and is robust against process-relocation: if a
+/// system service moves to a different port in a future Windows
+/// version, the filter still catches it as long as the process name
+/// is stable. Most of the ports a typical Windows host listens on are
+/// owned by `System` (PID 4) or `svchost.exe` — both covered here.
+///
+/// **Comparison is case-insensitive** because Windows process names
+/// canonically end in `.exe` but can be reported by tasklist with
+/// varying casing depending on locale and Windows version.
+///
+/// **What is NOT in this list (and why):**
+/// - User-runnable dev tools (`node.exe`, `python.exe`, etc.) — never
+///   filter user processes
+/// - Browser processes (`chrome.exe`, `firefox.exe`, `msedge.exe`) —
+///   user might be running a browser-attached dev workflow
+/// - Database servers (`postgres.exe`, `mysqld.exe`, `redis-server.exe`)
+///   — already covered by the port-level `IGNORED_PORTS` filter
+/// - IDE language servers (`rust-analyzer.exe`, `pylsp.exe`) — user
+///   might want to see their listen ports
+///
+/// `#[allow(dead_code)]` because the only runtime caller is inside
+/// `#[cfg(windows)] mod windows_impl`. On non-Windows non-test builds
+/// the constant compiles but is unreferenced — keeping it cross-platform
+/// compilable lets the parser_tests module exercise it on Linux CI
+/// without a `#[cfg(windows)]` test gate that would silently skip
+/// regressions until they reach a Windows runner.
+#[allow(dead_code)]
+const WINDOWS_SYSTEM_PROCESS_NAMES: &[&str] = &[
+    // Core kernel + session management
+    "System",                  // NT Kernel — owns 139 NetBIOS, 445 SMB, etc. (PID 4)
+    "Idle",                    // System Idle Process (PID 0)
+    "System Idle Process",     // Tasklist sometimes reports PID 0 with this name
+    "smss.exe",                // Session Manager Subsystem
+    "csrss.exe",               // Client/Server Runtime Subsystem
+    "wininit.exe",             // Windows Initialization
+    "winlogon.exe",            // Windows Logon
+    "services.exe",            // Service Control Manager
+    "lsass.exe",               // Local Security Authority
+    "lsm.exe",                 // Local Session Manager
+    // Service host — the catch-all for hundreds of Windows services,
+    // including 135 RPC, 5040 Delivery Optimization, and the dynamic
+    // RPC ephemeral ports (often 1042, 1043, etc.)
+    "svchost.exe",
+    // Desktop / windowing
+    "dwm.exe",                 // Desktop Window Manager
+    "fontdrvhost.exe",         // Font Driver Host
+    // Print + spooler
+    "spoolsv.exe",             // Print Spooler
+    // Search + indexing + defender — common ephemeral-port owners
+    "SearchIndexer.exe",       // Windows Search
+    "SearchProtocolHost.exe",  // Windows Search content extraction
+    "SearchFilterHost.exe",    // Windows Search filtering
+    "MsMpEng.exe",             // Microsoft Antimalware Engine (Defender)
+    "NisSrv.exe",              // Network Inspection Service (Defender)
+    "SecurityHealthService.exe", // Windows Security
+    // Update + delivery
+    "TrustedInstaller.exe",    // Windows Module Installer
+    // Misc system services that bind sockets
+    "WmiPrvSE.exe",            // WMI Provider Host
+    "dllhost.exe",             // COM Surrogate
+    "taskhostw.exe",           // Task Host
+    "RuntimeBroker.exe",       // Runtime Broker
+    "ApplicationFrameHost.exe", // UWP host
+];
+
+/// Returns true if the given process name matches a known Windows
+/// system process. Case-insensitive ASCII comparison.
+///
+/// Cross-platform pure function: no Windows-specific syscalls or types,
+/// so the test suite can validate it on Linux CI before it reaches a
+/// Windows runner. Only called from the Windows-specific
+/// `detect_listening_ports` path; Linux's own port detection uses
+/// `/proc/*/fd/` permissions to filter system processes implicitly,
+/// so this helper isn't invoked there.
+///
+/// See `WINDOWS_SYSTEM_PROCESS_NAMES` for the rationale on which names
+/// are included and which are intentionally absent.
+///
+/// `#[allow(dead_code)]` for the same reason as the constant above:
+/// the runtime caller is `#[cfg(windows)]`-gated but Linux test builds
+/// reference the function via `parser_tests`, so we keep it
+/// unconditionally compiled and just suppress the dead-code warning
+/// on non-Windows non-test builds.
+#[allow(dead_code)]
+fn is_windows_system_process(process_name: &str) -> bool {
+    WINDOWS_SYSTEM_PROCESS_NAMES
+        .iter()
+        .any(|sys| sys.eq_ignore_ascii_case(process_name))
+}
+
 /// Codemux internal port ranges.
 fn is_codemux_internal_port(port: u16) -> bool {
     (3900..=4199).contains(&port) || port >= 9222
@@ -342,8 +446,8 @@ fn parse_tasklist_csv(stdout: &str) -> HashMap<u32, String> {
 #[cfg(windows)]
 mod windows_impl {
     use super::{
-        is_codemux_internal_port, parse_netstat_output, parse_tasklist_csv, PortInfo,
-        IGNORED_PORTS,
+        is_codemux_internal_port, is_windows_system_process, parse_netstat_output,
+        parse_tasklist_csv, PortInfo, IGNORED_PORTS,
     };
     use std::collections::HashMap;
     use std::os::windows::process::CommandExt;
@@ -368,6 +472,18 @@ mod windows_impl {
     /// otherwise appear every 3 seconds under `scan_ports`), then
     /// delegates all parsing to the top-level `parse_netstat_output`
     /// function — which is cross-platform and unit-tested on Linux CI.
+    ///
+    /// After parsing, applies a Windows-specific system-process filter:
+    /// drops ports owned by `System`, `svchost.exe`, `lsass.exe`, and
+    /// other core Windows services. This matches Linux behavior, where
+    /// `/proc/*/fd/` permissions implicitly filter system-owned sockets
+    /// at the inode→PID resolution step. Without this filter the UI
+    /// shows 16+ system ports (135 RPC, 139 NetBIOS, 445 SMB, etc.)
+    /// that have no developer relevance.
+    ///
+    /// Filter is post-parse rather than inside `parse_netstat_output`
+    /// so the parser stays a pure cross-platform string function and
+    /// the Windows-specific behavior lives in Windows-specific code.
     pub fn detect_listening_ports() -> Vec<PortInfo> {
         let netstat = match silent_command("netstat").args(["-ano"]).output() {
             Ok(o) if o.status.success() => o,
@@ -375,7 +491,11 @@ mod windows_impl {
         };
         let stdout = String::from_utf8_lossy(&netstat.stdout);
         let process_names = load_process_names();
-        parse_netstat_output(&stdout, &process_names)
+        let mut ports = parse_netstat_output(&stdout, &process_names);
+        // Drop ports owned by Windows system processes. See
+        // `is_windows_system_process` for the list and rationale.
+        ports.retain(|p| !is_windows_system_process(&p.process_name));
+        ports
     }
 
     /// One-shot `tasklist /NH /FO csv` call — builds a PID → image-name
@@ -543,7 +663,10 @@ pub fn scan_ports(
 
 #[cfg(test)]
 mod parser_tests {
-    use super::{parse_netstat_output, parse_tasklist_csv};
+    use super::{
+        is_windows_system_process, parse_netstat_output, parse_tasklist_csv, PortInfo,
+        WINDOWS_SYSTEM_PROCESS_NAMES,
+    };
     use std::collections::HashMap;
 
     /// Realistic multi-line netstat fixture covering the cases we care about:
@@ -788,5 +911,336 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
         let map = parse_tasklist_csv(fixture);
         assert_eq!(map.len(), 1);
         assert_eq!(map.get(&4321), Some(&"valid.exe".to_string()));
+    }
+
+    // ── Windows system-process filter tests ───────────────────────
+    //
+    // These guard the fix for the user-reported "Windows port detection
+    // shows 16 system ports (135, 139, 445, 1042, 1043, ...)" issue.
+    // The filter is the Windows equivalent of Linux's natural
+    // /proc/*/fd/ permission filter — Linux drops system-owned sockets
+    // implicitly, Windows needs an explicit process-name match.
+    //
+    // All tests are cross-platform: they call `is_windows_system_process`
+    // directly and `parse_netstat_output` + `retain` to simulate what
+    // `windows_impl::detect_listening_ports` does. No Windows syscalls.
+
+    #[test]
+    fn test_is_windows_system_process_matches_core_kernel_processes() {
+        // The two highest-PID-frequency offenders from the user report:
+        // PID 4 ("System") owns 139 NetBIOS, 445 SMB, plus a handful of
+        // ephemeral ports. PID 0 ("Idle" / "System Idle Process") shows
+        // up too on some Windows builds.
+        assert!(is_windows_system_process("System"));
+        assert!(is_windows_system_process("Idle"));
+        assert!(is_windows_system_process("System Idle Process"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_matches_svchost() {
+        // svchost.exe is THE catch-all for hundreds of Windows services
+        // — it owns 135 RPC Endpoint Mapper, 5040 Delivery Optimization,
+        // and the dynamic RPC ephemeral ports (1042, 1043, etc. from the
+        // user's report). This single match is the most important entry
+        // in the filter list.
+        assert!(is_windows_system_process("svchost.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_matches_security_subsystem() {
+        // lsass + the Defender executables — lsass binds RPC, MsMpEng
+        // and friends bind ephemeral inspection ports.
+        assert!(is_windows_system_process("lsass.exe"));
+        assert!(is_windows_system_process("MsMpEng.exe"));
+        assert!(is_windows_system_process("NisSrv.exe"));
+        assert!(is_windows_system_process("SecurityHealthService.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_matches_search_indexer() {
+        // Windows Search binds ephemeral ports for content extraction
+        // workers. Three separate executables — all need to be filtered.
+        assert!(is_windows_system_process("SearchIndexer.exe"));
+        assert!(is_windows_system_process("SearchProtocolHost.exe"));
+        assert!(is_windows_system_process("SearchFilterHost.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_is_case_insensitive() {
+        // Tasklist locale + Windows version variations may report the
+        // same process with different casing. The filter must catch
+        // all variants without per-locale casing tables.
+        assert!(is_windows_system_process("SVCHOST.EXE"));
+        assert!(is_windows_system_process("svchost.EXE"));
+        assert!(is_windows_system_process("SvcHost.Exe"));
+        assert!(is_windows_system_process("SYSTEM"));
+        assert!(is_windows_system_process("system"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_does_not_match_user_processes() {
+        // CRITICAL false-positive guard: the filter MUST NOT hide any
+        // process a developer might run. If this test fails, the user
+        // would see their dev server vanish from the port UI.
+        assert!(!is_windows_system_process("node.exe"));
+        assert!(!is_windows_system_process("python.exe"));
+        assert!(!is_windows_system_process("python3.exe"));
+        assert!(!is_windows_system_process("ruby.exe"));
+        assert!(!is_windows_system_process("rustc.exe"));
+        assert!(!is_windows_system_process("cargo.exe"));
+        assert!(!is_windows_system_process("go.exe"));
+        assert!(!is_windows_system_process("java.exe"));
+        assert!(!is_windows_system_process("dotnet.exe"));
+        assert!(!is_windows_system_process("php.exe"));
+        assert!(!is_windows_system_process("deno.exe"));
+        assert!(!is_windows_system_process("bun.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_does_not_match_browsers() {
+        // Browsers might be running a CDP debug port the user wants to
+        // see — never filter them out. (The Codemux internal port range
+        // 9222+ catches the agent-browser CDP port separately.)
+        assert!(!is_windows_system_process("chrome.exe"));
+        assert!(!is_windows_system_process("firefox.exe"));
+        assert!(!is_windows_system_process("msedge.exe"));
+        assert!(!is_windows_system_process("brave.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_does_not_match_databases() {
+        // Database servers should remain visible — the user might be
+        // running a non-default port. The IGNORED_PORTS list handles
+        // standard ports (5432, 3306, 6379, 27017) at the port level.
+        assert!(!is_windows_system_process("postgres.exe"));
+        assert!(!is_windows_system_process("mysqld.exe"));
+        assert!(!is_windows_system_process("redis-server.exe"));
+        assert!(!is_windows_system_process("mongod.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_does_not_match_ide_language_servers() {
+        // Language servers bind ports for IDE integration. User dev
+        // tools — never filter.
+        assert!(!is_windows_system_process("rust-analyzer.exe"));
+        assert!(!is_windows_system_process("pylsp.exe"));
+        assert!(!is_windows_system_process("typescript-language-server.exe"));
+        assert!(!is_windows_system_process("clangd.exe"));
+    }
+
+    #[test]
+    fn test_is_windows_system_process_handles_empty_and_unknown() {
+        // Empty string and "unknown" (the fallback when tasklist
+        // doesn't have the PID) must NOT be filtered. An unknown
+        // process is still potentially user-relevant.
+        assert!(!is_windows_system_process(""));
+        assert!(!is_windows_system_process("unknown"));
+    }
+
+    #[test]
+    fn test_windows_system_process_names_constant_is_non_empty() {
+        // Compile-time-ish guard: if a future refactor accidentally
+        // empties the list, every system port would suddenly leak
+        // back into the UI. Loud failure here is much better than
+        // a regression.
+        assert!(
+            !WINDOWS_SYSTEM_PROCESS_NAMES.is_empty(),
+            "WINDOWS_SYSTEM_PROCESS_NAMES must contain at least one entry; \
+             an empty list disables the filter and reintroduces the \
+             16-system-ports-on-Windows bug"
+        );
+        // The two most important entries — defends against an entry
+        // being removed without a paired test update.
+        assert!(WINDOWS_SYSTEM_PROCESS_NAMES.contains(&"System"));
+        assert!(WINDOWS_SYSTEM_PROCESS_NAMES.contains(&"svchost.exe"));
+    }
+
+    /// Apply the same filter that `windows_impl::detect_listening_ports`
+    /// applies post-parse. Cross-platform helper so the integration
+    /// test below can run on Linux CI.
+    fn apply_windows_system_filter(ports: Vec<PortInfo>) -> Vec<PortInfo> {
+        ports
+            .into_iter()
+            .filter(|p| !is_windows_system_process(&p.process_name))
+            .collect()
+    }
+
+    #[test]
+    fn test_windows_system_filter_removes_user_reported_system_ports() {
+        // Reproduces the user-reported scenario: a netstat-style port
+        // list (parsed) containing a mix of system ports (135, 139,
+        // 445, 1042, 1043, 5040) and one legitimate dev server (5173).
+        // After applying the filter only the dev server should remain.
+        //
+        // The PIDs and process names mirror what tasklist produces on
+        // a real Windows box — System (PID 4) for SMB/NetBIOS, svchost
+        // for RPC and Delivery Optimization. The test simulates the
+        // post-parse filter step from `windows_impl::detect_listening_ports`.
+        let input = vec![
+            PortInfo {
+                port: 135,
+                pid: 1024,
+                process_name: "svchost.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 139,
+                pid: 4,
+                process_name: "System".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 445,
+                pid: 4,
+                process_name: "System".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 1042,
+                pid: 1024,
+                process_name: "svchost.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 1043,
+                pid: 1024,
+                process_name: "svchost.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 5040,
+                pid: 1024,
+                process_name: "svchost.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 5173,
+                pid: 12345,
+                process_name: "node.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+        ];
+
+        let filtered = apply_windows_system_filter(input);
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "expected only the node.exe dev server to survive, got: {filtered:?}"
+        );
+        assert_eq!(filtered[0].port, 5173);
+        assert_eq!(filtered[0].process_name, "node.exe");
+    }
+
+    #[test]
+    fn test_windows_system_filter_preserves_user_processes() {
+        // Mirror image of the previous test: every entry should
+        // SURVIVE the filter, because none of them are system processes.
+        // This guards against an over-aggressive future addition to
+        // WINDOWS_SYSTEM_PROCESS_NAMES.
+        let input = vec![
+            PortInfo {
+                port: 3000,
+                pid: 100,
+                process_name: "node.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 8000,
+                pid: 200,
+                process_name: "python.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 9229,
+                pid: 300,
+                process_name: "chrome.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+            PortInfo {
+                port: 8080,
+                pid: 400,
+                process_name: "java.exe".into(),
+                workspace_id: None,
+                label: None,
+            },
+        ];
+
+        let filtered = apply_windows_system_filter(input.clone());
+        assert_eq!(
+            filtered, input,
+            "filter must preserve all user processes verbatim"
+        );
+    }
+
+    #[test]
+    fn test_windows_system_filter_preserves_unknown_process_names() {
+        // When tasklist doesn't have a PID (rare but possible — the
+        // process exited between netstat and tasklist), the parser
+        // sets process_name = "unknown". The filter must NOT drop
+        // these — an unknown process might be user-relevant.
+        let input = vec![PortInfo {
+            port: 7777,
+            pid: 999,
+            process_name: "unknown".into(),
+            workspace_id: None,
+            label: None,
+        }];
+
+        let filtered = apply_windows_system_filter(input.clone());
+        assert_eq!(filtered, input, "unknown processes must survive the filter");
+    }
+
+    /// End-to-end-ish test of the full Windows pipeline:
+    /// netstat fixture → parse_netstat_output → system filter.
+    /// Mirrors what `windows_impl::detect_listening_ports` does, except
+    /// with a string fixture instead of a real netstat call.
+    #[test]
+    fn test_full_windows_pipeline_filters_system_and_keeps_user_ports() {
+        // Realistic mixed fixture: a few system services that should
+        // be filtered, one dev server that should survive.
+        let fixture = "\
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       1024
+  TCP    0.0.0.0:139            0.0.0.0:0              LISTENING       4
+  TCP    0.0.0.0:445            0.0.0.0:0              LISTENING       4
+  TCP    0.0.0.0:1042           0.0.0.0:0              LISTENING       1024
+  TCP    0.0.0.0:5040           0.0.0.0:0              LISTENING       1024
+  TCP    0.0.0.0:5173           0.0.0.0:0              LISTENING       12345
+";
+        let mut process_names = HashMap::new();
+        process_names.insert(4, "System".to_string());
+        process_names.insert(1024, "svchost.exe".to_string());
+        process_names.insert(12345, "node.exe".to_string());
+
+        let parsed = parse_netstat_output(fixture, &process_names);
+        // Parsing alone would return 5173 (135 is NOT in IGNORED_PORTS,
+        // and the system-process filter hasn't run yet — this confirms
+        // the parser is NOT doing the filtering, the post-parse step is).
+        let parsed_ports: Vec<u16> = parsed.iter().map(|p| p.port).collect();
+        // 135, 1042, 5040, 5173 should be in the parsed output.
+        // 139 and 445 are also not in IGNORED_PORTS so they're parsed too.
+        assert!(parsed_ports.contains(&5173), "5173 must be parsed");
+        assert!(parsed_ports.contains(&135), "135 must be parsed (filter is post-parse)");
+        assert!(parsed_ports.contains(&139), "139 must be parsed (filter is post-parse)");
+        assert!(parsed_ports.contains(&445), "445 must be parsed (filter is post-parse)");
+
+        let filtered = apply_windows_system_filter(parsed);
+        let filtered_ports: Vec<u16> = filtered.iter().map(|p| p.port).collect();
+        assert_eq!(
+            filtered_ports,
+            vec![5173],
+            "after the system-process filter only the node.exe dev server should remain"
+        );
     }
 }
