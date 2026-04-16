@@ -1151,7 +1151,15 @@ mod tests {
         assert!(!pid_is_live_xvfb(-1));
     }
 
+    // Unix-only: the whole XDG_RUNTIME_DIR fallback concept is freedesktop-
+    // specific and doesn't apply to Windows (no XDG on Windows, no /tmp
+    // semantic equivalent for ageing, no /proc for a guaranteed-unwritable
+    // seed path). On Windows `create_dir_all("/proc/...")` happily creates
+    // a relative directory in the test CWD and our "unwritable" assumption
+    // breaks. Windows users hit the virtual_display path only through future
+    // WSL2 integration, where this Linux code runs *inside* the distro.
     #[test]
+    #[cfg(unix)]
     fn ensure_secrets_dir_falls_back_when_xdg_unwritable() {
         // Point XDG_RUNTIME_DIR at a read-only path; ensure_secrets_dir
         // should degrade to /tmp/codemux-vd-<N>/ rather than failing.
