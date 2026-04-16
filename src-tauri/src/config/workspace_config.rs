@@ -12,6 +12,41 @@ pub struct WorkspaceConfig {
     pub run: Option<String>,
     #[serde(default)]
     pub worktree_includes: Vec<String>,
+    /// Display-isolation / sandbox settings for this workspace. All fields
+    /// have defaults so pre-existing `.codemux/config.json` files keep
+    /// deserializing cleanly.
+    #[serde(default)]
+    pub sandbox: SandboxConfig,
+}
+
+/// Per-workspace sandbox settings (Phase 2 of display isolation).
+///
+/// `None` fields fall back to the caller's default policy — typically the
+/// `ExecutionPolicy::openflow_agent_default()` values. Users override per
+/// workspace by editing `.codemux/config.json`:
+///
+/// ```json
+/// {
+///   "sandbox": {
+///     "virtual_display": true,
+///     "watch_vnc": true
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SandboxConfig {
+    /// Override `ExecutionPolicy::allow_desktop_gui`. `None` = use policy default.
+    #[serde(default)]
+    pub allow_desktop_gui: Option<bool>,
+    /// Override `ExecutionPolicy::virtual_display`. `None` = use policy default
+    /// (which itself reads the `CODEMUX_VIRTUAL_DISPLAY` env var).
+    #[serde(default)]
+    pub virtual_display: Option<bool>,
+    /// Expose the virtual display over x11vnc so the user can watch the
+    /// agent's GUI via a VNC client. Requires `virtual_display: true` and
+    /// `x11vnc` on PATH; no-op otherwise.
+    #[serde(default)]
+    pub watch_vnc: Option<bool>,
 }
 
 /// Find the git repository root by walking up from `path`.
@@ -91,6 +126,7 @@ pub fn read_effective_config(
         teardown: scripts.teardown,
         run: scripts.run,
         worktree_includes: scripts.worktree_includes,
+        sandbox: SandboxConfig::default(),
     })
 }
 
@@ -241,6 +277,57 @@ mod tests {
 
         let config = read_workspace_config(dir.path()).unwrap();
         assert_eq!(config.run, None);
+    }
+
+    #[test]
+    fn test_sandbox_defaults_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"setup": ["npm install"]}"#,
+        )
+        .unwrap();
+
+        let config = read_workspace_config(dir.path()).unwrap();
+        assert_eq!(config.sandbox.allow_desktop_gui, None);
+        assert_eq!(config.sandbox.virtual_display, None);
+        assert_eq!(config.sandbox.watch_vnc, None);
+    }
+
+    #[test]
+    fn test_sandbox_config_explicit_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"sandbox": {"virtual_display": true, "watch_vnc": true, "allow_desktop_gui": false}}"#,
+        )
+        .unwrap();
+
+        let config = read_workspace_config(dir.path()).unwrap();
+        assert_eq!(config.sandbox.allow_desktop_gui, Some(false));
+        assert_eq!(config.sandbox.virtual_display, Some(true));
+        assert_eq!(config.sandbox.watch_vnc, Some(true));
+    }
+
+    #[test]
+    fn test_sandbox_config_partial_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".codemux");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.json"),
+            r#"{"sandbox": {"virtual_display": true}}"#,
+        )
+        .unwrap();
+
+        let config = read_workspace_config(dir.path()).unwrap();
+        assert_eq!(config.sandbox.virtual_display, Some(true));
+        assert_eq!(config.sandbox.allow_desktop_gui, None);
+        assert_eq!(config.sandbox.watch_vnc, None);
     }
 
     #[test]

@@ -48,7 +48,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
 - Agent hooks: `docs/features/hooks.md`
-- Execution backends / sandboxing: `docs/features/execution.md`
+- Execution backends / sandboxing: `docs/features/execution.md`, `docs/plans/sandboxing.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`
 - Port detection: `docs/features/ports.md`
 - Search: `docs/features/search.md`

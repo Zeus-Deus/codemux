@@ -502,6 +502,15 @@ pub fn close_workspace_with_worktree(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
+    // Release virtual display for this workspace (idempotent).
+    {
+        let vd_manager: State<
+            '_,
+            crate::execution::virtual_display::VirtualDisplayManager,
+        > = app.state();
+        vd_manager.release(&workspace_id);
+    }
+
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
             let branch_to_delete = if delete_branch.unwrap_or(false) {
@@ -639,6 +648,16 @@ pub fn close_workspace(
     let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
     for session_id in result.removed_sessions {
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
+    }
+
+    // Release the virtual display (if any) allocated for this workspace.
+    // Idempotent — no-op if no display was ever acquired.
+    {
+        let vd_manager: State<
+            '_,
+            crate::execution::virtual_display::VirtualDisplayManager,
+        > = app.state();
+        vd_manager.release(&workspace_id);
     }
 
     crate::state::emit_app_state(&app);

@@ -11,6 +11,7 @@ pub mod package_detect;
 pub mod presets;
 pub mod settings_sync;
 pub mod update;
+pub mod virtual_display;
 pub mod workspace;
 
 pub use ai::*;
@@ -26,6 +27,7 @@ pub use package_detect::*;
 pub use presets::*;
 pub use settings_sync::*;
 pub use update::*;
+pub use virtual_display::*;
 pub use workspace::*;
 
 use crate::indexing::{
