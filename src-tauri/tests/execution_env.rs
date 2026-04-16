@@ -159,26 +159,37 @@ fn worktree_session_default_is_noop_today() {
 
 #[test]
 fn openflow_default_strips_gui_on_every_platform_fallback() {
-    // The OpenFlow default has allow_desktop_gui=false. On any platform where
-    // the real sandbox isn't available (or on macOS/Windows where the
-    // backends are still stubs), env_unset MUST be populated so the strip
-    // actually happens at spawn time.
+    // The OpenFlow default has allow_desktop_gui=false. There are four
+    // possible resolved backends depending on host OS + bwrap availability:
+    //
+    //   Linux + bwrap installed   -> LinuxBubblewrap (env stripped via
+    //                                 --unsetenv inside bwrap; env_unset
+    //                                 stays empty)
+    //   Linux - bwrap missing     -> HostPassthrough (env_unset populated)
+    //   macOS                     -> MacOsSandbox stub (env_unset populated)
+    //   Windows                   -> WindowsRestricted stub (env_unset populated)
+    //
+    // The invariant: except for the real-bwrap branch, every backend MUST
+    // populate env_unset so `allow_desktop_gui: false` is actually enforced
+    // at spawn time. Previously this test only handled the Linux cases and
+    // panicked on Windows CI with "unexpected effective backend:
+    // WindowsRestricted" when the runtime behavior was actually correct.
     let policy = ExecutionPolicy::openflow_agent_default();
     let prepared = prepare_agent_command("opencode".into(), vec![], "/tmp", &policy);
-    match prepared.backend {
-        ExecutionBackendKind::LinuxBubblewrap => {
-            // Real bwrap path: env handled by --unsetenv, env_unset empty.
-            assert!(prepared.env_unset.is_empty());
+
+    let is_real_bwrap = matches!(prepared.backend, ExecutionBackendKind::LinuxBubblewrap);
+    if is_real_bwrap {
+        assert!(
+            prepared.env_unset.is_empty(),
+            "bwrap handles env strip via --unsetenv; env_unset should be empty"
+        );
+    } else {
+        for key in gui_env_keys() {
+            assert!(
+                prepared.env_unset.iter().any(|k| k == key),
+                "env_unset missing {key} on {:?} backend — GUI env would leak",
+                prepared.backend
+            );
         }
-        ExecutionBackendKind::HostPassthrough => {
-            // Fallback: strip list must cover every GUI key.
-            for key in gui_env_keys() {
-                assert!(
-                    prepared.env_unset.iter().any(|k| k == key),
-                    "env_unset missing {key} on HostPassthrough fallback"
-                );
-            }
-        }
-        other => panic!("unexpected effective backend: {other:?}"),
     }
 }
