@@ -12,7 +12,9 @@ Stop agents running inside Codemux from pushing GUI windows onto the user's host
 
 ## Status at a Glance
 
-**Original user ask — "stop agent apps popping up on my screen"** — ✅ **SOLVED.** Phase 1 env-strip fires on every OpenFlow agent spawn across Linux/macOS/Windows. Phase 2 virtual display (Linux) is the opt-in upgrade for when you want agents to actually *run* headed apps invisibly.
+**Original user ask — "stop agent apps popping up on my screen"** — ✅ **SOLVED.** Phase 1 env-strip fires on every agent session spawn in Codemux across Linux/macOS/Windows. Phase 2 virtual display (Linux) is the opt-in upgrade for when you want agents to actually *run* headed apps invisibly.
+
+This is a **Codemux-level feature**, not OpenFlow-specific. OpenFlow (Codemux's built-in multi-agent orchestrator) happens to be the loudest consumer because it runs several agents in parallel, but the same `ExecutionPolicy` + `VirtualDisplayManager` infrastructure applies to any spawn path — future agent modes, user-opted worktree terminals, anything that goes through `prepare_agent_command`.
 
 | Phase | What | Status |
 |-------|------|--------|
@@ -48,7 +50,7 @@ Also:
 - Apply the policy to `spawn_pty_for_session` (today it has no policy at all, so regular worktree shells inherit `DISPLAY` raw).
 - Cross-platform safety: the GUI key list (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `DESKTOP_STARTUP_ID`, `XAUTHORITY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, `QT_QPA_PLATFORM`) is a no-op on Windows (those vars aren't set) and a partial benefit on macOS (XQuartz/GTK apps respect them; native Cocoa apps don't).
 
-**Default posture:** keep the OpenFlow agent default `allow_desktop_gui: false` — which today only worked on Linux+bwrap, and now works on every platform via env-strip. For regular worktree shells, keep the default `allow_desktop_gui: true` so user-typed `firefox` still opens normally. Per-workspace override via `.codemux/config.json` (later UI).
+**Default posture:** keep the agent-session default `allow_desktop_gui: false` (today this is what `ExecutionPolicy::openflow_agent_default()` produces; the name is historical and unchanged, but the policy applies to any agent consumer, not just OpenFlow). Previously this only actually worked on Linux+bwrap; now it works on every platform via env-strip. For regular worktree shells, keep the default `allow_desktop_gui: true` so user-typed `firefox` still opens normally. Per-workspace override via `.codemux/config.json` (later UI).
 
 This is all Phase 1 ships. It's ~150 lines and zero new dependencies.
 
@@ -72,8 +74,8 @@ Bwrap profile hardening, seccomp-bpf, Landlock, Job Object UI limits. Only when 
 
 ## Active Priorities
 
-1. **Ship Phase 1 this PR.** Env-strip for OpenFlow agents on all platforms, wired into both spawn paths. Tests included.
-2. **Per-workspace config surface** for `allow_desktop_gui` toggle — back-compat default preserves current behavior, OpenFlow keeps `false`, regular shells default `true`.
+1. **Ship Phase 1 this PR.** Env-strip for agent sessions on all platforms, wired into both spawn paths. Tests included.
+2. **Per-workspace config surface** for `allow_desktop_gui` toggle — back-compat default preserves current behavior, agent sessions keep `false`, regular shells default `true`.
 3. **Phase 2 design doc** for the virtual-display path once Phase 1 is baked.
 4. **Phase 4 ("watch the agent" VNC pane)** remains the product wedge — no local ADE ships this in 2026.
 
@@ -100,7 +102,7 @@ Bwrap profile hardening, seccomp-bpf, Landlock, Job Object UI limits. Only when 
   - Orphan sweep on `VirtualDisplayManager::new()` — unlinks stale lock files whose PID is dead (handles Codemux crashes)
   - `Drop` impl calls `shutdown_all()` for belt-and-braces cleanup on app exit
   - `ExecutionPolicy.virtual_display: bool` field with `#[serde(default)]` for back-compat
-  - `openflow_agent_default()` reads `CODEMUX_VIRTUAL_DISPLAY=1` env var to auto-enable for all OpenFlow agents (opt-in today, workspace-config later)
+  - `openflow_agent_default()` (the historical name for the agent-session constructor) reads `CODEMUX_VIRTUAL_DISPLAY=1` env var to auto-enable virtual display for every agent it constructs — that's currently OpenFlow adapters, but any future consumer of the same constructor gets the same behavior
   - `spawn_pty_for_agent` acquires via the manager AFTER env-strip and injects `DISPLAY=:N`; graceful degrade with log line if Xvfb isn't installed
   - Both workspace close paths (`close_workspace`, `close_workspace_with_worktree`) call `release(workspace_id)` — idempotent
   - 5 unit tests + 7 integration tests in `src-tauri/tests/virtual_display.rs` (real-Xvfb tests skip cleanly when Xvfb isn't installed)

@@ -1,7 +1,7 @@
 # Execution Backends
 
-- Purpose: Describe the sandbox-execution abstraction that gates how OpenFlow agents spawn child processes.
-- Audience: Anyone working on OpenFlow, sandboxing, cross-platform spawn behavior, or permission policies.
+- Purpose: Describe Codemux's sandbox-execution abstraction that gates how agent sessions (and any other spawn path that opts in) launch child processes.
+- Audience: Anyone working on agent sandboxing, cross-platform spawn behavior, display isolation, or permission policies. OpenFlow (Codemux's built-in multi-agent orchestrator) is the largest current consumer but not the only one.
 - Authority: Canonical feature doc for execution policy and backends.
 - Update when: A new backend is added, an existing backend's behavior changes, or the default policy changes.
 - Read next: `docs/features/openflow.md`, `docs/plans/windows-support.md`
@@ -32,7 +32,7 @@ pub struct ExecutionPolicy {
 }
 ```
 
-`ExecutionPolicy::openflow_agent_default()` picks the backend based on the compile-time host OS (`cfg!(target_os = ...)`) and sets sensible defaults (network on, browser automation on, desktop GUI off).
+`ExecutionPolicy::openflow_agent_default()` (historical name — today it's the default for every agent session, not strictly OpenFlow-only) picks the backend based on the compile-time host OS (`cfg!(target_os = ...)`) and sets sensible defaults (network on, browser automation on, desktop GUI off).
 
 `prepare_agent_command(executable, args, cwd, policy)` is the spawn-time entry point. It reads `policy.effective_backend()` and returns a `PreparedExecutionCommand` with the real executable, args, and the backend that was actually applied. On Linux with Bubblewrap, it wraps the command in `bwrap --bind / / --unshare-pid --unshare-ipc --unshare-net --die-with-parent ...` (see `build_linux_bwrap_args`). On every other branch today, it returns the original command unwrapped — the macOS and Windows backends are placeholders.
 
@@ -43,12 +43,12 @@ pub struct ExecutionPolicy {
 - Linux Bubblewrap sandbox with PID / IPC / network namespace unsharing and `--die-with-parent` cleanup
 - Graceful `HostPassthrough` fallback when `bwrap` is not installed (logged but not fatal)
 - Capability flags threaded through the policy struct and serialized for UI / settings
-- OpenFlow agents spawn via this path — the orchestrator does NOT touch `Command::new()` directly
+- Agent sessions spawn via this path — consumers (OpenFlow today, potentially others later) do NOT touch `Command::new()` directly
 - Backend label string (`"linux_bubblewrap"`, `"host_passthrough"`, etc.) surfaced in observability logs for every agent spawn
 - Cross-platform compile (the `LinuxBubblewrap` arm is `#[cfg(target_os = "linux")]` gated inside `prepare_agent_command`)
 - **Cross-platform GUI env-strip (Phase 1 display isolation):** `PreparedExecutionCommand` carries an `env_unset` list that both `spawn_pty_for_agent` and `spawn_pty_for_session` apply via `CommandBuilder::env_remove` after all env setting. On the bwrap branch the list is empty (bwrap handles it via `--unsetenv`); on every fallback path — macOS stub, Windows stub, bwrap-missing Linux, `HostPassthrough` — the list is populated from `gui_env_keys()` whenever `allow_desktop_gui=false`. This is what finally makes the OpenFlow `allow_desktop_gui: false` default actually take effect on macOS and Windows instead of being advisory.
 - **Adapter `extra_env` is filtered** against `env_unset` in `spawn_pty_for_agent` so an adapter propagating `DISPLAY` from the host env cannot silently un-do the strip.
-- **`ExecutionPolicy::worktree_session_default()`** preserves current behavior for regular (non-OpenFlow) worktree shells: `HostPassthrough` backend, `allow_desktop_gui: true`, no wrapping. Future per-workspace config can flip `allow_desktop_gui: false` to opt a workspace into env-strip without wrapping the shell in bwrap.
+- **`ExecutionPolicy::worktree_session_default()`** preserves current behavior for regular (non-agent) worktree shells: `HostPassthrough` backend, `allow_desktop_gui: true`, no wrapping. Future per-workspace config can flip `allow_desktop_gui: false` to opt a workspace into env-strip without wrapping the shell in bwrap.
 - **Phase 2: Per-workspace virtual display (Linux).** `src-tauri/src/execution/virtual_display.rs` manages Xvfb processes per workspace: lazy spawn on first agent acquire, idempotent acquire (same workspace gets same display), graceful `SIGTERM` → 5s grace → `SIGKILL` on release, orphan sweep of `/tmp/.X<n>-lock` on startup, shutdown-all on app exit via `Drop`. Xvfb is launched with the 2026-canonical flags for agent dev workflows: `-screen 0 1920x1080x24 -dpi 96 -noreset -nolisten tcp +extension GLX +extension RANDR -auth <cookie>`. Display numbers are allocated starting at `:1000` to avoid colliding with host session displays (`:0`–`:2`) and CI conventions (`:99`). Unsupported on macOS/Windows today — `is_supported()` returns `false` and `acquire()` returns `Error::Unsupported`/`Error::XvfbNotFound`; spawn code falls back to Phase 1 env-strip without crashing.
 - **Policy `virtual_display: bool` field** with `#[serde(default)]` for backward compatibility. `ExecutionPolicy::openflow_agent_default()` reads `CODEMUX_VIRTUAL_DISPLAY=1` / `true` / `yes` at construction time and flips the flag — opt-in for users who want computer-use today without editing JSON config. Per-workspace config (`.codemux/config.json` `sandbox.virtual_display`) also available — see below.
 - **Workspace close releases the virtual display.** Both `close_workspace` and `close_workspace_with_worktree` in `src-tauri/src/commands/workspace.rs` call `VirtualDisplayManager::release(workspace_id)` after PTY teardown. Idempotent — no-op if the workspace never opted in.
@@ -71,7 +71,7 @@ pub struct ExecutionPolicy {
 
 - **macOS backend is a placeholder**: `MacOsSandbox` falls through to `HostPassthrough`. A real implementation would use `sandbox-exec` with a profile (`/usr/bin/sandbox-exec -f <profile> ...`).
 - **Windows backend is a placeholder**: `WindowsRestricted` also falls through to `HostPassthrough`. A real implementation would use Job Objects (`CreateJobObject` + `SetInformationJobObject` for process limits) or AppContainer (`CreateProcessAsUser` with a restricted token).
-- **The Bubblewrap policy is hardcoded** — `build_linux_bwrap_args` has a single profile tuned for OpenFlow agents. There's no UI-configurable per-workspace policy yet.
+- **The Bubblewrap policy is hardcoded** — `build_linux_bwrap_args` has a single profile tuned for agent-session use. There's no UI-configurable per-workspace policy yet (per-workspace `.codemux/config.json` flags exist; a UI panel is planned).
 - **`allow_desktop_gui: false` is now enforced cross-platform via env-strip** on the `HostPassthrough` branch and the bwrap-missing fallback, in addition to the `--unsetenv` flags on the real bwrap branch. The strip is not a security control — a determined child can probe sockets directly — but it stops ~95% of accidental GUI popups from `npm run dev`, `electron .`, `playwright --headed`, etc. Real containment is Phase 2 (virtual display) / Phase 3 (full sandbox).
 - **No syscall filtering** — seccomp-bpf isn't wired into the Bubblewrap profile. An agent can still `unlink()` the user's files inside its own filesystem view because `bwrap --bind / /` exposes the host root read-write by default.
 
