@@ -15,6 +15,11 @@ import {
   TooltipProvider,
 } from "@/components/ui/tooltip";
 import {
+  HoverCard,
+  HoverCardTrigger,
+  HoverCardContent,
+} from "@/components/ui/hover-card";
+import {
   AlertDialog,
   AlertDialogAction,
   AlertDialogCancel,
@@ -602,6 +607,10 @@ function ConflictsSection({
   resolverEnabled,
   resolverStatus,
   resolverError,
+  resolverFiles,
+  resolverTempBranch,
+  resolverCli,
+  resolverModel,
   onStartResolve,
   onApproveResolve,
   onRejectResolve,
@@ -613,6 +622,10 @@ function ConflictsSection({
   resolverEnabled: boolean;
   resolverStatus: string;
   resolverError: string | null;
+  resolverFiles: string[];
+  resolverTempBranch: string | null;
+  resolverCli: string;
+  resolverModel: string | null;
   onStartResolve: () => void;
   onApproveResolve: () => void;
   onRejectResolve: () => void;
@@ -638,10 +651,62 @@ function ConflictsSection({
 
         {resolverStatus === "resolving" && (
           <div className="space-y-1">
-            <div className="flex items-center gap-1.5 px-1 py-1">
-              <Loader2 className="h-3 w-3 animate-spin text-primary" />
-              <span className="text-xs text-muted-foreground">AI is resolving conflicts...</span>
-            </div>
+            <HoverCard openDelay={150} closeDelay={100}>
+              <HoverCardTrigger asChild>
+                <div
+                  className="flex items-center gap-1.5 px-1 py-1 cursor-help rounded hover:bg-muted/40"
+                  data-testid="resolver-progress-trigger"
+                >
+                  <Loader2 className="h-3 w-3 animate-spin text-primary" />
+                  <span className="text-xs text-muted-foreground underline decoration-dotted decoration-muted-foreground/40 underline-offset-2">
+                    AI is resolving {resolverFiles.length || ""} conflict{resolverFiles.length === 1 ? "" : "s"}...
+                  </span>
+                </div>
+              </HoverCardTrigger>
+              <HoverCardContent side="bottom" align="start" className="w-72">
+                <div className="space-y-2">
+                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                    Resolver
+                  </div>
+                  <div className="text-xs">
+                    <span className="text-muted-foreground">Agent:</span>{" "}
+                    <span className="font-mono">{resolverCli}</span>
+                    {resolverModel && (
+                      <>
+                        {" "}
+                        <span className="text-muted-foreground">·</span>{" "}
+                        <span className="font-mono">{resolverModel}</span>
+                      </>
+                    )}
+                  </div>
+                  {resolverTempBranch && (
+                    <div className="text-xs">
+                      <span className="text-muted-foreground">Branch:</span>{" "}
+                      <span className="font-mono break-all">{resolverTempBranch}</span>
+                    </div>
+                  )}
+                  <div className="space-y-0.5">
+                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                      Conflicting files ({resolverFiles.length})
+                    </div>
+                    {resolverFiles.length === 0 ? (
+                      <div className="text-xs text-muted-foreground italic">none reported</div>
+                    ) : (
+                      <ul className="space-y-0.5 max-h-40 overflow-y-auto">
+                        {resolverFiles.map((path) => (
+                          <li key={path} className="text-xs font-mono break-all">
+                            {path}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground pt-1 border-t border-border">
+                    Working on a temp branch — your branch is untouched until you approve.
+                  </div>
+                </div>
+              </HoverCardContent>
+            </HoverCard>
             <Button
               size="xs"
               variant="ghost"
@@ -1914,6 +1979,10 @@ export function ChangesPanel({ workspace }: Props) {
                 resolverEnabled={config?.ai_resolver_enabled ?? false}
                 resolverStatus={resolver.status}
                 resolverError={resolver.error}
+                resolverFiles={resolver.conflictingFiles.map((f) => f.path)}
+                resolverTempBranch={resolver.tempBranch}
+                resolverCli={config?.ai_resolver_cli ?? "claude"}
+                resolverModel={config?.ai_resolver_model ?? null}
                 onStartResolve={handleStartResolve}
                 onApproveResolve={handleApproveResolve}
                 onRejectResolve={handleRejectResolve}

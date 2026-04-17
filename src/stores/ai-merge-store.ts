@@ -52,7 +52,20 @@ export const useAiMergeStore = create<AiMergeStore>()((set, get) => ({
   getResolver: (workspaceId) => get().resolvers[workspaceId] ?? IDLE,
 
   startResolution: (workspaceId, cwd, targetBranch, cli, model, strategy) => {
-    // Set creating_branch status
+    // If a previous run left a temp branch behind (error state, or a
+    // half-applied resolution), abort it before starting a new run. This
+    // prevents the bot/resolve-bot-resolve-... branch-name recursion that
+    // happened when the user pressed "Try Again" without aborting first.
+    const prior = get().resolvers[workspaceId];
+    const cleanup = prior?.tempBranch && prior?.originalBranch
+      ? abortResolution(cwd, prior.tempBranch, prior.originalBranch).catch((err) => {
+          // Log but don't block — backend will try its own cleanup, and
+          // the user's Try Again should still attempt a fresh run.
+          console.warn("[ai-merge] cleanup of stale temp branch failed:", err);
+        })
+      : Promise.resolve();
+
+    // Set creating_branch status (reset all prior fields)
     set((s) => ({
       resolvers: {
         ...s.resolvers,
@@ -60,8 +73,9 @@ export const useAiMergeStore = create<AiMergeStore>()((set, get) => ({
       },
     }));
 
-    // Step 1: Create temp branch and start merge
-    createResolverBranch(cwd, targetBranch)
+    // Step 1: Create temp branch and start merge (after cleanup)
+    cleanup
+      .then(() => createResolverBranch(cwd, targetBranch))
       .then((info) => {
         const files = info.conflicting_files.map((f) => f.path);
 

@@ -772,6 +772,91 @@ pub struct ResolverBranchInfo {
     pub conflicting_files: Vec<ConflictFile>,
 }
 
+/// Strip a previous resolver-branch prefix and trailing `-into-<target>-<ts>`
+/// from a branch name so a SECOND resolver invocation does not produce
+/// `bot/resolve-bot-resolve-...` recursion. Idempotent.
+///
+/// Recognizes BOTH prefix forms:
+///   - `bot/resolve-` (the original, what create_resolver_branch produces)
+///   - `bot-resolve-` (the dash form left over inside an already-nested
+///     branch name, because `replace('/', '-')` was applied to the prior
+///     branch when it was used as `safe_source`)
+///
+/// Examples:
+///   `bot/resolve-feature-into-main-1776365511` -> `feature`
+///   `bot/resolve-bot-resolve-foo-into-main-123-into-main-456` -> `foo`
+///   `feature/foo` -> `feature/foo` (untouched)
+pub(crate) fn strip_resolver_prefix(branch: &str) -> String {
+    let mut current = branch.to_string();
+    // Repeatedly peel `<prefix>...-into-<anything>-<digits>` layers,
+    // where <prefix> is either `bot/resolve-` or `bot-resolve-`.
+    loop {
+        let body = match current
+            .strip_prefix("bot/resolve-")
+            .or_else(|| current.strip_prefix("bot-resolve-"))
+        {
+            Some(rest) => rest,
+            None => return current,
+        };
+        // Find the last `-into-` that is followed by `<segment>-<digits>`.
+        let Some(into_idx) = body.rfind("-into-") else {
+            return current;
+        };
+        let after_into = &body[into_idx + "-into-".len()..];
+        // Trailing token must be all digits (timestamp).
+        let Some(last_dash) = after_into.rfind('-') else {
+            return current;
+        };
+        let trailing = &after_into[last_dash + 1..];
+        if trailing.is_empty() || !trailing.chars().all(|c| c.is_ascii_digit()) {
+            return current;
+        }
+        // Peel: keep just the source portion before `-into-`.
+        let stripped = body[..into_idx].to_string();
+        if stripped.is_empty() {
+            return current;
+        }
+        current = stripped;
+    }
+}
+
+/// Returns true if `text` contains any git conflict marker line.
+/// Looks for `<<<<<<< `, `>>>>>>> `, and `=======` AT THE START OF A LINE,
+/// matching how `git merge` writes them. The trailing space (or end-of-line
+/// for `=======`) prevents false positives on Markdown rule lines or
+/// `<<<<` patterns inside string literals/comments mid-line.
+pub(crate) fn has_conflict_markers(text: &str) -> bool {
+    for line in text.lines() {
+        if line.starts_with("<<<<<<< ")
+            || line.starts_with(">>>>>>> ")
+            || line == "======="
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Scan the listed files (relative to repo_path) for unresolved conflict
+/// markers. Returns the paths that still contain markers. Files that don't
+/// exist or can't be read are silently skipped — git status check covers
+/// "file deleted" cases separately.
+pub fn scan_files_for_conflict_markers(
+    repo_path: &Path,
+    files: &[String],
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for rel in files {
+        let abs = repo_path.join(rel);
+        if let Ok(content) = std::fs::read_to_string(&abs) {
+            if has_conflict_markers(&content) {
+                hits.push(rel.clone());
+            }
+        }
+    }
+    hits
+}
+
 pub fn create_resolver_branch(
     repo_path: &Path,
     target_branch: &str,
@@ -782,12 +867,14 @@ pub fn create_resolver_branch(
         return Err("Cannot create resolver branch: not on a named branch".to_string());
     }
 
-    // Generate temp branch name
+    // Generate temp branch name. Strip any prior resolver prefix so that a
+    // retry from a stale `bot/resolve-*` branch doesn't produce nested names.
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let safe_source = original_branch.replace('/', "-");
+    let canonical_source = strip_resolver_prefix(&original_branch);
+    let safe_source = canonical_source.replace('/', "-");
     let safe_target = target_branch.replace('/', "-");
     let temp_branch = format!("bot/resolve-{}-into-{}-{}", safe_source, safe_target, timestamp);
 
@@ -825,13 +912,31 @@ pub fn apply_resolution(
     original_branch: &str,
     message: &str,
 ) -> Result<(), String> {
-    // Verify all conflicts are resolved
+    // Verify all conflicts are resolved by git's index.
     let status = git_status(repo_path)?;
     let unresolved: Vec<_> = status.iter().filter(|f| f.status == FileStatus::Conflicted).collect();
     if !unresolved.is_empty() {
         return Err(format!(
-            "Cannot apply resolution: {} unresolved conflict(s)",
+            "Cannot apply resolution: {} unresolved conflict(s) — agent did not finish",
             unresolved.len()
+        ));
+    }
+
+    // Defense in depth: even if `git add` cleared the U flag, the file may
+    // still contain conflict markers in its content. Scan EVERY tracked file
+    // touched by this merge — both staged files and any path git knows about
+    // in the merge state.
+    let staged_paths: Vec<String> = status
+        .iter()
+        .filter(|f| f.is_staged)
+        .map(|f| f.path.clone())
+        .collect();
+    let dirty = scan_files_for_conflict_markers(repo_path, &staged_paths);
+    if !dirty.is_empty() {
+        return Err(format!(
+            "Cannot apply resolution: {} file(s) still contain conflict markers ({})",
+            dirty.len(),
+            dirty.join(", ")
         ));
     }
 
@@ -4210,5 +4315,285 @@ C  source.txt -> copy.txt";
         let wt = git_create_worktree(&local, "same-repo-feat", false, None, None)
             .expect("should work without pr_number for origin branch");
         git_remove_worktree(Path::new(&wt), Some("same-repo-feat"), true).expect("cleanup");
+    }
+
+    // ── Merge-resolver fixes ──────────────────────────────────────────
+    //
+    // Regression tests for the bugs reported in the merge-resolver deep
+    // dive: (1) `bot/resolve-` prefix recursion on retry, (2) conflict
+    // markers slipping past `apply_resolution` because `git add` clears
+    // the U flag from porcelain status. These are pure-function and
+    // file-system tests — no agent CLI is invoked.
+
+    #[test]
+    fn strip_resolver_prefix_passthrough_for_normal_branches() {
+        assert_eq!(strip_resolver_prefix("main"), "main");
+        assert_eq!(strip_resolver_prefix("feature/foo"), "feature/foo");
+        assert_eq!(strip_resolver_prefix("fix-stt-deadlock"), "fix-stt-deadlock");
+        assert_eq!(strip_resolver_prefix(""), "");
+    }
+
+    #[test]
+    fn strip_resolver_prefix_peels_one_layer() {
+        // The exact pattern produced by create_resolver_branch.
+        assert_eq!(
+            strip_resolver_prefix("bot/resolve-feature-into-main-1776365511"),
+            "feature"
+        );
+        assert_eq!(
+            strip_resolver_prefix("bot/resolve-fix-stt-into-main-1776365850"),
+            "fix-stt"
+        );
+    }
+
+    #[test]
+    fn strip_resolver_prefix_peels_nested_layers() {
+        // The exact branch reported in the user's incident:
+        //   bot/resolve-bot-resolve-fix-gpu-transcribe-deadlock-into-main-1776365511-into-main-1776365850
+        // strip_resolver_prefix MUST recurse all the way down to the
+        // original source branch `fix-gpu-transcribe-deadlock`. It
+        // recognizes both `bot/resolve-` (slash, original prefix) and
+        // `bot-resolve-` (dash form left by replace('/', '-')) so it can
+        // peel the inner layer too.
+        let nested =
+            "bot/resolve-bot-resolve-fix-gpu-transcribe-deadlock-into-main-1776365511-into-main-1776365850";
+        assert_eq!(
+            strip_resolver_prefix(nested),
+            "fix-gpu-transcribe-deadlock"
+        );
+    }
+
+    #[test]
+    fn strip_resolver_prefix_handles_dash_form_directly() {
+        // After the outer slash form is peeled once, the body lives in
+        // dash form. Verify we still peel that.
+        assert_eq!(
+            strip_resolver_prefix("bot-resolve-feature-into-main-1776365511"),
+            "feature"
+        );
+    }
+
+    #[test]
+    fn strip_resolver_prefix_idempotent_when_recursing() {
+        // Calling strip on its own output must converge — no infinite loops,
+        // no further changes once peeled.
+        let once = strip_resolver_prefix("bot/resolve-feature-into-main-1776365511");
+        let twice = strip_resolver_prefix(&once);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn strip_resolver_prefix_rejects_malformed_suffix() {
+        // Looks like a resolver branch but trailing token is not numeric:
+        // strip should NOT peel — return as-is.
+        assert_eq!(
+            strip_resolver_prefix("bot/resolve-foo-into-main-notanumber"),
+            "bot/resolve-foo-into-main-notanumber"
+        );
+        // Missing -into- separator: not a resolver pattern, return as-is.
+        assert_eq!(
+            strip_resolver_prefix("bot/resolve-foo-1776365511"),
+            "bot/resolve-foo-1776365511"
+        );
+    }
+
+    #[test]
+    fn has_conflict_markers_clean_file() {
+        assert!(!has_conflict_markers("hello world\n"));
+        assert!(!has_conflict_markers(""));
+        assert!(!has_conflict_markers("fn main() {\n    println!(\"hi\");\n}\n"));
+    }
+
+    #[test]
+    fn has_conflict_markers_detects_real_merge_output() {
+        // The exact shape `git merge` writes.
+        let conflicted = "\
+fn foo() {
+<<<<<<< HEAD
+    println!(\"ours\");
+=======
+    println!(\"theirs\");
+>>>>>>> branch
+}
+";
+        assert!(has_conflict_markers(conflicted));
+    }
+
+    #[test]
+    fn has_conflict_markers_ignores_in_string_literals_midline() {
+        // The pattern only matches at start-of-line with the trailing space
+        // (or end-of-line for `=======`). String literals or comments that
+        // contain `<<<<<<<` mid-line should NOT trip it.
+        let safe = r#"
+let banner = "<<<<<<< banner inside string";
+// also <<<<<<< not at start of line
+println!("{}", banner);
+"#;
+        assert!(!has_conflict_markers(safe));
+    }
+
+    #[test]
+    fn has_conflict_markers_ignores_markdown_rules() {
+        // `=======` is also a Markdown setext heading underline. Our match
+        // requires the line to be EXACTLY `=======` so a longer rule like
+        // `========` (8 equals) for a heading doesn't trip — but a 7-equals
+        // line in a real Markdown file is rare and would be a false
+        // positive. We accept that as the trade-off.
+        let md = "Title\n========\nBody text\n";
+        assert!(!has_conflict_markers(md));
+    }
+
+    #[test]
+    fn has_conflict_markers_partial_resolution() {
+        // Agent removed half the markers but left a stray `>>>>>>>`.
+        // This is the failure mode we explicitly want to catch.
+        let half = "\
+fn foo() {
+    println!(\"resolved\");
+>>>>>>> branch
+}
+";
+        assert!(has_conflict_markers(half));
+    }
+
+    #[test]
+    fn scan_files_for_conflict_markers_finds_dirty_files() {
+        let dir = TempDir::new().expect("tmp");
+        let repo = dir.path();
+        std::fs::write(repo.join("clean.txt"), "all good\n").unwrap();
+        std::fs::write(
+            repo.join("dirty.txt"),
+            "<<<<<<< HEAD\nA\n=======\nB\n>>>>>>> theirs\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("missing.txt"), "stub").unwrap(); // exists, clean
+        let hits = scan_files_for_conflict_markers(
+            repo,
+            &[
+                "clean.txt".into(),
+                "dirty.txt".into(),
+                "nonexistent.txt".into(),
+                "missing.txt".into(),
+            ],
+        );
+        assert_eq!(hits, vec!["dirty.txt"]);
+    }
+
+    /// Build a real two-branch merge-conflict scenario and return
+    /// (TempDir, repo_path, original_branch_name, target_branch_name).
+    /// The repo has a conflict in `shared.txt`. Cwd is the original branch.
+    fn setup_conflict_repo() -> (TempDir, PathBuf, String, String) {
+        let (dir, repo) = setup_test_repo();
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=t@t",
+            "commit", "--allow-empty", "-m", "base"]).unwrap();
+        // Pick whichever default branch exists.
+        let default_branch = run_git(&repo, &["branch", "--show-current"]).unwrap();
+        // Create target branch (main-side) with one edit.
+        run_git(&repo, &["checkout", "-b", "target"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "TARGET version\n").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=t@t",
+            "commit", "-m", "target edit"]).unwrap();
+        // Source branch (feature-side) with a conflicting edit.
+        run_git(&repo, &["checkout", &default_branch]).unwrap();
+        run_git(&repo, &["checkout", "-b", "feature"]).unwrap();
+        std::fs::write(repo.join("shared.txt"), "FEATURE version\n").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["-c", "user.name=Test", "-c", "user.email=t@t",
+            "commit", "-m", "feature edit"]).unwrap();
+        (dir, repo, "feature".to_string(), "target".to_string())
+    }
+
+    #[test]
+    fn create_resolver_branch_strips_prior_prefix_on_retry() {
+        let (_dir, repo, source, target) = setup_conflict_repo();
+        // First invocation: source is `feature` → temp branch
+        // `bot/resolve-feature-into-target-<ts1>`.
+        let info1 = create_resolver_branch(&repo, &target).expect("first resolver");
+        assert!(info1.temp_branch.starts_with("bot/resolve-feature-into-target-"));
+        assert_eq!(info1.original_branch, source);
+        // Abort the merge so we can simulate "Try Again" while still on
+        // the temp branch.
+        let _ = run_git(&repo, &["merge", "--abort"]);
+
+        // Sleep 1s to guarantee the next timestamp differs (otherwise
+        // git refuses to create a duplicate branch).
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Second invocation: cwd is now the temp branch. Without the
+        // strip_resolver_prefix fix, this would produce
+        // `bot/resolve-bot-resolve-feature-into-target-<ts1>-into-target-<ts2>`.
+        let info2 = create_resolver_branch(&repo, &target).expect("retry resolver");
+        assert!(
+            info2.temp_branch.starts_with("bot/resolve-feature-into-target-"),
+            "retry should peel prior resolver prefix, got {}",
+            info2.temp_branch
+        );
+        assert!(
+            !info2.temp_branch.contains("bot-resolve-"),
+            "retry must not nest the resolver prefix, got {}",
+            info2.temp_branch
+        );
+    }
+
+    #[test]
+    fn apply_resolution_rejects_unresolved_porcelain_status() {
+        let (_dir, repo, _source, target) = setup_conflict_repo();
+        let info = create_resolver_branch(&repo, &target).expect("resolver branch");
+        // Don't touch the file — conflicts are still UU in the index.
+        let err = apply_resolution(&repo, &info.temp_branch, &info.original_branch, "msg")
+            .expect_err("should reject unresolved");
+        assert!(
+            err.contains("unresolved conflict") || err.contains("unmerged"),
+            "expected unresolved-conflict error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_resolution_rejects_markers_even_after_git_add() {
+        let (_dir, repo, _source, target) = setup_conflict_repo();
+        let info = create_resolver_branch(&repo, &target).expect("resolver branch");
+        // Simulate the bug: agent writes a "resolution" that still has
+        // markers, then runs `git add` — clearing the U flag from
+        // porcelain status. The file-content scan must still catch it.
+        let bad = "\
+<<<<<<< HEAD
+FEATURE version
+=======
+TARGET version
+>>>>>>> target
+";
+        std::fs::write(repo.join("shared.txt"), bad).unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+
+        let err = apply_resolution(&repo, &info.temp_branch, &info.original_branch, "msg")
+            .expect_err("should reject conflict markers in staged content");
+        assert!(
+            err.contains("conflict markers") || err.contains("unmerged") || err.contains("unresolved"),
+            "expected marker-content error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_resolution_succeeds_when_conflict_truly_resolved() {
+        let (_dir, repo, source, target) = setup_conflict_repo();
+        let info = create_resolver_branch(&repo, &target).expect("resolver branch");
+        // Real resolution: pick one side, add, and let apply commit + merge.
+        std::fs::write(repo.join("shared.txt"), "RESOLVED version\n").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+
+        // Need git committer identity for the commit step.
+        run_git(&repo, &["config", "user.name", "Test"]).unwrap();
+        run_git(&repo, &["config", "user.email", "t@t"]).unwrap();
+
+        apply_resolution(&repo, &info.temp_branch, &info.original_branch, "resolved")
+            .expect("apply should succeed");
+
+        // After apply we should be back on the original branch with the
+        // merge committed.
+        let cur = run_git(&repo, &["branch", "--show-current"]).unwrap();
+        assert_eq!(cur, source);
+        let content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
+        assert_eq!(content, "RESOLVED version\n");
     }
 }

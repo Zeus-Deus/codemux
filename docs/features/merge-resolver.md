@@ -19,6 +19,9 @@ An AI-powered merge conflict resolver that works on temporary branches. When mer
 - User must explicitly approve the resolution before it is applied
 - Full diff review required before approval
 - Rejecting a resolution deletes the temporary branch and restores the original state
+- **Post-agent verification gate** (`ai::verify_resolution`): after the CLI exits, the backend independently verifies (a) `git status` shows zero `Conflicted` files AND (b) none of the originally-conflicting files contain `<<<<<<<` / `=======` / `>>>>>>>` markers. The UI never advances to "review" if the agent silently failed.
+- **Branch-name de-recursion** (`git::strip_resolver_prefix`): retry from a stale `bot/resolve-*` branch peels the prior prefix instead of nesting (`bot/resolve-bot-resolve-...`).
+- **Auto-cleanup on retry**: the frontend store calls `abortResolution` on any prior temp branch before starting a new one.
 
 ### Workflow
 
@@ -64,10 +67,11 @@ Resolver settings are in Settings > Editor & Workflow > Agent:
 
 ## Important Touch Points
 
-- `src-tauri/src/git.rs` — `create_resolver_branch`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`
-- `src-tauri/src/ai.rs` — `resolve_conflicts_with_agent` (agent invocation)
+- `src-tauri/src/git.rs` — `create_resolver_branch`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`, `strip_resolver_prefix`, `has_conflict_markers`, `scan_files_for_conflict_markers`
+- `src-tauri/src/ai.rs` — `resolve_conflicts_with_agent` (agent invocation), `verify_resolution` (post-agent gate)
 - `src-tauri/src/commands/git.rs` — Tauri command wrappers for resolver operations
-- `src/stores/ai-merge-store.ts` — Frontend state machine (zustand)
+- `src/stores/ai-merge-store.ts` — Frontend state machine (zustand); `startResolution` auto-cleans stale temp branches
 - `src/tauri/commands.ts` — Frontend command wrappers
-- `src/components/workspace/changes-panel.tsx` — "Merge Assistant" entry point
+- `src/components/workspace/changes-panel.tsx` — "Merge Assistant" entry point; HoverCard exposes file list / agent / temp branch during resolution
 - `src/components/workspace/pr-panel.tsx` — "Resolve Conflicts" entry point
+- `src/components/ui/hover-card.tsx` — shadcn HoverCard wrapper used by resolver progress UI
