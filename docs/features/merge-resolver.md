@@ -22,6 +22,12 @@ An AI-powered merge conflict resolver that works on temporary branches. When mer
 - **Post-agent verification gate** (`ai::verify_resolution`): after the CLI exits, the backend independently verifies (a) `git status` shows zero `Conflicted` files AND (b) none of the originally-conflicting files contain `<<<<<<<` / `=======` / `>>>>>>>` markers. The UI never advances to "review" if the agent silently failed.
 - **Branch-name de-recursion** (`git::strip_resolver_prefix`): retry from a stale `bot/resolve-*` branch peels the prior prefix instead of nesting (`bot/resolve-bot-resolve-...`).
 - **Auto-cleanup on retry**: the frontend store calls `abortResolution` on any prior temp branch before starting a new one.
+- **Non-interactive agent spawn** (`ai::build_resolver_argv`): the resolver is a one-shot headless task — there is no human to answer permission prompts. Every supported CLI is spawned with its skip-all-prompts flag so Edit/Write/Bash calls execute immediately:
+  - `claude --print --dangerously-skip-permissions …`
+  - `codex exec --full-auto …`
+  - `opencode run --dangerously-skip-permissions …`
+  This is safe because (a) the agent only ever operates inside the `bot/resolve-*` temp branch, (b) nothing is pushed or committed to the real branch without explicit user approval, and (c) the `verify_resolution` gate still runs post-hoc. The argv builder is a pure function with dedicated unit tests (`build_argv_*`) so a regression in any of these flag names fails CI immediately.
+- **Spawn timeout** (`ai::RESOLVER_TIMEOUT`, 10 min): if the agent deadlocks anyway (e.g. stuck network call, future CLI version that reintroduces an interactive prompt despite the flag), the spawn is killed and the UI shows a clear "did not finish within Ns" error instead of spinning forever.
 
 ### Workflow
 

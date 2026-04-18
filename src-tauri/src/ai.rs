@@ -1,6 +1,7 @@
 use crate::git::{git_status, scan_files_for_conflict_markers, FileStatus};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 use tokio::process::Command as AsyncCommand;
 
 pub fn claude_available() -> bool {
@@ -17,6 +18,84 @@ fn strategy_description(strategy: &str) -> &str {
         "prefer_ours" => "Keep our (current branch) changes as the baseline. Carefully integrate their changes where they don't conflict with ours.",
         "prefer_theirs" => "Keep their (target branch) changes as the baseline. Carefully integrate our changes where they don't conflict with theirs.",
         _ => "Understand the intent of both changes and write the optimal resolution that preserves all intended functionality.",
+    }
+}
+
+/// Upper bound on how long the resolver will wait for the agent CLI to
+/// finish. Large conflicts on big files can take a while, but if the agent
+/// deadlocks (e.g. blocking on an interactive permission prompt despite our
+/// skip-permissions flags, or stuck on a network call), we must bail so the
+/// UI can surface an error instead of spinning forever.
+pub(crate) const RESOLVER_TIMEOUT: Duration = Duration::from_secs(600); // 10 min
+
+/// Builds the argv (program + args) for spawning the given agent CLI in a
+/// fully non-interactive, pre-approved mode suitable for a headless merge
+/// resolver. Extracted as a pure function so tests can assert the exact
+/// flags without spawning a real process.
+///
+/// Returns `(program, args)`. The caller is responsible for setting
+/// `current_dir` and running with a timeout.
+///
+/// CRITICAL: every branch MUST include the CLI's "skip all permission
+/// prompts" flag. Without it the agent blocks on the first Edit/Bash call,
+/// the process never exits, and the user sees the resolver hang (or, worse,
+/// stdout saying "please grant me permissions" with no file changes — the
+/// exact failure mode this function exists to prevent).
+pub(crate) fn build_resolver_argv(
+    cli: &str,
+    model: Option<&str>,
+    system_prompt: &str,
+    user_prompt: &str,
+) -> (&'static str, Vec<String>) {
+    match cli {
+        "codex" => {
+            // `codex exec` is the non-interactive form; bare `codex` starts
+            // the TUI. `--full-auto` enables workspace-write sandbox + no
+            // approval prompts, matching the `codex --full-auto` pattern
+            // used in src-tauri/src/presets.rs for regular sessions.
+            let mut args = vec!["exec".to_string(), "--full-auto".to_string()];
+            if let Some(m) = model {
+                args.push("--model".to_string());
+                args.push(m.to_string());
+            }
+            args.push(format!("{}\n\n{}", system_prompt, user_prompt));
+            ("codex", args)
+        }
+        "opencode" => {
+            // `opencode run` is the non-interactive form.
+            // `--dangerously-skip-permissions` is documented in
+            // `opencode run --help` as "auto-approve permissions that are
+            // not explicitly denied".
+            let prompt = format!("{}\n\n{}", system_prompt, user_prompt);
+            let mut args = vec![
+                "run".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ];
+            if let Some(m) = model {
+                args.push("--model".to_string());
+                args.push(m.to_string());
+            }
+            args.push(prompt);
+            ("opencode", args)
+        }
+        _ => {
+            // Default: claude. `--print` is non-interactive.
+            // `--dangerously-skip-permissions` is the same flag used across
+            // the rest of Codemux (presets.rs, branch_name.rs,
+            // agent_context.rs) for headless claude invocations.
+            let mut args = vec![
+                "--print".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+                user_prompt.to_string(),
+                "--system-prompt".to_string(),
+                system_prompt.to_string(),
+            ];
+            if let Some(m) = model {
+                args.push("--model".to_string());
+                args.push(m.to_string());
+            }
+            ("claude", args)
+        }
     }
 }
 
@@ -52,48 +131,21 @@ pub async fn resolve_conflicts_with_agent(
         files.join(", ")
     );
 
-    let output = match cli {
-        "codex" => {
-            let mut args = vec!["--quiet".to_string()];
-            if let Some(m) = model {
-                args.push("--model".to_string());
-                args.push(m.to_string());
-            }
-            args.push(format!("{}\n\n{}", system_prompt, user_prompt));
-            AsyncCommand::new("codex")
-                .args(&args)
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run codex: {e}"))?
-        }
-        "opencode" => {
-            let prompt = format!("{}\n\n{}", system_prompt, user_prompt);
-            AsyncCommand::new("opencode")
-                .args(["--print", &prompt])
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run opencode: {e}"))?
-        }
-        _ => {
-            // Default: claude
-            let mut args = vec![
-                "--print".to_string(),
-                user_prompt,
-                "--system-prompt".to_string(),
-                system_prompt,
-            ];
-            if let Some(m) = model {
-                args.push("--model".to_string());
-                args.push(m.to_string());
-            }
-            AsyncCommand::new("claude")
-                .args(&args)
-                .current_dir(repo_path)
-                .output()
-                .await
-                .map_err(|e| format!("Failed to run claude: {e}"))?
+    let (program, args) = build_resolver_argv(cli, model, &system_prompt, &user_prompt);
+
+    // Timeout guard: if the agent deadlocks, bail cleanly instead of
+    // leaving the UI spinning forever.
+    let spawn = AsyncCommand::new(program)
+        .args(&args)
+        .current_dir(repo_path)
+        .output();
+    let output = match tokio::time::timeout(RESOLVER_TIMEOUT, spawn).await {
+        Ok(res) => res.map_err(|e| format!("Failed to run {cli}: {e}"))?,
+        Err(_) => {
+            return Err(format!(
+                "{cli} did not finish within {}s. The agent may be stuck on an interactive prompt despite skip-permissions flags. Abort and try again, or switch CLI / model.",
+                RESOLVER_TIMEOUT.as_secs()
+            ));
         }
     };
 
@@ -360,5 +412,148 @@ mod tests {
             err.contains("cannot determine intent"),
             "tail should be surfaced, got: {err}"
         );
+    }
+
+    // ---- Argv construction tests ----
+    //
+    // These are the tests that should have existed before the
+    // permission-prompt regression shipped. Each CLI branch MUST include
+    // the flag that bypasses interactive approvals; otherwise the spawned
+    // agent deadlocks on its first Edit/Bash call and the user sees the
+    // "I need you to grant permissions" failure reported in the bug.
+    //
+    // Keep these assertions flag-literal (not just "contains permissions")
+    // so a rename or typo in the real flag name is caught immediately.
+
+    #[test]
+    fn build_argv_claude_passes_dangerously_skip_permissions() {
+        let (program, args) = build_resolver_argv(
+            "claude",
+            None,
+            "sys prompt",
+            "user prompt",
+        );
+        assert_eq!(program, "claude");
+        assert!(
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "claude argv MUST include --dangerously-skip-permissions, got: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--print"), "need --print for non-interactive: {args:?}");
+        assert!(args.iter().any(|a| a == "--system-prompt"), "argv: {args:?}");
+        assert!(args.iter().any(|a| a == "user prompt"), "argv: {args:?}");
+        assert!(args.iter().any(|a| a == "sys prompt"), "argv: {args:?}");
+    }
+
+    #[test]
+    fn build_argv_claude_appends_model_when_set() {
+        let (_, args) = build_resolver_argv(
+            "claude",
+            Some("sonnet"),
+            "sys",
+            "user",
+        );
+        let idx = args.iter().position(|a| a == "--model").expect("model flag missing");
+        assert_eq!(args.get(idx + 1).map(String::as_str), Some("sonnet"));
+    }
+
+    #[test]
+    fn build_argv_claude_omits_model_when_none() {
+        let (_, args) = build_resolver_argv("claude", None, "sys", "user");
+        assert!(!args.iter().any(|a| a == "--model"), "argv: {args:?}");
+    }
+
+    #[test]
+    fn build_argv_codex_uses_exec_full_auto() {
+        let (program, args) = build_resolver_argv(
+            "codex",
+            None,
+            "sys prompt",
+            "user prompt",
+        );
+        assert_eq!(program, "codex");
+        // Bare `codex` starts the TUI; `codex exec` is the non-interactive
+        // form. `--full-auto` disables approval prompts (workspace-write
+        // sandbox). Without these flags codex hangs waiting for confirmation.
+        assert_eq!(args.first().map(String::as_str), Some("exec"), "argv: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--full-auto"),
+            "codex argv MUST include --full-auto, got: {args:?}"
+        );
+        // Prompt is concatenated system+user and appended last.
+        assert!(
+            args.last().map(String::as_str).unwrap_or_default().contains("user prompt"),
+            "prompt missing from argv: {args:?}"
+        );
+        assert!(
+            args.last().map(String::as_str).unwrap_or_default().contains("sys prompt"),
+            "system prompt missing from argv: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_argv_codex_appends_model_when_set() {
+        let (_, args) = build_resolver_argv(
+            "codex",
+            Some("gpt-5"),
+            "sys",
+            "user",
+        );
+        let idx = args.iter().position(|a| a == "--model").expect("model flag missing");
+        assert_eq!(args.get(idx + 1).map(String::as_str), Some("gpt-5"));
+    }
+
+    #[test]
+    fn build_argv_opencode_passes_dangerously_skip_permissions() {
+        let (program, args) = build_resolver_argv(
+            "opencode",
+            None,
+            "sys prompt",
+            "user prompt",
+        );
+        assert_eq!(program, "opencode");
+        // Bare `opencode` starts the TUI; `opencode run` is non-interactive.
+        assert_eq!(args.first().map(String::as_str), Some("run"), "argv: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "opencode argv MUST include --dangerously-skip-permissions, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_argv_opencode_appends_model_when_set() {
+        let (_, args) = build_resolver_argv(
+            "opencode",
+            Some("anthropic/claude-sonnet-4-6"),
+            "sys",
+            "user",
+        );
+        let idx = args.iter().position(|a| a == "--model").expect("model flag missing");
+        assert_eq!(args.get(idx + 1).map(String::as_str), Some("anthropic/claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn build_argv_unknown_cli_falls_back_to_claude() {
+        // Defensive: an unexpected `cli` string from a stale settings file
+        // should still produce a safe argv (with skip-permissions), not a
+        // bare `--print` that would hang on prompts.
+        let (program, args) = build_resolver_argv(
+            "some-future-cli",
+            None,
+            "sys",
+            "user",
+        );
+        assert_eq!(program, "claude");
+        assert!(
+            args.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "fallback argv MUST include --dangerously-skip-permissions, got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn resolver_timeout_is_reasonable() {
+        // Guardrail: not so short that a real agent run gets killed, not so
+        // long that a stuck agent blocks the UI for the rest of the day.
+        let s = RESOLVER_TIMEOUT.as_secs();
+        assert!((60..=1800).contains(&s), "timeout {s}s outside [60, 1800]");
     }
 }
