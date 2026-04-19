@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::json;
-use tempfile::{NamedTempFile, TempPath};
+use tempfile::TempDir;
 use tokio::time::timeout;
 
 use codemux_lib::agent_provider::codex::auth::{
@@ -93,26 +93,44 @@ where
     final_out
 }
 
-/// Write `value` to a temp file and return the path handle. The file is
-/// cleaned up when the [`TempPath`] is dropped.
-fn write_script(value: serde_json::Value) -> TempPath {
-    let f = NamedTempFile::new().expect("temp");
-    let path = f.into_temp_path();
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    path
+/// Guarded (dir, path) pair for a script that lives inside its own
+/// tempdir. Using a dedicated tempdir per script avoids inheritance /
+/// ETXTBSY races with concurrent tests that would briefly hold a
+/// writable fd on a shared tempfile.
+struct ScriptFile {
+    _dir: TempDir,
+    path: PathBuf,
 }
 
-/// Wrapper shell script that exports the caller's chosen env vars then
-/// execs the fake fixture. Returns a [`TempPath`] so the underlying file
-/// descriptor is not held open (otherwise Linux returns `ETXTBSY` when
-/// the child tries to exec it).
-fn wrapper_with_env(env: &[(&str, &str)]) -> TempPath {
-    let f = tempfile::Builder::new()
-        .prefix("codex-wrap-")
-        .suffix(".sh")
-        .tempfile()
-        .expect("temp");
-    let path = f.into_temp_path();
+impl ScriptFile {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+    fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
+        self.path.to_string_lossy()
+    }
+    fn to_path_buf(&self) -> PathBuf {
+        self.path.clone()
+    }
+}
+
+/// Write `value` as JSON to a fresh tempdir/script.json and return the
+/// guarded path.
+fn write_script(value: serde_json::Value) -> ScriptFile {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("script.json");
+    // Write+close in one call; std::fs::write drops the fd before
+    // returning.
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    ScriptFile { _dir: dir, path }
+}
+
+/// Write a bash wrapper script to a fresh tempdir and return it with +x
+/// permissions. The wrapper exports the requested env vars then execs
+/// the fake fixture.
+fn wrapper_with_env(env: &[(&str, &str)]) -> ScriptFile {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("wrap.sh");
     let mut body = String::from("#!/usr/bin/env bash\nset -e\n");
     for (k, v) in env {
         body.push_str(&format!("export {k}={}\n", shell_escape::escape(v)));
@@ -126,7 +144,7 @@ fn wrapper_with_env(env: &[(&str, &str)]) -> TempPath {
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
-    path
+    ScriptFile { _dir: dir, path }
 }
 
 mod shell_escape {
@@ -737,22 +755,19 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
     provider.stop_session(ThreadId("t-fail".into())).await.ok();
 }
 
-/// Write a bash script body to a fresh temp path with +x permissions and
-/// return the guarded path. Closes the temp fd before returning so that
-/// `exec`ing the path does not fail with ETXTBSY on Linux.
-fn write_bash_script(prefix: &str, body: &str) -> TempPath {
-    let f = tempfile::Builder::new()
-        .prefix(prefix)
-        .suffix(".sh")
-        .tempfile()
-        .unwrap();
-    let path = f.into_temp_path();
+/// Write a bash script body to a fresh dedicated tempdir with +x
+/// permissions and return the guarded path. Dedicated tempdir prevents
+/// ETXTBSY races with other concurrent tests writing to the same
+/// directory.
+fn write_bash_script(_prefix: &str, body: &str) -> ScriptFile {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("script.sh");
     std::fs::write(&path, body.as_bytes()).unwrap();
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).unwrap();
-    path
+    ScriptFile { _dir: dir, path }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -761,7 +776,7 @@ async fn auth_probe_installed_returns_version_when_codex_works() {
         "codex-ver-",
         "#!/usr/bin/env bash\nif [ \"$1\" = \"--version\" ]; then echo 'codex 1.0.0'; exit 0; fi\nexit 1\n",
     );
-    let result = probe_installed(&wrapper).await.unwrap();
+    let result = probe_installed(wrapper.path()).await.unwrap();
     assert_eq!(result.as_deref(), Some("1.0.0"));
 }
 
@@ -771,7 +786,7 @@ async fn auth_probe_unauthenticated_matches_common_patterns() {
         "codex-auth-",
         "#!/usr/bin/env bash\nif [ \"$2\" = \"status\" ]; then echo 'Not logged in. Run codex login.'; exit 0; fi\nexit 0\n",
     );
-    let status = probe_authenticated(&wrapper).await.unwrap();
+    let status = probe_authenticated(wrapper.path()).await.unwrap();
     assert!(matches!(status, AuthStatus::Unauthenticated { .. }));
 }
 
