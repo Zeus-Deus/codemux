@@ -1,35 +1,32 @@
 // Entry point for the claude-agent sidecar.
 //
 // * Reads newline-delimited JSON-RPC 2.0 messages from stdin.
-// * Dispatches requests to a fixed registry (currently only `ping`).
-// * Writes responses to stdout, logs everything else to stderr.
+// * Dispatches requests against the method registry built in
+//   `methods/index.ts`.
+// * Writes responses and notifications to stdout.
+// * All logging goes to stderr — stdout is reserved for the protocol
+//   channel.
 // * Exits 0 on stdin EOF, SIGTERM, or SIGINT; exits 1 on unhandled
 //   exceptions or rejections.
-//
-// This file deliberately lives at the edge — no business logic — so
-// that future methods just register themselves in `methods` without
-// risking protocol drift.
 
 import {
   formatMessage,
   isRequest,
   parseLine,
   RPC_INTERNAL_ERROR,
+  RPC_INVALID_PARAMS,
   RPC_METHOD_NOT_FOUND,
   RPC_PARSE_ERROR,
   type JsonRpcId,
   type JsonRpcOutgoing,
 } from "./rpc.ts";
 import { logger } from "./logger.ts";
-import { ping } from "./methods/ping.ts";
-
-type MethodHandler = (params: unknown) => Promise<unknown>;
-
-/** Registry of implemented methods. Keep the registry the single source
- *  of truth — `main.ts` should not contain any method-specific logic. */
-const methods: Record<string, MethodHandler> = {
-  ping: (params) => ping((params ?? {}) as Record<string, unknown>),
-};
+import {
+  buildMethods,
+  InvalidParamsError,
+  type MethodHandler,
+} from "./methods/index.ts";
+import type { EventEmitter } from "./session.ts";
 
 function writeMessage(msg: JsonRpcOutgoing): void {
   process.stdout.write(formatMessage(msg));
@@ -58,7 +55,18 @@ function writeMethodNotFound(id: JsonRpcId, method: string): void {
   });
 }
 
-function writeInternalError(id: JsonRpcId, err: unknown): void {
+function writeError(id: JsonRpcId, err: unknown): void {
+  if (err instanceof InvalidParamsError) {
+    writeMessage({
+      jsonrpc: "2.0",
+      id,
+      error: {
+        code: RPC_INVALID_PARAMS,
+        message: err.message,
+      },
+    });
+    return;
+  }
   const e = err instanceof Error ? err : new Error(String(err));
   writeMessage({
     jsonrpc: "2.0",
@@ -71,8 +79,20 @@ function writeInternalError(id: JsonRpcId, err: unknown): void {
   });
 }
 
-/** Dispatch one framed line. Any failure produces a well-formed
- *  JSON-RPC error response rather than throwing. */
+/** Event emitter passed into the session and permissions subsystems.
+ *  Each call turns into a JSON-RPC notification on stdout. */
+const emitter: EventEmitter = {
+  notification(method, params) {
+    writeMessage({
+      jsonrpc: "2.0",
+      method,
+      params,
+    });
+  },
+};
+
+const methods: Record<string, MethodHandler> = buildMethods(emitter);
+
 async function handleLine(raw: string): Promise<void> {
   let msg;
   try {
@@ -81,10 +101,8 @@ async function handleLine(raw: string): Promise<void> {
     writeParseError(raw, err);
     return;
   }
-  if (msg === null) return; // blank line, silently skip
+  if (msg === null) return;
 
-  // `isRequest` narrows `msg` to a type carrying `id`; capturing the
-  // narrowed value keeps subsequent branches type-safe.
   if (isRequest(msg)) {
     const handler = methods[msg.method];
     if (!handler) {
@@ -95,12 +113,11 @@ async function handleLine(raw: string): Promise<void> {
       const result = await handler(msg.params);
       writeMessage({ jsonrpc: "2.0", id: msg.id, result });
     } catch (err) {
-      writeInternalError(msg.id, err);
+      writeError(msg.id, err);
     }
     return;
   }
 
-  // Notification path: execute but never respond.
   const handler = methods[msg.method];
   if (!handler) {
     logger.warn("notification for unknown method", { method: msg.method });
@@ -116,8 +133,6 @@ async function handleLine(raw: string): Promise<void> {
   }
 }
 
-/** Drive stdin as a byte stream, split on `\n`, and dispatch each
- *  line. Tolerates partial lines across chunk boundaries. */
 async function runStdinLoop(): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = "";
@@ -131,7 +146,6 @@ async function runStdinLoop(): Promise<void> {
       await handleLine(line);
     }
   }
-  // Flush any decoder state and handle a trailing no-newline line.
   buffer += decoder.decode();
   if (buffer.trim() !== "") {
     await handleLine(buffer);
