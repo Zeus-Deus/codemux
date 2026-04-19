@@ -157,6 +157,103 @@ Rust side spawns the sidecar through
 helper the Codex adapter uses — so adding new methods is a matter of
 registering handlers in `sidecar/claude-agent/src/main.ts`.
 
+## Claude Agent SDK integration
+
+The sidecar (`sidecar/claude-agent/`) now hosts Anthropic's Claude
+Agent SDK in-process. All Claude inference goes through the SDK's
+`query()` — Codemux's Rust side never talks to Anthropic directly.
+
+### ToS boundary
+
+Three hard rules, enforced by `sidecar/claude-agent/scripts/check-tos-boundary.sh`
+(run on every `bun test` and as a standalone CI step):
+
+1. **No credential reads.** The sidecar must not open, stat, or
+   reference `.claude.json`, `~/.anthropic/`, or any file path that
+   could contain an OAuth token.
+2. **No Anthropic HTTP requests.** The sidecar must not reference
+   `api.anthropic.com` or `anthropic.com`. The SDK makes these requests
+   itself; the sidecar is a transport only.
+3. **No direct `claude` inference.** All inference runs through
+   `@anthropic-ai/claude-agent-sdk`'s `query()`. The sole exception is
+   `src/auth-probe.ts`, which is allow-listed for `claude --version`
+   and `claude auth status` subprocess calls.
+
+A fourth rule — no `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` env
+reads — is enforced by the same check.
+
+Run the check manually:
+
+```sh
+cd sidecar/claude-agent
+bun run check-tos
+```
+
+### Session lifecycle
+
+One `ClaudeSession` per chat thread, always in streaming-input mode.
+The prompt argument to `query()` is an `AsyncPromptQueue<SDKUserMessage>`
+that user-facing `send-turn` RPCs push into. A single background task
+iterates the returned `Query` and forwards every message to the Rust
+side as a `sdk-message` notification — no classification or
+translation happens in the sidecar.
+
+Two side-channel notifications are emitted in addition to the raw
+`sdk-message` for the two tool uses production integrations special-case:
+
+* `plan-proposed` — fires when an assistant `ExitPlanMode` tool_use
+  block lands (and from the permission bridge before denying the tool).
+* `user-input-requested` — fires when an assistant `AskUserQuestion`
+  tool_use block lands.
+
+### Exposed RPCs
+
+| Method | Purpose |
+|---|---|
+| `start-session` | Spawn a new ClaudeSession. |
+| `send-turn` | Queue a user message onto the session. |
+| `interrupt` | Halt the current turn (`query.interrupt`). |
+| `set-model` | Swap the session's default model. |
+| `set-permission-mode` | Change the session's permission mode. |
+| `respond-to-request` | Resolve a pending `canUseTool` approval. |
+| `respond-to-user-input` | Answer an `AskUserQuestion` prompt. |
+| `initialization-result` | Read the SDK's cached init payload. |
+| `stop-session` | Close a session; idempotent. |
+| `probe-installed` | Shell out to `<binary> --version`. |
+| `probe-authenticated` | Shell out to `<binary> auth status`. |
+| `ping` | Liveness probe from the scaffold. |
+
+Deliberately NOT exposed (per the integration research): the ~16
+other `Query` methods (`setMaxThinkingTokens`, `applyFlagSettings`,
+`supportedCommands`, `supportedModels`, `supportedAgents`,
+`mcpServerStatus`, `getContextUsage`, `reloadPlugins`, `accountInfo`,
+`rewindFiles`, `seedReadState`, `reconnectMcpServer`,
+`toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`).
+These ship as follow-ups only when UI calls for them.
+
+### Options construction
+
+Exactly 15 SDK `Options` fields are populated (`cwd`, `model`,
+`pathToClaudeCodeExecutable`, `settingSources: ["user","project","local"]`,
+`effort` (cast through `unknown` for forward-compat), `permissionMode`,
+`allowDangerouslySkipPermissions` (only with `bypassPermissions`),
+`settings` (when non-empty), `resume`, `sessionId`,
+`includePartialMessages: true`, `canUseTool`, `env: process.env`,
+`additionalDirectories` (when non-empty), `extraArgs` (when non-empty)).
+The other 30+ fields in the SDK's Options surface are intentionally
+left unset — they become features when the UI surfaces them.
+
+### Testing
+
+The sidecar ships with 38 Bun tests: 11 ping (scaffold), 18 session
+unit tests using a `FakeQuery` injected via `setQueryFactoryForTests`,
+and 9 permissions tests exercising the canUseTool bridge. The Rust
+side has 7 end-to-end integration tests (`sidecar_sdk.rs`) that spawn
+the compiled binary and cover the paths that don't require real
+Anthropic auth. Testing a real session is a manual smoke test — it
+requires a logged-in `claude` binary and live network egress, so it
+lives outside CI.
+
 ## Known follow-ups
 
 - **Recoverable thread-resume snippets.** The substring list in
@@ -175,3 +272,20 @@ registering handlers in `sidecar/claude-agent/src/main.ts`.
   shutdown without ownership gymnastics. The first call runs the full
   EOF-then-kill sequence; subsequent calls short-circuit via an internal
   `AtomicBool` and return `Ok(())` immediately.
+- **Image attachments in `send-turn`.** The sidecar RPC currently
+  accepts only `text` and an optional `modelOverride`. When the UI
+  needs multi-modal input, extend the RPC with an `images` array and
+  build `SDKUserMessage.content` with `tool_result`-style image blocks.
+- **Full AskUserQuestion UX.** The side-channel
+  `user-input-requested` notification surfaces the questions, and
+  `respond-to-user-input` accepts answers, but the translation to a
+  richer UI shape ships with the real chat pane. The current
+  implementation allows the SDK to continue with the given answers as
+  `updatedInput`.
+- **Unused SDK `Query` methods.** 16 methods are deliberately not
+  exposed as RPCs (`setMaxThinkingTokens`, `applyFlagSettings`,
+  `supportedCommands`, `supportedModels`, `supportedAgents`,
+  `mcpServerStatus`, `getContextUsage`, `reloadPlugins`, `accountInfo`,
+  `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
+  `toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`). Add
+  them piecemeal as UI features require.
