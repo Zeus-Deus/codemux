@@ -137,6 +137,19 @@ jobs:
             chmod +x "$DEST" 2>/dev/null || true
           fi
 
+      - name: Sidecar ToS boundary check
+        # Static check that forbids the sidecar from reading Claude
+        # credential files, hitting Anthropic URLs directly, spawning
+        # the `claude` binary outside the auth-probe allowlist, or
+        # peeking at ANTHROPIC_* / CLAUDE_CODE_OAUTH_TOKEN env vars.
+        # This is a hard CI gate so a violation can never slip in.
+        shell: bash
+        run: cd sidecar/claude-agent && bun run check-tos
+
+      - name: Sidecar unit tests
+        shell: bash
+        run: cd sidecar/claude-agent && bun install --frozen-lockfile && bun test
+
       - name: Build frontend
         # `frontendDist: "../dist"` in tauri.conf.json means tauri-build
         # wants `dist/` to exist at compile time — build the frontend first.
