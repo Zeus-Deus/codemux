@@ -1,3 +1,12 @@
+// ── Feature flags ──
+
+export interface FeatureFlags {
+  unstable_openflow: boolean;
+  unstable_browser_automation: boolean;
+  unstable_indexing: boolean;
+  enable_agent_chat: boolean;
+}
+
 // ── Synced Settings ──
 
 export interface AppearanceSettings {

@@ -711,6 +711,7 @@ pub fn run() {
             commands::get_observability_snapshot,
             commands::add_structured_log,
             commands::update_feature_flags,
+            commands::get_feature_flags,
             commands::update_permission_policy,
             commands::update_safety_config,
             commands::add_replay_record,

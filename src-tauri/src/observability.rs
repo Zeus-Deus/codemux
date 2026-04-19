@@ -35,6 +35,16 @@ pub struct FeatureFlags {
     pub unstable_openflow: bool,
     pub unstable_browser_automation: bool,
     pub unstable_indexing: bool,
+    /// Gates the agent-chat pane kind, its Tauri command surface, and
+    /// the runtime provider registry.
+    ///
+    /// Defaults to `false`: the chat pane is not selectable in the UI,
+    /// lifecycle commands return `FeatureDisabled`, and the provider
+    /// registry is not initialised at startup. Flip to `true` via
+    /// `update_feature_flags` or by editing
+    /// `.codemux/observability.json` to dogfood the scaffolding.
+    #[serde(default)]
+    pub enable_agent_chat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +129,24 @@ impl ObservabilityStore {
         let _ = save_snapshot(&snapshot);
     }
 
+    /// Read the current feature-flag snapshot.
+    ///
+    /// Callers that only need one flag should use the explicit
+    /// accessor (e.g. [`agent_chat_enabled`](Self::agent_chat_enabled))
+    /// so the call site documents which flag it depends on.
+    pub fn feature_flags(&self) -> FeatureFlags {
+        self.inner.lock().unwrap().feature_flags.clone()
+    }
+
+    /// Whether the agent-chat pane and provider registry are enabled.
+    ///
+    /// This is a plain boolean read, cheap to call from command
+    /// entry-points. The gate defaults to `false`; see
+    /// [`FeatureFlags::enable_agent_chat`] for how to flip it.
+    pub fn agent_chat_enabled(&self) -> bool {
+        self.inner.lock().unwrap().feature_flags.enable_agent_chat
+    }
+
     pub fn set_feature_flags(&self, flags: FeatureFlags) {
         let mut snapshot = self.inner.lock().unwrap();
         snapshot.feature_flags = flags;
@@ -177,6 +205,7 @@ fn default_snapshot() -> ObservabilitySnapshot {
             unstable_openflow: true,
             unstable_browser_automation: true,
             unstable_indexing: true,
+            enable_agent_chat: false,
         },
         permission_policy: PermissionPolicy {
             require_risky_action_approval: true,

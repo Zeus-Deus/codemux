@@ -175,6 +175,20 @@ pub fn update_feature_flags(
     Ok(())
 }
 
+/// Read the current feature-flag snapshot.
+///
+/// Thin wrapper around
+/// [`ObservabilityStore::feature_flags`](crate::observability::ObservabilityStore::feature_flags)
+/// so the frontend can check a single gate without pulling the whole
+/// observability snapshot. Used by the agent-chat pane shell to decide
+/// whether to offer the `agent_chat` pane kind.
+#[tauri::command]
+pub fn get_feature_flags(
+    store: State<'_, ObservabilityStore>,
+) -> Result<FeatureFlags, String> {
+    Ok(store.feature_flags())
+}
+
 #[tauri::command]
 pub fn update_permission_policy(
     store: State<'_, ObservabilityStore>,
