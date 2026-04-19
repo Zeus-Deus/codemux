@@ -712,6 +712,8 @@ pub fn run() {
             commands::add_structured_log,
             commands::update_feature_flags,
             commands::get_feature_flags,
+            commands::agent_chat_create_pane,
+            commands::agent_chat_close_pane,
             commands::update_permission_policy,
             commands::update_safety_config,
             commands::add_replay_record,

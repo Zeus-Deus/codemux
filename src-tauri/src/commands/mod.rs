@@ -1,3 +1,4 @@
+pub mod agent_chat;
 pub mod ai;
 pub mod auth;
 pub mod branch_name;
@@ -14,6 +15,7 @@ pub mod update;
 pub mod virtual_display;
 pub mod workspace;
 
+pub use agent_chat::*;
 pub use ai::*;
 pub use auth::*;
 pub use branch_name::*;
