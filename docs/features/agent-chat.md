@@ -337,8 +337,143 @@ cargo test --manifest-path src-tauri/Cargo.toml \
 The test starts a session, sends "Say hi.", and asserts a content
 delta arrives within 60 seconds. Never runs in CI.
 
+## Pane kind registration
+
+The pane tree now carries an `AgentChat` variant alongside `Terminal`,
+`Browser`, and `Split`. The enum lives in
+`src-tauri/src/state/state_impl.rs` and mirrors into
+`src/tauri/types.ts` so the frontend's discriminator pattern stays
+consistent:
+
+```rust
+PaneNodeSnapshot::AgentChat {
+    pane_id: PaneId,
+    title: String,
+    thread_id: Option<String>,
+    provider: Option<ProviderKind>,
+    cwd: Option<String>,
+}
+```
+
+All optional fields default to `None` through `#[serde(default)]`, so
+older persisted layouts (or test fixtures produced before this
+variant landed) deserialize cleanly. Three serde round-trip unit
+tests in the state module guard the schema:
+`agent_chat_pane_serde_round_trips`,
+`agent_chat_pane_defaults_round_trip`, and
+`agent_chat_pane_deserializes_without_optional_fields`.
+
+Pane creation is available on `AppStateStore::create_agent_chat_pane`,
+which inserts the new pane by splitting the workspace's currently
+active pane horizontally — the same insertion path
+`create_browser_pane` uses. `AppStateStore::agent_chat_thread_id` /
+`set_agent_chat_thread_id` read and assign the bound thread id so the
+Tauri command layer can write it back after `start_session` without
+another provider round-trip.
+
+The stub renderer in `src/components/chat/AgentChatPane.tsx` shows a
+single centered "Agent chat — coming soon" line using shadcn tokens
+only. It has no pane header, no composer, and no message list. The
+real chat UI (reading column, composer, status lines, content blocks,
+inline approvals) lands in Step 2; the stub container is structured
+so that step can replace the inner body without fighting pre-existing
+chrome.
+
+## Tauri command surface
+
+All commands gated on the `enable_agent_chat` feature flag. Lifecycle
+commands return a `feature_disabled: ...` string when the flag is
+off; session commands also return a `provider_not_configured: ...`
+string when the target provider is missing from the registry.
+
+| Command | Purpose |
+|---|---|
+| `agent_chat_create_pane` | Insert a new chat pane in a workspace, returns the new pane id. |
+| `agent_chat_close_pane` | Close a chat pane. Idempotent — double-close is a no-op. |
+| `dev_agent_chat_spawn_test_pane` | Debug-only. Spawns a chat pane in the active workspace for manual QA from the browser devtools. |
+| `agent_chat_start_session` | Start a provider session, writing the returned thread id back onto the pane. |
+| `agent_chat_send_turn` | Queue a user turn on a thread. |
+| `agent_chat_interrupt_turn` | Halt the currently-running turn. |
+| `agent_chat_respond_to_request` | Resolve a pending approval / input request. |
+| `agent_chat_set_model` | Swap a thread's model mid-session. |
+| `agent_chat_set_permission_mode` | Swap a thread's permission mode mid-session. |
+| `agent_chat_stop_session` | Gracefully close a session. Idempotent. |
+
+Provider errors are serialized as `SerializableProviderError` JSON so
+the UI can inspect the error subtype (e.g.
+`{"kind":"not_authenticated", ...}`) instead of parsing a free-form
+string.
+
+## Event bridge
+
+Every registered provider's canonical event stream is forwarded to
+the frontend on a single Tauri channel named `agent_chat_event`.
+Payloads carry the originating `thread_id` alongside the raw
+`ProviderRuntimeEvent` so subscribers can filter without re-parsing.
+Global events (`RuntimeWarning` without a thread id) are still
+forwarded, with an empty `ThreadId`. The frontend hook
+`useAgentChatEvents(threadId, handler)` in
+`src/hooks/use-agent-chat-events.ts` wires this up with a
+thread-id filter.
+
+The bridge is a thin loop: one background Tokio task per provider,
+each consuming the provider's `event_stream()` and re-emitting each
+event via `AppHandle::emit`. `broadcast::error::RecvError::Lagged`
+is already swallowed by each provider's event-stream helper, so slow
+subscribers never crash the loop — they just drop old events.
+
+## Feature flag
+
+The new flag `enable_agent_chat` lives on the existing `FeatureFlags`
+struct in `src-tauri/src/observability.rs`. It defaults to `false`;
+the entire provider registry (Claude + Codex adapters) skips
+initialisation while it's off, saving the memory.
+
+Three ways to flip it on locally:
+
+1. **UI:** once the chat pane ships in Step 4 the settings panel will
+   expose this. For now, call the existing
+   `update_feature_flags` Tauri command from the browser devtools:
+
+   ```js
+   await window.__TAURI__.invoke("update_feature_flags", {
+     flags: {
+       unstable_openflow: true,
+       unstable_browser_automation: true,
+       unstable_indexing: true,
+       enable_agent_chat: true,
+     },
+   });
+   ```
+
+2. **Config file:** edit `.codemux/observability.json` in the project
+   root, set `feature_flags.enable_agent_chat: true`, restart.
+
+3. **Fresh project:** the default store is persisted lazily, so a
+   brand-new Codemux project has no file yet. Start the app once
+   (to create the file), then edit it and restart.
+
+After the flag is on, open the browser devtools and call:
+
+```js
+await window.__TAURI__.invoke("dev_agent_chat_spawn_test_pane");
+```
+
+to insert a stub chat pane in the active workspace.
+
 ## Known follow-ups
 
+- **Step 2: visual chat UI.** Replace the stub renderer with the
+  real reading column, composer (target picker + textarea + footer
+  pills), streaming indicators, status lines, content blocks, and
+  inline approvals per the `codemux-chat-ui` skill.
+- **Step 3: "+" icon rewiring.** Surface agent chat alongside
+  terminal and browser in the new-pane affordance, with the
+  default provider read from a setting rather than required at
+  creation time.
+- **Step 4: Home chat landing.** When a workspace has no panes,
+  show the chat-home empty state (centered composer, marquee
+  headline) instead of the current splash / first-pane flow.
 - **Recoverable thread-resume snippets.** The substring list in
   `agent_provider/codex/protocol.rs` (`RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS`)
   is inferred from an upstream reference and should be verified against
