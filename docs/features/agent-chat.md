@@ -101,3 +101,22 @@ until later tasks wire a chat pane and feature flag on top.
 - Keep this file about current truth, not future plans. Future chunks (Claude
   adapter, Codex adapter, chat pane, orchestration wiring) will each own
   their own `docs/plans/` entry at time of work.
+
+## Known follow-ups
+
+- **Recoverable thread-resume snippets.** The substring list in
+  `agent_provider/codex/protocol.rs` (`RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS`)
+  is inferred from an upstream reference and should be verified against
+  real `codex app-server` error output. A mismatch degrades gracefully —
+  the resume simply fails instead of falling back to a fresh start — but
+  refining the list will give a nicer UX.
+- **Turn-start parameter plumbing.** `CodexAgentProvider::send_turn`
+  currently populates only the `model` field on the wire. The
+  `TurnStartParams` struct already models `service_tier`, `effort`, and
+  `collaboration_mode`; the adapter's public API needs matching
+  overrides once the UI wants to expose them.
+- **`JsonRpcChild::shutdown` is now `&self` and idempotent.** All
+  callers can share the handle via `Arc<JsonRpcChild>` and invoke
+  shutdown without ownership gymnastics. The first call runs the full
+  EOF-then-kill sequence; subsequent calls short-circuit via an internal
+  `AtomicBool` and return `Ok(())` immediately.
