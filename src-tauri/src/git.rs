@@ -1,3 +1,4 @@
+use crate::execution::sanitize_gui_env_std;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -95,9 +96,10 @@ pub(crate) fn sanitize_branch_for_worktree_path(branch: &str) -> String {
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git: {e}"))?;
 
@@ -115,10 +117,10 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String, String> {
 
 /// Run git and return stdout even on non-zero exit (for commands where failure is expected).
 fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
-    Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
-        .output()
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    cmd.output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
@@ -127,9 +129,10 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
 
 /// Run git and return (stdout, stderr, success) regardless of exit code.
 fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo_path)
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
