@@ -83,3 +83,12 @@ path = "tests/helpers/fake_codex_app_server/main.rs"
 test = false
 doctest = false
 bench = false
+
+# Test helper binary used by `tests/claude_adapter.rs` — simulates the
+# claude-agent sidecar without involving the real SDK.
+[[bin]]
+name = "fake_claude_sidecar"
+path = "tests/helpers/fake_claude_sidecar/main.rs"
+test = false
+doctest = false
+bench = false
