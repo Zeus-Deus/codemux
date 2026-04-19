@@ -15,14 +15,32 @@
 
 use std::sync::Arc;
 
-use tauri::{AppHandle, Manager, State};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::agent_provider::{
-    AgentProvider, ApprovalDecision, ProviderError, ProviderKind,
+    AgentProvider, ApprovalDecision, ProviderError, ProviderKind, ProviderRuntimeEvent,
     RequestId, SendTurnInput, SerializableProviderError, StartSessionInput, ThreadId, TurnId,
 };
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
+
+/// Event name emitted by the backend whenever a provider produces a
+/// runtime event. The frontend's `useAgentChatEvents` hook subscribes
+/// to this channel and filters by `thread_id`.
+pub const AGENT_CHAT_EVENT: &str = "agent_chat_event";
+
+/// Payload emitted on the [`AGENT_CHAT_EVENT`] Tauri channel.
+///
+/// Carries the originating thread id alongside the raw canonical
+/// event so subscribers can filter without re-parsing the payload.
+/// Events that are not scoped to a single thread (global
+/// `RuntimeWarning`s) are emitted with an empty `ThreadId`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentChatEventPayload {
+    pub thread_id: ThreadId,
+    pub event: ProviderRuntimeEvent,
+}
 
 /// Error string returned when a command runs with
 /// `enable_agent_chat` off.
@@ -287,4 +305,70 @@ pub async fn agent_chat_stop_session(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     impl_.stop_session(thread_id).await.map_err(provider_err)
+}
+
+// ── Event bridge ──────────────────────────────────────────────────────
+
+/// Start the provider-event forwarding tasks.
+///
+/// Spawns one Tokio task per registered provider. Each task consumes
+/// the provider's canonical event stream and re-emits each event on
+/// the [`AGENT_CHAT_EVENT`] Tauri channel wrapped in an
+/// [`AgentChatEventPayload`]. When a provider's stream ends (on
+/// shutdown) the task exits cleanly; the `event_stream()` helper on
+/// each provider already swallows `broadcast::error::RecvError::Lagged`
+/// and continues, so slow subscribers never crash this loop.
+///
+/// Intended to be called once after the registry has been fully
+/// populated at startup. Idempotency is not required — call sites
+/// guarantee a single call.
+pub async fn spawn_event_bridge(app: AppHandle) {
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let providers = registry.all().await;
+    for (kind, provider) in providers {
+        let app = app.clone();
+        let mut stream = provider.event_stream();
+        tauri::async_runtime::spawn(async move {
+            use futures_util::StreamExt;
+            eprintln!(
+                "[codemux::agent_chat] event bridge started for {kind:?}"
+            );
+            while let Some(event) = stream.next().await {
+                forward_event(&app, event);
+            }
+            eprintln!(
+                "[codemux::agent_chat] event bridge for {kind:?} ended (provider stream closed)"
+            );
+        });
+    }
+}
+
+/// Emit a single provider event to the frontend.
+///
+/// Extracted so tests can exercise the translation without spinning a
+/// Tokio task or a real provider. Also used as the inner loop of
+/// [`spawn_event_bridge`].
+pub fn forward_event(app: &AppHandle, event: ProviderRuntimeEvent) {
+    let thread_id = thread_id_for_event(&event)
+        // Events without a thread_id (e.g. global RuntimeWarning) are
+        // forwarded with an empty ThreadId so the frontend at least
+        // sees them; a richer global-warning channel is a follow-up.
+        .unwrap_or_else(|| ThreadId(String::new()));
+    let payload = AgentChatEventPayload { thread_id, event };
+    if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
+        eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
+    }
+}
+
+fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
+    match event {
+        ProviderRuntimeEvent::SessionConfigured { thread_id, .. }
+        | ProviderRuntimeEvent::ContentDelta { thread_id, .. }
+        | ProviderRuntimeEvent::ItemCompleted { thread_id, .. }
+        | ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
+        | ProviderRuntimeEvent::RequestOpened { thread_id, .. }
+        | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
+        | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. } => Some(thread_id.clone()),
+        ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
+    }
 }

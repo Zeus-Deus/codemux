@@ -537,6 +537,14 @@ pub fn run() {
                         registry
                             .set_codex(std::sync::Arc::new(codex) as _)
                             .await;
+
+                        // Bridge provider events to the frontend
+                        // exactly once, after both providers have been
+                        // injected (or attempted). spawn_event_bridge
+                        // subscribes every registered provider in a
+                        // fresh Tokio task each.
+                        commands::agent_chat::spawn_event_bridge(registry_handle.clone())
+                            .await;
                     });
                 }
             }

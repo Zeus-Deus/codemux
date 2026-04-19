@@ -90,3 +90,23 @@ export const onAuthStateChanged = (
   cb: EventCallback<AuthStatePayload>,
 ): Promise<UnlistenFn> =>
   listen<AuthStatePayload>("auth-state-changed", (e) => cb(e.payload));
+
+// ── Agent chat events ──
+//
+// Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload.
+// The Rust side emits a single channel name; subscribers filter by
+// thread_id via the useAgentChatEvents hook.
+
+/** Canonical provider event payload as emitted to the frontend. */
+export interface AgentChatEventPayload {
+  thread_id: string;
+  // ProviderRuntimeEvent is a tagged union; we keep it as `unknown`
+  // here so the frontend does not re-declare the full shape until the
+  // chat UI lands.
+  event: unknown;
+}
+
+export const onAgentChatEvent = (
+  cb: EventCallback<AgentChatEventPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
