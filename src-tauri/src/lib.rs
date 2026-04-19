@@ -776,6 +776,7 @@ pub fn run() {
             commands::get_feature_flags,
             commands::agent_chat_create_pane,
             commands::agent_chat_close_pane,
+            commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
             commands::agent_chat_send_turn,
             commands::agent_chat_interrupt_turn,

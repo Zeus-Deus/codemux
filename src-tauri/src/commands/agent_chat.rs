@@ -167,6 +167,39 @@ pub fn agent_chat_close_pane(
     Ok(())
 }
 
+// ── Dev-only harness ──────────────────────────────────────────────────
+
+/// Spawn a chat pane in the currently-active workspace.
+///
+/// Dev builds only (gated behind `cfg!(debug_assertions)`). Also
+/// gated on `enable_agent_chat`, since releasing a stub pane onto a
+/// user whose flag is off would be surprising. Prints the new pane
+/// id to stderr so it's easy to read back from the browser
+/// devtools while smoke-testing.
+#[tauri::command]
+pub fn dev_agent_chat_spawn_test_pane(
+    app: AppHandle,
+    state: State<'_, AppStateStore>,
+    observability: State<'_, ObservabilityStore>,
+) -> Result<String, String> {
+    if !cfg!(debug_assertions) {
+        return Err("dev_only: debug build required".to_string());
+    }
+    feature_flag_on(&observability)?;
+    let snapshot = state.snapshot();
+    let workspace_id = snapshot.active_workspace_id.0;
+    if workspace_id.is_empty() {
+        return Err("no_active_workspace".to_string());
+    }
+    let pane_id = state.create_agent_chat_pane(&workspace_id, None, None)?;
+    eprintln!(
+        "[codemux::agent_chat] dev_agent_chat_spawn_test_pane created pane {} in workspace {workspace_id}",
+        pane_id.0
+    );
+    crate::state::emit_app_state(&app);
+    Ok(pane_id.0)
+}
+
 // ── Provider session commands ────────────────────────────────────────
 //
 // Each command:
