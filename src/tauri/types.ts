@@ -529,9 +529,19 @@ export interface TabSnapshot {
   icon: string | null;
 }
 
+export type AgentChatProviderKind = "claude" | "codex";
+
 export type PaneNodeSnapshot =
   | { kind: "terminal"; pane_id: string; session_id: string; title: string }
   | { kind: "browser"; pane_id: string; browser_id: string; title: string }
+  | {
+      kind: "agent_chat";
+      pane_id: string;
+      title: string;
+      thread_id: string | null;
+      provider: AgentChatProviderKind | null;
+      cwd: string | null;
+    }
   | {
       kind: "split";
       pane_id: string;
