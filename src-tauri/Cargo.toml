@@ -52,6 +52,8 @@ url = "2"
 urlencoding = "2"
 regex = "1.12.3"
 which = "6"
+async-trait = "0.1"
+futures-core = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
@@ -62,3 +64,13 @@ tauri-plugin-dialog = { version = "2" }
 [dev-dependencies]
 mockito = "1"
 serial_test = "3"
+
+# Test helper binary used by `tests/json_rpc_child.rs` — simulates a JSON-RPC
+# peer over stdio. Compiled with the crate; not shipped in distributions
+# because tests do not run against release builds.
+[[bin]]
+name = "fake_rpc_child"
+path = "tests/helpers/fake_rpc_child/main.rs"
+test = false
+doctest = false
+bench = false

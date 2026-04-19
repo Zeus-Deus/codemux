@@ -650,10 +650,12 @@ name = "codemux"
 version = "0.1.25"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",
  "dirs",
+ "futures-core",
  "futures-util",
  "hostname",
  "libc",

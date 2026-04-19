@@ -1,9 +1,11 @@
 use tauri::{Emitter, Listener, Manager};
 
 pub mod agent_context;
+pub mod agent_provider;
 pub mod ai;
 pub mod auth;
 pub mod branch_name;
+pub mod json_rpc_child;
 pub mod mcp_server;
 pub mod agent_browser;
 pub mod cli;
