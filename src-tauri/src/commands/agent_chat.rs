@@ -15,8 +15,8 @@
 
 use std::sync::Arc;
 
-use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderError, ProviderKind, ProviderRuntimeEvent,
@@ -36,7 +36,7 @@ pub const AGENT_CHAT_EVENT: &str = "agent_chat_event";
 /// event so subscribers can filter without re-parsing the payload.
 /// Events that are not scoped to a single thread (global
 /// `RuntimeWarning`s) are emitted with an empty `ThreadId`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentChatEventPayload {
     pub thread_id: ThreadId,
     pub event: ProviderRuntimeEvent,
@@ -46,7 +46,11 @@ pub struct AgentChatEventPayload {
 /// `enable_agent_chat` off.
 pub const FEATURE_DISABLED_ERROR: &str = "feature_disabled: enable_agent_chat is off";
 
-pub(crate) fn feature_flag_on(store: &ObservabilityStore) -> Result<(), String> {
+/// Assert the `enable_agent_chat` flag is on, producing the shared
+/// [`FEATURE_DISABLED_ERROR`] string if not. Public so integration
+/// tests can exercise the gate without going through a Tauri
+/// command.
+pub fn feature_flag_on(store: &ObservabilityStore) -> Result<(), String> {
     if store.agent_chat_enabled() {
         Ok(())
     } else {
@@ -355,7 +359,7 @@ pub async fn agent_chat_stop_session(
 /// Intended to be called once after the registry has been fully
 /// populated at startup. Idempotency is not required — call sites
 /// guarantee a single call.
-pub async fn spawn_event_bridge(app: AppHandle) {
+pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     let registry: State<'_, ProviderRegistry> = app.state();
     let providers = registry.all().await;
     for (kind, provider) in providers {
@@ -381,7 +385,7 @@ pub async fn spawn_event_bridge(app: AppHandle) {
 /// Extracted so tests can exercise the translation without spinning a
 /// Tokio task or a real provider. Also used as the inner loop of
 /// [`spawn_event_bridge`].
-pub fn forward_event(app: &AppHandle, event: ProviderRuntimeEvent) {
+pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent) {
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -393,7 +397,10 @@ pub fn forward_event(app: &AppHandle, event: ProviderRuntimeEvent) {
     }
 }
 
-fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
+/// Extract the thread id carried by a provider runtime event, or
+/// `None` for events that are not bound to a specific thread
+/// (e.g. global `RuntimeWarning`s).
+pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
     match event {
         ProviderRuntimeEvent::SessionConfigured { thread_id, .. }
         | ProviderRuntimeEvent::ContentDelta { thread_id, .. }

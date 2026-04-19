@@ -64,6 +64,11 @@ tauri-plugin-dialog = { version = "2" }
 [dev-dependencies]
 mockito = "1"
 serial_test = "3"
+# Enable tauri's `test` feature so integration tests can build a
+# mock app handle via `tauri::test::mock_app`. Feature unification
+# means this flag activates at every build, but the `test` feature
+# is additive and doesn't change runtime behavior.
+tauri = { version = "2", features = ["test"] }
 
 # Test helper binary used by `tests/json_rpc_child.rs` — simulates a JSON-RPC
 # peer over stdio. Compiled with the crate; not shipped in distributions
