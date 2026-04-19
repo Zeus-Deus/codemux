@@ -139,6 +139,7 @@ pub fn run() {
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
+        .manage(commands::agent_chat::ProviderRegistry::new())
         // Phase 2 display-isolation: per-workspace virtual display manager.
         // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
         // prior Codemux crashes. Actual Xvfb spawning is lazy — first agent
@@ -487,6 +488,59 @@ pub fn run() {
 
             control::spawn_control_server(app.handle().clone());
 
+            // Agent-chat provider registry initialisation.
+            //
+            // When `enable_agent_chat` is on, spawn concrete Claude /
+            // Codex provider adapters into the
+            // `commands::agent_chat::ProviderRegistry` managed state.
+            // Claude's adapter resolves its sidecar binary eagerly,
+            // which involves filesystem IO — run the whole block on a
+            // background task so startup is not blocked, and treat
+            // per-provider failures as recoverable (leave the slot
+            // empty; commands routing to it return
+            // `provider_not_configured`).
+            //
+            // When the flag is off this whole task is skipped so
+            // memory is not consumed.
+            {
+                let observability: tauri::State<'_, observability::ObservabilityStore> =
+                    app.handle().state();
+                if observability.agent_chat_enabled() {
+                    let registry_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let registry: tauri::State<
+                            '_,
+                            commands::agent_chat::ProviderRegistry,
+                        > = registry_handle.state();
+
+                        match agent_provider::claude::ClaudeAgentProvider::new(
+                            agent_provider::claude::ClaudeProviderConfig::default(),
+                        )
+                        .await
+                        {
+                            Ok(provider) => {
+                                registry
+                                    .set_claude(std::sync::Arc::new(provider) as _)
+                                    .await;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[codemux::agent_chat] Claude provider init failed: {error}; \
+                                     commands routing to it will return provider_not_configured"
+                                );
+                            }
+                        }
+
+                        let codex = agent_provider::codex::CodexAgentProvider::new(
+                            agent_provider::codex::CodexProviderConfig::default(),
+                        );
+                        registry
+                            .set_codex(std::sync::Arc::new(codex) as _)
+                            .await;
+                    });
+                }
+            }
+
             // Periodically refresh git info for the active workspace
             let git_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -714,6 +768,13 @@ pub fn run() {
             commands::get_feature_flags,
             commands::agent_chat_create_pane,
             commands::agent_chat_close_pane,
+            commands::agent_chat_start_session,
+            commands::agent_chat_send_turn,
+            commands::agent_chat_interrupt_turn,
+            commands::agent_chat_respond_to_request,
+            commands::agent_chat_set_model,
+            commands::agent_chat_set_permission_mode,
+            commands::agent_chat_stop_session,
             commands::update_permission_policy,
             commands::update_safety_config,
             commands::add_replay_record,

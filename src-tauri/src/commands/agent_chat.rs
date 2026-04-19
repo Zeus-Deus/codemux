@@ -13,9 +13,14 @@
 //! any session is bound to it. Provider-session commands and the
 //! event bridge land in follow-up commits.
 
-use tauri::{AppHandle, State};
+use std::sync::Arc;
 
-use crate::agent_provider::ProviderKind;
+use tauri::{AppHandle, Manager, State};
+
+use crate::agent_provider::{
+    AgentProvider, ApprovalDecision, ProviderError, ProviderKind,
+    RequestId, SendTurnInput, SerializableProviderError, StartSessionInput, ThreadId, TurnId,
+};
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
@@ -29,6 +34,77 @@ pub(crate) fn feature_flag_on(store: &ObservabilityStore) -> Result<(), String> 
     } else {
         Err(FEATURE_DISABLED_ERROR.to_string())
     }
+}
+
+/// Shared registry of concrete provider implementations.
+///
+/// Keyed by [`ProviderKind`]; constructors are expected to populate
+/// whichever providers are reachable at startup and skip the rest.
+/// Absence of an entry is a recoverable error rather than a crash —
+/// the Tauri commands surface it as a provider-not-configured string.
+#[derive(Default)]
+pub struct ProviderRegistry {
+    claude: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+}
+
+impl ProviderRegistry {
+    /// Construct an empty registry. Providers must be injected via
+    /// [`set_claude`](Self::set_claude) / [`set_codex`](Self::set_codex).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Inject the Claude provider. Existing handle (if any) is
+    /// dropped; the trait's own shutdown path reaps its live
+    /// sessions.
+    pub async fn set_claude(&self, provider: Arc<dyn AgentProvider>) {
+        *self.claude.write().await = Some(provider);
+    }
+
+    /// Inject the Codex provider. Same semantics as
+    /// [`set_claude`](Self::set_claude).
+    pub async fn set_codex(&self, provider: Arc<dyn AgentProvider>) {
+        *self.codex.write().await = Some(provider);
+    }
+
+    /// Look up the provider for a given kind. Returns `None` when no
+    /// provider has been registered — commands must return a clean
+    /// error in that case instead of panicking.
+    pub async fn get(&self, kind: ProviderKind) -> Option<Arc<dyn AgentProvider>> {
+        match kind {
+            ProviderKind::Claude => self.claude.read().await.clone(),
+            ProviderKind::Codex => self.codex.read().await.clone(),
+        }
+    }
+
+    /// Snapshot every registered provider. Used at event-bridge
+    /// startup time to subscribe every registry member in one pass.
+    pub async fn all(&self) -> Vec<(ProviderKind, Arc<dyn AgentProvider>)> {
+        let mut out = Vec::new();
+        if let Some(p) = self.claude.read().await.clone() {
+            out.push((ProviderKind::Claude, p));
+        }
+        if let Some(p) = self.codex.read().await.clone() {
+            out.push((ProviderKind::Codex, p));
+        }
+        out
+    }
+}
+
+fn provider_err(err: ProviderError) -> String {
+    let ser: SerializableProviderError = err.to_serializable();
+    serde_json::to_string(&ser).unwrap_or_else(|_| "provider_error".to_string())
+}
+
+async fn lookup_provider(
+    registry: &ProviderRegistry,
+    kind: ProviderKind,
+) -> Result<Arc<dyn AgentProvider>, String> {
+    registry
+        .get(kind)
+        .await
+        .ok_or_else(|| format!("provider_not_configured: {kind:?}"))
 }
 
 // ── Lifecycle commands ────────────────────────────────────────────────
@@ -71,4 +147,144 @@ pub fn agent_chat_close_pane(
     let _ = state.close_pane(&pane_id);
     crate::state::emit_app_state(&app);
     Ok(())
+}
+
+// ── Provider session commands ────────────────────────────────────────
+//
+// Each command:
+// 1. Checks the feature flag.
+// 2. Looks up the target provider on the registry.
+// 3. Calls the matching trait method.
+// 4. Returns the result (serialized errors carry the full
+//    `SerializableProviderError` JSON so the UI can inspect subtype).
+
+/// Start a new provider session for the given pane.
+///
+/// The returned [`ThreadId`] is the identifier the provider itself
+/// minted — this command never re-mints a new id. Also writes the
+/// thread id back onto the `AgentChat` pane so future look-ups can
+/// resolve it without re-consulting the provider.
+#[tauri::command]
+pub async fn agent_chat_start_session(
+    app: AppHandle,
+    pane_id: String,
+    provider: ProviderKind,
+    input: StartSessionInput,
+) -> Result<ThreadId, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    let session = impl_.start_session(input).await.map_err(provider_err)?;
+    let state: State<'_, AppStateStore> = app.state();
+    state.set_agent_chat_thread_id(&pane_id, Some(session.thread_id.0.clone()));
+    crate::state::emit_app_state(&app);
+    Ok(session.thread_id)
+}
+
+/// Queue a user turn on an existing session.
+#[tauri::command]
+pub async fn agent_chat_send_turn(
+    app: AppHandle,
+    provider: ProviderKind,
+    input: SendTurnInput,
+) -> Result<TurnId, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    let turn = impl_.send_turn(input).await.map_err(provider_err)?;
+    Ok(turn.turn_id)
+}
+
+/// Interrupt the currently running turn on a thread.
+#[tauri::command]
+pub async fn agent_chat_interrupt_turn(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    turn_id: Option<TurnId>,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_
+        .interrupt_turn(thread_id, turn_id)
+        .await
+        .map_err(provider_err)
+}
+
+/// Respond to a pending approval / tool / input request.
+#[tauri::command]
+pub async fn agent_chat_respond_to_request(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    request_id: RequestId,
+    decision: ApprovalDecision,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_
+        .respond_to_request(thread_id, request_id, decision)
+        .await
+        .map_err(provider_err)
+}
+
+/// Swap a session's active model. `model == None` is a validation
+/// error — the trait's `set_model` takes a `String`, and the
+/// resulting `ProviderError::ValidationError` is reflected here.
+#[tauri::command]
+pub async fn agent_chat_set_model(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    model: Option<String>,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    let model = model.ok_or_else(|| "validation_error: model required".to_string())?;
+    impl_
+        .set_model(thread_id, model)
+        .await
+        .map_err(provider_err)
+}
+
+/// Change a session's permission mode (accept-edits, bypass, plan,
+/// etc.). The mode is passed through as a string; providers reject
+/// unknown values via `ProviderError::ValidationError`.
+#[tauri::command]
+pub async fn agent_chat_set_permission_mode(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    mode: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_
+        .set_permission_mode(thread_id, mode)
+        .await
+        .map_err(provider_err)
+}
+
+/// Gracefully terminate a session. Idempotent on the provider side.
+#[tauri::command]
+pub async fn agent_chat_stop_session(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_.stop_session(thread_id).await.map_err(provider_err)
 }
