@@ -12,6 +12,7 @@ Codemux is one Tauri desktop app repo, not a separate web frontend plus network 
 
 - `src/`: React + Tailwind + shadcn UI and Tauri IPC callers
 - `src-tauri/`: Rust domain/runtime, Tauri command surface, CLI, socket control, PTY and browser runtime integration
+- `sidecar/`: Bun-compiled TypeScript subprocesses Codemux spawns — currently just `sidecar/claude-agent/`, which hosts Anthropic's Claude Agent SDK and speaks JSON-RPC to the Rust side
 - `docs/`: canonical project docs
 
 ## Frontend Layer
@@ -36,6 +37,8 @@ Rust owns the durable app domain and runtime integration.
 - canonical app state: `src-tauri/src/state/`
 - PTY and terminal lifecycle: `src-tauri/src/terminal/`
 - OpenFlow runtime: `src-tauri/src/openflow/`
+- agent-chat providers: `src-tauri/src/agent_provider/` (the `AgentProvider` trait plus per-provider adapters for Codex and Claude; the Claude adapter drives the sidecar binary under `sidecar/claude-agent/`)
+- JSON-RPC stdio helper: `src-tauri/src/json_rpc_child/` (shared framing + routing for long-lived subprocesses both provider adapters use)
 - control server: `src-tauri/src/control.rs` (Unix socket on Linux/macOS via `tokio::net::UnixListener`, named pipe on Windows via `tokio::net::windows::named_pipe::ServerOptions`)
 - CLI entrypoint: `src-tauri/src/cli.rs`
 - browser runtime: `src-tauri/src/agent_browser.rs` (agent-browser v0.24.0, pure Rust, direct CDP)

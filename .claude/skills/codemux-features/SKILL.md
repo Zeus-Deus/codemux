@@ -1,6 +1,6 @@
 ---
 name: codemux-features
-description: Use when implementing new ADE features for Codemux — tasks system, MCP server, settings panel, notification sounds, custom keybinds, session persistence, browser DevTools, or any feature inspired by competing ADEs. Also use when asked to add a feature from another ADE or make Codemux competitive with other tools.
+description: Use when implementing new ADE features for Codemux — agent chat, tasks system, MCP server, settings panel, notification sounds, custom keybinds, session persistence, browser DevTools, or any feature inspired by competing ADEs. Also use when asked to add a feature from another ADE or make Codemux competitive with other tools.
 ---
 
 # Codemux ADE Feature Implementation Guide
@@ -29,9 +29,13 @@ For OpenFlow orchestration patterns, read `docs/features/openflow.md` and `docs/
 
 Implement in this order. Each feature builds on the previous ones.
 
-### Priority 1: Tasks System
+### Priority 1: Agent Chat
 
-**Why first:** Central task management is the biggest missing workflow feature. Users need to go from issue to workspace to agent session in one flow.
+**Why first:** The active work. The backend (`AgentProvider` trait, `JsonRpcChild`, `CodexAgentProvider`, claude-agent sidecar, `ClaudeAgentProvider`) is merged and tested on the `feature/agent-chat` branch. What's left is the UI surface — chat-home empty state, conversation pane, composer with provider / model / effort / permission controls — plus the Tauri commands wiring the trait to it. See `docs/features/agent-chat.md` for the current backend contract, and use the `codemux-chat-ui` skill for chat-pane visual standards (it extends the shared primitives in `codemux-ui`).
+
+### Priority 2: Tasks System
+
+**Why:** Central task management is the biggest missing workflow feature. Users need to go from issue to workspace to agent session in one flow.
 
 **What exists:** GitHub PR integration via `gh` CLI (create, view, checks, merge). Auth status check with graceful degradation (`GhStatus` enum in `src-tauri/src/github.rs`). No task/issue tracking.
 
@@ -55,9 +59,9 @@ Frontend (React):
 
 ---
 
-### Priority 2: MCP Server
+### Priority 3: MCP Server
 
-**Why second:** Enables agents to programmatically control Codemux. An agent running in a terminal can create workspaces, spawn other agents, open browser panes, and manage tasks.
+**Why:** Enables agents to programmatically control Codemux. An agent running in a terminal can create workspaces, spawn other agents, open browser panes, and manage tasks.
 
 **What exists:** Unix socket API (`codemux.sock`) with JSON protocol in `src-tauri/src/control.rs`. This is a solid foundation but is not MCP-compatible.
 
@@ -78,9 +82,9 @@ Configuration:
 
 ---
 
-### Priority 3: Settings Panel
+### Priority 4: Settings Panel
 
-**Why third:** Users need a central place to configure Codemux without editing JSON files.
+**Why:** Users need a central place to configure Codemux without editing JSON files.
 
 **What exists:** Theme sync (`src/stores/theme.ts`), notification sound toggle (state only, `set_notification_sound_enabled`), preset management (`src-tauri/src/presets.rs`), editor detection (`detect_editors` in `workspace.rs`). No settings UI.
 
@@ -93,7 +97,7 @@ Frontend (React):
   - **Editor**: default IDE (use existing `detect_editors` results)
   - **Terminal**: scrollback limit, cursor style
   - **Git**: default base branch
-  - **Keyboard**: shortcut viewer/editor (read-only initially, editable in Priority 5)
+  - **Keyboard**: shortcut viewer/editor (read-only initially, editable in Priority 6)
   - **Notifications**: sound toggle, desktop notification toggle
 
 Backend (Rust):
@@ -103,9 +107,9 @@ Backend (Rust):
 
 ---
 
-### Priority 4: Notification Sounds
+### Priority 5: Notification Sounds
 
-**Why fourth:** The sound toggle already exists in state (`set_notification_sound_enabled`), just needs audio playback wired up.
+**Why:** The sound toggle already exists in state (`set_notification_sound_enabled`), just needs audio playback wired up.
 
 **What exists:** Notification system with D-Bus (`notify-rust`), Hyprland focus (`hyprctl dispatch focuswindow`), attention badges, and a sound enabled flag in app state. No actual audio playback.
 
@@ -119,14 +123,14 @@ Backend (Rust):
 - Respect the existing sound toggle state
 
 Frontend (React):
-- Sound selection in settings panel (Priority 3)
+- Sound selection in settings panel (Priority 4)
 - Volume control (optional)
 
 ---
 
-### Priority 5: Custom Keybinds
+### Priority 6: Custom Keybinds
 
-**Why fifth:** Power users need to rebind shortcuts. The command palette (Ctrl+K) already lists all actions with their current keybinds.
+**Why:** Power users need to rebind shortcuts. The command palette (Ctrl+K) already lists all actions with their current keybinds.
 
 **What exists:** Keyboard shortcuts in `src/hooks/use-keyboard-shortcuts.ts` and `src/components/terminal/TerminalPane.tsx`. No user customization yet.
 
@@ -138,7 +142,7 @@ Backend (Rust):
 - Import/export keybind config
 
 Frontend (React):
-- Keybind editor in settings panel (extends Priority 3)
+- Keybind editor in settings panel (extends Priority 4)
 - Click-to-rebind UI: select action, press new key combo, save
 - Conflict detection (warn if key combo already assigned)
 - Reset to defaults button
