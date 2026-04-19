@@ -102,6 +102,61 @@ until later tasks wire a chat pane and feature flag on top.
   adapter, Codex adapter, chat pane, orchestration wiring) will each own
   their own `docs/plans/` entry at time of work.
 
+## Sidecar (claude-agent)
+
+Location: `sidecar/claude-agent/`.
+
+**Why it exists.** The Claude integration is built on a SDK that only
+runs under a JavaScript runtime. Rather than reverse-engineer that
+SDK's wire protocol and maintain a Rust port, we run it inside a tiny
+TypeScript subprocess and talk to it over JSON-RPC. This is the
+officially supported integration path, and it means Codemux's Rust
+side stays provider-agnostic.
+
+**Current state.** Scaffold only. The sidecar implements a single
+`ping` method that echoes its params back with a server timestamp.
+No SDK dependency yet — that lands in a follow-up task on top of a
+known-good foundation.
+
+**Toolchain.** [Bun](https://bun.sh) 1.3+ is the sole dependency. Bun
+handles install, test, and `bun build --compile` to produce a
+standalone binary per target platform.
+
+**How to build locally.** From the repo root:
+
+```sh
+bash scripts/build-claude-sidecar.sh
+```
+
+or directly:
+
+```sh
+cd sidecar/claude-agent
+bun install
+bun run build:all
+```
+
+The per-target binary is staged at
+`src-tauri/binaries/codemux-claude-sidecar-<target-triple>`, which is
+where Tauri's `externalBin` bundling picks it up. The Rust integration
+tests (`src-tauri/tests/sidecar_ping.rs`) look for the same path and
+skip cleanly (with a build hint) if the binary is missing.
+
+**How it's shipped.** `tauri.conf.json`'s `bundle.externalBin` array
+includes `binaries/codemux-claude-sidecar`. Tauri's packager picks up
+`binaries/codemux-claude-sidecar-<triple>` per target and embeds it
+into the AppImage / deb / rpm / NSIS installer. The release workflow
+(`.github/workflows/release.yml`) installs Bun and pre-stages the
+binary so tauri-action finds it before bundling. CI
+(`.github/workflows/ci.yml`) does the same, with a zero-byte
+placeholder fallback for constrained runners.
+
+**Protocol.** Newline-delimited JSON-RPC 2.0 over stdin/stdout. The
+Rust side spawns the sidecar through
+[`JsonRpcChild`](../../src-tauri/src/json_rpc_child/mod.rs) — the same
+helper the Codex adapter uses — so adding new methods is a matter of
+registering handlers in `sidecar/claude-agent/src/main.ts`.
+
 ## Known follow-ups
 
 - **Recoverable thread-resume snippets.** The substring list in
