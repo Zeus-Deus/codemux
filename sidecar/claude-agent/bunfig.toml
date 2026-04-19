@@ -1,0 +1,13 @@
+# Bun configuration for the claude-agent sidecar.
+#
+# The sidecar is a thin JSON-RPC server. It does NOT bundle any CLI
+# binary itself — the Rust side will tell it where the user's local
+# `claude` binary lives via a future `pathToClaudeCodeExecutable`
+# option. Skipping optional dependencies keeps install fast and the
+# tree small.
+
+[install]
+optional = false
+
+[install.cache]
+disable = false
