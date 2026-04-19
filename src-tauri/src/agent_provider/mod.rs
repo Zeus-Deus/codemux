@@ -6,6 +6,7 @@
 //!
 //! See `docs/features/agent-chat.md` for the bigger picture.
 
+pub mod codex;
 pub mod errors;
 pub mod events;
 pub mod provider;

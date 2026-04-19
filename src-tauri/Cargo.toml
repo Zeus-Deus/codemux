@@ -74,3 +74,12 @@ path = "tests/helpers/fake_rpc_child/main.rs"
 test = false
 doctest = false
 bench = false
+
+# Test helper binary used by `tests/codex_adapter.rs` — simulates the
+# `codex app-server` JSON-RPC peer.
+[[bin]]
+name = "fake_codex_app_server"
+path = "tests/helpers/fake_codex_app_server/main.rs"
+test = false
+doctest = false
+bench = false

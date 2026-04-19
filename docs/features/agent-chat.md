@@ -30,10 +30,13 @@ stand on a stable contract:
 - `src-tauri/src/json_rpc_child/` implements a reusable
   `JsonRpcChildProcess` helper for long-lived subprocesses that speak
   newline-delimited JSON-RPC 2.0 over stdio.
+- `src-tauri/src/agent_provider/codex/` implements the first concrete
+  provider — a `CodexAgentProvider` that drives the `codex app-server`
+  subprocess through the shared JSON-RPC helper and translates its
+  notifications into the canonical event stream.
 
-Neither module is reachable from Tauri commands, UI, or any runtime code
-paths today. They sit dormant until later tasks add concrete Claude / Codex
-adapters and wire a chat pane to them.
+None of this is reachable from Tauri commands or UI today. It sits dormant
+until later tasks wire a chat pane and feature flag on top.
 
 ## What Works Today
 
@@ -41,20 +44,29 @@ adapters and wire a chat pane to them.
 - Reusable JSON-RPC-over-stdio child-process helper with timeout, graceful
   shutdown, bidirectional notifications, server-initiated requests, and
   child-exit cleanup.
-- Integration tests (`src-tauri/tests/json_rpc_child.rs`) covering
-  request/response roundtrip, both notification directions, server-initiated
-  request roundtrip, timeout, child-exit diagnostics, graceful shutdown,
-  malformed-input resilience, and 20-way concurrent requests.
+- Codex provider end-to-end: spawn → init handshake → `thread/start` (with
+  `thread/resume` fallback) → turn dispatch → streaming notifications and
+  tool-approval requests → canonical event broadcast.
+- Auth probes (`probe_installed`, `probe_authenticated`) that shell out
+  to `codex --version` / `codex auth status` and classify the output.
+- Integration tests (`src-tauri/tests/json_rpc_child.rs` and
+  `src-tauri/tests/codex_adapter.rs`) covering the helper and the Codex
+  adapter respectively. The Codex adapter tests are backed by a scripted
+  fake fixture at `src-tauri/tests/helpers/fake_codex_app_server/main.rs`
+  so no real `codex` binary is required.
 
 ## Current Constraints
 
 - No user-visible chat panel yet.
-- No concrete Claude or Codex provider implementation yet — the trait has no
-  in-tree implementers.
+- No Claude adapter yet; Claude integration will live in a sibling
+  submodule once the SDK sidecar piece is designed.
 - No Tauri commands exposed.
 - No persistence, projection pipeline, or event sourcing.
-- No permission / approval UX; the approval event types exist but nothing
-  routes them to a human.
+- No permission / approval UX; approval events flow through the stream
+  but nothing routes them to a human.
+- The event broadcaster uses a bounded channel (default 1024) — slow
+  subscribers lose old events. This is deliberate; downstream UI must
+  treat the stream as live-only.
 
 ## Important Touch Points
 
@@ -67,10 +79,22 @@ adapters and wire a chat pane to them.
   `SerializableProviderError`.
 - `src-tauri/src/agent_provider/provider.rs` — the `AgentProvider` trait
   itself.
+- `src-tauri/src/agent_provider/codex/mod.rs` — `CodexAgentProvider`.
+- `src-tauri/src/agent_provider/codex/protocol.rs` — wire-level types for
+  the `codex app-server` JSON-RPC protocol.
+- `src-tauri/src/agent_provider/codex/translate.rs` — pure translation
+  functions from Codex notifications / server-initiated requests to
+  `ProviderRuntimeEvent`.
+- `src-tauri/src/agent_provider/codex/session.rs` — per-thread session
+  state plus background tasks that forward events.
+- `src-tauri/src/agent_provider/codex/auth.rs` — auth/installed probes.
 - `src-tauri/src/json_rpc_child/mod.rs` — the `JsonRpcChild` helper.
 - `src-tauri/tests/json_rpc_child.rs` — helper tests.
+- `src-tauri/tests/codex_adapter.rs` — Codex adapter integration tests.
 - `src-tauri/tests/helpers/fake_rpc_child/main.rs` — in-tree JSON-RPC peer
-  used as the tests' fixture.
+  used as the JsonRpcChild fixture.
+- `src-tauri/tests/helpers/fake_codex_app_server/main.rs` — scripted
+  fixture that impersonates the `codex app-server` subprocess.
 
 ## Notes
 
