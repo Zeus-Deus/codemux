@@ -216,7 +216,6 @@ async fn shutdown_is_graceful() {
     let result = child.request("echo", json!("ping")).await.expect("echo");
     assert_eq!(result, json!("ping"));
     // Helper exits cleanly once stdin closes.
-    // shutdown consumes the handle.
     // Wait for the helper to acknowledge EOF and exit.
     tokio::time::timeout(Duration::from_secs(3), async {
         let h = JsonRpcChild::spawn(config()).await.expect("spawn");
@@ -226,7 +225,12 @@ async fn shutdown_is_graceful() {
     .expect("shutdown should not hang")
     .expect("shutdown ok");
 
+    // shutdown takes &self, so the original handle is still usable after
+    // the call — though further RPCs will fail with ChildExited /
+    // AlreadyShutdown. A second shutdown call must be a cheap no-op.
     let _ = child.shutdown().await;
+    let second = child.shutdown().await;
+    assert!(second.is_ok(), "second shutdown must be idempotent Ok");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

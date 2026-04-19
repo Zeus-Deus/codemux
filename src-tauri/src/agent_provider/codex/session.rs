@@ -428,10 +428,21 @@ impl CodexSession {
         state.model = Some(model);
     }
 
-    /// Gracefully shut the session down: stop background tasks and close
-    /// the subprocess.
+    /// Gracefully shut the session down: close the JSON-RPC child
+    /// (EOF-then-kill), stop background tasks, and flip state to Closed.
+    ///
+    /// Idempotent: the underlying
+    /// [`JsonRpcChild::shutdown`](crate::json_rpc_child::JsonRpcChild::shutdown)
+    /// short-circuits on repeat calls, and the tasks list is drained, so
+    /// later invocations are cheap no-ops.
     pub async fn shutdown(&self) {
+        // Signal background tasks first so they stop pumping events
+        // mid-teardown.
         let _ = self.shutdown_tx.send(());
+
+        // Close the JSON-RPC child cleanly (EOF → 2s grace → kill).
+        let _ = self.child.shutdown().await;
+
         // Abort any tasks that haven't exited on their own.
         let tasks: Vec<_> = {
             let mut guard = self.tasks.lock().await;

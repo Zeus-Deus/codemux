@@ -225,8 +225,8 @@ struct ExitInfo {
 
 /// Handle to a running JSON-RPC child.
 ///
-/// Cheaply cloneable — all internal state is `Arc`-shared — so adapters can
-/// hand clones to background tasks freely.
+/// Cheaply shareable — all internal state is `Arc`-guarded — so adapters can
+/// wrap the handle in an `Arc` and hand it to background tasks freely.
 pub struct JsonRpcChild {
     writer: Arc<tokio::sync::Mutex<Option<ChildStdin>>>,
     pending: Arc<Mutex<PendingMap>>,
@@ -237,6 +237,10 @@ pub struct JsonRpcChild {
     alive: Arc<AtomicBool>,
     exit_info: Arc<Mutex<Option<ExitInfo>>>,
     shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Set to `true` the first time [`shutdown`](Self::shutdown) runs. A
+    /// second call observes `true` via `swap` and returns early; the
+    /// original cleanup has already fired.
+    shutdown_started: Arc<AtomicBool>,
 }
 
 impl JsonRpcChild {
@@ -405,6 +409,7 @@ impl JsonRpcChild {
             alive,
             exit_info,
             shutdown_tx: Arc::new(Mutex::new(Some(shutdown_tx))),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -522,7 +527,18 @@ impl JsonRpcChild {
 
     /// Close stdin, wait up to 2s for the child to exit on its own, and
     /// then kill it if it has not.
-    pub async fn shutdown(self) -> Result<(), RpcChildError> {
+    ///
+    /// Idempotent: a second call after the first one started observes the
+    /// internal `shutdown_started` flag and returns `Ok(())` immediately
+    /// without re-running the shutdown sequence. This lets `Arc<Self>`
+    /// holders coordinate cleanup without needing to decide who "owns"
+    /// the single shutdown call.
+    pub async fn shutdown(&self) -> Result<(), RpcChildError> {
+        if self.shutdown_started.swap(true, Ordering::SeqCst) {
+            // Someone else already kicked off shutdown. Nothing to do.
+            return Ok(());
+        }
+
         // Close stdin so the child observes EOF.
         {
             let mut guard = self.writer.lock().await;
