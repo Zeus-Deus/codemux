@@ -112,11 +112,29 @@ impl CodexAgentProvider {
     }
 }
 
+/// Cleanup semantics when the provider is dropped.
+///
+/// Two paths, both of which reap every live child process:
+///
+/// 1. **Normal path.** `tokio::runtime::Handle::try_current()` returns
+///    `Ok`, meaning the Tokio runtime is still alive. We spawn a cleanup
+///    task that iterates every live [`CodexSession`] and calls
+///    `session.shutdown().await`, which closes stdin (giving the child a
+///    chance to exit cleanly on EOF), then falls through to `kill` if it
+///    has not exited within the graceful-shutdown window.
+///
+/// 2. **Fallback path.** If `try_current()` returns `Err` — the runtime
+///    has already been torn down, e.g. deep in process shutdown — the
+///    spawned-task branch is skipped entirely. Cleanup then relies on
+///    `tokio::process::Command::kill_on_drop(true)` set on every
+///    [`JsonRpcChild`]: when each [`CodexSession`] is dropped, its
+///    `Arc<JsonRpcChild>` drops, which drops the underlying
+///    `tokio::process::Child`, which sends `SIGKILL` to the subprocess.
+///
+/// Either way, no child processes are leaked. Graceful stdin-EOF
+/// shutdown only happens on the normal path; the fallback is SIGKILL.
 impl Drop for CodexAgentProvider {
     fn drop(&mut self) {
-        // Best-effort async cleanup: spawn a task to shut every live
-        // session down. `kill_on_drop` on JsonRpcChild ensures the child
-        // process is reaped even if the tokio runtime is not available.
         let sessions = Arc::clone(&self.sessions);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -129,8 +147,6 @@ impl Drop for CodexAgentProvider {
                 }
             });
         }
-        // else: the runtime is gone (e.g. during test teardown); rely on
-        // JsonRpcChild's kill_on_drop to reap each child.
     }
 }
 
