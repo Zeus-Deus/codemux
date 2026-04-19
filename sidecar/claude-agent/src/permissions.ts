@@ -154,12 +154,17 @@ export function makeCanUseTool(
       decision = await decisionPromise;
     } catch {
       // Signal aborted before user responded — the SDK treats this as
-      // a deny.
+      // a deny. Abort handler already removed the pending entry.
       return {
         behavior: "deny",
         message: "Tool request was aborted.",
       } satisfies PermissionResult;
     }
+    // Clean up the pending entry regardless of who resolved it. The
+    // `respondToRequest` RPC path also deletes, but it is cheap and
+    // safe to do here so direct resolver callers (tests, or a future
+    // caller that doesn't go through the RPC) don't leak entries.
+    pending.delete(requestId);
 
     emit.notification("request-resolved", {
       threadId,
