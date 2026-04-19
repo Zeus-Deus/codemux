@@ -4,9 +4,9 @@
   "version": "0.1.25",
   "identifier": "com.codemux.app",
   "build": {
-    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && npm run dev",
+    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && npm run build",
+    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -30,7 +30,8 @@
     "createUpdaterArtifacts": true,
     "targets": "all",
     "externalBin": [
-      "binaries/agent-browser"
+      "binaries/agent-browser",
+      "binaries/codemux-claude-sidecar"
     ],
     "linux": {
       "deb": {
