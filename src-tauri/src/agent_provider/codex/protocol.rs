@@ -38,9 +38,23 @@ use serde_json::Value;
 
 use crate::agent_provider::ApprovalDecision;
 
-/// Error strings Codex surfaces when asked to resume a thread it no longer
-/// knows about. The adapter matches on these (case-insensitive) and falls
-/// back to a fresh `thread/start`.
+/// Substrings that identify a "thread not known" error from a failed
+/// `thread/resume` JSON-RPC call, triggering an automatic fallback to
+/// `thread/start`.
+///
+/// Inferred list. The upstream reference that prompted this adapter
+/// mentions a `RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS` constant but the
+/// exact string set was not cited, so these are the reasonable
+/// candidates. Matching is case-insensitive against whatever error
+/// message the RPC call surfaces.
+///
+/// An incomplete list is safe: a resume error that does not match falls
+/// through to a plain [`ProviderError::RpcError`](crate::agent_provider::ProviderError::RpcError)
+/// instead of being auto-recovered. The session ends up broken, but
+/// nothing misbehaves silently.
+///
+// TODO: verify against real codex app-server error messages once the
+// adapter is exercised in real failure scenarios.
 pub const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS: &[&str] = &[
     "thread not found",
     "unknown thread",
