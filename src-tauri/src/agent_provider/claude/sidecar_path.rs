@@ -112,18 +112,17 @@ pub fn probe_sidecar_binary_exists() -> Result<PathBuf, ProviderError> {
 /// Check executability of a specific path. Returned as a bool so
 /// callers can decide what to do — e.g. use it anyway on non-Unix
 /// platforms where the mode bits are meaningless.
+#[cfg(unix)]
 pub fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        return std::fs::metadata(path)
-            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
-            .unwrap_or(false);
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[cfg(test)]

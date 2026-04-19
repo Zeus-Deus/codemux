@@ -254,6 +254,89 @@ Anthropic auth. Testing a real session is a manual smoke test — it
 requires a logged-in `claude` binary and live network egress, so it
 lives outside CI.
 
+## Claude adapter
+
+`src-tauri/src/agent_provider/claude/` implements `AgentProvider` by
+driving the claude-agent sidecar via `JsonRpcChild`. Mirror of the
+Codex adapter's structure (`mod.rs`, `protocol.rs`, `translate.rs`,
+`session.rs`, `auth.rs`) with one addition — `sidecar_path.rs`
+resolves the bundled sidecar binary at runtime.
+
+### Architecture
+
+One sidecar subprocess per chat thread. Deliberately NOT multiplexed:
+
+- Per-session memory isolation.
+- One session's sidecar crashing doesn't affect the others.
+- Simpler state model — nothing cross-session inside the sidecar.
+
+The adapter spawns the bundled binary (at
+`src-tauri/binaries/codemux-claude-sidecar-<triple>` or a path from
+`CODEMUX_CLAUDE_SIDECAR_PATH`), sends `start-session` with the
+user's claude binary path, then wires two background tasks: one
+consuming the sidecar's notification broadcast, one consuming its
+incoming-request mpsc (currently unused — the sidecar doesn't issue
+server-initiated requests).
+
+### Event translation
+
+The sidecar forwards SDK messages opaquely as JSON. `translate.rs`
+does all classification on the Rust side, which keeps the sidecar's
+surface tiny and lets the Rust side evolve independently. Two paths:
+
+- Sidecar-specific notifications (`session-configured`,
+  `request-opened`, `plan-proposed`, `user-input-requested`,
+  `session-ended`, `session-error`) map directly to trait events.
+- SDK messages are structurally classified by `type` (and `subtype`
+  for `system:*`). 15+ known shapes; unknown variants always surface
+  as `RuntimeWarning` with the raw payload preserved. The
+  notification task wraps translation in `catch_unwind` so a
+  translation bug can't silently kill the event stream.
+
+### Configuration
+
+```rust
+let provider = ClaudeAgentProvider::new(ClaudeProviderConfig {
+    sidecar_binary: None,       // None => resolve at runtime
+    claude_binary: None,        // None => "claude" on PATH
+    event_channel_capacity: 1024,
+}).await?;
+```
+
+`CODEMUX_CLAUDE_SIDECAR_PATH` overrides the search for testing and
+manual override. The capacity default is 1024; smaller tests can use
+less.
+
+### Testing
+
+27 integration tests in `src-tauri/tests/claude_adapter.rs` drive
+the adapter against a `fake_claude_sidecar` binary that impersonates
+the real sidecar's RPCs without involving the SDK. Script-driven
+notifications let each test choreograph the exact event sequence.
+Two additional tests use the REAL compiled sidecar for
+`probe-installed` / `probe-authenticated` with a mock `claude`
+binary.
+
+43 unit tests in `translate.rs` / `protocol.rs` / `sidecar_path.rs`
+cover SDK-message classification, notification mapping, approval
+decision translation, and binary-path resolution.
+
+### Dogfood smoke test
+
+Run manually against a real `claude` CLI + real Anthropic auth:
+
+```sh
+# One-time: build the sidecar for the host platform.
+bash scripts/build-claude-sidecar.sh
+
+# Run the ignored dogfood test.
+cargo test --manifest-path src-tauri/Cargo.toml \
+  --test claude_adapter claude_real_session -- --ignored --nocapture
+```
+
+The test starts a session, sends "Say hi.", and asserts a content
+delta arrives within 60 seconds. Never runs in CI.
+
 ## Known follow-ups
 
 - **Recoverable thread-resume snippets.** The substring list in
@@ -289,3 +372,19 @@ lives outside CI.
   `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
   `toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`). Add
   them piecemeal as UI features require.
+- **Claude image attachments.** `ClaudeAgentProvider::send_turn`
+  only forwards `text` and optional `modelOverride` to the sidecar's
+  `send-turn`. The `SendTurnInput.images: Vec<ImageInput>` field
+  exists on the trait but is currently ignored. Wire it when the UI
+  needs multi-modal input.
+- **Claude AskUserQuestion full flow.** The adapter surfaces
+  `plan-proposed` and `user-input-requested` as
+  `RequestOpened { request_kind: "plan" | "user-input" }`. Answering
+  plan mode and filling in structured AskUserQuestion answers
+  requires UI-side work plus `respond-to-user-input` RPC plumbing —
+  the sidecar method is implemented, but nothing calls it yet.
+- **Claude dogfood testing.** Before shipping the Claude provider,
+  run the `claude_real_session` ignored test end-to-end on a
+  developer machine with a logged-in `claude` CLI. The test covers
+  a real content-delta round-trip. Add it to the release checklist
+  for any user-facing Claude changes.

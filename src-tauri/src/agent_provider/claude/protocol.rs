@@ -235,7 +235,7 @@ pub struct ProbeAuthenticatedResponse {
 // ---------------------------------------------------------------------------
 
 /// Structured error payload carried on `session-error` notifications.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct SidecarError {
     #[serde(default)]
     pub message: String,
@@ -368,15 +368,6 @@ impl SidecarNotification {
                 method: method.to_string(),
                 params,
             },
-        }
-    }
-}
-
-impl Default for SidecarError {
-    fn default() -> Self {
-        Self {
-            message: String::new(),
-            stack: None,
         }
     }
 }
