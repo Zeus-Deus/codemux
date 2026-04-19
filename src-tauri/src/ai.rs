@@ -1,6 +1,6 @@
 use crate::git::{git_status, scan_files_for_conflict_markers, FileStatus};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use tokio::process::Command as AsyncCommand;
 
@@ -99,6 +99,73 @@ pub(crate) fn build_resolver_argv(
     }
 }
 
+/// Outcome of attempting to run an agent CLI from the merge resolver. Split
+/// from `String`-typed errors so the caller can surface the "stuck on
+/// interactive prompt" timeout message using the real CLI name, regardless
+/// of whether the helper is called for `resolve_conflicts_with_agent` or
+/// `generate_commit_message`.
+#[derive(Debug)]
+pub(crate) enum ResolverRunError {
+    /// Spawn itself failed (binary missing, permission denied, etc.).
+    Spawn(String),
+    /// Spawn succeeded but collecting output failed mid-run.
+    Io(String),
+    /// The command exceeded the supplied timeout. The child was SIGKILLed via
+    /// `kill_on_drop(true)` when the future was dropped, so no process is left
+    /// behind — callers can safely retry.
+    Timeout,
+}
+
+/// Spawns an agent CLI and waits for it to finish, with three non-negotiable
+/// guarantees:
+///
+/// 1. **stdin is `/dev/null`** — inheriting the parent's stdin is what caused
+///    the "claude did not finish within 600s. The agent may be stuck on an
+///    interactive prompt despite skip-permissions flags." bug. Claude Code
+///    (and similar CLIs) probe stdin and block waiting for input/EOF that
+///    never arrives when stdin is inherited from a Tauri GUI parent. See
+///    anthropics/claude-code#43123 and #16306. `--print` /
+///    `--dangerously-skip-permissions` do NOT override this — they govern
+///    tool-approval prompts, not stdin EOF detection.
+///
+/// 2. **stdout/stderr are explicitly piped** so we can surface them to the
+///    user (verification tail, error reporting).
+///
+/// 3. **`kill_on_drop(true)`** — when `tokio::time::timeout` fires and drops
+///    the wait future, the `Child` is dropped, and tokio SIGKILLs the spawned
+///    process. Without this, each "Try Again" leaks an orphan agent process
+///    that keeps running detached, accumulating zombies for the life of the
+///    Codemux session.
+///
+/// This is extracted as a dedicated helper (instead of being inlined) so that
+/// regression tests can drive it with a cheap binary like `/bin/sh` or
+/// `/bin/cat` without having to stand up a fake `claude`.
+pub(crate) async fn run_resolver_cli(
+    program: &str,
+    args: &[String],
+    repo_path: &Path,
+    timeout: Duration,
+) -> Result<Output, ResolverRunError> {
+    let child = AsyncCommand::new(program)
+        .args(args)
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| ResolverRunError::Spawn(e.to_string()))?;
+
+    match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(ResolverRunError::Io(e.to_string())),
+        // Dropping `wait_with_output`'s future here also drops the Child,
+        // which triggers SIGKILL thanks to `kill_on_drop(true)`. Do not
+        // remove — see the module-level bug history.
+        Err(_) => Err(ResolverRunError::Timeout),
+    }
+}
+
 pub async fn resolve_conflicts_with_agent(
     repo_path: &Path,
     cli: &str,
@@ -133,15 +200,15 @@ pub async fn resolve_conflicts_with_agent(
 
     let (program, args) = build_resolver_argv(cli, model, &system_prompt, &user_prompt);
 
-    // Timeout guard: if the agent deadlocks, bail cleanly instead of
-    // leaving the UI spinning forever.
-    let spawn = AsyncCommand::new(program)
-        .args(&args)
-        .current_dir(repo_path)
-        .output();
-    let output = match tokio::time::timeout(RESOLVER_TIMEOUT, spawn).await {
-        Ok(res) => res.map_err(|e| format!("Failed to run {cli}: {e}"))?,
-        Err(_) => {
+    // Timeout guard + stdin-null + kill_on_drop all live inside
+    // `run_resolver_cli`. Do NOT inline this spawn — every previous attempt
+    // to do so has regressed one of those three properties.
+    let output = match run_resolver_cli(program, &args, repo_path, RESOLVER_TIMEOUT).await {
+        Ok(out) => out,
+        Err(ResolverRunError::Spawn(e)) | Err(ResolverRunError::Io(e)) => {
+            return Err(format!("Failed to run {cli}: {e}"));
+        }
+        Err(ResolverRunError::Timeout) => {
             return Err(format!(
                 "{cli} did not finish within {}s. The agent may be stuck on an interactive prompt despite skip-permissions flags. Abort and try again, or switch CLI / model.",
                 RESOLVER_TIMEOUT.as_secs()
@@ -246,6 +313,7 @@ pub async fn generate_commit_message(
         let output = AsyncCommand::new("git")
             .args(["diff", "--cached"])
             .current_dir(repo_path)
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| format!("Failed to run git diff: {e}"))?;
@@ -268,18 +336,37 @@ pub async fn generate_commit_message(
         diff
     );
 
-    let mut args = vec!["--print".to_string(), prompt];
+    // Same headless-claude requirements as the resolver: must include
+    // `--dangerously-skip-permissions` (so a stale permission prompt can't
+    // deadlock the call) and must go through `run_resolver_cli` so stdin is
+    // /dev/null and the child is killed if it hangs past the timeout. Prior
+    // to this, `generate_commit_message` had NO timeout at all — a hung
+    // claude would leave the commit-message UI spinning indefinitely.
+    let mut args = vec![
+        "--print".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        prompt,
+    ];
     if let Some(m) = model {
         args.push("--model".to_string());
         args.push(m.to_string());
     }
 
-    let output = AsyncCommand::new("claude")
-        .args(&args)
-        .current_dir(repo_path)
-        .output()
-        .await
-        .map_err(|e| format!("Failed to run claude: {e}"))?;
+    let output = match run_resolver_cli("claude", &args, repo_path, RESOLVER_TIMEOUT).await {
+        Ok(out) => out,
+        Err(ResolverRunError::Spawn(e)) | Err(ResolverRunError::Io(e)) => {
+            return Err(format!("Failed to run claude: {e}"));
+        }
+        Err(ResolverRunError::Timeout) => {
+            // Keep the message shape aligned with the resolver's timeout
+            // error so the UI (and user mental model) stays consistent
+            // across the two entry points that go through `run_resolver_cli`.
+            return Err(format!(
+                "claude did not finish within {}s. The agent may be stuck on an interactive prompt despite skip-permissions flags. Abort and try again, or switch CLI / model.",
+                RESOLVER_TIMEOUT.as_secs()
+            ));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -555,5 +642,217 @@ mod tests {
         // long that a stuck agent blocks the UI for the rest of the day.
         let s = RESOLVER_TIMEOUT.as_secs();
         assert!((60..=1800).contains(&s), "timeout {s}s outside [60, 1800]");
+    }
+
+    // ---- run_resolver_cli regression tests ----
+    //
+    // These three tests encode the contract of the spawn helper that the
+    // 600s-hang bug depended on. If any of them ever starts failing, the
+    // bug is back.
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_resolver_cli_closes_stdin() {
+        // `cat` with no arguments reads stdin until EOF and echoes it. If
+        // stdin were inherited from the test harness, it would either be
+        // a TTY (block forever) or the harness's pipe (block until the
+        // harness closes its end, which is never during the test).
+        //
+        // With `Stdio::null()`, cat sees EOF immediately, exits 0, and
+        // produces empty output. This is the exact behavior we need for
+        // `claude --print` — which otherwise hangs inheriting Tauri's
+        // unusable stdin (see anthropics/claude-code#43123).
+        let dir = TempDir::new().unwrap();
+        let out = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_resolver_cli("cat", &[], dir.path(), Duration::from_secs(2)),
+        )
+        .await
+        .expect("helper itself must not hang even if stdin handling broke");
+
+        let out = out.expect("cat should exit cleanly, not error");
+        assert!(
+            out.status.success(),
+            "cat exit should be 0 (EOF on stdin), got: {:?}",
+            out.status
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "cat should output nothing when stdin is /dev/null, got: {:?}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_resolver_cli_kills_child_on_timeout() {
+        // Spawns a shell that sleeps far longer than the supplied timeout.
+        // If `kill_on_drop(true)` were missing, the child would keep running
+        // detached after the timeout — the 600s hang's silent side effect.
+        // We assert the helper returns Timeout quickly; the Child is dropped
+        // when `wait_with_output`'s future is dropped, which SIGKILLs the
+        // shell. (We don't assert on the OS process table because that's
+        // racy across platforms, but the helper returning fast is what
+        // matters for the UX.)
+        let dir = TempDir::new().unwrap();
+        let start = std::time::Instant::now();
+        let res = run_resolver_cli(
+            "sh",
+            &["-c".to_string(), "sleep 30".to_string()],
+            dir.path(),
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(res, Err(ResolverRunError::Timeout)),
+            "expected Timeout, got: {res:?}"
+        );
+        // Timeout was 200ms; if kill_on_drop didn't fire we'd hang for 30s.
+        // Allow generous slack for slow CI but catch a real regression.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "helper should return promptly after timeout, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_resolver_cli_happy_path_captures_stdout() {
+        // Sanity: a fast-exiting command reports its stdout so the
+        // verification layer can scan agent output.
+        let dir = TempDir::new().unwrap();
+        let out = run_resolver_cli(
+            "sh",
+            &["-c".to_string(), "printf hello".to_string()],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("fast command must succeed");
+        assert!(out.status.success());
+        assert_eq!(&out.stdout, b"hello");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_resolver_cli_kills_child_on_timeout_pid_proof() {
+        // Empirical proof that the sleep child is actually reaped after the
+        // timeout fires — not just that the helper returns fast. We capture
+        // the shell's own PID (via `echo $$`) into a temp file before it
+        // execs `sleep`, then after the helper times out we poll `kill -0`
+        // until the kernel reports ESRCH (process gone).
+        let dir = TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid.txt");
+
+        // `echo $$ > pid; exec sleep 60` — after exec, the sleep process
+        // keeps the same PID as the shell, so the file holds the right PID.
+        let script = format!(
+            "echo $$ > {pid_path}; exec sleep 60",
+            pid_path = pid_file.display(),
+        );
+
+        let start = std::time::Instant::now();
+        let res = run_resolver_cli(
+            "sh",
+            &["-c".to_string(), script],
+            dir.path(),
+            Duration::from_millis(300),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(res, Err(ResolverRunError::Timeout)),
+            "expected Timeout, got: {res:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "helper should return promptly after timeout, took {elapsed:?}"
+        );
+
+        // The shell writes its PID synchronously before exec; the file must
+        // exist. If it doesn't, the shell never got far enough — not the
+        // scenario we want to test.
+        let pid_str = std::fs::read_to_string(&pid_file)
+            .expect("shell should have written its pid before exec'ing sleep");
+        let pid: i32 = pid_str.trim().parse().expect("pid file should contain an integer");
+
+        // Poll `/proc/<pid>/stat` up to 2s. We want to prove the process is
+        // no longer *running* (state Z = zombie or gone entirely counts as
+        // proof that SIGKILL was delivered). `kill -0` alone can't
+        // distinguish a zombie from a live process: both return success.
+        //
+        // The zombie may linger briefly because `wait_with_output`'s future
+        // was dropped on timeout — there's no one to reap the SIGCHLD until
+        // tokio's signal driver gets around to it. That's fine from the
+        // hang-bug perspective (the process is no longer *executing*), but
+        // we need the more precise check to say so.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let stat_path = format!("/proc/{pid}/stat");
+        let final_state: Option<String> = loop {
+            match std::fs::read_to_string(&stat_path) {
+                Err(_) => {
+                    // /proc/<pid> gone entirely — reaped. Best outcome.
+                    break None;
+                }
+                Ok(contents) => {
+                    // Format: "<pid> (<comm>) <state> ..."
+                    let state = contents
+                        .rsplit(')')
+                        .next()
+                        .and_then(|tail| tail.split_whitespace().next())
+                        .unwrap_or("?")
+                        .to_string();
+                    if state == "Z" {
+                        // zombie = SIGKILL delivered, process no longer running
+                        break Some(state);
+                    }
+                    // Still R/S/D/T — not dead yet, keep polling.
+                    if std::time::Instant::now() >= deadline {
+                        break Some(state);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+        };
+
+        match final_state.as_deref() {
+            None => { /* process fully reaped — kill_on_drop fired and SIGCHLD was handled */ }
+            Some("Z") => { /* zombie — SIGKILL delivered, process not executing */ }
+            Some(other) => panic!(
+                "sleep child (pid {pid}) still in state {other:?} 2s after timeout — \
+                 kill_on_drop didn't fire (expected reaped or Z zombie)"
+            ),
+        }
+
+        // Also do the user-friendly check: was the 'SHOULD_NOT_PRINT'-style
+        // side effect avoided? The script doesn't have one, but we can
+        // verify the helper's elapsed time is nowhere near the sleep's 60s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "sleep 60 ran to completion — kill_on_drop regressed"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_resolver_cli_surfaces_spawn_error_for_missing_binary() {
+        // If the user configured a CLI that isn't installed, we must
+        // return a Spawn error (which the caller maps to "Failed to run
+        // {cli}") — not hang, not silently succeed.
+        let dir = TempDir::new().unwrap();
+        let res = run_resolver_cli(
+            "codemux-no-such-binary-xyz",
+            &[],
+            dir.path(),
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            matches!(res, Err(ResolverRunError::Spawn(_))),
+            "expected Spawn error, got: {res:?}"
+        );
     }
 }

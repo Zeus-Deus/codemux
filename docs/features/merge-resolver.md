@@ -28,6 +28,11 @@ An AI-powered merge conflict resolver that works on temporary branches. When mer
   - `opencode run --dangerously-skip-permissions …`
   This is safe because (a) the agent only ever operates inside the `bot/resolve-*` temp branch, (b) nothing is pushed or committed to the real branch without explicit user approval, and (c) the `verify_resolution` gate still runs post-hoc. The argv builder is a pure function with dedicated unit tests (`build_argv_*`) so a regression in any of these flag names fails CI immediately.
 - **Spawn timeout** (`ai::RESOLVER_TIMEOUT`, 10 min): if the agent deadlocks anyway (e.g. stuck network call, future CLI version that reintroduces an interactive prompt despite the flag), the spawn is killed and the UI shows a clear "did not finish within Ns" error instead of spinning forever.
+- **Hardened spawn helper** (`ai::run_resolver_cli`): every agent CLI spawn goes through a single helper that guarantees three non-negotiable invariants. Regressing any one of them reintroduces the "did not finish within 600s / stuck on an interactive prompt" failure mode:
+  1. `stdin(Stdio::null())` — Claude Code (and similar CLIs) probe stdin and block indefinitely when they inherit an unusable parent stdin from the Tauri process (see anthropics/claude-code#43123 and #16306). `--print` / `--dangerously-skip-permissions` do NOT override this.
+  2. `stdout(Stdio::piped())` / `stderr(Stdio::piped())` — explicit so the verification gate and error tail always have the agent's output.
+  3. `kill_on_drop(true)` — when `tokio::time::timeout` fires and the `wait_with_output` future is dropped, the `Child` is dropped, SIGKILLing the spawned agent. Without this every "Try Again" would leak an orphan agent process that keeps running detached, accumulating zombies until the Codemux session exits.
+  Regression tests (`run_resolver_cli_closes_stdin`, `run_resolver_cli_kills_child_on_timeout`, `run_resolver_cli_happy_path_captures_stdout`, `run_resolver_cli_surfaces_spawn_error_for_missing_binary`) drive the helper with `/bin/cat` and `/bin/sh` so the three invariants fail CI if anyone inlines the spawn or drops a flag.
 
 ### Workflow
 
@@ -74,7 +79,7 @@ Resolver settings are in Settings > Editor & Workflow > Agent:
 ## Important Touch Points
 
 - `src-tauri/src/git.rs` — `create_resolver_branch`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`, `strip_resolver_prefix`, `has_conflict_markers`, `scan_files_for_conflict_markers`
-- `src-tauri/src/ai.rs` — `resolve_conflicts_with_agent` (agent invocation), `verify_resolution` (post-agent gate)
+- `src-tauri/src/ai.rs` — `resolve_conflicts_with_agent` (agent invocation), `run_resolver_cli` (hardened spawn helper: stdin-null + piped stdout/stderr + kill_on_drop), `verify_resolution` (post-agent gate), `generate_commit_message` (also routed through `run_resolver_cli` so a hung claude can't lock up the commit-message UI)
 - `src-tauri/src/commands/git.rs` — Tauri command wrappers for resolver operations
 - `src/stores/ai-merge-store.ts` — Frontend state machine (zustand); `startResolution` auto-cleans stale temp branches
 - `src/tauri/commands.ts` — Frontend command wrappers
