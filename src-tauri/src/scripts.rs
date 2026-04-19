@@ -2,6 +2,7 @@ use crate::config::workspace_config::{
     find_git_root, read_effective_config, read_workspace_config, WorkspaceConfig,
 };
 use crate::database::DatabaseStore;
+use crate::execution::sanitize_gui_env_std;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -160,14 +161,16 @@ fn copy_matching_files(
     worktree_path: &Path,
     exclude_file: &Path,
 ) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
-        .args([
-            "ls-files",
-            "--others",
-            "--ignored",
-            &format!("--exclude-from={}", exclude_file.display()),
-        ])
-        .current_dir(root_path)
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "ls-files",
+        "--others",
+        "--ignored",
+        &format!("--exclude-from={}", exclude_file.display()),
+    ])
+    .current_dir(root_path);
+    sanitize_gui_env_std(&mut cmd);
+    let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git ls-files for worktree includes: {e}"))?;
 
@@ -333,6 +336,7 @@ pub fn run_setup_scripts_with_config(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
+        sanitize_gui_env_std(&mut cmd);
 
         let output = cmd
             .output()
@@ -404,6 +408,7 @@ pub fn run_teardown_scripts(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
+        sanitize_gui_env_std(&mut cmd);
 
         let output = cmd
             .output()

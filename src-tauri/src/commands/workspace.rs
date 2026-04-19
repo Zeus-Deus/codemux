@@ -1123,9 +1123,10 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .iter()
         .find(|e| e.id == editor_id)
         .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
-    std::process::Command::new(&editor.command)
-        .arg(&path)
-        .spawn()
+    let mut cmd = std::process::Command::new(&editor.command);
+    cmd.arg(&path);
+    crate::execution::sanitize_gui_env_std(&mut cmd);
+    cmd.spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())
 }

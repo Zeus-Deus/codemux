@@ -18,7 +18,7 @@ This is a **Codemux-level feature**, not OpenFlow-specific. OpenFlow (Codemux's 
 
 | Phase | What | Status |
 |-------|------|--------|
-| 1 | Env-strip on spawn (cross-platform) | ✅ shipped, 16 tests |
+| 1 | Env-strip on spawn (cross-platform) | ✅ shipped, 16 tests — hardened (April 2026): default flipped to safe-by-default; neutralizer overrides added; direct `Command::new` sites migrated |
 | 2 | Per-workspace Xvfb virtual display (Linux) | ✅ shipped, 18 tests (10 lib + 8 integration) |
 | 2.5 | xauth cookie + x11vnc + per-workspace config + XDG_RUNTIME_DIR + PID-reuse hardening + crash detect + retry | ✅ shipped, +8 hardening tests + 6 wiring canaries |
 | 3 | "Watch the agent" noVNC pane inside Codemux | ⏸ deferred — Tauri command ready, needs React component |
@@ -50,7 +50,7 @@ Also:
 - Apply the policy to `spawn_pty_for_session` (today it has no policy at all, so regular worktree shells inherit `DISPLAY` raw).
 - Cross-platform safety: the GUI key list (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `DESKTOP_STARTUP_ID`, `XAUTHORITY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, `QT_QPA_PLATFORM`) is a no-op on Windows (those vars aren't set) and a partial benefit on macOS (XQuartz/GTK apps respect them; native Cocoa apps don't).
 
-**Default posture:** keep the agent-session default `allow_desktop_gui: false` (today this is what `ExecutionPolicy::openflow_agent_default()` produces; the name is historical and unchanged, but the policy applies to any agent consumer, not just OpenFlow). Previously this only actually worked on Linux+bwrap; now it works on every platform via env-strip. For regular worktree shells, keep the default `allow_desktop_gui: true` so user-typed `firefox` still opens normally. Per-workspace override via `.codemux/config.json` (later UI).
+**Default posture (hardened April 2026):** both constructors default to `allow_desktop_gui: false`. `ExecutionPolicy::openflow_agent_default()` continues to apply to any agent consumer (name is historical). `ExecutionPolicy::worktree_session_default()` was flipped from `true` to `false` so regular worktree shells also strip GUI env by default. Users who want `firefox` / `npm run dev` to open on the host display opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1` (process-wide) or per-workspace `.codemux/config.json` `sandbox.allow_desktop_gui: true`. The env-var opt-in is read at construction time by both policy constructors.
 
 This is all Phase 1 ships. It's ~150 lines and zero new dependencies.
 
@@ -88,12 +88,16 @@ Bwrap profile hardening, seccomp-bpf, Landlock, Job Object UI limits. Only when 
 - `build_linux_bwrap_args` clears GUI env vars via `--unsetenv` and tmpfs-shadows `/tmp/.X11-unix` and `$XDG_RUNTIME_DIR` (preserving Codemux control socket)
 - OpenFlow adapters both construct `AgentSpawnSpec` with `openflow_agent_default()`
 - Backend label written to observability logs
-- **Phase 1 (display isolation) shipped:**
-  - `PreparedExecutionCommand.env_unset: Vec<String>` field added
-  - `gui_env_keys()` helper with the canonical GUI env key list (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `DESKTOP_STARTUP_ID`, `XAUTHORITY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, `QT_QPA_PLATFORM`)
-  - `HostPassthrough` / macOS stub / Windows stub / bwrap-missing fallback all populate `env_unset` when `allow_desktop_gui=false`
-  - `spawn_pty_for_session` routed through `prepare_agent_command` with the new `worktree_session_default()` policy (HostPassthrough + GUI allowed — no-op for current behavior, ready to flip per-workspace)
+- **Phase 1 (display isolation) shipped — hardened April 2026: default flipped to safe-by-default; neutralizer overrides added; direct `Command::new` sites migrated:**
+  - `PreparedExecutionCommand.env_unset: Vec<String>` and `env_set: Vec<(String, String)>` fields; `terminal/mod.rs` applies both after all other env setting
+  - `gui_env_keys()` extended from 8 to 18+ keys: original X11 set (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `DESKTOP_STARTUP_ID`, `XAUTHORITY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, `QT_QPA_PLATFORM`) plus compositor sockets (`HYPRLAND_INSTANCE_SIGNATURE`, `SWAYSOCK`), DE detection (`XDG_CURRENT_DESKTOP`, `XDG_SESSION_DESKTOP`, `DESKTOP_SESSION`, `GNOME_DESKTOP_SESSION_ID`), and toolkit-forcing knobs (`NIXOS_OZONE_WL`, `MOZ_ENABLE_WAYLAND`, `MOZ_X11_EGL`)
+  - New `gui_env_overrides()` helper returns the neutralizer pairs applied alongside the unset list: `BROWSER=true` (defangs `xdg-open`), `MOZ_NO_REMOTE=1` (breaks Firefox single-instance handoff), `DBUS_SESSION_BUS_ADDRESS=disabled:` (blocks DBus auto-discovery fallback), `XDG_CURRENT_DESKTOP=X-Generic` (forces `xdg-open` onto the generic mimeapps path)
+  - `build_linux_bwrap_args` now `--unsetenv`s the full key list and `--setenv`s the neutralizers
+  - `HostPassthrough` / macOS stub / Windows stub / bwrap-missing fallback all populate `env_unset` + `env_set` when `allow_desktop_gui=false`
+  - `ExecutionPolicy::worktree_session_default()` default for `allow_desktop_gui` flipped from `true` to `false`; both constructors honor `CODEMUX_ALLOW_DESKTOP_GUI=1`/`true`/`yes` as the opt-in escape hatch
+  - `spawn_pty_for_session` routed through `prepare_agent_command` with the new `worktree_session_default()` policy
   - `spawn_pty_for_agent` applies `env_unset` AFTER every `cmd.env(...)` call including `extra_env`, and filters `extra_env` to drop keys in the unset list (fixes the silent-override gotcha)
+  - New `sanitize_gui_env_std()` / `sanitize_gui_env_tokio()` helpers migrated ~20 direct `Command::new()` spawn sites (agent_browser, git, mcp_server, ai, session_adapters, commands/*, scripts) so they no longer leak host display env
   - 10 unit tests in `src-tauri/src/execution/mod.rs` + 6 integration tests in `src-tauri/tests/execution_env.rs` — all green
 - **Phase 2 (per-workspace virtual display, Linux) shipped:**
   - New module `src-tauri/src/execution/virtual_display.rs` with `VirtualDisplayManager` (thread-safe, held as Tauri-managed state)
@@ -131,9 +135,9 @@ Bwrap profile hardening, seccomp-bpf, Landlock, Job Object UI limits. Only when 
 
 ## Open Questions
 
-- **Should regular worktree shells default to `allow_desktop_gui: false`?** Currently leaning *no* — user-typed commands in a plain shell pane should work normally. Users who run agents inside a plain shell can opt in per-workspace. (OpenFlow agents already default `false`.)
+- ~~**Should regular worktree shells default to `allow_desktop_gui: false`?**~~ **Resolved April 2026:** yes, flipped. `worktree_session_default()` now defaults to `false`; users who want passthrough opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1` or per-workspace `.codemux/config.json`.
 - **Per-workspace config shape.** `.codemux/config.json` `sandbox.allow_desktop_gui` boolean is simplest. Later add `sandbox.virtual_display: bool` for Phase 2.
-- **When to flip defaults.** If Phase 1 ships cleanly and users report no regressions for one release cycle, consider flipping `spawn_pty_for_session` default to `allow_desktop_gui: false` as well. Opt-in via workspace config in the meantime.
+- ~~**When to flip defaults.**~~ **Done April 2026.** `spawn_pty_for_session` default flipped via `worktree_session_default()` → `allow_desktop_gui: false`; opt-in via `CODEMUX_ALLOW_DESKTOP_GUI` or per-workspace config.
 - **Reuse `anthropic-experimental/sandbox-runtime`?** Only if/when Phase 3 (real sandbox) becomes a priority. For display isolation, rolling our own is smaller.
 
 ## Edge Cases Handled

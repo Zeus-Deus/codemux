@@ -17,6 +17,14 @@
 - Default to `npm run verify` after meaningful changes.
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
+## Spawning Child Processes
+
+- When spawning a child process via `std::process::Command::new(...)` or `tokio::process::Command::new(...)` from anywhere in the Rust backend, call `crate::execution::sanitize_gui_env_std(&mut cmd)` (or `sanitize_gui_env_tokio`) immediately before the terminal operation (`.output()` / `.spawn()` / `.status()`).
+- The only exceptions are commands that specifically need display access: `hyprctl`, `ydotool`, `systemctl`, `loginctl`.
+- This prevents agent-spawned processes from popping windows on the user's Hyprland/Wayland/X11 session.
+- When adding new display/DBus/compositor env vars that leak to children, append them to `gui_env_keys()` in `src-tauri/src/execution/mod.rs`.
+- Keep `build_linux_bwrap_args` in sync — the two code paths must strip the same set.
+
 ## UI & Feature Work
 
 - The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.

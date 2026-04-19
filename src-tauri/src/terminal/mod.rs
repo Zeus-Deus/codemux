@@ -1127,6 +1127,9 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     for key in &prepared_shell.env_unset {
         cmd.env_remove(key);
     }
+    for (key, val) in &prepared_shell.env_set {
+        cmd.env(key, val);
+    }
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -1982,6 +1985,10 @@ pub fn spawn_pty_for_agent(
             .env_unset
             .iter()
             .any(|k| k.eq_ignore_ascii_case(key))
+            || prepared
+                .env_set
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(key))
         {
             continue;
         }
@@ -2035,6 +2042,9 @@ pub fn spawn_pty_for_agent(
     // instead of being an advisory flag.
     for key in &prepared.env_unset {
         cmd.env_remove(key);
+    }
+    for (key, val) in &prepared.env_set {
+        cmd.env(key, val);
     }
 
     // Phase 2 display-isolation: if the policy asks for a virtual display,

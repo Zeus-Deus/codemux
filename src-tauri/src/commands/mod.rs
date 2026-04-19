@@ -295,14 +295,16 @@ pub fn kill_port(port: u16) -> Result<(), String> {
 
     let pid = target.pid;
     let output = if cfg!(windows) {
-        std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/F"]);
+        crate::execution::sanitize_gui_env_std(&mut cmd);
+        cmd.output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     } else {
-        std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output()
+        let mut cmd = std::process::Command::new("kill");
+        cmd.args(["-9", &pid.to_string()]);
+        crate::execution::sanitize_gui_env_std(&mut cmd);
+        cmd.output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     };
 

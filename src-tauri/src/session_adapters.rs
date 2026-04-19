@@ -453,11 +453,13 @@ pub async fn validate_resume(
 
     // Timeout after 5 seconds — a hanging validate command must not block
     // the entire restore flow.
-    let child = tokio::process::Command::new("sh")
-        .arg("-c")
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(&validate_cmd)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    crate::execution::sanitize_gui_env_tokio(&mut cmd);
+    let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn validate command: {e}"))?;
 

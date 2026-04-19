@@ -88,21 +88,28 @@ impl ExecutionPolicy {
 
     /// Default policy for regular worktree shell sessions (non-OpenFlow panes).
     ///
-    /// Preserves current behavior for plain user shells: no sandbox wrapping,
-    /// full inherited env, network/browser/GUI all allowed. The `HostPassthrough`
-    /// backend means `prepare_agent_command` returns the shell unmodified.
+    /// **Safe-by-default (as of April 2026):** `allow_desktop_gui` is `false`,
+    /// so plain user shells cannot accidentally pop Firefox/Chromium/Electron
+    /// windows onto the user's real Hyprland/Wayland session. The
+    /// `HostPassthrough` backend means the shell is not wrapped by bwrap —
+    /// we only strip GUI env keys and set neutralizers (`BROWSER=true`,
+    /// `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=disabled:`,
+    /// `XDG_CURRENT_DESKTOP=X-Generic`) so `systemctl --user`, `ssh-agent`,
+    /// and other host-session tools keep working.
     ///
-    /// Callers that want to hide desktop GUI (e.g. per-workspace opt-in via
-    /// `.codemux/config.json`) flip `allow_desktop_gui` to `false` and the
-    /// env-strip in `prepare_agent_command` takes effect automatically — still
-    /// without wrapping the shell, so `systemctl --user` and other host-session
-    /// tools keep working.
+    /// Users who want GUI apps launched from a pane (e.g. `npm run dev`
+    /// preview windows) can opt in per-workspace via `.codemux/config.json`
+    /// `{"sandbox": {"allow_desktop_gui": true}}`, or globally by setting
+    /// `CODEMUX_ALLOW_DESKTOP_GUI=1` before launching Codemux.
     pub fn worktree_session_default() -> Self {
+        let allow_desktop_gui = env::var("CODEMUX_ALLOW_DESKTOP_GUI")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
         Self {
             backend_preference: ExecutionBackendKind::HostPassthrough,
             allow_network: true,
             allow_browser_automation: true,
-            allow_desktop_gui: true,
+            allow_desktop_gui,
             virtual_display: false,
         }
     }
@@ -150,6 +157,15 @@ pub struct PreparedExecutionCommand {
     /// Stays empty on the `LinuxBubblewrap` branch because `build_linux_bwrap_args`
     /// already emits `--unsetenv` for the same set of keys.
     pub env_unset: Vec<String>,
+    /// Environment variables that must be *set* on the child process env
+    /// (e.g. `BROWSER=true`, `MOZ_NO_REMOTE=1`) after the caller has finished
+    /// setting its own env, but after `env_unset` is applied.
+    ///
+    /// These are neutralizers — they defeat escape hatches that pure env-strip
+    /// cannot close (DBus auto-discovery, `xdg-open` DE routing, firefox
+    /// remote protocol handoff). Empty on the `LinuxBubblewrap` branch because
+    /// `build_linux_bwrap_args` emits `--setenv` flags directly.
+    pub env_set: Vec<(String, String)>,
 }
 
 /// Environment variable keys that leak host-display access to a child process.
@@ -161,17 +177,84 @@ pub struct PreparedExecutionCommand {
 /// `playwright --headed`. On Windows, these keys typically aren't set and the
 /// strip is a no-op; on macOS, it covers XQuartz/X11 apps but not native Cocoa.
 ///
+/// On Linux with Hyprland/Wayland, the full set is needed because:
+/// - `WAYLAND_DISPLAY` overrides `DISPLAY` for most modern toolkits.
+/// - `HYPRLAND_INSTANCE_SIGNATURE` lets apps call `hyprctl` to reach the host.
+/// - `XDG_CURRENT_DESKTOP` / `DESKTOP_SESSION` / `GNOME_DESKTOP_SESSION_ID` /
+///   `XDG_SESSION_DESKTOP` route `xdg-open` through DE-specific DBus handlers,
+///   defeating the BROWSER override — strip them so `xdg-open` takes the
+///   generic mimeapps.list path (or the `BROWSER=true` neutralizer we set).
+/// - `NIXOS_OZONE_WL` / `MOZ_ENABLE_WAYLAND` force Electron/Firefox to Wayland.
+/// - `WAYLAND_SOCKET` is an alternate wayland discovery path.
+///
 /// Kept in sync with `--unsetenv` flags in `build_linux_bwrap_args`.
 pub fn gui_env_keys() -> &'static [&'static str] {
     &[
+        // X11
         "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "DBUS_SESSION_BUS_ADDRESS",
-        "DESKTOP_STARTUP_ID",
         "XAUTHORITY",
+        // Wayland
+        "WAYLAND_DISPLAY",
+        "WAYLAND_SOCKET",
+        // Session bus (DBus activation escape hatch: running firefox/chromium re-opens windows)
+        "DBUS_SESSION_BUS_ADDRESS",
+        // DE detection (routes xdg-open through portals / DE-specific handlers)
         "XDG_SESSION_TYPE",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "DESKTOP_SESSION",
+        "GNOME_DESKTOP_SESSION_ID",
+        // Compositor-specific reach-back (Hyprland, sway, Hyprland ecosystem)
+        "HYPRLAND_INSTANCE_SIGNATURE",
+        "HYPRCURSOR_THEME",
+        "HYPRCURSOR_SIZE",
+        "AQ_DRM_DEVICES",
+        "SWAYSOCK",
+        // Toolkit backend selectors (force app back to Wayland/X if left set)
         "GDK_BACKEND",
         "QT_QPA_PLATFORM",
+        "QT_QPA_PLATFORMTHEME",
+        "CLUTTER_BACKEND",
+        "SDL_VIDEODRIVER",
+        "NIXOS_OZONE_WL",
+        "MOZ_ENABLE_WAYLAND",
+        "MOZ_X11_EGL",
+        // Portal / gio bridges (DBus activation routes even without WAYLAND_DISPLAY)
+        "GTK_USE_PORTAL",
+        // Startup notification
+        "DESKTOP_STARTUP_ID",
+    ]
+}
+
+/// Environment variables to *set* (not unset) when desktop GUI is forbidden.
+///
+/// These neutralize the escape hatches that pure env-strip cannot close:
+/// - `BROWSER=true` makes `xdg-open <url>` a no-op (runs `/usr/bin/true`
+///   instead of reaching for the default browser).
+/// - `MOZ_NO_REMOTE=1` stops a spawned firefox from handing URLs to an already-
+///   running firefox instance via the X/DBus remote protocol.
+/// - `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null` uses the documented D-Bus
+///   address spec to fail the session-bus connection cleanly without triggering
+///   libdbus's autolaunch fallback that would re-discover `$XDG_RUNTIME_DIR/bus`.
+/// - `XDG_CURRENT_DESKTOP=X-Generic` forces `xdg-open` onto the generic
+///   mimeapps.list path instead of GNOME/KDE/portal DBus activation.
+/// - `DE=generic` belt-and-suspenders for older xdg-utils code paths that
+///   check `$DE` before `$XDG_CURRENT_DESKTOP`.
+/// - `GTK_USE_PORTAL=0` blocks GTK3/4 apps from routing through
+///   xdg-desktop-portal for file/URI opens even if they reach gio.
+/// - `GIO_USE_VFS=local` stops gio from DBus-activating gvfsd when parsing URIs.
+/// - `NO_AT_BRIDGE=1` suppresses at-spi2 bus activation attempts that would
+///   otherwise wake dbus-daemon on demand.
+pub fn gui_env_overrides() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("BROWSER", "true"),
+        ("MOZ_NO_REMOTE", "1"),
+        ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/dev/null"),
+        ("XDG_CURRENT_DESKTOP", "X-Generic"),
+        ("DE", "generic"),
+        ("GTK_USE_PORTAL", "0"),
+        ("GIO_USE_VFS", "local"),
+        ("NO_AT_BRIDGE", "1"),
     ]
 }
 
@@ -180,6 +263,52 @@ fn gui_env_unset_if_forbidden(policy: &ExecutionPolicy) -> Vec<String> {
         Vec::new()
     } else {
         gui_env_keys().iter().map(|s| s.to_string()).collect()
+    }
+}
+
+fn gui_env_set_if_forbidden(policy: &ExecutionPolicy) -> Vec<(String, String)> {
+    if policy.allow_desktop_gui {
+        Vec::new()
+    } else {
+        gui_env_overrides()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+}
+
+/// Apply GUI-env hygiene to a `std::process::Command`.
+///
+/// This is the entry point for the ~20 direct `Command::new()` spawn sites
+/// scattered across Codemux (agent_browser, git, mcp_server, ai, etc.) that
+/// don't go through the PTY/ExecutionPolicy path. Call this *after* setting
+/// any explicit `.env(K, V)` pairs so overrides win.
+///
+/// Effect: strips every key in `gui_env_keys()`, then sets the neutralizer
+/// values from `gui_env_overrides()`. Children spawned this way cannot pop
+/// windows onto the user's real Hyprland/Wayland/X11 session even if the
+/// caller never touched env explicitly.
+///
+/// Safe to call unconditionally — the strip is a no-op on Windows (keys not
+/// set) and macOS (X11 keys not usually set), so cross-platform callers
+/// don't need an OS gate.
+pub fn sanitize_gui_env_std(cmd: &mut std::process::Command) {
+    for key in gui_env_keys() {
+        cmd.env_remove(key);
+    }
+    for (k, v) in gui_env_overrides() {
+        cmd.env(k, v);
+    }
+}
+
+/// Same as `sanitize_gui_env_std` but for `tokio::process::Command`.
+/// Kept as a separate function because the two types don't share a trait.
+pub fn sanitize_gui_env_tokio(cmd: &mut tokio::process::Command) {
+    for key in gui_env_keys() {
+        cmd.env_remove(key);
+    }
+    for (k, v) in gui_env_overrides() {
+        cmd.env(k, v);
     }
 }
 
@@ -192,13 +321,14 @@ pub fn prepare_agent_command(
     match policy.effective_backend() {
         ExecutionBackendKind::LinuxBubblewrap => {
             if let Some(bwrap_path) = find_executable("bwrap") {
-                // Bwrap handles GUI env hygiene internally via `--unsetenv`,
-                // so env_unset stays empty on this branch.
+                // Bwrap handles GUI env hygiene internally via `--unsetenv`
+                // and `--setenv`, so env_unset / env_set stay empty here.
                 PreparedExecutionCommand {
                     executable: bwrap_path,
                     args: build_linux_bwrap_args(&executable, &args, cwd, policy),
                     backend: ExecutionBackendKind::LinuxBubblewrap,
                     env_unset: Vec::new(),
+                    env_set: Vec::new(),
                 }
             } else {
                 crate::diagnostics::stderr_line(
@@ -209,6 +339,7 @@ pub fn prepare_agent_command(
                     args,
                     backend: ExecutionBackendKind::HostPassthrough,
                     env_unset: gui_env_unset_if_forbidden(policy),
+                    env_set: gui_env_set_if_forbidden(policy),
                 }
             }
         }
@@ -217,6 +348,7 @@ pub fn prepare_agent_command(
             args,
             backend,
             env_unset: gui_env_unset_if_forbidden(policy),
+            env_set: gui_env_set_if_forbidden(policy),
         },
     }
 }
@@ -260,15 +392,22 @@ fn build_linux_bwrap_args(
     }
 
     if !policy.allow_desktop_gui {
-        for key in [
-            "DISPLAY",
-            "WAYLAND_DISPLAY",
-            "DBUS_SESSION_BUS_ADDRESS",
-            "DESKTOP_STARTUP_ID",
-            "XAUTHORITY",
-        ] {
+        // Strip the full extended key set — matches gui_env_keys() so bwrap
+        // and HostPassthrough paths behave identically. Missing a key on one
+        // path but not the other is the exact class of bug that let
+        // WAYLAND_DISPLAY slip through before.
+        for key in gui_env_keys() {
             out.push("--unsetenv".to_string());
-            out.push(key.to_string());
+            out.push((*key).to_string());
+        }
+
+        // Apply neutralizer overrides (BROWSER=true, MOZ_NO_REMOTE=1, etc.)
+        // so xdg-open / firefox / chromium can't escape via DBus activation
+        // or single-instance handoff even if env-strip is bypassed.
+        for (k, v) in gui_env_overrides() {
+            out.push("--setenv".to_string());
+            out.push((*k).to_string());
+            out.push((*v).to_string());
         }
 
         // Block X11 socket access even if a child process tries to recreate DISPLAY.
@@ -401,11 +540,169 @@ mod tests {
         assert!(p.allow_browser_automation);
     }
 
+    // Serializes every test in this module that mutates `CODEMUX_ALLOW_DESKTOP_GUI`.
+    // Integration tests in `tests/execution_env.rs` and `tests/gui_leak_prevention.rs`
+    // have their own per-crate mutex (separate process, so no contention with this one).
+    // Within this unit-test binary, every env-mutating test MUST acquire this guard.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvVarRestore {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarRestore {
+        fn snapshot(key: &'static str) -> Self {
+            Self {
+                key,
+                prior: env::var(key).ok(),
+            }
+        }
+    }
+
+    impl Drop for EnvVarRestore {
+        fn drop(&mut self) {
+            // SAFETY: std::env mutation in Rust 2024 is `unsafe`; safe here
+            // because `env_guard()` serializes every mutator in this module.
+            unsafe {
+                match &self.prior {
+                    Some(v) => env::set_var(self.key, v),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
     #[test]
-    fn worktree_default_allows_gui() {
+    fn worktree_default_forbids_gui_by_default() {
+        let _lock = env_guard();
+        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        // SAFETY: guarded by `env_guard()` above; restored by `_restore` Drop.
+        unsafe {
+            env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+        }
         let p = ExecutionPolicy::worktree_session_default();
-        assert!(p.allow_desktop_gui);
+        assert!(!p.allow_desktop_gui, "worktree default must strip GUI env");
         assert!(p.allow_network);
+    }
+
+    #[test]
+    fn worktree_default_honors_opt_in_env_one() {
+        let _lock = env_guard();
+        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        unsafe {
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "1");
+        }
+        let p = ExecutionPolicy::worktree_session_default();
+        assert!(p.allow_desktop_gui, "value `1` must re-enable GUI passthrough");
+    }
+
+    #[test]
+    fn worktree_default_honors_opt_in_env_true() {
+        let _lock = env_guard();
+        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        unsafe {
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "true");
+        }
+        let p = ExecutionPolicy::worktree_session_default();
+        assert!(
+            p.allow_desktop_gui,
+            "value `true` must re-enable GUI passthrough"
+        );
+    }
+
+    #[test]
+    fn worktree_default_honors_opt_in_env_yes() {
+        let _lock = env_guard();
+        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        unsafe {
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "yes");
+        }
+        let p = ExecutionPolicy::worktree_session_default();
+        assert!(
+            p.allow_desktop_gui,
+            "value `yes` must re-enable GUI passthrough"
+        );
+    }
+
+    #[test]
+    fn gui_env_keys_covers_wayland_and_dbus_escape_hatches() {
+        let keys = gui_env_keys();
+        for expected in [
+            "WAYLAND_DISPLAY",
+            "WAYLAND_SOCKET",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XDG_CURRENT_DESKTOP",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "MOZ_ENABLE_WAYLAND",
+            "NIXOS_OZONE_WL",
+        ] {
+            assert!(
+                keys.contains(&expected),
+                "gui_env_keys missing Wayland/DBus escape-hatch key {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn gui_env_overrides_neutralizes_browser_and_dbus() {
+        let overrides = gui_env_overrides();
+        let map: std::collections::HashMap<_, _> = overrides.iter().copied().collect();
+        assert_eq!(map.get("BROWSER").copied(), Some("true"));
+        assert_eq!(map.get("MOZ_NO_REMOTE").copied(), Some("1"));
+        // DBus neutralizer must use valid spec syntax (`unix:path=<path>`); a
+        // bare `disabled:` causes some libdbus clients to autolaunch-fall-back
+        // to `$XDG_RUNTIME_DIR/bus` and reach the real session bus anyway.
+        assert_eq!(
+            map.get("DBUS_SESSION_BUS_ADDRESS").copied(),
+            Some("unix:path=/dev/null")
+        );
+        assert_eq!(map.get("XDG_CURRENT_DESKTOP").copied(), Some("X-Generic"));
+        assert_eq!(map.get("DE").copied(), Some("generic"));
+        assert_eq!(map.get("GTK_USE_PORTAL").copied(), Some("0"));
+        assert_eq!(map.get("GIO_USE_VFS").copied(), Some("local"));
+        assert_eq!(map.get("NO_AT_BRIDGE").copied(), Some("1"));
+    }
+
+    #[test]
+    fn host_passthrough_populates_env_set_when_forbidden() {
+        let policy = policy_gui(false, ExecutionBackendKind::HostPassthrough);
+        let prepared = prepare_agent_command("echo".into(), vec![], "/tmp", &policy);
+        assert!(
+            !prepared.env_set.is_empty(),
+            "env_set must carry neutralizer overrides when gui is forbidden"
+        );
+        let keys: Vec<&str> = prepared.env_set.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"BROWSER"));
+        assert!(keys.contains(&"MOZ_NO_REMOTE"));
+    }
+
+    #[test]
+    fn host_passthrough_env_set_empty_when_gui_allowed() {
+        let policy = policy_gui(true, ExecutionBackendKind::HostPassthrough);
+        let prepared = prepare_agent_command("echo".into(), vec![], "/tmp", &policy);
+        assert!(prepared.env_set.is_empty());
+    }
+
+    #[test]
+    fn sanitize_gui_env_std_strips_and_sets() {
+        use std::process::Command;
+        let mut cmd = Command::new("true");
+        cmd.env("DISPLAY", ":0")
+            .env("WAYLAND_DISPLAY", "wayland-1")
+            .env("XDG_CURRENT_DESKTOP", "Hyprland");
+        sanitize_gui_env_std(&mut cmd);
+        // We can't observe env_remove after the fact without spawning, so
+        // smoke-test by spawning `env` (if available) is done in the
+        // integration tests. Here we simply verify the function returns
+        // without panicking and builds a valid command.
+        let _program = cmd.get_program().to_string_lossy().into_owned();
     }
 
     #[test]

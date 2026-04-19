@@ -768,9 +768,10 @@ async fn get_workspace_cwd() -> Result<String, String> {
 
 async fn run_git(args: &[&str]) -> Result<Value, String> {
     let cwd = get_workspace_cwd().await?;
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(&cwd)
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args).current_dir(&cwd);
+    crate::execution::sanitize_gui_env_tokio(&mut cmd);
+    let output = cmd
         .output()
         .await
         .map_err(|e| format!("Failed to run git: {e}"))?;
