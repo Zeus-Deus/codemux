@@ -1,8 +1,9 @@
 use tauri::{Emitter, State};
 
 use crate::auth::{
-    api_base_url, clear_token, is_token_expired, load_cached_user, load_token, save_auth,
-    AuthResponse, AuthState, AuthStatePayload, AuthUser,
+    api_base_url, clear_token, derive_auth_secret, is_token_expired, load_cached_user,
+    load_token, login_email_api, save_auth, signup_email_api, AuthResponse, AuthState,
+    AuthStatePayload, AuthUser,
 };
 use crate::database::DatabaseStore;
 
@@ -48,29 +49,22 @@ pub async fn signin_email(
         return Err("Email and password are required".into());
     }
 
-    let base = api_base_url();
-    let url = format!("{base}/api/auth/desktop/signin");
+    // Bitwarden-style zero-knowledge derivation: stretch
+    // (password, email) locally into a high-entropy AuthSecret and
+    // send THAT to the server in place of the raw password. The
+    // server bcrypt-hashes it like any password, but never sees the
+    // user's actual password. Must produce byte-identical output to
+    // Vexis's derivation or cross-product login breaks — pinned by
+    // `auth_secret_matches_vexis_for_known_input` in
+    // auth/derivation.rs.
+    //
+    // `login_email_api` takes `&AuthSecret`, not `&str` — the
+    // compiler refuses to let us pass the raw password past this
+    // point.
+    let auth_secret = derive_auth_secret(&password, &email)?;
+    drop(password); // raw password falls out of scope; only the derived secret proceeds.
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Authentication failed");
-        return Err(msg.to_string());
-    }
-
-    let api_resp: ApiAuthResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse response: {e}"))?;
+    let api_resp = login_email_api(&email, &auth_secret).await?;
 
     let user = AuthUser {
         id: api_resp.user.id.clone(),
@@ -106,28 +100,18 @@ pub async fn signup_email(
         return Err("Email and password are required".into());
     }
 
-    let base = api_base_url();
-    let url = format!("{base}/api/auth/desktop/signup");
+    // Bitwarden-style zero-knowledge derivation: the server only
+    // ever sees the stretched AuthSecret, never the raw password.
+    // Must match Vexis's derivation byte-for-byte or a user who
+    // signs up in Codemux can't later sign in from Vexis (and vice
+    // versa). See auth/derivation.rs.
+    //
+    // `signup_email_api` takes `&AuthSecret` — the compiler refuses
+    // to let the raw password reach the network.
+    let auth_secret = derive_auth_secret(&password, &email)?;
+    drop(password); // raw password falls out of scope; only the derived secret proceeds.
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "email": email,
-            "password": password,
-            "name": name,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Sign-up failed");
-        return Err(msg.to_string());
-    }
+    signup_email_api(&email, &auth_secret, &name).await?;
 
     // Don't save token — user must verify email first, then sign in
     Ok(())
@@ -262,14 +246,11 @@ pub fn get_auth_token(db: State<'_, DatabaseStore>) -> Result<Option<String>, St
 }
 
 // ── Internal types for API deserialization ────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiAuthResp {
-    token: String,
-    #[serde(rename = "expiresAt")]
-    expires_at: String,
-    user: ApiUserResp,
-}
+//
+// `check_auth` still hand-rolls its `/desktop/verify` HTTP call
+// here (no password involved, so it doesn't need the typed
+// AuthSecret boundary). The signin/signup response types live in
+// `auth/api.rs` alongside the typed helpers that return them.
 
 #[derive(Debug, serde::Deserialize)]
 struct ApiUserResp {

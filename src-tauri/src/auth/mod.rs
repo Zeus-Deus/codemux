@@ -17,6 +17,20 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use tauri::Emitter;
 
+// ── Submodules ───────────────────────────────────────────────────
+
+pub mod api;
+pub mod derivation;
+
+// Re-export the zero-knowledge auth derivation + API client at the
+// module root so command handlers can write
+// `crate::auth::{derive_auth_secret, login_email_api}` alongside the
+// other auth helpers. API client helpers are `pub(crate)` — they're
+// only meant for use inside this crate's Tauri commands and
+// intentionally don't leak to consumers linking against codemux_lib.
+pub(crate) use api::{login_email_api, signup_email_api};
+pub use derivation::{derive_auth_secret, AuthSecret};
+
 // ── Types ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

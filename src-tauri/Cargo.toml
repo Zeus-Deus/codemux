@@ -47,6 +47,8 @@ rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 aes-gcm = "0.10"
 sha2 = "0.10"
+argon2 = "0.5"
+hkdf = "0.12"
 hostname = "0.4"
 url = "2"
 urlencoding = "2"
@@ -62,3 +64,11 @@ tauri-plugin-dialog = { version = "2" }
 [dev-dependencies]
 mockito = "1"
 serial_test = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+# Used by auth/api.rs tests to dup2 stderr for the log-leak
+# regression guard. Unix-only because the underlying capture mechanism
+# relies on POSIX fd dup2. On Windows the equivalent guarantee is
+# provided statically by the typed AuthSecret boundary + Debug-redact
+# test.
+gag = "1"
