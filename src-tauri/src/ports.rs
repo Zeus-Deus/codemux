@@ -462,7 +462,6 @@ mod windows_impl {
     fn silent_command(program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.creation_flags(CREATE_NO_WINDOW);
-        crate::execution::sanitize_gui_env_std(&mut cmd);
         cmd
     }
 

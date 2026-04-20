@@ -178,10 +178,10 @@ fn machine_id() -> Vec<u8> {
         return id.trim().as_bytes().to_vec();
     }
     // macOS: use IOPlatformUUID via sysctl or hostname
-    let mut sysctl_cmd = std::process::Command::new("sysctl");
-    sysctl_cmd.args(["-n", "kern.uuid"]);
-    crate::execution::sanitize_gui_env_std(&mut sysctl_cmd);
-    if let Ok(output) = sysctl_cmd.output() {
+    if let Ok(output) = std::process::Command::new("sysctl")
+        .args(["-n", "kern.uuid"])
+        .output()
+    {
         if output.status.success() {
             return String::from_utf8_lossy(&output.stdout)
                 .trim()

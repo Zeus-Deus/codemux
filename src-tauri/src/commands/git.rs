@@ -69,12 +69,12 @@ pub fn git_fetch_changes(path: String) -> Result<(), String> {
 pub async fn git_fetch_prune(path: String) -> Result<(), String> {
     use std::time::Duration;
 
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["fetch", "--prune"]).current_dir(&path);
-    crate::execution::sanitize_gui_env_tokio(&mut cmd);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        cmd.output(),
+        tokio::process::Command::new("git")
+            .args(["fetch", "--prune"])
+            .current_dir(&path)
+            .output(),
     )
     .await;
 
@@ -268,12 +268,11 @@ pub async fn resolve_conflicts_with_agent(
 pub async fn git_clone_repo(url: String, target_dir: String) -> Result<String, String> {
     use std::time::Duration;
 
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.args(["clone", &url, &target_dir]);
-    crate::execution::sanitize_gui_env_tokio(&mut cmd);
     let result = tokio::time::timeout(
         Duration::from_secs(120),
-        cmd.output(),
+        tokio::process::Command::new("git")
+            .args(["clone", &url, &target_dir])
+            .output(),
     )
     .await;
 

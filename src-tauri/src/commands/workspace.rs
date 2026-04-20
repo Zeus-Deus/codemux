@@ -502,15 +502,6 @@ pub fn close_workspace_with_worktree(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
-    // Release virtual display for this workspace (idempotent).
-    {
-        let vd_manager: State<
-            '_,
-            crate::execution::virtual_display::VirtualDisplayManager,
-        > = app.state();
-        vd_manager.release(&workspace_id);
-    }
-
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
             let branch_to_delete = if delete_branch.unwrap_or(false) {
@@ -648,16 +639,6 @@ pub fn close_workspace(
     let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
     for session_id in result.removed_sessions {
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
-    }
-
-    // Release the virtual display (if any) allocated for this workspace.
-    // Idempotent — no-op if no display was ever acquired.
-    {
-        let vd_manager: State<
-            '_,
-            crate::execution::virtual_display::VirtualDisplayManager,
-        > = app.state();
-        vd_manager.release(&workspace_id);
     }
 
     crate::state::emit_app_state(&app);
@@ -1123,12 +1104,9 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .iter()
         .find(|e| e.id == editor_id)
         .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
-    let mut cmd = std::process::Command::new(&editor.command);
-    cmd.arg(&path);
-    // User-initiated GUI launch (UI button click): inherit full desktop env so
-    // the editor can reach Wayland/X11. Per CLAUDE.md "spawning child processes"
-    // rule, user-facing spawns must NOT sanitize.
-    cmd.spawn()
+    std::process::Command::new(&editor.command)
+        .arg(&path)
+        .spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())
 }

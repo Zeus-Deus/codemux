@@ -11,7 +11,6 @@ pub mod package_detect;
 pub mod presets;
 pub mod settings_sync;
 pub mod update;
-pub mod virtual_display;
 pub mod workspace;
 
 pub use ai::*;
@@ -27,7 +26,6 @@ pub use package_detect::*;
 pub use presets::*;
 pub use settings_sync::*;
 pub use update::*;
-pub use virtual_display::*;
 pub use workspace::*;
 
 use crate::indexing::{
@@ -295,16 +293,14 @@ pub fn kill_port(port: u16) -> Result<(), String> {
 
     let pid = target.pid;
     let output = if cfg!(windows) {
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/PID", &pid.to_string(), "/F"]);
-        crate::execution::sanitize_gui_env_std(&mut cmd);
-        cmd.output()
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     } else {
-        let mut cmd = std::process::Command::new("kill");
-        cmd.args(["-9", &pid.to_string()]);
-        crate::execution::sanitize_gui_env_std(&mut cmd);
-        cmd.output()
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     };
 

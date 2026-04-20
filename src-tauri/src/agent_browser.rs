@@ -3,8 +3,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::Mutex;
 
-use crate::execution::sanitize_gui_env_std;
-
 /// Stealth Chromium flags that reduce bot detection fingerprinting.
 /// Passed via the AGENT_BROWSER_ARGS env var (comma-separated).
 const STEALTH_CHROMIUM_ARGS: &str = "\
@@ -26,10 +24,7 @@ const STEALTH_CHROMIUM_ARGS: &str = "\
 fn stealth_user_agent() -> String {
     let candidates = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
     for bin in candidates {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("--version");
-        sanitize_gui_env_std(&mut cmd);
-        if let Ok(output) = cmd.output() {
+        if let Ok(output) = std::process::Command::new(bin).arg("--version").output() {
             if output.status.success() {
                 let version_str = String::from_utf8_lossy(&output.stdout);
                 // Parse version like "Chromium 131.0.6778.204" or "Google Chrome 131.0.6778.204"
@@ -97,18 +92,16 @@ pub fn kill_stream_daemons() {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/IM", "agent-browser.exe", "/F"])
-            .creation_flags(CREATE_NO_WINDOW);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "agent-browser.exe", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
+            .output();
     }
 }
 
@@ -162,10 +155,10 @@ fn kill_process_on_port(port: u16) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let mut netstat_cmd = std::process::Command::new("netstat");
-        netstat_cmd.args(["-ano"]).creation_flags(CREATE_NO_WINDOW);
-        sanitize_gui_env_std(&mut netstat_cmd);
-        let Ok(netstat) = netstat_cmd.output()
+        let Ok(netstat) = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
         else {
             eprintln!(
                 "[codemux::browser] kill_process_on_port({}): failed to spawn netstat",
@@ -181,19 +174,17 @@ fn kill_process_on_port(port: u16) {
         let pids = pids_listening_on_port(&stdout, port);
 
         for pid in pids {
-            let mut cmd = std::process::Command::new("taskkill");
-            cmd.args(["/PID", &pid.to_string(), "/F"])
-                .creation_flags(CREATE_NO_WINDOW);
-            sanitize_gui_env_std(&mut cmd);
-            let _ = cmd.output();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
         }
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
+            .output();
     }
 }
 
@@ -311,17 +302,15 @@ fn resolve_binary() -> String {
     // now, Windows falls through to the Tauri sidecar lookup and then
     // the `npx agent-browser` fallback.
     #[cfg(unix)]
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("agent-browser")
+        .output()
     {
-        let mut which_cmd = std::process::Command::new("which");
-        which_cmd.arg("agent-browser");
-        sanitize_gui_env_std(&mut which_cmd);
-        if let Ok(output) = which_cmd.output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                // Skip the node_modules/.bin shim — we want the native binary directly
-                if !path.is_empty() && !path.contains("node_modules/.bin") {
-                    return path;
-                }
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Skip the node_modules/.bin shim — we want the native binary directly
+            if !path.is_empty() && !path.contains("node_modules/.bin") {
+                return path;
             }
         }
     }
@@ -481,13 +470,11 @@ fn make_request_id() -> String {
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
     let shell_cmd = build_agent_browser_command(session, action, &params)?;
-    let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", &shell_cmd])
+    let output = std::process::Command::new("sh")
+        .args(["-c", &shell_cmd])
         .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
         .output()
         .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
 
@@ -514,10 +501,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         eprintln!("[codemux::browser] ARIA snapshot empty, falling back to DOM query");
         let dom_params = serde_json::json!({ "script": DOM_SNAPSHOT_SCRIPT });
         let dom_cmd = build_agent_browser_command(session, "eval", &dom_params)?;
-        let mut dom_cmd_builder = std::process::Command::new("sh");
-        dom_cmd_builder.args(["-c", &dom_cmd]);
-        sanitize_gui_env_std(&mut dom_cmd_builder);
-        if let Ok(dom_output) = dom_cmd_builder.output() {
+        if let Ok(dom_output) = std::process::Command::new("sh").args(["-c", &dom_cmd]).output() {
             let dom_stdout = String::from_utf8_lossy(&dom_output.stdout).to_string();
             let dom_tree = extract_eval_result(&dom_stdout);
             if !dom_tree.is_empty() && dom_tree != "(no elements found)" {
@@ -662,13 +646,11 @@ impl AgentBrowserManager {
             }
         }
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut cmd);
-        let output = cmd
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
 
@@ -696,13 +678,11 @@ impl AgentBrowserManager {
         let bin = resolve_binary();
         let port = self.allocate_port(browser_id).await?;
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} screenshot --session {}", bin, session)])
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("{} screenshot --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut cmd);
-        let output = cmd
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to get screenshot: {}", e))?;
 
@@ -744,10 +724,9 @@ impl AgentBrowserManager {
             kill_process_on_port(s.port);
         }
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} close --session {}", bin, session)]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("{} close --session {}", bin, session)])
+            .output();
         Ok(())
     }
 
@@ -784,10 +763,9 @@ impl AgentBrowserManager {
         // The agent-browser CLI would then reuse the stale daemon (by session name)
         // while BrowserPane connects to the newly allocated (empty) port.
 
-        let mut close_cmd = std::process::Command::new("sh");
-        close_cmd.args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)]);
-        sanitize_gui_env_std(&mut close_cmd);
-        let _ = close_cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)])
+            .output();
 
         let port = self.allocate_port(browser_id).await?;
 
@@ -802,13 +780,12 @@ impl AgentBrowserManager {
             "{} open about:blank --headless --session {}",
             bin, session
         );
-        let mut launch = std::process::Command::new("sh");
-        launch.args(["-c", &launch_cmd])
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &launch_cmd])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut launch);
-        let _ = launch.output();
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+            .output();
 
         // Give the daemon a moment to start the WebSocket stream server.
         std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -854,10 +831,9 @@ mod tests {
                 result
             );
             // Verify it's executable
-            let mut cmd = std::process::Command::new(&result);
-            cmd.arg("--version");
-            sanitize_gui_env_std(&mut cmd);
-            let output = cmd.output();
+            let output = std::process::Command::new(&result)
+                .arg("--version")
+                .output();
             assert!(output.is_ok(), "Binary at {} is not executable", result);
             let out = output.unwrap();
             let version = String::from_utf8_lossy(&out.stdout);

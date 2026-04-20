@@ -5,10 +5,9 @@ use std::time::Duration;
 use tokio::process::Command as AsyncCommand;
 
 pub fn claude_available() -> bool {
-    let mut cmd = Command::new("which");
-    cmd.arg("claude");
-    crate::execution::sanitize_gui_env_std(&mut cmd);
-    cmd.output()
+    Command::new("which")
+        .arg("claude")
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -147,15 +146,13 @@ pub(crate) async fn run_resolver_cli(
     repo_path: &Path,
     timeout: Duration,
 ) -> Result<Output, ResolverRunError> {
-    let mut cmd = AsyncCommand::new(program);
-    cmd.args(args)
+    let child = AsyncCommand::new(program)
+        .args(args)
         .current_dir(repo_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    crate::execution::sanitize_gui_env_tokio(&mut cmd);
-    let child = cmd
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| ResolverRunError::Spawn(e.to_string()))?;
 
@@ -313,12 +310,10 @@ pub async fn generate_commit_message(
     model: Option<&str>,
 ) -> Result<String, String> {
     let diff = {
-        let mut cmd = AsyncCommand::new("git");
-        cmd.args(["diff", "--cached"])
+        let output = AsyncCommand::new("git")
+            .args(["diff", "--cached"])
             .current_dir(repo_path)
-            .stdin(Stdio::null());
-        crate::execution::sanitize_gui_env_tokio(&mut cmd);
-        let output = cmd
+            .stdin(Stdio::null())
             .output()
             .await
             .map_err(|e| format!("Failed to run git diff: {e}"))?;

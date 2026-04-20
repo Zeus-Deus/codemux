@@ -193,15 +193,6 @@ pub struct TerminalSessionSnapshot {
     /// Written immediately when hooks fire, so each pane has its own data.
     #[serde(default)]
     pub adapter_captures: std::collections::HashMap<String, String>,
-    /// Who drives keystrokes in this session. Determines whether the
-    /// spawn path inherits the host `DISPLAY`/`WAYLAND_DISPLAY`/etc.
-    /// (Human) or strips them (Agent). Set by `apply_preset` at creation
-    /// time — plain Terminal tabs and the built-in Shell preset default
-    /// to Human; Claude/Codex/OpenCode/Gemini/Pi presets set it to Agent.
-    /// Persists through save/load so startup restore respawns each
-    /// session with the same persona it originally had.
-    #[serde(default)]
-    pub persona: crate::presets::Persona,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,8 +642,6 @@ impl AppStateStore {
             exit_code: None,
             original_command: None,
             adapter_captures: Default::default(),
-            // OpenFlow orchestrator-owned session — strip GUI env.
-            persona: crate::presets::Persona::Agent,
         });
 
         let workspace = snapshot
@@ -769,8 +758,6 @@ impl AppStateStore {
                 exit_code: None,
                 original_command: None,
                 adapter_captures: Default::default(),
-                // Plain workspace shells are user-driven — keep GUI env.
-                persona: crate::presets::Persona::Human,
             });
             session_ids.push(session_id);
         }
@@ -1240,8 +1227,6 @@ impl AppStateStore {
             exit_code: None,
             original_command: None,
             adapter_captures: Default::default(),
-            // Plain new-tab terminal — user-driven, keep GUI env.
-            persona: crate::presets::Persona::Human,
         });
 
         if let Some(workspace) = snapshot
@@ -1317,8 +1302,6 @@ impl AppStateStore {
             exit_code: None,
             original_command: None,
             adapter_captures: Default::default(),
-            // Plain split-pane terminal — user-driven, keep GUI env.
-            persona: crate::presets::Persona::Human,
         });
 
         let workspace = snapshot
@@ -1851,42 +1834,6 @@ impl AppStateStore {
         false
     }
 
-    /// Tag a terminal session's `persona` so the PTY spawn path can pick
-    /// the right `ExecutionPolicy`. Called by `apply_preset` BEFORE the
-    /// PTY is spawned — `spawn_pty_for_session` reads it back immediately.
-    /// Returns `false` if the session id isn't known (e.g. the caller
-    /// is racing against cleanup); callers should treat that as "leave
-    /// it at the default Human persona the session was created with".
-    pub fn update_terminal_session_persona(
-        &self,
-        session: &str,
-        persona: crate::presets::Persona,
-    ) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
-        if let Some(terminal) = snapshot
-            .terminal_sessions
-            .iter_mut()
-            .find(|terminal| terminal.session_id.0 == session)
-        {
-            terminal.persona = persona;
-            return true;
-        }
-        false
-    }
-
-    /// Read a session's persona. Returns `None` if the session is not in
-    /// state (e.g. it was deleted between a preset launch and the PTY
-    /// spawn). The spawn path treats `None` as `Human` — a missing
-    /// session is not an agent session.
-    pub fn terminal_session_persona(&self, session: &str) -> Option<crate::presets::Persona> {
-        let snapshot = self.inner.lock().unwrap();
-        snapshot
-            .terminal_sessions
-            .iter()
-            .find(|t| t.session_id.0 == session)
-            .map(|t| t.persona)
-    }
-
     pub fn update_terminal_session_command(&self, session: &str, command: String) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
@@ -2123,8 +2070,6 @@ impl AppStateStore {
                     exit_code: None,
                     original_command: None,
                     adapter_captures: Default::default(),
-                    // Recovery-path terminal — user-driven, keep GUI env.
-                    persona: crate::presets::Persona::Human,
                 });
 
                 new_session_id = Some(session_id);
@@ -2710,8 +2655,6 @@ fn default_app_state() -> AppStateSnapshot {
             exit_code: None,
             original_command: None,
             adapter_captures: Default::default(),
-            // Default-store Terminal 1 — user-driven, keep GUI env.
-            persona: crate::presets::Persona::Human,
         }],
         browser_sessions: vec![],
         agent_browser_sessions: vec![],

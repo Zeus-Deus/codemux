@@ -1,4 +1,3 @@
-use crate::execution::sanitize_gui_env_std;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -111,10 +110,9 @@ pub fn check_gh_status() -> GhStatus {
         return GhStatus::NotInstalled;
     }
 
-    let mut cmd = Command::new("gh");
-    cmd.args(["auth", "status"]);
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd.output();
+    let output = Command::new("gh")
+        .args(["auth", "status"])
+        .output();
 
     let Ok(output) = output else {
         return GhStatus::NotAuthenticated;
@@ -140,10 +138,9 @@ pub fn check_gh_status() -> GhStatus {
 }
 
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd
+    let output = Command::new("gh")
+        .args(args)
+        .current_dir(repo_path)
         .output()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
 
@@ -166,20 +163,19 @@ fn run_gh_json(repo_path: &Path, args: &[&str]) -> Result<serde_json::Value, Str
 
 /// Returns None on non-zero exit (e.g. "no PR for this branch") instead of Err.
 fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
-    cmd.output()
+    Command::new("gh")
+        .args(args)
+        .current_dir(repo_path)
+        .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
 }
 
 pub fn gh_available() -> bool {
-    let mut cmd = Command::new("which");
-    cmd.arg("gh");
-    sanitize_gui_env_std(&mut cmd);
-    cmd.output()
+    Command::new("which")
+        .arg("gh")
+        .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -243,13 +239,11 @@ const ISSUE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Run `gh` with a timeout. Returns Err if the process doesn't finish in time.
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
-    cmd.args(args)
+    let mut child = Command::new("gh")
+        .args(args)
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    sanitize_gui_env_std(&mut cmd);
-    let mut child = cmd
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
 

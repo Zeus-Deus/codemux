@@ -32,7 +32,6 @@ vi.mock("@/tauri/commands", () => ({
         is_builtin: true,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
-        persona: "agent",
       },
     ],
   }),

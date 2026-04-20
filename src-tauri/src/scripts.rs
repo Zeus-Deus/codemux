@@ -160,21 +160,14 @@ fn copy_matching_files(
     worktree_path: &Path,
     exclude_file: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut cmd = Command::new("git");
-    cmd.args([
-        "ls-files",
-        "--others",
-        "--ignored",
-        &format!("--exclude-from={}", exclude_file.display()),
-    ])
-    .current_dir(root_path);
-    // No GUI sanitization: `git ls-files` is pure git plumbing with no
-    // GUI touchpoint. Stripping DISPLAY/WAYLAND_DISPLAY here was a
-    // defensive overreach from the agent-leak hardening — git never
-    // opens a window, and worktree-includes runs from user-initiated
-    // workspace setup, so full env inheritance is both safe and
-    // consistent with the human-driven principal.
-    let output = cmd
+    let output = Command::new("git")
+        .args([
+            "ls-files",
+            "--others",
+            "--ignored",
+            &format!("--exclude-from={}", exclude_file.display()),
+        ])
+        .current_dir(root_path)
         .output()
         .map_err(|e| format!("Failed to run git ls-files for worktree includes: {e}"))?;
 
@@ -340,12 +333,6 @@ pub fn run_setup_scripts_with_config(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
-        // Setup scripts are user-initiated via the Run button — they
-        // inherit the full desktop env so `docker compose up`, `xdg-open`
-        // a docs URL in the browser, `notify-send`, etc. work like they
-        // do in any other terminal. Stripping GUI env here was a
-        // collateral casualty of the agent-leak lockdown; it broke the
-        // Run button for anyone whose setup actually does GUI things.
 
         let output = cmd
             .output()
@@ -417,10 +404,6 @@ pub fn run_teardown_scripts(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
-        // Teardown runs when the user deletes a workspace. Same user-
-        // initiated principal as setup — keep the host env so
-        // `docker compose down`, container shutdown, notifications,
-        // etc. all work.
 
         let output = cmd
             .output()

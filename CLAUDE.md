@@ -17,17 +17,6 @@
 - Default to `npm run verify` after meaningful changes.
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
-## Spawning Child Processes
-
-Policy follows the principal — who triggered the spawn?
-
-- **Agent-facing spawns** (MCP tool calls, `agent_browser`, OpenFlow orchestrator children, session-adapter helpers, etc.): call `crate::execution::sanitize_gui_env_std(&mut cmd)` (or `sanitize_gui_env_tokio`) immediately before `.output()` / `.spawn()` / `.status()`. This strips `DISPLAY`/`WAYLAND_DISPLAY`/etc. and sets neutralizers so AI-driven tool calls can't pop windows on the user's real desktop.
-- **User-initiated spawns** (setup/teardown scripts from the Run button, worktree-include `git ls-files`, etc.): do NOT call the sanitize helpers. The user clicked a button; they expect full desktop env. `docker compose up`, `notify-send`, `xdg-open`, and GUI launches must work.
-- Exceptions where the sanitize rule doesn't apply even for agent paths (display access required): `hyprctl`, `ydotool`, `systemctl`, `loginctl`.
-- When adding new display/DBus/compositor env vars that leak to children, append them to `gui_env_keys()` in `src-tauri/src/execution/mod.rs`.
-- Keep `build_linux_bwrap_args` in sync — the two code paths must strip the same set.
-- Terminal PTY spawns (`spawn_pty_for_session`, `spawn_pty_for_agent`) are driven by the session's `persona` field (see `src-tauri/src/presets.rs`): `Persona::Human` → full env; `Persona::Agent` → stripped env. The PTY paths do not call `sanitize_gui_env_std` — they build an `ExecutionPolicy` via `worktree_session_default_for_persona` and apply `env_unset`/`env_set` from the prepared command.
-
 ## UI & Feature Work
 
 - The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.

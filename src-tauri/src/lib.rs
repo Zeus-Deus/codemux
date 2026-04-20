@@ -137,11 +137,6 @@ pub fn run() {
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
-        // Phase 2 display-isolation: per-workspace virtual display manager.
-        // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
-        // prior Codemux crashes. Actual Xvfb spawning is lazy — first agent
-        // that opts in via CODEMUX_VIRTUAL_DISPLAY=1 triggers acquire().
-        .manage(execution::virtual_display::VirtualDisplayManager::new())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()
@@ -628,7 +623,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_platform,
-            commands::get_workspace_virtual_display,
             commands::get_current_theme,
             commands::get_shell_appearance,
             commands::get_app_state,

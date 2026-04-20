@@ -677,13 +677,6 @@ export interface OrchestratorTriggerResult {
 
 export type LaunchMode = "split_pane" | "new_tab";
 
-// Who drives keystrokes in a preset's session. Determines display-isolation
-// policy — "human" keeps the host DISPLAY/WAYLAND_DISPLAY (user can run
-// GUI apps from their own terminal); "agent" strips them so AI-driven
-// tool calls can't pop windows on the user's real desktop. Maps 1:1 to
-// the Rust `presets::Persona` enum.
-export type Persona = "human" | "agent";
-
 export interface TerminalPreset {
   id: string;
   name: string;
@@ -696,7 +689,6 @@ export interface TerminalPreset {
   is_builtin: boolean;
   auto_run_on_workspace: boolean;
   auto_run_on_new_tab: boolean;
-  persona: Persona;
 }
 
 export interface PresetStoreSnapshot {

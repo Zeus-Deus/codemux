@@ -878,63 +878,6 @@ fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, Strin
     vars
 }
 
-/// Extras derived from `.codemux/config.json` `sandbox` section that don't
-/// fit inside `ExecutionPolicy` — currently just the VNC-watch opt-in.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WorkspaceSandboxExtras {
-    watch_vnc: bool,
-}
-
-/// Pure core of `apply_workspace_sandbox_overrides`: given a workspace cwd
-/// and a starting policy, read `.codemux/config.json` there and merge the
-/// `sandbox` section into both the policy and the extras tuple. This is the
-/// side-effect-free half that unit tests drive directly with a tempdir.
-///
-/// Returns the updated policy + extras. Missing config file or absent fields
-/// leave the caller's defaults intact — this is the expected path for
-/// workspaces that opt out of per-workspace sandbox config.
-fn apply_sandbox_config_at(
-    cwd: &std::path::Path,
-    mut policy: crate::execution::ExecutionPolicy,
-) -> (crate::execution::ExecutionPolicy, WorkspaceSandboxExtras) {
-    let mut extras = WorkspaceSandboxExtras::default();
-    let Some(config) = crate::config::workspace_config::read_workspace_config(cwd) else {
-        return (policy, extras);
-    };
-    if let Some(v) = config.sandbox.allow_desktop_gui {
-        policy.allow_desktop_gui = v;
-    }
-    if let Some(v) = config.sandbox.virtual_display {
-        policy.virtual_display = v;
-    }
-    if let Some(v) = config.sandbox.watch_vnc {
-        extras.watch_vnc = v;
-    }
-    (policy, extras)
-}
-
-/// Read `.codemux/config.json` for the workspace and override the caller's
-/// execution policy with any per-workspace `sandbox.*` fields that are set.
-/// Missing config file or absent fields leave the policy untouched.
-///
-/// Silent no-op failure: if the config can't be read for any reason we fall
-/// back to the caller's defaults rather than blocking workspace creation.
-fn apply_workspace_sandbox_overrides(
-    app_state: &AppStateStore,
-    workspace_id: &str,
-    policy: crate::execution::ExecutionPolicy,
-) -> (crate::execution::ExecutionPolicy, WorkspaceSandboxExtras) {
-    let snapshot = app_state.snapshot();
-    let Some(ws) = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)
-    else {
-        return (policy, WorkspaceSandboxExtras::default());
-    };
-    apply_sandbox_config_at(std::path::Path::new(&ws.cwd), policy)
-}
-
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
@@ -993,66 +936,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     app_state.update_terminal_session_shell(&session_id, shell.clone());
 
     let cwd = session_working_dir(&app_state, &session_id);
-
-    // Persona-driven display-isolation wiring. The session's persona was
-    // set either at creation (plain shell / split / new-tab default to
-    // `Human`; `add_agent_terminal_to_workspace` for OpenFlow agents
-    // defaults to `Agent`) or by `apply_preset` (which sets `Agent` for
-    // Claude/Codex/OpenCode/Gemini/Pi presets before this spawn fires).
-    //
-    // - `Persona::Human` → `allow_desktop_gui: true` → `env_unset` / `env_set`
-    //   lists stay empty → shell inherits the host desktop env unchanged,
-    //   so `npm run tauri dev`, `firefox`, etc. work from a user's terminal.
-    // - `Persona::Agent` → `allow_desktop_gui: false` → every GUI env key
-    //   is stripped and neutralizers (BROWSER=true, DBUS=/dev/null, …)
-    //   are set, so AI-driven tool calls can't pop windows on the host.
-    //
-    // Reading via `terminal_session_persona` keeps the decision live with
-    // state rather than plumbing an extra parameter through every caller —
-    // startup restore, split pane, preset launch all converge here and
-    // each one already had to create (or restore) the session snapshot
-    // first. Missing-session → `Human` is the safe fallback (worst case:
-    // a stale id's shell gets GUI env, same as pre-fix behavior).
-    let persona = app_state
-        .terminal_session_persona(&session_id)
-        .unwrap_or(crate::presets::Persona::Human);
-    let base_policy =
-        crate::execution::ExecutionPolicy::worktree_session_default_for_persona(persona);
-
-    // Find owning workspace early — we need it both for the persona-overlaid
-    // policy (per-workspace `.codemux/config.json` can flip `allow_desktop_gui`
-    // or enable `virtual_display`) and for the virtual-display acquisition
-    // below (keyed by workspace_id). A lookup of None just means this session
-    // isn't parented to any workspace yet (orphan / startup race); in that
-    // case we use the plain persona-derived policy without workspace overlays.
-    let workspace_id_for_spawn: Option<String> = {
-        let snap = app_state.snapshot();
-        snap.workspaces
-            .iter()
-            .find(|ws| {
-                ws.surfaces.iter().any(|s| {
-                    crate::state::find_terminal_pane_id(&s.root, &session_id).is_some()
-                })
-            })
-            .map(|ws| ws.workspace_id.0.clone())
-    };
-
-    let (session_policy, sandbox_extras) = match workspace_id_for_spawn.as_deref() {
-        Some(ws_id) => apply_workspace_sandbox_overrides(&app_state, ws_id, base_policy),
-        None => (base_policy, WorkspaceSandboxExtras::default()),
-    };
-
-    let prepared_shell = crate::execution::prepare_agent_command(
-        shell.clone(),
-        Vec::new(),
-        &cwd,
-        &session_policy,
-    );
-
-    let mut cmd = CommandBuilder::new(&prepared_shell.executable);
-    for arg in &prepared_shell.args {
-        cmd.arg(arg);
-    }
+    let mut cmd = CommandBuilder::new(shell.clone());
     cmd.cwd(cwd);
 
     // Declare terminal capabilities — Codemux is the terminal emulator, so it
@@ -1155,68 +1039,6 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
-    }
-
-    // Phase 1 display-isolation: strip GUI env keys the policy marked for
-    // removal. With Human-persona panes (the default) this list is empty
-    // and the shell inherits the host desktop env unchanged. For Agent-
-    // persona panes (Claude/Codex/OpenCode/… or any custom preset the
-    // user flagged), this is the line that actually prevents
-    // `DISPLAY`/`WAYLAND_DISPLAY`/`HYPRLAND_INSTANCE_SIGNATURE`/etc.
-    // from reaching the child shell. Runs AFTER every `cmd.env(...)`
-    // above so nothing can silently re-set a stripped key.
-    for key in &prepared_shell.env_unset {
-        cmd.env_remove(key);
-    }
-    for (key, val) in &prepared_shell.env_set {
-        cmd.env(key, val);
-    }
-
-    // Phase 2 display-isolation: if the policy asks for a virtual display
-    // (Agent persona + `virtual_display: true` in per-workspace config or
-    // `CODEMUX_VIRTUAL_DISPLAY=1`), acquire an Xvfb slot and inject
-    // `DISPLAY=:N` AFTER the strip above. Mirrors the block in
-    // `spawn_pty_for_agent` — keeping the two paths in sync means an
-    // agent preset launched via PresetBar behaves identically to an
-    // OpenFlow-spawned agent for display purposes.
-    //
-    // Graceful degrade: if Xvfb isn't installed or the manager can't
-    // allocate a slot, we log a visible diagnostic (not a panic) and
-    // leave DISPLAY stripped — the agent runs headless. This is the
-    // documented fallback; callers that need guaranteed GUI render
-    // should install `xvfb` as a system dependency.
-    if session_policy.virtual_display {
-        if let Some(ws_id) = workspace_id_for_spawn.as_deref() {
-            let manager: State<'_, crate::execution::virtual_display::VirtualDisplayManager> =
-                app.state();
-            let opts = crate::execution::virtual_display::AcquireOptions {
-                watch_vnc: sandbox_extras.watch_vnc,
-            };
-            match manager.acquire_with_options(ws_id, opts) {
-                Ok(vd_env) => {
-                    for (k, v) in vd_env.env_pairs() {
-                        cmd.env(&k, &v);
-                    }
-                    let vnc_suffix = vd_env
-                        .vnc_port
-                        .map(|p| format!(" (VNC on 127.0.0.1:{p})"))
-                        .unwrap_or_default();
-                    crate::diagnostics::stderr_line(&format!(
-                        "[codemux::execution] Virtual display {} acquired for workspace {ws_id}{vnc_suffix}",
-                        vd_env.display
-                    ));
-                }
-                Err(e) => {
-                    crate::diagnostics::stderr_line(&format!(
-                        "[codemux::execution] Virtual display requested but unavailable for workspace {ws_id}: {e}"
-                    ));
-                }
-            }
-        } else {
-            crate::diagnostics::stderr_line(
-                "[codemux::execution] virtual_display=true but session has no workspace; skipping acquisition",
-            );
-        }
     }
 
     let child = match pty_pair.slave.spawn_command(cmd) {
@@ -1925,14 +1747,6 @@ pub fn spawn_pty_for_agent(
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let agent_store: State<'_, crate::openflow::AgentSessionStore> = app.state();
-
-    // Phase 2 display-isolation: per-workspace sandbox config wins over the
-    // adapter-provided policy defaults. Users toggle via `.codemux/config.json`:
-    //   {"sandbox": {"virtual_display": true, "watch_vnc": true}}
-    // If the file doesn't exist or the keys are absent, the adapter default
-    // (which itself reads the CODEMUX_VIRTUAL_DISPLAY env var) is preserved.
-    let (execution_policy, sandbox_extras) =
-        apply_workspace_sandbox_overrides(&app_state, &workspace_id, execution_policy);
     let sessions = terminal_state.sessions.clone();
     let agent_store_inner = agent_store.clone_inner();
 
@@ -2063,23 +1877,8 @@ pub fn spawn_pty_for_agent(
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
 
-    // Agent-specific env vars from the adapter. Adapter env is pre-filtered
-    // against `env_unset` so it can't silently re-set a policy-stripped key
-    // (e.g. an adapter propagating `DISPLAY` from the host env would otherwise
-    // un-do the `allow_desktop_gui=false` strip we're about to apply below).
-    // We still apply `env_unset` at the very end as the authoritative strip.
+    // Agent-specific env vars from the adapter.
     for (key, val) in &extra_env {
-        if prepared
-            .env_unset
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case(key))
-            || prepared
-                .env_set
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case(key))
-        {
-            continue;
-        }
         cmd.env(key, val);
     }
 
@@ -2119,55 +1918,6 @@ pub fn spawn_pty_for_agent(
             "0"
         },
     );
-
-    // Phase 1 display-isolation: authoritative env-strip. On the bwrap branch
-    // this list is empty (bwrap handles it via `--unsetenv`). On every other
-    // branch — macOS/Windows stubs, bwrap-missing fallback, HostPassthrough —
-    // when the policy says `allow_desktop_gui=false` the GUI env keys live
-    // here and we remove them AFTER every `cmd.env(...)` call above (including
-    // the `extra_env` merge). This is the guarantee that OpenFlow agents on
-    // macOS/Windows finally get their `allow_desktop_gui: false` respected
-    // instead of being an advisory flag.
-    for key in &prepared.env_unset {
-        cmd.env_remove(key);
-    }
-    for (key, val) in &prepared.env_set {
-        cmd.env(key, val);
-    }
-
-    // Phase 2 display-isolation: if the policy asks for a virtual display,
-    // acquire one for this workspace and inject `DISPLAY=:N` AFTER the strip
-    // above. Graceful degrade — if Xvfb isn't installed or the manager can't
-    // allocate a slot, we log, leave `DISPLAY` stripped, and the agent runs
-    // without a display (Phase 1 behavior). Agent code should be prepared for
-    // either outcome.
-    if execution_policy.virtual_display {
-        let manager: State<'_, crate::execution::virtual_display::VirtualDisplayManager> =
-            app.state();
-        let opts = crate::execution::virtual_display::AcquireOptions {
-            watch_vnc: sandbox_extras.watch_vnc,
-        };
-        match manager.acquire_with_options(&workspace_id, opts) {
-            Ok(vd_env) => {
-                for (k, v) in vd_env.env_pairs() {
-                    cmd.env(&k, &v);
-                }
-                let vnc_suffix = vd_env
-                    .vnc_port
-                    .map(|p| format!(" (VNC on 127.0.0.1:{p})"))
-                    .unwrap_or_default();
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::execution] Virtual display {} acquired for workspace {workspace_id}{vnc_suffix}",
-                    vd_env.display
-                ));
-            }
-            Err(e) => {
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::execution] Virtual display requested but unavailable for workspace {workspace_id}: {e}"
-                ));
-            }
-        }
-    }
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -4254,124 +4004,6 @@ mod tests {
             // Cannot simulate portable_pty::Child::process_id() returning
             // None without mocking the crate. The spawn path now fails
             // loudly (Fix 2). Documented as untested.
-        }
-    }
-
-    // ── Phase 2 sandbox-override helper tests ────────────────────────
-    //
-    // `apply_sandbox_config_at` is the pure core of
-    // `apply_workspace_sandbox_overrides` — takes a workspace cwd + starting
-    // policy, reads `.codemux/config.json`, merges the `sandbox` section.
-    // These tests drive it with real config files in tempdirs so the
-    // merge-precedence contract is tested end-to-end.
-
-    mod sandbox_overrides {
-        use super::*;
-        use std::fs;
-
-        fn default_policy() -> crate::execution::ExecutionPolicy {
-            crate::execution::ExecutionPolicy {
-                backend_preference: crate::execution::ExecutionBackendKind::HostPassthrough,
-                allow_network: true,
-                allow_browser_automation: true,
-                allow_desktop_gui: false,
-                virtual_display: false,
-            }
-        }
-
-        fn write_config(dir: &std::path::Path, body: &str) {
-            let cfg_dir = dir.join(".codemux");
-            fs::create_dir_all(&cfg_dir).unwrap();
-            fs::write(cfg_dir.join("config.json"), body).unwrap();
-        }
-
-        #[test]
-        fn no_config_file_leaves_policy_and_extras_untouched() {
-            let tmp = tempfile::tempdir().unwrap();
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn empty_sandbox_section_is_noop() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn virtual_display_override_flips_policy_field() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"virtual_display": true}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(policy.virtual_display);
-            // Other fields untouched.
-            assert!(!policy.allow_desktop_gui);
-            // watch_vnc wasn't in the config — extras default.
-            assert!(!extras.watch_vnc);
-        }
-
-        #[test]
-        fn allow_desktop_gui_override_flips_policy_field() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"allow_desktop_gui": true}}"#);
-            let (policy, _) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(policy.allow_desktop_gui);
-            // virtual_display unchanged.
-            assert!(!policy.virtual_display);
-        }
-
-        #[test]
-        fn watch_vnc_lands_in_extras_not_policy() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"watch_vnc": true}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(extras.watch_vnc);
-            // Policy untouched — watch_vnc is a display-manager concern,
-            // not an execution policy concern.
-            assert_eq!(policy, default_policy());
-        }
-
-        #[test]
-        fn all_three_fields_together() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(
-                tmp.path(),
-                r#"{"sandbox": {"allow_desktop_gui": false, "virtual_display": true, "watch_vnc": true}}"#,
-            );
-            let starting = crate::execution::ExecutionPolicy::worktree_session_default();
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), starting);
-            assert!(!policy.allow_desktop_gui, "config should override to false");
-            assert!(policy.virtual_display);
-            assert!(extras.watch_vnc);
-        }
-
-        #[test]
-        fn malformed_json_is_noop_not_panic() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), "{not: valid json");
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            // read_workspace_config returns None on parse error → fall
-            // through to caller defaults. MUST NOT panic.
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn config_without_sandbox_section_is_back_compat() {
-            let tmp = tempfile::tempdir().unwrap();
-            // Mimics an existing .codemux/config.json written before Phase 2
-            // landed — must not panic and must preserve caller defaults.
-            write_config(
-                tmp.path(),
-                r#"{"setup": ["npm install"], "teardown": []}"#,
-            );
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
         }
     }
 }

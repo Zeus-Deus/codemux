@@ -852,7 +852,6 @@ mod tests {
             exit_code: None,
             original_command: Some("claude".into()),
             adapter_captures: captures,
-            persona: crate::presets::Persona::Agent,
         });
         snap.active_workspace_id = WorkspaceId(ws_id.into());
         store.replace_snapshot(snap);
