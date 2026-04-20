@@ -343,6 +343,7 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
 
 #[tauri::command]
 pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    // `which xdg-open` is just a probe — sanitize keeps it noise-free.
     let mut which_cmd = Command::new("which");
     which_cmd
         .arg("xdg-open")
@@ -357,9 +358,11 @@ pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
     {
         return Err("xdg-open not found — cannot open file manager. Install xdg-utils.".to_string());
     }
+    // User-initiated GUI launch (UI button click): xdg-open must inherit full
+    // desktop env to hand the file off to the user's file manager. Per CLAUDE.md
+    // "spawning child processes" rule, user-facing spawns must NOT sanitize.
     let mut open_cmd = Command::new("xdg-open");
     open_cmd.arg(&path);
-    sanitize_gui_env_std(&mut open_cmd);
     open_cmd
         .spawn()
         .map_err(|e| format!("Failed to open file manager: {e}"))?;

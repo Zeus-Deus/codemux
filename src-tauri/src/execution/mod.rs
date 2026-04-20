@@ -86,43 +86,63 @@ impl ExecutionPolicy {
         }
     }
 
-    /// Default policy for regular worktree shell sessions, **keyed by the
-    /// principal driving the PTY** (the `Persona` stored on each session).
+    /// Default policy for regular worktree shell sessions.
     ///
-    /// Policy follows the principal:
-    /// - `Persona::Human` — a person is typing. Inherits `DISPLAY` /
-    ///   `WAYLAND_DISPLAY` / `HYPRLAND_INSTANCE_SIGNATURE` / etc. so
-    ///   `npm run tauri dev`, `firefox`, and other GUI launches from a
-    ///   user's own terminal pane work normally. This matches every
-    ///   other terminal emulator (kitty, alacritty, ghostty, …) —
-    ///   nothing surprising.
-    /// - `Persona::Agent` — an AI CLI is driving the keystrokes (Claude
-    ///   Code, OpenCode, Codex, Gemini, Pi, or any custom preset the
-    ///   user flagged). Desktop GUI env is stripped so a tool call of
-    ///   `npm run tauri dev` can't accidentally pop a window onto the
-    ///   user's Hyprland/Wayland session. Users who want agent-driven
-    ///   GUI testing set `virtual_display: true` per-workspace
-    ///   (`.codemux/config.json` → `{"sandbox": {"virtual_display": true}}`)
-    ///   or globally via `CODEMUX_VIRTUAL_DISPLAY=1` — the spawn path
-    ///   will acquire an Xvfb and inject `DISPLAY=:N` so webkit/GTK apps
-    ///   render into the virtual display instead of the host's.
+    /// Both `Persona::Human` and `Persona::Agent` now default to full desktop
+    /// env inheritance. Rationale: env-stripping is structurally leaky on
+    /// Linux — libwayland auto-discovers `wayland-0` via `XDG_RUNTIME_DIR`,
+    /// libdbus falls back to `$XDG_RUNTIME_DIR/bus`, and Hyprland's IPC
+    /// socket is enumerable. The strip never actually prevented GUI pop-ups,
+    /// but it DID break legitimate uses like Claude Code's `Ctrl+V` image
+    /// paste (which shells out to `wl-paste`/`xclip`, both of which need
+    /// `WAYLAND_DISPLAY`/`DISPLAY`). Matching every other ADE on the market
+    /// (Cursor, Codex CLI, Conductor, T3Code, Claude Code itself): agents
+    /// run in the user's session with full env. The `Persona` parameter is
+    /// retained for future per-persona policy knobs and is still consumed
+    /// by preset classification and UI.
+    ///
+    /// ### Opt-in isolation
+    ///
+    /// Isolation is available for users who explicitly want it:
+    /// - `CODEMUX_ALLOW_DESKTOP_GUI=0` — force-deny everywhere. The existing
+    ///   strip machinery engages: every `gui_env_keys()` key is unset and
+    ///   `gui_env_overrides()` neutralizers are injected.
+    /// - `.codemux/config.json` → `{"sandbox": {"allow_desktop_gui": false}}`
+    ///   — per-workspace force-deny.
+    /// - `CODEMUX_VIRTUAL_DISPLAY=1` combined with force-deny routes agents
+    ///   to a headless per-workspace Xvfb (see `VirtualDisplayManager`).
     ///
     /// ### Global overrides
     ///
-    /// `CODEMUX_ALLOW_DESKTOP_GUI` overrides the persona default:
-    /// - `1` / `true` / `yes` → force-allow for every session, including
-    ///   agents. Use when you explicitly trust your agents (e.g. running
-    ///   Codemux inside a container that's already display-isolated).
+    /// `CODEMUX_ALLOW_DESKTOP_GUI` overrides the default:
+    /// - `1` / `true` / `yes` → force-allow (same as default; kept for
+    ///   explicitness).
     /// - `0` / `false` / `no` → force-deny for every session, including
     ///   humans. Use for kiosk / CI / shared-host setups where no pane
     ///   should ever reach the host display.
-    /// - unset → per-persona default (described above).
+    /// - unset → default (full env, both personas).
     pub fn worktree_session_default_for_persona(
         persona: crate::presets::Persona,
     ) -> Self {
+        // Default to inheriting full desktop env for BOTH personas. Env-stripping
+        // is structurally leaky on Linux (libwayland auto-discovers wayland-0 via
+        // XDG_RUNTIME_DIR, libdbus falls back to $XDG_RUNTIME_DIR/bus, the Hyprland
+        // IPC socket is enumerable) so the strip never actually prevented GUI
+        // pop-ups, but it did break legitimate uses like Claude Code's Ctrl+V
+        // image paste (needs WAYLAND_DISPLAY to reach wl-paste/xclip). Match every
+        // other ADE on the market: agents run in the user's session with full env.
+        //
+        // Isolation is still available as opt-in:
+        // - `CODEMUX_ALLOW_DESKTOP_GUI=0` (force-deny everywhere)
+        // - `.codemux/config.json` → `{"sandbox": {"allow_desktop_gui": false}}`
+        // - `CODEMUX_VIRTUAL_DISPLAY=1` (route agents to a headless Xvfb)
+        //
+        // The Persona parameter is kept for future per-persona policy knobs and
+        // is still consumed by other systems (preset classification, UI).
+        let _ = persona;
         let allow_desktop_gui = match parse_gui_override_env() {
             Some(forced) => forced,
-            None => matches!(persona, crate::presets::Persona::Human),
+            None => true,
         };
 
         // Virtual display is an orthogonal knob: it routes a virtual
@@ -663,11 +683,13 @@ mod tests {
     }
 
     #[test]
-    fn worktree_default_denies_gui_for_agent_persona() {
-        // Agent-driven panes (Claude, Codex, OpenCode, …) must NOT inherit
-        // the host display — otherwise agent tool calls pop windows on the
-        // user's real desktop, which was the whole motivation for the
-        // 0e4e558 lockdown.
+    fn worktree_default_allows_gui_for_agent_persona() {
+        // Agent persona now inherits the host display by default — env-strip
+        // never actually prevented GUI pop-ups (socket auto-discovery) and
+        // broke legitimate clipboard tools (wl-paste/xclip for Claude Code's
+        // Ctrl+V image paste). Matches every other ADE (Cursor, Codex CLI,
+        // T3Code, Conductor). Opt-in isolation still available via
+        // CODEMUX_ALLOW_DESKTOP_GUI=0 (tested below).
         let _lock = env_guard();
         let _restore_gui = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         let _restore_vd = EnvVarRestore::snapshot("CODEMUX_VIRTUAL_DISPLAY");
@@ -679,24 +701,23 @@ mod tests {
             crate::presets::Persona::Agent,
         );
         assert!(
-            !p.allow_desktop_gui,
-            "agent-driven pane must strip DISPLAY/WAYLAND_DISPLAY"
+            p.allow_desktop_gui,
+            "agent-driven pane now inherits host DISPLAY by default"
         );
-        // Without CODEMUX_VIRTUAL_DISPLAY, virtual_display stays off —
-        // agents run headless. Opting in is a separate toggle.
         assert!(!p.virtual_display);
     }
 
     #[test]
     fn worktree_default_agent_persona_opts_into_virtual_display() {
-        // When CODEMUX_VIRTUAL_DISPLAY=1 and the pane is Agent-driven,
-        // the policy asks `terminal/mod.rs` to acquire an Xvfb and inject
-        // `DISPLAY=:N` so webkit/GTK apps can render headlessly.
+        // Virtual display only engages when GUI is forbidden. Since Agent
+        // now defaults to allow_desktop_gui=true, users must ALSO opt into
+        // isolation (CODEMUX_ALLOW_DESKTOP_GUI=0) to route agents through
+        // Xvfb.
         let _lock = env_guard();
         let _restore_gui = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         let _restore_vd = EnvVarRestore::snapshot("CODEMUX_VIRTUAL_DISPLAY");
         unsafe {
-            env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "0");
             env::set_var("CODEMUX_VIRTUAL_DISPLAY", "1");
         }
         let p = ExecutionPolicy::worktree_session_default_for_persona(
@@ -770,21 +791,24 @@ mod tests {
     #[test]
     fn env_override_accepts_case_sensitive_tokens() {
         // Spec: only lowercase `1`/`true`/`yes`/`0`/`false`/`no` count.
-        // `True`, `TRUE`, etc. return None (fall back to persona default)
-        // rather than risk ambiguity. Users who care can type the
-        // canonical form; typos don't lock them out — they get the safe
-        // per-persona default.
+        // `True`, `TRUE`, etc. return None (fall back to default) rather
+        // than risk ambiguity. Since the default is now allow_desktop_gui=true
+        // for both personas, an uppercase `TRUE` that falls through to the
+        // default is indistinguishable from a recognized `true`. To
+        // meaningfully test case-sensitivity we use `NO`, which a case-
+        // insensitive parser would read as deny but a strict parser should
+        // ignore and fall back to the default (allow).
         let _lock = env_guard();
         let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         unsafe {
-            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "TRUE"); // uppercase → None
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "NO"); // uppercase → None
         }
         let p = ExecutionPolicy::worktree_session_default_for_persona(
             crate::presets::Persona::Agent,
         );
-        // Persona default (Agent → deny) should take effect, not the
-        // uppercase-True that would otherwise have forced allow.
-        assert!(!p.allow_desktop_gui);
+        // Default (allow) should take effect, not the uppercase-NO that
+        // would otherwise have forced deny.
+        assert!(p.allow_desktop_gui);
     }
 
     #[test]

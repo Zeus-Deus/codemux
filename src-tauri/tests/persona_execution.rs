@@ -115,7 +115,13 @@ fn human_persona_policy_allows_gui() {
 }
 
 #[test]
-fn agent_persona_policy_denies_gui() {
+fn agent_persona_policy_allows_gui_by_default() {
+    // Both personas default to full desktop env. Env-stripping is structurally
+    // leaky on Linux (auto-discovery via XDG_RUNTIME_DIR) and broke legitimate
+    // clipboard tools like wl-paste/xclip — so Agent persona now matches other
+    // ADEs and inherits the user's desktop. Isolation remains available via
+    // CODEMUX_ALLOW_DESKTOP_GUI=0 (see env_override_force_deny_* tests below)
+    // or per-workspace `.codemux/config.json`.
     let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
     let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
@@ -124,7 +130,7 @@ fn agent_persona_policy_denies_gui() {
         env::remove_var("CODEMUX_VIRTUAL_DISPLAY");
     }
     let p = ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent);
-    assert!(!p.allow_desktop_gui);
+    assert!(p.allow_desktop_gui);
     assert!(!p.virtual_display);
 }
 
@@ -151,7 +157,10 @@ fn human_persona_prepared_command_has_empty_env_strip() {
 }
 
 #[test]
-fn agent_persona_prepared_command_strips_gui_keys() {
+fn agent_persona_prepared_command_leaves_env_alone_by_default() {
+    // New default: Agent persona inherits full env — env_unset/env_set must
+    // both be empty. The opt-in isolation path (CODEMUX_ALLOW_DESKTOP_GUI=0)
+    // is covered separately by `env_override_force_deny_populates_env_strip`.
     let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
     let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
@@ -161,22 +170,40 @@ fn agent_persona_prepared_command_strips_gui_keys() {
     }
     let policy = ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent);
     let prep = prepare_agent_command("echo".into(), vec![], "/tmp", &policy);
-    // Every key from `gui_env_keys()` must be in env_unset so the spawn
-    // path strips them from the child process.
+    assert!(
+        prep.env_unset.is_empty(),
+        "agent persona default must NOT strip any env keys — isolation is opt-in"
+    );
+    assert!(prep.env_set.is_empty());
+}
+
+#[test]
+fn agent_persona_opt_in_isolation_strips_gui_keys() {
+    // When a user explicitly opts into isolation via CODEMUX_ALLOW_DESKTOP_GUI=0,
+    // every `gui_env_keys()` must land in env_unset and every
+    // `gui_env_overrides()` neutralizer must land in env_set.
+    let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
+    let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
+    unsafe {
+        env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "0");
+        env::remove_var("CODEMUX_VIRTUAL_DISPLAY");
+    }
+    let policy = ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent);
+    let prep = prepare_agent_command("echo".into(), vec![], "/tmp", &policy);
     for key in gui_env_keys() {
         assert!(
             prep.env_unset.iter().any(|k| k == key),
-            "agent persona must include {key} in env_unset"
+            "opt-in isolation must include {key} in env_unset"
         );
     }
-    // Every neutralizer pair from `gui_env_overrides()` must be in env_set.
     for (k, v) in gui_env_overrides() {
         let actual = prep
             .env_set
             .iter()
             .find(|(pk, _)| pk == k)
-            .unwrap_or_else(|| panic!("agent persona must set neutralizer {k}"));
-        assert_eq!(actual.1, *v, "agent persona must set {k}={v}");
+            .unwrap_or_else(|| panic!("opt-in isolation must set neutralizer {k}"));
+        assert_eq!(actual.1, *v, "opt-in isolation must set {k}={v}");
     }
 }
 
@@ -236,13 +263,13 @@ fn human_persona_child_inherits_display() {
     );
 }
 
-/// The guarantee an Agent-persona pane must uphold: even if the parent
-/// Codemux process has DISPLAY set, the child never sees it. This is
-/// what stops Claude from popping a Firefox window on the host desktop
-/// when it runs `playwright --headed` or `npm run tauri dev`.
+/// Agent persona now inherits the host display by default. Clipboard tools
+/// (wl-paste, xclip — which Claude Code's Ctrl+V image paste relies on) need
+/// WAYLAND_DISPLAY/DISPLAY to function, and env-stripping never actually
+/// blocked GUI pop-ups anyway (socket auto-discovery via XDG_RUNTIME_DIR).
 #[test]
 #[cfg(target_os = "linux")]
-fn agent_persona_child_does_not_inherit_display() {
+fn agent_persona_child_inherits_display_by_default() {
     let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
     let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
@@ -254,8 +281,41 @@ fn agent_persona_child_does_not_inherit_display() {
     let prep = prepare_agent_command("env".into(), vec![], "/tmp", &policy);
 
     let mut cmd = Command::new("env");
-    // Seed the parent env with every GUI key an attacker/accidental
-    // launch could rely on. The strip must handle all of them.
+    cmd.env("DISPLAY", ":42");
+    cmd.env("WAYLAND_DISPLAY", "wayland-42");
+    cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "fake-sig");
+    apply_prepared_to_command(&mut cmd, &prep);
+
+    let env_map = run_env_and_parse(&mut cmd);
+    assert_eq!(
+        env_map.get("DISPLAY").map(String::as_str),
+        Some(":42"),
+        "Agent persona default must pass DISPLAY so clipboard tools work"
+    );
+    assert_eq!(
+        env_map.get("WAYLAND_DISPLAY").map(String::as_str),
+        Some("wayland-42"),
+        "Agent persona default must pass WAYLAND_DISPLAY so wl-paste/Ctrl+V image paste works"
+    );
+}
+
+/// When a user opts into isolation via CODEMUX_ALLOW_DESKTOP_GUI=0, the Agent
+/// persona must strip every GUI key and inject the neutralizers. This proves
+/// the opt-in path still works for security-conscious deployments.
+#[test]
+#[cfg(target_os = "linux")]
+fn agent_persona_opt_in_strips_display_from_child() {
+    let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
+    let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
+    unsafe {
+        env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "0");
+        env::remove_var("CODEMUX_VIRTUAL_DISPLAY");
+    }
+    let policy = ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent);
+    let prep = prepare_agent_command("env".into(), vec![], "/tmp", &policy);
+
+    let mut cmd = Command::new("env");
     cmd.env("DISPLAY", ":42");
     cmd.env("WAYLAND_DISPLAY", "wayland-42");
     cmd.env("HYPRLAND_INSTANCE_SIGNATURE", "fake-sig");
@@ -268,25 +328,24 @@ fn agent_persona_child_does_not_inherit_display() {
     for key in ["DISPLAY", "WAYLAND_DISPLAY", "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY"] {
         assert!(
             !env_map.contains_key(key),
-            "Agent persona must strip {key}; got {:?}",
+            "opt-in isolation must strip {key}; got {:?}",
             env_map.get(key)
         );
     }
-    // Neutralizers must be injected so escape-hatches are closed.
     assert_eq!(
         env_map.get("DBUS_SESSION_BUS_ADDRESS").map(String::as_str),
         Some("unix:path=/dev/null"),
-        "Agent persona must neutralize DBus session bus"
+        "opt-in isolation must neutralize DBus session bus"
     );
     assert_eq!(
         env_map.get("XDG_CURRENT_DESKTOP").map(String::as_str),
         Some("X-Generic"),
-        "Agent persona must neutralize DE detection"
+        "opt-in isolation must neutralize DE detection"
     );
     assert_eq!(
         env_map.get("BROWSER").map(String::as_str),
         Some("true"),
-        "Agent persona must neutralize xdg-open BROWSER"
+        "opt-in isolation must neutralize xdg-open BROWSER"
     );
 }
 
@@ -351,18 +410,21 @@ fn env_override_force_deny_hides_display_from_human_child() {
 
 #[test]
 fn agent_persona_opts_into_virtual_display_when_env_set() {
+    // Virtual display only engages when GUI is forbidden. Since Agent now
+    // defaults to allow_desktop_gui=true, the user must ALSO opt into
+    // isolation (CODEMUX_ALLOW_DESKTOP_GUI=0) to route agents through Xvfb.
     let _lock = persona_env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let _gui = EnvRestore::take("CODEMUX_ALLOW_DESKTOP_GUI");
     let _vd = EnvRestore::take("CODEMUX_VIRTUAL_DISPLAY");
     unsafe {
-        env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+        env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "0");
         env::set_var("CODEMUX_VIRTUAL_DISPLAY", "1");
     }
     let p = ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent);
     assert!(!p.allow_desktop_gui);
     assert!(
         p.virtual_display,
-        "Agent + CODEMUX_VIRTUAL_DISPLAY=1 must opt into Xvfb routing"
+        "Agent + CODEMUX_ALLOW_DESKTOP_GUI=0 + CODEMUX_VIRTUAL_DISPLAY=1 must opt into Xvfb"
     );
 }
 

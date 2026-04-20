@@ -1125,7 +1125,9 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
     let mut cmd = std::process::Command::new(&editor.command);
     cmd.arg(&path);
-    crate::execution::sanitize_gui_env_std(&mut cmd);
+    // User-initiated GUI launch (UI button click): inherit full desktop env so
+    // the editor can reach Wayland/X11. Per CLAUDE.md "spawning child processes"
+    // rule, user-facing spawns must NOT sanitize.
     cmd.spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())
