@@ -86,32 +86,75 @@ impl ExecutionPolicy {
         }
     }
 
-    /// Default policy for regular worktree shell sessions (non-OpenFlow panes).
+    /// Default policy for regular worktree shell sessions, **keyed by the
+    /// principal driving the PTY** (the `Persona` stored on each session).
     ///
-    /// **Safe-by-default (as of April 2026):** `allow_desktop_gui` is `false`,
-    /// so plain user shells cannot accidentally pop Firefox/Chromium/Electron
-    /// windows onto the user's real Hyprland/Wayland session. The
-    /// `HostPassthrough` backend means the shell is not wrapped by bwrap —
-    /// we only strip GUI env keys and set neutralizers (`BROWSER=true`,
-    /// `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=disabled:`,
-    /// `XDG_CURRENT_DESKTOP=X-Generic`) so `systemctl --user`, `ssh-agent`,
-    /// and other host-session tools keep working.
+    /// Policy follows the principal:
+    /// - `Persona::Human` — a person is typing. Inherits `DISPLAY` /
+    ///   `WAYLAND_DISPLAY` / `HYPRLAND_INSTANCE_SIGNATURE` / etc. so
+    ///   `npm run tauri dev`, `firefox`, and other GUI launches from a
+    ///   user's own terminal pane work normally. This matches every
+    ///   other terminal emulator (kitty, alacritty, ghostty, …) —
+    ///   nothing surprising.
+    /// - `Persona::Agent` — an AI CLI is driving the keystrokes (Claude
+    ///   Code, OpenCode, Codex, Gemini, Pi, or any custom preset the
+    ///   user flagged). Desktop GUI env is stripped so a tool call of
+    ///   `npm run tauri dev` can't accidentally pop a window onto the
+    ///   user's Hyprland/Wayland session. Users who want agent-driven
+    ///   GUI testing set `virtual_display: true` per-workspace
+    ///   (`.codemux/config.json` → `{"sandbox": {"virtual_display": true}}`)
+    ///   or globally via `CODEMUX_VIRTUAL_DISPLAY=1` — the spawn path
+    ///   will acquire an Xvfb and inject `DISPLAY=:N` so webkit/GTK apps
+    ///   render into the virtual display instead of the host's.
     ///
-    /// Users who want GUI apps launched from a pane (e.g. `npm run dev`
-    /// preview windows) can opt in per-workspace via `.codemux/config.json`
-    /// `{"sandbox": {"allow_desktop_gui": true}}`, or globally by setting
-    /// `CODEMUX_ALLOW_DESKTOP_GUI=1` before launching Codemux.
-    pub fn worktree_session_default() -> Self {
-        let allow_desktop_gui = env::var("CODEMUX_ALLOW_DESKTOP_GUI")
-            .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+    /// ### Global overrides
+    ///
+    /// `CODEMUX_ALLOW_DESKTOP_GUI` overrides the persona default:
+    /// - `1` / `true` / `yes` → force-allow for every session, including
+    ///   agents. Use when you explicitly trust your agents (e.g. running
+    ///   Codemux inside a container that's already display-isolated).
+    /// - `0` / `false` / `no` → force-deny for every session, including
+    ///   humans. Use for kiosk / CI / shared-host setups where no pane
+    ///   should ever reach the host display.
+    /// - unset → per-persona default (described above).
+    pub fn worktree_session_default_for_persona(
+        persona: crate::presets::Persona,
+    ) -> Self {
+        let allow_desktop_gui = match parse_gui_override_env() {
+            Some(forced) => forced,
+            None => matches!(persona, crate::presets::Persona::Human),
+        };
+
+        // Virtual display is an orthogonal knob: it routes a virtual
+        // `DISPLAY=:N` into the pane AFTER the strip. Only meaningful
+        // when GUI is forbidden (allow_desktop_gui=false); with GUI
+        // allowed the host DISPLAY is already inherited and Xvfb would
+        // just compete. We gate acquisition on the policy field in
+        // `terminal/mod.rs`, so setting it to `true` here for Human
+        // persona is a no-op and stays off to avoid confusion.
+        let virtual_display = !allow_desktop_gui
+            && env::var("CODEMUX_VIRTUAL_DISPLAY")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+
         Self {
             backend_preference: ExecutionBackendKind::HostPassthrough,
             allow_network: true,
             allow_browser_automation: true,
             allow_desktop_gui,
-            virtual_display: false,
+            virtual_display,
         }
+    }
+
+    /// Convenience wrapper: `worktree_session_default_for_persona(Human)`.
+    ///
+    /// Kept as a named helper because callers at the top of `spawn_pty_for_session`
+    /// instantiate a starting policy before they've looked up the session's
+    /// actual persona — this gives them the human-safe default (plain shell
+    /// inherits full env). The real persona-aware dispatch happens via
+    /// `worktree_session_default_for_persona` after the lookup.
+    pub fn worktree_session_default() -> Self {
+        Self::worktree_session_default_for_persona(crate::presets::Persona::Human)
     }
 
     /// Current fallback behavior while platform backends are being built.
@@ -256,6 +299,26 @@ pub fn gui_env_overrides() -> &'static [(&'static str, &'static str)] {
         ("GIO_USE_VFS", "local"),
         ("NO_AT_BRIDGE", "1"),
     ]
+}
+
+/// Parse `CODEMUX_ALLOW_DESKTOP_GUI` as a three-state override.
+///
+/// Returns:
+/// - `Some(true)` for `1` / `true` / `yes` — force allow GUI for every
+///   session regardless of persona
+/// - `Some(false)` for `0` / `false` / `no` — force deny for every session
+/// - `None` for unset or any other value — fall through to persona default
+///
+/// The unrecognized-value case returns `None` (not a parse error) so
+/// typos in the env var can't accidentally lock users out of their
+/// desktop — they just get the normal persona-based default, which
+/// is the behavior they'd have gotten without the env var at all.
+fn parse_gui_override_env() -> Option<bool> {
+    match env::var("CODEMUX_ALLOW_DESKTOP_GUI").ok()?.as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
 }
 
 fn gui_env_unset_if_forbidden(policy: &ExecutionPolicy) -> Vec<String> {
@@ -580,7 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn worktree_default_forbids_gui_by_default() {
+    fn worktree_default_allows_gui_for_human_persona() {
+        // New baseline: a human-driven pane (the plain "+" Terminal tab,
+        // the Shell preset, setup/teardown run button) inherits the host
+        // desktop env. Without this, users can't `npm run tauri dev` or
+        // launch any other GUI app from their own terminal.
         let _lock = env_guard();
         let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         // SAFETY: guarded by `env_guard()` above; restored by `_restore` Drop.
@@ -588,47 +655,172 @@ mod tests {
             env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
         }
         let p = ExecutionPolicy::worktree_session_default();
-        assert!(!p.allow_desktop_gui, "worktree default must strip GUI env");
+        assert!(
+            p.allow_desktop_gui,
+            "human-driven pane must inherit host DISPLAY/WAYLAND_DISPLAY"
+        );
         assert!(p.allow_network);
     }
 
     #[test]
-    fn worktree_default_honors_opt_in_env_one() {
+    fn worktree_default_denies_gui_for_agent_persona() {
+        // Agent-driven panes (Claude, Codex, OpenCode, …) must NOT inherit
+        // the host display — otherwise agent tool calls pop windows on the
+        // user's real desktop, which was the whole motivation for the
+        // 0e4e558 lockdown.
+        let _lock = env_guard();
+        let _restore_gui = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        let _restore_vd = EnvVarRestore::snapshot("CODEMUX_VIRTUAL_DISPLAY");
+        unsafe {
+            env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+            env::remove_var("CODEMUX_VIRTUAL_DISPLAY");
+        }
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Agent,
+        );
+        assert!(
+            !p.allow_desktop_gui,
+            "agent-driven pane must strip DISPLAY/WAYLAND_DISPLAY"
+        );
+        // Without CODEMUX_VIRTUAL_DISPLAY, virtual_display stays off —
+        // agents run headless. Opting in is a separate toggle.
+        assert!(!p.virtual_display);
+    }
+
+    #[test]
+    fn worktree_default_agent_persona_opts_into_virtual_display() {
+        // When CODEMUX_VIRTUAL_DISPLAY=1 and the pane is Agent-driven,
+        // the policy asks `terminal/mod.rs` to acquire an Xvfb and inject
+        // `DISPLAY=:N` so webkit/GTK apps can render headlessly.
+        let _lock = env_guard();
+        let _restore_gui = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        let _restore_vd = EnvVarRestore::snapshot("CODEMUX_VIRTUAL_DISPLAY");
+        unsafe {
+            env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+            env::set_var("CODEMUX_VIRTUAL_DISPLAY", "1");
+        }
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Agent,
+        );
+        assert!(!p.allow_desktop_gui);
+        assert!(p.virtual_display);
+    }
+
+    #[test]
+    fn worktree_default_human_persona_ignores_virtual_display() {
+        // Virtual display is only meaningful when GUI is forbidden. For
+        // a Human persona, `allow_desktop_gui=true` means the host DISPLAY
+        // is already inherited — Xvfb would just compete. So even with
+        // CODEMUX_VIRTUAL_DISPLAY=1, we keep virtual_display=false and
+        // let the user's real desktop take precedence.
+        let _lock = env_guard();
+        let _restore_gui = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        let _restore_vd = EnvVarRestore::snapshot("CODEMUX_VIRTUAL_DISPLAY");
+        unsafe {
+            env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
+            env::set_var("CODEMUX_VIRTUAL_DISPLAY", "1");
+        }
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Human,
+        );
+        assert!(p.allow_desktop_gui);
+        assert!(
+            !p.virtual_display,
+            "Human + CODEMUX_VIRTUAL_DISPLAY=1 should stay off — no point competing with host DISPLAY"
+        );
+    }
+
+    #[test]
+    fn env_override_true_forces_gui_for_agent_persona() {
+        // Global "I trust my agents" override: even Agent-driven panes
+        // get the host DISPLAY inherited.
         let _lock = env_guard();
         let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         unsafe {
             env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "1");
         }
-        let p = ExecutionPolicy::worktree_session_default();
-        assert!(p.allow_desktop_gui, "value `1` must re-enable GUI passthrough");
-    }
-
-    #[test]
-    fn worktree_default_honors_opt_in_env_true() {
-        let _lock = env_guard();
-        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
-        unsafe {
-            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "true");
-        }
-        let p = ExecutionPolicy::worktree_session_default();
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Agent,
+        );
         assert!(
             p.allow_desktop_gui,
-            "value `true` must re-enable GUI passthrough"
+            "CODEMUX_ALLOW_DESKTOP_GUI=1 must force-allow, overriding Agent persona"
         );
     }
 
     #[test]
-    fn worktree_default_honors_opt_in_env_yes() {
+    fn env_override_false_forces_deny_for_human_persona() {
+        // Kiosk / CI / shared-host lockdown: even Human-driven panes lose
+        // the host DISPLAY. Useful when Codemux is running in a context
+        // where no pane should reach the host desktop.
         let _lock = env_guard();
         let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
         unsafe {
-            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "yes");
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "0");
         }
-        let p = ExecutionPolicy::worktree_session_default();
-        assert!(
-            p.allow_desktop_gui,
-            "value `yes` must re-enable GUI passthrough"
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Human,
         );
+        assert!(
+            !p.allow_desktop_gui,
+            "CODEMUX_ALLOW_DESKTOP_GUI=0 must force-deny, overriding Human persona"
+        );
+    }
+
+    #[test]
+    fn env_override_accepts_case_sensitive_tokens() {
+        // Spec: only lowercase `1`/`true`/`yes`/`0`/`false`/`no` count.
+        // `True`, `TRUE`, etc. return None (fall back to persona default)
+        // rather than risk ambiguity. Users who care can type the
+        // canonical form; typos don't lock them out — they get the safe
+        // per-persona default.
+        let _lock = env_guard();
+        let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+        unsafe {
+            env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "TRUE"); // uppercase → None
+        }
+        let p = ExecutionPolicy::worktree_session_default_for_persona(
+            crate::presets::Persona::Agent,
+        );
+        // Persona default (Agent → deny) should take effect, not the
+        // uppercase-True that would otherwise have forced allow.
+        assert!(!p.allow_desktop_gui);
+    }
+
+    #[test]
+    fn env_override_honors_every_allow_token() {
+        for token in ["1", "true", "yes"] {
+            let _lock = env_guard();
+            let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+            unsafe {
+                env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", token);
+            }
+            let p = ExecutionPolicy::worktree_session_default_for_persona(
+                crate::presets::Persona::Agent,
+            );
+            assert!(
+                p.allow_desktop_gui,
+                "token `{token}` must force-allow regardless of persona"
+            );
+        }
+    }
+
+    #[test]
+    fn env_override_honors_every_deny_token() {
+        for token in ["0", "false", "no"] {
+            let _lock = env_guard();
+            let _restore = EnvVarRestore::snapshot("CODEMUX_ALLOW_DESKTOP_GUI");
+            unsafe {
+                env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", token);
+            }
+            let p = ExecutionPolicy::worktree_session_default_for_persona(
+                crate::presets::Persona::Human,
+            );
+            assert!(
+                !p.allow_desktop_gui,
+                "token `{token}` must force-deny regardless of persona"
+            );
+        }
     }
 
     #[test]

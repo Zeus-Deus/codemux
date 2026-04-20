@@ -2,7 +2,6 @@ use crate::config::workspace_config::{
     find_git_root, read_effective_config, read_workspace_config, WorkspaceConfig,
 };
 use crate::database::DatabaseStore;
-use crate::execution::sanitize_gui_env_std;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -169,7 +168,12 @@ fn copy_matching_files(
         &format!("--exclude-from={}", exclude_file.display()),
     ])
     .current_dir(root_path);
-    sanitize_gui_env_std(&mut cmd);
+    // No GUI sanitization: `git ls-files` is pure git plumbing with no
+    // GUI touchpoint. Stripping DISPLAY/WAYLAND_DISPLAY here was a
+    // defensive overreach from the agent-leak hardening — git never
+    // opens a window, and worktree-includes runs from user-initiated
+    // workspace setup, so full env inheritance is both safe and
+    // consistent with the human-driven principal.
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run git ls-files for worktree includes: {e}"))?;
@@ -336,7 +340,12 @@ pub fn run_setup_scripts_with_config(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
-        sanitize_gui_env_std(&mut cmd);
+        // Setup scripts are user-initiated via the Run button — they
+        // inherit the full desktop env so `docker compose up`, `xdg-open`
+        // a docs URL in the browser, `notify-send`, etc. work like they
+        // do in any other terminal. Stripping GUI env here was a
+        // collateral casualty of the agent-leak lockdown; it broke the
+        // Run button for anyone whose setup actually does GUI things.
 
         let output = cmd
             .output()
@@ -408,7 +417,10 @@ pub fn run_teardown_scripts(
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
-        sanitize_gui_env_std(&mut cmd);
+        // Teardown runs when the user deletes a workspace. Same user-
+        // initiated principal as setup — keep the host env so
+        // `docker compose down`, container shutdown, notifications,
+        // etc. all work.
 
         let output = cmd
             .output()

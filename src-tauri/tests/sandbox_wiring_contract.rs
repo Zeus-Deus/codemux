@@ -172,15 +172,26 @@ fn execution_policy_constructors_set_virtual_display() {
         "openflow_agent_default must set virtual_display explicitly"
     );
 
-    let (_, after_worktree) = src
-        .split_once("pub fn worktree_session_default()")
-        .expect("worktree_session_default must exist");
-    let worktree_body = after_worktree
+    // After the persona-based split, the real policy construction lives
+    // in `worktree_session_default_for_persona`. The bare
+    // `worktree_session_default` is a Human-persona wrapper that delegates
+    // — so enforcing the `virtual_display` contract on the persona-aware
+    // constructor is what catches hand-rolled ExecutionPolicy literals
+    // that skip the field. The `_for_persona` suffix is part of the
+    // match string so changing to a different naming scheme requires
+    // updating this contract too.
+    let (_, after_persona_ctor) = src
+        .split_once("pub fn worktree_session_default_for_persona(")
+        .expect(
+            "worktree_session_default_for_persona must exist — the canonical \
+             policy constructor since the April-2026 persona split",
+        );
+    let persona_ctor_body = after_persona_ctor
         .split_once("pub fn ")
         .map(|(body, _)| body)
-        .unwrap_or(after_worktree);
+        .unwrap_or(after_persona_ctor);
     assert!(
-        worktree_body.contains("virtual_display"),
-        "worktree_session_default must set virtual_display explicitly"
+        persona_ctor_body.contains("virtual_display"),
+        "worktree_session_default_for_persona must set virtual_display explicitly"
     );
 }

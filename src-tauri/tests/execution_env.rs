@@ -183,21 +183,19 @@ fn linux_preference_off_platform_still_strips_env() {
 }
 
 #[test]
-fn worktree_session_default_strips_gui_by_default() {
-    // As of April 2026, the worktree shell default flipped from
-    // `allow_desktop_gui: true` to `false` so agent-spawned GUI apps can't
-    // pop windows on the user's real Hyprland/Wayland/X11 session.
-    // The backend is still HostPassthrough (shell is NOT wrapped by bwrap —
-    // that would break `systemctl --user`), but env_unset is now populated.
+fn worktree_session_default_allows_gui_for_human_persona() {
+    // As of the persona-based split, `worktree_session_default()` returns
+    // the Human-persona policy — the pane the user just opened in their own
+    // terminal. That policy inherits the host DISPLAY/WAYLAND_DISPLAY so
+    // `npm run tauri dev`, `firefox`, etc. work normally.
     //
-    // Users who want GUI passthrough opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1`
-    // or per-workspace `.codemux/config.json`.
-    //
-    // Guard against concurrent opt-in env var set by other tests in this
-    // binary: snapshot + clear, run assertions, restore.
+    // Agent-persona panes (Claude/Codex/OpenCode presets) go through
+    // `worktree_session_default_for_persona(Persona::Agent)` instead, which
+    // strips GUI env. The split is tested end-to-end in
+    // `tests/persona_execution.rs`.
     let _lock = env_mutation_guard().lock().unwrap_or_else(|e| e.into_inner());
     let restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
-    // SAFETY: serialized via env_mutation_guard above; restored by `restore` Drop.
+    // SAFETY: serialized via env_mutation_guard; restored by `restore` Drop.
     unsafe {
         std::env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
     }
@@ -209,16 +207,12 @@ fn worktree_session_default_strips_gui_by_default() {
         ExecutionBackendKind::HostPassthrough
     ));
     assert!(
-        !prepared.env_unset.is_empty(),
-        "worktree default must strip GUI env by default"
+        prepared.env_unset.is_empty(),
+        "Human default must NOT strip GUI env — user is driving the keystrokes"
     );
     assert!(
-        prepared.env_unset.iter().any(|k| k == "DISPLAY"),
-        "DISPLAY must be in the strip list"
-    );
-    assert!(
-        !prepared.env_set.is_empty(),
-        "neutralizer overrides must be applied"
+        prepared.env_set.is_empty(),
+        "Human default must NOT inject neutralizers — they'd break dbus / xdg-open"
     );
     assert_eq!(prepared.executable, "bash");
     drop(restore);
@@ -332,8 +326,13 @@ fn bwrap_fallback_applies_env_set() {
 }
 
 #[test]
-fn allow_desktop_gui_opt_in_empty_string_is_false() {
-    let _g = env_mutation_guard().lock().unwrap();
+fn allow_desktop_gui_opt_in_empty_string_is_none_fallback() {
+    // Three-state semantics: `""` is neither a recognized allow token
+    // (`1`/`true`/`yes`) nor a recognized deny token (`0`/`false`/`no`).
+    // It falls through to the persona default — Human → allow.
+    let _g = env_mutation_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
     // SAFETY: env mutation guarded by env_mutation_guard + restored via Drop.
     unsafe {
@@ -341,41 +340,48 @@ fn allow_desktop_gui_opt_in_empty_string_is_false() {
     }
     let p = ExecutionPolicy::worktree_session_default();
     assert!(
-        !p.allow_desktop_gui,
-        "empty CODEMUX_ALLOW_DESKTOP_GUI must not enable GUI passthrough"
+        p.allow_desktop_gui,
+        "empty CODEMUX_ALLOW_DESKTOP_GUI must fall through to persona default (Human → allow)"
     );
 }
 
 #[test]
-fn allow_desktop_gui_opt_in_arbitrary_value_is_false() {
-    let _g = env_mutation_guard().lock().unwrap();
+fn allow_desktop_gui_opt_in_arbitrary_value_is_none_fallback() {
+    let _g = env_mutation_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
     unsafe {
         std::env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "banana");
     }
     let p = ExecutionPolicy::worktree_session_default();
     assert!(
-        !p.allow_desktop_gui,
-        "only 1/true/yes should enable GUI passthrough; got allow_desktop_gui=true for 'banana'"
+        p.allow_desktop_gui,
+        "unrecognized token must fall through to persona default — typos shouldn't lock users out"
     );
 }
 
 #[test]
 fn allow_desktop_gui_opt_in_case_sensitive() {
     // Documents current behavior: the matcher is case-sensitive, so an
-    // uppercase `TRUE` does NOT enable GUI passthrough. If a future refactor
-    // makes this case-insensitive, flip the assertion here intentionally —
-    // this test exists to make the change visible in review.
-    let _g = env_mutation_guard().lock().unwrap();
+    // uppercase `TRUE` is neither an allow token nor a deny token — it
+    // falls through to the persona default. The worktree default is
+    // Human persona, so the effect is "GUI allowed". If a future
+    // refactor makes the matcher case-insensitive, flip this assertion
+    // intentionally — the test exists to surface the change in review.
+    let _g = env_mutation_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
     unsafe {
         std::env::set_var("CODEMUX_ALLOW_DESKTOP_GUI", "TRUE");
     }
     let p = ExecutionPolicy::worktree_session_default();
     assert!(
-        !p.allow_desktop_gui,
-        "CODEMUX_ALLOW_DESKTOP_GUI matcher is case-sensitive; uppercase TRUE should NOT \
-         enable GUI. If this assertion is surprising, the matcher has been changed."
+        p.allow_desktop_gui,
+        "CODEMUX_ALLOW_DESKTOP_GUI matcher is case-sensitive; uppercase TRUE falls through \
+         to the persona default (Human → allow). If this assertion is surprising, the matcher \
+         has been changed to accept mixed case."
     );
 }
 
@@ -452,10 +458,11 @@ fn openflow_default_policy_also_has_env_set() {
 
 #[test]
 fn execution_policy_serde_round_trip_with_new_defaults() {
-    // Round-trip the worktree default (which now defaults to
-    // allow_desktop_gui=false) through serde_json to catch any missed serde
-    // attribute on new fields.
-    let _g = env_mutation_guard().lock().unwrap();
+    // Round-trip the worktree default (Human persona → allow_desktop_gui=true)
+    // through serde_json to catch any missed serde attribute on new fields.
+    let _g = env_mutation_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
     unsafe {
         std::env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
@@ -464,12 +471,17 @@ fn execution_policy_serde_round_trip_with_new_defaults() {
     let s = serde_json::to_string(&p).expect("serialize ExecutionPolicy");
     let back: ExecutionPolicy = serde_json::from_str(&s).expect("deserialize ExecutionPolicy");
     assert_eq!(p, back);
-    assert!(!back.allow_desktop_gui);
+    assert!(
+        back.allow_desktop_gui,
+        "Human default round-trips with allow_desktop_gui=true"
+    );
 }
 
 #[test]
 fn worktree_default_is_stable_without_env_var() {
-    let _g = env_mutation_guard().lock().unwrap();
+    let _g = env_mutation_guard()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let _restore = EnvVarGuard::save("CODEMUX_ALLOW_DESKTOP_GUI");
     unsafe {
         std::env::remove_var("CODEMUX_ALLOW_DESKTOP_GUI");
@@ -477,8 +489,8 @@ fn worktree_default_is_stable_without_env_var() {
     for i in 0..3 {
         let p = ExecutionPolicy::worktree_session_default();
         assert!(
-            !p.allow_desktop_gui,
-            "worktree default iteration {i} should be allow_desktop_gui=false without env var"
+            p.allow_desktop_gui,
+            "worktree default iteration {i} is Human persona → allow_desktop_gui=true"
         );
         assert_eq!(p.backend_preference, ExecutionBackendKind::HostPassthrough);
     }

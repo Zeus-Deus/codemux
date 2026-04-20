@@ -50,7 +50,15 @@ Also:
 - Apply the policy to `spawn_pty_for_session` (today it has no policy at all, so regular worktree shells inherit `DISPLAY` raw).
 - Cross-platform safety: the GUI key list (`DISPLAY`, `WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `DESKTOP_STARTUP_ID`, `XAUTHORITY`, `XDG_SESSION_TYPE`, `GDK_BACKEND`, `QT_QPA_PLATFORM`) is a no-op on Windows (those vars aren't set) and a partial benefit on macOS (XQuartz/GTK apps respect them; native Cocoa apps don't).
 
-**Default posture (hardened April 2026):** both constructors default to `allow_desktop_gui: false`. `ExecutionPolicy::openflow_agent_default()` continues to apply to any agent consumer (name is historical). `ExecutionPolicy::worktree_session_default()` was flipped from `true` to `false` so regular worktree shells also strip GUI env by default. Users who want `firefox` / `npm run dev` to open on the host display opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1` (process-wide) or per-workspace `.codemux/config.json` `sandbox.allow_desktop_gui: true`. The env-var opt-in is read at construction time by both policy constructors.
+**Default posture (persona-based, April 2026 — superseded "always strip" approach):** policy follows the principal driving the PTY. The `TerminalPreset` struct carries a `persona: Persona` (`Human` | `Agent`); sessions carry a matching field so the split survives startup restore.
+
+- `ExecutionPolicy::openflow_agent_default()` — `allow_desktop_gui: false` (unchanged; historical name applies to any agent consumer).
+- `ExecutionPolicy::worktree_session_default_for_persona(Persona::Agent)` — `allow_desktop_gui: false`. Used for built-in Claude / Codex / OpenCode / Gemini / Pi presets and any custom preset flagged `persona: agent`.
+- `ExecutionPolicy::worktree_session_default_for_persona(Persona::Human)` (aliased as the bare `worktree_session_default()`) — `allow_desktop_gui: true`. Used for plain Terminal tabs, the built-in Shell preset, and any custom preset without the agent flag.
+
+The earlier "both constructors default to `false`" design was too aggressive: users couldn't run `npm run tauri dev` from their own terminal. The persona split restores that while keeping the anti-popup guarantee for agent-driven panes.
+
+Global `CODEMUX_ALLOW_DESKTOP_GUI` is now three-state: `1`/`true`/`yes` force-allows regardless of persona (trust-my-agents); `0`/`false`/`no` force-denies regardless (kiosk/CI); unset or any other token falls through to the persona default.
 
 This is all Phase 1 ships. It's ~150 lines and zero new dependencies.
 
@@ -132,10 +140,22 @@ Bwrap profile hardening, seccomp-bpf, Landlock, Job Object UI limits. Only when 
   - New integration test file `sandbox_wiring_contract.rs` — 6 source-level canary tests that fail loudly if anyone removes: the `release()` call in either close path, the `.manage(VirtualDisplayManager)` registration, the `get_workspace_virtual_display` command, the `env_unset`-after-`extra_env` ordering, or the `virtual_display` field in either policy constructor
 - **Final verification:** 663 Rust tests pass, 303 TS tests pass, `cargo check` clean, `tsc --noEmit` clean.
 - **Cross-platform safety audited:** every Xvfb/xauth/x11vnc function has a `#[cfg(not(target_os = "linux"))]` stub returning `Error::Unsupported`. Windows and macOS still compile; `is_supported()` returns `false` and spawn code degrades to Phase 1 env-strip.
+- **Phase 2.6 (persona split, April 2026 second pass — supersedes the original "always strip" default):**
+  - New `presets::Persona { Human, Agent }` enum with `#[serde(default)]` → `Human`. Added as a field to `TerminalPreset` (with `sync_builtins` force-refreshing builtins from the template so upgrades don't silently convert agent builtins back to Human) and to `TerminalSessionSnapshot` (so the split survives startup restore).
+  - New `ExecutionPolicy::worktree_session_default_for_persona(Persona)` — Human → `allow_desktop_gui: true`; Agent → `false` + optional `virtual_display` via `CODEMUX_VIRTUAL_DISPLAY`. Bare `worktree_session_default()` kept as a Human-default wrapper.
+  - `CODEMUX_ALLOW_DESKTOP_GUI` is now three-state via `parse_gui_override_env`: allow tokens force-allow regardless of persona, deny tokens force-deny regardless, unrecognized/unset falls through to the persona default.
+  - `spawn_pty_for_session` reads the session's persona from state, builds the right policy, applies `apply_workspace_sandbox_overrides`, and acquires virtual display if the final policy asks for it. Mirrors the existing `spawn_pty_for_agent` virtual-display block so both paths behave identically.
+  - `apply_preset` calls `update_terminal_session_persona(&session_id, preset.persona)` BEFORE `spawn_pty_for_session` for both the split-pane and new-tab branches.
+  - `add_agent_terminal_to_workspace` (OpenFlow agent creation) seeds `persona: Agent`.
+  - Built-in presets: Claude / Codex / OpenCode / Gemini / Pi → `Persona::Agent`; Shell → `Persona::Human`. Custom presets default `Human`. Persona of builtins is force-refreshed from the template on every `load_presets` call to defeat drift from old-schema saves.
+  - `scripts.rs` no longer calls `sanitize_gui_env_std` — setup/teardown scripts and worktree-includes `git ls-files` are user-initiated and must inherit full env (the Run button was broken by the earlier overreach).
+  - Frontend: `Persona` type + `persona` field on `TerminalPreset`; `create_preset` / `update_preset` Tauri commands accept optional persona; `PresetEditorSheet` exposes a Human/Agent selector (disabled for builtins with a hint about their fixed identity).
+  - Tests: 13 unit tests in `presets.rs` (persona round-trip, sync_builtins refresh, legacy JSON deserialize), 9 new unit tests in `execution/mod.rs` (persona dispatch, three-state env override, token matrix), 13 new integration tests in `tests/persona_execution.rs` (end-to-end: spawn `env` as child, assert DISPLAY inherited for Human, stripped for Agent, neutralizers set, force-allow/force-deny overrides work). Two existing integration tests updated (`tests/execution_env.rs` and `tests/gui_leak_prevention.rs`) to assert the new Human-default. `sandbox_wiring_contract.rs` canary updated to check `worktree_session_default_for_persona` for the `virtual_display` field.
+  - Cross-platform: the persona split is pure env-plumbing, no new Linux-only code paths. Frontend types are string-enum `"human"|"agent"` so the UI works identically on macOS / Windows / Linux.
 
 ## Open Questions
 
-- ~~**Should regular worktree shells default to `allow_desktop_gui: false`?**~~ **Resolved April 2026:** yes, flipped. `worktree_session_default()` now defaults to `false`; users who want passthrough opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1` or per-workspace `.codemux/config.json`.
+- ~~**Should regular worktree shells default to `allow_desktop_gui: false`?**~~ **Re-resolved April 2026 (second pass) with the persona split:** no, plain shells go back to `true` because users clicking "+" in their own terminal expect it to behave like any terminal emulator (kitty, alacritty, …). The lockdown moved to the preset layer: agent presets (Claude / Codex / OpenCode / Gemini / Pi) carry `persona: Agent` and their sessions spawn with `allow_desktop_gui: false`. Custom presets default to `Human` but the user can flip them to `Agent` in the preset editor. This is the final design — the "always strip" default broke `npm run tauri dev` for users who typed it themselves, which was the regression that motivated the second pass.
 - **Per-workspace config shape.** `.codemux/config.json` `sandbox.allow_desktop_gui` boolean is simplest. Later add `sandbox.virtual_display: bool` for Phase 2.
 - ~~**When to flip defaults.**~~ **Done April 2026.** `spawn_pty_for_session` default flipped via `worktree_session_default()` → `allow_desktop_gui: false`; opt-in via `CODEMUX_ALLOW_DESKTOP_GUI` or per-workspace config.
 - **Reuse `anthropic-experimental/sandbox-runtime`?** Only if/when Phase 3 (real sandbox) becomes a priority. For display isolation, rolling our own is smaller.

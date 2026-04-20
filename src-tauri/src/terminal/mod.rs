@@ -994,15 +994,54 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 
     let cwd = session_working_dir(&app_state, &session_id);
 
-    // Phase 1 display-isolation wiring: route regular worktree shells through
-    // `prepare_agent_command` so the `allow_desktop_gui` policy is honored here
-    // too. With the default `worktree_session_default` policy
-    // (HostPassthrough + gui allowed) this is a no-op — the shell is spawned
-    // exactly as before. If a future per-workspace config flips
-    // `allow_desktop_gui` to `false`, `prepared.env_unset` will be populated
-    // with GUI env keys and stripped below, without wrapping the shell in
-    // bwrap (which would surprise users by breaking `systemctl --user`, etc.).
-    let session_policy = crate::execution::ExecutionPolicy::worktree_session_default();
+    // Persona-driven display-isolation wiring. The session's persona was
+    // set either at creation (plain shell / split / new-tab default to
+    // `Human`; `add_agent_terminal_to_workspace` for OpenFlow agents
+    // defaults to `Agent`) or by `apply_preset` (which sets `Agent` for
+    // Claude/Codex/OpenCode/Gemini/Pi presets before this spawn fires).
+    //
+    // - `Persona::Human` → `allow_desktop_gui: true` → `env_unset` / `env_set`
+    //   lists stay empty → shell inherits the host desktop env unchanged,
+    //   so `npm run tauri dev`, `firefox`, etc. work from a user's terminal.
+    // - `Persona::Agent` → `allow_desktop_gui: false` → every GUI env key
+    //   is stripped and neutralizers (BROWSER=true, DBUS=/dev/null, …)
+    //   are set, so AI-driven tool calls can't pop windows on the host.
+    //
+    // Reading via `terminal_session_persona` keeps the decision live with
+    // state rather than plumbing an extra parameter through every caller —
+    // startup restore, split pane, preset launch all converge here and
+    // each one already had to create (or restore) the session snapshot
+    // first. Missing-session → `Human` is the safe fallback (worst case:
+    // a stale id's shell gets GUI env, same as pre-fix behavior).
+    let persona = app_state
+        .terminal_session_persona(&session_id)
+        .unwrap_or(crate::presets::Persona::Human);
+    let base_policy =
+        crate::execution::ExecutionPolicy::worktree_session_default_for_persona(persona);
+
+    // Find owning workspace early — we need it both for the persona-overlaid
+    // policy (per-workspace `.codemux/config.json` can flip `allow_desktop_gui`
+    // or enable `virtual_display`) and for the virtual-display acquisition
+    // below (keyed by workspace_id). A lookup of None just means this session
+    // isn't parented to any workspace yet (orphan / startup race); in that
+    // case we use the plain persona-derived policy without workspace overlays.
+    let workspace_id_for_spawn: Option<String> = {
+        let snap = app_state.snapshot();
+        snap.workspaces
+            .iter()
+            .find(|ws| {
+                ws.surfaces.iter().any(|s| {
+                    crate::state::find_terminal_pane_id(&s.root, &session_id).is_some()
+                })
+            })
+            .map(|ws| ws.workspace_id.0.clone())
+    };
+
+    let (session_policy, sandbox_extras) = match workspace_id_for_spawn.as_deref() {
+        Some(ws_id) => apply_workspace_sandbox_overrides(&app_state, ws_id, base_policy),
+        None => (base_policy, WorkspaceSandboxExtras::default()),
+    };
+
     let prepared_shell = crate::execution::prepare_agent_command(
         shell.clone(),
         Vec::new(),
@@ -1119,16 +1158,65 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     }
 
     // Phase 1 display-isolation: strip GUI env keys the policy marked for
-    // removal. With `worktree_session_default` (GUI allowed) this list is
-    // empty. If a user flips `allow_desktop_gui` off later, this is the line
-    // that actually prevents `DISPLAY`/`WAYLAND_DISPLAY`/etc. from reaching
-    // the child shell. Runs AFTER every `cmd.env(...)` above so nothing can
-    // silently re-set a stripped key.
+    // removal. With Human-persona panes (the default) this list is empty
+    // and the shell inherits the host desktop env unchanged. For Agent-
+    // persona panes (Claude/Codex/OpenCode/… or any custom preset the
+    // user flagged), this is the line that actually prevents
+    // `DISPLAY`/`WAYLAND_DISPLAY`/`HYPRLAND_INSTANCE_SIGNATURE`/etc.
+    // from reaching the child shell. Runs AFTER every `cmd.env(...)`
+    // above so nothing can silently re-set a stripped key.
     for key in &prepared_shell.env_unset {
         cmd.env_remove(key);
     }
     for (key, val) in &prepared_shell.env_set {
         cmd.env(key, val);
+    }
+
+    // Phase 2 display-isolation: if the policy asks for a virtual display
+    // (Agent persona + `virtual_display: true` in per-workspace config or
+    // `CODEMUX_VIRTUAL_DISPLAY=1`), acquire an Xvfb slot and inject
+    // `DISPLAY=:N` AFTER the strip above. Mirrors the block in
+    // `spawn_pty_for_agent` — keeping the two paths in sync means an
+    // agent preset launched via PresetBar behaves identically to an
+    // OpenFlow-spawned agent for display purposes.
+    //
+    // Graceful degrade: if Xvfb isn't installed or the manager can't
+    // allocate a slot, we log a visible diagnostic (not a panic) and
+    // leave DISPLAY stripped — the agent runs headless. This is the
+    // documented fallback; callers that need guaranteed GUI render
+    // should install `xvfb` as a system dependency.
+    if session_policy.virtual_display {
+        if let Some(ws_id) = workspace_id_for_spawn.as_deref() {
+            let manager: State<'_, crate::execution::virtual_display::VirtualDisplayManager> =
+                app.state();
+            let opts = crate::execution::virtual_display::AcquireOptions {
+                watch_vnc: sandbox_extras.watch_vnc,
+            };
+            match manager.acquire_with_options(ws_id, opts) {
+                Ok(vd_env) => {
+                    for (k, v) in vd_env.env_pairs() {
+                        cmd.env(&k, &v);
+                    }
+                    let vnc_suffix = vd_env
+                        .vnc_port
+                        .map(|p| format!(" (VNC on 127.0.0.1:{p})"))
+                        .unwrap_or_default();
+                    crate::diagnostics::stderr_line(&format!(
+                        "[codemux::execution] Virtual display {} acquired for workspace {ws_id}{vnc_suffix}",
+                        vd_env.display
+                    ));
+                }
+                Err(e) => {
+                    crate::diagnostics::stderr_line(&format!(
+                        "[codemux::execution] Virtual display requested but unavailable for workspace {ws_id}: {e}"
+                    ));
+                }
+            }
+        } else {
+            crate::diagnostics::stderr_line(
+                "[codemux::execution] virtual_display=true but session has no workspace; skipping acquisition",
+            );
+        }
     }
 
     let child = match pty_pair.slave.spawn_command(cmd) {

@@ -29,6 +29,7 @@ import type {
   OpenFlowRunRecord,
   OpenFlowRuntimeSnapshot,
   OrchestratorTriggerResult,
+  Persona,
   PresetStoreSnapshot,
   ProjectMemorySnapshot,
   ProjectMemoryUpdate,
@@ -696,6 +697,7 @@ export const createPreset = (params: {
   workingDirectory: string | null;
   launchMode: LaunchMode;
   icon: string | null;
+  persona?: Persona;
 }) =>
   invoke<string>("create_preset", params);
 
@@ -709,6 +711,7 @@ export const updatePreset = (params: {
   icon: string | null;
   autoRunOnWorkspace?: boolean;
   autoRunOnNewTab?: boolean;
+  persona?: Persona;
 }) =>
   invoke("update_preset", params);
 

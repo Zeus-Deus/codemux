@@ -75,7 +75,7 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
+import type { EditorInfo, LaunchMode, Persona, PresetStoreSnapshot, TerminalPreset } from "@/tauri/types";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
@@ -264,6 +264,7 @@ function PresetEditorSheet({
   const [pinned, setPinned] = useState(true);
   const [autoRunOnWorkspace, setAutoRunOnWorkspace] = useState(false);
   const [autoRunOnNewTab, setAutoRunOnNewTab] = useState(false);
+  const [persona, setPersona] = useState<Persona>("human");
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Sync when preset changes
@@ -276,6 +277,7 @@ function PresetEditorSheet({
     setPinned(preset.pinned);
     setAutoRunOnWorkspace(preset.auto_run_on_workspace);
     setAutoRunOnNewTab(preset.auto_run_on_new_tab);
+    setPersona(preset.persona);
     setConfirmDelete(false);
   }, [preset]);
 
@@ -434,6 +436,45 @@ function PresetEditorSheet({
               </Select>
             </div>
 
+            {/* Persona: who drives keystrokes in this pane */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Keystroke driver</label>
+              <Select
+                value={persona}
+                disabled={preset.is_builtin}
+                onValueChange={(v: Persona) => {
+                  setPersona(v);
+                  updatePreset({
+                    id: preset.id,
+                    name,
+                    description: description || null,
+                    commands: commands.filter((c) => c.trim()),
+                    workingDirectory: preset.working_directory,
+                    launchMode,
+                    icon: preset.icon,
+                    autoRunOnWorkspace,
+                    autoRunOnNewTab,
+                    persona: v,
+                  }).catch(console.error);
+                }}
+              >
+                <SelectTrigger className="h-9">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="human">Human (full desktop access)</SelectItem>
+                  <SelectItem value="agent">Agent (no desktop GUI)</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                {preset.is_builtin
+                  ? "Built-in presets are fixed: Shell is Human, Claude / Codex / OpenCode / Gemini / Pi are Agent."
+                  : persona === "human"
+                    ? "Pane inherits host DISPLAY/WAYLAND so you can run GUI apps from the terminal."
+                    : "Pane strips desktop env so AI tool calls can't pop windows on your real desktop. Enable virtual_display per-workspace for headless GUI testing."}
+              </p>
+            </div>
+
             {/* Auto-run */}
             <div className="space-y-3">
               <label className="text-sm font-medium">Auto-run</label>
@@ -453,6 +494,7 @@ function PresetEditorSheet({
                         icon: preset.icon,
                         autoRunOnWorkspace: checked,
                         autoRunOnNewTab: autoRunOnNewTab,
+                        persona,
                       }).catch(console.error);
                     }}
                     className="mt-0.5"
@@ -479,6 +521,7 @@ function PresetEditorSheet({
                         icon: preset.icon,
                         autoRunOnWorkspace: autoRunOnWorkspace,
                         autoRunOnNewTab: checked,
+                        persona,
                       }).catch(console.error);
                     }}
                     className="mt-0.5"

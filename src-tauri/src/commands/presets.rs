@@ -5,8 +5,8 @@ use tauri::State;
 
 use crate::database::DatabaseStore;
 use crate::presets::{
-    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetStoreSnapshot,
-    PresetStoreState, TerminalPreset,
+    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, Persona,
+    PresetStoreSnapshot, PresetStoreState, TerminalPreset,
 };
 use crate::state::AppStateStore;
 use crate::terminal;
@@ -29,6 +29,7 @@ pub fn create_preset(
     working_directory: Option<String>,
     launch_mode: LaunchMode,
     pinned: bool,
+    persona: Option<Persona>,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let preset = TerminalPreset {
@@ -43,6 +44,7 @@ pub fn create_preset(
         is_builtin: false,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
+        persona: persona.unwrap_or_default(),
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -69,6 +71,7 @@ pub fn update_preset(
     icon: Option<String>,
     auto_run_on_workspace: Option<bool>,
     auto_run_on_new_tab: Option<bool>,
+    persona: Option<Persona>,
 ) -> Result<(), String> {
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     let preset = store
@@ -77,7 +80,12 @@ pub fn update_preset(
         .find(|p| p.id == id)
         .ok_or_else(|| format!("Preset not found: {id}"))?;
 
-    // All presets are fully editable (only delete is protected for builtins)
+    // All presets are fully editable (only delete is protected for builtins).
+    // Persona on builtins is re-synced from the template on next load —
+    // see `sync_builtins`. That's intentional: the persona of a builtin
+    // is tied to its identity (Claude is an agent CLI; Shell is a human
+    // shell), not a user preference. If a user really needs a human-driven
+    // Claude wrapper, they create a custom preset with `persona: Human`.
     if let Some(name) = name {
         preset.name = name;
     }
@@ -104,6 +112,9 @@ pub fn update_preset(
     }
     if let Some(v) = auto_run_on_new_tab {
         preset.auto_run_on_new_tab = v;
+    }
+    if let Some(v) = persona {
+        preset.persona = v;
     }
 
     save_presets(&db, &store)?;
@@ -305,6 +316,11 @@ pub fn apply_preset(
                 let session_id =
                     state.split_pane(&target_pane, crate::state::SplitDirection::Horizontal)?;
 
+                // Tag the session with the preset's persona BEFORE spawning.
+                // `spawn_pty_for_session` reads persona back to pick between
+                // host-GUI passthrough (Human) and env-strip (Agent).
+                state.update_terminal_session_persona(&session_id.0, preset.persona);
+
                 terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                 if !command.is_empty() {
@@ -353,6 +369,10 @@ pub fn apply_preset(
                 let _ = state.set_tab_icon(&workspace_id, &tab_id, preset.icon.clone());
 
                 if let Some(session_id) = session_id {
+                    // Tag the session with the preset's persona BEFORE
+                    // spawning — mirrors the split-pane branch above.
+                    state.update_terminal_session_persona(&session_id.0, preset.persona);
+
                     terminal::spawn_pty_for_session(app.clone(), session_id.0.clone());
 
                     if !command.is_empty() {

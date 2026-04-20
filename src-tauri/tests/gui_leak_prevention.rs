@@ -255,8 +255,14 @@ fn sanitize_does_not_touch_codemux_env() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn worktree_session_default_strips_by_default() {
-    let _guard = env_lock().lock().unwrap();
+fn worktree_session_default_allows_gui_for_human_persona() {
+    // Post-persona-split behavior: `worktree_session_default()` represents
+    // a Human-driven pane (plain Terminal tab, Shell preset, setup scripts).
+    // It inherits the host DISPLAY/WAYLAND — env_unset/env_set stay empty.
+    // Agent-persona panes go through
+    // `worktree_session_default_for_persona(Persona::Agent)` and DO strip
+    // — covered by `tests/persona_execution.rs`.
+    let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let prev = env::var("CODEMUX_ALLOW_DESKTOP_GUI").ok();
     // SAFETY: test is serialized via env_lock(); mutation is scoped and restored below.
     unsafe {
@@ -265,18 +271,18 @@ fn worktree_session_default_strips_by_default() {
 
     let policy = ExecutionPolicy::worktree_session_default();
     assert!(
-        !policy.allow_desktop_gui,
-        "worktree default must forbid GUI in 2026+"
+        policy.allow_desktop_gui,
+        "worktree default (Human persona) must inherit host DISPLAY"
     );
     let prepared = prepare_agent_command("bash".into(), vec![], "/tmp", &policy);
     assert!(
-        prepared.env_unset.iter().any(|k| k == "DISPLAY"),
-        "env_unset should contain DISPLAY, got {:?}",
+        prepared.env_unset.is_empty(),
+        "Human persona must not strip env keys, got {:?}",
         prepared.env_unset
     );
     assert!(
-        prepared.env_set.iter().any(|(k, _)| k == "BROWSER"),
-        "env_set should contain BROWSER, got {:?}",
+        prepared.env_set.is_empty(),
+        "Human persona must not inject neutralizers, got {:?}",
         prepared.env_set
     );
 
