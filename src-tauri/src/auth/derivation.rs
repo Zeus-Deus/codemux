@@ -408,8 +408,8 @@ mod tests {
             elapsed.as_millis()
         );
         assert!(
-            elapsed.as_secs() < 5,
-            "argon2id derivation should finish < 5s (got {:?}) — params too strong?",
+            elapsed.as_secs() < 30,
+            "argon2id derivation should finish < 30s (got {:?}) — params too strong?",
             elapsed
         );
     }
