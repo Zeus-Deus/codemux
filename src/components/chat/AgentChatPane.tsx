@@ -186,12 +186,74 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [isSending, streaming, activeTurnId]);
 
+  // T3Code-aligned interrupt: the SDK's `query.interrupt()` causes its
+  // async iterator to exit. The session is functionally dead after
+  // that (ClaudeAdapter.ts:2363 calls `stopSessionInternal`
+  // unconditionally). T3Code's next `sendTurn` creates a brand-new
+  // SDK query transparently via `ensureSessionForThread`. Our Rust
+  // adapter has no equivalent auto-recreate, so we do it proactively:
+  // interrupt for the immediate turn abort, then stop + start the
+  // session so subsequent turns land on a live SDK query. Transcript
+  // and picker state persist via `migrateThreadId`.
   const handleStop = useCallback(() => {
     if (!threadId) return;
-    agentChatInterruptTurn(provider, threadId, null).catch((err) => {
-      toast.error(`Failed to stop turn: ${err}`);
-    });
-  }, [threadId, provider]);
+    if (restarting) return;
+    const currentSlice = useAgentChatStore.getState().threads[threadId];
+    if (!currentSlice) return;
+    setRestarting(true);
+    void (async () => {
+      // Fire-and-forget the interrupt RPC so the SDK query aborts
+      // immediately — don't block on it.
+      agentChatInterruptTurn(provider, threadId, null).catch(() => {
+        // Stop path will also tear down the sidecar; an interrupt
+        // failure here is safe to swallow.
+      });
+      try {
+        await agentChatStopSession(provider, threadId);
+      } catch (err) {
+        console.warn("[agent-chat] stop_session during Stop failed", err);
+      }
+      if (!cwd) {
+        setRestarting(false);
+        return;
+      }
+      try {
+        const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+        const newId = await agentChatStartSession(
+          pane.pane_id,
+          provider,
+          {
+            thread_id: newLocalThreadId,
+            cwd,
+            model: currentSlice.model,
+            resume_cursor: currentSlice.resumeCursor,
+            permission_mode: currentSlice.permissionMode,
+            additional_directories: [],
+            env: null,
+          },
+        );
+        migrateThreadId(threadId, newId);
+        setThreadId(newId);
+        setSessionLaunchMode(newId, currentSlice.permissionMode);
+      } catch (err) {
+        toast.error(`Failed to restart session after stop: ${err}`);
+      } finally {
+        setRestarting(false);
+        // Belt-and-braces: restart cleared any in-flight state, so
+        // drop the local send guard.
+        sendInFlightRef.current = false;
+        setIsSending(false);
+      }
+    })();
+  }, [
+    threadId,
+    provider,
+    cwd,
+    pane.pane_id,
+    restarting,
+    migrateThreadId,
+    setSessionLaunchMode,
+  ]);
 
   const handleRespond = useCallback(
     (requestId: string, decision: ApprovalDecision) => {
