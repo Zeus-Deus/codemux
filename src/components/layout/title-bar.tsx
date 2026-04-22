@@ -15,6 +15,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
+import { SpawnChatPaneButton } from "@/components/debug/SpawnChatPaneButton";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -300,6 +301,15 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       {/* Left */}
       <div className="flex items-center gap-1 pl-2">
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
+        {/* Dev-only spawn-chat-pane button. The component self-gates
+            on import.meta.env.DEV + enable_agent_chat and renders null
+            in release builds, so this mount stays invisible for users.
+            Wrapped in a shrink-0 span so the button's w-full class
+            resolves to its intrinsic content width inside this
+            content-sized flex row rather than stretching the bar. */}
+        <span className="shrink-0">
+          <SpawnChatPaneButton />
+        </span>
       </div>
 
       {/* Center — search trigger absolutely positioned */}
