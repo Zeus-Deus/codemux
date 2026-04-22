@@ -6,6 +6,7 @@ import { SidebarPortsSection } from "./sidebar-ports-section";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
 import { SidebarAddRepo } from "./sidebar-add-repo";
 import { CloneDialog } from "@/components/overlays/clone-dialog";
+import { SpawnChatPaneButton } from "@/components/debug/SpawnChatPaneButton";
 
 export function AppSidebar() {
   return (
@@ -19,6 +20,7 @@ export function AppSidebar() {
       <SidebarPortsSection />
       <SidebarFooter className="gap-0 p-0">
         <SidebarAddRepo />
+        <SpawnChatPaneButton />
       </SidebarFooter>
       <SidebarRail />
       <CloneDialog />

@@ -9,6 +9,7 @@ import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
+import { useFeatureFlagsInit } from "@/stores/feature-flags";
 
 function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -30,6 +31,7 @@ function App() {
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
   useScrollbackSerializer();
+  useFeatureFlagsInit();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

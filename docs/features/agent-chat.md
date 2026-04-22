@@ -461,6 +461,14 @@ await window.__TAURI__.invoke("dev_agent_chat_spawn_test_pane");
 
 to insert a stub chat pane in the active workspace.
 
+## Dev affordances
+
+A dev-only "Spawn chat pane" button appears at the bottom of the
+sidebar in debug builds when `enable_agent_chat` is on. It invokes
+`dev_agent_chat_spawn_test_pane` to drop a stub chat pane into the
+active workspace. This is a temporary affordance for manual testing
+before the real chat UI lands.
+
 ## Known follow-ups
 
 - **Step 2: visual chat UI.** Replace the stub renderer with the
