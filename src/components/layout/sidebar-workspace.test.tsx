@@ -1,8 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+
+const setShowNewWorkspaceDialogMock = vi.fn();
+let enableAgentChatFlag = false;
 
 // Mock Tauri commands
 vi.mock("@/tauri/commands", () => ({
@@ -14,6 +17,9 @@ vi.mock("@/tauri/commands", () => ({
   openInEditor: vi.fn().mockResolvedValue(undefined),
   dbGetUiState: vi.fn().mockResolvedValue(null),
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
+  revealInFileManager: vi.fn().mockResolvedValue(undefined),
+  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   getGithubIssue: vi.fn().mockResolvedValue({
     number: 92, title: "Test", state: "Open", labels: [], assignees: [],
     url: "https://github.com/u/r/issues/92", body: null,
@@ -25,14 +31,26 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
     const state = {
       showNewWorkspaceDialog: false,
-      setShowNewWorkspaceDialog: vi.fn(),
+      setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
     };
+    return selector(state);
+  }),
+}));
+
+vi.mock("@/stores/feature-flags", () => ({
+  useFeatureFlags: vi.fn((selector) => {
+    const state = { enableAgentChat: enableAgentChatFlag, loaded: true };
     return selector(state);
   }),
 }));
 
 import { SidebarProjectGroup } from "./sidebar-project-group";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
+import {
+  activateWorkspace,
+  agentChatCreatePane,
+  createEmptyWorkspace,
+} from "@/tauri/commands";
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {
@@ -94,6 +112,96 @@ describe("SidebarProjectGroup", () => {
     expect(avatar).toHaveClass("bg-muted");
     expect(avatar).toHaveClass("text-muted-foreground");
     expect(avatar?.style.color).toBeFalsy();
+  });
+
+  describe("+ button click behavior", () => {
+    const PROJECT_PATH = "/home/user/myproject";
+
+    function renderGroup() {
+      const utils = render(
+        <TooltipProvider>
+          <SidebarProjectGroup
+            projectName="myproject"
+            projectPath={PROJECT_PATH}
+            workspaces={[]}
+            activeWorkspaceId=""
+          />
+        </TooltipProvider>,
+      );
+      const plus = utils.container.querySelector(
+        'button[aria-label="New workspace"]',
+      ) as HTMLElement;
+      return { ...utils, plus };
+    }
+
+    beforeEach(() => {
+      setShowNewWorkspaceDialogMock.mockClear();
+      vi.mocked(createEmptyWorkspace).mockClear();
+      vi.mocked(createEmptyWorkspace).mockResolvedValue("ws-new");
+      vi.mocked(activateWorkspace).mockClear();
+      vi.mocked(agentChatCreatePane).mockClear();
+      enableAgentChatFlag = false;
+    });
+
+    it("flag OFF + plain click → opens NewWorkspaceDialog", () => {
+      enableAgentChatFlag = false;
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag OFF + Shift+click → opens NewWorkspaceDialog", () => {
+      enableAgentChatFlag = false;
+      const { plus } = renderGroup();
+      fireEvent.click(plus, { shiftKey: true });
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + plain click → creates empty workspace + activates + opens chat pane (no terminal pane)", async () => {
+      enableAgentChatFlag = true;
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      await vi.waitFor(() => {
+        expect(agentChatCreatePane).toHaveBeenCalled();
+      });
+      // createEmptyWorkspace (not createWorkspace) — the empty variant
+      // doesn't spawn a terminal session, so agent_chat_create_pane
+      // mounts its own fresh surface containing only the chat pane.
+      // No skipSetup arg: projects SHOULD get setup scripts + MCP
+      // config; only the home-chat path opts out.
+      expect(createEmptyWorkspace).toHaveBeenCalledWith(PROJECT_PATH);
+      const call = vi.mocked(createEmptyWorkspace).mock.calls[0];
+      expect(call[1]).toBeUndefined();
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-new");
+      expect(agentChatCreatePane).toHaveBeenCalledWith("ws-new", null, PROJECT_PATH);
+      expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + Shift+click → opens dialog, does NOT call chat commands", () => {
+      enableAgentChatFlag = true;
+      const { plus } = renderGroup();
+      fireEvent.click(plus, { shiftKey: true });
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + createEmptyWorkspace rejects → falls back to dialog", async () => {
+      enableAgentChatFlag = true;
+      vi.mocked(createEmptyWorkspace).mockRejectedValueOnce(new Error("boom"));
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      await vi.waitFor(() => {
+        expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      });
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
   });
 });
 

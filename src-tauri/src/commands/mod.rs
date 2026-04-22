@@ -191,6 +191,19 @@ pub fn get_feature_flags(
     Ok(store.feature_flags())
 }
 
+/// Return the user's home directory as a string.
+///
+/// Used by the sidebar-header "+" chat flow to create a workspace
+/// anchored at `~` when the user wants an ambient chat not tied to
+/// a specific project. Errors if `dirs::home_dir()` returns `None`
+/// (no `HOME` env on Unix, no `USERPROFILE` on Windows).
+#[tauri::command]
+pub fn get_home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .ok_or_else(|| "home_dir_unavailable".to_string())
+}
+
 #[tauri::command]
 pub fn update_permission_policy(
     store: State<'_, ObservabilityStore>,

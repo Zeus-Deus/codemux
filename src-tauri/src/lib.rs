@@ -774,6 +774,7 @@ pub fn run() {
             commands::add_structured_log,
             commands::update_feature_flags,
             commands::get_feature_flags,
+            commands::get_home_dir,
             commands::agent_chat_create_pane,
             commands::agent_chat_close_pane,
             commands::dev_agent_chat_spawn_test_pane,

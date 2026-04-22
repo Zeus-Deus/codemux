@@ -122,8 +122,14 @@ export const restartTerminalSession = (sessionId: string) =>
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });
 
-export const createEmptyWorkspace = (cwd: string) =>
-  invoke<string>("create_empty_workspace", { cwd });
+export const createEmptyWorkspace = (
+  cwd: string,
+  opts?: { skipSetup?: boolean },
+) =>
+  invoke<string>("create_empty_workspace", {
+    cwd,
+    skipSetup: opts?.skipSetup ?? null,
+  });
 
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
@@ -873,6 +879,15 @@ export interface AgentChatSendTurnInput {
   images?: Array<{ data: number[]; media_type: string }>;
   model_override: string | null;
 }
+
+export const getHomeDir = () => invoke<string>("get_home_dir");
+
+export const agentChatCreatePane = (
+  workspaceId: string,
+  provider: AgentChatProviderKind | null = null,
+  cwd: string | null = null,
+) =>
+  invoke<string>("agent_chat_create_pane", { workspaceId, provider, cwd });
 
 export const agentChatStartSession = (
   paneId: string,

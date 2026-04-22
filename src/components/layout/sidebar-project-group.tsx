@@ -25,8 +25,18 @@ import {
 } from "@/components/ui/tooltip";
 import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { dbGetUiState, dbSetUiState, closeWorkspace, closeWorkspaceWithWorktree, revealInFileManager } from "@/tauri/commands";
+import {
+  dbGetUiState,
+  dbSetUiState,
+  closeWorkspace,
+  closeWorkspaceWithWorktree,
+  revealInFileManager,
+  createEmptyWorkspace,
+  activateWorkspace,
+  agentChatCreatePane,
+} from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
 const PROJECT_COLORS = [
@@ -75,6 +85,7 @@ export function SidebarProjectGroup({
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   useEffect(() => {
     dbGetUiState(`collapsed:project:${projectPath}`).then((val) => {
@@ -108,6 +119,24 @@ export function SidebarProjectGroup({
 
   const handleCopyPath = () => {
     navigator.clipboard.writeText(projectPath).catch(console.error);
+  };
+
+  const handlePlusClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    if (e.shiftKey || !enableAgentChat) {
+      setShowNewWorkspaceDialog(true, projectPath);
+      return;
+    }
+
+    try {
+      const wsId = await createEmptyWorkspace(projectPath);
+      await activateWorkspace(wsId);
+      await agentChatCreatePane(wsId, null, projectPath);
+    } catch (err) {
+      console.error("[sidebar] failed to open chat pane:", err);
+      setShowNewWorkspaceDialog(true, projectPath);
+    }
   };
 
   const handleCloseProject = () => {
@@ -168,13 +197,13 @@ export function SidebarProjectGroup({
                   size="icon-xs"
                   className="shrink-0 ml-1"
                   aria-label="New workspace"
-                  onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true, projectPath); }}
+                  onClick={handlePlusClick}
                 >
                   <Plus className="h-4 w-4 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4}>
-                New workspace
+              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
               </TooltipContent>
             </Tooltip>
 
