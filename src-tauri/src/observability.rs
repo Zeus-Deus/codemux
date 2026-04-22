@@ -71,12 +71,34 @@ pub struct SafetyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilitySnapshot {
+    #[serde(default)]
     pub logs: Vec<StructuredLogEntry>,
+    #[serde(default = "default_metrics_snapshot")]
     pub metrics: MetricsSnapshot,
+    #[serde(default = "default_feature_flags")]
     pub feature_flags: FeatureFlags,
+    #[serde(default = "default_permission_policy")]
     pub permission_policy: PermissionPolicy,
+    #[serde(default)]
     pub replay_records: Vec<ReplayRecord>,
+    #[serde(default = "default_safety_config")]
     pub safety_config: SafetyConfig,
+}
+
+fn default_metrics_snapshot() -> MetricsSnapshot {
+    default_snapshot().metrics
+}
+
+fn default_feature_flags() -> FeatureFlags {
+    default_snapshot().feature_flags
+}
+
+fn default_permission_policy() -> PermissionPolicy {
+    default_snapshot().permission_policy
+}
+
+fn default_safety_config() -> SafetyConfig {
+    default_snapshot().safety_config
 }
 
 pub struct ObservabilityStore {
