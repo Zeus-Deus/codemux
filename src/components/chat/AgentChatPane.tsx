@@ -40,6 +40,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
   const [starting, setStarting] = useState(false);
   const [restarting, setRestarting] = useState(false);
+  // Optimistic in-flight flag mirroring T3Code's `isSendBusy`
+  // (ChatView.tsx:406). Set synchronously on submit so the button
+  // disables BEFORE the backend's Running event round-trips. Without
+  // this, a fast second submit races the event and the backend rejects
+  // with "session has an active turn".
+  const [isSending, setIsSending] = useState(false);
 
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
@@ -132,8 +138,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const handleSubmit = useCallback(() => {
     if (!threadId) return;
+    if (isSending) return;
     const text = draft.trim();
     if (!text) return;
+    setIsSending(true);
     appendUserMessage(threadId, text);
     const input = {
       thread_id: threadId,
@@ -142,8 +150,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
     agentChatSendTurn(provider, input).catch((err) => {
       toast.error(`Failed to send turn: ${err}`);
+      setIsSending(false);
     });
-  }, [threadId, draft, provider, appendUserMessage]);
+  }, [threadId, isSending, draft, provider, appendUserMessage]);
+
+  // Clear the optimistic send flag once the backend acknowledges the
+  // turn (Running event → streaming=true in the store) OR once the
+  // turn finishes (streaming back to false). Either transition means
+  // the backend now owns the authoritative turn state and the local
+  // guard is no longer needed.
+  useEffect(() => {
+    if (isSending && streaming) setIsSending(false);
+  }, [isSending, streaming]);
 
   const handleStop = useCallback(() => {
     if (!threadId) return;
@@ -267,7 +285,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         provider={provider}
         model={model}
         permissionMode={permissionMode}
-        streaming={streaming}
+        streaming={streaming || isSending}
         sessionReady={sessionReady}
         showProviderPicker={ENABLE_PROVIDER_PICKER}
         onDraftChange={(next) => {
