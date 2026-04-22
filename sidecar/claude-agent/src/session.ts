@@ -114,6 +114,21 @@ export function resetQueryFactoryForTests(): void {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Prepend "Ultrathink:\n" to `text` when `effort === "ultrathink"`,
+ *  idempotently. Port of T3Code's `applyClaudePromptEffortPrefix`
+ *  (packages/shared/src/model.ts:285). The canonical prepend lives
+ *  client-side; this copy exists as a defensive belt-and-braces layer
+ *  in case a caller bypasses the client and writes the effort field
+ *  directly in `start-session`. Idempotency keeps the double-fire
+ *  safe. */
+function applyClaudePromptEffortPrefix(text: string, effort: string | undefined): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+  if (effort !== "ultrathink") return trimmed;
+  if (trimmed.startsWith("Ultrathink:")) return trimmed;
+  return `Ultrathink:\n${trimmed}`;
+}
+
 /** Heuristic: is this thrown value an abort / interrupt rather than a
  *  genuine error? Matches the pattern the research report §9c saw in
  *  production — no `import { AbortError }`, just string checks. */
@@ -199,10 +214,16 @@ export class ClaudeSession {
    *  this session. See T3Code's `context.resumeSessionId = message
    *  .session_id` pattern (ClaudeAdapter.ts:1255). */
   private sdkSessionId: string | null = null;
+  /** Session-level effort, captured at start. Used by `sendTurn` to
+   *  apply the ultrathink prompt-prepend defensively. The canonical
+   *  prepend lives in the frontend; this one fires only when a caller
+   *  bypasses it and writes `effort: "ultrathink"` directly. */
+  private readonly effort: string | undefined;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
     this.emitter = emit;
+    this.effort = input.effort;
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     this.pendingApprovals = new Map();
 
@@ -341,11 +362,12 @@ export class ClaudeSession {
         });
       }
     }
+    const preparedText = applyClaudePromptEffortPrefix(input.text, this.effort);
     const msg: SDKUserMessage = {
       type: "user",
       message: {
         role: "user",
-        content: input.text,
+        content: preparedText,
       },
       parent_tool_use_id: null,
     };

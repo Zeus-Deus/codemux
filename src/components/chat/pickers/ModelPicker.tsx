@@ -1,11 +1,10 @@
 import { useState } from "react";
-import { Check, ChevronDown, Cpu } from "lucide-react";
+import { Check, ChevronDown } from "lucide-react";
 
 import {
   Command,
   CommandEmpty,
   CommandGroup,
-  CommandInput,
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
@@ -16,6 +15,8 @@ import {
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
+import { ProviderLogo } from "../provider-logo";
+import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
 
 // TODO: replace with a backend-driven list once the providers expose a
 // `list_models_for_chat(provider)` equivalent to list_models_for_tool.
@@ -78,18 +79,21 @@ export function ModelPicker({ provider, value, onChange, disabled }: Props) {
           disabled={disabled}
           className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none disabled:opacity-50"
         >
-          <Cpu className="h-3 w-3" />
+          <ProviderLogo provider={provider} className="h-3 w-3" />
           <span className="max-w-[140px] truncate">
             {modelLabel(provider, current)}
           </span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
         </button>
       </PopoverTrigger>
-      <PopoverContent className="w-[300px] p-0" align="start">
+      <PopoverContent
+        className="w-[300px] p-0"
+        align="start"
+        onOpenAutoFocus={focusCmdkRootOnOpen}
+      >
         <Command>
-          <CommandInput placeholder="Search models..." className="h-8" />
           <CommandList className="max-h-[300px]">
-            <CommandEmpty>No matching models</CommandEmpty>
+            <CommandEmpty>No models available</CommandEmpty>
             <CommandGroup>
               {list.map((model) => (
                 <CommandItem
@@ -101,6 +105,7 @@ export function ModelPicker({ provider, value, onChange, disabled }: Props) {
                   }}
                   className="h-9 gap-2 text-xs"
                 >
+                  <ProviderLogo provider={provider} className="h-3.5 w-3.5" />
                   <span className="flex-1 min-w-0 truncate">{model.label}</span>
                   <Check
                     className={cn(

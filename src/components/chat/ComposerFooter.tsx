@@ -1,8 +1,14 @@
 import { ArrowUp, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type {
+  AgentChatProviderKind,
+  ChatModelInfo,
+  PermissionModeOption,
+} from "@/tauri/types";
 
+import { ContextWindowPicker } from "./pickers/ContextWindowPicker";
+import { EffortPicker } from "./pickers/EffortPicker";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ProviderPicker } from "./pickers/ProviderPicker";
@@ -11,12 +17,20 @@ interface Props {
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
+  effort: string | null;
+  contextWindow: string | null;
+  activeModel: ChatModelInfo | null;
+  effortLabelMap: Record<string, string>;
+  permissionModes: PermissionModeOption[] | null;
+  ultrathinkInBodyText: boolean;
   streaming: boolean;
   canSubmit: boolean;
   showProviderPicker: boolean;
   onProviderChange: (provider: AgentChatProviderKind) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
+  onEffortChange: (effort: string) => void;
+  onContextWindowChange: (value: string) => void;
   onSubmit: () => void;
   onStop: () => void;
   controlsDisabled: boolean;
@@ -26,12 +40,20 @@ export function ComposerFooter({
   provider,
   model,
   permissionMode,
+  effort,
+  contextWindow,
+  activeModel,
+  effortLabelMap,
+  permissionModes,
+  ultrathinkInBodyText,
   streaming,
   canSubmit,
   showProviderPicker,
   onProviderChange,
   onModelChange,
   onPermissionModeChange,
+  onEffortChange,
+  onContextWindowChange,
   onSubmit,
   onStop,
   controlsDisabled,
@@ -52,7 +74,22 @@ export function ComposerFooter({
           onChange={onModelChange}
           disabled={controlsDisabled}
         />
+        <EffortPicker
+          model={activeModel}
+          value={effort}
+          labelMap={effortLabelMap}
+          ultrathinkInBodyText={ultrathinkInBodyText}
+          onChange={onEffortChange}
+          disabled={controlsDisabled}
+        />
+        <ContextWindowPicker
+          model={activeModel}
+          value={contextWindow}
+          onChange={onContextWindowChange}
+          disabled={controlsDisabled}
+        />
         <PermissionModePicker
+          modes={permissionModes}
           value={permissionMode}
           onChange={onPermissionModeChange}
           disabled={controlsDisabled}

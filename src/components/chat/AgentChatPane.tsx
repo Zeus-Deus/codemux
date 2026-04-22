@@ -1,13 +1,26 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
+import {
+  planCapabilityCompatReset,
+  planEffortChange,
+  planModelChange,
+  planPermissionModeChange,
+  planSubmit,
+} from "@/lib/agent-chat/chat-pane-plans";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
+import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
 import { useAppStore } from "@/stores/app-store";
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   useAgentChatStore,
 } from "@/stores/agent-chat-store";
+import {
+  selectCapabilities,
+  selectModel,
+  useProviderCapabilities,
+} from "@/stores/provider-capabilities-store";
 import {
   agentChatInterruptTurn,
   agentChatRespondToRequest,
@@ -23,6 +36,7 @@ import type {
 } from "@/tauri/types";
 
 import { ChatTranscript } from "./ChatTranscript";
+import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 
@@ -62,6 +76,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     return ws?.cwd ?? null;
   });
   const cwd = pane.cwd ?? fallbackCwd;
+  const isHomeWorkspace = useAppStore((s) => {
+    if (!s.appState) return false;
+    const ws = s.appState.workspaces.find(
+      (w) => w.workspace_id === s.appState!.active_workspace_id,
+    );
+    return ws?.workspace_type === "home";
+  });
 
   const ensureThread = useAgentChatStore((s) => s.ensureThread);
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
@@ -70,10 +91,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const setSessionLaunchMode = useAgentChatStore(
     (s) => s.setSessionLaunchMode,
   );
+  const setStoreEffort = useAgentChatStore((s) => s.setEffort);
+  const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
+  );
+
+  // Chat-side capabilities for the active provider. `null` until the
+  // refresh hook resolves (or when the backend errors — pickers render
+  // a disabled "unavailable" state in that case).
+  const capabilities = useProviderCapabilities((s) =>
+    selectCapabilities(s, provider),
   );
 
   const slice = useAgentChatStore((s) =>
@@ -86,6 +116,32 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const model = slice?.model ?? null;
   const permissionMode =
     slice?.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+  const effort = slice?.effort ?? null;
+  const contextWindow = slice?.contextWindow ?? null;
+  const activeModel = selectModel(capabilities, model);
+  const effortLabelMap = capabilities?.effort_label_map ?? {};
+  const permissionModes = capabilities?.permission_modes ?? null;
+  const ultrathinkInBodyText = hasUltrathinkInBodyText(draft);
+
+  // When capabilities arrive (or change), reset the thread's
+  // permissionMode if it's orphaned for the active provider. Seeds
+  // the default when the slice has no mode yet. Idempotent — fires
+  // only when the current value actually needs to change.
+  useEffect(() => {
+    if (!threadId) return;
+    if (!capabilities) return;
+    const plan = planCapabilityCompatReset({
+      capabilities,
+      currentPermissionMode: permissionMode,
+    });
+    if (plan.resetPermissionMode !== undefined) {
+      // null is a legitimate reset value (provider with no modes).
+      setStorePermissionMode(
+        threadId,
+        plan.resetPermissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+      );
+    }
+  }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
 
   // Subscribe to provider events for this thread. The handler reads
   // store actions via `getState()` so it stays stable across
@@ -119,11 +175,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       additional_directories: [],
       env: null,
     };
+    const defaultModel = defaultModelForProvider(provider);
     agentChatStartSession(pane.pane_id, provider, startInput)
       .then((id) => {
         setThreadId(id);
         ensureThread(id);
-        setStoreModel(id, defaultModelForProvider(provider));
+        setStoreModel(id, defaultModel);
         setStorePermissionMode(id, startMode);
         setSessionLaunchMode(id, startMode);
       })
@@ -152,22 +209,24 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // `sendInFlightRef.current === true` and bails.
     if (sendInFlightRef.current) return;
     if (!threadId) return;
-    const text = draft.trim();
-    if (!text) return;
+    const rawText = draft.trim();
+    if (!rawText) return;
+    const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
     setIsSending(true);
-    appendUserMessage(threadId, text);
+    appendUserMessage(threadId, plan.text);
     const input = {
       thread_id: threadId,
-      text,
+      text: plan.text,
       model_override: null,
+      effort_override: plan.effortOverride,
     };
     agentChatSendTurn(provider, input).catch((err) => {
       toast.error(`Failed to send turn: ${err}`);
       sendInFlightRef.current = false;
       setIsSending(false);
     });
-  }, [threadId, draft, provider, appendUserMessage]);
+  }, [threadId, draft, provider, effort, appendUserMessage]);
 
   // Clear the optimistic send flag the moment the backend
   // acknowledges the turn via Running (streaming=true in the store).
@@ -228,6 +287,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             model: currentSlice.model,
             resume_cursor: currentSlice.resumeCursor,
             permission_mode: currentSlice.permissionMode,
+            effort: currentSlice.effort,
+            context_window: currentSlice.contextWindow,
             additional_directories: [],
             env: null,
           },
@@ -272,57 +333,88 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (next: string) => {
       if (!threadId) return;
       setStoreModel(threadId, next);
+      // Compatibility rule — use a pure planner so the decision is
+      // testable in isolation (see `planModelChange`). Reads from the
+      // fallback capability snapshot so the reset is correct even
+      // while live data is still loading.
+      const nextModel =
+        capabilities?.models.find((m) => m.id === next) ?? null;
+      const plan = planModelChange({
+        newModel: nextModel,
+        currentEffort: effort,
+        currentContextWindow: contextWindow,
+      });
+      if (plan.resetEffort !== undefined) {
+        setStoreEffort(threadId, plan.resetEffort);
+      }
+      if (plan.resetContextWindow !== undefined) {
+        setStoreContextWindow(threadId, plan.resetContextWindow);
+      }
       agentChatSetModel(provider, threadId, next).catch((err) => {
         toast.error(`Failed to set model: ${err}`);
       });
     },
-    [threadId, provider, setStoreModel],
+    [
+      threadId,
+      provider,
+      capabilities,
+      effort,
+      contextWindow,
+      setStoreModel,
+      setStoreEffort,
+      setStoreContextWindow,
+    ],
   );
 
-  const handlePermissionModeChange = useCallback(
-    (next: string) => {
+  /**
+   * Shared silent-restart helper. Permission-mode, effort, and
+   * context-window all trigger the same flow on Claude: stop the
+   * current session, start a new one with the updated launch params,
+   * migrate the thread id. Transcript + model + draft survive via
+   * `migrateThreadId`; resume cursor carries session state when
+   * available. Codex-side callers don't route through here.
+   */
+  const restartSessionWith = useCallback(
+    (updates: {
+      permissionMode?: string;
+      effort?: string | null;
+      contextWindow?: string | null;
+    }) => {
       if (!threadId) return;
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
-      // Persist the user's choice immediately so the picker label
-      // updates regardless of restart outcome.
-      setStorePermissionMode(threadId, next);
-      // T3Code-aligned: mode swap ≡ session restart. The SDK only
-      // respects permission-mode at launch (and `bypassPermissions`
-      // additionally requires `allowDangerouslySkipPermissions` at
-      // launch — there is no mid-session escalation path). Rather
-      // than introducing two restart flows, restart on every change.
-      if (currentSlice.sessionLaunchMode === next) return;
       if (restarting) return;
       setRestarting(true);
       const resumeCursor = currentSlice.resumeCursor;
       const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+      const nextMode = updates.permissionMode ?? currentSlice.permissionMode;
+      const nextEffort =
+        updates.effort !== undefined ? updates.effort : currentSlice.effort;
+      const nextContext =
+        updates.contextWindow !== undefined
+          ? updates.contextWindow
+          : currentSlice.contextWindow;
       void (async () => {
         try {
           await agentChatStopSession(provider, threadId);
         } catch (err) {
-          // stop_session is idempotent on the provider; log and
-          // continue so a transient stop failure doesn't strand the
-          // user on a misconfigured session.
           console.warn("[agent-chat] stop_session during restart failed", err);
         }
         try {
-          const newId = await agentChatStartSession(
-            pane.pane_id,
-            provider,
-            {
-              thread_id: newLocalThreadId,
-              cwd: cwd ?? "",
-              model: currentSlice.model,
-              resume_cursor: resumeCursor,
-              permission_mode: next,
-              additional_directories: [],
-              env: null,
-            },
-          );
+          const newId = await agentChatStartSession(pane.pane_id, provider, {
+            thread_id: newLocalThreadId,
+            cwd: cwd ?? "",
+            model: currentSlice.model,
+            resume_cursor: resumeCursor,
+            permission_mode: nextMode,
+            effort: nextEffort,
+            context_window: nextContext,
+            additional_directories: [],
+            env: null,
+          });
           migrateThreadId(threadId, newId);
           setThreadId(newId);
-          setSessionLaunchMode(newId, next);
+          setSessionLaunchMode(newId, nextMode);
         } catch (err) {
           toast.error(`Failed to restart session: ${err}`);
         } finally {
@@ -336,10 +428,87 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       cwd,
       pane.pane_id,
       restarting,
-      setStorePermissionMode,
       migrateThreadId,
       setSessionLaunchMode,
     ],
+  );
+
+  const handlePermissionModeChange = useCallback(
+    (next: string) => {
+      if (!threadId) return;
+      const currentSlice = useAgentChatStore.getState().threads[threadId];
+      if (!currentSlice) return;
+      // Delegate the decision to `planPermissionModeChange` — it
+      // checks the mode is valid for the active provider and reads
+      // `permission_granularity` from capabilities to decide whether
+      // to restart. Returns null for unknown modes.
+      const plan = planPermissionModeChange({
+        nextMode: next,
+        capabilities,
+      });
+      if (!plan) return;
+      setStorePermissionMode(threadId, plan.setPermissionMode);
+      // Skip the restart when the same mode is already live on the
+      // current session — avoids a no-op session teardown.
+      if (currentSlice.sessionLaunchMode === plan.setPermissionMode) return;
+      if (plan.restart) {
+        restartSessionWith({ permissionMode: plan.setPermissionMode });
+      }
+      // PerTurn providers: the mode is already persisted; the next
+      // `sendTurn` picks it up via `permission_mode_override`.
+    },
+    [threadId, capabilities, setStorePermissionMode, restartSessionWith],
+  );
+
+  /**
+   * Effort change — delegates the decision to `planEffortChange` so
+   * the three-branch logic (ultrathink prepend / strip-and-set / plain
+   * set) can be unit-tested in isolation. This handler is pure
+   * action-dispatch.
+   */
+  const handleEffortChange = useCallback(
+    (next: string) => {
+      if (!threadId) return;
+      const plan = planEffortChange({
+        nextEffort: next,
+        model: activeModel,
+        currentDraft: draft,
+        provider,
+      });
+      if (!plan) return;
+      if (plan.updateDraft) {
+        setInputDraft(threadId, plan.updateDraft.nextDraft);
+      }
+      if (plan.setEffort !== null) {
+        setStoreEffort(threadId, plan.setEffort);
+      }
+      if (plan.restart) {
+        restartSessionWith({ effort: plan.setEffort });
+      }
+    },
+    [
+      threadId,
+      activeModel,
+      draft,
+      provider,
+      setInputDraft,
+      setStoreEffort,
+      restartSessionWith,
+    ],
+  );
+
+  const handleContextWindowChange = useCallback(
+    (next: string) => {
+      if (!threadId) return;
+      setStoreContextWindow(threadId, next);
+      // Context window on Claude is encoded into the model id (e.g.
+      // `claude-opus-4-7[1m]`), which is a session-init parameter.
+      // Mid-session change → restart.
+      if (provider === "claude") {
+        restartSessionWith({ contextWindow: next });
+      }
+    },
+    [threadId, provider, setStoreContextWindow, restartSessionWith],
   );
 
   const handleProviderChange = useCallback(
@@ -358,31 +527,50 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const sessionReady = threadId != null && !starting && !restarting;
 
+  const composerEl = (
+    <Composer
+      draft={draft}
+      cwd={cwd}
+      isHomeWorkspace={isHomeWorkspace}
+      provider={provider}
+      model={model}
+      permissionMode={permissionMode}
+      effort={effort}
+      contextWindow={contextWindow}
+      activeModel={activeModel}
+      effortLabelMap={effortLabelMap}
+      permissionModes={permissionModes}
+      ultrathinkInBodyText={ultrathinkInBodyText}
+      streaming={streaming || isSending}
+      sessionReady={sessionReady}
+      showProviderPicker={ENABLE_PROVIDER_PICKER}
+      onDraftChange={(next) => {
+        if (!threadId) return;
+        setInputDraft(threadId, next);
+      }}
+      onSubmit={handleSubmit}
+      onStop={handleStop}
+      onProviderChange={handleProviderChange}
+      onModelChange={handleModelChange}
+      onPermissionModeChange={handlePermissionModeChange}
+      onEffortChange={handleEffortChange}
+      onContextWindowChange={handleContextWindowChange}
+    />
+  );
+
   return (
     <div className="flex h-full w-full flex-col bg-background">
-      <ChatTranscript
-        messages={messages}
-        onRespondToRequest={handleRespond}
-      />
-      <Composer
-        draft={draft}
-        cwd={cwd}
-        provider={provider}
-        model={model}
-        permissionMode={permissionMode}
-        streaming={streaming || isSending}
-        sessionReady={sessionReady}
-        showProviderPicker={ENABLE_PROVIDER_PICKER}
-        onDraftChange={(next) => {
-          if (!threadId) return;
-          setInputDraft(threadId, next);
-        }}
-        onSubmit={handleSubmit}
-        onStop={handleStop}
-        onProviderChange={handleProviderChange}
-        onModelChange={handleModelChange}
-        onPermissionModeChange={handlePermissionModeChange}
-      />
+      {messages.length === 0 ? (
+        <ChatHomeLanding composer={composerEl} />
+      ) : (
+        <>
+          <ChatTranscript
+            messages={messages}
+            onRespondToRequest={handleRespond}
+          />
+          {composerEl}
+        </>
+      )}
     </div>
   );
 }

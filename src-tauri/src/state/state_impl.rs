@@ -10,11 +10,12 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_NOTIFICATIONS: usize = 500;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceType {
     Standard,
     OpenFlow,
+    Home,
 }
 
 impl Default for WorkspaceType {
@@ -1146,6 +1147,30 @@ impl AppStateStore {
         {
             workspace.project_root = Some(project_root);
         }
+    }
+
+    pub fn set_workspace_type(&self, workspace_id: &str, workspace_type: WorkspaceType) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.workspace_type = workspace_type;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// First workspace with `workspace_type == Home`, if any.
+    pub fn find_home_workspace_id(&self) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_type == WorkspaceType::Home)
+            .map(|w| w.workspace_id.0.clone())
     }
 
     /// Update detected ports. Returns true if the port list actually changed.
@@ -4732,5 +4757,74 @@ mod tests {
             store.agent_chat_thread_id(&pane_id.0),
             Some("thread-xyz".into())
         );
+    }
+
+    #[test]
+    fn workspace_type_serde_roundtrip_all_variants() {
+        for variant in [
+            WorkspaceType::Standard,
+            WorkspaceType::OpenFlow,
+            WorkspaceType::Home,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: WorkspaceType = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, back, "roundtrip failed for {variant:?} ({json})");
+        }
+        assert_eq!(
+            serde_json::to_string(&WorkspaceType::Home).unwrap(),
+            "\"home\""
+        );
+    }
+
+    #[test]
+    fn find_home_workspace_id_returns_none_when_absent() {
+        let store = AppStateStore::default();
+        assert!(store.find_home_workspace_id().is_none());
+    }
+
+    #[test]
+    fn set_workspace_type_tags_home_and_find_returns_it() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+        assert!(store.set_workspace_type(&ws_id.0, WorkspaceType::Home));
+        assert_eq!(store.find_home_workspace_id(), Some(ws_id.0.clone()));
+    }
+
+    #[test]
+    fn get_or_create_home_workspace_is_idempotent() {
+        // Models the command body's state-level logic: if a Home workspace
+        // exists, return it; otherwise create + tag.
+        let store = AppStateStore::default();
+
+        // First call: none exists → create and tag.
+        let first = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+
+        // Second call: the tagged workspace is returned unchanged.
+        let second = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+        assert_eq!(first, second, "repeat call must return the same Home id");
+
+        // Simulate a hard-delete of the Home workspace.
+        {
+            let mut snap = store.inner.lock().unwrap();
+            snap.workspaces.retain(|w| w.workspace_id.0 != first);
+        }
+        assert!(store.find_home_workspace_id().is_none());
+
+        // Post-delete: next call creates a fresh Home with a new id.
+        let third = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+        assert_ne!(third, first, "post-deletion call must create a fresh id");
+        assert_eq!(store.find_home_workspace_id(), Some(third));
     }
 }

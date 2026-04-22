@@ -32,6 +32,13 @@ export interface ChatThreadSlice extends ChatThreadState {
   /** SDK session_id wrapped in a resume payload. `null` until the
    *  first SDK message lands and `ResumeCursorUpdated` fires. */
   resumeCursor: unknown | null;
+  /** Reasoning / effort level. For Claude this is session-scoped (the
+   *  pane restarts on change); for Codex it's per-turn (no restart).
+   *  `null` means "use the model default". */
+  effort: string | null;
+  /** Context-window selection (Claude-only today). `null` means "use
+   *  the model default". */
+  contextWindow: string | null;
 }
 
 function emptySlice(): ChatThreadSlice {
@@ -43,6 +50,8 @@ function emptySlice(): ChatThreadSlice {
     inputDraft: "",
     activeTurnId: null,
     resumeCursor: null,
+    effort: null,
+    contextWindow: null,
   };
 }
 
@@ -77,6 +86,10 @@ interface AgentChatStore {
   migrateThreadId: (oldThreadId: string, newThreadId: string) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
+  /** Set the thread's reasoning/effort level. `null` clears to default. */
+  setEffort: (threadId: string, effort: string | null) => void;
+  /** Set the thread's context-window selection. `null` clears. */
+  setContextWindow: (threadId: string, contextWindow: string | null) => void;
 }
 
 function updateSlice(
@@ -219,6 +232,22 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }
       return { threads: rest };
     }),
+
+  setEffort: (threadId, effort) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.effort === effort ? slice : { ...slice, effort },
+      ),
+    ),
+
+  setContextWindow: (threadId, contextWindow) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.contextWindow === contextWindow
+          ? slice
+          : { ...slice, contextWindow },
+      ),
+    ),
 }));
 
 export const selectThread =

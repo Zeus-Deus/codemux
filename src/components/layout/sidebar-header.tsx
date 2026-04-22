@@ -7,12 +7,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import {
-  getHomeDir,
-  createEmptyWorkspace,
-  activateWorkspace,
-  agentChatCreatePane,
-} from "@/tauri/commands";
+import { openHomeChat } from "@/lib/home-chat";
 import { Plus } from "lucide-react";
 
 export function SidebarHeader() {
@@ -26,10 +21,7 @@ export function SidebarHeader() {
     }
 
     try {
-      const homeDir = await getHomeDir();
-      const wsId = await createEmptyWorkspace(homeDir, { skipSetup: true });
-      await activateWorkspace(wsId);
-      await agentChatCreatePane(wsId, null, homeDir);
+      await openHomeChat();
     } catch (err) {
       console.error("[sidebar-header] failed to open home chat:", err);
       setShowDialog(true);

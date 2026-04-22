@@ -100,6 +100,16 @@ pub struct StartSessionInput {
     /// Initial permission mode name. String to avoid baking each provider's
     /// enum into the trait.
     pub permission_mode: Option<String>,
+    /// Optional reasoning / effort level. For Claude this is session-level
+    /// (restart on change). Codex uses the per-turn field on
+    /// [`SendTurnInput`] instead.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Optional context-window selection (Claude-only today). When set to
+    /// `"1m"` the Claude adapter appends the `[1m]` bracket to the model
+    /// id before the SDK call.
+    #[serde(default)]
+    pub context_window: Option<String>,
     /// Optional list of extra directories the agent should be allowed to
     /// access beyond `cwd`.
     pub additional_directories: Vec<PathBuf>,
@@ -107,7 +117,8 @@ pub struct StartSessionInput {
     /// the runtime's env when `None`.
     pub env: Option<std::collections::HashMap<String, String>>,
     /// Free-form provider-specific extras. Adapters parse what they
-    /// understand and ignore the rest.
+    /// understand and ignore the rest. First-class fields above win over
+    /// keys here when both are present.
     #[serde(default)]
     pub extra: serde_json::Value,
 }
@@ -124,6 +135,127 @@ pub struct SendTurnInput {
     pub images: Vec<ImageInput>,
     /// Optional per-turn model override. Not all providers support this.
     pub model_override: Option<String>,
+    /// Optional per-turn effort override. Used by Codex which applies
+    /// effort on `turn/start`; Claude ignores this (its effort is baked
+    /// into the session).
+    #[serde(default)]
+    pub effort_override: Option<String>,
+    /// Optional per-turn permission-mode override. Used by Codex
+    /// (sandboxPolicy on `turn/start`). Claude ignores this — its
+    /// permission mode is session-scoped and changes require restart.
+    #[serde(default)]
+    pub permission_mode_override: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Chat-side capabilities (UI-facing)
+// ---------------------------------------------------------------------------
+
+/// Granularity at which a provider applies an effort / reasoning change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortGranularity {
+    /// Change requires a silent session restart (Claude).
+    PerSession,
+    /// Change applies to the next turn without restart (Codex).
+    PerTurn,
+}
+
+/// A single context-window option a model exposes (e.g. 200k / 1M).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextWindowOption {
+    /// Machine-identifier used in API calls (e.g. `"200k"`, `"1m"`).
+    pub value: String,
+    /// Human-readable label (e.g. `"200k"`, `"1M"`).
+    pub label: String,
+    /// True when this option should be selected by default.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// A single permission mode a provider exposes (e.g. Claude's
+/// `default` / `acceptEdits` / `bypassPermissions`; Codex's sandbox
+/// policies). Value strings are provider-native — each adapter
+/// interprets them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionModeOption {
+    /// Machine identifier (provider-native).
+    pub value: String,
+    /// Human-readable short label (e.g. `"Supervised"`, `"Workspace write"`).
+    pub label: String,
+    /// One-line description shown under the label in the picker.
+    pub description: String,
+    /// True when this is the provider's default mode.
+    #[serde(default)]
+    pub is_default: bool,
+}
+
+/// Chat-side model metadata — what the composer pickers need to know.
+///
+/// Separate from the per-provider runtime capabilities (`capabilities()` on
+/// the trait) because this lives in the UI layer and is serialized to the
+/// frontend verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatModelInfo {
+    /// Model identifier (e.g. `"claude-opus-4-7"`).
+    pub id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Optional one-line description.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Effort levels the model honours natively via the SDK/RPC param.
+    #[serde(default)]
+    pub effort_levels: Vec<String>,
+    /// Which effort level should be selected when none is configured.
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    /// Effort levels that the UI implements via a prompt-prepend rather
+    /// than the SDK/RPC param. Claude uses this for `ultrathink`.
+    #[serde(default)]
+    pub prompt_injected_effort_levels: Vec<String>,
+    /// Context-window options. Empty = not applicable.
+    #[serde(default)]
+    pub context_window_options: Vec<ContextWindowOption>,
+    /// True when the model supports adaptive thinking (Claude Opus 4.6+).
+    #[serde(default)]
+    pub supports_adaptive_thinking: bool,
+    /// True when the model exposes a thinking on/off toggle but no effort
+    /// levels (Claude Haiku). Not rendered in MVP.
+    #[serde(default)]
+    pub supports_thinking_toggle: bool,
+    /// True when the model supports the fast-mode flag.
+    #[serde(default)]
+    pub supports_fast_mode: bool,
+}
+
+/// Bundle of chat-side capability data for a single provider. Returned by
+/// the `list_chat_provider_capabilities` Tauri command and cached
+/// client-side in a Zustand store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderChatCapabilities {
+    /// Models the provider exposes, in the order they should be displayed.
+    pub models: Vec<ChatModelInfo>,
+    /// How the provider applies effort changes.
+    pub effort_granularity: EffortGranularity,
+    /// Canonical label for each effort value ("xhigh" -> "Extra High",
+    /// etc.). Lets the UI render consistent names across models.
+    #[serde(default)]
+    pub effort_label_map: std::collections::HashMap<String, String>,
+    /// Permission / approval modes the provider honours. Empty means
+    /// the provider has no concept of permission modes and the UI
+    /// should hide the picker.
+    #[serde(default)]
+    pub permission_modes: Vec<PermissionModeOption>,
+    /// Default permission mode value when none has been selected.
+    /// Should match one of the `permission_modes` entries marked
+    /// `is_default: true`.
+    #[serde(default)]
+    pub default_permission_mode: Option<String>,
+    /// How the provider applies permission-mode changes. Typically
+    /// matches `effort_granularity` but kept separate in case a future
+    /// provider diverges.
+    pub permission_granularity: EffortGranularity,
 }
 
 /// Result of a successful [`AgentProvider::send_turn`](super::AgentProvider::send_turn).

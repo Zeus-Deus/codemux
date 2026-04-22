@@ -107,6 +107,7 @@ impl CodexSession {
         thread_id: ThreadId,
         cwd: PathBuf,
         model: Option<String>,
+        permission_mode: Option<String>,
         resume_cursor: Option<Value>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
@@ -195,12 +196,20 @@ impl CodexSession {
                     .map(|s| s.to_string());
                 match resume_id {
                     Some(rid) => {
+                        let (approval_policy, sandbox) = match codex_permission_mode_to_policy_pair(
+                            permission_mode.as_deref(),
+                        ) {
+                            Some((ap, sb)) => (Some(ap), Some(sb)),
+                            None => (None, None),
+                        };
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
                             model: model.clone(),
                             service_tier: None,
                             cwd: Some(cwd.clone()),
                             collaboration_mode: None,
+                            approval_policy,
+                            sandbox,
                             experimental_raw_events: false,
                         };
                         let params_value = serde_json::to_value(&params).unwrap();
@@ -224,7 +233,7 @@ impl CodexSession {
                                     ),
                                     original_payload: None,
                                 });
-                                start_fresh_thread(&child, cwd.clone(), model.clone()).await?
+                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?
                             }
                             Err(e) => {
                                 return Err(ProviderError::RpcError {
@@ -233,10 +242,10 @@ impl CodexSession {
                             }
                         }
                     }
-                    None => start_fresh_thread(&child, cwd.clone(), model.clone()).await?,
+                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?,
                 }
             }
-            None => start_fresh_thread(&child, cwd.clone(), model.clone()).await?,
+            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?,
         };
 
         // --- assemble session handle ----------------------------------------
@@ -301,11 +310,13 @@ impl CodexSession {
     }
 
     /// Queue a user turn on this session. Returns the Codex-assigned turn
-    /// identifier.
+    /// identifier. Codex applies `effort` per-turn (no session restart
+    /// needed), so the override is threaded straight into the RPC.
     pub async fn send_turn(
         &self,
         text: String,
         model_override: Option<String>,
+        effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
         let (codex_thread_id, model_default, already_active) = {
             let state = self.state.lock().await;
@@ -332,7 +343,7 @@ impl CodexSession {
             }],
             model: model_override.or(model_default),
             service_tier: None,
-            effort: None,
+            effort: effort_override,
             collaboration_mode: None,
         };
         let params_value = serde_json::to_value(&params).unwrap();
@@ -471,17 +482,43 @@ impl Drop for CodexSession {
     }
 }
 
+/// Translate Codemux's logical Codex permission-mode string into the
+/// `(approval_policy, sandbox)` pair the Codex RPC expects on
+/// `thread/start` / `thread/resume`. Mirrors T3Code's table
+/// (`apps/server/src/provider/Layers/CodexSessionRuntime.ts:237-258`).
+///
+/// Returns `None` when no mode is set — callers skip the RPC fields
+/// entirely rather than sending empty strings.
+pub(crate) fn codex_permission_mode_to_policy_pair(
+    mode: Option<&str>,
+) -> Option<(String, String)> {
+    match mode? {
+        "read-only" => Some(("untrusted".into(), "read-only".into())),
+        "workspace-write" => Some(("on-request".into(), "workspace-write".into())),
+        "danger-full-access" => Some(("never".into(), "danger-full-access".into())),
+        _ => None,
+    }
+}
+
 /// Issue a fresh `thread/start` and return the Codex-assigned thread id.
 async fn start_fresh_thread(
     child: &JsonRpcChild,
     cwd: PathBuf,
     model: Option<String>,
+    permission_mode: Option<String>,
 ) -> Result<String, ProviderError> {
+    let (approval_policy, sandbox) =
+        match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
+            Some((ap, sb)) => (Some(ap), Some(sb)),
+            None => (None, None),
+        };
     let params = ThreadStartParams {
         model,
         service_tier: None,
         cwd: Some(cwd),
         collaboration_mode: None,
+        approval_policy,
+        sandbox,
         experimental_raw_events: false,
     };
     let params_value = serde_json::to_value(&params).unwrap();

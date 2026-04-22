@@ -1,5 +1,6 @@
 import { Sidebar, SidebarContent, SidebarFooter, SidebarRail } from "@/components/ui/sidebar";
 import { SidebarHeader } from "./sidebar-header";
+import { SidebarHomeRow } from "./sidebar-home-row";
 import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarOpenflowSection } from "./sidebar-openflow-section";
 import { SidebarPortsSection } from "./sidebar-ports-section";
@@ -12,6 +13,7 @@ export function AppSidebar() {
     <Sidebar side="left" variant="sidebar" collapsible="offcanvas">
       <SidebarHeader />
       <SidebarContent>
+        <SidebarHomeRow />
         <SidebarWorkspaceList />
       </SidebarContent>
       <SidebarSetupBanner />

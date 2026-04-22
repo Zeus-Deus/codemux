@@ -100,6 +100,8 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         model: None,
         resume_cursor: None,
         permission_mode: None,
+        effort: None,
+        context_window: None,
         additional_directories: vec![],
         env: None,
         extra: serde_json::Value::Null,
@@ -272,6 +274,8 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             text: "first".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap()
@@ -303,6 +307,8 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             text: "second".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap()
@@ -355,6 +361,8 @@ async fn send_turn_emits_session_state_changed_running_with_matching_turn_id() {
             text: "hello".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -442,6 +450,8 @@ async fn interrupt_emits_session_state_changed_ready() {
             text: "work forever".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -535,6 +545,8 @@ async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
                 text: format!("turn {i}"),
                 images: vec![],
                 model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
             })
             .await
             .unwrap_or_else(|e| {
@@ -612,6 +624,8 @@ async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed(
             text: "hello".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -662,6 +676,8 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -706,6 +722,8 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -753,6 +771,8 @@ async fn request_opened_for_command_tool_routes_to_request_opened_event() {
             text: "please ls".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -813,6 +833,8 @@ async fn interrupt_turn_sends_interrupt_rpc() {
             text: "go".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -833,6 +855,8 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             text: "go".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -926,6 +950,8 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             text: "hi".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap_err();
@@ -951,6 +977,8 @@ async fn concurrent_send_turn_returns_validation_error() {
             text: "first".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -960,6 +988,8 @@ async fn concurrent_send_turn_returns_validation_error() {
             text: "second".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap_err();
@@ -1005,6 +1035,8 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await;
     let mut saw_error = false;
@@ -1045,6 +1077,8 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -1090,6 +1124,8 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -1134,6 +1170,8 @@ async fn session_error_emits_session_state_changed_plus_warning() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -1233,6 +1271,8 @@ async fn event_ordering_across_rapid_bursts() {
             text: "x".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();
@@ -1349,6 +1389,8 @@ async fn claude_real_session() {
             text: "Say hi.".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();

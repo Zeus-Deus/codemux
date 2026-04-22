@@ -50,6 +50,8 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         model: None,
         resume_cursor: None,
         permission_mode: None,
+        effort: None,
+        context_window: None,
         additional_directories: vec![],
         env: None,
         extra: serde_json::Value::Null,
@@ -207,6 +209,8 @@ async fn send_turn_forwards_to_selected_provider() {
             text: "hello".into(),
             images: vec![],
             model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
         })
         .await
         .unwrap();

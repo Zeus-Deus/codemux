@@ -531,6 +531,45 @@ export interface TabSnapshot {
 
 export type AgentChatProviderKind = "claude" | "codex";
 
+// ── Chat-side provider capabilities ───────────────────────────────────
+
+export type EffortGranularity = "per_session" | "per_turn";
+
+export interface ContextWindowOption {
+  value: string;
+  label: string;
+  is_default: boolean;
+}
+
+export interface ChatModelInfo {
+  id: string;
+  label: string;
+  description: string | null;
+  effort_levels: string[];
+  default_effort: string | null;
+  prompt_injected_effort_levels: string[];
+  context_window_options: ContextWindowOption[];
+  supports_adaptive_thinking: boolean;
+  supports_thinking_toggle: boolean;
+  supports_fast_mode: boolean;
+}
+
+export interface PermissionModeOption {
+  value: string;
+  label: string;
+  description: string;
+  is_default: boolean;
+}
+
+export interface ProviderChatCapabilities {
+  models: ChatModelInfo[];
+  effort_granularity: EffortGranularity;
+  effort_label_map: Record<string, string>;
+  permission_modes: PermissionModeOption[];
+  default_permission_mode: string | null;
+  permission_granularity: EffortGranularity;
+}
+
 export type PaneNodeSnapshot =
   | { kind: "terminal"; pane_id: string; session_id: string; title: string }
   | { kind: "browser"; pane_id: string; browser_id: string; title: string }
@@ -557,7 +596,7 @@ export interface SurfaceSnapshot {
   active_pane_id: string;
 }
 
-export type WorkspaceType = "standard" | "open_flow";
+export type WorkspaceType = "standard" | "open_flow" | "home";
 
 export interface WorkspaceSnapshot {
   workspace_id: string;

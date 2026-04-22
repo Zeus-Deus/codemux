@@ -12,6 +12,7 @@
 //! isolation; same trade-off the Codex adapter makes.
 
 pub mod auth;
+pub mod capabilities;
 pub mod protocol;
 pub(crate) mod session;
 pub mod sidecar_path;

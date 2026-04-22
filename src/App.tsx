@@ -10,6 +10,8 @@ import { LoginScreen } from "@/components/auth/login-screen";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
+import { useProviderCapabilitiesInit } from "@/stores/provider-capabilities-store";
+import { useBootIntoHome } from "@/hooks/use-boot-into-home";
 
 function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -32,6 +34,8 @@ function App() {
   useKeyboardShortcuts();
   useScrollbackSerializer();
   useFeatureFlagsInit();
+  useProviderCapabilitiesInit();
+  useBootIntoHome();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

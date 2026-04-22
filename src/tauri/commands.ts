@@ -1,7 +1,7 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 export { Channel };
-import type { AgentChatProviderKind } from "./types";
+import type { AgentChatProviderKind, ProviderChatCapabilities } from "./types";
 import type { ApprovalDecision } from "./events";
 import type {
   UserSettings,
@@ -129,6 +129,16 @@ export const createEmptyWorkspace = (
   invoke<string>("create_empty_workspace", {
     cwd,
     skipSetup: opts?.skipSetup ?? null,
+  });
+
+export const getOrCreateHomeWorkspace = () =>
+  invoke<string>("get_or_create_home_workspace");
+
+export const listChatProviderCapabilities = (
+  provider: AgentChatProviderKind,
+) =>
+  invoke<ProviderChatCapabilities>("list_chat_provider_capabilities", {
+    provider,
   });
 
 export const regenerateMcpConfig = (workspaceId: string) =>
@@ -868,6 +878,10 @@ export interface AgentChatStartSessionInput {
   model: string | null;
   resume_cursor: unknown | null;
   permission_mode: string | null;
+  /** Claude only — session-scoped reasoning effort. */
+  effort?: string | null;
+  /** Claude only — context-window selector (e.g. "1m" adds [1m] bracket). */
+  context_window?: string | null;
   additional_directories: string[];
   env: Record<string, string> | null;
   extra?: unknown;
@@ -878,6 +892,12 @@ export interface AgentChatSendTurnInput {
   text: string;
   images?: Array<{ data: number[]; media_type: string }>;
   model_override: string | null;
+  /** Codex only — per-turn effort. Claude ignores this. */
+  effort_override?: string | null;
+  /** Codex only (future) — per-turn permission-mode override via
+   *  `sandboxPolicy` on `turn/start`. Wired in the backend struct;
+   *  MVP Codex UI still round-trips mode via session restart. */
+  permission_mode_override?: string | null;
 }
 
 export const getHomeDir = () => invoke<string>("get_home_dir");

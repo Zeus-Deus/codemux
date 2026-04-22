@@ -1,16 +1,27 @@
 import { useEffect, useRef } from "react";
 
 import { cn } from "@/lib/utils";
-import type { AgentChatProviderKind } from "@/tauri/types";
+import type {
+  AgentChatProviderKind,
+  ChatModelInfo,
+  PermissionModeOption,
+} from "@/tauri/types";
 
 import { ComposerFooter } from "./ComposerFooter";
 
 interface Props {
   draft: string;
   cwd: string | null;
+  isHomeWorkspace?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
+  effort: string | null;
+  contextWindow: string | null;
+  activeModel: ChatModelInfo | null;
+  effortLabelMap: Record<string, string>;
+  permissionModes: PermissionModeOption[] | null;
+  ultrathinkInBodyText: boolean;
   streaming: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
@@ -20,6 +31,8 @@ interface Props {
   onProviderChange: (provider: AgentChatProviderKind) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
+  onEffortChange: (effort: string) => void;
+  onContextWindowChange: (value: string) => void;
 }
 
 const MAX_ROWS_APPROX_PX = 32 + 7 * 20; // ~8 rows
@@ -27,9 +40,16 @@ const MAX_ROWS_APPROX_PX = 32 + 7 * 20; // ~8 rows
 export function Composer({
   draft,
   cwd,
+  isHomeWorkspace = false,
   provider,
   model,
   permissionMode,
+  effort,
+  contextWindow,
+  activeModel,
+  effortLabelMap,
+  permissionModes,
+  ultrathinkInBodyText,
   streaming,
   sessionReady,
   showProviderPicker,
@@ -39,6 +59,8 @@ export function Composer({
   onProviderChange,
   onModelChange,
   onPermissionModeChange,
+  onEffortChange,
+  onContextWindowChange,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -63,10 +85,16 @@ export function Composer({
   return (
     <div className="w-full px-4 pb-3">
       <div className="mx-auto w-full max-w-2xl">
-        {cwd && (
-          <div className="px-2 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
-            {cwd}
+        {isHomeWorkspace ? (
+          <div className="px-2 pb-1 text-[11px] text-muted-foreground/70 truncate">
+            Home
           </div>
+        ) : (
+          cwd && (
+            <div className="px-2 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
+              {cwd}
+            </div>
+          )
         )}
         <div
           className={cn(
@@ -94,12 +122,20 @@ export function Composer({
             provider={provider}
             model={model}
             permissionMode={permissionMode}
+            effort={effort}
+            contextWindow={contextWindow}
+            activeModel={activeModel}
+            effortLabelMap={effortLabelMap}
+            permissionModes={permissionModes}
+            ultrathinkInBodyText={ultrathinkInBodyText}
             streaming={streaming}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             onProviderChange={onProviderChange}
             onModelChange={onModelChange}
             onPermissionModeChange={onPermissionModeChange}
+            onEffortChange={onEffortChange}
+            onContextWindowChange={onContextWindowChange}
             onSubmit={onSubmit}
             onStop={onStop}
             controlsDisabled={!sessionReady}

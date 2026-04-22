@@ -21,7 +21,12 @@ interface DropTarget {
 
 export function SidebarWorkspaceList() {
   const appState = useAppStore((s) => s.appState);
-  const projectGroups = useProjectGroupedWorkspaces(appState?.workspaces ?? []);
+  // Home is rendered separately in SidebarHomeRow and must not appear
+  // again inside a project group.
+  const nonHomeWorkspaces = (appState?.workspaces ?? []).filter(
+    (w) => w.workspace_type !== "home",
+  );
+  const projectGroups = useProjectGroupedWorkspaces(nonHomeWorkspaces);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);

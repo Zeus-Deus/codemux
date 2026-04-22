@@ -123,6 +123,14 @@ pub struct ThreadStartParams {
     /// `"auto-accept"` / `"interactive"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
+    /// Approval policy — one of `"untrusted" | "on-request" | "never"`.
+    /// Paired with `sandbox` via the Codex runtime-mode table.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "approvalPolicy")]
+    pub approval_policy: Option<String>,
+    /// Sandbox mode — one of `"read-only" | "workspace-write" |
+    /// "danger-full-access"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     /// Whether to subscribe to raw experimental events. We always send
     /// `false` — the canonical event schema is synthesised from the
     /// documented notifications.
@@ -144,6 +152,10 @@ pub struct ThreadResumeParams {
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "approvalPolicy")]
+    pub approval_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
     pub experimental_raw_events: bool,
 }
 

@@ -23,6 +23,7 @@
 //!   `Closed` and exit cleanly.
 
 pub mod auth;
+pub mod capabilities;
 pub mod protocol;
 pub(crate) mod session;
 pub mod translate;
@@ -187,6 +188,7 @@ impl AgentProvider for CodexAgentProvider {
             thread_id.clone(),
             input.cwd,
             input.model,
+            input.permission_mode,
             input.resume_cursor.clone(),
             self.spawn_config(),
             self.event_tx.clone(),
@@ -217,7 +219,9 @@ impl AgentProvider for CodexAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: input.thread_id.clone(),
         })?;
-        let turn_id = session.send_turn(input.text, input.model_override).await?;
+        let turn_id = session
+            .send_turn(input.text, input.model_override, input.effort_override)
+            .await?;
         Ok(TurnStartResult { turn_id })
     }
 

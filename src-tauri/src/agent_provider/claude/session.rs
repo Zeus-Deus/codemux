@@ -134,15 +134,33 @@ impl ClaudeSession {
         })?;
 
         // Build `start-session` params from the trait-level input.
-        let params = StartSessionParams {
-            thread_id: thread_id.0.clone(),
-            cwd: input.cwd.clone(),
-            model: input.model.clone(),
-            effort: input
+        //
+        // First-class fields on `StartSessionInput` (effort,
+        // context_window) win over keys in the free-form `extra`
+        // passthrough. Context window is encoded into the model id
+        // itself via `resolve_claude_api_model_id` — Anthropic's API
+        // expects the `[1m]` suffix as part of the model string.
+        let resolved_model = input
+            .model
+            .as_deref()
+            .map(|m| {
+                crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
+                    m,
+                    input.context_window.as_deref(),
+                )
+            });
+        let resolved_effort = input.effort.clone().or_else(|| {
+            input
                 .extra
                 .get("effort")
                 .and_then(|v| v.as_str())
-                .map(String::from),
+                .map(String::from)
+        });
+        let params = StartSessionParams {
+            thread_id: thread_id.0.clone(),
+            cwd: input.cwd.clone(),
+            model: resolved_model,
+            effort: resolved_effort,
             permission_mode: input.permission_mode.clone(),
             allow_dangerously_skip_permissions: match input.permission_mode.as_deref() {
                 Some("bypassPermissions") => Some(true),

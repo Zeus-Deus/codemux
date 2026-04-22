@@ -24,10 +24,11 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 
 const setShowDialogMock = vi.fn();
 let enableAgentChatFlag = false;
+let appStateSnapshot: unknown = null;
 
 vi.mock("@/tauri/commands", () => ({
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
-  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-home"),
+  getOrCreateHomeWorkspace: vi.fn().mockResolvedValue("ws-home"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-home"),
 }));
@@ -49,12 +50,19 @@ vi.mock("@/stores/feature-flags", () => ({
   }),
 }));
 
+vi.mock("@/stores/app-store", () => ({
+  useAppStore: Object.assign(
+    vi.fn((selector) => selector({ appState: appStateSnapshot })),
+    { getState: () => ({ appState: appStateSnapshot }) },
+  ),
+}));
+
 import { SidebarHeader } from "./sidebar-header";
 import {
   activateWorkspace,
   agentChatCreatePane,
-  createEmptyWorkspace,
   getHomeDir,
+  getOrCreateHomeWorkspace,
 } from "@/tauri/commands";
 
 function renderHeader() {
@@ -76,11 +84,12 @@ describe("SidebarHeader + button", () => {
     setShowDialogMock.mockClear();
     vi.mocked(getHomeDir).mockClear();
     vi.mocked(getHomeDir).mockResolvedValue("/home/user");
-    vi.mocked(createEmptyWorkspace).mockClear();
-    vi.mocked(createEmptyWorkspace).mockResolvedValue("ws-home");
+    vi.mocked(getOrCreateHomeWorkspace).mockClear();
+    vi.mocked(getOrCreateHomeWorkspace).mockResolvedValue("ws-home");
     vi.mocked(activateWorkspace).mockClear();
     vi.mocked(agentChatCreatePane).mockClear();
     enableAgentChatFlag = false;
+    appStateSnapshot = null;
   });
 
   it("flag OFF + plain click → opens NewWorkspaceDialog", () => {
@@ -88,7 +97,7 @@ describe("SidebarHeader + button", () => {
     const { plus } = renderHeader();
     fireEvent.click(plus);
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getHomeDir).not.toHaveBeenCalled();
+    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
     expect(agentChatCreatePane).not.toHaveBeenCalled();
   });
 
@@ -97,21 +106,76 @@ describe("SidebarHeader + button", () => {
     const { plus } = renderHeader();
     fireEvent.click(plus, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getHomeDir).not.toHaveBeenCalled();
+    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
     expect(agentChatCreatePane).not.toHaveBeenCalled();
   });
 
-  it("flag ON + plain click → creates empty workspace at home, activates, opens chat pane", async () => {
+  it("flag ON + plain click (no prior chat pane) → gets Home, activates, spawns chat pane", async () => {
     enableAgentChatFlag = true;
+    // Home exists but has no chat pane on its active surface.
+    appStateSnapshot = {
+      active_workspace_id: "ws-home",
+      workspaces: [
+        {
+          workspace_id: "ws-home",
+          active_surface_id: "surf-1",
+          surfaces: [
+            {
+              surface_id: "surf-1",
+              root: {
+                kind: "terminal",
+                pane_id: "pane-term",
+                session_id: "sess-1",
+                title: "Terminal",
+              },
+            },
+          ],
+        },
+      ],
+    };
     const { plus } = renderHeader();
     fireEvent.click(plus);
     await vi.waitFor(() => {
       expect(agentChatCreatePane).toHaveBeenCalled();
     });
-    expect(getHomeDir).toHaveBeenCalled();
-    expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", { skipSetup: true });
+    expect(getOrCreateHomeWorkspace).toHaveBeenCalled();
     expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
+    expect(getHomeDir).toHaveBeenCalled();
     expect(agentChatCreatePane).toHaveBeenCalledWith("ws-home", null, "/home/user");
+    expect(setShowDialogMock).not.toHaveBeenCalled();
+  });
+
+  it("flag ON + plain click (Home already has chat pane) → activates only, no duplicate pane", async () => {
+    enableAgentChatFlag = true;
+    appStateSnapshot = {
+      active_workspace_id: "ws-home",
+      workspaces: [
+        {
+          workspace_id: "ws-home",
+          active_surface_id: "surf-1",
+          surfaces: [
+            {
+              surface_id: "surf-1",
+              root: {
+                kind: "agent_chat",
+                pane_id: "pane-chat",
+                title: "Chat",
+                thread_id: null,
+                provider: null,
+                cwd: null,
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const { plus } = renderHeader();
+    fireEvent.click(plus);
+    await vi.waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
+    });
+    expect(getOrCreateHomeWorkspace).toHaveBeenCalled();
+    expect(agentChatCreatePane).not.toHaveBeenCalled();
     expect(setShowDialogMock).not.toHaveBeenCalled();
   });
 
@@ -120,13 +184,13 @@ describe("SidebarHeader + button", () => {
     const { plus } = renderHeader();
     fireEvent.click(plus, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getHomeDir).not.toHaveBeenCalled();
+    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
     expect(agentChatCreatePane).not.toHaveBeenCalled();
   });
 
-  it("flag ON + getHomeDir rejects → falls back to dialog", async () => {
+  it("flag ON + getOrCreateHomeWorkspace rejects → falls back to dialog", async () => {
     enableAgentChatFlag = true;
-    vi.mocked(getHomeDir).mockRejectedValueOnce(new Error("no home"));
+    vi.mocked(getOrCreateHomeWorkspace).mockRejectedValueOnce(new Error("boom"));
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     const { plus } = renderHeader();
     fireEvent.click(plus);

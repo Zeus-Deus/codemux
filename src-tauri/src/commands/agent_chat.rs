@@ -19,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
-    AgentProvider, ApprovalDecision, ProviderError, ProviderKind, ProviderRuntimeEvent,
-    RequestId, SendTurnInput, SerializableProviderError, StartSessionInput, ThreadId, TurnId,
+    AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
+    ProviderRuntimeEvent, RequestId, SendTurnInput, SerializableProviderError,
+    StartSessionInput, ThreadId, TurnId,
 };
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
@@ -328,6 +329,32 @@ pub async fn agent_chat_set_permission_mode(
         .set_permission_mode(thread_id, mode)
         .await
         .map_err(provider_err)
+}
+
+/// Return the chat-side capabilities bundle for a provider.
+///
+/// MVP ships fallback (hand-maintained) data only. Live harvesting from
+/// the Claude SDK's `initializationResult()` and from Codex's
+/// `model/list` RPC is deferred — once wired the returned snapshot will
+/// be a merge of live models + hand-maintained extras (see
+/// `agent_provider/claude/capabilities.rs`).
+///
+/// Not gated on the `enable_agent_chat` flag: the frontend's
+/// capabilities store refreshes at app boot regardless, so the picker
+/// UI can render a disabled "unavailable" pill rather than crash when
+/// the flag is off.
+#[tauri::command]
+pub async fn list_chat_provider_capabilities(
+    provider: ProviderKind,
+) -> Result<ProviderChatCapabilities, String> {
+    match provider {
+        ProviderKind::Claude => Ok(
+            crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),
+        ),
+        ProviderKind::Codex => Ok(
+            crate::agent_provider::codex::capabilities::codex_fallback_capabilities(),
+        ),
+    }
 }
 
 /// Gracefully terminate a session. Idempotent on the provider side.

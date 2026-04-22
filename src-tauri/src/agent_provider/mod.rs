@@ -17,7 +17,8 @@ pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{CompletedItem, ContentDelta, ProviderRuntimeEvent, TurnStatus, TurnUsage};
 pub use provider::{AgentProvider, ProviderEventStream};
 pub use types::{
-    ApprovalDecision, ImageInput, ProviderCapabilities, ProviderKind, ProviderSession,
-    ProviderSessionId, RequestId, SendTurnInput, SessionStatus, StartSessionInput, ThreadId,
-    TurnId, TurnStartResult,
+    ApprovalDecision, ChatModelInfo, ContextWindowOption, EffortGranularity, ImageInput,
+    PermissionModeOption, ProviderCapabilities, ProviderChatCapabilities, ProviderKind,
+    ProviderSession, ProviderSessionId, RequestId, SendTurnInput, SessionStatus,
+    StartSessionInput, ThreadId, TurnId, TurnStartResult,
 };

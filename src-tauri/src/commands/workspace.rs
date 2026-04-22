@@ -13,6 +13,7 @@ use crate::state::{
     SplitDirection,
     TabKind,
     WorkspacePresetLayout,
+    WorkspaceType,
 };
 use crate::terminal;
 use notify_rust::Notification;
@@ -163,6 +164,40 @@ pub fn create_empty_workspace(
             crate::mcp_server::upsert_mcp_config(&repo_path, &workspace_id.0);
         }
     }
+
+    crate::state::emit_app_state(&app);
+    Ok(workspace_id.0)
+}
+
+/// Return the existing Home workspace id, or create one anchored at
+/// `$HOME` if none exists yet.
+///
+/// Home is a singleton: the first workspace with
+/// `workspace_type == Home` wins. If the user hard-deletes it, the next
+/// call lazily recreates one (no delete protection by design). Creation
+/// passes `skip_setup=true` semantics — no `.mcp.json` injection, no
+/// setup scripts — since the home directory is not a project.
+#[tauri::command]
+pub fn get_or_create_home_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+) -> Result<String, String> {
+    if let Some(existing) = state.find_home_workspace_id() {
+        return Ok(existing);
+    }
+
+    let home_dir = dirs::home_dir()
+        .ok_or_else(|| "home_dir_unavailable".to_string())?;
+    let repo_path = home_dir.clone();
+
+    let workspace_id = state.create_empty_workspace_at_path(repo_path.clone());
+
+    let project_root = crate::config::workspace_config::find_git_root(&repo_path)
+        .unwrap_or_else(|| repo_path.clone());
+    state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
+    populate_git_info(&state, &workspace_id.0, &repo_path);
+
+    state.set_workspace_type(&workspace_id.0, WorkspaceType::Home);
 
     crate::state::emit_app_state(&app);
     Ok(workspace_id.0)
