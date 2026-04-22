@@ -408,7 +408,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
         | ProviderRuntimeEvent::RequestOpened { thread_id, .. }
         | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
-        | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
+        | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }

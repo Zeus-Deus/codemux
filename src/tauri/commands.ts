@@ -1,6 +1,8 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 export { Channel };
+import type { AgentChatProviderKind } from "./types";
+import type { ApprovalDecision } from "./events";
 import type {
   UserSettings,
   AgentConfig,
@@ -846,3 +848,86 @@ export const pickFilesDialog = (title?: string) =>
 
 export const getPackageFormat = () =>
   invoke<string>("get_package_format");
+
+// ── Agent Chat ──
+//
+// Frontend wrappers for the agent_chat_* Tauri commands defined in
+// src-tauri/src/commands/agent_chat.rs. Every wrapper takes a
+// ProviderKind so a single pane can route to either provider without
+// the UI needing to know the Rust enum encoding.
+
+export interface AgentChatStartSessionInput {
+  thread_id: string;
+  cwd: string;
+  model: string | null;
+  resume_cursor: unknown | null;
+  permission_mode: string | null;
+  additional_directories: string[];
+  env: Record<string, string> | null;
+  extra?: unknown;
+}
+
+export interface AgentChatSendTurnInput {
+  thread_id: string;
+  text: string;
+  images?: Array<{ data: number[]; media_type: string }>;
+  model_override: string | null;
+}
+
+export const agentChatStartSession = (
+  paneId: string,
+  provider: AgentChatProviderKind,
+  input: AgentChatStartSessionInput,
+) =>
+  invoke<string>("agent_chat_start_session", { paneId, provider, input });
+
+export const agentChatSendTurn = (
+  provider: AgentChatProviderKind,
+  input: AgentChatSendTurnInput,
+) => invoke<string>("agent_chat_send_turn", { provider, input });
+
+export const agentChatInterruptTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  turnId: string | null = null,
+) =>
+  invoke<void>("agent_chat_interrupt_turn", {
+    provider,
+    threadId,
+    turnId,
+  });
+
+export const agentChatRespondToRequest = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  requestId: string,
+  decision: ApprovalDecision,
+) =>
+  invoke<void>("agent_chat_respond_to_request", {
+    provider,
+    threadId,
+    requestId,
+    decision,
+  });
+
+export const agentChatSetModel = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  model: string | null,
+) => invoke<void>("agent_chat_set_model", { provider, threadId, model });
+
+export const agentChatSetPermissionMode = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  mode: string,
+) =>
+  invoke<void>("agent_chat_set_permission_mode", {
+    provider,
+    threadId,
+    mode,
+  });
+
+export const agentChatStopSession = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+) => invoke<void>("agent_chat_stop_session", { provider, threadId });

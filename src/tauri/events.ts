@@ -93,17 +93,113 @@ export const onAuthStateChanged = (
 
 // ── Agent chat events ──
 //
-// Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload.
+// Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload
+// and src-tauri/src/agent_provider/events.rs:ProviderRuntimeEvent.
 // The Rust side emits a single channel name; subscribers filter by
 // thread_id via the useAgentChatEvents hook.
+
+export type ApprovalDecision =
+  | { decision: "allow"; updated_input?: unknown }
+  | { decision: "allow_for_session" }
+  | { decision: "deny"; message: string }
+  | { decision: "cancel" };
+
+export type SessionStatus =
+  | { status: "starting" }
+  | { status: "ready" }
+  | { status: "running"; active_turn: string }
+  | { status: "waiting_approval"; request_id: string }
+  | { status: "error"; message: string }
+  | { status: "closed" };
+
+export type ContentDelta =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
+  | { kind: "tool_input"; tool_name: string; partial_json: string };
+
+export type CompletedItem =
+  | { kind: "assistant_text"; text: string }
+  | { kind: "assistant_thinking"; text: string }
+  | { kind: "tool_use"; tool_name: string; input: unknown; tool_use_id: string }
+  | {
+      kind: "tool_result";
+      tool_use_id: string;
+      content: unknown;
+      is_error: boolean;
+    };
+
+export type TurnStatus =
+  | { kind: "success" }
+  | { kind: "error"; subtype: string; message: string }
+  | { kind: "max_turns" }
+  | { kind: "max_budget" };
+
+export interface TurnUsage {
+  total_cost_usd: number | null;
+  duration_ms: number;
+  num_turns: number;
+}
+
+export type ProviderRuntimeEvent =
+  | {
+      type: "session_configured";
+      thread_id: string;
+      provider_session_id: string;
+    }
+  | {
+      type: "content_delta";
+      thread_id: string;
+      turn_id: string;
+      delta: ContentDelta;
+    }
+  | {
+      type: "item_completed";
+      thread_id: string;
+      turn_id: string;
+      item: CompletedItem;
+    }
+  | {
+      type: "turn_completed";
+      thread_id: string;
+      turn_id: string;
+      status: TurnStatus;
+      usage: TurnUsage | null;
+    }
+  | {
+      type: "request_opened";
+      thread_id: string;
+      turn_id: string;
+      request_id: string;
+      request_kind: string;
+      payload: unknown;
+    }
+  | {
+      type: "request_resolved";
+      thread_id: string;
+      request_id: string;
+      decision: ApprovalDecision;
+    }
+  | {
+      type: "session_state_changed";
+      thread_id: string;
+      status: SessionStatus;
+    }
+  | {
+      type: "runtime_warning";
+      thread_id: string | null;
+      message: string;
+      original_payload: unknown | null;
+    }
+  | {
+      type: "resume_cursor_updated";
+      thread_id: string;
+      resume_cursor: unknown;
+    };
 
 /** Canonical provider event payload as emitted to the frontend. */
 export interface AgentChatEventPayload {
   thread_id: string;
-  // ProviderRuntimeEvent is a tagged union; we keep it as `unknown`
-  // here so the frontend does not re-declare the full shape until the
-  // chat UI lands.
-  event: unknown;
+  event: ProviderRuntimeEvent;
 }
 
 export const onAgentChatEvent = (

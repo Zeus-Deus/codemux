@@ -71,6 +71,11 @@ pub(crate) struct ClaudeSessionState {
     pub model: Option<String>,
     /// Last-applied permission mode.
     pub permission_mode: Option<String>,
+    /// SDK-assigned session id, learnt from the sidecar's
+    /// `sdk-session-id` notification. `None` until the first SDK
+    /// message arrives. Passed back to the sidecar as `resume` on a
+    /// mid-session restart.
+    pub sdk_session_id: Option<String>,
 }
 
 /// A live Claude session handle.
@@ -81,6 +86,10 @@ pub(crate) struct ClaudeSession {
     pub cwd: PathBuf,
     pub sidecar: Arc<JsonRpcChild>,
     pub state: Mutex<ClaudeSessionState>,
+    /// Broadcast sender used to emit runtime events from methods that
+    /// mutate session status (e.g. `send_turn`, `interrupt`). Background
+    /// tasks receive their own clone via spawn args.
+    event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     /// Signal used to tell background tasks to exit.
     shutdown_tx: broadcast::Sender<()>,
     /// Handles retained so `shutdown()` can abort them.
@@ -189,6 +198,7 @@ impl ClaudeSession {
             pending_approvals: HashMap::new(),
             model: input.model.clone(),
             permission_mode: input.permission_mode.clone(),
+            sdk_session_id: None,
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -196,6 +206,7 @@ impl ClaudeSession {
             cwd: input.cwd,
             sidecar: Arc::clone(&sidecar),
             state,
+            event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             intentionally_closed: Arc::new(RwLock::new(false)),
@@ -281,6 +292,17 @@ impl ClaudeSession {
                 active_turn: turn_id.clone(),
             };
         }
+        // Announce the state flip so subscribers (composer, reducer)
+        // learn that a turn is in flight. Claude's SDK never emits a
+        // text delta for a pure-tool turn, so without this event the
+        // frontend's streaming flag would stay false for the entire
+        // turn and let the user queue a second one.
+        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: self.thread_id.clone(),
+            status: SessionStatus::Running {
+                active_turn: turn_id.clone(),
+            },
+        });
         Ok(turn_id)
     }
 
@@ -308,6 +330,15 @@ impl ClaudeSession {
             .map_err(|e| ProviderError::RpcError {
                 message: format!("interrupt RPC failed: {e}"),
             })?;
+        // Announce Ready before mutating local state so subscribers
+        // never observe `Ready` in the struct with no corresponding
+        // event in flight. The SessionEnded notification that the
+        // sidecar will emit next translates to `Closed`, so this is
+        // the only place Ready is surfaced after an interrupt.
+        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: self.thread_id.clone(),
+            status: SessionStatus::Ready,
+        });
         let mut state = self.state.lock().await;
         state.active_turn = None;
         state.status = SessionStatus::Ready;
@@ -482,6 +513,33 @@ impl ClaudeSession {
     }
 }
 
+/// Replace an empty [`TurnId`] on an event with the session's
+/// currently-active turn id. No-op when the event already carries a
+/// non-empty turn id or when the session has no active turn.
+///
+/// Claude's SDK does not expose per-turn identifiers — every message
+/// carries `session_id` but no `turn_id`. The translator falls back to
+/// an empty string, which breaks every frontend consumer that keys on
+/// turn_id. We stamp the adapter's own turn id (minted in `send_turn`)
+/// onto events as they leave the broadcaster.
+fn stamp_turn_id(event: &mut ProviderRuntimeEvent, active: Option<&TurnId>) {
+    let Some(active) = active else { return };
+    if active.0.is_empty() {
+        return;
+    }
+    match event {
+        ProviderRuntimeEvent::ContentDelta { turn_id, .. }
+        | ProviderRuntimeEvent::ItemCompleted { turn_id, .. }
+        | ProviderRuntimeEvent::TurnCompleted { turn_id, .. }
+        | ProviderRuntimeEvent::RequestOpened { turn_id, .. } => {
+            if turn_id.0.is_empty() {
+                *turn_id = active.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Detect whether a `stop-session` response indicates the sidecar
 /// had already forgotten the thread. Used as a light sanity check.
 #[cfg_attr(not(test), allow(dead_code))]
@@ -539,7 +597,23 @@ fn spawn_notifications_task(
                                     original_payload: Some(note.params),
                                 }]
                             });
-                            for e in events {
+                            // Claude SDK messages carry session_id
+                            // but no per-turn id, so the translator
+                            // emits events with `turn_id = ""`. Stamp
+                            // the session's active turn before
+                            // broadcasting so frontend consumers can
+                            // key merges (delta coalescing) and
+                            // lookups by turn_id. Without this, the
+                            // frontend's find-trailing-assistant
+                            // match-by-turn_id collapses across turns
+                            // and the 2nd turn's deltas overwrite the
+                            // 1st turn's assistant message.
+                            let active_turn = {
+                                let state = session.state.lock().await;
+                                state.active_turn.clone()
+                            };
+                            for mut e in events {
+                                stamp_turn_id(&mut e, active_turn.as_ref());
                                 let _ = event_tx.send(e);
                             }
                         }
@@ -656,6 +730,42 @@ async fn mutate_state_from_notification(
             state
                 .pending_approvals
                 .insert(RequestId(request_id.clone()), tool_input.clone());
+        }
+        SidecarNotification::SdkSessionId { session_id, .. } => {
+            let mut state = session.state.lock().await;
+            state.sdk_session_id = Some(session_id.clone());
+        }
+        SidecarNotification::SdkMessage { message, .. } => {
+            // The SDK's `result` message marks the end of a single
+            // turn. The session stays alive (the prompt queue is
+            // persistent) so `session-ended` does NOT fire between
+            // turns — that notification only appears on full
+            // teardown. Without this hook, `state.active_turn` stays
+            // populated forever and `send_turn` rejects every
+            // subsequent turn with "session has an active turn".
+            // Emit a Ready state change too so any subscriber that
+            // tracks SessionStateChanged as the streaming-flag
+            // authority (parity with Fix 2's Running emission) is
+            // kept in sync.
+            if message.get("type").and_then(|v| v.as_str()) == Some("result") {
+                let already_ready = {
+                    let mut state = session.state.lock().await;
+                    let was_running = state.active_turn.is_some();
+                    state.active_turn = None;
+                    if matches!(state.status, SessionStatus::Running { .. }) {
+                        state.status = SessionStatus::Ready;
+                    }
+                    !was_running
+                };
+                if !already_ready {
+                    let _ = session
+                        .event_tx
+                        .send(ProviderRuntimeEvent::SessionStateChanged {
+                            thread_id: session.thread_id.clone(),
+                            status: SessionStatus::Ready,
+                        });
+                }
+            }
         }
         SidecarNotification::SessionEnded { reason, .. } => {
             let mut state = session.state.lock().await;

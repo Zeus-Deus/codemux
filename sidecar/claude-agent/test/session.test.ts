@@ -81,6 +81,38 @@ test("sendTurn enqueues a user message that the fake query receives", async () =
   await session.close();
 });
 
+test("sdk-session-id notification fires once, with the SDK message's session_id", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  const mkAssistant = (sid: string): SDKMessage =>
+    ({
+      type: "assistant",
+      message: {
+        id: "m1",
+        type: "message",
+        role: "assistant",
+        content: [],
+        model: "claude-opus",
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      parent_tool_use_id: null,
+      uuid: "u-1" as `${string}-${string}-${string}-${string}-${string}`,
+      session_id: sid,
+    }) as unknown as SDKMessage;
+  fake.emit(mkAssistant("sdk-session-abc"));
+  fake.emit(mkAssistant("sdk-session-abc"));
+  fake.emit(mkAssistant("different-id-should-be-ignored"));
+  await new Promise((r) => setTimeout(r, 10));
+  const idEvents = events.filter((e) => e.method === "sdk-session-id");
+  expect(idEvents.length).toBe(1);
+  expect((idEvents[0]?.params as { sessionId: string }).sessionId).toBe(
+    "sdk-session-abc",
+  );
+  await session.close();
+});
+
 test("fake query emitting assistant message produces sdk-message opaquely", async () => {
   const { emit, events } = recordingEmitter();
   const session = new ClaudeSession(minimalInput(), emit);

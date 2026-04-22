@@ -193,6 +193,12 @@ export class ClaudeSession {
   private readonly pendingApprovals: PendingApprovals;
   private closed = false;
   private iterationTask: Promise<void>;
+  /** SDK-assigned session id, observed from the first incoming SDK
+   *  message that carries `session_id`. Forwarded to the Rust side
+   *  as a `sdk-session-id` notification so restarts can resume from
+   *  this session. See T3Code's `context.resumeSessionId = message
+   *  .session_id` pattern (ClaudeAdapter.ts:1255). */
+  private sdkSessionId: string | null = null;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -229,6 +235,7 @@ export class ClaudeSession {
     try {
       for await (const message of this.query) {
         if (this.closed) break;
+        this.observeSdkSessionId(message);
         this.emitter.notification("sdk-message", {
           threadId: this.threadId,
           message,
@@ -257,6 +264,20 @@ export class ClaudeSession {
         });
       }
     }
+  }
+
+  /** Watch incoming SDK messages for a `session_id` field. Emit a
+   *  one-shot `sdk-session-id` notification the first time one is
+   *  observed so the Rust side can store it as a resume cursor. */
+  private observeSdkSessionId(message: SDKMessage): void {
+    if (this.sdkSessionId !== null) return;
+    const maybeId = (message as unknown as { session_id?: unknown }).session_id;
+    if (typeof maybeId !== "string" || maybeId.length === 0) return;
+    this.sdkSessionId = maybeId;
+    this.emitter.notification("sdk-session-id", {
+      threadId: this.threadId,
+      sessionId: maybeId,
+    });
   }
 
   /** Emit side-channel notifications for the two tool uses that

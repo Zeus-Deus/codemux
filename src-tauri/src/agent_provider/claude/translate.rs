@@ -147,6 +147,13 @@ pub fn translate_notification(
                 original_payload: None,
             },
         ],
+        SidecarNotification::SdkSessionId {
+            thread_id: _,
+            session_id,
+        } => vec![ProviderRuntimeEvent::ResumeCursorUpdated {
+            thread_id: thread_id.clone(),
+            resume_cursor: serde_json::json!({ "resume": session_id }),
+        }],
         SidecarNotification::Unknown { method, params } => {
             vec![ProviderRuntimeEvent::RuntimeWarning {
                 thread_id: Some(thread_id.clone()),

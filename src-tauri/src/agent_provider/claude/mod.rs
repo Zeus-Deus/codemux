@@ -178,6 +178,7 @@ impl AgentProvider for ClaudeAgentProvider {
         )
         .await?;
         let session_id = session.provider_session_id.clone();
+        let sdk_session_id = session.state.lock().await.sdk_session_id.clone();
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(thread_id.clone(), Arc::clone(&session));
@@ -187,7 +188,13 @@ impl AgentProvider for ClaudeAgentProvider {
             provider: ProviderKind::Claude,
             session_id: session_id.clone(),
             status: SessionStatus::Ready,
-            resume_cursor: Some(serde_json::json!({ "resume": session_id.0 })),
+            // `resume_cursor` is the SDK's own session_id, not the
+            // runtime thread_id. At start-session time the SDK hasn't
+            // yet assigned one — it arrives on the first SDK message
+            // as `ResumeCursorUpdated`. Return `None` here; the
+            // frontend learns the cursor via the event stream.
+            resume_cursor: sdk_session_id
+                .map(|id| serde_json::json!({ "resume": id })),
         })
     }
 
@@ -272,18 +279,17 @@ impl AgentProvider for ClaudeAgentProvider {
         let sessions = self.collect_sessions().await;
         let mut out = Vec::with_capacity(sessions.len());
         for s in sessions {
-            let status = {
+            let (status, sdk_session_id) = {
                 let state = s.state.lock().await;
-                state.status.clone()
+                (state.status.clone(), state.sdk_session_id.clone())
             };
             out.push(ProviderSession {
                 thread_id: s.thread_id.clone(),
                 provider: ProviderKind::Claude,
                 session_id: s.provider_session_id.clone(),
                 status,
-                resume_cursor: Some(serde_json::json!({
-                    "resume": s.provider_session_id.0,
-                })),
+                resume_cursor: sdk_session_id
+                    .map(|id| serde_json::json!({ "resume": id })),
             });
         }
         Ok(out)

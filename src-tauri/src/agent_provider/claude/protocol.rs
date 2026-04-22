@@ -294,6 +294,13 @@ pub enum SidecarNotification {
         thread_id: String,
         error: SidecarError,
     },
+    /// Sidecar observed the SDK's internal session_id on an incoming
+    /// message. Stable for the life of the session; the adapter
+    /// stashes it as the resume cursor.
+    SdkSessionId {
+        thread_id: String,
+        session_id: String,
+    },
     Unknown {
         method: String,
         params: Value,
@@ -363,6 +370,10 @@ impl SidecarNotification {
                 thread_id: field_string(&params, "threadId"),
                 error: serde_json::from_value(field_value(&params, "error"))
                     .unwrap_or_default(),
+            },
+            "sdk-session-id" => Self::SdkSessionId {
+                thread_id: field_string(&params, "threadId"),
+                session_id: field_string(&params, "sessionId"),
             },
             _ => Self::Unknown {
                 method: method.to_string(),

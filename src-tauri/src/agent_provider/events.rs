@@ -139,4 +139,13 @@ pub enum ProviderRuntimeEvent {
         message: String,
         original_payload: Option<serde_json::Value>,
     },
+    /// A resume cursor became available (or changed). Emitted when
+    /// the provider observes its own internal session identifier for
+    /// the first time, or at subsequent checkpoints where the cursor
+    /// is refreshed. Consumers store this and pass it back in
+    /// [`StartSessionInput::resume_cursor`] on a later restart.
+    ResumeCursorUpdated {
+        thread_id: ThreadId,
+        resume_cursor: serde_json::Value,
+    },
 }

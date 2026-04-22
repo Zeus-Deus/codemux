@@ -193,6 +193,368 @@ async fn starts_session_and_reports_ready() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
+    // Regression: Claude's SDK messages carry session_id but no
+    // per-turn id. The translator defaults to turn_id="" which
+    // confuses frontend consumers that merge assistant deltas by
+    // turn_id — the 2nd turn's deltas end up coalesced into the 1st
+    // turn's assistant message. The adapter must stamp its own
+    // turn_id (from `send_turn`) on outbound events so consecutive
+    // turns stay distinguishable.
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-stamp",
+                "message": {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "reply one"}
+                    }
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-stamp",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": 10,
+                    "num_turns": 1
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-stamp",
+                "message": {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": "reply two"}
+                    }
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-stamp",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_ms": 10,
+                    "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-stamp")).await.unwrap();
+    let mut stream = provider.event_stream();
+
+    // Turn 1
+    let turn1 = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-stamp".into()),
+            text: "first".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap()
+        .turn_id;
+    let mut delta1_turn: Option<TurnId> = None;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::ContentDelta { turn_id, .. } = &ev {
+                delta1_turn = Some(turn_id.clone());
+                break;
+            }
+        }
+    })
+    .await;
+    // Drain the TurnCompleted so turn 2 can start cleanly.
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if matches!(ev, ProviderRuntimeEvent::TurnCompleted { .. }) {
+                break;
+            }
+        }
+    })
+    .await;
+
+    // Turn 2
+    let turn2 = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-stamp".into()),
+            text: "second".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap()
+        .turn_id;
+    let mut delta2_turn: Option<TurnId> = None;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::ContentDelta { turn_id, .. } = &ev {
+                delta2_turn = Some(turn_id.clone());
+                break;
+            }
+        }
+    })
+    .await;
+
+    assert_eq!(
+        delta1_turn.as_ref(),
+        Some(&turn1),
+        "first turn's delta should carry the send_turn turn_id"
+    );
+    assert_eq!(
+        delta2_turn.as_ref(),
+        Some(&turn2),
+        "second turn's delta should carry a fresh send_turn turn_id"
+    );
+    assert_ne!(delta1_turn, delta2_turn, "turn ids must differ across turns");
+
+    provider
+        .stop_session(ThreadId("t-stamp".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_emits_session_state_changed_running_with_matching_turn_id() {
+    // Claude's SDK never emits a text delta for a pure-tool turn, so
+    // the frontend's streaming flag relies on SessionStateChanged
+    // firing right after send_turn succeeds. This test locks down
+    // that behaviour at the adapter boundary.
+    let wrapper = wrapper_with_env(&[]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider
+        .start_session(start_input("t-running"))
+        .await
+        .unwrap();
+    let mut stream = provider.event_stream();
+    let returned_turn = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-running".into()),
+            text: "hello".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_running_with_matching_turn = false;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Running { active_turn },
+                ..
+            } = &ev
+            {
+                assert_eq!(active_turn, &returned_turn.turn_id);
+                saw_running_with_matching_turn = true;
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(saw_running_with_matching_turn);
+    provider
+        .stop_session(ThreadId("t-running".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sdk_session_id_notification_is_translated_into_resume_cursor_updated() {
+    let script = write_script(json!([
+        {
+            "after": "start-session",
+            "delay_ms": 5,
+            "emit": "notification",
+            "method": "sdk-session-id",
+            "params": {
+                "threadId": "t-resume",
+                "sessionId": "deadbeef-1234-5678-90ab-cdef12345678"
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let mut stream = provider.event_stream();
+    provider
+        .start_session(start_input("t-resume"))
+        .await
+        .unwrap();
+
+    let mut saw_cursor = false;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::ResumeCursorUpdated {
+                resume_cursor, ..
+            } = &ev
+            {
+                let resume = resume_cursor.get("resume").and_then(|v| v.as_str());
+                assert_eq!(resume, Some("deadbeef-1234-5678-90ab-cdef12345678"));
+                saw_cursor = true;
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(saw_cursor);
+    provider
+        .stop_session(ThreadId("t-resume".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_emits_session_state_changed_ready() {
+    let wrapper = wrapper_with_env(&[]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider
+        .start_session(start_input("t-int"))
+        .await
+        .unwrap();
+    let returned_turn = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-int".into()),
+            text: "work forever".into(),
+            images: vec![],
+            model_override: None,
+        })
+        .await
+        .unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .interrupt_turn(ThreadId("t-int".into()), Some(returned_turn.turn_id.clone()))
+        .await
+        .unwrap();
+    let mut saw_ready = false;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Ready,
+                ..
+            } = &ev
+            {
+                saw_ready = true;
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(saw_ready);
+    provider.stop_session(ThreadId("t-int".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
+    // Regression: Claude's SDK streaming-queue mode keeps the session
+    // alive across turns, so `session-ended` never fires between
+    // turns. Without per-turn clearing of `state.active_turn`, the
+    // second `send_turn` rejects with "session has an active turn".
+    // Each scripted "result" is what the SDK emits at a turn
+    // boundary; the adapter must treat it as the clear signal.
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-3x",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "turn_id": "sdk-turn-1",
+                    "duration_ms": 10,
+                    "num_turns": 1
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-3x",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "turn_id": "sdk-turn-2",
+                    "duration_ms": 10,
+                    "num_turns": 1
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-3x",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "turn_id": "sdk-turn-3",
+                    "duration_ms": 10,
+                    "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-3x")).await.unwrap();
+    let mut stream = provider.event_stream();
+
+    for i in 1..=3 {
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: ThreadId("t-3x".into()),
+                text: format!("turn {i}"),
+                images: vec![],
+                model_override: None,
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("send_turn {i} failed: {e:?}");
+            });
+        // Wait for the scripted result to flow back and clear
+        // active_turn before the next send_turn.
+        let _ = timeout(Duration::from_secs(3), async {
+            while let Some(ev) = stream.next().await {
+                if let ProviderRuntimeEvent::TurnCompleted { .. } = ev {
+                    break;
+                }
+            }
+        })
+        .await;
+    }
+    provider.stop_session(ThreadId("t-3x".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed() {
     let script = write_script(json!([
         {
