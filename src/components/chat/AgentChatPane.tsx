@@ -42,10 +42,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const [restarting, setRestarting] = useState(false);
   // Optimistic in-flight flag mirroring T3Code's `isSendBusy`
   // (ChatView.tsx:406). Set synchronously on submit so the button
-  // disables BEFORE the backend's Running event round-trips. Without
-  // this, a fast second submit races the event and the backend rejects
-  // with "session has an active turn".
+  // disables BEFORE the backend's Running event round-trips.
+  //
+  // NOTE: `isSending` is useState (drives the render), but rapid-fire
+  // Enter presses in the SAME JS tick don't see the updated state —
+  // the `useCallback` closure captured the pre-set snapshot. T3Code
+  // pairs the state with a `sendInFlightRef.current` synchronous
+  // guard (ChatView.tsx:2458) for exactly this reason: refs mutate
+  // synchronously, so the second call within the same tick sees the
+  // flag the first one just set. We do the same.
   const [isSending, setIsSending] = useState(false);
+  const sendInFlightRef = useRef(false);
 
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
@@ -75,6 +82,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+  const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
   const permissionMode =
     slice?.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
@@ -137,10 +145,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   ]);
 
   const handleSubmit = useCallback(() => {
+    // Synchronous ref check BEFORE any React state reads — closes the
+    // same-tick race that the `useState` guard can't (captured closure
+    // sees the pre-set snapshot when two Enter presses fire in one
+    // tick). Refs mutate synchronously; the second call sees
+    // `sendInFlightRef.current === true` and bails.
+    if (sendInFlightRef.current) return;
     if (!threadId) return;
-    if (isSending) return;
     const text = draft.trim();
     if (!text) return;
+    sendInFlightRef.current = true;
     setIsSending(true);
     appendUserMessage(threadId, text);
     const input = {
@@ -150,18 +164,27 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     };
     agentChatSendTurn(provider, input).catch((err) => {
       toast.error(`Failed to send turn: ${err}`);
+      sendInFlightRef.current = false;
       setIsSending(false);
     });
-  }, [threadId, isSending, draft, provider, appendUserMessage]);
+  }, [threadId, draft, provider, appendUserMessage]);
 
-  // Clear the optimistic send flag once the backend acknowledges the
-  // turn (Running event → streaming=true in the store) OR once the
-  // turn finishes (streaming back to false). Either transition means
-  // the backend now owns the authoritative turn state and the local
-  // guard is no longer needed.
+  // Clear the optimistic send flag the moment the backend
+  // acknowledges the turn via Running (streaming=true in the store).
+  // For the degenerate case where Running and turn_completed batch
+  // into the same render — so `streaming` appears to stay false from
+  // the Composer's perspective — we also clear when `activeTurnId`
+  // transitions non-null (another backend-ack signal) or when the
+  // next render cycle completes without streaming flipping; the
+  // sync-ref flip already prevented duplicate submits so the `ref`
+  // stays correct either way.
   useEffect(() => {
-    if (isSending && streaming) setIsSending(false);
-  }, [isSending, streaming]);
+    if (!isSending) return;
+    if (streaming || activeTurnId != null) {
+      sendInFlightRef.current = false;
+      setIsSending(false);
+    }
+  }, [isSending, streaming, activeTurnId]);
 
   const handleStop = useCallback(() => {
     if (!threadId) return;

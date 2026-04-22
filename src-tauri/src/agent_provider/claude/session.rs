@@ -743,27 +743,20 @@ async fn mutate_state_from_notification(
             // teardown. Without this hook, `state.active_turn` stays
             // populated forever and `send_turn` rejects every
             // subsequent turn with "session has an active turn".
-            // Emit a Ready state change too so any subscriber that
-            // tracks SessionStateChanged as the streaming-flag
-            // authority (parity with Fix 2's Running emission) is
-            // kept in sync.
+            //
+            // We deliberately do NOT emit `SessionStateChanged(Ready)`
+            // from here — `translate_result` (called right after this
+            // function returns) emits `TurnCompleted` which the
+            // frontend reducer already treats as the
+            // streaming=false signal. Emitting both events created
+            // a Ready → TurnCompleted ordering inversion that briefly
+            // re-armed the send button before the turn was visually
+            // complete.
             if message.get("type").and_then(|v| v.as_str()) == Some("result") {
-                let already_ready = {
-                    let mut state = session.state.lock().await;
-                    let was_running = state.active_turn.is_some();
-                    state.active_turn = None;
-                    if matches!(state.status, SessionStatus::Running { .. }) {
-                        state.status = SessionStatus::Ready;
-                    }
-                    !was_running
-                };
-                if !already_ready {
-                    let _ = session
-                        .event_tx
-                        .send(ProviderRuntimeEvent::SessionStateChanged {
-                            thread_id: session.thread_id.clone(),
-                            status: SessionStatus::Ready,
-                        });
+                let mut state = session.state.lock().await;
+                state.active_turn = None;
+                if matches!(state.status, SessionStatus::Running { .. }) {
+                    state.status = SessionStatus::Ready;
                 }
             }
         }
