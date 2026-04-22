@@ -203,11 +203,30 @@ impl ObservabilityStore {
 
 pub fn load_observability_store() -> ObservabilityStore {
     let path = snapshot_path();
-    if let Ok(contents) = fs::read_to_string(&path) {
-        if let Ok(snapshot) = serde_json::from_str::<ObservabilitySnapshot>(&contents) {
-            return ObservabilityStore {
-                inner: Arc::new(Mutex::new(snapshot)),
-            };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<ObservabilitySnapshot>(&contents) {
+            Ok(snapshot) => {
+                return ObservabilityStore {
+                    inner: Arc::new(Mutex::new(snapshot)),
+                };
+            }
+            Err(error) => {
+                // Don't swallow: partial/corrupt JSON silently defaulting to
+                // `enable_agent_chat: false` cost us hours. Log and continue.
+                eprintln!(
+                    "[codemux::observability] Failed to parse {}: {error}. Falling back to defaults.",
+                    path.display()
+                );
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // First run on this machine — nothing to log.
+        }
+        Err(error) => {
+            eprintln!(
+                "[codemux::observability] Failed to read {}: {error}. Falling back to defaults.",
+                path.display()
+            );
         }
     }
 
@@ -264,7 +283,14 @@ fn save_snapshot(snapshot: &ObservabilitySnapshot) -> Result<(), String> {
 }
 
 fn snapshot_path() -> PathBuf {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Anchor to $HOME, not CWD. CWD drifts between build modes (`cargo
+    // tauri dev` launches from `src-tauri/`, the installed binary from
+    // wherever the user invoked it), so a CWD-relative path produces a
+    // different file per launch — feature flags and safety config
+    // appear to "not stick" across restarts. See feature/agent-chat
+    // debugging for the incident.
+    let root = dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     root.join(".codemux").join("observability.json")
 }
 
@@ -287,4 +313,34 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regresses the dev-vs-release drift bug: the old CWD-relative
+    // `snapshot_path` resolved to `src-tauri/.codemux/observability.json`
+    // under `cargo tauri dev` and `$HOME/.codemux/observability.json`
+    // under the installed binary — so edits in one file never affected
+    // the other launch mode. Pinning to `$HOME` keeps both in sync.
+    #[test]
+    #[serial_test::serial]
+    fn snapshot_path_is_home_anchored_regardless_of_cwd() {
+        let home = dirs::home_dir().expect("HOME must be set for this test");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let prev_cwd = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(tmp.path()).expect("set_current_dir to tempdir");
+
+        let path = snapshot_path();
+
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+
+        assert!(
+            path.starts_with(&home),
+            "snapshot_path() = {} should live under HOME = {}",
+            path.display(),
+            home.display()
+        );
+    }
 }
