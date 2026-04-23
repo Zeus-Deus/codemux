@@ -68,7 +68,7 @@ export function useKeyboardShortcuts() {
   return null;
 }
 
-function dispatch(actionId: string, _e: KeyboardEvent): boolean {
+export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
