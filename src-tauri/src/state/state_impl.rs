@@ -15,6 +15,16 @@ const MAX_NOTIFICATIONS: usize = 500;
 pub enum WorkspaceType {
     Standard,
     OpenFlow,
+    /// The Home singleton is being retired across the Stage A→E
+    /// rework. Stage B keeps the variant intact (code paths like
+    /// `get_or_create_home_workspace` still construct it). Stage E
+    /// deletes it and, in the SAME commit, adds `#[serde(alias =
+    /// "home")]` on `Standard` so legacy SQLite rows continue to
+    /// deserialise. Adding the alias now would collide with this
+    /// variant and trigger a `serde_derive`-emitted
+    /// `unreachable_patterns` warning that neither enum- nor
+    /// variant-level `#[allow]` silences — so the alias work is
+    /// deferred to Stage E.
     Home,
 }
 

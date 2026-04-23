@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   pickFolderDialog,
   createEmptyRepo,
@@ -110,7 +111,14 @@ export function NewProjectScreen() {
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspace(wsId);
-      if (!hasWorkspaces) {
+      // Skip the legacy onboarding wizard when the user opted into the
+      // chat-agent + lazy-workspace flow; useEnsureDraftWhenEmpty will
+      // auto-spawn an agent_chat pane on the empty project workspace
+      // instead.
+      const flags = useFeatureFlags.getState();
+      const skipOnboarding =
+        flags.enableAgentChat && flags.enableLazyWorkspaceCreation;
+      if (!hasWorkspaces && !skipOnboarding) {
         useUIStore.getState().setOnboardingProjectDir(projectPath);
       }
       setShowNewProjectScreen(false);

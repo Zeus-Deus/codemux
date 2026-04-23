@@ -7,11 +7,10 @@ import type {
   PermissionModeOption,
 } from "@/tauri/types";
 
-import { ContextWindowPicker } from "./pickers/ContextWindowPicker";
-import { EffortPicker } from "./pickers/EffortPicker";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ProviderPicker } from "./pickers/ProviderPicker";
+import { ReasoningPicker } from "./pickers/ReasoningPicker";
 
 interface Props {
   provider: AgentChatProviderKind;
@@ -26,6 +25,10 @@ interface Props {
   streaming: boolean;
   canSubmit: boolean;
   showProviderPicker: boolean;
+  /** When false, hides the Stop button even while streaming. Used by
+   *  the draft surface to avoid exposing a no-op Stop affordance
+   *  mid-materialise. Defaults to true (existing behaviour). */
+  showStopButton?: boolean;
   onProviderChange: (provider: AgentChatProviderKind) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
@@ -49,6 +52,7 @@ export function ComposerFooter({
   streaming,
   canSubmit,
   showProviderPicker,
+  showStopButton = true,
   onProviderChange,
   onModelChange,
   onPermissionModeChange,
@@ -59,7 +63,7 @@ export function ComposerFooter({
   controlsDisabled,
 }: Props) {
   return (
-    <div className="flex items-center gap-1.5 px-2 pb-2 pt-1">
+    <div className="flex items-center gap-1.5 px-3 pb-2 pt-1">
       <div className="flex flex-wrap items-center gap-1.5 min-w-0">
         {showProviderPicker && (
           <ProviderPicker
@@ -74,18 +78,14 @@ export function ComposerFooter({
           onChange={onModelChange}
           disabled={controlsDisabled}
         />
-        <EffortPicker
+        <ReasoningPicker
           model={activeModel}
-          value={effort}
+          effortValue={effort}
+          contextWindowValue={contextWindow}
           labelMap={effortLabelMap}
           ultrathinkInBodyText={ultrathinkInBodyText}
-          onChange={onEffortChange}
-          disabled={controlsDisabled}
-        />
-        <ContextWindowPicker
-          model={activeModel}
-          value={contextWindow}
-          onChange={onContextWindowChange}
+          onEffortChange={onEffortChange}
+          onContextWindowChange={onContextWindowChange}
           disabled={controlsDisabled}
         />
         <PermissionModePicker
@@ -96,7 +96,7 @@ export function ComposerFooter({
         />
       </div>
       <div className="ml-auto">
-        {streaming ? (
+        {streaming && showStopButton ? (
           <button
             type="button"
             onClick={onStop}
@@ -113,7 +113,7 @@ export function ComposerFooter({
           <button
             type="button"
             onClick={onSubmit}
-            disabled={!canSubmit}
+            disabled={!canSubmit || streaming}
             className={cn(
               "inline-flex h-7 w-7 items-center justify-center rounded-full",
               "bg-foreground text-background hover:bg-foreground/90",

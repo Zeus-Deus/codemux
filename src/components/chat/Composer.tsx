@@ -12,7 +12,6 @@ import { ComposerFooter } from "./ComposerFooter";
 interface Props {
   draft: string;
   cwd: string | null;
-  isHomeWorkspace?: boolean;
   provider: AgentChatProviderKind;
   model: string | null;
   permissionMode: string | null;
@@ -25,6 +24,18 @@ interface Props {
   streaming: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
+  /** When set, renders a muted inline banner above the textarea. Used
+   *  for draft-send retry affordance (§8). `null` hides the banner. */
+  errorMessage?: string | null;
+  /** When false, hides the Stop button even while streaming. The draft
+   *  surface uses this during materialise because there is no live
+   *  session to interrupt. Defaults to true. */
+  showStopButton?: boolean;
+  /** Optional replacement for the Zone 1 strip (the cwd / "Home"
+   *  label above the textarea). The draft surface uses this to thread
+   *  a project picker in when the draft target is Home. Pass `null`
+   *  (or omit) to keep the default cwd label. */
+  zone1Override?: React.ReactNode;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -40,7 +51,6 @@ const MAX_ROWS_APPROX_PX = 32 + 7 * 20; // ~8 rows
 export function Composer({
   draft,
   cwd,
-  isHomeWorkspace = false,
   provider,
   model,
   permissionMode,
@@ -53,6 +63,9 @@ export function Composer({
   streaming,
   sessionReady,
   showProviderPicker,
+  errorMessage = null,
+  showStopButton = true,
+  zone1Override = null,
   onDraftChange,
   onSubmit,
   onStop,
@@ -85,23 +98,30 @@ export function Composer({
   return (
     <div className="w-full px-4 pb-3">
       <div className="mx-auto w-full max-w-2xl">
-        {isHomeWorkspace ? (
-          <div className="px-2 pb-1 text-[11px] text-muted-foreground/70 truncate">
-            Home
-          </div>
-        ) : (
-          cwd && (
-            <div className="px-2 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
-              {cwd}
-            </div>
-          )
-        )}
+        {zone1Override !== null
+          ? <div className="pb-1">{zone1Override}</div>
+          : cwd && (
+              <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
+                {cwd}
+              </div>
+            )}
         <div
           className={cn(
             "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
             "transition-shadow",
           )}
         >
+          {errorMessage && (
+            <div
+              role="alert"
+              className="px-3 pt-2 text-[11px] text-destructive/90 leading-tight"
+            >
+              <span>Send failed: {errorMessage}. </span>
+              <span className="text-muted-foreground/80">
+                Press Enter to retry.
+              </span>
+            </div>
+          )}
           <textarea
             ref={textareaRef}
             value={draft}
@@ -131,6 +151,7 @@ export function Composer({
             streaming={streaming}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
+            showStopButton={showStopButton}
             onProviderChange={onProviderChange}
             onModelChange={onModelChange}
             onPermissionModeChange={onPermissionModeChange}

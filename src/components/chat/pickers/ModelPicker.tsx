@@ -18,46 +18,44 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
 
-// TODO: replace with a backend-driven list once the providers expose a
-// `list_models_for_chat(provider)` equivalent to list_models_for_tool.
-// Hard-coded here so Step 2 can render a working picker without a new
-// Tauri command. Claude ids track `src-tauri/src/agent_provider/claude/
-// protocol.rs` and `src-tauri/src/commands/openflow.rs`. Codex ids
-// match T3Code's `packages/contracts/src/model.ts` (the `codex` CLI
-// itself does not expose a `list-models` command and accepts any
-// string — IDs here are the ones known to resolve server-side).
-const CLAUDE_MODELS = [
-  { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
-  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
-];
+// The model list + default-model / label helpers moved to
+// `@/lib/agent-chat/capability-defaults` in the Stage C Effort-lock
+// fix. This file used to carry a hand-maintained `CLAUDE_MODELS` /
+// `CODEX_MODELS` table that diverged from Rust's
+// `provider-capabilities-store` truth (3 vs 5 Claude models). Re-
+// export the capability-driven helpers here so existing callers
+// (AgentChatPane, chat-draft-store, etc.) don't need an import path
+// change.
+import {
+  capabilityDefaults,
+  defaultModelId,
+  modelsForProvider as modelsForProviderFromCaps,
+  modelLabel as modelLabelFromCaps,
+} from "@/lib/agent-chat/capability-defaults";
 
-const CODEX_MODELS = [
-  { id: "gpt-5.4", label: "GPT-5.4 (Codex)" },
-  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
-  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
-];
-
-export function defaultModelForProvider(
-  provider: AgentChatProviderKind,
-): string {
-  return provider === "claude" ? CLAUDE_MODELS[0].id : CODEX_MODELS[0].id;
-}
+export const defaultModelForProvider = defaultModelId;
 
 export function modelsForProvider(
   provider: AgentChatProviderKind,
 ): Array<{ id: string; label: string }> {
-  return provider === "claude" ? CLAUDE_MODELS : CODEX_MODELS;
+  return modelsForProviderFromCaps(provider);
 }
 
 export function modelLabel(
   provider: AgentChatProviderKind,
   id: string | null,
 ): string {
-  if (!id) return modelsForProvider(provider)[0]?.label ?? "Model";
-  const list = modelsForProvider(provider);
-  return list.find((m) => m.id === id)?.label ?? id;
+  if (!id) {
+    const fallback = modelsForProviderFromCaps(provider)[0]?.label;
+    return fallback ?? "Model";
+  }
+  return modelLabelFromCaps(provider, id);
 }
+
+// Re-exported for call sites that want the full seed (model + effort
+// + contextWindow + permissionMode). Kept here so imports can come
+// from a single picker module.
+export { capabilityDefaults };
 
 interface Props {
   provider: AgentChatProviderKind;

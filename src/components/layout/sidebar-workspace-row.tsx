@@ -31,6 +31,7 @@ import {
 } from "@/tauri/commands";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
@@ -252,6 +253,12 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   });
 
   const handleActivate = () => {
+    // Clear any active draft first so `WorkspaceMain`'s lazy branch
+    // (`lazyEnabled && activeDraftId`) doesn't keep the draft surface
+    // on screen after the backend's active_workspace_id flips. The
+    // draft itself stays in the store — clicking "+" again restores
+    // it with composer text intact via the single-slot rule.
+    useChatDraftStore.getState().setActiveDraft(null);
     activateWorkspace(workspace.workspace_id).catch(console.error);
   };
 

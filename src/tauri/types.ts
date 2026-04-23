@@ -5,6 +5,7 @@ export interface FeatureFlags {
   unstable_browser_automation: boolean;
   unstable_indexing: boolean;
   enable_agent_chat: boolean;
+  enable_lazy_workspace_creation: boolean;
 }
 
 // ── Synced Settings ──
@@ -735,6 +736,12 @@ export interface OrchestratorTriggerResult {
 
 export type LaunchMode = "split_pane" | "new_tab";
 
+/** Mirror of the Rust `PresetKind` enum. `cli` is the classic
+ *  terminal-launch preset; `chat_agent` is a native agent-chat preset
+ *  that spawns an `agent_chat` pane instead of a CLI subprocess. The
+ *  frontend `materializeWithPreset` dispatches on this field. */
+export type PresetKind = "cli" | "chat_agent";
+
 export interface TerminalPreset {
   id: string;
   name: string;
@@ -747,6 +754,9 @@ export interface TerminalPreset {
   is_builtin: boolean;
   auto_run_on_workspace: boolean;
   auto_run_on_new_tab: boolean;
+  /** Defaults to `"cli"` on the Rust side for presets persisted
+   *  before this field existed. */
+  kind: PresetKind;
 }
 
 export interface PresetStoreSnapshot {

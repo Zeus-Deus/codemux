@@ -11,17 +11,25 @@ import {
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
-import { useAppStore } from "@/stores/app-store";
+import {
+  findWorkspaceIdForPane,
+  groupWorkspacesByProject,
+  useAppStore,
+  useHomeDir,
+} from "@/stores/app-store";
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   useAgentChatStore,
 } from "@/stores/agent-chat-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   selectCapabilities,
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import {
+  activateWorkspace,
+  agentChatCreatePane,
   agentChatInterruptTurn,
   agentChatRespondToRequest,
   agentChatSendTurn,
@@ -39,6 +47,10 @@ import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
+import { DerivativeBranchPicker } from "./pickers/DerivativeBranchPicker";
+import { WorktreePicker } from "./pickers/WorktreePicker";
+import { ProjectPicker } from "@/components/overlays/project-picker";
+import { useUIStore } from "@/stores/ui-store";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
 // passes the pane snapshot verbatim; nothing else imports this type.
@@ -76,13 +88,55 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     return ws?.cwd ?? null;
   });
   const cwd = pane.cwd ?? fallbackCwd;
-  const isHomeWorkspace = useAppStore((s) => {
-    if (!s.appState) return false;
-    const ws = s.appState.workspaces.find(
-      (w) => w.workspace_id === s.appState!.active_workspace_id,
+
+  // Stage C race fix: when the pane was just created by
+  // `materializeAndSend` → `agent_chat_create_pane`, its `thread_id`
+  // starts as `null` and only flips to the draft's pre-minted value
+  // once the `agent_chat_start_session` emit lands on the frontend.
+  // If mount happens inside that race window, the original `useState`
+  // initialiser captured `null` and the mount effect below would mint
+  // a fresh thread id + start a duplicate session — orphaning the
+  // slice materialise seeded with the draft's thread id. This
+  // prop-sync effect catches up whenever `pane.thread_id` becomes
+  // non-null after mount.
+  useEffect(() => {
+    if (pane.thread_id && pane.thread_id !== threadId) {
+      setThreadId(pane.thread_id);
+    }
+  }, [pane.thread_id, threadId]);
+
+  // Stage C race fix (belt to the above suspender): if `pane.thread_id`
+  // is still null at mount but a promoted draft claims this workspace,
+  // use the draft's pre-minted thread id directly. Materialize already
+  // started the session server-side — AgentChatPane just subscribes.
+  const workspaceIdForPane = useAppStore((s) =>
+    findWorkspaceIdForPane(s, pane.pane_id),
+  );
+  const promotedDraftThreadId = useChatDraftStore((s) => {
+    if (!workspaceIdForPane) return null;
+    const match = Object.values(s.draftsById).find(
+      (d) => d.promotedTo?.workspaceId === workspaceIdForPane,
     );
-    return ws?.workspace_type === "home";
+    return match?.threadId ?? null;
   });
+  // A pane is "home-rooted" if its workspace's project_root matches
+  // the cached $HOME. This replaces the legacy `workspace_type ===
+  // "home"` check since the Home singleton was retired in Stage B of
+  // the Home rework.
+  const homeDir = useHomeDir();
+  const workspaceProjectRoot = useAppStore((s) => {
+    if (!s.appState) return null;
+    const ws = s.appState.workspaces.find(
+      (w) =>
+        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+    );
+    return ws?.project_root ?? ws?.cwd ?? null;
+  });
+  const isHomeWorkspace =
+    homeDir !== null && workspaceProjectRoot === homeDir;
+  const setShowNewWorkspaceDialog = useUIStore(
+    (s) => s.setShowNewWorkspaceDialog,
+  );
 
   const ensureThread = useAgentChatStore((s) => s.ensureThread);
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
@@ -159,6 +213,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       ensureThread(threadId);
       return;
     }
+    // Stage C race fix: if a promoted draft owns this workspace, it
+    // already started the session under `draft.threadId`. Just adopt
+    // that id — don't spin up a second session.
+    if (promotedDraftThreadId) {
+      setThreadId(promotedDraftThreadId);
+      ensureThread(promotedDraftThreadId);
+      return;
+    }
     if (starting || startAttempted.current) return;
     if (!cwd) return;
     startAttempted.current = true;
@@ -191,6 +253,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       .finally(() => setStarting(false));
   }, [
     threadId,
+    promotedDraftThreadId,
     starting,
     pane.pane_id,
     provider,
@@ -527,11 +590,89 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const sessionReady = threadId != null && !starting && !restarting;
 
+  // Derivative branch — base the "+ New worktree…" inline submit
+  // forks from. Persists for the pane's lifetime; defaults to "main".
+  const [derivativeBranch, setDerivativeBranch] = useState("main");
+
+  // Zone 1 dispatch — Home-rooted panes get a ProjectPicker so the
+  // user can hop to a different project mid-conversation. All other
+  // panes get a WorktreePicker + DerivativeBranchPicker pair scoped to
+  // this pane's project so the user can switch worktrees or create
+  // one inline.
+  const zone1Override = (() => {
+    if (!workspaceProjectRoot) return null;
+    if (isHomeWorkspace) {
+      return (
+        <ProjectPicker
+          value={null}
+          onChange={(targetProjectPath) => {
+            // Clear any active draft — the project switch promotes us
+            // into a real workspace, so the draft surface should not
+            // re-mount on top of it (Stage C Bug-2 pattern).
+            useChatDraftStore.getState().setActiveDraft(null);
+            const snapshot = useAppStore.getState().appState;
+            const groups = snapshot
+              ? groupWorkspacesByProject(snapshot.workspaces, homeDir)
+              : [];
+            const targetGroup = groups.find(
+              (g) => g.projectPath === targetProjectPath,
+            );
+            const target = targetGroup?.workspaces[0];
+            if (target) {
+              activateWorkspace(target.workspace_id).catch(console.error);
+            } else {
+              setShowNewWorkspaceDialog(true, targetProjectPath);
+            }
+          }}
+        />
+      );
+    }
+    return (
+      <div className="flex items-center gap-2">
+        <WorktreePicker
+          mode="active"
+          projectPath={workspaceProjectRoot}
+          currentWorkspaceId={workspaceIdForPane ?? undefined}
+          derivativeBranch={derivativeBranch}
+          onSwitchWorkspace={(wsId) => {
+            // Bug-2 draft-clear pattern: any draft pinned to this slot
+            // would otherwise re-render on top of the activated
+            // workspace's pane.
+            useChatDraftStore.getState().setActiveDraft(null);
+            activateWorkspace(wsId).catch(console.error);
+          }}
+          onWorktreeCreated={async (wsId) => {
+            // Spawn an agent_chat pane first — a freshly created
+            // worktree has zero panes, and `useEnsureDraftWhenEmpty`
+            // would otherwise inject a Home draft over the workspace
+            // view. See DraftChatSurface.handleWorktreeCreated for the
+            // full rationale.
+            try {
+              await agentChatCreatePane(wsId, "claude", null);
+            } catch (err) {
+              console.error(
+                "Failed to create agent_chat pane for new worktree:",
+                err,
+              );
+            }
+            useChatDraftStore.getState().setActiveDraft(null);
+            activateWorkspace(wsId).catch(console.error);
+          }}
+        />
+        <DerivativeBranchPicker
+          projectPath={workspaceProjectRoot}
+          value={derivativeBranch}
+          onChange={setDerivativeBranch}
+        />
+      </div>
+    );
+  })();
+
   const composerEl = (
     <Composer
       draft={draft}
       cwd={cwd}
-      isHomeWorkspace={isHomeWorkspace}
+      zone1Override={zone1Override}
       provider={provider}
       model={model}
       permissionMode={permissionMode}

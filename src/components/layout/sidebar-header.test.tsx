@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, fireEvent } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider } from "@/components/ui/sidebar";
 
@@ -24,14 +24,7 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 
 const setShowDialogMock = vi.fn();
 let enableAgentChatFlag = false;
-let appStateSnapshot: unknown = null;
-
-vi.mock("@/tauri/commands", () => ({
-  getHomeDir: vi.fn().mockResolvedValue("/home/user"),
-  getOrCreateHomeWorkspace: vi.fn().mockResolvedValue("ws-home"),
-  activateWorkspace: vi.fn().mockResolvedValue(undefined),
-  agentChatCreatePane: vi.fn().mockResolvedValue("pane-home"),
-}));
+let enableLazyFlag = false;
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
@@ -45,25 +38,17 @@ vi.mock("@/stores/ui-store", () => ({
 
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: vi.fn((selector) => {
-    const state = { enableAgentChat: enableAgentChatFlag, loaded: true };
+    const state = {
+      enableAgentChat: enableAgentChatFlag,
+      enableLazyWorkspaceCreation: enableLazyFlag,
+      loaded: true,
+    };
     return selector(state);
   }),
 }));
 
-vi.mock("@/stores/app-store", () => ({
-  useAppStore: Object.assign(
-    vi.fn((selector) => selector({ appState: appStateSnapshot })),
-    { getState: () => ({ appState: appStateSnapshot }) },
-  ),
-}));
-
 import { SidebarHeader } from "./sidebar-header";
-import {
-  activateWorkspace,
-  agentChatCreatePane,
-  getHomeDir,
-  getOrCreateHomeWorkspace,
-} from "@/tauri/commands";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 function renderHeader() {
   const utils = render(
@@ -82,122 +67,75 @@ function renderHeader() {
 describe("SidebarHeader + button", () => {
   beforeEach(() => {
     setShowDialogMock.mockClear();
-    vi.mocked(getHomeDir).mockClear();
-    vi.mocked(getHomeDir).mockResolvedValue("/home/user");
-    vi.mocked(getOrCreateHomeWorkspace).mockClear();
-    vi.mocked(getOrCreateHomeWorkspace).mockResolvedValue("ws-home");
-    vi.mocked(activateWorkspace).mockClear();
-    vi.mocked(agentChatCreatePane).mockClear();
     enableAgentChatFlag = false;
-    appStateSnapshot = null;
+    enableLazyFlag = false;
+    useChatDraftStore.setState({
+      draftsById: {},
+      activeHomeDraftId: null,
+      projectDraftIdByPath: {},
+      activeDraftId: null,
+    });
   });
 
-  it("flag OFF + plain click → opens NewWorkspaceDialog", () => {
+  it("agent_chat OFF + plain click → opens NewWorkspaceDialog", () => {
     enableAgentChatFlag = false;
     const { plus } = renderHeader();
     fireEvent.click(plus);
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
-    expect(agentChatCreatePane).not.toHaveBeenCalled();
   });
 
-  it("flag OFF + Shift+click → opens NewWorkspaceDialog", () => {
+  it("agent_chat OFF + Shift+click → opens NewWorkspaceDialog", () => {
     enableAgentChatFlag = false;
     const { plus } = renderHeader();
     fireEvent.click(plus, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
-    expect(agentChatCreatePane).not.toHaveBeenCalled();
   });
 
-  it("flag ON + plain click (no prior chat pane) → gets Home, activates, spawns chat pane", async () => {
+  it("agent_chat ON + lazy OFF + plain click → opens NewWorkspaceDialog (Home singleton retired)", () => {
     enableAgentChatFlag = true;
-    // Home exists but has no chat pane on its active surface.
-    appStateSnapshot = {
-      active_workspace_id: "ws-home",
-      workspaces: [
-        {
-          workspace_id: "ws-home",
-          active_surface_id: "surf-1",
-          surfaces: [
-            {
-              surface_id: "surf-1",
-              root: {
-                kind: "terminal",
-                pane_id: "pane-term",
-                session_id: "sess-1",
-                title: "Terminal",
-              },
-            },
-          ],
-        },
-      ],
-    };
+    enableLazyFlag = false;
     const { plus } = renderHeader();
     fireEvent.click(plus);
-    await vi.waitFor(() => {
-      expect(agentChatCreatePane).toHaveBeenCalled();
-    });
-    expect(getOrCreateHomeWorkspace).toHaveBeenCalled();
-    expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
-    expect(getHomeDir).toHaveBeenCalled();
-    expect(agentChatCreatePane).toHaveBeenCalledWith("ws-home", null, "/home/user");
-    expect(setShowDialogMock).not.toHaveBeenCalled();
+    expect(setShowDialogMock).toHaveBeenCalledWith(true);
+    // Draft path must not fire when lazy flag is off.
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
   });
 
-  it("flag ON + plain click (Home already has chat pane) → activates only, no duplicate pane", async () => {
+  it("agent_chat ON + Shift+click → opens NewWorkspaceDialog (regardless of lazy flag)", () => {
     enableAgentChatFlag = true;
-    appStateSnapshot = {
-      active_workspace_id: "ws-home",
-      workspaces: [
-        {
-          workspace_id: "ws-home",
-          active_surface_id: "surf-1",
-          surfaces: [
-            {
-              surface_id: "surf-1",
-              root: {
-                kind: "agent_chat",
-                pane_id: "pane-chat",
-                title: "Chat",
-                thread_id: null,
-                provider: null,
-                cwd: null,
-              },
-            },
-          ],
-        },
-      ],
-    };
-    const { plus } = renderHeader();
-    fireEvent.click(plus);
-    await vi.waitFor(() => {
-      expect(activateWorkspace).toHaveBeenCalledWith("ws-home");
-    });
-    expect(getOrCreateHomeWorkspace).toHaveBeenCalled();
-    expect(agentChatCreatePane).not.toHaveBeenCalled();
-    expect(setShowDialogMock).not.toHaveBeenCalled();
-  });
-
-  it("flag ON + Shift+click → opens dialog, does NOT call chat commands", () => {
-    enableAgentChatFlag = true;
+    enableLazyFlag = true;
     const { plus } = renderHeader();
     fireEvent.click(plus, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    expect(getOrCreateHomeWorkspace).not.toHaveBeenCalled();
-    expect(agentChatCreatePane).not.toHaveBeenCalled();
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
   });
 
-  it("flag ON + getOrCreateHomeWorkspace rejects → falls back to dialog", async () => {
-    enableAgentChatFlag = true;
-    vi.mocked(getOrCreateHomeWorkspace).mockRejectedValueOnce(new Error("boom"));
-    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    const { plus } = renderHeader();
-    fireEvent.click(plus);
-    await vi.waitFor(() => {
-      expect(setShowDialogMock).toHaveBeenCalledWith(true);
+  describe("lazy workspace creation", () => {
+    it("lazy ON + plain click → creates home draft, sets it active, no dialog", () => {
+      enableAgentChatFlag = true;
+      enableLazyFlag = true;
+      const { plus } = renderHeader();
+      fireEvent.click(plus);
+
+      const state = useChatDraftStore.getState();
+      expect(state.activeHomeDraftId).not.toBeNull();
+      expect(state.activeDraftId).toBe(state.activeHomeDraftId);
+      const draft = state.draftsById[state.activeHomeDraftId!];
+      expect(draft.target).toEqual({ kind: "home" });
+      expect(setShowDialogMock).not.toHaveBeenCalled();
     });
-    expect(agentChatCreatePane).not.toHaveBeenCalled();
-    errSpy.mockRestore();
+
+    it("lazy ON + plain click reuses the existing home draft on a second click", () => {
+      enableAgentChatFlag = true;
+      enableLazyFlag = true;
+      const { plus } = renderHeader();
+      fireEvent.click(plus);
+      const firstId = useChatDraftStore.getState().activeHomeDraftId;
+      fireEvent.click(plus);
+      expect(useChatDraftStore.getState().activeHomeDraftId).toBe(firstId);
+      expect(
+        Object.keys(useChatDraftStore.getState().draftsById),
+      ).toHaveLength(1);
+    });
   });
 });

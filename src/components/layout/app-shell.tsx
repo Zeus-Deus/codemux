@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { useAppStore } from "@/stores/app-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
@@ -22,6 +24,11 @@ export function AppShell() {
   const hasWorkspaces = useAppStore(
     (s) => (s.appState?.workspaces.length ?? 0) > 0,
   );
+  // Under lazy creation, a client-side draft is enough to keep the
+  // main app shell alive even before any workspace exists. The draft
+  // surface is rendered by WorkspaceMain.
+  const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const showSettings = useUIStore((s) => s.showSettings);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
@@ -58,8 +65,10 @@ export function AppShell() {
     return <NewProjectScreen />;
   }
 
-  // Full-screen empty state — no sidebar, no title bar
-  if (!hasWorkspaces) {
+  // Full-screen empty state — no sidebar, no title bar. Bypassed when
+  // a lazy-creation draft is active, so the draft surface can render
+  // inside the normal app shell (sidebar, title bar, WorkspaceMain).
+  if (!hasWorkspaces && !(lazyEnabled && hasActiveDraft)) {
     return <EmptyState />;
   }
 

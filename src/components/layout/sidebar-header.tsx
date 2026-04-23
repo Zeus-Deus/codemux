@@ -5,27 +5,40 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { openHomeChat } from "@/lib/home-chat";
 import { Plus } from "lucide-react";
 
 export function SidebarHeader() {
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const enableLazyWorkspaceCreation = useFeatureFlags(
+    (s) => s.enableLazyWorkspaceCreation,
+  );
 
-  const handlePlusClick = async (e: React.MouseEvent) => {
+  const handlePlusClick = (e: React.MouseEvent) => {
+    // Shift+click or agent-chat flag off → open NewWorkspaceDialog.
     if (e.shiftKey || !enableAgentChat) {
       setShowDialog(true);
       return;
     }
 
-    try {
-      await openHomeChat();
-    } catch (err) {
-      console.error("[sidebar-header] failed to open home chat:", err);
-      setShowDialog(true);
+    // Lazy-creation path: open (or reuse) the single-slot Home draft
+    // without materialising a workspace. The draft surface renders via
+    // WorkspaceMain's lazy branch.
+    if (enableLazyWorkspaceCreation) {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateHomeDraft();
+      store.setActiveDraft(draft.draftId);
+      return;
     }
+
+    // Legacy path (agent_chat on, lazy off): the old `openHomeChat`
+    // helper has been removed along with the Home singleton. There's
+    // no sensible eager "create a Home workspace" path anymore, so
+    // plain-click falls back to the same dialog as Shift+click.
+    setShowDialog(true);
   };
 
   return (
@@ -46,9 +59,7 @@ export function SidebarHeader() {
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-          {enableAgentChat
-            ? "New chat at home · Shift+click for new workspace"
-            : "New workspace"}
+          New workspace
         </TooltipContent>
       </Tooltip>
       <SidebarSeparator />

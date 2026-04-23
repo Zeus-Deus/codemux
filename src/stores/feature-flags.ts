@@ -7,6 +7,10 @@ import type { FeatureFlags } from "@/tauri/types";
 interface FeatureFlagsStore {
   /** Whether the agent-chat pane kind and provider registry are enabled. */
   enableAgentChat: boolean;
+  /** Whether sidebar-plus and boot-into-Home open a client-side chat
+   *  draft instead of eagerly materialising a workspace. The draft is
+   *  promoted to a real workspace on first message send. */
+  enableLazyWorkspaceCreation: boolean;
   /** True once the initial Tauri call has resolved. Consumers should
    *  guard against rendering flag-dependent affordances until `loaded`
    *  flips, so a flash-of-content doesn't appear on startup. */
@@ -19,19 +23,21 @@ interface FeatureFlagsStore {
 
 export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
   enableAgentChat: false,
+  enableLazyWorkspaceCreation: false,
   loaded: false,
   refresh: async () => {
     try {
       const flags = await invoke<FeatureFlags>("get_feature_flags");
       set({
         enableAgentChat: flags.enable_agent_chat,
+        enableLazyWorkspaceCreation: flags.enable_lazy_workspace_creation,
         loaded: true,
       });
     } catch (err) {
       console.error("Failed to fetch feature flags:", err);
       // Fall back to defaults-off on error so guards stay closed,
       // but mark loaded so consumers can stop waiting.
-      set({ enableAgentChat: false, loaded: true });
+      set({ enableAgentChat: false, enableLazyWorkspaceCreation: false, loaded: true });
     }
   },
 }));

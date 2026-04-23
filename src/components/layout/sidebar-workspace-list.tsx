@@ -3,7 +3,11 @@ import {
   SidebarGroup,
   SidebarGroupContent,
 } from "@/components/ui/sidebar";
-import { useProjectGroupedWorkspaces, useAppStore } from "@/stores/app-store";
+import {
+  useAppStore,
+  useHomeDir,
+  useProjectGroupedWorkspaces,
+} from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
@@ -21,12 +25,12 @@ interface DropTarget {
 
 export function SidebarWorkspaceList() {
   const appState = useAppStore((s) => s.appState);
-  // Home is rendered separately in SidebarHomeRow and must not appear
-  // again inside a project group.
-  const nonHomeWorkspaces = (appState?.workspaces ?? []).filter(
-    (w) => w.workspace_type !== "home",
-  );
-  const projectGroups = useProjectGroupedWorkspaces(nonHomeWorkspaces);
+  const allWorkspaces = appState?.workspaces ?? [];
+  // Home-rooted workspaces flow through the same grouping pipeline as
+  // any other project now; `groupWorkspacesByProject` labels them as
+  // "Home" when their `project_root` matches the cached $HOME.
+  const homeDir = useHomeDir();
+  const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);

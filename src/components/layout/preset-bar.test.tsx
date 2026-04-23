@@ -13,6 +13,9 @@ const mockGetProjectScripts = vi.fn().mockResolvedValue(null);
 const mockGetWorkspaceConfig = vi.fn().mockResolvedValue(null);
 const mockRunProjectDevCommand = vi.fn().mockResolvedValue(undefined);
 
+const mockAgentChatCreatePane = vi.fn().mockResolvedValue("pane-ca");
+const mockMaterializeWithPreset = vi.fn();
+
 vi.mock("@/tauri/commands", () => ({
   getPresets: (...args: unknown[]) => mockGetPresets(...args),
   applyPreset: (...args: unknown[]) => mockApplyPreset(...args),
@@ -20,6 +23,11 @@ vi.mock("@/tauri/commands", () => ({
   getProjectScripts: (...args: unknown[]) => mockGetProjectScripts(...args),
   getWorkspaceConfig: (...args: unknown[]) => mockGetWorkspaceConfig(...args),
   runProjectDevCommand: (...args: unknown[]) => mockRunProjectDevCommand(...args),
+  agentChatCreatePane: (...args: unknown[]) => mockAgentChatCreatePane(...args),
+}));
+
+vi.mock("@/lib/agent-chat/materialize", () => ({
+  materializeWithPreset: (...args: unknown[]) => mockMaterializeWithPreset(...args),
 }));
 
 vi.mock("@/tauri/events", () => ({
@@ -56,6 +64,10 @@ vi.mock("@/stores/app-store", () => ({
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { PresetBar } from "./preset-bar";
 import { toast as mockToast } from "@/lib/toast";
+import {
+  useChatDraftStore,
+  type DraftId,
+} from "@/stores/chat-draft-store";
 
 function flushPromises() {
   return act(() => new Promise((r) => setTimeout(r, 0)));
@@ -74,6 +86,7 @@ function makePreset(overrides: Partial<TerminalPreset> = {}): TerminalPreset {
     is_builtin: true,
     auto_run_on_workspace: false,
     auto_run_on_new_tab: false,
+    kind: "cli",
     ...overrides,
   };
 }
@@ -190,5 +203,269 @@ describe("PresetBar — preset failure feedback", () => {
     await flushPromises();
 
     expect(mockApplyPreset).toHaveBeenCalledWith("ws-1", "claude-code", "split_pane");
+  });
+});
+
+// ── Draft mode + CLI-on-Home gating (Task 7 + Task 7b) ──
+
+function resetDraftStore() {
+  useChatDraftStore.setState({
+    draftsById: {},
+    activeHomeDraftId: null,
+    projectDraftIdByPath: {},
+    activeDraftId: null,
+  });
+}
+
+function renderDraftPresetBar(options: {
+  presets: TerminalPreset[];
+  draftId: DraftId;
+  disabled?: boolean;
+}) {
+  return render(
+    // `delayDuration={0}` short-circuits Radix's default hover delay
+    // so `userEvent.hover` + `findByText` can settle within the test
+    // timeout. Matches the pattern used elsewhere in the app-shell
+    // overlay tests.
+    <TooltipProvider delayDuration={0}>
+      <PresetBar
+        workspaceId={null}
+        draftId={options.draftId}
+        disabled={options.disabled}
+      />
+    </TooltipProvider>,
+  );
+}
+
+describe("PresetBar — draft mode dispatch", () => {
+  beforeEach(() => {
+    resetDraftStore();
+    mockMaterializeWithPreset.mockReset();
+    mockMaterializeWithPreset.mockResolvedValue({
+      success: true,
+      workspaceId: "ws-new",
+      paneId: "pane-new",
+      threadId: "tid-new",
+    });
+  });
+
+  it("draft mode + click routes through materializeWithPreset with the draft's composer text", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore
+      .getState()
+      .updateDraftTarget(draft.draftId, {
+        kind: "project",
+        projectPath: "/p",
+      });
+    useChatDraftStore.getState().updateDraftInput(draft.draftId, "type this");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderDraftPresetBar({ presets: [chatAgent], draftId: draft.draftId });
+    await flushPromises();
+
+    const button = screen.getByRole("button", { name: /chat agent/i });
+    await userEvent.click(button);
+    await flushPromises();
+
+    expect(mockMaterializeWithPreset).toHaveBeenCalledTimes(1);
+    const [passedDraft, passedPreset, passedPrompt] =
+      mockMaterializeWithPreset.mock.calls[0];
+    expect(passedDraft.draftId).toBe(draft.draftId);
+    expect(passedPreset.id).toBe("builtin-chat-agent");
+    expect(passedPrompt).toBe("type this");
+    // Workspace-mode dispatch must not fire in draft mode.
+    expect(mockApplyPreset).not.toHaveBeenCalled();
+    expect(mockAgentChatCreatePane).not.toHaveBeenCalled();
+  });
+
+  it("on successful materialize the active draft is cleared", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore
+      .getState()
+      .updateDraftTarget(draft.draftId, {
+        kind: "project",
+        projectPath: "/p",
+      });
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderDraftPresetBar({ presets: [chatAgent], draftId: draft.draftId });
+    await flushPromises();
+
+    await userEvent.click(screen.getByRole("button", { name: /chat agent/i }));
+    await flushPromises();
+
+    expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+  });
+});
+
+describe("PresetBar — Home-draft full gating (Task 7b revised)", () => {
+  beforeEach(() => {
+    resetDraftStore();
+    mockMaterializeWithPreset.mockReset();
+    mockMaterializeWithPreset.mockResolvedValue({
+      success: true,
+      workspaceId: "ws-new",
+      paneId: "pane-new",
+      threadId: "tid-new",
+    });
+  });
+
+  it("Home draft + CLI preset → button is disabled and click is a no-op", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const cli = makePreset({ kind: "cli" });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cli]));
+
+    renderDraftPresetBar({ presets: [cli], draftId: draft.draftId });
+    await flushPromises();
+
+    const button = screen.getByRole("button", { name: /claude code/i });
+    expect(button).toBeDisabled();
+    // userEvent refuses to click disabled controls by default, matching
+    // the real browser semantics. Firing the low-level event bypasses
+    // pointer-capture checks and confirms our handler still bails.
+    fireEvent.click(button);
+    await flushPromises();
+    expect(mockMaterializeWithPreset).not.toHaveBeenCalled();
+    expect(mockApplyPreset).not.toHaveBeenCalled();
+  });
+
+  it("Home draft + Chat Agent preset → button is ALSO disabled (prevents duplicate chat)", async () => {
+    const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderDraftPresetBar({ presets: [chatAgent], draftId: draft.draftId });
+    await flushPromises();
+
+    const button = screen.getByRole("button", { name: /chat agent/i });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    await flushPromises();
+    // No dispatch of any kind — the user is already in a chat draft.
+    expect(mockMaterializeWithPreset).not.toHaveBeenCalled();
+    expect(mockApplyPreset).not.toHaveBeenCalled();
+    expect(mockAgentChatCreatePane).not.toHaveBeenCalled();
+  });
+
+  it("Project draft + Chat Agent preset → enabled (regression)", async () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/foo");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderDraftPresetBar({ presets: [chatAgent], draftId: draft.draftId });
+    await flushPromises();
+
+    const button = screen.getByRole("button", { name: /chat agent/i });
+    expect(button).not.toBeDisabled();
+    await userEvent.click(button);
+    await flushPromises();
+
+    expect(mockMaterializeWithPreset).toHaveBeenCalledTimes(1);
+  });
+
+  it("Project draft + CLI preset → button is enabled", async () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/foo");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const cli = makePreset({ kind: "cli" });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cli]));
+
+    renderDraftPresetBar({ presets: [cli], draftId: draft.draftId });
+    await flushPromises();
+
+    expect(screen.getByRole("button", { name: /claude code/i })).not.toBeDisabled();
+  });
+
+  it("disabled prop (materializing) → every preset button is disabled", async () => {
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateProjectDraft("/projects/foo");
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const cli = makePreset({ id: "cli-1", name: "Claude Code", kind: "cli" });
+    const chat = makePreset({
+      id: "chat-1",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cli, chat]));
+
+    renderDraftPresetBar({
+      presets: [cli, chat],
+      draftId: draft.draftId,
+      disabled: true,
+    });
+    await flushPromises();
+
+    expect(screen.getByRole("button", { name: /claude code/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /chat agent/i })).toBeDisabled();
+  });
+});
+
+describe("PresetBar — ChatAgent on a real workspace", () => {
+  beforeEach(() => {
+    resetDraftStore();
+    mockAgentChatCreatePane.mockClear().mockResolvedValue("pane-ca");
+  });
+
+  it("workspace-mode click on Chat Agent spawns a sibling agent_chat pane", async () => {
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderPresetBar("ws-real");
+    await flushPromises();
+
+    await userEvent.click(screen.getByRole("button", { name: /chat agent/i }));
+    await flushPromises();
+
+    expect(mockAgentChatCreatePane).toHaveBeenCalledWith(
+      "ws-real",
+      "claude",
+      null,
+    );
+    // The CLI dispatch path must not fire for a ChatAgent preset.
+    expect(mockApplyPreset).not.toHaveBeenCalled();
   });
 });

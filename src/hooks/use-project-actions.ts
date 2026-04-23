@@ -9,7 +9,19 @@ import {
   activateWorkspace,
 } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+
+/** True when the user opted into the chat-agent + lazy-workspace-
+ *  creation flow, in which case the first-project legacy onboarding
+ *  wizard must not fire — `useEnsureDraftWhenEmpty` will auto-spawn an
+ *  agent_chat pane on the freshly created empty project workspace
+ *  instead, giving the user the chat UI directly. Read synchronously
+ *  from `getState()` so action callbacks don't need to subscribe. */
+function shouldSkipOnboarding(): boolean {
+  const flags = useFeatureFlags.getState();
+  return flags.enableAgentChat && flags.enableLazyWorkspaceCreation;
+}
 
 interface OpenProjectResult {
   success: boolean;
@@ -42,7 +54,7 @@ export function useProjectActions() {
     const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
     const wsId = await createEmptyWorkspace(folder);
     await activateWorkspace(wsId);
-    if (!hasWorkspaces) {
+    if (!hasWorkspaces && !shouldSkipOnboarding()) {
       useUIStore.getState().setOnboardingProjectDir(folder);
     }
 
@@ -62,7 +74,7 @@ export function useProjectActions() {
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(clonedPath);
       await activateWorkspace(wsId);
-      if (!hasWorkspaces) {
+      if (!hasWorkspaces && !shouldSkipOnboarding()) {
         useUIStore.getState().setOnboardingProjectDir(clonedPath);
       }
 

@@ -12,6 +12,77 @@ vi.mock("@/assets/preset-icons/codex.svg", () => ({
   default: "/mock/codex.svg",
 }));
 
+// `ModelPicker` now reads its model list from
+// `provider-capabilities-store` via `capability-defaults.ts`. Stub a
+// minimal payload that mirrors the Rust `capabilities.rs` data the
+// real store would return, so the test's label assertions keep
+// matching reality.
+const CLAUDE_MODELS_STUB = [
+  { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
+  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+];
+const CODEX_MODELS_STUB = [
+  { id: "gpt-5.4", label: "GPT-5.4 (Codex)" },
+  { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
+  { id: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
+];
+const capsState = {
+  claude: {
+    models: CLAUDE_MODELS_STUB.map((m) => ({
+      id: m.id,
+      label: m.label,
+      description: null,
+      effort_levels: [],
+      default_effort: null,
+      prompt_injected_effort_levels: [],
+      context_window_options: [],
+      supports_adaptive_thinking: false,
+      supports_thinking_toggle: false,
+      supports_fast_mode: false,
+    })),
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: null,
+    permission_granularity: "per_session",
+  },
+  codex: {
+    models: CODEX_MODELS_STUB.map((m) => ({
+      id: m.id,
+      label: m.label,
+      description: null,
+      effort_levels: [],
+      default_effort: null,
+      prompt_injected_effort_levels: [],
+      context_window_options: [],
+      supports_adaptive_thinking: false,
+      supports_thinking_toggle: false,
+      supports_fast_mode: false,
+    })),
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: null,
+    permission_granularity: "per_session",
+  },
+  claudeError: null,
+  codexError: null,
+  loaded: true,
+};
+
+vi.mock("@/stores/provider-capabilities-store", () => ({
+  useProviderCapabilities: Object.assign(
+    vi.fn((selector: (s: unknown) => unknown) => selector(capsState)),
+    { getState: () => capsState },
+  ),
+  selectCapabilities: (
+    state: typeof capsState,
+    provider: "claude" | "codex",
+  ) => state[provider],
+  selectModel: () => null,
+}));
+
 afterEach(() => {
   cleanup();
 });

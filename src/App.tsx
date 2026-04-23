@@ -7,11 +7,13 @@ import { AppShell } from "@/components/layout/app-shell";
 import { Toaster } from "@/components/ui/sonner";
 import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
+import { useAppStore } from "@/stores/app-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { useFeatureFlagsInit } from "@/stores/feature-flags";
 import { useProviderCapabilitiesInit } from "@/stores/provider-capabilities-store";
-import { useBootIntoHome } from "@/hooks/use-boot-into-home";
+import { useEnsureDraftWhenEmpty } from "@/hooks/use-ensure-draft-when-empty";
+import { getHomeDir } from "@/tauri/commands";
 
 function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
@@ -29,13 +31,28 @@ function App() {
   // Listen for auth state changes from Tauri (OAuth callback, token expiry)
   useAuthEvents();
 
+  // Cache $HOME at App mount. Downstream selectors (project-group
+  // labelling, future Step-5 home-rooted chat detection) compare
+  // project_root against this value — without it, home-rooted
+  // workspaces render under the literal path basename.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const homeDir = await getHomeDir();
+        useAppStore.getState().setHomeDir(homeDir);
+      } catch (err) {
+        console.error("Failed to cache home dir:", err);
+      }
+    })();
+  }, []);
+
   // Only initialize app state and shortcuts when authenticated
   useAppStateInit(!isAuthenticated);
   useKeyboardShortcuts();
   useScrollbackSerializer();
   useFeatureFlagsInit();
   useProviderCapabilitiesInit();
-  useBootIntoHome();
+  useEnsureDraftWhenEmpty();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

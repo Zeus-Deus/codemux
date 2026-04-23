@@ -5,8 +5,8 @@ use tauri::State;
 
 use crate::database::DatabaseStore;
 use crate::presets::{
-    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetStoreSnapshot,
-    PresetStoreState, TerminalPreset,
+    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetKind,
+    PresetStoreSnapshot, PresetStoreState, TerminalPreset,
 };
 use crate::state::AppStateStore;
 use crate::terminal;
@@ -43,6 +43,9 @@ pub fn create_preset(
         is_builtin: false,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
+        // User-created presets default to CLI. If we later add UI
+        // for creating ChatAgent presets, plumb a `kind` arg through.
+        kind: PresetKind::Cli,
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,6 +207,19 @@ pub fn apply_preset(
         .ok_or_else(|| format!("Preset not found: {preset_id}"))?
         .clone();
     drop(store);
+
+    // ChatAgent presets are dispatched by the frontend via
+    // `agentChatCreatePane` + `agentChatStartSession` + `agentChatSendTurn`
+    // (see `src/lib/agent-chat/materialize.ts::materializeWithPreset`).
+    // Routing one through the terminal path would fall into the empty-
+    // commands Shell branch below and spawn a blank shell, so short-
+    // circuit here with an explicit error.
+    if matches!(preset.kind, PresetKind::ChatAgent) {
+        return Err(format!(
+            "apply_preset cannot launch ChatAgent preset `{}`; dispatch via the agent-chat API instead.",
+            preset.id
+        ));
+    }
 
     // Check that all command binaries exist before creating any tabs/splits.
     for cmd in &preset.commands {

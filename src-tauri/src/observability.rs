@@ -45,6 +45,16 @@ pub struct FeatureFlags {
     /// `.codemux/observability.json` to dogfood the scaffolding.
     #[serde(default)]
     pub enable_agent_chat: bool,
+    /// Gates the lazy-workspace-creation path: sidebar-plus and
+    /// boot-into-Home open a client-side chat draft instead of
+    /// eagerly materialising a workspace. The draft is promoted to a
+    /// real workspace on first message send.
+    ///
+    /// Defaults to `false`: today's eager flow is preserved. Flip to
+    /// `true` via `update_feature_flags` or by editing
+    /// `.codemux/observability.json`.
+    #[serde(default)]
+    pub enable_lazy_workspace_creation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -247,6 +257,7 @@ fn default_snapshot() -> ObservabilitySnapshot {
             unstable_browser_automation: true,
             unstable_indexing: true,
             enable_agent_chat: false,
+            enable_lazy_workspace_creation: false,
         },
         permission_policy: PermissionPolicy {
             require_risky_action_approval: true,

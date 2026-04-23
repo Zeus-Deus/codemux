@@ -16,19 +16,25 @@ use crate::agent_provider::{
     ProviderChatCapabilities,
 };
 
-fn ctx_200k_default() -> ContextWindowOption {
+// Highest-is-default rule: when a model exposes multiple context
+// windows, the largest is flagged as the default. Users who want the
+// smaller window still get a visible picker pill they can click to
+// switch. This flipped from "200k is default" in the Stage C
+// Context-Window-visibility pass — previously the picker hid itself
+// on the default, so the 1M option was effectively undiscoverable.
+fn ctx_200k() -> ContextWindowOption {
     ContextWindowOption {
         value: "200k".into(),
         label: "200k".into(),
-        is_default: true,
+        is_default: false,
     }
 }
 
-fn ctx_1m() -> ContextWindowOption {
+fn ctx_1m_default() -> ContextWindowOption {
     ContextWindowOption {
         value: "1m".into(),
         label: "1M".into(),
-        is_default: false,
+        is_default: true,
     }
 }
 
@@ -63,7 +69,7 @@ fn models() -> Vec<ChatModelInfo> {
             ],
             default_effort: Some("xhigh".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
-            context_window_options: vec![ctx_200k_default(), ctx_1m()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
@@ -81,7 +87,7 @@ fn models() -> Vec<ChatModelInfo> {
             ],
             default_effort: Some("high".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
-            context_window_options: vec![ctx_200k_default(), ctx_1m()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: true,
@@ -112,7 +118,7 @@ fn models() -> Vec<ChatModelInfo> {
             effort_levels: vec!["low".into(), "medium".into(), "high".into()],
             default_effort: Some("high".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
-            context_window_options: vec![ctx_200k_default(), ctx_1m()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
@@ -210,8 +216,58 @@ mod tests {
             .iter()
             .find(|o| o.is_default)
             .unwrap();
-        assert_eq!(default_ctx.value, "200k");
+        // Highest-is-default rule (Stage C follow-up): the larger
+        // context window is now flagged as the default across every
+        // multi-option Claude model.
+        assert_eq!(default_ctx.value, "1m");
         assert_eq!(opus.default_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn every_multi_option_model_defaults_to_the_largest_context_window() {
+        // "Largest" here is a lexical shortcut: "1m" > "200k" in our
+        // fixed two-option universe. If a third option lands later
+        // (e.g. "2m"), update this ordering helper to sort by
+        // numeric bytes.
+        fn size_rank(value: &str) -> u32 {
+            match value {
+                "200k" => 200_000,
+                "1m" => 1_000_000,
+                other => other
+                    .trim_end_matches(|c: char| !c.is_ascii_digit())
+                    .parse()
+                    .unwrap_or(0),
+            }
+        }
+
+        let caps = claude_fallback_capabilities();
+        for model in &caps.models {
+            if model.context_window_options.len() <= 1 {
+                continue;
+            }
+            let default_option = model
+                .context_window_options
+                .iter()
+                .find(|o| o.is_default)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "model {} has multiple context windows but no default",
+                        model.id
+                    )
+                });
+            let max_rank = model
+                .context_window_options
+                .iter()
+                .map(|o| size_rank(&o.value))
+                .max()
+                .unwrap();
+            assert_eq!(
+                size_rank(&default_option.value),
+                max_rank,
+                "model {} default context window must be the largest option",
+                model.id,
+            );
+        }
     }
 
     #[test]
