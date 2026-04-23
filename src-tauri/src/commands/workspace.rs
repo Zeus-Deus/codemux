@@ -22,7 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, State};
 
-fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
+/// Read fresh git branch / ahead-behind / diff-stat / changed-file counts for
+/// `repo_path` and write them into the workspace snapshot. Crash-proof:
+/// `git_branch_info` and friends return defaults for non-git directories,
+/// detached HEAD, and corrupted `.git` directories. `pub(crate)` so the
+/// periodic refresh loop in `lib.rs` can reuse this instead of duplicating
+/// the extraction logic.
+pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
     let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
@@ -525,6 +531,23 @@ pub fn activate_workspace(
     workspace_id: String,
 ) -> Result<(), String> {
     if state.activate_workspace(&workspace_id) {
+        // Refresh git info synchronously before emitting state so the sidebar
+        // sees the current HEAD immediately on click, not up to 5s later when
+        // the background polling loop next ticks. Cheap (~3 git subprocesses,
+        // ~20ms typical); `git_branch_info` handles non-git/detached/corrupted
+        // repos without panicking.
+        let cwd = {
+            let snapshot = state.snapshot();
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+                .map(|w| w.cwd.clone())
+        };
+        if let Some(cwd) = cwd {
+            populate_git_info(&state, &workspace_id, Path::new(&cwd));
+        }
+
         // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
         // sessions for the workspace that was active at last close. Sessions
         // for any other workspace stay on disk-only until the user activates
