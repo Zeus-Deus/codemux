@@ -496,14 +496,22 @@ pub fn run() {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-                    // Only poll when the user can see the sidebar. `is_focused`
-                    // returns Err if the window is closing; treat that as
-                    // unfocused and skip.
-                    let window_focused = git_handle
+                    // Pause polling only when the sidebar is genuinely not
+                    // on screen. `is_focused()` would wrongly pause when the
+                    // window is visible on another Hyprland/KDE/Gnome
+                    // workspace — users there still expect the sidebar to
+                    // reflect live branch state. `is_minimized()` returning
+                    // Err defaults to "treat as minimized" so we skip the
+                    // tick rather than busy-loop on a broken window handle.
+                    let window_active = git_handle
                         .get_webview_window("main")
-                        .and_then(|w| w.is_focused().ok())
+                        .map(|w| {
+                            let visible = w.is_visible().unwrap_or(false);
+                            let minimized = w.is_minimized().unwrap_or(true);
+                            visible && !minimized
+                        })
                         .unwrap_or(false);
-                    if !window_focused {
+                    if !window_active {
                         continue;
                     }
 

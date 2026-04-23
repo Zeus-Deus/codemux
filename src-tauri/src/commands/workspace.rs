@@ -531,11 +531,15 @@ pub fn activate_workspace(
     workspace_id: String,
 ) -> Result<(), String> {
     if state.activate_workspace(&workspace_id) {
-        // Refresh git info synchronously before emitting state so the sidebar
-        // sees the current HEAD immediately on click, not up to 5s later when
-        // the background polling loop next ticks. Cheap (~3 git subprocesses,
-        // ~20ms typical); `git_branch_info` handles non-git/detached/corrupted
-        // repos without panicking.
+        // Kick off git refresh in a background thread — don't block the
+        // activate click. `populate_git_info` runs 5-8 git subprocesses
+        // (branch + upstream + ahead/behind + two diff-stat calls + status
+        // with duplicated `diff --numstat`), which can hit 100-300ms on a
+        // cold filesystem cache or a large repo. The 5s polling loop
+        // reconciles, so worst case the sidebar shows slightly stale branch
+        // info for one tick. `git_branch_info` handles non-git / detached /
+        // corrupted repos without panicking, and the spawned thread emits
+        // app state when done so the sidebar picks up the refresh.
         let cwd = {
             let snapshot = state.snapshot();
             snapshot
@@ -545,7 +549,13 @@ pub fn activate_workspace(
                 .map(|w| w.cwd.clone())
         };
         if let Some(cwd) = cwd {
-            populate_git_info(&state, &workspace_id, Path::new(&cwd));
+            let refresh_app = app.clone();
+            let refresh_ws = workspace_id.clone();
+            std::thread::spawn(move || {
+                let state: tauri::State<'_, AppStateStore> = refresh_app.state();
+                populate_git_info(&state, &refresh_ws, Path::new(&cwd));
+                crate::state::emit_app_state(&refresh_app);
+            });
         }
 
         // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
