@@ -110,7 +110,7 @@ export function NewProjectScreen() {
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspace(wsId);
-      if (!hasWorkspaces) {
+      if (!hasWorkspaces && !useUIStore.getState().hasSeenOnboarding) {
         useUIStore.getState().setOnboardingProjectDir(projectPath);
       }
       setShowNewProjectScreen(false);

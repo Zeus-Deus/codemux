@@ -37,12 +37,14 @@ export function useProjectActions() {
 
     await dbAddRecentProject(folder, name);
 
-    // Only show the onboarding wizard if there are no existing workspaces
-    // across any project. If workspaces already exist, just create and activate.
+    // Only show the onboarding wizard for truly first-time users — no existing
+    // workspaces AND they have never seen/dismissed onboarding before. The
+    // `hasSeenOnboarding` flag persists so that closing all workspaces or
+    // opening a second project doesn't re-arm the wizard.
     const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
     const wsId = await createEmptyWorkspace(folder);
     await activateWorkspace(wsId);
-    if (!hasWorkspaces) {
+    if (!hasWorkspaces && !useUIStore.getState().hasSeenOnboarding) {
       useUIStore.getState().setOnboardingProjectDir(folder);
     }
 
@@ -62,7 +64,7 @@ export function useProjectActions() {
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(clonedPath);
       await activateWorkspace(wsId);
-      if (!hasWorkspaces) {
+      if (!hasWorkspaces && !useUIStore.getState().hasSeenOnboarding) {
         useUIStore.getState().setOnboardingProjectDir(clonedPath);
       }
 

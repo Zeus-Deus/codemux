@@ -25,7 +25,13 @@ import {
   ChevronLeft,
   ChevronDown,
   Check,
+  X,
 } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { BranchPicker } from "./branch-picker";
 import { useUIStore } from "@/stores/ui-store";
 import {
@@ -55,7 +61,7 @@ interface Props {
   onCancel: () => void;
 }
 
-export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onCancel: _onCancel }: Props) {
+export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onCancel }: Props) {
   // ── Step state ──
   const [step, setStep] = useState<Step>("workspace");
 
@@ -135,6 +141,19 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       setTimeout(() => taskInputRef.current?.focus(), 100);
     }
   }, [step]);
+
+  // ── Clear debounce timer on unmount to avoid post-unmount setState ──
+  useEffect(() => {
+    return () => {
+      if (branchGenTimeout.current) clearTimeout(branchGenTimeout.current);
+    };
+  }, []);
+
+  // ── Skip onboarding — dismiss wizard, leave temp workspace intact ──
+  const handleSkip = () => {
+    if (branchGenTimeout.current) clearTimeout(branchGenTimeout.current);
+    onCancel();
+  };
 
   // ── Debounced branch name generation (only when not manually edited) ──
   const handleTaskChange = (value: string) => {
@@ -314,7 +333,23 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
   const projectName = projectDir.split("/").filter(Boolean).pop() || "project";
 
   return (
-    <div className="flex-1 h-full flex flex-col overflow-hidden bg-background">
+    <div className="relative flex-1 h-full flex flex-col overflow-hidden bg-background">
+      {/* ── Skip affordance — top-right, always visible ── */}
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleSkip}
+            aria-label="Skip onboarding"
+            className="absolute top-4 right-4 z-10 text-muted-foreground hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent side="bottom">Skip (Esc)</TooltipContent>
+      </Tooltip>
+
       {/* ── External worktrees banner — outside scroll container ── */}
       {externalWorktrees.length > 0 && (
         <div className="mx-6 mt-6 rounded-lg border border-border/60 bg-card/50 p-4">

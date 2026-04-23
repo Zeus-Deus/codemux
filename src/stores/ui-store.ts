@@ -19,6 +19,7 @@ interface UIStore {
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
   onboardingProjectDir: string | null;
+  hasSeenOnboarding: boolean;
   /** Callback ref set by AppShell after SidebarProvider mounts */
   sidebarToggleFn: (() => void) | null;
 
@@ -59,6 +60,7 @@ export const useUIStore = create<UIStore>()(
       showCloneDialog: false,
       showNewProjectScreen: false,
       onboardingProjectDir: null,
+      hasSeenOnboarding: false,
       sidebarToggleFn: null,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
@@ -113,7 +115,12 @@ export const useUIStore = create<UIStore>()(
 
       setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
 
-      setOnboardingProjectDir: (dir) => set({ onboardingProjectDir: dir }),
+      setOnboardingProjectDir: (dir) =>
+        set((s) =>
+          dir === null
+            ? { onboardingProjectDir: null, hasSeenOnboarding: true }
+            : { onboardingProjectDir: dir, hasSeenOnboarding: s.hasSeenOnboarding },
+        ),
 
       setSidebarToggleFn: (fn) => set({ sidebarToggleFn: fn }),
     }),
@@ -123,6 +130,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
+        hasSeenOnboarding: state.hasSeenOnboarding,
       }),
     },
   ),
