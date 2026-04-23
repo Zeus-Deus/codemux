@@ -480,25 +480,57 @@ pub fn run() {
 
             control::spawn_control_server(app.handle().clone());
 
-            // Periodically refresh git info for the active workspace
+            // Periodically refresh git info for EVERY workspace (so non-active
+            // sidebar rows stay honest when agents switch branches), plus
+            // PR/issue info for the active workspace only (where `gh` CLI
+            // calls are the expensive part and only the visible row benefits
+            // from being up-to-date every 5s).
+            //
+            // Serial iteration on purpose — cost is predictable (~3 git
+            // subprocesses × N workspaces per tick) and easy to throttle
+            // later if needed. Skips the tick entirely when the main window
+            // is unfocused to avoid wasting CPU/battery while the user is
+            // elsewhere.
             let git_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    let state: tauri::State<'_, state::AppStateStore> = git_handle.state();
-                    if let Some((workspace_id, cwd)) = state.active_workspace_cwd() {
-                        let path = std::path::PathBuf::from(&cwd);
-                        let branch_info = git::git_branch_info(&path).ok();
-                        let diff_stat = git::git_diff_stat(&path).ok();
-                        let changed_files = git::git_status(&path).map(|f| f.len() as u32).unwrap_or(0);
-                        let branch = branch_info.as_ref().and_then(|i| i.branch.clone());
-                        let ahead = branch_info.as_ref().map(|i| i.ahead).unwrap_or(0);
-                        let behind = branch_info.as_ref().map(|i| i.behind).unwrap_or(0);
-                        let additions = diff_stat.as_ref().map(|s| s.staged_additions + s.unstaged_additions).unwrap_or(0);
-                        let deletions = diff_stat.as_ref().map(|s| s.staged_deletions + s.unstaged_deletions).unwrap_or(0);
-                        state.update_workspace_git_info(&workspace_id, branch, ahead, behind, additions, deletions, changed_files);
 
-                        // Only fetch PR/issue info if gh CLI is available
+                    // Pause polling only when the sidebar is genuinely not
+                    // on screen. `is_focused()` would wrongly pause when the
+                    // window is visible on another Hyprland/KDE/Gnome
+                    // workspace — users there still expect the sidebar to
+                    // reflect live branch state. `is_minimized()` returning
+                    // Err defaults to "treat as minimized" so we skip the
+                    // tick rather than busy-loop on a broken window handle.
+                    let window_active = git_handle
+                        .get_webview_window("main")
+                        .map(|w| {
+                            let visible = w.is_visible().unwrap_or(false);
+                            let minimized = w.is_minimized().unwrap_or(true);
+                            visible && !minimized
+                        })
+                        .unwrap_or(false);
+                    if !window_active {
+                        continue;
+                    }
+
+                    let state: tauri::State<'_, state::AppStateStore> = git_handle.state();
+                    let all_workspaces = state.all_workspace_cwds();
+                    let active = state.active_workspace_cwd();
+
+                    // Refresh git info for every workspace via the shared helper.
+                    for (workspace_id, cwd) in &all_workspaces {
+                        let path = std::path::PathBuf::from(cwd);
+                        commands::workspace::populate_git_info(&state, workspace_id, &path);
+                    }
+
+                    // PR / linked-issue refresh stays scoped to the active
+                    // workspace — each call shells out to `gh`, which is the
+                    // expensive part, and the user can only see one PR panel
+                    // at a time anyway.
+                    if let Some((workspace_id, cwd)) = active {
+                        let path = std::path::PathBuf::from(&cwd);
                         if github::gh_available() {
                             let pr_info = match github::get_branch_pr(&path) {
                                 Ok(info) => info,
@@ -536,8 +568,12 @@ pub fn run() {
                                 }
                             }
                         }
+                    }
 
-                        // Single emit after both git and PR info are updated
+                    // Single emit per tick, regardless of how many workspaces
+                    // were refreshed or whether PR info was updated. The
+                    // frontend dedups on payload equality anyway.
+                    if !all_workspaces.is_empty() {
                         state::emit_app_state(&git_handle);
                     }
                 }
