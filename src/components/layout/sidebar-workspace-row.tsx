@@ -18,6 +18,11 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
 import {
@@ -87,12 +92,14 @@ function RemoveWorkspaceDialog({
       <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
           <DialogTitle className="text-sm">
-            Remove workspace &ldquo;{workspace.title}&rdquo;?
+            {isWorktree
+              ? <>Remove workspace &ldquo;{workspace.title}&rdquo;?</>
+              : <>Close workspace &ldquo;{workspace.title}&rdquo;?</>}
           </DialogTitle>
           <DialogDescription>
             {isWorktree
               ? "Deleting will permanently remove the worktree. You can hide instead to keep files on disk."
-              : "This will close the workspace."}
+              : "Removes this workspace from the sidebar. Project files on disk are untouched."}
           </DialogDescription>
         </DialogHeader>
 
@@ -128,23 +135,55 @@ function RemoveWorkspaceDialog({
           >
             Cancel
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            className="h-7 px-3 text-xs"
-            onClick={handleHide}
-          >
-            Hide
-          </Button>
-          {isWorktree && (
-            <Button
-              variant="destructive"
-              size="sm"
-              className="h-7 px-3 text-xs"
-              onClick={handleDelete}
-            >
-              Delete
-            </Button>
+          {isWorktree ? (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="h-7 px-3 text-xs"
+                    onClick={handleHide}
+                  >
+                    Hide
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                  Remove from sidebar. Worktree files stay on disk.
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 px-3 text-xs"
+                    onClick={handleDelete}
+                  >
+                    Delete
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                  Permanently remove worktree directory from disk.
+                </TooltipContent>
+              </Tooltip>
+            </>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-3 text-xs"
+                  onClick={handleHide}
+                >
+                  Close
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                Remove from sidebar. Project files on disk are untouched.
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
       </DialogContent>
