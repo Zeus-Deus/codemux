@@ -4,6 +4,7 @@ import {
   capabilityDefaults,
   defaultModelId,
 } from "@/lib/agent-chat/capability-defaults";
+import type { ChatMode } from "@/stores/agent-chat-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 /** Branded draft identifier. Assigned via `crypto.randomUUID()`. */
@@ -25,6 +26,11 @@ export interface ChatDraft {
   effort: string | null;
   contextWindow: string | null;
   permissionMode: string | null;
+  /** Composer mode pill carried through draft → slice on materialise.
+   *  `default` renders no pill. Drafts can pre-select a mode before
+   *  the session exists; materialise applies the mode-specific
+   *  session config (for `plan` that's `permission_mode: "plan"`). */
+  mode: ChatMode;
   inputDraft: string;
   /** Pre-minted thread id passed to `agent_chat_start_session` on
    *  materialise. Sharing the id with the real session means the
@@ -67,7 +73,12 @@ export interface ChatDraftStore {
     config: Partial<
       Pick<
         ChatDraft,
-        "provider" | "model" | "effort" | "contextWindow" | "permissionMode"
+        | "provider"
+        | "model"
+        | "effort"
+        | "contextWindow"
+        | "permissionMode"
+        | "mode"
       >
     >,
   ) => void;
@@ -127,6 +138,7 @@ function makeDraft(target: DraftTarget): ChatDraft {
     effort: defaults.effort,
     contextWindow: defaults.contextWindow,
     permissionMode: defaults.permissionMode,
+    mode: "default",
     inputDraft: "",
     threadId: newThreadId(),
     promotedTo: null,

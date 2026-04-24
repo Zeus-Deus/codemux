@@ -160,6 +160,7 @@ export function PresetBar({
       setSessionLaunchMode: chat.setSessionLaunchMode,
       setEffort: chat.setEffort,
       setContextWindow: chat.setContextWindow,
+      setMode: chat.setMode,
     }).then((result) => {
       if (result.success) {
         // Same transition cleanup DraftChatSurface uses on composer

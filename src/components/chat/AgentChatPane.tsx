@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import {
@@ -29,14 +29,15 @@ import {
 } from "@/stores/provider-capabilities-store";
 import {
   activateWorkspace,
-  agentChatCreatePane,
   agentChatInterruptTurn,
   agentChatRespondToRequest,
   agentChatSendTurn,
   agentChatSetModel,
+  agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
 } from "@/tauri/commands";
+import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
@@ -46,8 +47,13 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import {
+  type AskUserQuestionOutput,
+  ComposerPendingInputPanel,
+} from "./ComposerPendingInputPanel";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import { DerivativeBranchPicker } from "./pickers/DerivativeBranchPicker";
+import type { ActivePillMode } from "./pickers/ModePill";
 import { WorktreePicker } from "./pickers/WorktreePicker";
 import { ProjectPicker } from "@/components/overlays/project-picker";
 import { useUIStore } from "@/stores/ui-store";
@@ -147,10 +153,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
+  const setStoreMode = useAgentChatStore((s) => s.setMode);
+  const setStoreModePriorPermissionMode = useAgentChatStore(
+    (s) => s.setModePriorPermissionMode,
+  );
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
+  );
+  const markRequestResolved = useAgentChatStore(
+    (s) => s.markRequestResolved,
   );
 
   // Chat-side capabilities for the active provider. `null` until the
@@ -172,6 +185,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     slice?.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
   const effort = slice?.effort ?? null;
   const contextWindow = slice?.contextWindow ?? null;
+  const mode = slice?.mode ?? "default";
   const activeModel = selectModel(capabilities, model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
@@ -391,6 +405,159 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     },
     [threadId, provider, markRequestResponding],
   );
+
+  // Plan-accept: flip the live session to `default` permission mode
+  // (Claude adapter wires `query.setPermissionMode` directly — no
+  // session restart) and send a synthetic "Proceed with the plan."
+  // turn so the model un-sticks from the deny + interrupt that
+  // ExitPlanMode triggered. This deliberately bypasses
+  // `handlePermissionModeChange`, which goes through
+  // `restartSessionWith` because Claude's capability declares
+  // per-session granularity. Research 1 confirmed the live setter
+  // is safe.
+  const handleAcceptPlan = useCallback(
+    async (requestId: string) => {
+      if (!threadId) return;
+      // Collapse the plan card locally. The sidecar denied+interrupted
+      // the ExitPlanMode tool before emitting the request, so no
+      // `request-resolved` event will ever arrive — without this the
+      // card stays on its pending affordances and pins the transcript
+      // tail in a "user must act" state that suppresses the thinking
+      // indicator during the synthetic turn that follows.
+      markRequestResolved(threadId, requestId, { decision: "allow" });
+      try {
+        await agentChatSetPermissionMode(provider, threadId, "default");
+        setStorePermissionMode(threadId, "default");
+        setSessionLaunchMode(threadId, "default");
+        // Stage 3: accepting a plan also clears the Plan pill so the
+        // picker reappears and the composer returns to normal. The
+        // stashed priorPermissionMode is discarded — the user explicitly
+        // opted into `default` by accepting.
+        setStoreMode(threadId, "default");
+        setStoreModePriorPermissionMode(threadId, null);
+        await agentChatSendTurn(provider, {
+          thread_id: threadId,
+          text: "Proceed with the plan.",
+          model_override: null,
+          effort_override: null,
+          permission_mode_override: null,
+        });
+      } catch (err) {
+        toast.error(`Failed to accept plan: ${err}`);
+      }
+    },
+    [
+      threadId,
+      provider,
+      markRequestResolved,
+      setStorePermissionMode,
+      setSessionLaunchMode,
+      setStoreMode,
+      setStoreModePriorPermissionMode,
+    ],
+  );
+
+  // Plan-reject: send a new user turn carrying the feedback (or a
+  // generic revise prompt when empty). The ExitPlanMode canUseTool
+  // was already denied + interrupted by the sidecar before this
+  // card rendered, so there is no approval to resolve here — just a
+  // fresh turn that lands on the still-open plan-mode session.
+  const handleRejectPlan = useCallback(
+    async (requestId: string) => {
+      if (!threadId) return;
+      // Same reasoning as handleAcceptPlan: no sidecar round-trip, so
+      // collapse the card locally before firing the follow-up turn.
+      markRequestResolved(threadId, requestId, {
+        decision: "deny",
+        message: "Please revise the plan.",
+      });
+      try {
+        await agentChatSendTurn(provider, {
+          thread_id: threadId,
+          text: "Please revise the plan.",
+          model_override: null,
+          effort_override: null,
+          permission_mode_override: null,
+        });
+      } catch (err) {
+        toast.error(`Failed to reject plan: ${err}`);
+      }
+    },
+    [threadId, provider, markRequestResolved],
+  );
+
+  // Composer-level mode pill activation. Plan pill flips the live
+  // session to `permission_mode: "plan"` via `setPermissionMode` (no
+  // restart per Research 1). The prior picker value is stashed on
+  // the slice so toggle-off can restore it. Ask / Debug land in
+  // Stages 4 & 6 — they currently no-op past the slice update so
+  // the UI still shows the pill.
+  const handleModeActivate = useCallback(
+    async (newMode: ActivePillMode) => {
+      if (!threadId) return;
+      const currentSlice = useAgentChatStore.getState().threads[threadId];
+      if (!currentSlice) return;
+      if (currentSlice.mode === newMode) return;
+      if (newMode === "plan") {
+        const priorMode = currentSlice.permissionMode;
+        try {
+          await agentChatSetPermissionMode(provider, threadId, "plan");
+        } catch (err) {
+          toast.error(`Failed to activate Plan mode: ${err}`);
+          return;
+        }
+        setStoreModePriorPermissionMode(threadId, priorMode);
+        setStorePermissionMode(threadId, "plan");
+        setSessionLaunchMode(threadId, "plan");
+        setStoreMode(threadId, "plan");
+      } else {
+        // Ask / Debug: state-only flip in Stage 3. Stages 4 and 6
+        // will layer prompt-wrappers on top; for now the pill
+        // provides discoverability only.
+        setStoreMode(threadId, newMode);
+      }
+    },
+    [
+      threadId,
+      provider,
+      setStoreModePriorPermissionMode,
+      setStorePermissionMode,
+      setSessionLaunchMode,
+      setStoreMode,
+    ],
+  );
+
+  // Composer-level mode pill removal. Plan pill restores the stashed
+  // prior `permissionMode` live; Ask / Debug just flip the slice
+  // back to `default`. Missing prior falls back to the provider's
+  // default mode so the session is never left in an orphan state.
+  const handleModeRemove = useCallback(async () => {
+    if (!threadId) return;
+    const currentSlice = useAgentChatStore.getState().threads[threadId];
+    if (!currentSlice) return;
+    if (currentSlice.mode === "plan") {
+      const restore =
+        currentSlice.modePriorPermissionMode ??
+        DEFAULT_THREAD_PERMISSION_MODE;
+      try {
+        await agentChatSetPermissionMode(provider, threadId, restore);
+      } catch (err) {
+        toast.error(`Failed to exit Plan mode: ${err}`);
+        return;
+      }
+      setStorePermissionMode(threadId, restore);
+      setSessionLaunchMode(threadId, restore);
+    }
+    setStoreMode(threadId, "default");
+    setStoreModePriorPermissionMode(threadId, null);
+  }, [
+    threadId,
+    provider,
+    setStorePermissionMode,
+    setSessionLaunchMode,
+    setStoreMode,
+    setStoreModePriorPermissionMode,
+  ]);
 
   const handleModelChange = useCallback(
     (next: string) => {
@@ -642,16 +809,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             activateWorkspace(wsId).catch(console.error);
           }}
           onWorktreeCreated={async (wsId) => {
-            // Spawn an agent_chat pane first — a freshly created
-            // worktree has zero panes, and `useEnsureDraftWhenEmpty`
-            // would otherwise inject a Home draft over the workspace
-            // view. See DraftChatSurface.handleWorktreeCreated for the
-            // full rationale.
+            // Pre-start the session before activating — otherwise
+            // the newly mounted AgentChatPane races to mint its own
+            // thread_id, and the user's first send can land before
+            // the session is registered in the adapter's HashMap
+            // (→ `session_not_found`). See
+            // `prestart-worktree-session.ts` for the rationale.
             try {
-              await agentChatCreatePane(wsId, "claude", null);
+              await prestartWorktreeSession(wsId);
             } catch (err) {
               console.error(
-                "Failed to create agent_chat pane for new worktree:",
+                "Failed to prestart worktree chat session:",
                 err,
               );
             }
@@ -667,6 +835,49 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       </div>
     );
   })();
+
+  // AskUserQuestion prompts render as a composer-attached panel
+  // (t3code / Claude.ai pattern) rather than inline in the transcript.
+  // Only the first pending user-input request surfaces; MessageList
+  // reduces user-input items to a tiny marker so the transcript
+  // doesn't duplicate the prompt.
+  const pendingUserInput = useMemo<ChatViewItem | null>(() => {
+    for (const m of messages) {
+      if (
+        m.kind === "permission_request" &&
+        m.request_kind === "user-input" &&
+        m.resolution.state === "pending"
+      ) {
+        return m;
+      }
+    }
+    return null;
+  }, [messages]);
+
+  const handleSubmitUserInput = useCallback(
+    (output: AskUserQuestionOutput) => {
+      if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
+        return;
+      }
+      handleRespond(pendingUserInput.request_id, {
+        decision: "allow",
+        updated_input: output,
+      });
+    },
+    [pendingUserInput, handleRespond],
+  );
+
+  const pendingInputPanelEl =
+    pendingUserInput && pendingUserInput.kind === "permission_request" ? (
+      <ComposerPendingInputPanel
+        // Remount when the pending request_id changes so per-question
+        // state (picks / free-text / current index) resets for a new
+        // prompt instead of leaking from the previous one.
+        key={pendingUserInput.request_id}
+        item={pendingUserInput}
+        onSubmit={handleSubmitUserInput}
+      />
+    ) : null;
 
   const composerEl = (
     <Composer
@@ -685,6 +896,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       streaming={streaming || isSending}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
+      mode={mode}
       onDraftChange={(next) => {
         if (!threadId) return;
         setInputDraft(threadId, next);
@@ -696,6 +908,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
+      onModeActivate={handleModeActivate}
+      onModeRemove={handleModeRemove}
     />
   );
 
@@ -707,8 +921,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         <>
           <ChatTranscript
             messages={messages}
+            streaming={streaming || isSending}
             onRespondToRequest={handleRespond}
+            onAcceptPlan={handleAcceptPlan}
+            onRejectPlan={handleRejectPlan}
           />
+          {pendingInputPanelEl}
           {composerEl}
         </>
       )}

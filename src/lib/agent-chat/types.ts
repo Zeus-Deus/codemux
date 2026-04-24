@@ -41,6 +41,12 @@ export interface ToolCallItem {
   input: unknown;
   status: "running" | "done" | "error";
   result_content: unknown | null;
+  /** When a permission request is tied to this tool call via
+   *  `tool_use_id`, the reducer stores the request's id here so the
+   *  renderer can look up the pending `PermissionRequestItem` and
+   *  show an inline approval footer on the tool-call card. `null` in
+   *  bypassPermissions mode or before the approval event lands. */
+  approval_request_id: string | null;
 }
 
 export interface PermissionRequestItem {
@@ -51,6 +57,11 @@ export interface PermissionRequestItem {
   turn_id: string | null;
   request_kind: string;
   payload: unknown;
+  /** Provider tool_use_id — when present, the reducer links this
+   *  request to the matching `ToolCallItem.approval_request_id`.
+   *  `null` for standalone requests (plan, unmatched, Codex
+   *  server-initiated). */
+  tool_use_id: string | null;
   resolution:
     | { state: "pending" }
     | { state: "responding"; decision: ApprovalDecision }

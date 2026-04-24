@@ -451,7 +451,11 @@ describe("WorktreePicker — inline New Worktree input", () => {
     expect(call[0]).toBe("/projects/foo"); // repoPath
     expect(call[1]).toBe("feature/cool-thing"); // branch
     expect(call[2]).toBe(true); // newBranch
-    expect(call[3]).toBe("single"); // layout
+    // "empty" layout → backend creates git worktree + empty
+    // workspace (no terminal/PTY); chat pane is attached afterward
+    // by handleWorktreeCreated → agentChatCreatePane. Any other
+    // layout reintroduces the split-with-leftover-terminal bug.
+    expect(call[3]).toBe("empty"); // layout
     expect(call[4]).toBe("main"); // base → derivativeBranch
     // generateRandomBranchName MUST NOT be called — user provided one.
     expect(generateRandomBranchName).not.toHaveBeenCalled();

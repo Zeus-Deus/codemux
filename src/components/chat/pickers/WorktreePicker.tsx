@@ -239,7 +239,12 @@ function NewWorktreeRow({
         projectPath,
         branchName,
         true,
-        "single",
+        // "empty" layout — the backend creates the git worktree and
+        // an empty workspace (no surfaces / terminal / PTY); the
+        // chat pane is attached afterward by `handleWorktreeCreated`
+        // via `agentChatCreatePane`. Any other layout would seed a
+        // terminal pane that then splits with the chat pane.
+        "empty",
         derivativeBranch || null,
         null,
         null,

@@ -15,6 +15,21 @@ function nextId(prefix: string): string {
   return `${prefix}-${idCounter}`;
 }
 
+/** Tools whose UI is owned by a dedicated specialized renderer
+ *  (`PlanProposalBlock` inline, `ComposerPendingInputPanel` attached
+ *  to the composer) driven by the `permission_request` row. We
+ *  deliberately skip creating a `ToolCallItem` for these so Stage 1's
+ *  tool_use_id merge path doesn't swallow the request into a generic
+ *  ToolCallCard and shadow the specialized renderer. */
+const SPECIALIZED_TOOLS = new Set(["ExitPlanMode", "AskUserQuestion"]);
+
+/** Request kinds that render via a specialized block rather than the
+ *  generic approval footer. Used by the `tool_result` placeholder
+ *  guard so a ghost "(pending)" tool card never materialises for a
+ *  specialized tool even if the SDK starts emitting tool_result for
+ *  them in a future version. */
+const SPECIALIZED_REQUEST_KINDS = new Set(["plan", "user-input"]);
+
 const warnedVariants = new Set<string>();
 function warnOnce(variant: string, payload: unknown) {
   if (warnedVariants.has(variant)) return;
@@ -129,6 +144,31 @@ export function markRequestResponding(
   };
 }
 
+/**
+ * Local-only action: mark a permission request as resolved. Used for
+ * synthetic decisions where there is no round-trip through the sidecar
+ * (e.g. plan accept/reject — the sidecar has already denied + interrupted
+ * the ExitPlanMode tool use, so no `request-resolved` notification ever
+ * fires). Without this, the plan card stays in `pending` forever and
+ * pins the transcript tail in a "user must act" state.
+ */
+export function markRequestResolved(
+  state: ChatThreadState,
+  requestId: string,
+  decision: ApprovalDecision,
+): ChatThreadState {
+  const found = findPermissionRequest(state.messages, requestId);
+  if (!found) return state;
+  return {
+    ...state,
+    messages: replaceItem(state.messages, found.index, {
+      ...found.item,
+      resolution: { state: "resolved", decision },
+    }),
+    pendingRequestIds: state.pendingRequestIds.filter((id) => id !== requestId),
+  };
+}
+
 export function applyEvent(
   state: ChatThreadState,
   event: ProviderRuntimeEvent,
@@ -164,18 +204,35 @@ export function applyEvent(
         // Step 2's transcript.
         return state;
       }
-      const existing = findTrailingAssistant(state.messages, event.turn_id);
-      if (existing) {
+      // Only continue an existing assistant message when it's both
+      // the CURRENT TAIL and still streaming. If anything else has
+      // landed after the last assistant (tool call, permission
+      // request, turn-ended marker, …), those events mark the
+      // boundary between two content blocks — the incoming deltas
+      // belong to a FRESH assistant message at a new seq, otherwise
+      // they'd render at the sealed block's (now stale) position and
+      // visually leapfrog over the intervening items. This is the
+      // AskUserQuestion "Answered appears above older tool calls"
+      // bug: after the user's answer, the next text deltas would
+      // back-merge onto the turn's first assistant.
+      const tail = state.messages[state.messages.length - 1];
+      if (
+        tail &&
+        tail.kind === "assistant_message" &&
+        tail.streaming &&
+        (!tail.turn_id || tail.turn_id === event.turn_id)
+      ) {
+        const lastIndex = state.messages.length - 1;
         const next: AssistantMessageItem = {
-          ...existing.item,
+          ...tail,
           turn_id: event.turn_id,
-          text: existing.item.text + delta.text,
+          text: tail.text + delta.text,
           streaming: true,
         };
         return {
           ...state,
           streaming: true,
-          messages: replaceItem(state.messages, existing.index, next),
+          messages: replaceItem(state.messages, lastIndex, next),
         };
       }
       const { seq, next: seqBumped } = takeSeq(state);
@@ -230,6 +287,15 @@ export function applyEvent(
           return state;
         }
         case "tool_use": {
+          // Specialized tools (ExitPlanMode, AskUserQuestion) drive
+          // their own UI through a `permission_request` row — skipping
+          // the ToolCallItem here prevents Stage 1's tool_use_id merge
+          // from stamping `approval_request_id` on an otherwise-unused
+          // tool card and suppressing the specialized renderer in
+          // MessageList.
+          if (SPECIALIZED_TOOLS.has(item.tool_name)) {
+            return state;
+          }
           // Tool input may have streamed in via content_delta tool_input;
           // we ignore those deltas in Step 2 and attach the finalised
           // tool_use here. If the same tool_use_id already exists (e.g.
@@ -247,6 +313,16 @@ export function applyEvent(
             };
           }
           const { seq, next: seqBumped } = takeSeq(state);
+          // Defensive association: if a permission_request with a
+          // matching tool_use_id already exists (request_opened
+          // landed before the assistant tool_use — unusual but
+          // possible depending on SDK ordering), link the new tool
+          // call to it up front.
+          const priorRequest = seqBumped.messages.find(
+            (m): m is PermissionRequestItem =>
+              m.kind === "permission_request" &&
+              m.tool_use_id === item.tool_use_id,
+          );
           const newToolCall: ToolCallItem = {
             kind: "tool_call",
             id: nextId("tool"),
@@ -256,6 +332,7 @@ export function applyEvent(
             input: item.input,
             status: "running",
             result_content: null,
+            approval_request_id: priorRequest?.request_id ?? null,
           };
           return { ...seqBumped, messages: [...seqBumped.messages, newToolCall] };
         }
@@ -272,6 +349,22 @@ export function applyEvent(
               messages: replaceItem(state.messages, found.index, next),
             };
           }
+          // Specialized tools never emit a tool_result in practice
+          // (ExitPlanMode is denied by the sidecar, AskUserQuestion's
+          // "result" is the user's answer routed back through
+          // `respond-to-request`). Guard defensively: if the
+          // tool_use_id matches a pending specialized request, don't
+          // create a ghost "(pending)" placeholder that would
+          // resurrect the very card the tool_use guard prevented.
+          const specializedPending = state.messages.find(
+            (m): m is PermissionRequestItem =>
+              m.kind === "permission_request" &&
+              m.tool_use_id === item.tool_use_id &&
+              SPECIALIZED_REQUEST_KINDS.has(m.request_kind),
+          );
+          if (specializedPending) {
+            return state;
+          }
           // Result arrived before we saw the tool_use. Create a placeholder
           // carrying the result so nothing is lost; the tool_use item
           // handler will attach when the use shows up.
@@ -285,6 +378,7 @@ export function applyEvent(
             input: null,
             status: item.is_error ? "error" : "done",
             result_content: item.content,
+            approval_request_id: null,
           };
           return {
             ...seqBumped,
@@ -344,11 +438,30 @@ export function applyEvent(
         turn_id: event.turn_id,
         request_kind: event.request_kind,
         payload: event.payload,
+        tool_use_id: event.tool_use_id,
         resolution: { state: "pending" },
       };
+      // When the request is tied to an in-flight tool_use, link the
+      // two so the renderer can show an inline approval footer on the
+      // ToolCallCard. Falls through without mutation when no match
+      // exists (plan/user-input standalone requests, or a tool_use
+      // that hasn't landed yet — the latter is unexpected in Claude's
+      // ordering but handled defensively by keeping the standalone
+      // row until tool_use arrives, at which point we stamp it).
+      let messages: ChatViewItem[] = [...seqBumped.messages, item];
+      if (event.tool_use_id) {
+        const toolMatch = findToolCallByUseId(messages, event.tool_use_id);
+        if (toolMatch) {
+          const patched: ToolCallItem = {
+            ...toolMatch.item,
+            approval_request_id: event.request_id,
+          };
+          messages = replaceItem(messages, toolMatch.index, patched);
+        }
+      }
       return {
         ...seqBumped,
-        messages: [...seqBumped.messages, item],
+        messages,
         pendingRequestIds: seqBumped.pendingRequestIds.includes(event.request_id)
           ? seqBumped.pendingRequestIds
           : [...seqBumped.pendingRequestIds, event.request_id],

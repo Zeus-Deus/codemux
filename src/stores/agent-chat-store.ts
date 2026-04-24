@@ -4,6 +4,7 @@ import {
   applyEvent,
   appendUserMessage,
   createEmptyThreadState,
+  markRequestResolved,
   markRequestResponding,
 } from "@/lib/agent-chat/reducer";
 import type { ChatThreadState, ChatViewItem } from "@/lib/agent-chat/types";
@@ -18,6 +19,12 @@ import type {
  * footer picker; a mode change triggers a silent session restart.
  */
 export const DEFAULT_THREAD_PERMISSION_MODE = "bypassPermissions";
+
+/** Composer-level Cursor-style mode toggle. Orthogonal to the
+ *  permission picker: Plan commandeers `permissionMode` under the
+ *  hood, Ask/Debug layer a prompt-wrapper (Stages 4 & 6). `default`
+ *  means "no pill — regular agent behavior". */
+export type ChatMode = "default" | "plan" | "ask" | "debug";
 
 export interface ChatThreadSlice extends ChatThreadState {
   model: string | null;
@@ -39,6 +46,17 @@ export interface ChatThreadSlice extends ChatThreadState {
   /** Context-window selection (Claude-only today). `null` means "use
    *  the model default". */
   contextWindow: string | null;
+  /** Composer-level Cursor-style mode pill. `default` means no pill. */
+  mode: ChatMode;
+  /** When Plan pill activates, we stash the prior `permissionMode`
+   *  here so toggle-off can restore it. `null` at all other times. */
+  modePriorPermissionMode: string | null;
+  /** Seeded true by Stage 6's grep-on-open when `// CODEMUX_DEBUG`
+   *  markers exist in the workspace, and flipped on by Claude's
+   *  first debug-mode tool use. Drives the "Clean up debug logs"
+   *  affordance. Defined on the slice from Stage 3 onward but
+   *  unused until Stage 6. */
+  hasDebugActivity: boolean;
 }
 
 function emptySlice(): ChatThreadSlice {
@@ -52,6 +70,9 @@ function emptySlice(): ChatThreadSlice {
     resumeCursor: null,
     effort: null,
     contextWindow: null,
+    mode: "default",
+    modePriorPermissionMode: null,
+    hasDebugActivity: false,
   };
 }
 
@@ -66,6 +87,14 @@ interface AgentChatStore {
   appendUserMessage: (threadId: string, text: string) => void;
   /** Flag a permission request as in-flight while the invoke runs. */
   markRequestResponding: (
+    threadId: string,
+    requestId: string,
+    decision: ApprovalDecision,
+  ) => void;
+  /** Locally mark a permission request resolved (no sidecar round-trip).
+   *  Used for plan accept/reject — the sidecar denied+interrupted the
+   *  ExitPlanMode tool, so no `request-resolved` notification will fire. */
+  markRequestResolved: (
     threadId: string,
     requestId: string,
     decision: ApprovalDecision,
@@ -90,6 +119,17 @@ interface AgentChatStore {
   setEffort: (threadId: string, effort: string | null) => void;
   /** Set the thread's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
+  /** Set the composer-level Cursor-style mode. */
+  setMode: (threadId: string, mode: ChatMode) => void;
+  /** Stash / clear the permissionMode value to restore when the
+   *  Plan pill is removed. Pass `null` to clear. */
+  setModePriorPermissionMode: (
+    threadId: string,
+    priorMode: string | null,
+  ) => void;
+  /** Flip the `hasDebugActivity` flag (Stage 6). Defined on the
+   *  store now so Stage 3 doesn't need another migration. */
+  setHasDebugActivity: (threadId: string, value: boolean) => void;
 }
 
 function updateSlice(
@@ -163,6 +203,14 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       updateSlice(state, threadId, (slice) => ({
         ...slice,
         ...markRequestResponding(slice, requestId, decision),
+      })),
+    ),
+
+  markRequestResolved: (threadId, requestId, decision) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        ...markRequestResolved(slice, requestId, decision),
       })),
     ),
 
@@ -246,6 +294,31 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         slice.contextWindow === contextWindow
           ? slice
           : { ...slice, contextWindow },
+      ),
+    ),
+
+  setMode: (threadId, mode) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.mode === mode ? slice : { ...slice, mode },
+      ),
+    ),
+
+  setModePriorPermissionMode: (threadId, priorMode) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.modePriorPermissionMode === priorMode
+          ? slice
+          : { ...slice, modePriorPermissionMode: priorMode },
+      ),
+    ),
+
+  setHasDebugActivity: (threadId, value) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.hasDebugActivity === value
+          ? slice
+          : { ...slice, hasDebugActivity: value },
       ),
     ),
 }));

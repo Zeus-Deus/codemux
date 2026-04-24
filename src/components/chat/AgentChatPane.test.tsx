@@ -234,6 +234,11 @@ vi.mock("@/stores/agent-chat-store", () => {
       getState: () => ({
         threads: buildThreads(),
         applyEvent: vi.fn(),
+        // prestartWorktreeSession reads these three to seed the
+        // agent-chat slice after start_session resolves.
+        ensureThread: vi.fn(),
+        setPermissionMode: vi.fn(),
+        setSessionLaunchMode: vi.fn(),
       }),
     },
   );
@@ -466,7 +471,12 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
     expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-foo-feat");
   });
 
-  it("WorktreePicker onWorktreeCreated spawns an agent_chat pane, clears the draft, and activates the workspace", async () => {
+  it("WorktreePicker onWorktreeCreated pre-starts the session (create_pane + start_session with real cwd) before activation", async () => {
+    // The new worktree workspace must be in the store so
+    // prestartWorktreeSession can read its cwd. In production
+    // emit_app_state fires inside create_worktree_workspace before
+    // the Tauri invoke returns, so the workspace is present by the
+    // time onWorktreeCreated runs.
     mockAppState.appState = {
       active_workspace_id: "ws-foo",
       workspaces: [
@@ -475,6 +485,12 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
           workspace_type: "standard",
           project_root: "/projects/foo",
           cwd: "/projects/foo",
+        },
+        {
+          workspace_id: "ws-new",
+          workspace_type: "standard",
+          project_root: "/projects/foo",
+          cwd: "/projects/foo-feat",
         },
       ],
     };
@@ -487,20 +503,29 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
     };
     render(<AgentChatPane pane={projectPane} />);
     expect(lastWorktreePickerProps).not.toBeNull();
-    const { activateWorkspace, agentChatCreatePane } = await import(
-      "@/tauri/commands"
-    );
+    const { activateWorkspace, agentChatCreatePane, agentChatStartSession } =
+      await import("@/tauri/commands");
     vi.mocked(activateWorkspace).mockClear();
     vi.mocked(agentChatCreatePane).mockClear();
+    vi.mocked(agentChatStartSession).mockClear();
     await lastWorktreePickerProps!.onWorktreeCreated("ws-new");
-    // Pane must be created BEFORE the draft clears / activate fires,
-    // otherwise useEnsureDraftWhenEmpty races and injects a Home
-    // draft over the empty workspace.
+    // create_pane receives the REAL workspace cwd (closes the
+    // `if (!cwd) return` mount-effect guard that caused
+    // session_not_found). start_session runs BEFORE activation so the
+    // adapter HashMap already holds the thread_id when AgentChatPane
+    // mounts.
     expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
       "ws-new",
       "claude",
-      null,
+      "/projects/foo-feat",
     );
+    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
+    const [paneId, provider, input] =
+      vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(paneId).toBe("pane-new");
+    expect(provider).toBe("claude");
+    expect(input.cwd).toBe("/projects/foo-feat");
+    expect(input.permission_mode).toBe("bypassPermissions");
     expect(setActiveDraftMock).toHaveBeenCalledWith(null);
     expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
     // The legacy dialog must NOT open — inline-input flow is self-

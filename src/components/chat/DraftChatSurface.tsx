@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
+import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
@@ -15,17 +16,14 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
-import {
-  activateWorkspace,
-  agentChatCreatePane,
-  getHomeDir,
-} from "@/tauri/commands";
+import { activateWorkspace } from "@/tauri/commands";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import { ProjectPicker } from "@/components/overlays/project-picker";
 import { DerivativeBranchPicker } from "./pickers/DerivativeBranchPicker";
+import type { ActivePillMode } from "./pickers/ModePill";
 import { WorktreePicker } from "./pickers/WorktreePicker";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
@@ -60,31 +58,73 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
 
-  // Resolve display cwd for Zone 1 of the composer. The Zone 1 slot
-  // is now always overridden by a picker (ProjectPicker for home
-  // drafts, WorktreePicker otherwise), so this only matters as a
-  // fallback for the rare case where the override resolves to null.
-  const [resolvedHomeDir, setResolvedHomeDir] = useState<string | null>(null);
-  useEffect(() => {
-    if (draft.target.kind !== "home") return;
-    let cancelled = false;
-    getHomeDir()
-      .then((dir) => {
-        if (!cancelled) setResolvedHomeDir(dir);
-      })
-      .catch((err) => {
-        console.warn("[draft-chat-surface] getHomeDir failed:", err);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [draft.target.kind]);
+  // Home directory is hydrated once at App mount into useAppStore.
+  // Reading it from there (rather than re-fetching via a local Tauri
+  // roundtrip on every DraftChatSurface mount) closes a race where
+  // the user hit Send before the roundtrip resolved: the seed effect
+  // below would still be blocked on its gate, `draft.target.kind`
+  // stayed on "home", and materializeAndSend went down the
+  // `createHomeRootedWorkspace` path — minting a duplicate workspace
+  // instead of reusing the active sidebar workspace.
+  const appHomeDir = useAppStore((s) => s.homeDir);
 
   const existingWorkspaceCwd = useAppStore((s) => {
     if (draft.target.kind !== "existing_workspace") return null;
     const wsId = draft.target.workspaceId;
     return s.appState?.workspaces.find((w) => w.workspace_id === wsId)?.cwd ?? null;
   });
+
+  // Identity + project path of the currently active sidebar workspace.
+  // Split into two primitive selectors (instead of a single object
+  // selector) so Zustand's default Object.is equality doesn't see a
+  // fresh reference every render and retrigger the seed effect in an
+  // infinite loop. Used to seed a home draft's target when the user
+  // lands on Home while a project workspace is active, so the composer
+  // mirrors the sidebar context instead of sitting on "Select project."
+  // We seed to `existing_workspace` (not `project`) because the user's
+  // intent is "send into the active workspace I'm looking at," not
+  // "spawn a new worktree for this project" — the latter would double
+  // the workspace on submit.
+  const activeSidebarWorkspaceId = useAppStore((s) => {
+    const st = s.appState;
+    if (!st?.active_workspace_id) return null;
+    const ws = st.workspaces.find(
+      (w) => w.workspace_id === st.active_workspace_id,
+    );
+    return ws ? ws.workspace_id : null;
+  });
+  const activeSidebarProjectPath = useAppStore((s) => {
+    const st = s.appState;
+    if (!st?.active_workspace_id) return null;
+    const ws = st.workspaces.find(
+      (w) => w.workspace_id === st.active_workspace_id,
+    );
+    return ws ? ws.project_root ?? ws.cwd ?? null : null;
+  });
+
+  // Seed the home draft's target with the active sidebar workspace on
+  // mount. Gated on appHomeDir so a home-rooted workspace (where
+  // `project_root === $HOME`) stays on the general Home landing rather
+  // than being mistaken for a real project. Runs once per draft: as
+  // soon as the target flips away from "home" the guard short-circuits
+  // every subsequent render, so the user's later picker changes stick.
+  useEffect(() => {
+    if (draft.target.kind !== "home") return;
+    if (appHomeDir === null) return;
+    if (!activeSidebarWorkspaceId || !activeSidebarProjectPath) return;
+    if (activeSidebarProjectPath === appHomeDir) return;
+    updateDraftTarget(draft.draftId, {
+      kind: "existing_workspace",
+      workspaceId: activeSidebarWorkspaceId,
+    });
+  }, [
+    draft.target.kind,
+    draft.draftId,
+    activeSidebarWorkspaceId,
+    activeSidebarProjectPath,
+    appHomeDir,
+    updateDraftTarget,
+  ]);
 
   // Project root of the workspace targeted by an `existing_workspace`
   // draft. Used to scope the WorktreePicker (so the dropdown lists the
@@ -122,17 +162,45 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // Re-read fresh state so a same-tick keystroke then Enter sees the
     // just-written text.
     const state = useChatDraftStore.getState();
-    const currentDraft = state.draftsById[draft.draftId];
+    let currentDraft = state.draftsById[draft.draftId];
     if (!currentDraft) return;
     if (currentDraft.promoting) return;
     const text = currentDraft.inputDraft.trim();
     if (!text) return;
 
+    // Submit-time salvage: if we're about to send a "home" draft while
+    // a project-rooted sidebar workspace is active, silently re-route
+    // the target to `existing_workspace` before handing off to
+    // materialize. The mount-time seed effect normally catches this,
+    // but if the user types-and-sends fast enough that the effect
+    // hasn't run yet (React `useEffect` runs post-paint, and the
+    // appHomeDir selector might still be null on the very first tick)
+    // we'd otherwise hit `createHomeRootedWorkspace` and mint a
+    // duplicate workspace.
+    if (
+      currentDraft.target.kind === "home" &&
+      activeSidebarWorkspaceId !== null &&
+      activeSidebarProjectPath !== null &&
+      appHomeDir !== null &&
+      activeSidebarProjectPath !== appHomeDir
+    ) {
+      state.updateDraftTarget(currentDraft.draftId, {
+        kind: "existing_workspace",
+        workspaceId: activeSidebarWorkspaceId,
+      });
+      // Re-read after the mutation so the snapshot handed to
+      // materializeAndSend carries the corrected target.
+      const refreshed = useChatDraftStore
+        .getState()
+        .draftsById[currentDraft.draftId];
+      if (refreshed) currentDraft = refreshed;
+    }
+
     // Resolve the cwd the backend should launch under.
     const cwdForSession = (() => {
       switch (currentDraft.target.kind) {
         case "home":
-          return resolvedHomeDir;
+          return appHomeDir;
         case "project":
           return currentDraft.target.projectPath;
         case "existing_workspace":
@@ -158,6 +226,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       setSessionLaunchMode: chat.setSessionLaunchMode,
       setEffort: chat.setEffort,
       setContextWindow: chat.setContextWindow,
+      setMode: chat.setMode,
     })
       .then((result) => {
         if (result.success) {
@@ -175,8 +244,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       });
   }, [
     draft.draftId,
-    resolvedHomeDir,
+    appHomeDir,
     existingWorkspaceCwd,
+    activeSidebarWorkspaceId,
+    activeSidebarProjectPath,
     setActiveDraft,
     clearDraft,
   ]);
@@ -230,6 +301,24 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     [draft.draftId, updateDraftConfig],
   );
 
+  // Drafts have no live session yet, so mode activation / removal
+  // is state-only: we just stamp the new mode on the draft. On
+  // materialize, `effectivePermissionMode` reads `draft.mode` and
+  // overrides `permission_mode` for the `start_session` call (Plan
+  // boots the SDK straight into plan mode — no restart needed
+  // because there's no session to restart). Ask / Debug are
+  // tracked at the slice level only; their prompt-wrappers land in
+  // Stages 4 & 6.
+  const handleModeActivate = useCallback(
+    (newMode: ActivePillMode) => {
+      updateDraftConfig(draft.draftId, { mode: newMode });
+    },
+    [draft.draftId, updateDraftConfig],
+  );
+  const handleModeRemove = useCallback(() => {
+    updateDraftConfig(draft.draftId, { mode: "default" });
+  }, [draft.draftId, updateDraftConfig]);
+
   // Zone 1 dispatch:
   //  - home target → ProjectPicker (lets the user retarget without
   //    sending first; clicking a project switches the draft target).
@@ -240,17 +329,18 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   //  - existing_workspace target → same pair scoped to the targeted
   //    workspace's project.
   const handleWorktreeCreated = async (wsId: string) => {
-    // Spawn an agent_chat pane into the fresh workspace BEFORE
-    // activating. A worktree created via `createWorktreeWorkspace`
-    // with no agent preset is a workspace with zero panes; if we
-    // activate it as-is, `useEnsureDraftWhenEmpty` detects the empty
-    // surface and auto-creates a Home draft, which then overrides
-    // the workspace view. Mirrors the `launchChatAgentOnWorkspace`
-    // path used by the preset bar.
+    // Attach a chat pane AND pre-start the provider session BEFORE
+    // activating the workspace. This mirrors materializeAndSend's
+    // ordering: by the time AgentChatPane mounts, `pane.thread_id`
+    // is already set so the mount-effect adopts it via the
+    // `if (threadId) ensureThread(...)` branch, avoiding the race
+    // where the user's first send lands with an unregistered
+    // thread_id → `session_not_found`. See
+    // `prestart-worktree-session.ts` for the full rationale.
     try {
-      await agentChatCreatePane(wsId, "claude", null);
+      await prestartWorktreeSession(wsId);
     } catch (err) {
-      console.error("Failed to create agent_chat pane for new worktree:", err);
+      console.error("Failed to prestart worktree chat session:", err);
     }
     // Clear the draft after the pane exists so the ensure-draft hook
     // has a non-empty workspace to observe and stays dormant.
@@ -342,6 +432,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       showStopButton={false}
       errorMessage={draft.lastSendError}
       zone1Override={zone1Override}
+      mode={draft.mode}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}
@@ -350,6 +441,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
+      onModeActivate={handleModeActivate}
+      onModeRemove={handleModeRemove}
     />
   );
 

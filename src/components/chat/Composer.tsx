@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
 import { cn } from "@/lib/utils";
+import type { ChatMode } from "@/stores/agent-chat-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -8,6 +9,7 @@ import type {
 } from "@/tauri/types";
 
 import { ComposerFooter } from "./ComposerFooter";
+import type { ActivePillMode } from "./pickers/ModePill";
 
 interface Props {
   draft: string;
@@ -24,6 +26,10 @@ interface Props {
   streaming: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
+  /** Composer-level Cursor-style mode pill. Swaps the placeholder,
+   *  hides the permission picker, and toggles the mode selector
+   *  (dropdown → pill). */
+  mode: ChatMode;
   /** When set, renders a muted inline banner above the textarea. Used
    *  for draft-send retry affordance (§8). `null` hides the banner. */
   errorMessage?: string | null;
@@ -44,6 +50,8 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
+  onModeActivate: (mode: ActivePillMode) => void;
+  onModeRemove: () => void;
 }
 
 const MAX_ROWS_APPROX_PX = 32 + 7 * 20; // ~8 rows
@@ -63,6 +71,7 @@ export function Composer({
   streaming,
   sessionReady,
   showProviderPicker,
+  mode,
   errorMessage = null,
   showStopButton = true,
   zone1Override = null,
@@ -74,6 +83,8 @@ export function Composer({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
+  onModeActivate,
+  onModeRemove,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -93,6 +104,33 @@ export function Composer({
       e.preventDefault();
       if (canSubmit) onSubmit();
     }
+  };
+
+  // Slash-command interception — only at draft start, only when no
+  // mode pill is active (can't re-activate what's already on).
+  //
+  // Stage 3 wires `/plan` end-to-end. `/ask` and `/debug` are
+  // reserved — the dropdown shows them disabled and typing them
+  // strips the slash-command but does nothing (a no-op rather than
+  // an error so users who discover them early don't get yelled at).
+  const handleTextareaChange = (
+    e: React.ChangeEvent<HTMLTextAreaElement>,
+  ) => {
+    const value = e.target.value;
+    if (mode === "default" && value.startsWith("/")) {
+      const match = value.match(/^\/(plan|ask|debug)(?:\s|$)/);
+      if (match) {
+        const rest = value.slice(match[0].length).trimStart();
+        if (match[1] === "plan") {
+          onModeActivate("plan");
+        }
+        // /ask and /debug intentionally no-op in Stage 3 — still
+        // strip the command so the textarea clears.
+        onDraftChange(rest);
+        return;
+      }
+    }
+    onDraftChange(value);
   };
 
   return (
@@ -125,10 +163,10 @@ export function Composer({
           <textarea
             ref={textareaRef}
             value={draft}
-            onChange={(e) => onDraftChange(e.target.value)}
+            onChange={handleTextareaChange}
             onKeyDown={handleKeyDown}
             placeholder={
-              sessionReady ? "Message the agent…" : "Starting session…"
+              sessionReady ? placeholderForMode(mode) : "Starting session…"
             }
             rows={1}
             className={cn(
@@ -152,6 +190,9 @@ export function Composer({
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
+            mode={mode}
+            onModeActivate={onModeActivate}
+            onModeRemove={onModeRemove}
             onProviderChange={onProviderChange}
             onModelChange={onModelChange}
             onPermissionModeChange={onPermissionModeChange}
@@ -165,4 +206,21 @@ export function Composer({
       </div>
     </div>
   );
+}
+
+/** Placeholder text per Cursor-style mode. `default` keeps the
+ *  existing copy; Plan/Ask/Debug swap in mode-specific prompts so
+ *  users see at a glance what the pill changes about their next
+ *  message. */
+function placeholderForMode(mode: ChatMode): string {
+  switch (mode) {
+    case "plan":
+      return "Plan and design before coding…";
+    case "ask":
+      return "Ask questions without making changes…";
+    case "debug":
+      return "Debug and troubleshoot issues…";
+    case "default":
+      return "Message the agent…";
+  }
 }

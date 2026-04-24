@@ -54,6 +54,7 @@ function makeActions(): SpyActions {
     setSessionLaunchMode: vi.fn(),
     setEffort: vi.fn(),
     setContextWindow: vi.fn(),
+    setMode: vi.fn(),
   };
 }
 
@@ -67,6 +68,7 @@ function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
     effort: null,
     contextWindow: null,
     permissionMode: "bypassPermissions",
+    mode: "default",
     inputDraft: "hello",
     threadId: "pre-minted-thread-xyz",
     promotedTo: null,
@@ -850,6 +852,82 @@ describe("materializeWithPreset", () => {
         "1m",
       );
       expect(actions.appendUserMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Stage 3 — mode pill propagation", () => {
+    it("draft.mode='plan' overrides permission_mode to 'plan' on start_session", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions", // user picker
+        mode: "plan", // pill trumps the picker
+      });
+
+      await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "claude",
+        expect.objectContaining({ permission_mode: "plan" }),
+      );
+    });
+
+    it("draft.mode='default' leaves permission_mode as the draft's picker value", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "acceptEdits",
+        mode: "default",
+      });
+
+      await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "claude",
+        expect.objectContaining({ permission_mode: "acceptEdits" }),
+      );
+    });
+
+    it("slice seeding mirrors the effective permission_mode (Plan boots into plan)", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions",
+        mode: "plan",
+      });
+
+      await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+      expect(actions.setPermissionMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "plan",
+      );
+      expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "plan",
+      );
+      expect(actions.setMode).toHaveBeenCalledWith(draft.threadId, "plan");
+    });
+
+    it("ChatAgent preset path also honours draft.mode", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions",
+        mode: "plan",
+      });
+      const preset = makePreset({ kind: "chat_agent" });
+
+      await materializeWithPreset(draft, preset, "hi", actions);
+
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "claude",
+        expect.objectContaining({ permission_mode: "plan" }),
+      );
+      expect(actions.setMode).toHaveBeenCalledWith(draft.threadId, "plan");
     });
   });
 

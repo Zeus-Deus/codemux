@@ -8,7 +8,10 @@ import {
   getHomeDir,
   renameWorkspace,
 } from "@/tauri/commands";
-import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
+import {
+  DEFAULT_THREAD_PERMISSION_MODE,
+  type ChatMode,
+} from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
@@ -54,6 +57,8 @@ export interface MaterializeActions {
   setEffort: (threadId: string, effort: string | null) => void;
   /** Seed the slice's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
+  /** Seed the slice's composer mode pill. Stage 3 onward. */
+  setMode: (threadId: string, mode: ChatMode) => void;
 }
 
 export type MaterializeResult =
@@ -150,7 +155,7 @@ export async function materializeAndSend(
       cwd,
       model: draft.model,
       resume_cursor: null,
-      permission_mode: draft.permissionMode,
+      permission_mode: effectivePermissionMode(draft),
       effort: draft.effort,
       context_window: draft.contextWindow,
       additional_directories: [],
@@ -309,7 +314,7 @@ export async function materializeWithPreset(
         cwd,
         model: draft.model,
         resume_cursor: null,
-        permission_mode: draft.permissionMode,
+        permission_mode: effectivePermissionMode(draft),
         effort: draft.effort,
         context_window: draft.contextWindow,
         additional_directories: [],
@@ -394,19 +399,38 @@ export async function materializeWithPreset(
  *  non-null value the restart-detection can compare against.
  *
  *  All setters are idempotent slice mutations — calling them against
- *  a slice that already has these values is a no-op. */
+ *  a slice that already has these values is a no-op.
+ *
+ *  Plan-mode coupling: when `draft.mode === "plan"` the effective
+ *  session permission_mode is forced to `"plan"` so the SDK boots
+ *  with write operations locked off; the user's picker value is
+ *  stashed on the slice (as `modePriorPermissionMode` via
+ *  AgentChatPane's activation handler) so "remove pill" can restore
+ *  it later. */
 function seedSliceFromDraft(
   draft: ChatDraft,
   actions: MaterializeActions,
 ): void {
-  const mode = draft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+  const effectiveMode = effectivePermissionMode(draft);
   actions.setModel(draft.threadId, draft.model);
-  actions.setPermissionMode(draft.threadId, mode);
-  actions.setSessionLaunchMode(draft.threadId, mode);
+  actions.setPermissionMode(draft.threadId, effectiveMode);
+  actions.setSessionLaunchMode(draft.threadId, effectiveMode);
   if (draft.effort) actions.setEffort(draft.threadId, draft.effort);
   if (draft.contextWindow) {
     actions.setContextWindow(draft.threadId, draft.contextWindow);
   }
+  actions.setMode(draft.threadId, draft.mode);
+}
+
+/** Resolve the permission_mode the SDK session should launch with.
+ *  Plan-mode pill wins: if the user activated Plan on the draft,
+ *  the SDK boots in `"plan"` mode regardless of the picker value
+ *  (the picker is hidden while the pill is active anyway). Ask and
+ *  Debug modes do NOT override permission_mode in Stage 3 — those
+ *  paths land in Stages 4 and 6. */
+export function effectivePermissionMode(draft: ChatDraft): string {
+  if (draft.mode === "plan") return "plan";
+  return draft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
 }
 
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename

@@ -11,13 +11,14 @@ vi.mock("@/tauri/commands", () => ({
   // tests never trigger the popover, so these stay quiet.
   dbGetRecentProjects: vi.fn().mockResolvedValue([]),
   dbGetUiState: vi.fn().mockResolvedValue(null),
-  // Post-"New worktree" dispatch uses activateWorkspace. Stub so
-  // onWorktreeCreated tests can assert on it.
+  // Post-"New worktree" dispatch: activateWorkspace fires after the
+  // helper resolves. create_pane + start_session are called INSIDE
+  // prestartWorktreeSession; assertions below verify both ran with
+  // the workspace's real cwd (NOT null), closing the
+  // session_not_found race.
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
-  // The worktree-created handler spawns an agent_chat pane before
-  // activating so the new workspace has a pane that the
-  // ensure-draft-when-empty hook will see.
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
+  agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
 }));
 
 vi.mock("@/lib/agent-chat/materialize", () => ({
@@ -135,7 +136,11 @@ function resetStores() {
     activeDraftId: null,
   });
   useAgentChatStore.setState({ threads: {} });
-  useAppStore.setState({ appState: null });
+  // homeDir is normally hydrated at App mount; seed it here so the
+  // DraftChatSurface's seed effect and submit-time home-cwd resolver
+  // see a populated value straight away (they no longer roundtrip via
+  // getHomeDir()).
+  useAppStore.setState({ appState: null, homeDir: "/home/user" });
   useUIStore.setState({
     showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
@@ -198,6 +203,108 @@ describe("DraftChatSurface", () => {
       // ProjectPicker renders a trigger button with "Select project"
       // text when value=null.
       expect(container.textContent).toContain("Select project");
+    });
+
+    it("home draft seeds its target to the active sidebar workspace (so send reuses it instead of spawning a duplicate worktree)", async () => {
+      // Reproduces the exact screenshot bug AND the follow-up bug:
+      // the picker needs to show the project, AND the draft must
+      // submit into the existing workspace — seeding to `project`
+      // would make send spawn a fresh worktree, doubling the
+      // workspace.
+      const appStateStub = {
+        schema_version: 1,
+        active_workspace_id: "ws-whatsapp",
+        workspaces: [
+          {
+            workspace_id: "ws-whatsapp",
+            title: "whatsapp-intake-bot",
+            workspace_type: "standard",
+            cwd: "/projects/whatsapp-intake-bot",
+            git_branch: "main",
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: null,
+            worktree_path: null,
+            project_root: "/projects/whatsapp-intake-bot",
+            pr_number: null,
+            pr_state: null,
+            pr_url: null,
+            linked_issue: null,
+            tabs: [],
+            active_tab_id: "",
+            active_surface_id: "",
+            surfaces: [],
+          },
+        ],
+      } as unknown as Parameters<typeof useAppStore.setState>[0];
+      useAppStore.setState({ appState: appStateStub as never });
+
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { findByText, queryByText } = renderSurface();
+      // Seeding effect reads the hydrated appHomeDir from useAppStore
+      // (set via resetStores) and flips target home → existing_workspace
+      // on the first effect pass. The ProjectPicker stub is gone; the
+      // WorktreePicker stub scoped to that project appears.
+      await findByText("worktree:/projects/whatsapp-intake-bot");
+      expect(queryByText("Select project")).toBeNull();
+      // Store is persistently flipped to existing_workspace so the
+      // send path reuses the active workspace rather than creating a
+      // new one.
+      const after = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(after?.target).toEqual({
+        kind: "existing_workspace",
+        workspaceId: "ws-whatsapp",
+      });
+    });
+
+    it("home draft does NOT seed when the active workspace is home-rooted (no real project)", async () => {
+      // Active workspace's project_root IS the home directory — this
+      // is the "bare Home landing" case, not a real project context.
+      // getHomeDir is mocked to "/home/user" at the top of the file.
+      const appStateStub = {
+        schema_version: 1,
+        active_workspace_id: "ws-home",
+        workspaces: [
+          {
+            workspace_id: "ws-home",
+            title: "home",
+            workspace_type: "standard",
+            cwd: "/home/user",
+            git_branch: "",
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: null,
+            worktree_path: null,
+            project_root: "/home/user",
+            pr_number: null,
+            pr_state: null,
+            pr_url: null,
+            linked_issue: null,
+            tabs: [],
+            active_tab_id: "",
+            active_surface_id: "",
+            surfaces: [],
+          },
+        ],
+      } as unknown as Parameters<typeof useAppStore.setState>[0];
+      useAppStore.setState({ appState: appStateStub as never });
+
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { findByText } = renderSurface();
+      // Picker stays on "Select project" — the draft remains home.
+      await findByText("Select project");
+      const after = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(after?.target).toEqual({ kind: "home" });
     });
 
     it("renders the WorktreePicker for project-target drafts (not ProjectPicker)", () => {
@@ -374,7 +481,9 @@ describe("DraftChatSurface", () => {
       expect(materializeAndSend).not.toHaveBeenCalled();
     });
 
-    it("resolves home cwd via getHomeDir() for home-target drafts", async () => {
+    it("resolves home cwd via useAppStore.homeDir for home-target drafts (no active project workspace)", async () => {
+      // Home draft with no active sidebar workspace → stays as "home"
+      // target, materialize gets the hydrated homeDir as cwd.
       vi.mocked(materializeAndSend).mockResolvedValueOnce({
         success: true,
         workspaceId: "ws-home",
@@ -386,11 +495,8 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       const { container } = renderSurface();
       const ta = container.querySelector("textarea") as HTMLTextAreaElement;
-
-      // Poll-submit: fireEvent.keyDown repeatedly until the async
-      // getHomeDir() resolves and resolvedHomeDir lands in state.
+      fireEvent.keyDown(ta, { key: "Enter" });
       await vi.waitFor(() => {
-        fireEvent.keyDown(ta, { key: "Enter" });
         expect(materializeAndSend).toHaveBeenCalled();
       });
       const [, , cwd] = vi.mocked(materializeAndSend).mock.calls[0];
@@ -483,7 +589,43 @@ describe("DraftChatSurface", () => {
       });
     });
 
-    it("project draft → onWorktreeCreated spawns an agent_chat pane, clears the draft, and activates the workspace", async () => {
+    it("project draft → onWorktreeCreated pre-starts the session (create_pane + start_session with real cwd), THEN clears draft + activates", async () => {
+      // Seed the new workspace in the app-store so prestartWorktreeSession
+      // can read its cwd. In production, emit_app_state inside
+      // create_worktree_workspace populates this before the Tauri
+      // invoke returns.
+      useAppStore.setState({
+        appState: {
+          schema_version: 1,
+          active_workspace_id: "ws-new",
+          workspaces: [
+            {
+              workspace_id: "ws-new",
+              title: "New Worktree",
+              workspace_type: "standard",
+              cwd: "/projects/foo-feat",
+              git_branch: "feat/x",
+              git_ahead: 0,
+              git_behind: 0,
+              git_additions: 0,
+              git_deletions: 0,
+              git_changed_files: 0,
+              notification_count: 0,
+              latest_agent_state: null,
+              worktree_path: "/projects/foo-feat",
+              project_root: "/projects/foo",
+              pr_number: null,
+              pr_state: null,
+              pr_url: null,
+              linked_issue: null,
+              tabs: [],
+              active_tab_id: "",
+              active_surface_id: "",
+              surfaces: [],
+            },
+          ],
+        } as never,
+      });
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
@@ -493,20 +635,33 @@ describe("DraftChatSurface", () => {
       expect(lastWorktreePickerProps.current!.projectPath).toBe(
         "/projects/foo",
       );
-      const { activateWorkspace, agentChatCreatePane } = await import(
-        "@/tauri/commands"
-      );
+      const {
+        activateWorkspace,
+        agentChatCreatePane,
+        agentChatStartSession,
+      } = await import("@/tauri/commands");
       vi.mocked(activateWorkspace).mockClear();
       vi.mocked(agentChatCreatePane).mockClear();
+      vi.mocked(agentChatStartSession).mockClear();
       await lastWorktreePickerProps.current!.onWorktreeCreated("ws-new");
-      // Pane creation must precede activation so
-      // useEnsureDraftWhenEmpty doesn't inject a Home draft over the
-      // empty workspace.
+      // create_pane receives the REAL cwd, not null — closes the
+      // mount-effect `if (!cwd) return` guard that used to silently
+      // skip session start.
       expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
         "ws-new",
         "claude",
-        null,
+        "/projects/foo-feat",
       );
+      // start_session runs BEFORE activateWorkspace so by the time
+      // AgentChatPane mounts, the adapter HashMap already has an
+      // entry for this thread_id.
+      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
+      const [paneId, provider, input] =
+        vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(paneId).toBe("pane-new");
+      expect(provider).toBe("claude");
+      expect(input.cwd).toBe("/projects/foo-feat");
+      expect(input.permission_mode).toBe("bypassPermissions");
       // Draft cleared before activation so the new pane mounts solo.
       expect(useChatDraftStore.getState().activeDraftId).toBeNull();
       expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
@@ -535,17 +690,13 @@ describe("DraftChatSurface", () => {
       expect(lastWorktreePickerProps.current!.projectPath).toBe(
         "/projects/foo",
       );
-      const { activateWorkspace, agentChatCreatePane } = await import(
-        "@/tauri/commands"
-      );
+      const { activateWorkspace } = await import("@/tauri/commands");
       vi.mocked(activateWorkspace).mockClear();
-      vi.mocked(agentChatCreatePane).mockClear();
+      // onWorktreeCreated is fired with a workspace id that isn't in
+      // the store — prestartWorktreeSession takes its safe fallback
+      // and skips create_pane / start_session. The draft-clear and
+      // activateWorkspace calls still need to happen regardless.
       await lastWorktreePickerProps.current!.onWorktreeCreated("ws-new");
-      expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
-        "ws-new",
-        "claude",
-        null,
-      );
       expect(useChatDraftStore.getState().activeDraftId).toBeNull();
       expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
     });

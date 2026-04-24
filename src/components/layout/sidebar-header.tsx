@@ -8,7 +8,7 @@ import {
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { Plus } from "lucide-react";
+import { Home } from "lucide-react";
 
 export function SidebarHeader() {
   const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
@@ -43,23 +43,28 @@ export function SidebarHeader() {
 
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
-      {/* + New Workspace row */}
+      {/* Home-chat entry row. Distinguished from per-project "+"
+          buttons (which create project-scoped chats) by the house
+          icon and "Home" label — the action always opens a Home
+          draft rooted at $HOME regardless of active project
+          context. Shift+click still falls through to the
+          New Workspace dialog (legacy / CLI path). */}
       <Tooltip>
         <TooltipTrigger asChild>
           <Button
             variant="ghost"
-            aria-label="New workspace"
+            aria-label="New agent"
             className="w-full justify-start pl-3 pr-2 py-3 h-auto text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
             onClick={handlePlusClick}
           >
             <div className="size-6 flex items-center justify-center shrink-0 mr-2.5">
-              <Plus className="h-3.5 w-3.5" />
+              <Home className="h-3.5 w-3.5" />
             </div>
-            <span>New Workspace</span>
+            <span>New Agent</span>
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-          New workspace
+          New chat in home directory · Shift+click for workspace dialog
         </TooltipContent>
       </Tooltip>
       <SidebarSeparator />

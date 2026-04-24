@@ -1,0 +1,342 @@
+import { useState } from "react";
+import {
+  BookOpen,
+  Check,
+  CheckSquare,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  FileText,
+  FolderSearch,
+  Globe,
+  Loader2,
+  Pencil,
+  Search,
+  Terminal,
+  Wrench,
+  X,
+  type LucideIcon,
+} from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import type {
+  PermissionRequestItem,
+  ToolCallItem,
+} from "@/lib/agent-chat/types";
+import type { ApprovalDecision } from "@/tauri/events";
+
+import { ToolCallBlock } from "./ToolCallBlock";
+import { ToolCallStatus } from "./ToolCallStatus";
+
+interface Props {
+  item: ToolCallItem;
+  /** Resolved from the slice by matching `item.approval_request_id`
+   *  against the thread's permission requests. `null` when the tool
+   *  call is not gated (bypassPermissions mode) or the request event
+   *  hasn't landed yet. */
+  approval: PermissionRequestItem | null;
+  onDecide: (decision: ApprovalDecision) => void;
+}
+
+/**
+ * Stage 1 merged card — tool call header, result body, and inline
+ * approval footer in one row. Replaces the two stacked rows that the
+ * prior ToolCallStatus + ToolCallBlock + PermissionRequestBlock
+ * arrangement produced.
+ *
+ * Six visual states driven by `(approval.resolution, item.status)`:
+ *
+ *   pending_approval  approval=pending           → header + expanded input + Allow/Deny
+ *   responding        approval=responding        → header + "Submitting decision…"
+ *   denied            approval=resolved & deny   → header with strike-through + one-liner
+ *   executing         no approval & status=running → header + spinner, body collapsed
+ *   success           status=done                → header + check, body collapsed, expandable
+ *   error             status=error               → header with muted-red target + X, body expanded
+ */
+export function ToolCallCard({ item, approval, onDecide }: Props) {
+  const resolution = approval?.resolution;
+  const isPendingApproval = resolution?.state === "pending";
+  const isResponding = resolution?.state === "responding";
+  const isDenied =
+    resolution?.state === "resolved" && resolution.decision.decision !== "allow";
+  const isExecuting = !isPendingApproval && !isResponding && !isDenied && item.status === "running";
+  const isSuccess = item.status === "done";
+  const isError = item.status === "error";
+
+  // Default collapsed behavior per Stage 1 spec:
+  //  - pending_approval: expanded so user can see what they're approving.
+  //  - error: expanded (auto-expand on error).
+  //  - everything else: collapsed; user can toggle.
+  const defaultExpanded = isPendingApproval || isError;
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  const Icon = TOOL_ICONS[item.tool_name] ?? FALLBACK_ICON;
+  const StatusGlyph = glyphForState({
+    isPendingApproval,
+    isResponding,
+    isDenied,
+    isExecuting,
+    isSuccess,
+    isError,
+  });
+
+  const hasResultBody = hasRenderableContent(item.result_content);
+  const inputText = hasRenderableInput(item.input)
+    ? safeStringify(item.input)
+    : null;
+  const canExpand = hasResultBody || inputText !== null;
+
+  return (
+    <div className="space-y-1">
+      {/* Header row: icon · status-line · glyph · chevron, all hugging
+          left. `min-w-0 truncate` on the label lets long commands
+          ellipsize rather than push the trailing glyphs off-screen. */}
+      <div className="flex items-center gap-2 min-w-0">
+        <Icon
+          className={cn(
+            "h-3 w-3 shrink-0",
+            isDenied ? "text-muted-foreground/50" : "text-muted-foreground",
+          )}
+          aria-hidden
+        />
+        <div
+          className={cn(
+            "min-w-0 truncate",
+            isDenied && "line-through text-muted-foreground/60",
+          )}
+        >
+          <ToolCallStatus item={item} />
+        </div>
+        {StatusGlyph && (
+          <StatusGlyph
+            className={cn(
+              "h-3 w-3 shrink-0 text-muted-foreground",
+              isExecuting && "animate-spin",
+            )}
+            aria-hidden
+          />
+        )}
+        {canExpand && !isPendingApproval && !isResponding && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="shrink-0 text-muted-foreground/60 hover:text-foreground"
+            aria-label={expanded ? "Collapse" : "Expand"}
+          >
+            {expanded ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+          </button>
+        )}
+      </div>
+
+      {/* Approval footer (pending) */}
+      {isPendingApproval && (
+        <ApprovalFooter
+          inputText={inputText}
+          onDecide={onDecide}
+          toolName={item.tool_name}
+        />
+      )}
+
+      {/* In-flight decision marker */}
+      {isResponding && (
+        <div className="py-0.5 text-xs text-muted-foreground/70">
+          Submitting decision…
+        </div>
+      )}
+
+      {/* Denied terminal state */}
+      {isDenied && resolution?.state === "resolved" && (
+        <div className="py-0.5 text-xs text-muted-foreground">
+          {denialLabel(resolution.decision)}
+        </div>
+      )}
+
+      {/* Result body when expanded */}
+      {expanded && !isPendingApproval && !isResponding && !isDenied && (
+        <>
+          {inputText !== null && !hasResultBody && (
+            <ToolCallBlock content={null} text={inputText} />
+          )}
+          {hasResultBody && (
+            <ToolCallBlock
+              content={item.result_content}
+              error={isError}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Approval footer
+// ---------------------------------------------------------------------------
+
+interface ApprovalFooterProps {
+  inputText: string | null;
+  toolName: string;
+  onDecide: (decision: ApprovalDecision) => void;
+}
+
+function ApprovalFooter({ inputText, onDecide }: ApprovalFooterProps) {
+  const [denying, setDenying] = useState(false);
+  const [reason, setReason] = useState("");
+
+  const allow = () => onDecide({ decision: "allow" });
+  const allowSession = () => onDecide({ decision: "allow_for_session" });
+  const confirmDeny = () =>
+    onDecide({ decision: "deny", message: reason || "User denied" });
+
+  return (
+    <div className="rounded-md bg-muted/30 p-3 space-y-2">
+      {inputText !== null && (
+        <ToolCallBlock content={null} text={inputText} />
+      )}
+      {!denying ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={allow}
+          >
+            Allow
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={allowSession}
+          >
+            Allow for session
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={() => setDenying(true)}
+          >
+            Deny
+          </Button>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <textarea
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Reason (optional)"
+            className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-xs text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
+            rows={2}
+          />
+          <div className="flex items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-3 text-xs"
+              onClick={() => {
+                setDenying(false);
+                setReason("");
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 px-3 text-xs"
+              onClick={confirmDeny}
+            >
+              Confirm deny
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const TOOL_ICONS: Record<string, LucideIcon> = {
+  Read: FileText,
+  Write: Pencil,
+  Edit: Pencil,
+  MultiEdit: Pencil,
+  Bash: Terminal,
+  Glob: FolderSearch,
+  Grep: Search,
+  WebFetch: Globe,
+  WebSearch: Globe,
+  TodoWrite: CheckSquare,
+  NotebookEdit: BookOpen,
+};
+const FALLBACK_ICON: LucideIcon = Wrench;
+
+function glyphForState(states: {
+  isPendingApproval: boolean;
+  isResponding: boolean;
+  isDenied: boolean;
+  isExecuting: boolean;
+  isSuccess: boolean;
+  isError: boolean;
+}): LucideIcon | null {
+  if (states.isPendingApproval) return Clock;
+  if (states.isResponding) return Loader2;
+  if (states.isExecuting) return Loader2;
+  if (states.isSuccess) return Check;
+  if (states.isError) return X;
+  if (states.isDenied) return X;
+  return null;
+}
+
+function denialLabel(decision: ApprovalDecision): string {
+  switch (decision.decision) {
+    case "deny":
+      return `Denied${decision.message ? `: ${decision.message}` : ""}`;
+    case "cancel":
+      return "Cancelled";
+    // `allow` / `allow_for_session` would never land here because
+    // the caller checks for `decision !== "allow"` before rendering
+    // this branch — but the switch is exhaustive so TypeScript
+    // doesn't narrow against it.
+    case "allow":
+    case "allow_for_session":
+      return "Allowed";
+  }
+}
+
+function hasRenderableContent(content: unknown): boolean {
+  if (content == null) return false;
+  if (typeof content === "string") return content.length > 0;
+  if (Array.isArray(content)) return content.length > 0;
+  return true;
+}
+
+function hasRenderableInput(input: unknown): boolean {
+  if (input == null) return false;
+  if (typeof input === "object") {
+    return Object.keys(input as Record<string, unknown>).length > 0;
+  }
+  return true;
+}
+
+function safeStringify(v: unknown): string {
+  try {
+    return JSON.stringify(v, null, 2);
+  } catch {
+    return String(v);
+  }
+}
