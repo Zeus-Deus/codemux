@@ -27,6 +27,7 @@ import { cn } from "@/lib/utils";
 import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
 import {
   activateWorkspace,
+  checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
   renameWorkspace,
@@ -39,6 +40,8 @@ import { useAppStore } from "@/stores/app-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
+import { toast } from "@/lib/toast";
+import { useDefaultBranch } from "./default-branch-cache";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -191,7 +194,7 @@ function RemoveWorkspaceDialog({
   );
 }
 
-function WorkspaceContextMenuItems({
+export function WorkspaceContextMenuItems({
   workspace,
   onRemoveRequest,
 }: {
@@ -199,6 +202,13 @@ function WorkspaceContextMenuItems({
   onRemoveRequest: () => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
+  const isWorktree = !!workspace.worktree_path;
+  // Default-branch lookup is scoped to the project_root (the real repo root
+  // shared by all workspaces pointing at the same repo). Falls back to cwd
+  // for primary workspaces that haven't had project_root stamped yet.
+  const defaultBranch = useDefaultBranch(
+    workspace.project_root ?? (isWorktree ? null : workspace.cwd),
+  );
 
   useEffect(() => {
     detectEditors().then(setEditors).catch(console.error);
@@ -220,6 +230,26 @@ function WorkspaceContextMenuItems({
   const handleOpenInEditor = (editorId: string) => {
     openInEditor(editorId, workspace.cwd).catch(console.error);
   };
+
+  const handleCheckoutDefault = async () => {
+    try {
+      const branch = await checkoutDefaultBranchInWorkspace(workspace.workspace_id);
+      toast.success(`Switched to ${branch}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Couldn't switch: ${message}`);
+    }
+  };
+
+  // Show the "Checkout default branch" action only for primary workspaces
+  // (worktree workspaces live on a fixed branch by design — swapping their
+  // HEAD would break the Codemux worktree model). Disable when we already
+  // know we're on the default branch — gated on `defaultBranch` being
+  // resolved so the action stays clickable while the fetch is pending, and
+  // the backend's `Ok(None)` guard handles the "actually on default" edge.
+  const showCheckoutDefault = !isWorktree;
+  const isOnDefault =
+    defaultBranch !== null && workspace.git_branch === defaultBranch;
 
   return (
     <ContextMenuContent>
@@ -248,6 +278,14 @@ function WorkspaceContextMenuItems({
       >
         Copy branch name
       </ContextMenuItem>
+      {showCheckoutDefault && (
+        <ContextMenuItem
+          onClick={handleCheckoutDefault}
+          disabled={isOnDefault}
+        >
+          Checkout default branch
+        </ContextMenuItem>
+      )}
       <ContextMenuItem
         onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
       >

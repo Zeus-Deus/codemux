@@ -1,17 +1,20 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, act, cleanup } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // Mock Tauri commands
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  checkoutDefaultBranchInWorkspace: vi.fn().mockResolvedValue("main"),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   detectEditors: vi.fn().mockResolvedValue([]),
+  getDefaultBranch: vi.fn().mockResolvedValue("main"),
   openInEditor: vi.fn().mockResolvedValue(undefined),
+  runWorkspaceSetup: vi.fn().mockResolvedValue(undefined),
   dbGetUiState: vi.fn().mockResolvedValue(null),
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
   getGithubIssue: vi.fn().mockResolvedValue({
@@ -19,6 +22,24 @@ vi.mock("@/tauri/commands", () => ({
     url: "https://github.com/u/r/issues/92", body: null,
   }),
 }));
+
+// `useDefaultBranch` uses a module-level cache; reset between suites so a
+// mock return from a prior test doesn't leak in.
+import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
+import { beforeEach } from "vitest";
+beforeEach(() => __resetDefaultBranchCacheForTests());
+
+// Flush pending microtasks + unmount before the next test so late-resolving
+// `getDefaultBranch` promises finish their React update inside the jsdom
+// lifetime instead of after teardown (which would log a spurious
+// "window is not defined" from React's scheduler).
+afterEach(async () => {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  cleanup();
+});
 
 // Mock stores
 vi.mock("@/stores/ui-store", () => ({

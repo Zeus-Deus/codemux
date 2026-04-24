@@ -267,6 +267,15 @@ export const detectPackageManager = (projectPath: string) =>
 export const reorderWorkspaces = (workspaceIds: string[]) =>
   invoke("reorder_workspaces", { workspaceIds });
 
+// Switch a primary workspace's repo to its default branch. Returns the
+// branch name on success. Rejects with git's stderr when the checkout is
+// refused (dirty conflicts, rebase in progress, etc.) so the caller can
+// toast the message verbatim. The backend refreshes git info synchronously
+// before returning, so the sidebar label updates without waiting for the
+// 5s polling tick.
+export const checkoutDefaultBranchInWorkspace = (workspaceId: string) =>
+  invoke<string>("checkout_default_branch_in_workspace", { workspaceId });
+
 // ── GitHub ──
 
 export const checkGhStatus = () =>
