@@ -709,6 +709,7 @@ pub fn run() {
             commands::git_discard_file,
             commands::git_log_entries,
             commands::refresh_workspace_git_info,
+            commands::checkout_default_branch_in_workspace,
             commands::create_browser_pane,
             commands::browser_open_url,
             commands::browser_history_back,

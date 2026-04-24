@@ -1340,7 +1340,12 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
 
 /// Find the remote tracking ref for a branch (e.g. `origin/main` for `main`).
 /// Find the default branch for the repo (main, master, etc.).
-fn find_default_branch(repo_path: &Path) -> Option<String> {
+/// `pub(crate)` so helpers outside the branch-ops module (e.g.
+/// `checkout_default_branch`) can reuse the same resolution logic. Does NOT
+/// supersede `git_default_branch` — that one is the frontend-facing command
+/// with a slightly different fallback (`Ok("main")` instead of `None`).
+/// Consolidating the two is a separate follow-up.
+pub(crate) fn find_default_branch(repo_path: &Path) -> Option<String> {
     // Try origin/HEAD first
     if let Ok(output) = run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         if let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/") {
@@ -1354,6 +1359,29 @@ fn find_default_branch(repo_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Switch the repo to its default branch (main / master / whatever
+/// `origin/HEAD` points at). Returns:
+/// - `Ok(Some(branch_name))` on success, or if the repo is already on the
+///   default branch (no checkout actually runs in the already-on-default case).
+/// - `Ok(None)` if no default branch could be determined (unborn HEAD, no
+///   main/master, no `origin/HEAD` symref).
+/// - `Err(stderr)` if git refused the checkout — dirty working tree with
+///   conflicts, rebase/merge in progress, `index.lock` contention, etc. The
+///   error string is passed through verbatim so callers can surface git's
+///   own message. Never destructive: git's native refusal protects work.
+pub fn checkout_default_branch(repo_path: &Path) -> Result<Option<String>, String> {
+    let default = match find_default_branch(repo_path) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let current = run_git_permissive(repo_path, &["branch", "--show-current"]);
+    if current == default {
+        return Ok(Some(default));
+    }
+    run_git(repo_path, &["checkout", &default])?;
+    Ok(Some(default))
 }
 
 /// Returns `None` if no remote ref exists. Only checks `origin` remote
@@ -4595,5 +4623,135 @@ TARGET version
         assert_eq!(cur, source);
         let content = std::fs::read_to_string(repo.join("shared.txt")).unwrap();
         assert_eq!(content, "RESOLVED version\n");
+    }
+
+    // ---- checkout_default_branch ----
+
+    /// Clean feature-branch repo → checkout_default_branch switches HEAD
+    /// back to the default and returns the branch name.
+    #[test]
+    fn checkout_default_branch_switches_from_feature_to_default() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let default = main_branch(&repo).to_string();
+
+        run_git(&repo, &["checkout", "-b", "feature/x"]).expect("create feature");
+        let current = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(current, "feature/x");
+
+        let result = checkout_default_branch(&repo).expect("checkout should succeed");
+        assert_eq!(result, Some(default.clone()));
+
+        let after = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(after, default, "HEAD should be on default branch");
+    }
+
+    /// Already on default → returns Ok(Some(default)) without running a
+    /// no-op checkout. Verified by checking the reflog is unchanged.
+    #[test]
+    fn checkout_default_branch_noop_when_already_on_default() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let default = main_branch(&repo).to_string();
+        let current = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(current, default, "precondition: should start on default");
+
+        // Snapshot HEAD reflog count before the call.
+        let reflog_before = run_git_permissive(&repo, &["reflog", "HEAD"])
+            .lines()
+            .count();
+
+        let result = checkout_default_branch(&repo).expect("checkout should succeed");
+        assert_eq!(result, Some(default));
+
+        let reflog_after = run_git_permissive(&repo, &["reflog", "HEAD"])
+            .lines()
+            .count();
+        assert_eq!(
+            reflog_before, reflog_after,
+            "no-op path must not add a reflog entry for a redundant checkout"
+        );
+    }
+
+    /// Repo with no commits / no branches / no remote → find_default_branch
+    /// returns None → helper returns Ok(None) instead of Err or panic.
+    #[test]
+    fn checkout_default_branch_returns_none_when_no_default_exists() {
+        let dir = TempDir::new().expect("tmp");
+        let repo = dir.path().to_path_buf();
+        run_git(&repo, &["init"]).expect("init");
+        // No initial commit, no origin, no main/master branch.
+
+        let result = checkout_default_branch(&repo).expect("should not Err on unborn repo");
+        assert!(result.is_none(), "expected None, got {:?}", result);
+    }
+
+    /// Uncommitted change that conflicts with a tracked file on the default
+    /// branch → git refuses → Err(stderr) bubbles up, current branch is
+    /// unchanged.
+    #[test]
+    fn checkout_default_branch_errs_on_dirty_conflict_and_preserves_branch() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let default = main_branch(&repo).to_string();
+
+        // Create tracked file on default.
+        std::fs::write(repo.join("shared.txt"), "default content\n").unwrap();
+        run_git(&repo, &["add", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "add shared on default"]).unwrap();
+
+        // Feature branch with no shared.txt yet.
+        run_git(&repo, &["checkout", "-b", "feature/x"]).unwrap();
+        run_git(&repo, &["rm", "shared.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "remove shared on feature"]).unwrap();
+
+        // Now create an *untracked* file at the same path — checkout would
+        // have to overwrite it, which git refuses.
+        std::fs::write(repo.join("shared.txt"), "local dirty content\n").unwrap();
+
+        let err = checkout_default_branch(&repo).expect_err("should refuse to overwrite");
+        assert!(
+            err.contains("would be overwritten") || err.contains("Aborting"),
+            "expected git's 'would be overwritten' message, got: {err}"
+        );
+
+        let after = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(after, "feature/x", "branch must be unchanged after failed checkout");
+        let _ = default; // silence unused binding
+    }
+
+    /// `origin/HEAD` pointing at `develop` → we switch to `develop`, not
+    /// main. This is the "custom default name" case.
+    #[test]
+    fn checkout_default_branch_uses_origin_head_for_non_standard_default() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+        git_config(&local);
+
+        // Create a `develop` branch, push it, then point origin/HEAD at it.
+        run_git(&local, &["checkout", "-b", "develop"]).expect("create develop");
+        std::fs::write(local.join("d.txt"), "dev").unwrap();
+        run_git(&local, &["add", "d.txt"]).unwrap();
+        run_git(&local, &["commit", "-m", "dev commit"]).unwrap();
+        run_git(&local, &["push", "-u", "origin", "develop"]).expect("push develop");
+
+        // Force origin/HEAD → refs/remotes/origin/develop.
+        run_git(
+            &local,
+            &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/develop"],
+        )
+        .expect("set origin/HEAD to develop");
+
+        // Switch to a feature branch so we're not already on develop.
+        run_git(&local, &["checkout", "-b", "feature/custom-default"]).expect("feature");
+
+        let result = checkout_default_branch(&local).expect("checkout should succeed");
+        assert_eq!(
+            result,
+            Some("develop".to_string()),
+            "should resolve default via origin/HEAD, not hardcoded main/master"
+        );
+
+        let after = run_git_permissive(&local, &["branch", "--show-current"]);
+        assert_eq!(after, "develop");
     }
 }

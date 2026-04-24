@@ -1023,6 +1023,45 @@ pub fn refresh_workspace_git_info(
     Ok(())
 }
 
+/// Switch a workspace's repo to its default branch (main / master / origin
+/// HEAD). On success, refresh git info synchronously so the sidebar label
+/// updates without waiting for the 5s polling loop. On failure, return the
+/// git stderr verbatim for the frontend to surface as a toast.
+///
+/// Used by the sidebar's right-click "Checkout default branch" action to
+/// close the intent gap where `Open ↵ main` attaches to a repo currently on
+/// a different branch (attach-only by design — no HEAD mutation).
+#[tauri::command]
+pub fn checkout_default_branch_in_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<String, String> {
+    let cwd = {
+        let snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.cwd.clone())
+            .ok_or_else(|| "Workspace not found".to_string())?
+    };
+    let repo_path = Path::new(&cwd);
+
+    match crate::git::checkout_default_branch(repo_path) {
+        Ok(Some(branch)) => {
+            // Sync refresh: closes the 0–5s sidebar-label lag from the
+            // background polling loop by writing fresh branch info before
+            // we emit.
+            populate_git_info(&state, &workspace_id, repo_path);
+            crate::state::emit_app_state(&app);
+            Ok(branch)
+        }
+        Ok(None) => Err("No default branch could be determined for this repo.".to_string()),
+        Err(stderr) => Err(stderr),
+    }
+}
+
 // ---- Editor integration ----
 
 #[derive(Debug, Clone, Serialize)]
