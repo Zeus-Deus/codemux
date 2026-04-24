@@ -7,6 +7,7 @@ import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import {
+  agentChatListMessages,
   agentChatStartSession,
   agentChatStopSession,
   closePane,
@@ -76,6 +77,28 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
         useAgentChatStore.getState().resetThread(pane.thread_id);
       }
       const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+      // Hydrate the new slice with the picked session's persisted
+      // transcript BEFORE we kick off the provider — that way the
+      // pane renders the full history immediately, instead of going
+      // blank for the second or two it takes the SDK to boot. We
+      // hydrate against the picked thread id (where the messages
+      // live in SQLite); on the upcoming `ResumeCursorUpdated`,
+      // `collapse_duplicate_agent_chat_sessions` migrates those
+      // rows over to the new thread id so future history-list calls
+      // still see them.
+      try {
+        const payloads = await agentChatListMessages(record.thread_id);
+        if (payloads.length > 0) {
+          useAgentChatStore
+            .getState()
+            .hydrateThread(newLocalThreadId, payloads);
+        }
+      } catch (err) {
+        // Hydration failure is non-fatal — the SDK still has the
+        // server-side context, the user just won't see the
+        // historical transcript. Log so it's debuggable.
+        console.warn("[agent-chat] hydrate on resume failed:", err);
+      }
       await agentChatStartSession(pane.pane_id, provider, {
         thread_id: newLocalThreadId,
         cwd,
@@ -87,13 +110,9 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
       });
       // `agent_chat_start_session` writes the new thread id back onto
       // the pane snapshot; AgentChatPane's prop-sync effect picks it
-      // up automatically.
-      //
-      // The SDK restores context server-side (the model will
-      // remember the prior conversation) but does NOT replay the
-      // transcript locally — so the pane goes empty. Surface a
-      // toast so the user has visible confirmation the resume
-      // actually took effect.
+      // up automatically. The replayed transcript is already in the
+      // store under `newLocalThreadId`, so MessageList renders it
+      // the moment the pane re-reads `pane.thread_id`.
       toast.success(
         `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
       );

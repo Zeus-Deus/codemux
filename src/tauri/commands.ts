@@ -996,3 +996,15 @@ export const agentChatRenameSession = (threadId: string, title: string) =>
 
 export const agentChatDeleteSession = (threadId: string) =>
   invoke<void>("agent_chat_delete_session", { threadId });
+
+/**
+ * Return the persisted message envelopes for a thread, in original
+ * insertion order. Each element is a JSON-encoded envelope: either a
+ * canonical `ProviderRuntimeEvent` (`item_completed`, `turn_completed`,
+ * `request_opened`, `request_resolved`) or a synthetic
+ * `{type: "user_message", text: ...}` record. The frontend hydrate
+ * action replays each payload through the agent-chat reducer to
+ * rebuild the visible transcript on resume.
+ */
+export const agentChatListMessages = (threadId: string) =>
+  invoke<string[]>("agent_chat_list_messages", { threadId });

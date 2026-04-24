@@ -295,6 +295,7 @@ pub async fn agent_chat_send_turn(
     // Capture the inputs we need for persistence before the provider
     // consumes `input`.
     let thread_id_for_persist = input.thread_id.0.clone();
+    let user_text_for_persist = input.text.clone();
     let first_line = first_line_title(&input.text);
     let turn = impl_.send_turn(input).await.map_err(provider_err)?;
 
@@ -308,6 +309,19 @@ pub async fn agent_chat_send_turn(
         if let Some(title) = first_line {
             let _ = db.set_agent_chat_title(&thread_id_for_persist, &title);
         }
+    }
+    // Persist the user message envelope. User messages never come
+    // back through the provider event stream, so this is the one
+    // chance to record them. Best-effort: a failed write means
+    // resume will skip this user turn but the live conversation is
+    // unaffected.
+    let user_msg = serde_json::json!({
+        "type": "user_message",
+        "thread_id": thread_id_for_persist,
+        "text": user_text_for_persist,
+    });
+    if let Ok(payload) = serde_json::to_string(&user_msg) {
+        let _ = db.append_agent_chat_message(&thread_id_for_persist, &payload);
     }
     Ok(turn.turn_id)
 }
@@ -492,12 +506,34 @@ pub async fn agent_chat_rename_session(
 /// Delete a persisted chat session. Idempotent. Note this does not
 /// stop a live session — the UI should call `agent_chat_stop_session`
 /// first if the row being deleted is the current pane's active chat.
+/// Persisted messages cascade-delete from the FK on agent_chat_messages.
 #[tauri::command]
 pub async fn agent_chat_delete_session(
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
     db.delete_agent_chat_session(&thread_id)
+}
+
+/// Return the persisted transcript for a thread.
+///
+/// Each element is a JSON-encoded envelope — typically a
+/// `ProviderRuntimeEvent` (`ItemCompleted`, `TurnCompleted`,
+/// `RequestOpened`, `RequestResolved`) or a synthetic
+/// `{"type":"user_message","text":...}` record. The frontend's
+/// hydrate action parses each payload and dispatches it through the
+/// same pure reducer that handles live events, rebuilding the
+/// transcript for resume.
+///
+/// Not gated on the feature flag for the same reason as
+/// `agent_chat_list_sessions` — the dropdown should silently render
+/// an empty list rather than surfacing a feature-flag error string.
+#[tauri::command]
+pub async fn agent_chat_list_messages(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Vec<String>, String> {
+    Ok(db.list_agent_chat_messages(&thread_id))
 }
 
 // ── Event bridge ──────────────────────────────────────────────────────
@@ -570,6 +606,30 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
+    // Best-effort transcript persistence so the SessionSelector resume
+    // path can replay the visible conversation. We only persist events
+    // that mutate the rendered transcript; partial deltas, lifecycle
+    // notices, and runtime warnings are skipped:
+    //   - content_delta: replaced by the trailing item_completed
+    //   - session_state_changed / session_configured: lifecycle only
+    //   - runtime_warning: console-only by design
+    //   - resume_cursor_updated: already persisted above
+    if should_persist_event(&event) {
+        if let Some(thread_id) = thread_id_for_event(&event) {
+            if !thread_id.0.is_empty() {
+                if let Ok(payload) = serde_json::to_string(&event) {
+                    let db: State<'_, DatabaseStore> = app.state();
+                    if let Err(error) =
+                        db.append_agent_chat_message(&thread_id.0, &payload)
+                    {
+                        eprintln!(
+                            "[codemux::agent_chat] failed to persist message: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -579,6 +639,19 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
         eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
     }
+}
+
+/// Whether a canonical provider event should be written to
+/// `agent_chat_messages`. Extracted so the policy is unit-testable
+/// without an `AppHandle`.
+pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
+    matches!(
+        event,
+        ProviderRuntimeEvent::ItemCompleted { .. }
+            | ProviderRuntimeEvent::TurnCompleted { .. }
+            | ProviderRuntimeEvent::RequestOpened { .. }
+            | ProviderRuntimeEvent::RequestResolved { .. }
+    )
 }
 
 /// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
@@ -685,5 +758,154 @@ mod tests {
         assert_eq!(extract_sdk_session_id(&json!({})), None);
         assert_eq!(extract_sdk_session_id(&json!("just-a-string")), None);
         assert_eq!(extract_sdk_session_id(&json!({"resume": 42})), None);
+    }
+
+    // ── should_persist_event policy ──
+    //
+    // Pinned tests: changing this filter changes the on-disk format
+    // contract. Adding a transcript-relevant variant means flipping
+    // its case here AND adding a hydrate-side handler in the
+    // frontend `replayPayloads` tests. Adding a UI-only variant
+    // means adding a `not persisted` row.
+
+    use crate::agent_provider::events::{
+        CompletedItem, ContentDelta, TurnStatus, TurnUsage,
+    };
+    use crate::agent_provider::types::{
+        ApprovalDecision, ProviderSessionId, RequestId, SessionStatus,
+    };
+
+    fn tid() -> ThreadId {
+        ThreadId("t".into())
+    }
+    fn turn() -> TurnId {
+        TurnId("turn-1".into())
+    }
+    fn req() -> RequestId {
+        RequestId("req-1".into())
+    }
+
+    #[test]
+    fn should_persist_item_completed_assistant_text() {
+        let e = ProviderRuntimeEvent::ItemCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            item: CompletedItem::AssistantText {
+                text: "hi".into(),
+            },
+        };
+        assert!(should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_persist_item_completed_tool_use_and_result() {
+        let tool_use = ProviderRuntimeEvent::ItemCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            item: CompletedItem::ToolUse {
+                tool_name: "Read".into(),
+                input: json!({"path": "/x"}),
+                tool_use_id: "tu-1".into(),
+            },
+        };
+        assert!(should_persist_event(&tool_use));
+        let tool_result = ProviderRuntimeEvent::ItemCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            item: CompletedItem::ToolResult {
+                tool_use_id: "tu-1".into(),
+                content: json!("ok"),
+                is_error: false,
+            },
+        };
+        assert!(should_persist_event(&tool_result));
+    }
+
+    #[test]
+    fn should_persist_turn_completed() {
+        let e = ProviderRuntimeEvent::TurnCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            status: TurnStatus::Success,
+            usage: Some(TurnUsage {
+                total_cost_usd: None,
+                duration_ms: 1,
+                num_turns: 1,
+            }),
+        };
+        assert!(should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_persist_request_open_and_resolve() {
+        let opened = ProviderRuntimeEvent::RequestOpened {
+            thread_id: tid(),
+            turn_id: turn(),
+            request_id: req(),
+            request_kind: "tool".into(),
+            payload: json!({}),
+            tool_use_id: None,
+        };
+        assert!(should_persist_event(&opened));
+        let resolved = ProviderRuntimeEvent::RequestResolved {
+            thread_id: tid(),
+            request_id: req(),
+            decision: ApprovalDecision::AllowForSession,
+        };
+        assert!(should_persist_event(&resolved));
+    }
+
+    #[test]
+    fn should_not_persist_content_delta() {
+        // Replaced by the trailing item_completed (assistant_text).
+        // Persisting both would produce duplicates on replay.
+        let e = ProviderRuntimeEvent::ContentDelta {
+            thread_id: tid(),
+            turn_id: turn(),
+            delta: ContentDelta::Text { text: "hi".into() },
+        };
+        assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_not_persist_session_state_changed() {
+        let e = ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: tid(),
+            status: SessionStatus::Ready,
+        };
+        assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_not_persist_session_configured() {
+        let e = ProviderRuntimeEvent::SessionConfigured {
+            thread_id: tid(),
+            provider_session_id: ProviderSessionId("s".into()),
+        };
+        assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_not_persist_runtime_warning() {
+        // Console-only by design (see reducer's `runtime_warning`
+        // case — `console.warn` then return state unchanged).
+        let e = ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(tid()),
+            message: "oops".into(),
+            original_payload: None,
+        };
+        assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_not_persist_resume_cursor_updated() {
+        // Already persisted via the dedicated agent_chat_sessions
+        // sdk_session_id column; persisting it twice would clutter
+        // the message replay log without adding any rendered output.
+        let e = ProviderRuntimeEvent::ResumeCursorUpdated {
+            thread_id: tid(),
+            resume_cursor: json!({"resume": "uuid"}),
+        };
+        assert!(!should_persist_event(&e));
     }
 }

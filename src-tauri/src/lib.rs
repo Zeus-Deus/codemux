@@ -790,6 +790,7 @@ pub fn run() {
             commands::agent_chat_list_sessions,
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
+            commands::agent_chat_list_messages,
             commands::update_permission_policy,
             commands::update_safety_config,
             commands::add_replay_record,

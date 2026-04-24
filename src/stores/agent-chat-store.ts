@@ -1,5 +1,6 @@
 import { create } from "zustand";
 
+import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import {
   applyEvent,
   appendUserMessage,
@@ -113,6 +114,14 @@ interface AgentChatStore {
    *  restart: the new SDK session gets a new thread id but the
    *  transcript, model, and draft should persist). */
   migrateThreadId: (oldThreadId: string, newThreadId: string) => void;
+  /** Replace a thread's transcript (and seq counter) by replaying
+   *  persisted message payloads through the pure reducer. Used on
+   *  the session-history "Resume" path to restore the visible
+   *  conversation before a fresh provider session boots. UI-only
+   *  fields (model, permissionMode, mode, …) on the slice are
+   *  preserved so resume keeps the user's current picker choices.
+   *  Calling on an unknown thread creates the slice. */
+  hydrateThread: (threadId: string, payloads: string[]) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
   /** Set the thread's reasoning/effort level. `null` clears to default. */
@@ -269,6 +278,25 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }
       nextThreads[newThreadId] = migrated;
       return { threads: nextThreads };
+    }),
+
+  hydrateThread: (threadId, payloads) =>
+    set((state) => {
+      const replayed = replayPayloads(payloads);
+      const existing = state.threads[threadId] ?? emptySlice();
+      // Spread `replayed` last so its `messages`, `nextSeq`,
+      // `streaming`, `pendingRequestIds` overwrite the empty slice's
+      // defaults. UI-only fields (model, permissionMode, mode, …)
+      // come from `existing` because picker choices belong to the
+      // user, not to the historical conversation.
+      const next: ChatThreadSlice = {
+        ...existing,
+        ...replayed,
+        // Hydration is a fresh-start scenario — drop ephemeral
+        // turn-state fields the live event stream owns.
+        activeTurnId: null,
+      };
+      return { threads: { ...state.threads, [threadId]: next } };
     }),
 
   resetThread: (threadId) =>

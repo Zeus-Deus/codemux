@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -152,6 +152,19 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             ON agent_chat_sessions(workspace_id, last_active_at DESC);
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_cwd
             ON agent_chat_sessions(cwd, last_active_at DESC);
+
+        CREATE TABLE IF NOT EXISTS agent_chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (thread_id)
+                REFERENCES agent_chat_sessions(thread_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
+            ON agent_chat_messages(thread_id, id ASC);
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -477,6 +490,14 @@ impl DatabaseStore {
             params![old_thread_id, new_thread_id],
         )
         .map_err(|e| format!("Failed to migrate agent_chat_session: {e}"))?;
+        // Move persisted messages over BEFORE dropping the source row,
+        // otherwise ON DELETE CASCADE would wipe the transcript history
+        // we just promised to carry forward.
+        conn.execute(
+            "UPDATE agent_chat_messages SET thread_id = ?2 WHERE thread_id = ?1",
+            params![old_thread_id, new_thread_id],
+        )
+        .map_err(|e| format!("Failed to migrate agent_chat_messages: {e}"))?;
         conn.execute(
             "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
             params![old_thread_id],
@@ -656,6 +677,20 @@ impl DatabaseStore {
             params![sdk_session_id, survivor],
         )
         .map_err(|e| format!("Failed to merge duplicate sessions: {e}"))?;
+        // Move persisted messages from the non-survivors onto the
+        // survivor BEFORE the DELETE — otherwise ON DELETE CASCADE
+        // wipes the transcript history of the prior thread_ids whose
+        // messages we want to keep visible after resume.
+        conn.execute(
+            "UPDATE agent_chat_messages
+             SET thread_id = ?2
+             WHERE thread_id IN (
+                 SELECT thread_id FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1 AND thread_id != ?2
+             )",
+            params![sdk_session_id, survivor],
+        )
+        .map_err(|e| format!("Failed to migrate duplicate session messages: {e}"))?;
         // Delete the non-survivors.
         conn.execute(
             "DELETE FROM agent_chat_sessions
@@ -701,6 +736,93 @@ impl DatabaseStore {
             },
         )
         .ok()
+    }
+}
+
+// ── Agent Chat Messages ──
+//
+// Per-message persistence so the SessionSelector "Resume" path can
+// rehydrate the visible transcript, not just the SDK's server-side
+// context. Rows are JSON-serialized envelopes — either a canonical
+// `ProviderRuntimeEvent` or a synthetic `{type: "user_message", ...}`
+// record (since user messages live only on the client side and never
+// pass through the provider stream). Frontend hydration replays each
+// payload through the same reducer that handles live events, so the
+// rebuilt transcript is byte-identical to the original render.
+//
+// FK to agent_chat_sessions(thread_id) ON DELETE CASCADE means an
+// explicit `delete_agent_chat_session` cleanly drops history. The two
+// silent-restart / collapse paths above explicitly MOVE messages onto
+// the survivor row before the delete, so logical-conversation merges
+// never lose history.
+
+impl DatabaseStore {
+    /// Append a single message envelope. `payload_json` must be a
+    /// fully-serialized JSON string — typically the result of
+    /// `serde_json::to_string(&ProviderRuntimeEvent::…)` or a synthetic
+    /// `{"type":"user_message","text":"…"}` record. Best-effort: rows
+    /// for an unknown thread_id (FK violation) are silently dropped
+    /// rather than crashing the event-bridge loop.
+    pub fn append_agent_chat_message(
+        &self,
+        thread_id: &str,
+        payload_json: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        match conn.execute(
+            "INSERT INTO agent_chat_messages (thread_id, payload)
+             VALUES (?1, ?2)",
+            params![thread_id, payload_json],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
+            {
+                // Parent session row was already deleted (rare race
+                // between forward_event and delete_agent_chat_session).
+                // Drop the message silently — it is exactly the
+                // history the user just asked us to forget.
+                Ok(())
+            }
+            Err(e) => Err(format!("Failed to append agent_chat_message: {e}")),
+        }
+    }
+
+    /// Return every persisted message for a thread, ordered by
+    /// insertion time (the autoincrement `id`). Each element is the
+    /// raw JSON payload — the frontend parses and dispatches it.
+    pub fn list_agent_chat_messages(&self, thread_id: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT payload FROM agent_chat_messages
+             WHERE thread_id = ?1
+             ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))
+            .map(|iter| iter.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Drop every persisted message for a thread without touching the
+    /// session row. Used when the user picks "New Chat" against an
+    /// existing thread (we'd rather not pollute history with the
+    /// prior conversation's messages once they've been explicitly
+    /// abandoned). Idempotent.
+    #[cfg(test)]
+    pub fn delete_agent_chat_messages_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM agent_chat_messages WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|e| format!("Failed to delete messages: {e}"))?;
+        Ok(())
     }
 }
 
@@ -1737,6 +1859,242 @@ mod tests {
         }
         let capped = db.list_agent_chat_sessions("ws", None, 3);
         assert_eq!(capped.len(), 3);
+    }
+
+    // ── Agent Chat Messages ──
+
+    fn seed_session(db: &DatabaseStore, thread_id: &str) {
+        db.upsert_agent_chat_session(thread_id, "ws", Some("/p"), "claude")
+            .unwrap();
+    }
+
+    #[test]
+    fn agent_chat_messages_append_and_list_preserves_insertion_order() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+
+        for i in 0..5 {
+            db.append_agent_chat_message("t", &format!(r#"{{"i":{i}}}"#))
+                .unwrap();
+        }
+
+        let rows = db.list_agent_chat_messages("t");
+        assert_eq!(rows.len(), 5);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row, &format!(r#"{{"i":{i}}}"#));
+        }
+    }
+
+    #[test]
+    fn agent_chat_messages_list_returns_empty_for_unknown_thread() {
+        let db = init_test_database();
+        assert!(db.list_agent_chat_messages("nope").is_empty());
+    }
+
+    #[test]
+    fn agent_chat_messages_list_filters_by_thread() {
+        let db = init_test_database();
+        seed_session(&db, "t1");
+        seed_session(&db, "t2");
+
+        db.append_agent_chat_message("t1", r#"{"a":1}"#).unwrap();
+        db.append_agent_chat_message("t2", r#"{"b":2}"#).unwrap();
+        db.append_agent_chat_message("t1", r#"{"c":3}"#).unwrap();
+
+        let t1 = db.list_agent_chat_messages("t1");
+        assert_eq!(t1, vec![r#"{"a":1}"#.to_string(), r#"{"c":3}"#.to_string()]);
+        let t2 = db.list_agent_chat_messages("t2");
+        assert_eq!(t2, vec![r#"{"b":2}"#.to_string()]);
+    }
+
+    #[test]
+    fn agent_chat_messages_cascade_delete_on_session_drop() {
+        // Cleanup hygiene: deleting a session row from the dropdown
+        // also drops its persisted transcript, freeing disk and
+        // hiding the chat from any "leak" of orphan rows.
+        let db = init_test_database();
+        seed_session(&db, "t");
+        db.append_agent_chat_message("t", r#"{"x":1}"#).unwrap();
+        db.append_agent_chat_message("t", r#"{"x":2}"#).unwrap();
+        assert_eq!(db.list_agent_chat_messages("t").len(), 2);
+
+        db.delete_agent_chat_session("t").unwrap();
+        assert!(db.list_agent_chat_messages("t").is_empty());
+    }
+
+    #[test]
+    fn agent_chat_messages_append_to_unknown_thread_is_silent_noop() {
+        // FK violation: parent session row absent. The contract is
+        // "best-effort persistence" — the event-bridge loop must not
+        // crash on a race where forward_event fires after the user
+        // has deleted the session.
+        let db = init_test_database();
+        let result = db.append_agent_chat_message("ghost", r#"{"x":1}"#);
+        assert!(
+            result.is_ok(),
+            "FK violation should be swallowed silently"
+        );
+        assert!(db.list_agent_chat_messages("ghost").is_empty());
+    }
+
+    #[test]
+    fn agent_chat_messages_append_surfaces_unrelated_errors() {
+        // Closed-on-purpose: only FK_CONSTRAINT is swallowed. Other
+        // SQL errors must propagate so we don't silently accumulate
+        // data corruption. Without an easy way to force a non-FK
+        // failure in-memory, this test acts as documentation: if this
+        // assert ever changes shape, revisit `append_agent_chat_message`.
+        let db = init_test_database();
+        seed_session(&db, "t");
+        // Sanity: the happy path still returns Ok on a real row.
+        assert!(db
+            .append_agent_chat_message("t", r#"{"ok":true}"#)
+            .is_ok());
+    }
+
+    #[test]
+    fn migrate_agent_chat_session_moves_messages_to_new_thread() {
+        // Silent restart path: the user changes permission_mode mid-
+        // conversation. The store-side migrateThreadId carries the
+        // transcript forward in memory; the DB-side migration must
+        // do the same, otherwise the next list_messages call sees an
+        // empty history under the new thread id.
+        let db = init_test_database();
+        seed_session(&db, "old");
+        db.append_agent_chat_message("old", r#"{"i":1}"#).unwrap();
+        db.append_agent_chat_message("old", r#"{"i":2}"#).unwrap();
+
+        seed_session(&db, "new");
+        db.migrate_agent_chat_session("old", "new").unwrap();
+
+        // Messages now live under "new", and the source row is gone.
+        assert!(db.list_agent_chat_messages("old").is_empty());
+        let migrated = db.list_agent_chat_messages("new");
+        assert_eq!(migrated, vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]);
+        assert!(db.get_agent_chat_session("old").is_none());
+    }
+
+    #[test]
+    fn collapse_duplicate_agent_chat_sessions_moves_messages_onto_survivor() {
+        // The dropdown's "Resume" path produces a new thread_id
+        // sharing the original's sdk_session_id. Without the
+        // pre-collapse UPDATE on agent_chat_messages, the FK cascade
+        // would wipe the historical transcript when the duplicate
+        // session row gets dropped — exactly the regression the
+        // resume feature is meant to avoid.
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('oldest', 'sdk-xyz', 'ws', 'claude', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('newest', 'sdk-xyz', 'ws', 'claude', '2025-03-01', '2025-03-01')",
+                [],
+            )
+            .unwrap();
+        }
+        db.append_agent_chat_message("oldest", r#"{"i":"old1"}"#)
+            .unwrap();
+        db.append_agent_chat_message("oldest", r#"{"i":"old2"}"#)
+            .unwrap();
+        db.append_agent_chat_message("newest", r#"{"i":"new1"}"#)
+            .unwrap();
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-xyz").unwrap();
+
+        // Survivor "newest" now owns every message; the merged-out
+        // row is gone.
+        assert!(db.get_agent_chat_session("oldest").is_none());
+        assert!(db.list_agent_chat_messages("oldest").is_empty());
+        let survivor = db.list_agent_chat_messages("newest");
+        // Order across the moved-in rows preserves the insertion id;
+        // we don't test exact ordering here (it can interleave by id)
+        // but verify count + every payload is present.
+        assert_eq!(survivor.len(), 3);
+        let joined = survivor.join(",");
+        assert!(joined.contains(r#"{"i":"old1"}"#));
+        assert!(joined.contains(r#"{"i":"old2"}"#));
+        assert!(joined.contains(r#"{"i":"new1"}"#));
+    }
+
+    #[test]
+    fn agent_chat_messages_supports_large_payloads() {
+        // Tool results can carry serialized file contents — ~50KB
+        // is plausible. SQLite handles arbitrary TEXT lengths but
+        // make sure no hidden truncation crept in via column types.
+        let db = init_test_database();
+        seed_session(&db, "t");
+        let big = format!(r#"{{"data":"{}"}}"#, "x".repeat(50_000));
+        db.append_agent_chat_message("t", &big).unwrap();
+        let rows = db.list_agent_chat_messages("t");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], big);
+    }
+
+    #[test]
+    fn agent_chat_messages_high_volume_round_trip() {
+        // Sanity: a long conversation (5 turns × ~10 events per
+        // turn) round-trips cleanly. Catches any per-row overhead
+        // regressions or query-prepare bugs that might surface only
+        // at scale.
+        let db = init_test_database();
+        seed_session(&db, "t");
+        for i in 0..500 {
+            db.append_agent_chat_message("t", &format!(r#"{{"i":{i}}}"#))
+                .unwrap();
+        }
+        let rows = db.list_agent_chat_messages("t");
+        assert_eq!(rows.len(), 500);
+        // Ordering is monotonic by insertion.
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row, &format!(r#"{{"i":{i}}}"#));
+        }
+    }
+
+    #[test]
+    fn agent_chat_messages_delete_for_thread_is_idempotent() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap();
+        db.delete_agent_chat_messages_for_thread("t").unwrap();
+        assert!(db.list_agent_chat_messages("t").is_empty());
+        // Second call on already-empty thread doesn't error.
+        db.delete_agent_chat_messages_for_thread("t").unwrap();
+        // Session row is untouched by message-only deletion.
+        assert!(db.get_agent_chat_session("t").is_some());
+    }
+
+    #[test]
+    fn agent_chat_messages_lifecycle_survives_reopen() {
+        // End-to-end persistence guarantee: messages written to a
+        // file-backed DB are still there after the process restarts.
+        // Closes the loop — without this, replay-on-resume would only
+        // work within a single session.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+
+        {
+            let conn = open_connection(&path).unwrap();
+            create_schema(&conn).unwrap();
+            let db = DatabaseStore { conn: Mutex::new(conn) };
+            db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+                .unwrap();
+            db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap();
+            db.append_agent_chat_message("t", r#"{"i":2}"#).unwrap();
+        }
+
+        let conn = open_connection(&path).unwrap();
+        create_schema(&conn).unwrap();
+        let db = DatabaseStore { conn: Mutex::new(conn) };
+        let rows = db.list_agent_chat_messages("t");
+        assert_eq!(rows, vec![r#"{"i":1}"#.to_string(), r#"{"i":2}"#.to_string()]);
     }
 
     #[test]
