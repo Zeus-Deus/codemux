@@ -25,7 +25,7 @@ vi.mock("@/tauri/commands", () => ({
 
 // `useDefaultBranch` uses a module-level cache; reset between suites so a
 // mock return from a prior test doesn't leak in.
-import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row";
+import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
 import { beforeEach } from "vitest";
 beforeEach(() => __resetDefaultBranchCacheForTests());
 

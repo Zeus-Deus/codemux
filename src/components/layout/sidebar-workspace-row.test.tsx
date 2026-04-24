@@ -88,8 +88,8 @@ vi.mock("@/stores/app-store", () => ({
 import {
   SidebarWorkspaceRow,
   WorkspaceContextMenuItems,
-  __resetDefaultBranchCacheForTests,
 } from "./sidebar-workspace-row";
+import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},

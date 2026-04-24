@@ -32,7 +32,6 @@ import {
   closeWorkspaceWithWorktree,
   renameWorkspace,
   detectEditors,
-  getDefaultBranch,
   openInEditor,
   runWorkspaceSetup,
 } from "@/tauri/commands";
@@ -42,78 +41,7 @@ import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
-
-// Module-level cache of project_root → default branch name, so each project
-// only resolves its default branch once per app session regardless of how
-// many workspace rows render it. `null` means "we tried and failed" and is
-// cached to avoid retry storms. `inFlight` deduplicates concurrent fetches
-// across rows mounting at the same time.
-const defaultBranchCache = new Map<string, string | null>();
-const defaultBranchInFlight = new Map<string, Promise<string | null>>();
-
-// Triggers a re-render on any subscribed row when `defaultBranchCache` is
-// updated for a new project_root. Keeps the cache logic decoupled from
-// React rerender semantics without pulling in a zustand slice.
-const defaultBranchListeners = new Set<() => void>();
-function notifyDefaultBranchListeners() {
-  for (const cb of defaultBranchListeners) cb();
-}
-
-/** Test-only: drop the module-level default-branch cache between cases so
- * a prior test's mocked answer doesn't leak into the next one. Not wired
- * into app code. */
-export function __resetDefaultBranchCacheForTests() {
-  defaultBranchCache.clear();
-  defaultBranchInFlight.clear();
-}
-
-/**
- * Resolve the default branch for a project path (shared across all workspace
- * rows that point at the same `project_root`). Returns the cached value
- * synchronously when available, otherwise kicks off a single fetch and
- * re-renders this row when it resolves. Never throws — a missing
- * `origin/HEAD` or detection failure caches `null`, which the caller treats
- * as "unknown" (action still renders but falls through the backend's
- * `Ok(None)` guard). Uses a mount flag so a late-resolving fetch can't
- * setState on an unmounted component (otherwise React logs a warning and
- * — under Vitest's jsdom teardown — crashes with "window is not defined").
- */
-function useDefaultBranch(projectRoot: string | null | undefined): string | null {
-  const [, setTick] = useState(0);
-
-  useEffect(() => {
-    if (!projectRoot) return;
-    let mounted = true;
-    const cb = () => {
-      if (mounted) setTick((n) => n + 1);
-    };
-    defaultBranchListeners.add(cb);
-
-    if (
-      !defaultBranchCache.has(projectRoot) &&
-      !defaultBranchInFlight.has(projectRoot)
-    ) {
-      const promise = getDefaultBranch(projectRoot)
-        .then((branch) => branch || null)
-        .catch(() => null)
-        .then((result) => {
-          defaultBranchCache.set(projectRoot, result);
-          defaultBranchInFlight.delete(projectRoot);
-          notifyDefaultBranchListeners();
-          return result;
-        });
-      defaultBranchInFlight.set(projectRoot, promise);
-    }
-
-    return () => {
-      mounted = false;
-      defaultBranchListeners.delete(cb);
-    };
-  }, [projectRoot]);
-
-  if (!projectRoot) return null;
-  return defaultBranchCache.get(projectRoot) ?? null;
-}
+import { useDefaultBranch } from "./default-branch-cache";
 
 interface Props {
   workspace: WorkspaceSnapshot;
