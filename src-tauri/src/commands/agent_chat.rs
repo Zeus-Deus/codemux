@@ -23,6 +23,7 @@ use crate::agent_provider::{
     ProviderRuntimeEvent, RequestId, SendTurnInput, SerializableProviderError,
     StartSessionInput, ThreadId, TurnId,
 };
+use crate::database::{AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
@@ -219,7 +220,9 @@ pub fn dev_agent_chat_spawn_test_pane(
 /// The returned [`ThreadId`] is the identifier the provider itself
 /// minted — this command never re-mints a new id. Also writes the
 /// thread id back onto the `AgentChat` pane so future look-ups can
-/// resolve it without re-consulting the provider.
+/// resolve it without re-consulting the provider, and upserts an
+/// `agent_chat_sessions` row so the history dropdown can surface
+/// the session after a restart.
 #[tauri::command]
 pub async fn agent_chat_start_session(
     app: AppHandle,
@@ -231,9 +234,49 @@ pub async fn agent_chat_start_session(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    // Extract the cwd for persistence BEFORE moving input into the
+    // provider: StartSessionInput is owned by the provider after
+    // start_session().
+    let cwd_for_persist = input
+        .cwd
+        .to_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+    // Trace the resume wire so the dev console shows whether a
+    // resume_cursor actually reached the provider, and with what
+    // shape. Helps distinguish "frontend didn't send it" from
+    // "provider didn't honour it".
+    match input.resume_cursor.as_ref() {
+        Some(cursor) => eprintln!(
+            "[codemux::agent_chat] start_session pane={pane_id} provider={provider:?} resume_cursor={cursor}"
+        ),
+        None => eprintln!(
+            "[codemux::agent_chat] start_session pane={pane_id} provider={provider:?} resume_cursor=(none)"
+        ),
+    }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
     state.set_agent_chat_thread_id(&pane_id, Some(session.thread_id.0.clone()));
+    // Persist the session for the history dropdown. Scope is
+    // (workspace_id, cwd): workspace lookup goes through the state
+    // store because the command layer only knows the pane id.
+    if let Some(workspace_id) = state.workspace_id_for_pane(&pane_id) {
+        let db: State<'_, DatabaseStore> = app.state();
+        let provider_str = match provider {
+            ProviderKind::Claude => "claude",
+            ProviderKind::Codex => "codex",
+        };
+        if let Err(error) = db.upsert_agent_chat_session(
+            &session.thread_id.0,
+            &workspace_id,
+            cwd_for_persist.as_deref(),
+            provider_str,
+        ) {
+            eprintln!(
+                "[codemux::agent_chat] failed to persist session record: {error}"
+            );
+        }
+    }
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
 }
@@ -249,8 +292,44 @@ pub async fn agent_chat_send_turn(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
+    // Capture the inputs we need for persistence before the provider
+    // consumes `input`.
+    let thread_id_for_persist = input.thread_id.0.clone();
+    let first_line = first_line_title(&input.text);
     let turn = impl_.send_turn(input).await.map_err(provider_err)?;
+
+    // Best-effort: bump last_active_at so the session floats to the
+    // top of the dropdown, and set an auto-title from the first user
+    // turn if none exists yet. Failures here are non-fatal — a
+    // missing persistence row must never block the turn.
+    let db: State<'_, DatabaseStore> = app.state();
+    let _ = db.touch_agent_chat_session(&thread_id_for_persist);
+    if db.get_agent_chat_title(&thread_id_for_persist).is_none() {
+        if let Some(title) = first_line {
+            let _ = db.set_agent_chat_title(&thread_id_for_persist, &title);
+        }
+    }
     Ok(turn.turn_id)
+}
+
+/// Derive a short dropdown title from the first user turn's text.
+/// Takes the first non-empty line, trims, and caps at 60 chars. Returns
+/// None for empty input so the DB column stays null.
+fn first_line_title(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let trimmed = line.trim();
+    let truncated: String = if trimmed.chars().count() > 60 {
+        let mut s: String = trimmed.chars().take(57).collect();
+        s.push_str("…");
+        s
+    } else {
+        trimmed.to_string()
+    };
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
 }
 
 /// Interrupt the currently running turn on a thread.
@@ -371,6 +450,56 @@ pub async fn agent_chat_stop_session(
     impl_.stop_session(thread_id).await.map_err(provider_err)
 }
 
+// ── Session history (for the pane-header dropdown) ──────────────────
+
+/// List persisted chat sessions for the history dropdown.
+///
+/// Scope is (workspace_id, optional cwd). When `cwd` is present the
+/// list is narrowed to sessions opened from that exact directory so
+/// the dropdown matches the pane the user is looking at; passing
+/// `None` returns every session in the workspace regardless of
+/// worktree.
+///
+/// Not gated on the feature flag: the dropdown UI should render an
+/// empty list rather than surface a raw error string when the flag is
+/// off.
+#[tauri::command]
+pub async fn agent_chat_list_sessions(
+    db: State<'_, DatabaseStore>,
+    workspace_id: String,
+    cwd: Option<String>,
+    limit: Option<u32>,
+) -> Result<Vec<AgentChatSessionRecord>, String> {
+    let limit = limit.unwrap_or(50);
+    Ok(db.list_agent_chat_sessions(&workspace_id, cwd.as_deref(), limit))
+}
+
+/// Rename a persisted chat session. Used by the dropdown's per-row
+/// "Rename" affordance.
+#[tauri::command]
+pub async fn agent_chat_rename_session(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    title: String,
+) -> Result<(), String> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("validation_error: title cannot be empty".to_string());
+    }
+    db.set_agent_chat_title(&thread_id, trimmed)
+}
+
+/// Delete a persisted chat session. Idempotent. Note this does not
+/// stop a live session — the UI should call `agent_chat_stop_session`
+/// first if the row being deleted is the current pane's active chat.
+#[tauri::command]
+pub async fn agent_chat_delete_session(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<(), String> {
+    db.delete_agent_chat_session(&thread_id)
+}
+
 // ── Event bridge ──────────────────────────────────────────────────────
 
 /// Start the provider-event forwarding tasks.
@@ -411,8 +540,36 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
 ///
 /// Extracted so tests can exercise the translation without spinning a
 /// Tokio task or a real provider. Also used as the inner loop of
-/// [`spawn_event_bridge`].
+/// [`spawn_event_bridge`]. As a side effect, persists the SDK session
+/// UUID carried by `ResumeCursorUpdated` so the history dropdown can
+/// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent) {
+    if let ProviderRuntimeEvent::ResumeCursorUpdated {
+        thread_id,
+        resume_cursor,
+    } = &event
+    {
+        if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) =
+                db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id)
+            {
+                eprintln!(
+                    "[codemux::agent_chat] failed to persist sdk_session_id: {error}"
+                );
+            }
+            // Resume creates a fresh DB row (new thread_id) carrying the
+            // same sdk_session_id as the original. Collapse the
+            // duplicates so the dropdown doesn't grow unboundedly.
+            if let Err(error) =
+                db.collapse_duplicate_agent_chat_sessions(&sdk_session_id)
+            {
+                eprintln!(
+                    "[codemux::agent_chat] failed to collapse duplicates: {error}"
+                );
+            }
+        }
+    }
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -422,6 +579,21 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
         eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
     }
+}
+
+/// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
+///
+/// The Claude adapter wraps the id under a `resume` or `sessionId`
+/// key (same shape the adapter accepts on the way in — see
+/// `agent_provider/claude/session.rs`). Extracted so the logic is
+/// unit-testable without spinning up an app handle.
+pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
+    cursor
+        .get("resume")
+        .or_else(|| cursor.get("sessionId"))
+        .or_else(|| cursor.get("session_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Extract the thread id carried by a provider runtime event, or
@@ -438,5 +610,80 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn first_line_title_takes_first_nonempty_line() {
+        assert_eq!(
+            first_line_title("Hello there\nsecond line"),
+            Some("Hello there".into())
+        );
+    }
+
+    #[test]
+    fn first_line_title_skips_leading_blank_lines() {
+        assert_eq!(
+            first_line_title("\n\n  First real content  \n"),
+            Some("First real content".into())
+        );
+    }
+
+    #[test]
+    fn first_line_title_returns_none_for_empty_or_whitespace() {
+        assert_eq!(first_line_title(""), None);
+        assert_eq!(first_line_title("   \n  \n"), None);
+    }
+
+    #[test]
+    fn first_line_title_truncates_long_lines() {
+        let long = "x".repeat(200);
+        let title = first_line_title(&long).unwrap();
+        // 57 chars + ellipsis
+        assert_eq!(title.chars().count(), 58);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn first_line_title_handles_multibyte_correctly() {
+        // 100 chinese chars → each counts as 1 in .chars(); should
+        // truncate to 57 + …
+        let multi: String = std::iter::repeat('漢').take(100).collect();
+        let title = first_line_title(&multi).unwrap();
+        assert_eq!(title.chars().count(), 58);
+    }
+
+    #[test]
+    fn extract_sdk_session_id_handles_all_three_keys() {
+        assert_eq!(
+            extract_sdk_session_id(&json!({"resume": "uuid-a"})),
+            Some("uuid-a".into())
+        );
+        assert_eq!(
+            extract_sdk_session_id(&json!({"sessionId": "uuid-b"})),
+            Some("uuid-b".into())
+        );
+        assert_eq!(
+            extract_sdk_session_id(&json!({"session_id": "uuid-c"})),
+            Some("uuid-c".into())
+        );
+    }
+
+    #[test]
+    fn extract_sdk_session_id_prefers_resume_key() {
+        let both = json!({"resume": "first", "sessionId": "second"});
+        assert_eq!(extract_sdk_session_id(&both), Some("first".into()));
+    }
+
+    #[test]
+    fn extract_sdk_session_id_returns_none_for_missing_or_non_string() {
+        assert_eq!(extract_sdk_session_id(&json!({})), None);
+        assert_eq!(extract_sdk_session_id(&json!("just-a-string")), None);
+        assert_eq!(extract_sdk_session_id(&json!({"resume": 42})), None);
     }
 }

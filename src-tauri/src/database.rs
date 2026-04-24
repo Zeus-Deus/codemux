@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -26,6 +26,24 @@ pub struct OpenFlowHistoryEntry {
     pub agent_count: Option<i32>,
     pub started_at: Option<String>,
     pub completed_at: Option<String>,
+}
+
+/// Persisted record for an agent-chat session so the history dropdown
+/// can reopen prior chats after the app restarts. One row per pane's
+/// lifetime thread_id; the `sdk_session_id` column carries the Claude
+/// Agent SDK session UUID (populated once the SDK's first message
+/// lands) and is what the "resume" path feeds back into
+/// `StartSessionInput::resume_cursor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatSessionRecord {
+    pub thread_id: String,
+    pub sdk_session_id: Option<String>,
+    pub workspace_id: String,
+    pub cwd: Option<String>,
+    pub provider: String,
+    pub title: Option<String>,
+    pub created_at: String,
+    pub last_active_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -118,11 +136,29 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             encrypted_data BLOB NOT NULL,
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS agent_chat_sessions (
+            thread_id TEXT PRIMARY KEY,
+            sdk_session_id TEXT,
+            workspace_id TEXT NOT NULL,
+            cwd TEXT,
+            provider TEXT NOT NULL,
+            title TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
+            ON agent_chat_sessions(workspace_id, last_active_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_cwd
+            ON agent_chat_sessions(cwd, last_active_at DESC);
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
 
-    // Set schema version if not already set
+    // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
+    // above means re-running this on a v1 DB silently adds the new
+    // table/indexes, so we just need to bump the stored version.
     let count: i32 = conn
         .query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))
         .map_err(|e| format!("Failed to check schema version: {e}"))?;
@@ -133,6 +169,12 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             params![SCHEMA_VERSION],
         )
         .map_err(|e| format!("Failed to set schema version: {e}"))?;
+    } else {
+        conn.execute(
+            "UPDATE schema_version SET version = ?1",
+            params![SCHEMA_VERSION],
+        )
+        .map_err(|e| format!("Failed to bump schema version: {e}"))?;
     }
 
     Ok(())
@@ -365,6 +407,300 @@ impl DatabaseStore {
         .unwrap()
         .filter_map(|r| r.ok())
         .collect()
+    }
+}
+
+// ── Agent Chat Sessions ──
+//
+// Persistence for the chat-history dropdown. One row per thread the
+// user has ever opened in a given workspace/cwd. Rows are cheap
+// (text-only, ~200 bytes each) so we never prune automatically — the
+// user deletes explicitly from the dropdown.
+
+impl DatabaseStore {
+    /// Insert or refresh a session row. Called from
+    /// `agent_chat_start_session`: on a brand-new chat we INSERT, on a
+    /// silent restart (same thread_id after migrate) the ON CONFLICT
+    /// bumps `last_active_at` and preserves `sdk_session_id`/`title`.
+    pub fn upsert_agent_chat_session(
+        &self,
+        thread_id: &str,
+        workspace_id: &str,
+        cwd: Option<&str>,
+        provider: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_sessions
+                 (thread_id, workspace_id, cwd, provider, created_at, last_active_at)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'))
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 workspace_id = ?2,
+                 cwd = ?3,
+                 provider = ?4,
+                 last_active_at = datetime('now')",
+            params![thread_id, workspace_id, cwd, provider],
+        )
+        .map_err(|e| format!("Failed to upsert agent_chat_session: {e}"))?;
+        Ok(())
+    }
+
+    /// Copy metadata (title, sdk_session_id, created_at) from an old
+    /// thread id to a new one. Used on silent restart so the session
+    /// keeps its history-dropdown identity after
+    /// `migrateThreadId`. The caller is expected to `upsert` the new
+    /// row first; this just carries forward the human-facing fields.
+    pub fn migrate_agent_chat_session(
+        &self,
+        old_thread_id: &str,
+        new_thread_id: &str,
+    ) -> Result<(), String> {
+        if old_thread_id == new_thread_id {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions SET
+                 title = COALESCE(
+                     (SELECT title FROM agent_chat_sessions WHERE thread_id = ?1),
+                     title
+                 ),
+                 sdk_session_id = COALESCE(
+                     (SELECT sdk_session_id FROM agent_chat_sessions WHERE thread_id = ?1),
+                     sdk_session_id
+                 ),
+                 created_at = COALESCE(
+                     (SELECT created_at FROM agent_chat_sessions WHERE thread_id = ?1),
+                     created_at
+                 )
+             WHERE thread_id = ?2",
+            params![old_thread_id, new_thread_id],
+        )
+        .map_err(|e| format!("Failed to migrate agent_chat_session: {e}"))?;
+        conn.execute(
+            "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![old_thread_id],
+        )
+        .map_err(|e| format!("Failed to drop migrated source row: {e}"))?;
+        Ok(())
+    }
+
+    /// Record the Claude Agent SDK session UUID once the sidecar's
+    /// `sdk-session-id` notification has resolved. This is the value
+    /// that later feeds `StartSessionInput::resume_cursor` when the
+    /// user reopens the chat from the history dropdown.
+    pub fn set_agent_chat_sdk_session_id(
+        &self,
+        thread_id: &str,
+        sdk_session_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET sdk_session_id = ?2, last_active_at = datetime('now')
+                 WHERE thread_id = ?1",
+            params![thread_id, sdk_session_id],
+        )
+        .map_err(|e| format!("Failed to set sdk_session_id: {e}"))?;
+        Ok(())
+    }
+
+    /// Set (or replace) the dropdown title for a session. Called
+    /// once from the first-turn auto-title path and again any time
+    /// the user renames the session from the dropdown.
+    pub fn set_agent_chat_title(
+        &self,
+        thread_id: &str,
+        title: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET title = ?2, last_active_at = datetime('now')
+                 WHERE thread_id = ?1",
+            params![thread_id, title],
+        )
+        .map_err(|e| format!("Failed to set title: {e}"))?;
+        Ok(())
+    }
+
+    /// Returns the current title for a session, or None if the
+    /// session is absent / has no title yet. Used by the auto-title
+    /// path to check "should I generate a title from this turn".
+    pub fn get_agent_chat_title(&self, thread_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT title FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Bump `last_active_at` so an active session floats to the top
+    /// of the dropdown. Called on every user turn.
+    pub fn touch_agent_chat_session(&self, thread_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET last_active_at = datetime('now')
+                 WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|e| format!("Failed to touch session: {e}"))?;
+        Ok(())
+    }
+
+    /// List sessions for the dropdown, ordered by recency. Scoped to
+    /// a single workspace. When `cwd` is Some the list is further
+    /// filtered to sessions opened from that exact directory so the
+    /// dropdown matches the pane the user is looking at.
+    pub fn list_agent_chat_sessions(
+        &self,
+        workspace_id: &str,
+        cwd: Option<&str>,
+        limit: u32,
+    ) -> Vec<AgentChatSessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(AgentChatSessionRecord {
+                thread_id: row.get(0)?,
+                sdk_session_id: row.get(1)?,
+                workspace_id: row.get(2)?,
+                cwd: row.get(3)?,
+                provider: row.get(4)?,
+                title: row.get(5)?,
+                created_at: row.get(6)?,
+                last_active_at: row.get(7)?,
+            })
+        };
+        // Only surface rows that actually have an sdk_session_id —
+        // without one the Claude SDK cannot resume the conversation
+        // so offering them in the dropdown leads to a dead-end toast.
+        // Rows are created with null sdk_session_id and get the UUID
+        // once `ResumeCursorUpdated` fires (after the first SDK
+        // message), so this filter cleanly hides transient rows from
+        // silent restarts that never got interacted with.
+        if let Some(cwd) = cwd {
+            let mut stmt = match conn.prepare(
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+                 FROM agent_chat_sessions
+                 WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
+                 ORDER BY last_active_at DESC LIMIT ?3",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            stmt.query_map(params![workspace_id, cwd, limit], map_row)
+                .map(|iter| iter.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        } else {
+            let mut stmt = match conn.prepare(
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+                 FROM agent_chat_sessions
+                 WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
+                 ORDER BY last_active_at DESC LIMIT ?2",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            stmt.query_map(params![workspace_id, limit], map_row)
+                .map(|iter| iter.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        }
+    }
+
+    /// De-duplicate sessions that share an `sdk_session_id`. When the
+    /// user resumes a past chat we start a NEW provider session with
+    /// a new `thread_id`, but its SDK session id matches an existing
+    /// row's. Without cleanup the dropdown would eventually show
+    /// duplicate entries for the same logical conversation. This
+    /// collapses all rows sharing an `sdk_session_id` into the most
+    /// recent one, carrying forward the best title / earliest
+    /// created_at.
+    pub fn collapse_duplicate_agent_chat_sessions(
+        &self,
+        sdk_session_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        // Pick the most-recently-active row as the survivor.
+        let survivor: Option<String> = conn
+            .query_row(
+                "SELECT thread_id FROM agent_chat_sessions
+                 WHERE sdk_session_id = ?1
+                 ORDER BY last_active_at DESC LIMIT 1",
+                params![sdk_session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(survivor) = survivor else {
+            return Ok(());
+        };
+        // Merge identity fields: keep the earliest created_at and
+        // any non-null title across the whole set onto the survivor.
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET created_at = COALESCE(
+                     (SELECT MIN(created_at) FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1),
+                     created_at
+                 ),
+                 title = COALESCE(
+                     title,
+                     (SELECT title FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND title IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 )
+             WHERE thread_id = ?2",
+            params![sdk_session_id, survivor],
+        )
+        .map_err(|e| format!("Failed to merge duplicate sessions: {e}"))?;
+        // Delete the non-survivors.
+        conn.execute(
+            "DELETE FROM agent_chat_sessions
+             WHERE sdk_session_id = ?1 AND thread_id != ?2",
+            params![sdk_session_id, survivor],
+        )
+        .map_err(|e| format!("Failed to drop duplicate sessions: {e}"))?;
+        Ok(())
+    }
+
+    /// Delete a session row. Idempotent.
+    pub fn delete_agent_chat_session(&self, thread_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|e| format!("Failed to delete session: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch a single session record by thread_id.
+    pub fn get_agent_chat_session(
+        &self,
+        thread_id: &str,
+    ) -> Option<AgentChatSessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+             FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(AgentChatSessionRecord {
+                    thread_id: row.get(0)?,
+                    sdk_session_id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    cwd: row.get(3)?,
+                    provider: row.get(4)?,
+                    title: row.get(5)?,
+                    created_at: row.get(6)?,
+                    last_active_at: row.get(7)?,
+                })
+            },
+        )
+        .ok()
     }
 }
 
@@ -1098,5 +1434,338 @@ mod tests {
         assert_eq!(loaded.setup, vec!["yarn install"]);
         assert_eq!(loaded.teardown, vec!["echo bye"]);
         assert_eq!(loaded.run, Some("yarn dev".into()));
+    }
+
+    // ── Agent Chat Sessions ──
+
+    #[test]
+    fn agent_chat_sessions_upsert_and_fetch() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session(
+            "thread-1",
+            "ws-1",
+            Some("/tmp/proj"),
+            "claude",
+        )
+        .unwrap();
+
+        let rec = db
+            .get_agent_chat_session("thread-1")
+            .expect("row should exist");
+        assert_eq!(rec.thread_id, "thread-1");
+        assert_eq!(rec.workspace_id, "ws-1");
+        assert_eq!(rec.cwd.as_deref(), Some("/tmp/proj"));
+        assert_eq!(rec.provider, "claude");
+        assert_eq!(rec.title, None);
+        assert_eq!(rec.sdk_session_id, None);
+    }
+
+    #[test]
+    fn agent_chat_sessions_upsert_on_conflict_preserves_identity_bumps_activity() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
+            .unwrap();
+        db.set_agent_chat_title("t", "Original title").unwrap();
+        db.set_agent_chat_sdk_session_id("t", "sdk-uuid-xyz")
+            .unwrap();
+
+        // Re-upsert with a different provider — the row should
+        // continue to exist with its identity fields intact.
+        db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "codex")
+            .unwrap();
+
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.provider, "codex");
+        assert_eq!(rec.title.as_deref(), Some("Original title"));
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid-xyz"));
+    }
+
+    #[test]
+    fn agent_chat_sessions_set_sdk_session_id() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "claude")
+            .unwrap();
+        assert!(db.get_agent_chat_session("t").unwrap().sdk_session_id.is_none());
+
+        db.set_agent_chat_sdk_session_id("t", "sdk-uuid-abc")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t")
+                .unwrap()
+                .sdk_session_id
+                .as_deref(),
+            Some("sdk-uuid-abc")
+        );
+    }
+
+    #[test]
+    fn agent_chat_sessions_title_roundtrip() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "claude")
+            .unwrap();
+        assert_eq!(db.get_agent_chat_title("t"), None);
+        db.set_agent_chat_title("t", "Refactor the auth layer")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_title("t").as_deref(),
+            Some("Refactor the auth layer")
+        );
+        // Updating overwrites.
+        db.set_agent_chat_title("t", "Rename").unwrap();
+        assert_eq!(db.get_agent_chat_title("t").as_deref(), Some("Rename"));
+    }
+
+    #[test]
+    fn agent_chat_sessions_list_filters_by_workspace_and_cwd() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t1", "ws-a", Some("/p1"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("t1", "sdk-t1").unwrap();
+        db.upsert_agent_chat_session("t2", "ws-a", Some("/p2"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("t2", "sdk-t2").unwrap();
+        db.upsert_agent_chat_session("t3", "ws-b", Some("/p1"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("t3", "sdk-t3").unwrap();
+
+        // Workspace-only scope returns every row in that workspace.
+        let all_in_a = db.list_agent_chat_sessions("ws-a", None, 100);
+        assert_eq!(all_in_a.len(), 2);
+
+        // Workspace + cwd scope narrows further.
+        let p1_in_a = db.list_agent_chat_sessions("ws-a", Some("/p1"), 100);
+        assert_eq!(p1_in_a.len(), 1);
+        assert_eq!(p1_in_a[0].thread_id, "t1");
+
+        // Different workspace returns no crossover.
+        let p1_in_b = db.list_agent_chat_sessions("ws-b", Some("/p1"), 100);
+        assert_eq!(p1_in_b.len(), 1);
+        assert_eq!(p1_in_b[0].thread_id, "t3");
+    }
+
+    #[test]
+    fn agent_chat_sessions_list_hides_rows_without_sdk_session_id() {
+        // Rows created by every start_session() but never graduated
+        // to "have an SDK session id" are useless for resume — they
+        // shouldn't appear in the dropdown. This is the main
+        // practical cause of dropdown clutter: every silent restart
+        // creates a fresh row and most never receive a
+        // ResumeCursorUpdated event.
+        let db = init_test_database();
+        db.upsert_agent_chat_session("with-id", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("with-id", "sdk-uuid").unwrap();
+        db.upsert_agent_chat_session("no-id", "ws", Some("/p"), "claude")
+            .unwrap();
+
+        let listed = db.list_agent_chat_sessions("ws", None, 100);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].thread_id, "with-id");
+
+        let scoped = db.list_agent_chat_sessions("ws", Some("/p"), 100);
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].thread_id, "with-id");
+    }
+
+    #[test]
+    fn collapse_duplicate_agent_chat_sessions_keeps_survivor() {
+        // Simulate the resume flow creating multiple rows for the
+        // same logical chat: each row shares an sdk_session_id but
+        // has a fresh thread_id.
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, title, created_at, last_active_at)
+                 VALUES ('oldest', 'sdk-xyz', 'ws', 'claude', 'Original', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('middle', 'sdk-xyz', 'ws', 'claude', '2025-02-01', '2025-02-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('newest', 'sdk-xyz', 'ws', 'claude', '2025-03-01', '2025-03-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-xyz")
+            .unwrap();
+
+        // Only the newest row survives.
+        assert!(db.get_agent_chat_session("oldest").is_none());
+        assert!(db.get_agent_chat_session("middle").is_none());
+        let survivor = db.get_agent_chat_session("newest").unwrap();
+        // Title carried forward from the original row.
+        assert_eq!(survivor.title.as_deref(), Some("Original"));
+        // created_at carried forward to the earliest value.
+        assert_eq!(survivor.created_at, "2025-01-01");
+    }
+
+    #[test]
+    fn collapse_duplicate_agent_chat_sessions_is_noop_when_no_match() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", None, "claude")
+            .unwrap();
+        // No sdk_session_id set — collapse must not touch the row.
+        db.collapse_duplicate_agent_chat_sessions("sdk-missing")
+            .unwrap();
+        assert!(db.get_agent_chat_session("t").is_some());
+    }
+
+    #[test]
+    fn agent_chat_sessions_list_orders_by_last_active_desc() {
+        let db = init_test_database();
+        // Seed with explicit timestamps so ordering is deterministic.
+        // Each row needs a non-null sdk_session_id or list() filters
+        // it out.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('old', 'sdk-old', 'ws', 'claude', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('newest', 'sdk-newest', 'ws', 'claude', '2025-01-01', '2025-06-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('mid', 'sdk-mid', 'ws', 'claude', '2025-01-01', '2025-03-01')",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = db.list_agent_chat_sessions("ws", None, 10);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].thread_id, "newest");
+        assert_eq!(rows[1].thread_id, "mid");
+        assert_eq!(rows[2].thread_id, "old");
+    }
+
+    #[test]
+    fn agent_chat_sessions_touch_floats_to_top() {
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('a', 'sdk-a', 'ws', 'claude', '2025-01-01', '2025-01-01')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('b', 'sdk-b', 'ws', 'claude', '2025-01-01', '2025-06-01')",
+                [],
+            )
+            .unwrap();
+        }
+        // Before touch, 'b' is on top.
+        let before = db.list_agent_chat_sessions("ws", None, 10);
+        assert_eq!(before[0].thread_id, "b");
+
+        // After touch on 'a', 'a' has today's timestamp → top.
+        db.touch_agent_chat_session("a").unwrap();
+        let after = db.list_agent_chat_sessions("ws", None, 10);
+        assert_eq!(after[0].thread_id, "a");
+    }
+
+    #[test]
+    fn agent_chat_sessions_delete_is_idempotent() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", None, "claude")
+            .unwrap();
+        assert!(db.get_agent_chat_session("t").is_some());
+        db.delete_agent_chat_session("t").unwrap();
+        assert!(db.get_agent_chat_session("t").is_none());
+        // Second call is a no-op.
+        db.delete_agent_chat_session("t").unwrap();
+    }
+
+    #[test]
+    fn agent_chat_sessions_migrate_carries_forward_identity() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("old", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.set_agent_chat_title("old", "My chat").unwrap();
+        db.set_agent_chat_sdk_session_id("old", "sdk-uuid").unwrap();
+
+        // Simulate migrateThreadId: caller upserts the new row first,
+        // then asks us to carry forward the identity fields.
+        db.upsert_agent_chat_session("new", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+
+        assert!(db.get_agent_chat_session("old").is_none());
+        let rec = db.get_agent_chat_session("new").unwrap();
+        assert_eq!(rec.title.as_deref(), Some("My chat"));
+        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid"));
+    }
+
+    #[test]
+    fn agent_chat_sessions_limit_caps_rows() {
+        let db = init_test_database();
+        for i in 0..10 {
+            db.upsert_agent_chat_session(
+                &format!("t{i}"),
+                "ws",
+                None,
+                "claude",
+            )
+            .unwrap();
+            db.set_agent_chat_sdk_session_id(&format!("t{i}"), &format!("sdk-{i}"))
+                .unwrap();
+        }
+        let capped = db.list_agent_chat_sessions("ws", None, 3);
+        assert_eq!(capped.len(), 3);
+    }
+
+    #[test]
+    fn agent_chat_sessions_lifecycle_survives_reopen() {
+        // Confirms the migration upgrades a legacy v1 DB cleanly:
+        // schema_version starts at 2, and sessions round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat.db");
+
+        {
+            let conn = open_connection(&path).unwrap();
+            create_schema(&conn).unwrap();
+            let db = DatabaseStore { conn: Mutex::new(conn) };
+            db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+                .unwrap();
+            db.set_agent_chat_title("t", "Persisted").unwrap();
+        }
+
+        let conn = open_connection(&path).unwrap();
+        create_schema(&conn).unwrap();
+        let db = DatabaseStore { conn: Mutex::new(conn) };
+        let version: u32 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.title.as_deref(), Some("Persisted"));
     }
 }

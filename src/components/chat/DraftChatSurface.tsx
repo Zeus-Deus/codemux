@@ -448,7 +448,28 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
 
   return (
     <div className="flex h-full w-full flex-col bg-background">
-      <ChatHomeLanding composer={composerEl} />
+      <DraftSurfaceHeader />
+      <div className="flex-1 min-h-0 overflow-hidden">
+        <ChatHomeLanding composer={composerEl} />
+      </div>
     </div>
+  );
+}
+
+/**
+ * Placeholder chrome that matches AgentChatPaneHeader's visual band
+ * (h-7 border-b) so the draft surface doesn't look "naked" next to a
+ * materialized pane. Drafts have no session yet, so the session
+ * selector / split / close controls from the real pane header don't
+ * apply — we only borrow the silhouette.
+ */
+function DraftSurfaceHeader() {
+  return (
+    <header
+      className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-background px-1.5"
+      data-testid="draft-surface-header"
+    >
+      <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
+    </header>
   );
 }

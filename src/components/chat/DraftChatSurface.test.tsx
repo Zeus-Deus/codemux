@@ -178,6 +178,40 @@ describe("DraftChatSurface", () => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
 
+    it("renders a pane-header band above the chat-home so the draft is not missing chrome", () => {
+      // Regression guard for the "Image 53" bug: a freshly opened
+      // project landed on the draft chat-home with no pane header
+      // at all, while Images 54/55 showed an "Agent Chat" band.
+      // The draft surface borrows that silhouette (h-7, bottom
+      // border) so the two views match.
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { getByTestId } = renderSurface();
+      const header = getByTestId("draft-surface-header");
+      expect(header).toBeInTheDocument();
+      expect(header.textContent).toContain("Agent Chat");
+      expect(header.className).toContain("h-7");
+      expect(header.className).toContain("border-b");
+    });
+
+    it("the header band sits ABOVE the home landing in DOM order", () => {
+      // Visual hierarchy: the header is the first child of the
+      // surface root; the chat-home wrapper comes after. If these
+      // are flipped the header would render under the centered
+      // headline.
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      const root = container.firstElementChild as HTMLElement;
+      const header = root.querySelector('[data-testid="draft-surface-header"]');
+      const headline = root.querySelector("h1");
+      expect(header).not.toBeNull();
+      expect(headline).not.toBeNull();
+      expect(header!.compareDocumentPosition(headline!)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    });
+
     it("seeds the composer textarea with the draft's inputDraft", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().updateDraftInput(draft.draftId, "typed so far");

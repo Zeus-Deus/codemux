@@ -2,6 +2,7 @@ import React from "react";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { BrowserPane } from "@/components/browser/BrowserPane";
 import { AgentChatPane } from "@/components/chat/AgentChatPane";
+import { AgentChatPaneHeader } from "@/components/chat/AgentChatPaneHeader";
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
@@ -281,17 +282,20 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   }
 
   if (node.kind === "agent_chat") {
-    // Stub renderer: no pane header, no composer, no message list —
-    // the real chat UI lands in Step 2. Deliberately no per-pane
-    // chrome here so Step 2 can replace the inner container without
-    // fighting pre-existing headers.
     return (
       <div
-        className="flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
-        <AgentChatPane pane={node} />
+        <AgentChatPaneHeader
+          pane={node}
+          isActive={isActive}
+          onPointerDown={(e) => handleDragStart(e, node.pane_id)}
+        />
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <AgentChatPane pane={node} />
+        </div>
       </div>
     );
   }

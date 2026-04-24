@@ -966,3 +966,33 @@ export const agentChatStopSession = (
   provider: AgentChatProviderKind,
   threadId: string,
 ) => invoke<void>("agent_chat_stop_session", { provider, threadId });
+
+// ── Session history (pane-header dropdown) ──
+
+export interface AgentChatSessionRecord {
+  thread_id: string;
+  sdk_session_id: string | null;
+  workspace_id: string;
+  cwd: string | null;
+  provider: string;
+  title: string | null;
+  created_at: string;
+  last_active_at: string;
+}
+
+export const agentChatListSessions = (
+  workspaceId: string,
+  cwd: string | null = null,
+  limit: number | null = null,
+) =>
+  invoke<AgentChatSessionRecord[]>("agent_chat_list_sessions", {
+    workspaceId,
+    cwd,
+    limit,
+  });
+
+export const agentChatRenameSession = (threadId: string, title: string) =>
+  invoke<void>("agent_chat_rename_session", { threadId, title });
+
+export const agentChatDeleteSession = (threadId: string) =>
+  invoke<void>("agent_chat_delete_session", { threadId });

@@ -162,13 +162,29 @@ describe("WorktreePicker — active mode", () => {
     vi.mocked(generateRandomBranchName).mockReset();
   });
 
-  it("trigger pill shows the current workspace's git_branch", () => {
+  it("trigger pill shows the worktree folder basename, not the git branch", () => {
+    // The primary pill identifies the worktree (a folder). For the
+    // workspace at /projects/foo on branch "main", the pill should
+    // read "foo" — the branch string belongs to the adjacent
+    // DerivativeBranchPicker ("from main"). Regression guard for the
+    // "shows `master` instead of project folder name" bug.
     const { trigger } = renderActive();
     expect(trigger).not.toBeNull();
-    expect(trigger!.textContent).toContain("main");
+    expect(trigger!.textContent).toContain("foo");
+    expect(trigger!.textContent).not.toContain("main");
   });
 
-  it("falls back to basename of cwd when git_branch is null", () => {
+  it("trigger uses cwd basename even for non-default worktrees with a populated git_branch", () => {
+    // Non-default worktree: cwd differs from project_root and the
+    // branch is populated. The pill must still read the folder name.
+    const { trigger } = renderActive({
+      currentWorkspaceId: "ws-foo-feat",
+    });
+    expect(trigger!.textContent).toContain("foo-feat-x");
+    expect(trigger!.textContent).not.toContain("feat/x");
+  });
+
+  it("uses basename of cwd when git_branch is null", () => {
     currentWorkspaces = [
       makeWs({
         workspace_id: "ws-x",
@@ -319,14 +335,18 @@ describe("WorktreePicker — draft mode", () => {
     expect(trigger!.textContent).toContain("foo");
   });
 
-  it("trigger label uses branch when target is existing_workspace", () => {
+  it("trigger label uses the targeted worktree's folder basename for existing_workspace", () => {
+    // Regression guard: the trigger shows the worktree FOLDER name,
+    // not the git branch. The branch sits in the sibling
+    // DerivativeBranchPicker.
     const { trigger } = renderDraft({
       draftTarget: {
         kind: "existing_workspace",
         workspaceId: "ws-foo-feat",
       },
     });
-    expect(trigger!.textContent).toContain("feat/x");
+    expect(trigger!.textContent).toContain("foo-feat-x");
+    expect(trigger!.textContent).not.toContain("feat/x");
   });
 
   it("clicking a worktree row fires onChangeDraftTarget with existing_workspace target", async () => {
@@ -373,6 +393,45 @@ describe("WorktreePicker — draft mode", () => {
     await user.click(trigger!);
     await user.click(await screen.findByText("feat/x"));
     expect(onSwitchWorkspace).not.toHaveBeenCalled();
+  });
+});
+
+describe("WorktreePicker — screenshot regression (folder vs branch)", () => {
+  // Direct reproduction of the reported bug: project folder
+  // "the-machine" sits on branch "master" (the default). The trigger
+  // pill must show "the-machine", not "master".
+  beforeEach(() => {
+    currentWorkspaces = [
+      makeWs({
+        workspace_id: "ws-the-machine-default",
+        cwd: "/home/user/code/the-machine",
+        project_root: "/home/user/code/the-machine",
+        git_branch: "master",
+      }),
+    ];
+    vi.mocked(createWorktreeWorkspace).mockReset();
+    vi.mocked(generateRandomBranchName).mockReset();
+  });
+
+  it("active mode: pill reads 'the-machine', not 'master'", () => {
+    const { trigger } = renderActive({
+      projectPath: "/home/user/code/the-machine",
+      currentWorkspaceId: "ws-the-machine-default",
+    });
+    expect(trigger!.textContent).toContain("the-machine");
+    expect(trigger!.textContent).not.toContain("master");
+  });
+
+  it("draft existing_workspace: pill reads 'the-machine', not 'master'", () => {
+    const { trigger } = renderDraft({
+      projectPath: "/home/user/code/the-machine",
+      draftTarget: {
+        kind: "existing_workspace",
+        workspaceId: "ws-the-machine-default",
+      },
+    });
+    expect(trigger!.textContent).toContain("the-machine");
+    expect(trigger!.textContent).not.toContain("master");
   });
 });
 

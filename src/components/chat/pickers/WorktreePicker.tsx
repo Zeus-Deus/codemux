@@ -85,11 +85,15 @@ export function WorktreePicker({
   const currentGroup = groups.find((g) => g.projectPath === projectPath);
   const worktrees = currentGroup?.workspaces ?? [];
 
-  // Trigger pill label resolution.
+  // Trigger pill label resolution. The primary pill identifies the
+  // *worktree* (a folder), so prefer the cwd basename over git_branch —
+  // the branch belongs to the sibling DerivativeBranchPicker ("from
+  // <branch>"). Dropdown rows below still show git_branch because
+  // users scan the list by branch.
   const triggerLabel = (() => {
     if (mode === "active") {
       const ws = worktrees.find((w) => w.workspace_id === currentWorkspaceId);
-      return ws?.git_branch ?? (ws ? basename(ws.cwd) : basename(projectPath));
+      return ws ? basename(ws.cwd) : basename(projectPath);
     }
     // Draft mode.
     if (!draftTarget) return basename(projectPath);
@@ -100,7 +104,7 @@ export function WorktreePicker({
       const ws = worktrees.find(
         (w) => w.workspace_id === draftTarget.workspaceId,
       );
-      return ws?.git_branch ?? (ws ? basename(ws.cwd) : basename(projectPath));
+      return ws ? basename(ws.cwd) : basename(projectPath);
     }
     return basename(projectPath);
   })();
