@@ -245,6 +245,11 @@ pub fn translate_server_request(
         request_id: request_id.clone(),
         request_kind: msg.request_kind().to_string(),
         payload: msg.payload().clone(),
+        // Codex's server-initiated approval requests are not tied to a
+        // provider-side tool_use_id — the frontend renders them as
+        // standalone permission rows. Always `None` until Codex surfaces
+        // one.
+        tool_use_id: None,
     }
 }
 

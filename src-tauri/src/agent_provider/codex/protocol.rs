@@ -577,7 +577,13 @@ pub struct ApprovalResponse {
 impl From<ApprovalDecision> for ApprovalResponse {
     fn from(value: ApprovalDecision) -> Self {
         match value {
-            ApprovalDecision::Allow { updated_input } => Self {
+            ApprovalDecision::Allow {
+                updated_input,
+                // Codex has no analogue to Claude's updatedPermissions —
+                // the "always allow" path will surface through Codex's
+                // sandbox policy instead. Drop the rules on the floor.
+                updated_permissions: _,
+            } => Self {
                 decision: "allow".to_string(),
                 updated_input,
                 message: None,
@@ -650,6 +656,7 @@ mod tests {
     fn approval_response_from_allow_omits_message() {
         let r = ApprovalResponse::from(ApprovalDecision::Allow {
             updated_input: Some(json!({"x": 1})),
+            updated_permissions: None,
         });
         assert_eq!(r.decision, "allow");
         assert_eq!(r.updated_input, Some(json!({"x": 1})));

@@ -301,10 +301,14 @@ export class ClaudeSession {
     });
   }
 
-  /** Emit side-channel notifications for the two tool uses that
-   *  production integrations treat specially (research §5f). The raw
-   *  `sdk-message` is still sent alongside so consumers never lose
-   *  context. */
+  /** Emit a side-channel notification for `ExitPlanMode`, which
+   *  permissions.ts denies before a `request-opened` ever fires —
+   *  so without this extra hop the UI would never learn the plan
+   *  text. `AskUserQuestion` used to ride the same side-channel but
+   *  was removed in Stage 1 once canUseTool's `request-opened`
+   *  started carrying `kind: "user-input"` — the two emissions
+   *  previously produced duplicate cards with different request ids.
+   */
   private emitSpecialCases(message: SDKMessage): void {
     if (message.type !== "assistant") return;
     const content = (message as unknown as {
@@ -325,13 +329,7 @@ export class ClaudeSession {
         id?: string;
         input?: unknown;
       };
-      if (toolUse.name === "AskUserQuestion") {
-        this.emitter.notification("user-input-requested", {
-          threadId: this.threadId,
-          toolUseId: toolUse.id ?? null,
-          input: toolUse.input ?? null,
-        });
-      } else if (toolUse.name === "ExitPlanMode") {
+      if (toolUse.name === "ExitPlanMode") {
         this.emitter.notification("plan-proposed", {
           threadId: this.threadId,
           toolUseId: toolUse.id ?? null,

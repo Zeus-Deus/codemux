@@ -344,7 +344,11 @@ test("initializationResult forwards the SDK response opaquely", async () => {
   await session.close();
 });
 
-test("AskUserQuestion tool_use emits a user-input-requested side-channel", async () => {
+test("AskUserQuestion tool_use does NOT emit a user-input-requested side-channel", async () => {
+  // Stage 1 dedup: the canUseTool permission bridge now carries the
+  // AskUserQuestion request through `request-opened` with
+  // `kind: "user-input"`. Firing an additional side-channel here
+  // produced duplicate cards with mismatching request ids.
   const { emit, events } = recordingEmitter();
   const session = new ClaudeSession(minimalInput(), emit);
   const msg = {
@@ -363,10 +367,10 @@ test("AskUserQuestion tool_use emits a user-input-requested side-channel", async
   } as unknown as SDKMessage;
   fake.emit(msg);
   await new Promise((r) => setTimeout(r, 10));
-  // Both the raw sdk-message AND the side-channel fire.
+  // The raw sdk-message still fires — the UI derives the tool_call
+  // row from it. The side-channel is gone.
   expect(events.some((e) => e.method === "sdk-message")).toBe(true);
-  const side = events.find((e) => e.method === "user-input-requested");
-  expect(side).toBeDefined();
+  expect(events.some((e) => e.method === "user-input-requested")).toBe(false);
   await session.close();
 });
 

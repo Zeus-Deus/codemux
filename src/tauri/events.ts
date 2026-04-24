@@ -99,7 +99,15 @@ export const onAuthStateChanged = (
 // thread_id via the useAgentChatEvents hook.
 
 export type ApprovalDecision =
-  | { decision: "allow"; updated_input?: unknown }
+  | {
+      decision: "allow";
+      updated_input?: unknown;
+      /** Opaque SDK-shaped `PermissionUpdate[]` — populated when the
+       *  user picks an "always allow" scope. Stage 1 never sends it,
+       *  but the field is on the wire now so Stage 5 can fill it in
+       *  without another backend change. */
+      updated_permissions?: unknown[];
+    }
   | { decision: "allow_for_session" }
   | { decision: "deny"; message: string }
   | { decision: "cancel" };
@@ -172,6 +180,12 @@ export type ProviderRuntimeEvent =
       request_id: string;
       request_kind: string;
       payload: unknown;
+      /** Provider tool_use_id when this request maps to an in-flight
+       *  tool invocation. Lets the reducer merge the approval into
+       *  its originating tool_call row. `null` for standalone
+       *  requests (plan, Codex server-initiated, or when the provider
+       *  didn't supply one). */
+      tool_use_id: string | null;
     }
   | {
       type: "request_resolved";

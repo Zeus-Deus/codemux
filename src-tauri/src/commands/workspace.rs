@@ -291,6 +291,11 @@ pub fn create_worktree_workspace(
         "six" => WorkspacePresetLayout::Six,
         "eight" => WorkspacePresetLayout::Eight,
         "shell_browser" => WorkspacePresetLayout::ShellBrowser,
+        // The inline "+ New worktree…" chat flow uses `empty` so the
+        // resulting workspace has no terminal/PTY, no tab, and no
+        // surface — the chat pane is attached afterward by the
+        // frontend via `agent_chat_create_pane`.
+        "empty" => WorkspacePresetLayout::Empty,
         _ => return Err(format!("Unsupported layout: {layout}")),
     };
 

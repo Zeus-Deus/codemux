@@ -800,7 +800,10 @@ async fn respond_to_request_allow_forwards_to_sidecar() {
         .respond_to_request(
             ThreadId("t-ok".into()),
             RequestId("r-123".into()),
-            ApprovalDecision::Allow { updated_input: None },
+            ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            },
         )
         .await
         .unwrap();

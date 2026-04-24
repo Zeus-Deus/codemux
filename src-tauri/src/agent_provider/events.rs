@@ -117,6 +117,13 @@ pub enum ProviderRuntimeEvent {
         request_id: RequestId,
         request_kind: String,
         payload: serde_json::Value,
+        /// The provider's own tool-use identifier when this request maps to
+        /// an in-flight tool invocation (Claude's `canUseTool` path). Lets
+        /// the UI merge a permission request into its originating
+        /// tool-call card. `None` for standalone requests (plan, user-input,
+        /// Codex server-initiated requests not tied to a tool_use).
+        #[serde(default)]
+        tool_use_id: Option<String>,
     },
     /// The outstanding request was resolved with the user's decision.
     RequestResolved {

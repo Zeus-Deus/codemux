@@ -277,8 +277,13 @@ pub struct TurnStartResult {
 pub enum ApprovalDecision {
     /// Approve the request. `updated_input` may override the tool input the
     /// model provided (e.g. the user edited the command before running).
+    /// `updated_permissions` carries opaque SDK-shaped `PermissionUpdate[]`
+    /// values that the provider persists (e.g. "always allow Bash" rules).
+    /// Left `None` for a one-shot approve.
     Allow {
         updated_input: Option<serde_json::Value>,
+        #[serde(default)]
+        updated_permissions: Option<Vec<serde_json::Value>>,
     },
     /// Approve and remember this decision for the rest of the session.
     AllowForSession,

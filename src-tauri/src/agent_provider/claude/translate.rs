@@ -53,6 +53,7 @@ pub fn translate_notification(
             request_id,
             tool_name,
             tool_input,
+            tool_use_id,
             kind,
         } => {
             let turn_id = extract_turn_id(&tool_input);
@@ -66,14 +67,25 @@ pub fn translate_notification(
                     kind
                 },
                 payload: tool_input,
+                tool_use_id,
             }]
         }
-        SidecarNotification::RequestResolved { .. } => {
-            // The sidecar already knows the decision — we emitted
-            // it on the way in. No canonical event; suppress to
-            // keep the stream clean. Tests that care read from the
-            // sidecar event log directly.
-            vec![]
+        SidecarNotification::RequestResolved {
+            thread_id: _,
+            request_id,
+            decision,
+        } => {
+            // Translate the sidecar-shaped decision (behavior: allow|deny,
+            // plus optional message/interrupt) back into the canonical
+            // enum. Previously this event was suppressed, which left the
+            // UI's optimistic "Submitting decision…" state stuck forever.
+            // Emitting it here lets the frontend reducer flip the
+            // permission-request row to its final resolved state.
+            vec![ProviderRuntimeEvent::RequestResolved {
+                thread_id: thread_id.clone(),
+                request_id: RequestId(request_id),
+                decision: sidecar_decision_to_approval(&decision),
+            }]
         }
         SidecarNotification::UserInputRequested {
             thread_id: _,
@@ -83,9 +95,10 @@ pub fn translate_notification(
             vec![ProviderRuntimeEvent::RequestOpened {
                 thread_id: thread_id.clone(),
                 turn_id: TurnId(String::new()),
-                request_id: RequestId(tool_use_id.unwrap_or_default()),
+                request_id: RequestId(tool_use_id.clone().unwrap_or_default()),
                 request_kind: "user-input".into(),
                 payload: input,
+                tool_use_id,
             }]
         }
         SidecarNotification::PlanProposed {
@@ -96,9 +109,10 @@ pub fn translate_notification(
             vec![ProviderRuntimeEvent::RequestOpened {
                 thread_id: thread_id.clone(),
                 turn_id: TurnId(String::new()),
-                request_id: RequestId(tool_use_id.unwrap_or_default()),
+                request_id: RequestId(tool_use_id.clone().unwrap_or_default()),
                 request_kind: "plan".into(),
                 payload: plan,
+                tool_use_id,
             }]
         }
         SidecarNotification::SessionEnded { reason, .. } => {
@@ -549,6 +563,46 @@ fn extract_usage(msg: &serde_json::Value) -> Option<TurnUsage> {
         duration_ms,
         num_turns,
     })
+}
+
+/// Turn the sidecar-shaped decision blob (opaque JSON we emitted
+/// outbound as a `SidecarDecision`) back into the canonical
+/// [`ApprovalDecision`]. The sidecar's `request-resolved`
+/// notification carries this same shape — `{behavior, message?,
+/// interrupt?, updatedInput?, updatedPermissions?}`. We lose the
+/// `AllowForSession` distinction on the way through since the wire
+/// shape doesn't preserve it; the UI only needs allow / deny /
+/// cancel to render resolution state, so that trade-off is safe.
+fn sidecar_decision_to_approval(v: &serde_json::Value) -> crate::agent_provider::ApprovalDecision {
+    use crate::agent_provider::ApprovalDecision;
+    let behavior = v.get("behavior").and_then(|b| b.as_str()).unwrap_or("");
+    match behavior {
+        "allow" => {
+            let updated_input = v.get("updatedInput").cloned();
+            let updated_permissions = v
+                .get("updatedPermissions")
+                .and_then(|p| p.as_array())
+                .map(|arr| arr.clone());
+            ApprovalDecision::Allow {
+                updated_input,
+                updated_permissions,
+            }
+        }
+        "deny" => {
+            let interrupt = v.get("interrupt").and_then(|b| b.as_bool()).unwrap_or(false);
+            if interrupt {
+                ApprovalDecision::Cancel
+            } else {
+                let message = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                ApprovalDecision::Deny { message }
+            }
+        }
+        _ => ApprovalDecision::Cancel,
+    }
 }
 
 fn classify_tool(tool_name: &str) -> String {
@@ -1022,6 +1076,7 @@ mod tests {
             request_id: "r-1".into(),
             tool_name: "Bash".into(),
             tool_input: json!({"command": "ls"}),
+            tool_use_id: Some("tu-abc".into()),
             kind: "command".into(),
         };
         let events = translate_notification(&tid(), n);
@@ -1029,10 +1084,15 @@ mod tests {
             ProviderRuntimeEvent::RequestOpened {
                 request_kind,
                 request_id,
+                tool_use_id,
                 ..
             } => {
                 assert_eq!(request_kind, "command");
                 assert_eq!(request_id.0, "r-1");
+                // Stage 1 wire change — tool_use_id flows through so the
+                // frontend reducer can merge the approval with its
+                // originating tool_call row.
+                assert_eq!(tool_use_id.as_deref(), Some("tu-abc"));
             }
             _ => panic!("expected RequestOpened"),
         }
@@ -1045,12 +1105,19 @@ mod tests {
             request_id: "r-2".into(),
             tool_name: "Read".into(),
             tool_input: json!({"path": "/a"}),
+            tool_use_id: None,
             kind: String::new(),
         };
         let events = translate_notification(&tid(), n);
         match &events[0] {
-            ProviderRuntimeEvent::RequestOpened { request_kind, .. } => {
-                assert_eq!(request_kind, "file-read")
+            ProviderRuntimeEvent::RequestOpened {
+                request_kind,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(request_kind, "file-read");
+                // No tool_use_id on this path — standalone approval.
+                assert!(tool_use_id.is_none());
             }
             _ => panic!("expected RequestOpened"),
         }
@@ -1129,6 +1196,74 @@ mod tests {
             &events[1],
             ProviderRuntimeEvent::SessionStateChanged {
                 status: SessionStatus::Closed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn notification_request_resolved_allow_emits_canonical_event() {
+        // Stage 1 fix: the sidecar's `request-resolved` notification
+        // is now forwarded as a canonical `RequestResolved` event so
+        // the frontend reducer can flip the UI out of its optimistic
+        // "Submitting decision…" state. Previously suppressed.
+        let n = SidecarNotification::RequestResolved {
+            thread_id: "t".into(),
+            request_id: "r-1".into(),
+            decision: json!({"behavior": "allow"}),
+        };
+        let events = translate_notification(&tid(), n);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ProviderRuntimeEvent::RequestResolved {
+                request_id,
+                decision,
+                ..
+            } => {
+                assert_eq!(request_id.0, "r-1");
+                assert!(matches!(
+                    decision,
+                    crate::agent_provider::ApprovalDecision::Allow { .. }
+                ));
+            }
+            _ => panic!("expected RequestResolved"),
+        }
+    }
+
+    #[test]
+    fn notification_request_resolved_deny_preserves_message() {
+        let n = SidecarNotification::RequestResolved {
+            thread_id: "t".into(),
+            request_id: "r-2".into(),
+            decision: json!({"behavior": "deny", "message": "nope"}),
+        };
+        let events = translate_notification(&tid(), n);
+        match &events[0] {
+            ProviderRuntimeEvent::RequestResolved { decision, .. } => match decision {
+                crate::agent_provider::ApprovalDecision::Deny { message } => {
+                    assert_eq!(message, "nope");
+                }
+                _ => panic!("expected Deny"),
+            },
+            _ => panic!("expected RequestResolved"),
+        }
+    }
+
+    #[test]
+    fn notification_request_resolved_deny_with_interrupt_becomes_cancel() {
+        // The sidecar's Cancel variant round-trips as
+        // `{behavior: "deny", interrupt: true}` — classify it back into
+        // `ApprovalDecision::Cancel` so the UI renders "Cancelled".
+        let n = SidecarNotification::RequestResolved {
+            thread_id: "t".into(),
+            request_id: "r-3".into(),
+            decision: json!({"behavior": "deny", "interrupt": true}),
+        };
+        let events = translate_notification(&tid(), n);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::RequestResolved {
+                decision: crate::agent_provider::ApprovalDecision::Cancel,
                 ..
             }
         ));

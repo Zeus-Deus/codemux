@@ -145,6 +145,14 @@ pub enum WorkspacePresetLayout {
     Six,
     Eight,
     ShellBrowser,
+    /// No surfaces, no tabs, no terminal sessions — an "empty shell"
+    /// workspace whose panes are populated later by the caller
+    /// (e.g. `agent_chat_create_pane` after an inline worktree
+    /// creation). Matches the shape of
+    /// [`create_empty_workspace_at_path`]; differs from it only in
+    /// that the workspace also carries worktree metadata set by the
+    /// bundled `create_worktree_workspace` command.
+    Empty,
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -766,6 +774,15 @@ impl AppStateStore {
         cwd_path: PathBuf,
         layout: WorkspacePresetLayout,
     ) -> WorkspaceId {
+        // Empty layout short-circuits to the same shape
+        // `create_empty_workspace_at_path` produces: no tabs, no
+        // surfaces, no terminal sessions. Callers (e.g. the inline
+        // chat-worktree flow) fill the workspace with their own pane
+        // afterward via `agent_chat_create_pane`.
+        if matches!(layout, WorkspacePresetLayout::Empty) {
+            return self.create_empty_workspace_at_path(cwd_path);
+        }
+
         let mut snapshot = self.inner.lock().unwrap();
         let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
@@ -3205,6 +3222,7 @@ fn layout_shell_count(layout: &WorkspacePresetLayout) -> usize {
         WorkspacePresetLayout::Six => 6,
         WorkspacePresetLayout::Eight => 8,
         WorkspacePresetLayout::ShellBrowser => 1,
+        WorkspacePresetLayout::Empty => 0,
     }
 }
 
@@ -3295,6 +3313,16 @@ fn build_workspace_layout(
                 ),
             ],
         ),
+        WorkspacePresetLayout::Empty => {
+            // `create_workspace_with_layout` short-circuits the Empty
+            // variant before reaching this helper; if we ever land
+            // here it means the short-circuit has been bypassed.
+            unreachable!(
+                "build_workspace_layout should not be called with Empty — \
+                 create_workspace_with_layout short-circuits that variant \
+                 to `create_empty_workspace_at_path`"
+            )
+        }
     }
 }
 
@@ -3990,6 +4018,52 @@ mod tests {
             }
             _ => panic!("expected shell+browser preset to be a horizontal split"),
         }
+    }
+
+    #[test]
+    fn workspace_preset_empty_produces_no_surfaces_terminals_or_tabs() {
+        // Empty layout is what the inline "+ New worktree…" chat
+        // flow uses: the backend creates the git worktree + workspace
+        // record, but leaves no surfaces / terminal sessions / tabs
+        // behind — the frontend attaches a chat pane afterward via
+        // `agent_chat_create_pane`. Regressing this to any other
+        // layout reintroduces the split-with-leftover-terminal bug.
+        let store = AppStateStore::default();
+        let terminals_before = store.snapshot().terminal_sessions.len();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-empty"),
+            WorkspacePresetLayout::Empty,
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("workspace must be registered");
+
+        assert!(
+            workspace.surfaces.is_empty(),
+            "Empty layout must produce zero surfaces (got {})",
+            workspace.surfaces.len(),
+        );
+        assert!(
+            workspace.tabs.is_empty(),
+            "Empty layout must produce zero tabs (got {})",
+            workspace.tabs.len(),
+        );
+        assert_eq!(
+            workspace.active_tab_id, "",
+            "Empty layout must leave active_tab_id blank, not a dangling Terminal tab",
+        );
+        assert_eq!(
+            snapshot.terminal_sessions.len(),
+            terminals_before,
+            "Empty layout must NOT allocate any terminal sessions",
+        );
+        assert_eq!(
+            snapshot.active_workspace_id, workspace_id,
+            "Empty layout still activates the new workspace (parity with other variants)",
+        );
     }
 
     #[test]

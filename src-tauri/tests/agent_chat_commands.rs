@@ -255,6 +255,7 @@ async fn respond_to_request_forwards_to_provider() {
             RequestId("req-1".into()),
             ApprovalDecision::Allow {
                 updated_input: None,
+                updated_permissions: None,
             },
         )
         .await

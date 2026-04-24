@@ -399,7 +399,10 @@ async fn command_approval_request_roundtrip() {
         .respond_to_request(
             ThreadId("t-ap".into()),
             request_id,
-            ApprovalDecision::Allow { updated_input: None },
+            ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            },
         )
         .await
         .unwrap();

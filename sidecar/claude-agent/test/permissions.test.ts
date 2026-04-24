@@ -119,13 +119,22 @@ test("deny decision returns behavior=deny with the given message", async () => {
   }
 });
 
-test("AskUserQuestion tool still goes through permission flow (emits request-opened)", async () => {
+test("AskUserQuestion emits a single request-opened tagged kind=user-input", async () => {
+  // Stage 1 dedup: previously AskUserQuestion triggered BOTH the
+  // canUseTool `request-opened` AND a `user-input-requested`
+  // side-channel, producing two separate cards in the UI with
+  // different request ids. The side-channel is gone; the
+  // `classifyToolKind` special case tags the single canUseTool
+  // emission as `user-input` so the frontend picks the structured
+  // form renderer.
   const { emit, events } = recorder();
   const pending: PendingApprovals = new Map();
   const cb = makeCanUseTool("thr", emit, pending);
   const promise = cb("AskUserQuestion", { questions: [] }, mkOptions());
   await new Promise((r) => setTimeout(r, 0));
-  expect(events.some((e) => e.method === "request-opened")).toBe(true);
+  const opened = events.filter((e) => e.method === "request-opened");
+  expect(opened).toHaveLength(1);
+  expect((opened[0]?.params as { kind: string }).kind).toBe("user-input");
   const requestId = [...pending.keys()][0] as string;
   pending.get(requestId)?.({
     behavior: "allow",

@@ -60,6 +60,13 @@ export function classifyToolKind(
   toolName: string,
   _toolInput: Record<string, unknown>,
 ): string {
+  // Specialized surfaces the UI renders as structured forms, not
+  // generic allow/deny prompts. AskUserQuestion is the SDK's
+  // interactive-clarification tool — the runtime ships a dedicated
+  // form for it, so we tag the request kind up front rather than
+  // leaving it to downstream fuzzy matching.
+  if (toolName === "AskUserQuestion") return "user-input";
+
   const n = toolName.toLowerCase();
   if (n === "bash" || n.includes("shell") || n.includes("command")) {
     return "command";

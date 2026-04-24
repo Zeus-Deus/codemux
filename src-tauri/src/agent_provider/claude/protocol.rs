@@ -119,10 +119,13 @@ pub struct SidecarDecision {
 impl From<ApprovalDecision> for SidecarDecision {
     fn from(value: ApprovalDecision) -> Self {
         match value {
-            ApprovalDecision::Allow { updated_input } => Self {
+            ApprovalDecision::Allow {
+                updated_input,
+                updated_permissions,
+            } => Self {
                 behavior: "allow".into(),
                 updated_input,
-                updated_permissions: None,
+                updated_permissions: updated_permissions.map(Value::Array),
                 message: None,
                 interrupt: None,
             },
@@ -269,6 +272,10 @@ pub enum SidecarNotification {
         request_id: String,
         tool_name: String,
         tool_input: Value,
+        /// Claude's own tool-use identifier, forwarded so the runtime can
+        /// merge a permission request with its originating tool_use row.
+        /// `None` when the sidecar did not populate `toolUseId`.
+        tool_use_id: Option<String>,
         kind: String,
     },
     RequestResolved {
@@ -345,6 +352,7 @@ impl SidecarNotification {
                 request_id: field_string(&params, "requestId"),
                 tool_name: field_string(&params, "toolName"),
                 tool_input: field_value(&params, "toolInput"),
+                tool_use_id: field_opt_string(&params, "toolUseId"),
                 kind: field_string(&params, "kind"),
             },
             "request-resolved" => Self::RequestResolved {
@@ -420,11 +428,33 @@ mod tests {
     fn decision_allow_passes_updated_input_through() {
         let d: SidecarDecision = ApprovalDecision::Allow {
             updated_input: Some(json!({"edited": true})),
+            updated_permissions: None,
         }
         .into();
         assert_eq!(d.behavior, "allow");
         assert_eq!(d.updated_input, Some(json!({"edited": true})));
         assert!(d.message.is_none());
+        assert!(d.updated_permissions.is_none());
+    }
+
+    #[test]
+    fn decision_allow_forwards_updated_permissions_as_array() {
+        // "Allow always" flows through `updated_permissions` — an opaque
+        // `PermissionUpdate[]` per the SDK — wrapped back into a JSON
+        // array on the wire.
+        let rule = json!({
+            "type": "addRules",
+            "rules": [{"toolName": "Bash"}],
+            "behavior": "allow",
+            "destination": "localSettings"
+        });
+        let d: SidecarDecision = ApprovalDecision::Allow {
+            updated_input: None,
+            updated_permissions: Some(vec![rule.clone()]),
+        }
+        .into();
+        assert_eq!(d.behavior, "allow");
+        assert_eq!(d.updated_permissions, Some(json!([rule])));
     }
 
     #[test]
