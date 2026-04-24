@@ -292,11 +292,12 @@ describe("Checkout default branch menu item", () => {
   });
 
   it("extracts .message when the checkout rejects with an Error instance", async () => {
-    // The Tauri plugin usually stringifies errors, but `invoke` can also
-    // reject with an Error-typed value (e.g. if a layer above throws).
-    // The handler's `err instanceof Error ? err.message : String(err)`
-    // branch must pull the message out cleanly — otherwise the toast shows
-    // the generic "[object Object]".
+    // The Tauri plugin normally rejects with the raw Err(String) from Rust,
+    // but `invoke` can also surface an Error-typed value (e.g. if a middle
+    // layer throws). The handler's `err instanceof Error ? err.message
+    // : String(err)` branch must pull `.message` out cleanly — otherwise
+    // the toast shows `String(err)` which prefixes "Error: " (and, for
+    // object-shaped errors, would produce "[object Object]").
     mockCheckoutDefault.mockRejectedValueOnce(
       new Error("index.lock exists, another git process seems to be running"),
     );
@@ -312,9 +313,11 @@ describe("Checkout default branch menu item", () => {
 
     await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
     const [msg] = mockToast.error.mock.calls[0];
-    expect(msg).toMatch(/Couldn't switch:/);
-    expect(msg).toMatch(/index\.lock exists/);
-    expect(msg).not.toMatch(/\[object Object\]/);
+    // Exact-match the shape: no "Error: " prefix from String(err), no
+    // "[object Object]" from a non-Error object.
+    expect(msg).toBe(
+      "Couldn't switch: index.lock exists, another git process seems to be running",
+    );
   });
 
   it("falls back to cwd when project_root is not yet stamped on a primary workspace", async () => {
