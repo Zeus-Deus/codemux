@@ -254,4 +254,107 @@ describe("Checkout default branch menu item", () => {
     );
     expect(container.querySelector("svg.lucide-laptop")).toBeInTheDocument();
   });
+
+  // ── Edge cases ──
+
+  it("keeps the item clickable while the default-branch fetch is still in flight", async () => {
+    // Never-resolving promise so `defaultBranch` stays null for the whole
+    // render. Confirms the "don't block on fetch" rule from the design:
+    // the handler must be callable before we know the default branch, and
+    // the backend's `Ok(None)` guard is what catches the "actually on
+    // default" edge — not a pre-click UI gate.
+    mockGetDefaultBranch.mockImplementationOnce(
+      () => new Promise<string>(() => {}),
+    );
+    const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+
+    const item = screen.getByRole("menuitem", { name: /Checkout default branch/i });
+    expect(item).toBeInTheDocument();
+    expect(item).not.toBeDisabled();
+  });
+
+  it("treats an empty string from getDefaultBranch as unknown (item not pre-disabled)", async () => {
+    // Backend returns "" when git_default_branch couldn't resolve anything
+    // meaningful. The hook's `branch || null` normalization should coerce
+    // that into `null` so the disabled gate doesn't trigger.
+    mockGetDefaultBranch.mockResolvedValueOnce("");
+    const ws = makeWorkspace({ worktree_path: null, git_branch: "" });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    const item = screen.getByRole("menuitem", { name: /Checkout default branch/i });
+    expect(item).not.toBeDisabled();
+  });
+
+  it("extracts .message when the checkout rejects with an Error instance", async () => {
+    // The Tauri plugin usually stringifies errors, but `invoke` can also
+    // reject with an Error-typed value (e.g. if a layer above throws).
+    // The handler's `err instanceof Error ? err.message : String(err)`
+    // branch must pull the message out cleanly — otherwise the toast shows
+    // the generic "[object Object]".
+    mockCheckoutDefault.mockRejectedValueOnce(
+      new Error("index.lock exists, another git process seems to be running"),
+    );
+    const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+
+    await flushDefaultBranchFetch();
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: /Checkout default branch/i }),
+    );
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
+    const [msg] = mockToast.error.mock.calls[0];
+    expect(msg).toMatch(/Couldn't switch:/);
+    expect(msg).toMatch(/index\.lock exists/);
+    expect(msg).not.toMatch(/\[object Object\]/);
+  });
+
+  it("falls back to cwd when project_root is not yet stamped on a primary workspace", async () => {
+    // During the brief window between `create_workspace_at_path` and
+    // `set_workspace_project_root`, primary rows can momentarily have
+    // `project_root: null`. The hook's `project_root ?? cwd` fallback means
+    // the default-branch fetch still uses *some* path — and for primary
+    // workspaces the cwd is the repo root anyway, so it's the right answer.
+    const ws = makeWorkspace({
+      worktree_path: null,
+      project_root: null,
+      cwd: "/home/user/projects/myapp",
+      git_branch: "feature/x",
+    });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(mockGetDefaultBranch).toHaveBeenCalledWith(
+      "/home/user/projects/myapp",
+    );
+  });
+
+  it("does not fetch getDefaultBranch for worktree workspaces (project_root-scoped no-op)", async () => {
+    // Worktree rows don't expose the checkout action, so triggering the
+    // default-branch fetch would be wasted work. The fallback in
+    // `WorkspaceContextMenuItems` passes `null` for worktree workspaces
+    // when `project_root` is unset, and the hook no-ops on a null key.
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
+      project_root: null,
+      cwd: "/home/user/.codemux/worktrees/myapp/feature-x",
+      git_branch: "feature-x",
+    });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+  });
 });

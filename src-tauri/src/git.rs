@@ -4754,4 +4754,103 @@ TARGET version
         let after = run_git_permissive(&local, &["branch", "--show-current"]);
         assert_eq!(after, "develop");
     }
+
+    /// Rebase in progress → git refuses checkout with a specific error. Same
+    /// Err-and-preserve-branch semantics as the dirty-conflict case; adding
+    /// this test guards against a regression where we'd accidentally swallow
+    /// this class of error (e.g. if someone tried to force the checkout).
+    #[test]
+    fn checkout_default_branch_errs_during_rebase() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        let default = main_branch(&repo).to_string();
+
+        // Two divergent commits to rebase.
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run_git(&repo, &["add", "a.txt"]).unwrap();
+        run_git(&repo, &["commit", "-m", "a on default"]).unwrap();
+
+        run_git(&repo, &["checkout", "-b", "feature/x"]).unwrap();
+        std::fs::write(repo.join("a.txt"), "a-feature\n").unwrap();
+        run_git(&repo, &["commit", "-am", "a on feature"]).unwrap();
+
+        run_git(&repo, &["checkout", &default]).unwrap();
+        std::fs::write(repo.join("a.txt"), "a-default\n").unwrap();
+        run_git(&repo, &["commit", "-am", "a on default v2"]).unwrap();
+        run_git(&repo, &["checkout", "feature/x"]).unwrap();
+
+        // Start an interactive-style rebase that will stop on conflicts.
+        let (_out, _err, _ok) = run_git_full(&repo, &["rebase", &default]).unwrap();
+        // Confirm a rebase is actually in progress (regardless of conflict state).
+        let rebase_in_progress = repo.join(".git/rebase-apply").exists()
+            || repo.join(".git/rebase-merge").exists();
+        assert!(
+            rebase_in_progress,
+            "test precondition failed: rebase didn't start"
+        );
+
+        // checkout should fail; branch stays on the rebase head (feature/x
+        // or a detached HEAD, depending on git version — what matters is
+        // that it's NOT the default).
+        let result = checkout_default_branch(&repo);
+        assert!(
+            result.is_err(),
+            "expected Err while rebase is in progress, got {:?}",
+            result
+        );
+
+        // Clean up so the TempDir drop doesn't hit a lingering rebase.
+        let _ = run_git(&repo, &["rebase", "--abort"]);
+    }
+
+    /// No `origin/HEAD` symref, no remote at all, but `main` exists locally
+    /// → helper falls through to the hardcoded `main` / `master` check and
+    /// switches to `main`. Guards the fallback path that `find_default_branch`
+    /// uses when `symbolic-ref refs/remotes/origin/HEAD` returns nothing.
+    #[test]
+    fn checkout_default_branch_falls_back_to_main_without_origin_head() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // If the test harness landed on `master` instead of `main`, rename
+        // so we can assert specifically on the `main` fallback branch.
+        let current = run_git_permissive(&repo, &["branch", "--show-current"]);
+        if current == "master" {
+            run_git(&repo, &["branch", "-m", "master", "main"]).expect("rename to main");
+        }
+
+        // Verify precondition: no origin/HEAD, no remote refs.
+        let origin_head = run_git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD"]);
+        assert!(origin_head.is_err(), "precondition: origin/HEAD shouldn't exist");
+
+        run_git(&repo, &["checkout", "-b", "feature/y"]).unwrap();
+        let result = checkout_default_branch(&repo).expect("should fall back to main");
+        assert_eq!(result, Some("main".to_string()), "expected fallback to 'main'");
+        let after = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(after, "main");
+    }
+
+    /// No `origin/HEAD`, no `main`, but `master` exists → falls through to
+    /// the second fallback candidate. Paired with the previous test to
+    /// ensure both sides of the hardcoded fallback list are covered.
+    #[test]
+    fn checkout_default_branch_falls_back_to_master_when_no_main() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Normalize default to `master`: rename `main` if that's what init produced.
+        let current = run_git_permissive(&repo, &["branch", "--show-current"]);
+        if current == "main" {
+            run_git(&repo, &["branch", "-m", "main", "master"]).expect("rename to master");
+        }
+        // Ensure `main` does NOT exist so the first fallback candidate misses.
+        let main_exists = run_git(&repo, &["rev-parse", "--verify", "main"]).is_ok();
+        assert!(!main_exists, "precondition: 'main' must not exist");
+
+        run_git(&repo, &["checkout", "-b", "feature/z"]).unwrap();
+        let result = checkout_default_branch(&repo).expect("should fall back to master");
+        assert_eq!(result, Some("master".to_string()), "expected fallback to 'master'");
+        let after = run_git_permissive(&repo, &["branch", "--show-current"]);
+        assert_eq!(after, "master");
+    }
 }
