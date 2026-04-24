@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render } from "@testing-library/react";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
+import { cleanup, render } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -13,6 +13,11 @@ let currentDraftsById: Record<
 let workspaceIdForPaneOverride: string | null = "ws-home";
 const setShowNewWorkspaceDialogMock = vi.fn();
 const setActiveDraftMock = vi.fn();
+// Hoisted so the model-seed effect tests can observe whether (and
+// with what) setModel was called from inside AgentChatPane's mount.
+// Stable across selector calls — the agent-chat-store mock below
+// reuses this exact spy in every state object it produces.
+const setModelMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -220,7 +225,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         threads: buildThreads(),
         ensureThread: vi.fn(),
         setInputDraft: vi.fn(),
-        setModel: vi.fn(),
+        setModel: setModelMock,
         setPermissionMode: vi.fn(),
         setSessionLaunchMode: vi.fn(),
         migrateThreadId: vi.fn(),
@@ -719,5 +724,79 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
     ) as HTMLElement | null;
     expect(stub).not.toBeNull();
     expect(stub!.dataset.projectPath).toBe("/tmp/adhoc");
+  });
+});
+
+// ── Default-model seed effect ─────────────────────────────────────────
+//
+// Regression coverage for the bug where the ReasoningPicker disappeared
+// after app restart / resume / any other path that left the slice with
+// `model: null` under a pre-existing thread_id. The mount effect at the
+// top of AgentChatPane short-circuits when threadId is set, so without
+// a separate seed effect the slice's model would stay null and
+// ReasoningPicker (`if (!model) return null`) would render nothing.
+
+describe("AgentChatPane default-model seed effect", () => {
+  beforeEach(() => {
+    currentMessages = [];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    setModelMock.mockClear();
+    vi.mocked(agentChatStartSession).mockClear();
+    mockAppState.appState = HOME_APP_STATE.appState;
+  });
+  afterEach(() => {
+    // Without an explicit unmount the prior test's pane stays in the
+    // DOM and its async session-start `.then(...)` callback fires its
+    // setStoreModel call into the next test's accumulated mock.calls
+    // — exactly the pollution that hid this bug initially. cleanup()
+    // unmounts every render() from this test file.
+    cleanup();
+  });
+
+  it("seeds slice.model with the provider default when slice.model is null on mount", () => {
+    // Pane already has a thread_id (existing pane reopened, or app
+    // restart hydrated the pane snapshot but the in-memory store is
+    // empty). Slice exists with model: null. The mount effect that
+    // starts a session short-circuits in this branch, so the new
+    // seed effect must compensate.
+    const existingPane = {
+      ...pane,
+      thread_id: "thread-x",
+    };
+    render(<AgentChatPane pane={existingPane} />);
+    expect(setModelMock).toHaveBeenCalled();
+    const [threadId, model] = setModelMock.mock.calls[0];
+    expect(threadId).toBe("thread-x");
+    // defaultModelForProvider("claude") falls back to "claude-opus-4-7"
+    // when capabilities aren't in the test environment.
+    expect(model).toBe("claude-opus-4-7");
+  });
+
+  it("does not call setModel when there is no thread_id yet", () => {
+    // The "new pane" mount path takes a different branch — it starts
+    // a session and the .then() handler seeds the model. This effect
+    // must not fire pre-thread, otherwise we'd write to the wrong key.
+    const draftlessPane = {
+      ...pane,
+      thread_id: null as unknown as string,
+    };
+    render(<AgentChatPane pane={draftlessPane} />);
+    expect(setModelMock).not.toHaveBeenCalled();
+  });
+
+  it("uses codex default when the pane is on the codex provider", () => {
+    // The fallback table maps each provider to its own default. A
+    // pane on codex must not get seeded with the claude default.
+    const codexPane = {
+      ...pane,
+      thread_id: "thread-x",
+      provider: "codex" as const,
+    };
+    render(<AgentChatPane pane={codexPane} />);
+    expect(setModelMock).toHaveBeenCalled();
+    const [, model] = setModelMock.mock.calls[0];
+    expect(model).toBe("gpt-5.4");
   });
 });

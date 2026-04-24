@@ -211,6 +211,28 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
 
+  // Seed slice.model with the provider's default whenever the slice
+  // exists (threadId set) but has no model yet. Three paths land in
+  // this state:
+  //   (a) app restart — the pane snapshot still carries a thread_id,
+  //       but the in-memory store was wiped, so `ensureThread` below
+  //       creates a fresh empty slice
+  //   (b) resume from session history — `hydrateThread` rebuilds the
+  //       transcript from persisted events, none of which carry the
+  //       chosen model
+  //   (c) any future flow that pre-creates a slice without seeding
+  //       the model (e.g. silent restart on a thread that never got
+  //       a model assigned)
+  // Without this seed, ReasoningPicker (which short-circuits on
+  // `!model`) renders nothing and the user loses the effort /
+  // context-window picker. Idempotent — bails the moment a model is
+  // present.
+  useEffect(() => {
+    if (!threadId) return;
+    if (model !== null) return;
+    setStoreModel(threadId, defaultModelForProvider(provider));
+  }, [threadId, model, provider, setStoreModel]);
+
   // Subscribe to provider events for this thread. The handler reads
   // store actions via `getState()` so it stays stable across
   // re-renders — otherwise we'd rebind the Tauri listener on every
