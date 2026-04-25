@@ -104,6 +104,8 @@ import {
   VscDiffRenamed,
   VscCopy,
 } from "react-icons/vsc";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { PrStatusIcon } from "@/components/github/pr-status-icon";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
@@ -1730,6 +1732,32 @@ export function ChangesPanel({ workspace }: Props) {
               Refresh
             </TooltipContent>
           </Tooltip>
+
+          {/* Open PR on GitHub — right-aligned (Superset's ChangesHeader
+              PRButton pattern). Only renders when a PR URL is known;
+              workspaces without a PR show no placeholder. */}
+          {workspace.pr_url && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  className="ml-auto"
+                  onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
+                >
+                  <PrStatusIcon state={workspace.pr_state} size={3} />
+                  {workspace.pr_number != null && (
+                    <span className="tabular-nums">#{workspace.pr_number}</span>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="text-xs">
+                {workspace.pr_number != null
+                  ? `Open PR #${workspace.pr_number} on GitHub`
+                  : "Open PR on GitHub"}
+              </TooltipContent>
+            </Tooltip>
+          )}
         </div>
 
         {/* Commit area */}
