@@ -558,6 +558,7 @@ export interface WorkspaceSnapshot {
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;
+  pr_branch: string | null;
   linked_issue: LinkedIssue | null;
   tabs: TabSnapshot[];
   active_tab_id: string;

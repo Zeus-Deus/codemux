@@ -317,6 +317,10 @@ pub struct WorkspaceSnapshot {
     pub pr_state: Option<String>,
     #[serde(default)]
     pub pr_url: Option<String>,
+    /// Branch the recorded PR fields belong to. Used to clear stale PR data
+    /// when the user switches off that branch — see `apply_pr_refresh`.
+    #[serde(default)]
+    pub pr_branch: Option<String>,
     #[serde(default)]
     pub linked_issue: Option<crate::github::LinkedIssue>,
     #[serde(default)]
@@ -589,6 +593,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_branch: None,
             linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
@@ -713,6 +718,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_branch: None,
             linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
@@ -800,6 +806,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_branch: None,
             linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
@@ -926,6 +933,7 @@ impl AppStateStore {
         pr_number: Option<u32>,
         pr_state: Option<String>,
         pr_url: Option<String>,
+        pr_branch: Option<String>,
     ) {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -936,7 +944,65 @@ impl AppStateStore {
             workspace.pr_number = pr_number;
             workspace.pr_state = pr_state;
             workspace.pr_url = pr_url;
+            workspace.pr_branch = pr_branch;
         }
+    }
+
+    /// Reconcile a workspace's PR fields against a fresh `gh pr view` result.
+    ///
+    /// Fork-checkout PRs cannot be resolved by `gh pr view` from the local
+    /// branch, so a `None` result must NOT blanket-clear PR fields — the
+    /// stored fields may have been set explicitly during PR-checkout. We
+    /// disambiguate by comparing the recorded `pr_branch` against the
+    /// workspace's current branch: if they differ, the user moved off the
+    /// branch the PR belonged to and the fields are stale.
+    pub fn apply_pr_refresh(
+        &self,
+        workspace_id: &str,
+        current_branch: Option<&str>,
+        pr: Option<(u32, String, String)>,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+
+        let before = (
+            workspace.pr_number,
+            workspace.pr_state.clone(),
+            workspace.pr_url.clone(),
+            workspace.pr_branch.clone(),
+        );
+
+        let moved_branch = match (workspace.pr_branch.as_deref(), current_branch) {
+            (Some(prev), Some(curr)) => prev != curr,
+            _ => false,
+        };
+        if moved_branch {
+            workspace.pr_number = None;
+            workspace.pr_state = None;
+            workspace.pr_url = None;
+            workspace.pr_branch = None;
+        }
+
+        if let Some((number, state, url)) = pr {
+            workspace.pr_number = Some(number);
+            workspace.pr_state = Some(state);
+            workspace.pr_url = Some(url);
+            workspace.pr_branch = current_branch.map(|s| s.to_string());
+        }
+
+        before
+            != (
+                workspace.pr_number,
+                workspace.pr_state.clone(),
+                workspace.pr_url.clone(),
+                workspace.pr_branch.clone(),
+            )
     }
 
     pub fn set_workspace_worktree(
@@ -2619,6 +2685,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_branch: None,
             linked_issue: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
@@ -4363,6 +4430,142 @@ mod tests {
             default_session,
             new_session.unwrap().0,
             "new tab session must differ from the reused default"
+        );
+    }
+
+    // ── apply_pr_refresh ─────────────────────────────────────────────────
+
+    fn pr(number: u32, state: &str, url: &str) -> (u32, String, String) {
+        (number, state.into(), url.into())
+    }
+
+    fn first_workspace_id(store: &AppStateStore) -> String {
+        store.snapshot().workspaces[0].workspace_id.0.clone()
+    }
+
+    fn pr_fields(store: &AppStateStore, id: &str) -> (Option<u32>, Option<String>, Option<String>, Option<String>) {
+        let snap = store.snapshot();
+        let ws = snap.workspaces.iter().find(|w| w.workspace_id.0 == id).unwrap();
+        (ws.pr_number, ws.pr_state.clone(), ws.pr_url.clone(), ws.pr_branch.clone())
+    }
+
+    #[test]
+    fn apply_pr_refresh_stores_branch_with_pr() {
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+
+        let changed = store.apply_pr_refresh(
+            &id,
+            Some("feature/x"),
+            Some(pr(42, "OPEN", "https://gh/o/r/pull/42")),
+        );
+
+        assert!(changed);
+        assert_eq!(
+            pr_fields(&store, &id),
+            (Some(42), Some("OPEN".into()), Some("https://gh/o/r/pull/42".into()), Some("feature/x".into())),
+        );
+    }
+
+    #[test]
+    fn apply_pr_refresh_clears_when_branch_changed_and_gh_returns_none() {
+        // Original bug: switching off a PR branch should drop the icon.
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+        store.apply_pr_refresh(&id, Some("feature/x"), Some(pr(42, "OPEN", "u")));
+
+        let changed = store.apply_pr_refresh(&id, Some("main"), None);
+
+        assert!(changed);
+        assert_eq!(pr_fields(&store, &id), (None, None, None, None));
+    }
+
+    #[test]
+    fn apply_pr_refresh_preserves_when_branch_matches_and_gh_returns_none() {
+        // Fork-checkout case: gh can't see the PR from the local branch but
+        // the PR fields were set explicitly during checkout — keep them.
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+        store.update_workspace_pr_info(
+            &id,
+            Some(99),
+            None,
+            None,
+            Some("fork/feature".into()),
+        );
+
+        let changed = store.apply_pr_refresh(&id, Some("fork/feature"), None);
+
+        assert!(!changed);
+        assert_eq!(
+            pr_fields(&store, &id),
+            (Some(99), None, None, Some("fork/feature".into())),
+        );
+    }
+
+    #[test]
+    fn apply_pr_refresh_replaces_when_branch_changed_and_gh_returns_pr() {
+        // Switching to another branch that has its own PR: stale PR is
+        // overwritten and pr_branch tracks the new branch.
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+        store.apply_pr_refresh(&id, Some("feature/x"), Some(pr(42, "OPEN", "u1")));
+
+        let changed = store.apply_pr_refresh(
+            &id,
+            Some("feature/y"),
+            Some(pr(7, "MERGED", "u2")),
+        );
+
+        assert!(changed);
+        assert_eq!(
+            pr_fields(&store, &id),
+            (Some(7), Some("MERGED".into()), Some("u2".into()), Some("feature/y".into())),
+        );
+    }
+
+    #[test]
+    fn apply_pr_refresh_no_op_when_nothing_stored_and_no_pr() {
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+
+        let changed = store.apply_pr_refresh(&id, Some("main"), None);
+
+        assert!(!changed);
+        assert_eq!(pr_fields(&store, &id), (None, None, None, None));
+    }
+
+    #[test]
+    fn apply_pr_refresh_no_op_when_same_pr_and_branch() {
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+        store.apply_pr_refresh(&id, Some("feature/x"), Some(pr(42, "OPEN", "u")));
+
+        let changed = store.apply_pr_refresh(&id, Some("feature/x"), Some(pr(42, "OPEN", "u")));
+
+        assert!(!changed);
+    }
+
+    #[test]
+    fn apply_pr_refresh_preserves_when_current_branch_unknown() {
+        // git_branch_info can fail (detached HEAD, broken .git, etc.).
+        // We must not interpret that as "user moved branches" and clear.
+        let store = AppStateStore::default();
+        let id = first_workspace_id(&store);
+        store.update_workspace_pr_info(
+            &id,
+            Some(42),
+            Some("OPEN".into()),
+            Some("u".into()),
+            Some("feature/x".into()),
+        );
+
+        let changed = store.apply_pr_refresh(&id, None, None);
+
+        assert!(!changed);
+        assert_eq!(
+            pr_fields(&store, &id),
+            (Some(42), Some("OPEN".into()), Some("u".into()), Some("feature/x".into())),
         );
     }
 }
