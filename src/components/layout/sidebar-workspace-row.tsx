@@ -484,7 +484,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                             >
                               <PrStatusIcon state={workspace.pr_state} size={3} />
                               {workspace.pr_number && (
-                                <span className="text-[10px] tabular-nums text-white">
+                                <span className="text-[10px] tabular-nums text-muted-foreground/60">
                                   #{workspace.pr_number}
                                 </span>
                               )}
