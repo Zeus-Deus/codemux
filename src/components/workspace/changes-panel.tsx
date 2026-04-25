@@ -1777,12 +1777,12 @@ export function ChangesPanel({ workspace }: Props) {
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Button
-                    variant="ghost"
+                    variant="outline"
                     size="xs"
                     className={cn(
                       workspace.pr_state === "OPEN" &&
                         workspace.pr_number != null &&
-                        "rounded-r-none",
+                        "rounded-r-none border-r-0",
                     )}
                     onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
                   >
@@ -1804,9 +1804,9 @@ export function ChangesPanel({ workspace }: Props) {
                     <TooltipTrigger asChild>
                       <DropdownMenuTrigger asChild>
                         <Button
-                          variant="ghost"
+                          variant="outline"
                           size="icon-xs"
-                          className="size-6 p-0 rounded-l-none border-l border-border/40"
+                          className="size-6 p-0 rounded-l-none"
                           disabled={mergingPr !== null}
                           aria-label="Merge PR"
                         >
@@ -1822,7 +1822,7 @@ export function ChangesPanel({ workspace }: Props) {
                       Merge PR
                     </TooltipContent>
                   </Tooltip>
-                  <DropdownMenuContent align="end" className="w-52">
+                  <DropdownMenuContent align="end" className="w-fit">
                     <DropdownMenuItem
                       onClick={() => handleMergePr("squash")}
                       disabled={mergingPr !== null}
