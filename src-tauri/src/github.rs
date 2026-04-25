@@ -29,6 +29,20 @@ pub struct PullRequestInfo {
     pub updated_at: Option<String>,
 }
 
+impl PullRequestInfo {
+    /// State string that feeds the workspace `pr_state` field (and the
+    /// sidebar PR-status icon). Collapses `is_draft: true` into a "DRAFT"
+    /// label so the sidebar can pick the muted draft icon without needing
+    /// a separate `is_draft` column on the workspace.
+    pub fn display_state(&self) -> String {
+        if self.is_draft {
+            "DRAFT".to_string()
+        } else {
+            self.state.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingPrItem {
     pub number: u32,

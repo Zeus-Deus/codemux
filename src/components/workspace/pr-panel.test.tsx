@@ -177,10 +177,10 @@ describe("cache TTL", () => {
 
   it("ghStatusCache returns value before TTL", () => {
     vi.useFakeTimers();
-    setCachedGhStatus({ status: "NotAuthenticated" });
+    setCachedGhStatus({ status: "Authenticated", username: "alice" });
 
     vi.advanceTimersByTime(CACHE_TTL_MS - 1000);
-    expect(getCachedGhStatus()).toEqual({ status: "NotAuthenticated" });
+    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "alice" });
   });
 
   it("repoCheckCache expires after TTL", () => {
@@ -198,12 +198,12 @@ describe("cache TTL", () => {
     setCachedRepoCheck("/path/a", true);
 
     vi.advanceTimersByTime(CACHE_TTL_MS / 2);
-    setCachedRepoCheck("/path/b", false);
+    setCachedRepoCheck("/path/b", true);
 
-    // Expire first entry
+    // Expire only the first entry
     vi.advanceTimersByTime(CACHE_TTL_MS / 2 + 1);
     expect(getCachedRepoCheck("/path/a")).toBeUndefined();
-    expect(getCachedRepoCheck("/path/b")).toBe(false);
+    expect(getCachedRepoCheck("/path/b")).toBe(true);
   });
 
   it("manual refresh bypasses caches", async () => {
@@ -230,30 +230,46 @@ describe("cache TTL", () => {
     expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
   });
 
-  it("stale failure recovers after TTL", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-
-    // First render: checkGithubRepo fails (cached as false)
+  it("failures are not cached — recovery is immediate, no TTL wait", async () => {
+    // First render: checkGithubRepo returns false. The buggy old behavior
+    // cached this for 60s; the fix drops failure caching entirely so the
+    // user sees the recovery on the very next render.
     mockCheckGithubRepo.mockResolvedValue(false);
 
     const { unmount } = render(<PrPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
     expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
+    expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
 
     unmount();
 
-    // Advance past TTL so cache expires
-    vi.advanceTimersByTime(CACHE_TTL_MS + 1);
-
-    // Now mock success
+    // No TTL advance — fix the underlying issue and re-render immediately.
     mockCheckGithubRepo.mockResolvedValue(true);
 
     render(<PrPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    // Should re-check (cache expired) and now see the PR panel content
     expect(screen.queryByText("Not a GitHub repository")).not.toBeInTheDocument();
+  });
+
+  it("setCachedGhStatus drops non-Authenticated values", () => {
+    setCachedGhStatus({ status: "NotAuthenticated" });
+    expect(getCachedGhStatus()).toBeNull();
+
+    setCachedGhStatus({ status: "NotInstalled" });
+    expect(getCachedGhStatus()).toBeNull();
+
+    setCachedGhStatus({ status: "Authenticated", username: "test" });
+    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "test" });
+  });
+
+  it("setCachedRepoCheck drops false values", () => {
+    setCachedRepoCheck("/path/x", false);
+    expect(getCachedRepoCheck("/path/x")).toBeUndefined();
+
+    setCachedRepoCheck("/path/x", true);
+    expect(getCachedRepoCheck("/path/x")).toBe(true);
   });
 });
 

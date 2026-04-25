@@ -52,6 +52,11 @@ interface Props {
 }
 
 // ── Module-level caches with TTL ──
+//
+// Only successful results are cached. NotAuthenticated/NotInstalled and
+// "not a GitHub repo" responses bypass the cache so the user sees the
+// recovery (e.g. after `gh auth login` or after a `git remote add origin`)
+// on the very next render, not 60 seconds later.
 export const CACHE_TTL_MS = 60_000;
 
 interface CacheEntry<T> { value: T; ts: number; }
@@ -67,7 +72,9 @@ export function getCachedGhStatus(): GhStatus | null {
   return ghStatusCache.value;
 }
 
+/** Stores only successful auth statuses; failures are dropped on the floor. */
 export function setCachedGhStatus(value: GhStatus): void {
+  if (value.status !== "Authenticated") return;
   ghStatusCache = { value, ts: Date.now() };
 }
 
@@ -80,7 +87,9 @@ export function getCachedRepoCheck(key: string): boolean | undefined {
   return entry.value;
 }
 
+/** Stores only positive repo-check results; non-GitHub paths re-check every call. */
 export function setCachedRepoCheck(key: string, value: boolean): void {
+  if (!value) return;
   repoCheckCache.set(key, { value, ts: Date.now() });
 }
 

@@ -545,7 +545,7 @@ pub fn run() {
                             // PR-checkout (fork branches where `gh pr view` can't resolve).
                             if pr_info.is_some() {
                                 let pr_number = pr_info.as_ref().map(|p| p.number);
-                                let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+                                let pr_state = pr_info.as_ref().map(|p| p.display_state());
                                 let pr_url = pr_info.as_ref().map(|p| p.url.clone());
                                 state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
                             }
@@ -576,6 +576,150 @@ pub fn run() {
                     if !all_workspaces.is_empty() {
                         state::emit_app_state(&git_handle);
                     }
+                }
+            });
+
+            // Background PR polling for the sidebar PR-status icon. The 5s
+            // tick above only refreshes the active workspace's PR info; this
+            // 60s tick walks every workspace so non-active sidebar rows
+            // don't go stale (the user might leave the app open while a
+            // teammate merges a PR on GitHub).
+            //
+            // Sequential per tick on purpose — each `gh pr view` is a
+            // subprocess fork, and we'd rather take ~Nx longer than slam
+            // `gh` with N parallel children. Each call gets a 10s timeout
+            // so a single hanging `gh` doesn't block subsequent workspaces.
+            //
+            // Pauses the per-workspace walk when `gh` is missing or
+            // unauthenticated (status is rechecked every tick — `gh auth
+            // status` is itself a cheap fork+exec, ~50ms).
+            let pr_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                const TICK_SECS: u64 = 60;
+                const PER_CALL_TIMEOUT_SECS: u64 = 10;
+                let mut last_status_authed: Option<bool> = None;
+
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+
+                    // Check gh status outside spawn_blocking because it's a
+                    // fast call and we don't need the timeout machinery for it.
+                    let gh_status = github::check_gh_status();
+                    let authed = matches!(gh_status, github::GhStatus::Authenticated { .. });
+
+                    // Log status transitions only — avoids spamming when
+                    // the user is offline for an extended period.
+                    if last_status_authed != Some(authed) {
+                        eprintln!(
+                            "[codemux::pr-poll] gh auth status: {} (was: {:?})",
+                            if authed { "authenticated" } else { "unavailable" },
+                            last_status_authed,
+                        );
+                        last_status_authed = Some(authed);
+                    }
+
+                    if !authed {
+                        continue;
+                    }
+
+                    let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
+                    let workspaces: Vec<(String, String)> = {
+                        let snapshot = state.snapshot();
+                        snapshot
+                            .workspaces
+                            .iter()
+                            .map(|w| {
+                                let path = w
+                                    .worktree_path
+                                    .clone()
+                                    .unwrap_or_else(|| w.cwd.clone());
+                                (w.workspace_id.0.clone(), path)
+                            })
+                            .collect()
+                    };
+
+                    let mut refreshed = 0usize;
+                    let mut skipped_non_github = 0usize;
+                    let mut timed_out = 0usize;
+
+                    for (workspace_id, cwd) in workspaces {
+                        let path = std::path::PathBuf::from(&cwd);
+
+                        // Skip non-GitHub repos cheaply (this itself shells
+                        // out, but a single `gh repo view` is cheap relative
+                        // to skipping the whole tick on a non-GitHub
+                        // workspace).
+                        let path_for_repo = path.clone();
+                        let is_gh = tokio::time::timeout(
+                            std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
+                            tokio::task::spawn_blocking(move || {
+                                github::is_github_repo(&path_for_repo)
+                            }),
+                        )
+                        .await;
+                        let is_gh = match is_gh {
+                            Ok(Ok(b)) => b,
+                            Ok(Err(_)) => false,
+                            Err(_) => {
+                                timed_out += 1;
+                                continue;
+                            }
+                        };
+                        if !is_gh {
+                            skipped_non_github += 1;
+                            continue;
+                        }
+
+                        let path_for_pr = path.clone();
+                        let pr_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
+                            tokio::task::spawn_blocking(move || {
+                                github::get_branch_pr(&path_for_pr)
+                            }),
+                        )
+                        .await;
+
+                        match pr_result {
+                            Ok(Ok(Ok(Some(pr)))) => {
+                                state.update_workspace_pr_info(
+                                    &workspace_id,
+                                    Some(pr.number),
+                                    Some(pr.display_state()),
+                                    Some(pr.url.clone()),
+                                );
+                                refreshed += 1;
+                            }
+                            Ok(Ok(Ok(None))) => {
+                                // No PR — leave existing pr_number alone.
+                                // Matches refresh_workspace_pr's behavior of
+                                // not clearing fork-branch PRs that gh can't
+                                // resolve.
+                            }
+                            Ok(Ok(Err(e))) => {
+                                eprintln!(
+                                    "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!(
+                                    "[codemux::pr-poll] join error for {workspace_id}: {e}"
+                                );
+                            }
+                            Err(_) => {
+                                eprintln!(
+                                    "[codemux::pr-poll] gh pr view timed out (>{PER_CALL_TIMEOUT_SECS}s) for {workspace_id}"
+                                );
+                                timed_out += 1;
+                            }
+                        }
+                    }
+
+                    if refreshed > 0 {
+                        state::emit_app_state(&pr_handle);
+                    }
+                    eprintln!(
+                        "[codemux::pr-poll] tick — refreshed={refreshed} skipped_non_github={skipped_non_github} timed_out={timed_out}"
+                    );
                 }
             });
 
