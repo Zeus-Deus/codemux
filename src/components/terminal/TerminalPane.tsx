@@ -3,6 +3,8 @@ import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -300,9 +302,25 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
     const fitAddon = new FitAddon();
     const serializeAddon = new SerializeAddon();
+    const unicode11Addon = new Unicode11Addon();
+    term.loadAddon(unicode11Addon);
+    term.unicode.activeVersion = "11";
     term.loadAddon(fitAddon);
     term.loadAddon(serializeAddon);
     term.open(containerEl);
+
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        webgl.dispose();
+      });
+      term.loadAddon(webgl);
+    } catch (err) {
+      console.warn(
+        "[Codemux] WebGL renderer unavailable, falling back to DOM",
+        err,
+      );
+    }
 
     termRef.current = term;
     fitAddonRef.current = fitAddon;
