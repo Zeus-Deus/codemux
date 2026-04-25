@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, memo } from "react";
 import { CheckCircle2, XCircle, Loader2, Minus } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { CheckInfo } from "@/tauri/types";
@@ -6,7 +6,15 @@ import { CollapsibleSection } from "./collapsible-section";
 
 // Per-row check icon. Matches the tab-badge spinner so the same color
 // + motion appears in both places when checks are running.
-function CheckIcon({ status }: { status: string }) {
+//
+// `memo` is load-bearing here: React Query refetches every 2.5s and
+// hands ReviewChecks fresh `checks` array references each tick. Without
+// memo, every CheckIcon would re-render — even when the status hasn't
+// changed — and the CSS `animate-spin` keyframe would visibly stutter
+// every couple of seconds. With memo + a primitive-string `status`
+// prop, React skips the re-render entirely and the SVG keeps spinning
+// smoothly through the refetch.
+const CheckIcon = memo(function CheckIcon({ status }: { status: string }) {
   const s = status.toLowerCase();
   if (s === "pass" || s === "success")
     return <CheckCircle2 className="h-3 w-3 text-success shrink-0" />;
@@ -16,7 +24,7 @@ function CheckIcon({ status }: { status: string }) {
     return <Minus className="h-3 w-3 text-muted-foreground shrink-0" />;
   // pending / queued / in-progress / anything else → spinning amber loader
   return <Loader2 className="h-3 w-3 text-amber-500 shrink-0 animate-spin" />;
-}
+});
 
 interface Props {
   checks: CheckInfo[];

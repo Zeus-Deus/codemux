@@ -57,7 +57,7 @@ export function ReviewHeader({ pr }: Props) {
         target="_blank"
         rel="noopener noreferrer"
         onClick={handleOpen}
-        className="group flex items-center gap-1.5 cursor-pointer"
+        className="group flex items-center gap-1.5 cursor-pointer rounded-sm px-1 -mx-1 py-0.5 -my-0.5 no-underline hover:bg-accent/30 transition-colors"
       >
         <PrStatusIcon
           state={pr.is_draft ? "draft" : pr.state}
@@ -65,7 +65,7 @@ export function ReviewHeader({ pr }: Props) {
           className="shrink-0"
         />
         <span
-          className="min-w-0 flex-1 truncate text-xs font-medium text-foreground"
+          className="min-w-0 flex-1 truncate text-xs font-medium text-foreground no-underline"
           title={pr.title}
         >
           {pr.title}
