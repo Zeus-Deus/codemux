@@ -74,6 +74,7 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
     pr_number: null,
     pr_state: null,
     pr_url: null,
+    pr_branch: null,
     linked_issue: null,
     tabs: [],
     active_tab_id: "",

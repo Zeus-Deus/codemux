@@ -184,14 +184,13 @@ pub fn refresh_workspace_pr(
     };
 
     let pr_info = crate::github::get_branch_pr(Path::new(&cwd))?;
-    // Only overwrite if we found a PR — don't clear a pr_number that was
-    // explicitly set during PR-checkout (fork branches where gh can't resolve).
-    if pr_info.is_some() {
-        let pr_number = pr_info.as_ref().map(|p| p.number);
-        let pr_state = pr_info.as_ref().map(|p| p.display_state());
-        let pr_url = pr_info.as_ref().map(|p| p.url.clone());
-        state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
-    }
+    let current_branch = crate::git::git_branch_info(Path::new(&cwd))
+        .ok()
+        .and_then(|i| i.branch);
+    let pr_tuple = pr_info
+        .as_ref()
+        .map(|p| (p.number, p.display_state(), p.url.clone()));
+    state.apply_pr_refresh(&workspace_id, current_branch.as_deref(), pr_tuple);
     crate::state::emit_app_state(&app);
     Ok(())
 }
