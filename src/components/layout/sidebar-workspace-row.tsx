@@ -447,53 +447,61 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 )}
               </div>
 
-              {/* Branch name row */}
+              {/* Branch name row. Issue + PR badges are grouped into a
+                  single right-aligned cluster so they sit next to each
+                  other at the bottom-right when both are present (no dead
+                  gap), and the branch text is the only element that
+                  truncates when space is tight. */}
               {workspace.git_branch && (
                 <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   <span className="truncate">{workspace.git_branch}</span>
-                  {workspace.linked_issue && (
-                    <IssueDetailPopover
-                      workspaceId={workspace.workspace_id}
-                      issue={workspace.linked_issue}
-                    />
-                  )}
-                  {showPrIcon && (
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <button
-                          type="button"
-                          onClick={handlePrClick}
-                          disabled={!workspace.pr_url}
-                          aria-label={
-                            workspace.pr_number
-                              ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
-                              : `Pull request — ${prHumanState ?? ""}`
-                          }
-                          className={cn(
-                            "ml-auto inline-flex items-center gap-0.5 shrink-0 rounded px-0.5 hover:bg-foreground/10 transition-colors",
-                            !workspace.pr_url && "cursor-not-allowed opacity-60",
-                          )}
-                        >
-                          <PrStatusIcon state={workspace.pr_state} size={3} />
-                          {workspace.pr_number && (
-                            <span className="text-[10px] tabular-nums">
-                              #{workspace.pr_number}
-                            </span>
-                          )}
-                        </button>
-                      </TooltipTrigger>
-                      <TooltipContent side="right" sideOffset={4} className="text-xs">
-                        <div>
-                          {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
-                          {prHumanState ?? "Pull request"}
-                        </div>
-                        {workspace.pr_url && (
-                          <div className="text-muted-foreground text-[10px]">
-                            Click to open on GitHub
-                          </div>
-                        )}
-                      </TooltipContent>
-                    </Tooltip>
+                  {(workspace.linked_issue || showPrIcon) && (
+                    <div className="flex items-center gap-1 ml-auto shrink-0">
+                      {workspace.linked_issue && (
+                        <IssueDetailPopover
+                          workspaceId={workspace.workspace_id}
+                          issue={workspace.linked_issue}
+                        />
+                      )}
+                      {showPrIcon && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              onClick={handlePrClick}
+                              disabled={!workspace.pr_url}
+                              aria-label={
+                                workspace.pr_number
+                                  ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
+                                  : `Pull request — ${prHumanState ?? ""}`
+                              }
+                              className={cn(
+                                "inline-flex items-center gap-0.5 rounded px-0.5 hover:bg-foreground/10 transition-colors",
+                                !workspace.pr_url && "cursor-not-allowed opacity-60",
+                              )}
+                            >
+                              <PrStatusIcon state={workspace.pr_state} size={3} />
+                              {workspace.pr_number && (
+                                <span className="text-[10px] tabular-nums">
+                                  #{workspace.pr_number}
+                                </span>
+                              )}
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="right" sideOffset={4} className="text-xs">
+                            <div>
+                              {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
+                              {prHumanState ?? "Pull request"}
+                            </div>
+                            {workspace.pr_url && (
+                              <div className="text-muted-foreground text-[10px]">
+                                Click to open on GitHub
+                              </div>
+                            )}
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
+                    </div>
                   )}
                 </div>
               )}
