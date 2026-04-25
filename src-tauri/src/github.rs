@@ -554,15 +554,25 @@ pub fn merge_pull_request(
 }
 
 pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-    let output = run_gh_optional(
-        repo_path,
-        &["pr", "checks", "--json", "name,state,conclusion,elapsedTime,detailUrl,startedAt,completedAt"],
-    );
+    // `gh pr checks` exits non-zero when checks are pending (exit 1) or
+    // any have failed (exit 8) — even with `--json`, where the JSON is
+    // still written to stdout. `run_gh_optional` discards stdout on
+    // non-zero exit, which silently swallowed the entire check list any
+    // time a PR had a running or failing check (which is exactly when
+    // the user wants to see the data). Bypass the helper for this call
+    // and capture stdout regardless of exit code.
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            "--json",
+            "name,state,conclusion,elapsedTime,detailUrl,startedAt,completedAt",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run gh: {e}"))?;
 
-    let Some(json_str) = output else {
-        return Ok(Vec::new());
-    };
-
+    let json_str = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
     if json_str.is_empty() {
         return Ok(Vec::new());
     }

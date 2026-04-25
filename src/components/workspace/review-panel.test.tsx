@@ -1,7 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, cleanup, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
@@ -134,36 +133,20 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// ── Bug 1: Refresh triggers PR discovery when no PR ──
+// The refresh button was removed in the visual-match PR — auto-poll
+// (2.5s for PR detail + checks, 30s for comments) handles freshness
+// now. The discovery / fetch behaviors these tests covered are still
+// exercised indirectly through the React Query hooks that fire on
+// mount and on workspace switch.
 
-describe("refresh button", () => {
-  it("calls refreshWorkspacePr when no PR exists", async () => {
-    const user = userEvent.setup();
-    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
-    await flushPromises();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-
-    expect(mockRefreshWorkspacePr).toHaveBeenCalledWith("ws-1");
-  });
-
-  it("calls getBranchPullRequest (fetchDetails) when PR exists", async () => {
-    const user = userEvent.setup();
+describe("auto-fetch on mount", () => {
+  it("calls getBranchPullRequest when PR exists on mount", async () => {
     mockGetBranchPullRequest.mockResolvedValue(mockPr);
 
     renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
     await flushPromises();
 
-    // fetchDetails is called on mount; clear to isolate the refresh click
-    mockGetBranchPullRequest.mockClear();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
     expect(mockGetBranchPullRequest).toHaveBeenCalledWith("/home/user/project");
-    expect(mockRefreshWorkspacePr).not.toHaveBeenCalled();
   });
 });
 
@@ -213,9 +196,7 @@ describe("cache TTL", () => {
     expect(getCachedRepoCheck("/path/b")).toBe(true);
   });
 
-  it("manual refresh bypasses caches", async () => {
-    const user = userEvent.setup();
-
+  it("warm caches skip the auth + repo init calls", async () => {
     // Pre-populate caches so auth init won't call checkGhStatus/checkGithubRepo
     setCachedGhStatus({ status: "Authenticated", username: "test" });
     setCachedRepoCheck("/home/user/project", true);
@@ -226,15 +207,6 @@ describe("cache TTL", () => {
     // Auth init should NOT have called these (cache was warm)
     expect(mockCheckGhStatus).not.toHaveBeenCalled();
     expect(mockCheckGithubRepo).not.toHaveBeenCalled();
-
-    // Click refresh — should bust caches
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    // Caches were busted; verify they're empty
-    expect(getCachedGhStatus()).toBeNull();
-    expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
   });
 
   it("failures are not cached — recovery is immediate, no TTL wait", async () => {
@@ -294,30 +266,6 @@ describe("error state", () => {
     });
   });
 
-  it("clears error on successful retry", async () => {
-    const user = userEvent.setup();
-    // First: fail
-    mockGetBranchPullRequest.mockRejectedValue(new Error("network error"));
-
-    renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.getByText(/network error/)).toBeInTheDocument();
-    });
-
-    // Now succeed
-    mockGetBranchPullRequest.mockResolvedValue(mockPr);
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.queryByText(/network error/)).not.toBeInTheDocument();
-    });
-  });
-
   it("shows NoPrView (not error) when genuinely no PR", async () => {
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
@@ -326,22 +274,6 @@ describe("error state", () => {
     // No error banner should be present
     expect(screen.queryByText(/Failed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
-  });
-
-  it("shows error when refresh discovery fails", async () => {
-    const user = userEvent.setup();
-    mockRefreshWorkspacePr.mockRejectedValue(new Error("gh pr view failed"));
-
-    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
-    await flushPromises();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.getByText(/gh pr view failed/)).toBeInTheDocument();
-    });
   });
 });
 

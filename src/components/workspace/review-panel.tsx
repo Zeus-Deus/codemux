@@ -15,7 +15,6 @@ import {
 import {
   GitPullRequest,
   AlertCircle,
-  RefreshCw,
   ChevronLeft,
 } from "lucide-react";
 import {
@@ -27,7 +26,6 @@ import {
   getPrReviewComments,
   getPrInlineComments,
   listBranches,
-  refreshWorkspacePr,
   getDefaultBranch,
 } from "@/tauri/commands";
 import type {
@@ -371,7 +369,11 @@ export function ReviewPanel({ workspace }: Props) {
 
   const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
-  const [incomingRefreshKey, setIncomingRefreshKey] = useState(0);
+  // The IncomingPrsView used to be re-fetched via the now-removed
+  // refresh button. Auto-poll covers regular PR data; the incoming
+  // list relies on its own internal mount cycle (and on the 60s Rust
+  // background poll updating workspace.pr_state for each row).
+  const incomingRefreshKey = 0;
 
   const isBaseBranch = defaultBranch != null && workspace.git_branch === defaultBranch;
 
@@ -438,20 +440,25 @@ export function ReviewPanel({ workspace }: Props) {
     isGithubRepo === true &&
     hasPr;
 
+  // Cadence per Superset (`ChangesView.tsx:105` polls at 2500ms when
+  // active). PR detail + checks update fast so the user sees their
+  // PR move from pending → success without a manual refresh.
+  // Reviews + inline comments stay at 30s — they change less often
+  // and the JSON payloads are larger.
   const prDetailQuery = useQuery({
     queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
     queryFn: () => getBranchPullRequest(cwd),
     enabled: detailsEnabled,
-    staleTime: 10_000,
-    refetchInterval: 10_000,
+    staleTime: 2_500,
+    refetchInterval: 2_500,
   });
 
   const checksQuery = useQuery({
     queryKey: ["pr", "checks", workspace.workspace_id, workspace.pr_number] as const,
     queryFn: () => getPullRequestChecks(cwd),
     enabled: detailsEnabled,
-    staleTime: 10_000,
-    refetchInterval: 10_000,
+    staleTime: 2_500,
+    refetchInterval: 2_500,
   });
 
   const reviewsQuery = useQuery({
@@ -478,24 +485,13 @@ export function ReviewPanel({ workspace }: Props) {
   const checks: CheckInfo[] = checksQuery.data ?? [];
   const reviews: ReviewComment[] = reviewsQuery.data ?? [];
   const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
-  const detailLoading =
-    prDetailQuery.isFetching ||
-    checksQuery.isFetching ||
-    reviewsQuery.isFetching ||
-    inlineQuery.isFetching;
-  // The error banner surfaces (a) the primary detail query's error,
-  // and (b) errors from the manual-refresh PR-discovery path
-  // (`refresh_workspace_pr`) which lives outside React Query because
-  // it's a one-shot bootstrap call, not a long-lived data subscription.
-  // The other queries swallow their errors via empty-array fallbacks
-  // below since their failures are usually transient and the empty
-  // sections render fine.
-  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
-  const fetchError =
-    discoveryError ??
-    (prDetailQuery.error
-      ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
-      : null);
+  // Only the primary detail query's error feeds the banner — the
+  // others swallow their errors via empty-array fallbacks below since
+  // their failures are usually transient and the empty sections
+  // render fine.
+  const fetchError = prDetailQuery.error
+    ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
+    : null;
 
   // Helper to invalidate every PR query for this workspace at once —
   // used by manual refresh and (in §3.3) by commit/push/merge events.
@@ -506,37 +502,6 @@ export function ReviewPanel({ workspace }: Props) {
         q.queryKey[2] === workspace.workspace_id,
     });
   }, [queryClient, workspace.workspace_id]);
-
-  const [discovering, setDiscovering] = useState(false);
-
-  const handleRefresh = useCallback(async () => {
-    setDiscoveryError(null);
-    if (!hasPr && isBaseBranch) {
-      // On base branch — refresh incoming PR list
-      setIncomingRefreshKey((k) => k + 1);
-      return;
-    }
-    if (!hasPr) {
-      // No PR known — re-discover via backend (gh pr view).
-      setDiscovering(true);
-      try {
-        // Bust caches so auth/repo re-check on next render cycle
-        ghStatusCache = null;
-        repoCheckCache.delete(cwd);
-        await refreshWorkspacePr(workspace.workspace_id);
-        // State update flows via app-state-changed → re-render. If PR
-        // found, hasPr flips and the useQuery effects below trigger.
-      } catch (err) {
-        console.warn("[review-panel] refresh_workspace_pr failed:", err);
-        setDiscoveryError(err instanceof Error ? err.message : String(err));
-      } finally {
-        setDiscovering(false);
-      }
-      return;
-    }
-    // PR exists — invalidate all PR-related queries to refetch.
-    invalidatePrQueries();
-  }, [hasPr, isBaseBranch, cwd, workspace.workspace_id, invalidatePrQueries]);
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
     // Seed the detail cache directly so the user sees the new PR
@@ -585,20 +550,9 @@ export function ReviewPanel({ workspace }: Props) {
 
   return (
     <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
-      <div className="flex items-center justify-end px-3 pt-2">
-        <Button
-          size="xs"
-          variant="ghost"
-          className="h-6 w-6 p-0"
-          onClick={handleRefresh}
-          title="Refresh"
-          disabled={detailLoading || discovering}
-        >
-          <RefreshCw
-            className={`h-3 w-3 ${detailLoading || discovering ? "animate-spin" : ""}`}
-          />
-        </Button>
-      </div>
+      {/* No refresh button — auto-poll handles freshness (2.5s for PR
+          detail and checks, 30s for reviews + inline comments while the
+          tab is active). Mirrors Superset's pattern. */}
       {fetchError && (
         <div className="mx-3 mb-1 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
           <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />

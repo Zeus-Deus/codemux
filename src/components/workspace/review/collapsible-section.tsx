@@ -30,7 +30,7 @@ export function CollapsibleSection({
           <ChevronRight
             className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`}
           />
-          <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+          <span className="text-xs font-medium text-foreground truncate">
             {label}
           </span>
           {count !== undefined && (
