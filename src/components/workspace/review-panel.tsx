@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -383,13 +384,7 @@ export function ReviewPanel({ workspace }: Props) {
     getCachedGhStatus() === null || getCachedRepoCheck(cwd) === undefined,
   );
 
-  const [pr, setPr] = useState<PullRequestInfo | null>(null);
-  const [checks, setChecks] = useState<CheckInfo[]>([]);
-  const [reviews, setReviews] = useState<ReviewComment[]>([]);
-  const [inlineComments, setInlineComments] = useState<InlineReviewComment[]>([]);
-  const [deployments, setDeployments] = useState<DeploymentInfo[]>([]);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
   const [incomingRefreshKey, setIncomingRefreshKey] = useState(0);
 
@@ -436,95 +431,152 @@ export function ReviewPanel({ workspace }: Props) {
     };
   }, [cwd]);
 
-  // Fetch full PR details when pr_number changes
-  const fetchDetails = useCallback(async () => {
-    if (!hasPr) {
-      setPr(null);
-      setChecks([]);
-      setReviews([]);
-      setInlineComments([]);
-      setDeployments([]);
-      return;
-    }
-    setDetailLoading(true);
-    try {
-      setFetchError(null);
-      const prNum = workspace.pr_number!;
-      const [prInfo, prChecks, prReviews, prInline, prDeploys] = await Promise.all([
-        getBranchPullRequest(cwd),
-        getPullRequestChecks(cwd).catch((e) => { console.warn("[review-panel] checks:", e); return [] as CheckInfo[]; }),
-        getPrReviewComments(cwd).catch((e) => { console.warn("[review-panel] reviews:", e); return [] as ReviewComment[]; }),
-        getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[review-panel] inline:", e); return [] as InlineReviewComment[]; }),
-        getPrDeployments(cwd, prNum).catch((e) => { console.warn("[review-panel] deploys:", e); return [] as DeploymentInfo[]; }),
-      ]);
-      setPr(prInfo);
-      setChecks(prChecks);
-      setReviews(prReviews);
-      setInlineComments(prInline);
-      setDeployments(prDeploys);
-    } catch (err) {
-      console.warn("[review-panel] fetchDetails failed:", err);
-      setFetchError(String(err));
-      setPr(null);
-      setChecks([]);
-      setReviews([]);
-      setInlineComments([]);
-      setDeployments([]);
-    } finally {
-      setDetailLoading(false);
-    }
-  }, [cwd, hasPr, workspace.pr_number]);
+  // ── React Query: PR data ──
+  //
+  // Each query is keyed by (workspaceId, pr_number) so switching
+  // workspaces auto-cancels in-flight calls for the previous workspace
+  // — the stale-data-flashing bug the analysis (§4) called out.
+  // staleTime + refetchInterval keep the surface honest without
+  // hammering `gh`. Reviews/inline comments are slower (30s) than
+  // PR/checks/deploys (10s) since they change less often.
+  //
+  // Caveat: AbortSignal is plumbed through but the underlying Rust
+  // commands are sync `pub fn` using `std::process::Command`, so a
+  // canceled query stops the JS from caring about the result; the
+  // `gh` subprocess keeps running until natural completion (already
+  // bounded by the existing 10s timeout in `run_gh_timed`). Wasted
+  // CPU on a stale call is minimal; the fix that matters here is that
+  // the *result* never lands in the new workspace's UI.
+  const detailsEnabled =
+    !initialLoading &&
+    ghStatus?.status === "Authenticated" &&
+    isGithubRepo === true &&
+    hasPr;
 
-  useEffect(() => {
-    if (initialLoading) return;
-    if (ghStatus?.status !== "Authenticated") return;
-    if (!isGithubRepo) return;
-    fetchDetails();
-  }, [fetchDetails, initialLoading, ghStatus, isGithubRepo]);
+  const prDetailQuery = useQuery({
+    queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getBranchPullRequest(cwd),
+    enabled: detailsEnabled,
+    staleTime: 10_000,
+    refetchInterval: 10_000,
+  });
+
+  const checksQuery = useQuery({
+    queryKey: ["pr", "checks", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getPullRequestChecks(cwd),
+    enabled: detailsEnabled,
+    staleTime: 10_000,
+    refetchInterval: 10_000,
+  });
+
+  const reviewsQuery = useQuery({
+    queryKey: ["pr", "reviews", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getPrReviewComments(cwd),
+    enabled: detailsEnabled,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+
+  const inlineQuery = useQuery({
+    queryKey: ["pr", "inline", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => {
+      const num = workspace.pr_number;
+      if (num == null) return Promise.resolve([] as InlineReviewComment[]);
+      return getPrInlineComments(cwd, num);
+    },
+    enabled: detailsEnabled && workspace.pr_number != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+
+  const deploysQuery = useQuery({
+    queryKey: ["pr", "deploys", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => {
+      const num = workspace.pr_number;
+      if (num == null) return Promise.resolve([] as DeploymentInfo[]);
+      return getPrDeployments(cwd, num);
+    },
+    enabled: detailsEnabled && workspace.pr_number != null,
+    staleTime: 10_000,
+    refetchInterval: 10_000,
+  });
+
+  const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
+  const checks: CheckInfo[] = checksQuery.data ?? [];
+  const reviews: ReviewComment[] = reviewsQuery.data ?? [];
+  const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
+  const deployments: DeploymentInfo[] = deploysQuery.data ?? [];
+  const detailLoading =
+    prDetailQuery.isFetching ||
+    checksQuery.isFetching ||
+    reviewsQuery.isFetching ||
+    inlineQuery.isFetching ||
+    deploysQuery.isFetching;
+  // The error banner surfaces (a) the primary detail query's error,
+  // and (b) errors from the manual-refresh PR-discovery path
+  // (`refresh_workspace_pr`) which lives outside React Query because
+  // it's a one-shot bootstrap call, not a long-lived data subscription.
+  // The other queries swallow their errors via empty-array fallbacks
+  // below since their failures are usually transient and the empty
+  // sections render fine.
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const fetchError =
+    discoveryError ??
+    (prDetailQuery.error
+      ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
+      : null);
+
+  // Helper to invalidate every PR query for this workspace at once —
+  // used by manual refresh and (in §3.3) by commit/push/merge events.
+  const invalidatePrQueries = useCallback(() => {
+    queryClient.invalidateQueries({
+      predicate: (q) =>
+        q.queryKey[0] === "pr" &&
+        q.queryKey[2] === workspace.workspace_id,
+    });
+  }, [queryClient, workspace.workspace_id]);
+
+  const [discovering, setDiscovering] = useState(false);
 
   const handleRefresh = useCallback(async () => {
-    setFetchError(null);
+    setDiscoveryError(null);
     if (!hasPr && isBaseBranch) {
       // On base branch — refresh incoming PR list
       setIncomingRefreshKey((k) => k + 1);
       return;
     }
     if (!hasPr) {
-      // No PR known — re-discover via backend (gh pr view)
-      setDetailLoading(true);
+      // No PR known — re-discover via backend (gh pr view).
+      setDiscovering(true);
       try {
         // Bust caches so auth/repo re-check on next render cycle
         ghStatusCache = null;
         repoCheckCache.delete(cwd);
         await refreshWorkspacePr(workspace.workspace_id);
-        // State update flows via app-state-changed → re-render.
-        // If PR found, hasPr becomes true → useEffect triggers fetchDetails.
+        // State update flows via app-state-changed → re-render. If PR
+        // found, hasPr flips and the useQuery effects below trigger.
       } catch (err) {
         console.warn("[review-panel] refresh_workspace_pr failed:", err);
-        setFetchError(String(err));
+        setDiscoveryError(err instanceof Error ? err.message : String(err));
       } finally {
-        setDetailLoading(false);
+        setDiscovering(false);
       }
       return;
     }
-    // PR exists — re-fetch full details
-    fetchDetails();
-  }, [hasPr, isBaseBranch, cwd, workspace.workspace_id, fetchDetails]);
+    // PR exists — invalidate all PR-related queries to refetch.
+    invalidatePrQueries();
+  }, [hasPr, isBaseBranch, cwd, workspace.workspace_id, invalidatePrQueries]);
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
-    setPr(newPr);
-    const prNum = newPr.number;
-    Promise.all([
-      getPullRequestChecks(cwd).catch((e) => { console.warn("[review-panel] checks:", e); return [] as CheckInfo[]; }),
-      getPrReviewComments(cwd).catch((e) => { console.warn("[review-panel] reviews:", e); return [] as ReviewComment[]; }),
-      getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[review-panel] inline:", e); return [] as InlineReviewComment[]; }),
-      getPrDeployments(cwd, prNum).catch((e) => { console.warn("[review-panel] deploys:", e); return [] as DeploymentInfo[]; }),
-    ]).then(([c, r, ic, d]) => {
-      setChecks(c);
-      setReviews(r);
-      setInlineComments(ic);
-      setDeployments(d);
-    });
+    // Seed the detail cache directly so the user sees the new PR
+    // immediately without waiting for the workspace state push to
+    // flip pr_number. Then invalidate the rest so checks/reviews/
+    // deploys fetch fresh.
+    queryClient.setQueryData(
+      ["pr", "detail", workspace.workspace_id, newPr.number],
+      newPr,
+    );
+    invalidatePrQueries();
   };
 
   // ── Render ──
@@ -569,10 +621,10 @@ export function ReviewPanel({ workspace }: Props) {
           className="h-6 w-6 p-0"
           onClick={handleRefresh}
           title="Refresh"
-          disabled={detailLoading}
+          disabled={detailLoading || discovering}
         >
           <RefreshCw
-            className={`h-3 w-3 ${detailLoading ? "animate-spin" : ""}`}
+            className={`h-3 w-3 ${detailLoading || discovering ? "animate-spin" : ""}`}
           />
         </Button>
       </div>
