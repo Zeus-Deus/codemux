@@ -477,7 +477,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                                   : `Pull request — ${prHumanState ?? ""}`
                               }
                               className={cn(
-                                "inline-flex items-center gap-0.5 rounded px-1 py-px transition-opacity",
+                                "inline-flex items-center gap-0.5 rounded-md px-1.5 py-px transition-opacity",
                                 prToneCls,
                                 workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
                               )}
