@@ -481,6 +481,89 @@ mod tests {
         assert_eq!(d.interrupt, Some(true));
     }
 
+    // ─────────────────────────────────────────────────────────────
+    // Stage 5 wire contract — the inner `SidecarDecision` tests
+    // above prove the From<> impl forwards the field, but they do
+    // NOT prove the field survives JSON serialization of the
+    // wrapping `RespondToRequestParams` (which is what actually
+    // hits the sidecar's stdin). These tests lock the outer shape.
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn respond_to_request_params_serialize_with_nested_updated_permissions() {
+        let rule = json!({
+            "type": "addRules",
+            "rules": [{"toolName": "Bash"}],
+            "behavior": "allow",
+            "destination": "localSettings",
+        });
+        let params = RespondToRequestParams {
+            thread_id: "t-1".into(),
+            request_id: "r-1".into(),
+            decision: ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: Some(vec![rule.clone()]),
+            }
+            .into(),
+        };
+
+        let v = serde_json::to_value(&params).expect("serialize");
+
+        // Outer keys are camelCase per `#[serde(rename_all = ...)]`
+        // on the struct — confirms the wrapping survives.
+        assert_eq!(v["threadId"], json!("t-1"));
+        assert_eq!(v["requestId"], json!("r-1"));
+        // Nested decision carries the array intact, camelCased.
+        assert_eq!(v["decision"]["behavior"], json!("allow"));
+        assert_eq!(v["decision"]["updatedPermissions"], json!([rule]));
+        // `updatedInput` and `message` are absent thanks to
+        // `skip_serializing_if = "Option::is_none"` — important
+        // because the SDK distinguishes "not provided" from `null`
+        // for `updatedInput` (falls back to the original toolInput).
+        assert!(v["decision"].get("updatedInput").is_none());
+        assert!(v["decision"].get("message").is_none());
+        assert!(v["decision"].get("interrupt").is_none());
+    }
+
+    #[test]
+    fn respond_to_request_params_omit_updated_permissions_for_one_shot_allow() {
+        // Stage 5 "Allow once" → `updated_permissions: None`. The
+        // wrapping struct must NOT emit `updatedPermissions: null`
+        // either; the field is just absent.
+        let params = RespondToRequestParams {
+            thread_id: "t-1".into(),
+            request_id: "r-1".into(),
+            decision: ApprovalDecision::Allow {
+                updated_input: None,
+                updated_permissions: None,
+            }
+            .into(),
+        };
+
+        let v = serde_json::to_value(&params).expect("serialize");
+
+        assert_eq!(v["decision"]["behavior"], json!("allow"));
+        assert!(v["decision"].get("updatedPermissions").is_none());
+    }
+
+    #[test]
+    fn respond_to_request_params_emit_empty_array_for_allow_for_session() {
+        // The legacy `AllowForSession` variant emits an explicit
+        // empty `updatedPermissions: []` (per the existing inner
+        // test at `decision_allow_for_session_emits_empty_updated_permissions`).
+        // Lock that the empty-array form survives the wrapping
+        // struct too — the SDK distinguishes `[]` from omission.
+        let params = RespondToRequestParams {
+            thread_id: "t-1".into(),
+            request_id: "r-1".into(),
+            decision: ApprovalDecision::AllowForSession.into(),
+        };
+
+        let v = serde_json::to_value(&params).expect("serialize");
+
+        assert_eq!(v["decision"]["updatedPermissions"], json!([]));
+    }
+
     #[test]
     fn notification_from_method_classifies_known_events() {
         let n = SidecarNotification::from_method_params(

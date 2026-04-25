@@ -179,6 +179,107 @@ test("abort on signal rejects the pending decision and translates to deny", asyn
   expect(pending.size).toBe(0);
 });
 
+// ────────────────────────────────────────────────────────────────────
+// Stage 5 — `updatedPermissions` forwarding from the resolver
+// decision through to the SDK's `PermissionResult`. The bridge in
+// `permissions.ts` is a `decision.updatedPermissions !== undefined`
+// guard plus a bare `as PermissionUpdate[]` cast — easy to break
+// without these tests catching it.
+// ────────────────────────────────────────────────────────────────────
+
+test("allow with updatedPermissions surfaces the array on PermissionResult", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  const cb = makeCanUseTool("thr", emit, pending);
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  const requestId = [...pending.keys()][0] as string;
+  const ruleArray = [
+    {
+      type: "addRules",
+      rules: [{ toolName: "Bash" }],
+      behavior: "allow",
+      destination: "localSettings",
+    },
+  ];
+  pending.get(requestId)?.({
+    behavior: "allow",
+    updatedPermissions: ruleArray,
+  } as ApprovalDecision);
+
+  const result = await promise;
+  expect(result.behavior).toBe("allow");
+  if (result.behavior === "allow") {
+    // The cast at permissions.ts:191-192 is unchecked — the test
+    // locks that the array survives the resolver→PermissionResult
+    // hop without mutation, dropping fields, or null coercion.
+    expect(result.updatedPermissions).toEqual(ruleArray);
+    // updatedInput falls back to the original toolInput because
+    // the decision didn't carry one.
+    expect(result.updatedInput).toEqual({ command: "ls" });
+  }
+
+  // The `request-resolved` notification mirrors the decision back
+  // to the Rust side; it must carry the same `updatedPermissions`
+  // so observers (logs, future "rule saved" UI) see what was sent.
+  const resolved = events.find((e) => e.method === "request-resolved");
+  expect(resolved).toBeDefined();
+  const resolvedDecision = (resolved?.params as { decision: ApprovalDecision })
+    .decision;
+  expect(resolvedDecision.behavior).toBe("allow");
+  if (resolvedDecision.behavior === "allow") {
+    expect(resolvedDecision.updatedPermissions).toEqual(ruleArray);
+  }
+});
+
+test("allow WITHOUT updatedPermissions leaves the field undefined on PermissionResult", async () => {
+  // One-shot allow path: the SDK distinguishes "no rule update"
+  // (undefined) from "explicit empty rule update" ([]). The bridge
+  // must NOT inject a default empty array — that would silently
+  // bypass any other rule sources for that tool.
+  const { emit } = recorder();
+  const pending: PendingApprovals = new Map();
+  const cb = makeCanUseTool("thr", emit, pending);
+  const promise = cb("Read", { path: "/x" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow" });
+
+  const result = await promise;
+  if (result.behavior === "allow") {
+    expect(result.updatedPermissions).toBeUndefined();
+    // Specifically NOT an empty array, NOT null.
+    expect(result).not.toHaveProperty("updatedPermissions");
+  } else {
+    throw new Error("expected allow");
+  }
+});
+
+test("allow with empty updatedPermissions array (legacy AllowForSession) preserves the empty array verbatim", async () => {
+  // The Rust side's `AllowForSession` variant emits
+  // `updatedPermissions: []` (per `protocol.rs::decision_allow_for_session_emits_empty_updated_permissions`).
+  // The bridge must forward `[]` distinct from `undefined` — the
+  // SDK uses the empty-array marker to scope an in-memory session
+  // rule.
+  const { emit } = recorder();
+  const pending: PendingApprovals = new Map();
+  const cb = makeCanUseTool("thr", emit, pending);
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({
+    behavior: "allow",
+    updatedPermissions: [],
+  } as ApprovalDecision);
+
+  const result = await promise;
+  if (result.behavior === "allow") {
+    expect(result.updatedPermissions).toEqual([]);
+  } else {
+    throw new Error("expected allow");
+  }
+});
+
 test("classifies tool kinds coarsely for request-opened", async () => {
   const { emit, events } = recorder();
   const pending: PendingApprovals = new Map();

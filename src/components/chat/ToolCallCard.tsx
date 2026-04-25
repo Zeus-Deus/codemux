@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   BookOpen,
   Check,
@@ -19,6 +19,17 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  buildPermissionUpdate,
+  type PermissionScope,
+} from "@/lib/agent-chat/permission-rules";
+import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type {
   PermissionRequestItem,
@@ -133,9 +144,13 @@ export function ToolCallCard({ item, approval, onDecide }: Props) {
         )}
       </div>
 
-      {/* Approval footer (pending) */}
-      {isPendingApproval && (
+      {/* Approval footer (pending). Keyed on the approval request id so
+          a fresh approval (different request_id) remounts the footer
+          and clears the deny textarea / dropdown state — otherwise
+          stale text from a prior denial leaks into the next prompt. */}
+      {isPendingApproval && approval && (
         <ApprovalFooter
+          key={approval.request_id}
           inputText={inputText}
           onDecide={onDecide}
           toolName={item.tool_name}
@@ -184,14 +199,57 @@ interface ApprovalFooterProps {
   onDecide: (decision: ApprovalDecision) => void;
 }
 
-function ApprovalFooter({ inputText, onDecide }: ApprovalFooterProps) {
+function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) {
   const [denying, setDenying] = useState(false);
   const [reason, setReason] = useState("");
+  // Synchronous in-flight guard. The parent flips
+  // `approval.resolution` to `responding` after the IPC round-trips,
+  // but rapid double-clicks can fire `handleAllow` (or `confirmDeny`)
+  // in the same tick before React re-renders. Once we've dispatched
+  // a decision for this approval, all further clicks are dropped —
+  // the footer is about to unmount when `responding` lands.
+  const dispatchedRef = useRef(false);
 
-  const allow = () => onDecide({ decision: "allow" });
-  const allowSession = () => onDecide({ decision: "allow_for_session" });
-  const confirmDeny = () =>
+  const handleAllow = (scope: PermissionScope) => {
+    if (dispatchedRef.current) return;
+    // Stage 5 omits ruleContent — every "Allow always" matches any
+    // input for the tool. Stage 7 will add command-specific rules.
+    const updatedPermissions = buildPermissionUpdate(scope, { toolName });
+    if (scope !== "once" && !updatedPermissions) {
+      // Defensive: helper returned undefined for a persistent scope
+      // (currently only possible if `PermissionScope` gains a new
+      // member that the helper hasn't been taught). Drop to a
+      // one-shot allow rather than silently writing nothing or
+      // accidentally targeting `userSettings`.
+      onDecide({ decision: "allow" });
+      dispatchedRef.current = true;
+      return;
+    }
+    dispatchedRef.current = true;
+    onDecide({
+      decision: "allow",
+      ...(updatedPermissions ? { updated_permissions: updatedPermissions } : {}),
+    });
+    // Toast wording is action-oriented (not past-tense) because the
+    // SDK persists the rule asynchronously and the sidecar does not
+    // currently surface a write-failed signal. The settings-file
+    // path is shown so the user can verify.
+    if (scope === "project") {
+      toast.success(`Allowing ${toolName} for this project`, {
+        description: "Rule saved to .claude/settings.local.json",
+      });
+    } else if (scope === "user") {
+      toast.success(`Allowing ${toolName} for all projects`, {
+        description: "Rule saved to ~/.claude/settings.json",
+      });
+    }
+  };
+
+  const confirmDeny = () => {
+    if (dispatchedRef.current) return;
+    dispatchedRef.current = true;
     onDecide({ decision: "deny", message: reason || "User denied" });
+  };
 
   return (
     <div className="rounded-md bg-muted/30 p-3 space-y-2">
@@ -205,19 +263,43 @@ function ApprovalFooter({ inputText, onDecide }: ApprovalFooterProps) {
             variant="outline"
             size="sm"
             className="h-7 px-3 text-xs"
-            onClick={allow}
+            onClick={() => handleAllow("once")}
           >
             Allow
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-7 px-3 text-xs"
-            onClick={allowSession}
-          >
-            Allow for session
-          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-3 text-xs"
+              >
+                Allow always
+                <ChevronDown className="ml-1 h-3 w-3" aria-hidden />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start" className="text-xs">
+              <DropdownMenuItem
+                onSelect={() => handleAllow("project")}
+                className="text-xs gap-3"
+              >
+                <span>For this project</span>
+                <span className="ml-auto text-[10px] text-muted-foreground">
+                  .claude/settings.local.json
+                </span>
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onSelect={() => handleAllow("user")}
+                className="text-xs gap-3"
+              >
+                <span>For all projects</span>
+                <span className="ml-auto text-[10px] text-muted-foreground">
+                  ~/.claude/settings.json
+                </span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button
             type="button"
             variant="outline"
