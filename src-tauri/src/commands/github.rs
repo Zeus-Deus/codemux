@@ -188,7 +188,7 @@ pub fn refresh_workspace_pr(
     // explicitly set during PR-checkout (fork branches where gh can't resolve).
     if pr_info.is_some() {
         let pr_number = pr_info.as_ref().map(|p| p.number);
-        let pr_state = pr_info.as_ref().map(|p| p.state.clone());
+        let pr_state = pr_info.as_ref().map(|p| p.display_state());
         let pr_url = pr_info.as_ref().map(|p| p.url.clone());
         state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
     }

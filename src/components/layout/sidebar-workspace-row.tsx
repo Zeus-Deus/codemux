@@ -25,6 +25,8 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
   activateWorkspace,
   checkoutDefaultBranchInWorkspace,
@@ -342,6 +344,15 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
       <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
     );
 
+  const showPrIcon = !!workspace.pr_state && workspaceStatus !== "working";
+  const prHumanState = humanizePrState(workspace.pr_state);
+  const handlePrClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (workspace.pr_url) {
+      openUrl(workspace.pr_url).catch(console.error);
+    }
+  };
+
   return (
     <>
       <ContextMenu>
@@ -362,20 +373,53 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground rounded-r" />
             )}
 
-            {/* Icon — size-6 container matches project header avatar width */}
+            {/* Icon — size-6 container matches project header avatar width.
+                When the workspace has a PR, the host-type icon is replaced
+                with a clickable PR-status icon (open → emerald, merged →
+                purple, etc.) that opens the PR on GitHub. */}
             <div className="relative size-6 flex items-center justify-center shrink-0 mr-2.5">
               {workspaceStatus === "working" ? (
                 <AsciiSpinner />
+              ) : showPrIcon ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      onClick={handlePrClick}
+                      disabled={!workspace.pr_url}
+                      aria-label={
+                        workspace.pr_number
+                          ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
+                          : `Pull request — ${prHumanState ?? ""}`
+                      }
+                      className={cn(
+                        "rounded p-0.5 hover:bg-foreground/10 transition-colors flex items-center justify-center",
+                        !workspace.pr_url && "cursor-not-allowed opacity-60",
+                      )}
+                    >
+                      <PrStatusIcon state={workspace.pr_state} />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="right" sideOffset={4} className="text-xs">
+                    <div>
+                      {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
+                      {prHumanState ?? "Pull request"}
+                    </div>
+                    {workspace.pr_url && (
+                      <div className="text-muted-foreground text-[10px]">
+                        Click to open on GitHub
+                      </div>
+                    )}
+                  </TooltipContent>
+                </Tooltip>
               ) : (
-                <>
-                  {icon}
-                  {workspaceStatus && (
-                    <StatusIndicator
-                      status={workspaceStatus}
-                      className="absolute -top-0.5 -right-0.5"
-                    />
-                  )}
-                </>
+                icon
+              )}
+              {workspaceStatus && workspaceStatus !== "working" && (
+                <StatusIndicator
+                  status={workspaceStatus}
+                  className="absolute -top-0.5 -right-0.5"
+                />
               )}
             </div>
 
@@ -440,11 +484,6 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               {workspace.git_branch && (
                 <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   <span className="truncate">{workspace.git_branch}</span>
-                  {workspace.pr_number && (
-                    <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
-                      #{workspace.pr_number}
-                    </Badge>
-                  )}
                   {workspace.linked_issue && (
                     <IssueDetailPopover
                       workspaceId={workspace.workspace_id}
