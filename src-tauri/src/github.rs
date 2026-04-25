@@ -554,19 +554,36 @@ pub fn merge_pull_request(
 }
 
 pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-    // `gh pr checks` exits non-zero when checks are pending (exit 1) or
-    // any have failed (exit 8) — even with `--json`, where the JSON is
-    // still written to stdout. `run_gh_optional` discards stdout on
-    // non-zero exit, which silently swallowed the entire check list any
-    // time a PR had a running or failing check (which is exactly when
-    // the user wants to see the data). Bypass the helper for this call
-    // and capture stdout regardless of exit code.
+    // `gh pr checks --json` only accepts a specific field set:
+    // bucket / completedAt / description / event / link / name /
+    // startedAt / state / workflow. The previous version asked for
+    // `conclusion,elapsedTime,detailUrl` — none of which exist on
+    // gh's side, so gh wrote "Unknown JSON field" to stderr and
+    // stdout was empty for every PR. That's why the Checks section
+    // showed "No checks reported." even when CI was actively running.
+    //
+    // Mapping to our CheckInfo struct:
+    //   gh `bucket` ("pass" / "fail" / "pending" / "skipping" /
+    //                "cancel") → conclusion (matches the strings the
+    //                frontend's CheckIcon already understands).
+    //   gh `link`            → detail_url
+    //   gh `state`           → status (raw "IN_PROGRESS" / "COMPLETED"
+    //                                   / "QUEUED" — fallback when
+    //                                   bucket is empty).
+    //   elapsed_time         → None for now (gh doesn't expose it on
+    //                                  this command; could be derived
+    //                                  later from started/completed).
+    //
+    // Also: `gh pr checks` exits non-zero when checks are pending
+    // (exit 1) or any have failed (exit 8) but still writes valid
+    // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
+    // on non-zero exit) and capture stdout regardless.
     let output = Command::new("gh")
         .args([
             "pr",
             "checks",
             "--json",
-            "name,state,conclusion,elapsedTime,detailUrl,startedAt,completedAt",
+            "name,state,bucket,link,startedAt,completedAt",
         ])
         .current_dir(repo_path)
         .output()
@@ -586,9 +603,9 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
         .map(|c| CheckInfo {
             name: c["name"].as_str().unwrap_or("").to_string(),
             status: c["state"].as_str().unwrap_or("pending").to_string(),
-            conclusion: c["conclusion"].as_str().map(|s| s.to_string()),
-            elapsed_time: c["elapsedTime"].as_str().map(|s| s.to_string()),
-            detail_url: c["detailUrl"].as_str().map(|s| s.to_string()),
+            conclusion: c["bucket"].as_str().map(|s| s.to_string()),
+            elapsed_time: None,
+            detail_url: c["link"].as_str().map(|s| s.to_string()),
             started_at: c["startedAt"].as_str().map(|s| s.to_string()),
             completed_at: c["completedAt"].as_str().map(|s| s.to_string()),
         })
