@@ -17,7 +17,7 @@ interface Props {
   onRefresh: () => void;
 }
 
-export function PrMergeControls({ pr, cwd, onRefresh }: Props) {
+export function ReviewMergeControls({ pr, cwd, onRefresh }: Props) {
   const [mergeMethod, setMergeMethod] = useState("squash");
   const [confirmMerge, setConfirmMerge] = useState(false);
   const [merging, setMerging] = useState(false);

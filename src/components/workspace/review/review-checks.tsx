@@ -15,7 +15,7 @@ interface Props {
   checks: CheckInfo[];
 }
 
-export function PrChecks({ checks }: Props) {
+export function ReviewChecks({ checks }: Props) {
   const { passed, total, summaryColor } = useMemo(() => {
     const p = checks.filter(
       (c) => {

@@ -10,7 +10,7 @@ interface Props {
   onSubmitted: () => void;
 }
 
-export function PrReviewActions({ cwd, prNumber, onSubmitted }: Props) {
+export function ReviewActions({ cwd, prNumber, onSubmitted }: Props) {
   const [body, setBody] = useState("");
   const [submitting, setSubmitting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

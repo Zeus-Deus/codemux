@@ -4,7 +4,7 @@ import { X } from "lucide-react";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
 import { ChangesPanel } from "@/components/workspace/changes-panel";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
-import { PrPanel } from "@/components/workspace/pr-panel";
+import { ReviewPanel } from "@/components/workspace/review-panel";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface Props {
@@ -43,8 +43,8 @@ export function RightPanel({ workspace, activeTab }: Props) {
             <TabsTrigger value="files" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
               Files
             </TabsTrigger>
-            <TabsTrigger value="pr" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
-              PR
+            <TabsTrigger value="review" className="px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden data-[state=active]:!bg-card data-[state=active]:!text-foreground data-[state=inactive]:!text-muted-foreground/70 data-[state=inactive]:!border-r data-[state=inactive]:!border-r-border/40 data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20">
+              Review
               {workspace.pr_number && (
                 <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
                   #{workspace.pr_number}
@@ -68,8 +68,8 @@ export function RightPanel({ workspace, activeTab }: Props) {
         <TabsContent value="files" className="flex-1 overflow-hidden">
           <FileTreePanel workspace={workspace} />
         </TabsContent>
-        <TabsContent value="pr" className="flex-1 overflow-hidden">
-          <PrPanel workspace={workspace} />
+        <TabsContent value="review" className="flex-1 overflow-hidden">
+          <ReviewPanel workspace={workspace} />
         </TabsContent>
       </Tabs>
     </div>

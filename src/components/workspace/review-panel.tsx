@@ -39,13 +39,13 @@ import type {
   InlineReviewComment,
   DeploymentInfo,
 } from "@/tauri/types";
-import { PrHeader } from "./pr/pr-header";
-import { PrChecks } from "./pr/pr-checks";
-import { PrReviews } from "./pr/pr-reviews";
-import { PrReviewActions } from "./pr/pr-review-actions";
-import { PrDeployments } from "./pr/pr-deployments";
-import { PrMergeControls } from "./pr/pr-merge-controls";
-import { IncomingPrsView } from "./pr/incoming-prs-view";
+import { ReviewHeader } from "./review/review-header";
+import { ReviewChecks } from "./review/review-checks";
+import { ReviewThreads } from "./review/review-threads";
+import { ReviewActions } from "./review/review-actions";
+import { ReviewDeployments } from "./review/review-deployments";
+import { ReviewMergeControls } from "./review/review-merge-controls";
+import { IncomingPrsView } from "./review/incoming-prs-view";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -126,7 +126,7 @@ function StatusMessage({
   );
 }
 
-function PrSkeleton() {
+function ReviewSkeleton() {
   return (
     <div className="space-y-3 p-3">
       <div className="space-y-1.5">
@@ -281,9 +281,9 @@ function CreatePrForm({
   );
 }
 
-// ── NoPrView ──
+// ── NoReviewView ──
 
-function NoPrView({
+function NoReviewView({
   cwd,
   branchName,
   onCreated,
@@ -318,9 +318,9 @@ function NoPrView({
   );
 }
 
-// ── PrView ──
+// ── ReviewView ──
 
-function PrView({
+function ReviewView({
   pr,
   checks,
   reviews,
@@ -339,17 +339,17 @@ function PrView({
 }) {
   return (
     <div className="space-y-2 p-3">
-      <PrHeader pr={pr} />
+      <ReviewHeader pr={pr} />
 
       <div className="border-t border-border/30" />
 
-      <PrChecks checks={checks} />
-      <PrReviews reviews={reviews} inlineComments={inlineComments} />
+      <ReviewChecks checks={checks} />
+      <ReviewThreads reviews={reviews} inlineComments={inlineComments} />
 
       {pr.state === "OPEN" && (
         <>
           <div className="border-t border-border/30" />
-          <PrReviewActions
+          <ReviewActions
             cwd={cwd}
             prNumber={pr.number}
             onSubmitted={onRefresh}
@@ -357,21 +357,21 @@ function PrView({
         </>
       )}
 
-      <PrDeployments deployments={deployments} />
+      <ReviewDeployments deployments={deployments} />
 
       {pr.state === "OPEN" && (
         <>
           <div className="border-t border-border/30" />
-          <PrMergeControls pr={pr} cwd={cwd} onRefresh={onRefresh} />
+          <ReviewMergeControls pr={pr} cwd={cwd} onRefresh={onRefresh} />
         </>
       )}
     </div>
   );
 }
 
-// ── Main PrPanel ──
+// ── Main ReviewPanel ──
 
-export function PrPanel({ workspace }: Props) {
+export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const hasPr = workspace.pr_number != null;
 
@@ -452,10 +452,10 @@ export function PrPanel({ workspace }: Props) {
       const prNum = workspace.pr_number!;
       const [prInfo, prChecks, prReviews, prInline, prDeploys] = await Promise.all([
         getBranchPullRequest(cwd),
-        getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
-        getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
-        getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
-        getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
+        getPullRequestChecks(cwd).catch((e) => { console.warn("[review-panel] checks:", e); return [] as CheckInfo[]; }),
+        getPrReviewComments(cwd).catch((e) => { console.warn("[review-panel] reviews:", e); return [] as ReviewComment[]; }),
+        getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[review-panel] inline:", e); return [] as InlineReviewComment[]; }),
+        getPrDeployments(cwd, prNum).catch((e) => { console.warn("[review-panel] deploys:", e); return [] as DeploymentInfo[]; }),
       ]);
       setPr(prInfo);
       setChecks(prChecks);
@@ -463,7 +463,7 @@ export function PrPanel({ workspace }: Props) {
       setInlineComments(prInline);
       setDeployments(prDeploys);
     } catch (err) {
-      console.warn("[pr-panel] fetchDetails failed:", err);
+      console.warn("[review-panel] fetchDetails failed:", err);
       setFetchError(String(err));
       setPr(null);
       setChecks([]);
@@ -500,7 +500,7 @@ export function PrPanel({ workspace }: Props) {
         // State update flows via app-state-changed → re-render.
         // If PR found, hasPr becomes true → useEffect triggers fetchDetails.
       } catch (err) {
-        console.warn("[pr-panel] refresh_workspace_pr failed:", err);
+        console.warn("[review-panel] refresh_workspace_pr failed:", err);
         setFetchError(String(err));
       } finally {
         setDetailLoading(false);
@@ -515,10 +515,10 @@ export function PrPanel({ workspace }: Props) {
     setPr(newPr);
     const prNum = newPr.number;
     Promise.all([
-      getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
-      getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
-      getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
-      getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
+      getPullRequestChecks(cwd).catch((e) => { console.warn("[review-panel] checks:", e); return [] as CheckInfo[]; }),
+      getPrReviewComments(cwd).catch((e) => { console.warn("[review-panel] reviews:", e); return [] as ReviewComment[]; }),
+      getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[review-panel] inline:", e); return [] as InlineReviewComment[]; }),
+      getPrDeployments(cwd, prNum).catch((e) => { console.warn("[review-panel] deploys:", e); return [] as DeploymentInfo[]; }),
     ]).then(([c, r, ic, d]) => {
       setChecks(c);
       setReviews(r);
@@ -530,7 +530,7 @@ export function PrPanel({ workspace }: Props) {
   // ── Render ──
 
   if (initialLoading) {
-    return <PrSkeleton />;
+    return <ReviewSkeleton />;
   }
 
   if (ghStatus?.status === "NotInstalled") {
@@ -583,7 +583,7 @@ export function PrPanel({ workspace }: Props) {
         </div>
       )}
       {hasPr && pr ? (
-        <PrView
+        <ReviewView
           pr={pr}
           checks={checks}
           reviews={reviews}
@@ -593,7 +593,7 @@ export function PrPanel({ workspace }: Props) {
           onRefresh={handleRefresh}
         />
       ) : hasPr && !pr ? (
-        <PrSkeleton />
+        <ReviewSkeleton />
       ) : isBaseBranch ? (
         <IncomingPrsView
           cwd={cwd}
@@ -602,7 +602,7 @@ export function PrPanel({ workspace }: Props) {
           refreshKey={incomingRefreshKey}
         />
       ) : (
-        <NoPrView
+        <NoReviewView
           cwd={cwd}
           branchName={workspace.git_branch}
           onCreated={handlePrCreated}

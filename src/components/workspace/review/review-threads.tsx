@@ -80,7 +80,7 @@ interface GroupedReview {
   inlineComments: InlineReviewComment[];
 }
 
-export function PrReviews({ reviews, inlineComments }: Props) {
+export function ReviewThreads({ reviews, inlineComments }: Props) {
   const grouped = useMemo(() => {
     // Group inline comments by pull_request_review_id
     const inlineByReview = new Map<number, InlineReviewComment[]>();

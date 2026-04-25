@@ -19,7 +19,7 @@ interface Props {
   deployments: DeploymentInfo[];
 }
 
-export function PrDeployments({ deployments }: Props) {
+export function ReviewDeployments({ deployments }: Props) {
   const withUrls = deployments.filter((d) => d.url);
   if (withUrls.length === 0) return null;
 

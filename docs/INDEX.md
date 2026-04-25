@@ -42,7 +42,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - File tree: `docs/features/file-tree.md`
 - Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
-- PR integration: `docs/features/pr-integration.md`
+- Review tab / PR integration: `docs/features/review-integration.md`
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system: `docs/features/terminal.md`
 - Terminal presets: `docs/features/presets.md`

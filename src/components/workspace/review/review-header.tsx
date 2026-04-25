@@ -35,7 +35,7 @@ interface Props {
   pr: PullRequestInfo;
 }
 
-export function PrHeader({ pr }: Props) {
+export function ReviewHeader({ pr }: Props) {
   const [copied, setCopied] = useState(false);
 
   const stateLabel = pr.is_draft ? "Draft" : (pr.state ?? "OPEN");
