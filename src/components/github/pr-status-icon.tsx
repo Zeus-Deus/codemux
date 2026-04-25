@@ -16,6 +16,22 @@ const STATE_TO_ICON: Record<PrStatusState, IconSpec> = {
   draft: { Icon: GitPullRequestDraft, colorCls: "text-muted-foreground" },
 };
 
+/** Tinted background + text-color pair for the sidebar PR pill — matches
+ *  the icon color at low opacity so the row reads "this PR is merged/open/…"
+ *  at a glance. Mirrors Superset's color-coded badge style. */
+const STATE_TO_TONE: Record<PrStatusState, string> = {
+  merged: "text-purple-500 bg-purple-500/15",
+  open: "text-emerald-500 bg-emerald-500/15",
+  closed: "text-destructive bg-destructive/15",
+  draft: "text-muted-foreground bg-muted-foreground/15",
+};
+
+export function prStatusToneClass(state: string | null | undefined): string | null {
+  const normalized = normalizePrState(state);
+  if (!normalized) return null;
+  return STATE_TO_TONE[normalized];
+}
+
 export function normalizePrState(state: string | null | undefined): PrStatusState | null {
   if (!state) return null;
   const lower = state.toLowerCase();

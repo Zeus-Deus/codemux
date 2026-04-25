@@ -26,7 +26,7 @@ import {
 import { cn } from "@/lib/utils";
 import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
+import { PrStatusIcon, humanizePrState, prStatusToneClass } from "@/components/github/pr-status-icon";
 import {
   activateWorkspace,
   checkoutDefaultBranchInWorkspace,
@@ -346,6 +346,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
 
   const showPrIcon = !!workspace.pr_state && workspaceStatus !== "working";
   const prHumanState = humanizePrState(workspace.pr_state);
+  const prToneCls = prStatusToneClass(workspace.pr_state);
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (workspace.pr_url) {
@@ -476,8 +477,9 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                                   : `Pull request — ${prHumanState ?? ""}`
                               }
                               className={cn(
-                                "inline-flex items-center gap-0.5 rounded px-0.5 hover:bg-foreground/10 transition-colors",
-                                !workspace.pr_url && "cursor-not-allowed opacity-60",
+                                "inline-flex items-center gap-0.5 rounded px-1 py-px transition-opacity",
+                                prToneCls,
+                                workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
                               )}
                             >
                               <PrStatusIcon state={workspace.pr_state} size={3} />
