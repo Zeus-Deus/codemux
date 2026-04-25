@@ -1774,54 +1774,43 @@ export function ChangesPanel({ workspace }: Props) {
               since merge methods don't apply to them. */}
           {workspace.pr_url && (
             <div className="ml-auto flex items-center">
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="xs"
-                    className={cn(
-                      workspace.pr_state === "OPEN" &&
-                        workspace.pr_number != null &&
-                        "rounded-r-none border-r-0",
-                    )}
-                    onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
-                  >
-                    <PrStatusIcon state={workspace.pr_state} size={3} />
-                    {workspace.pr_number != null && (
-                      <span className="tabular-nums">#{workspace.pr_number}</span>
-                    )}
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="text-xs">
-                  {workspace.pr_number != null
+              <Button
+                variant="outline"
+                size="xs"
+                className={cn(
+                  workspace.pr_state === "OPEN" &&
+                    workspace.pr_number != null &&
+                    "rounded-r-none border-r-0",
+                )}
+                onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
+                aria-label={
+                  workspace.pr_number != null
                     ? `Open PR #${workspace.pr_number} on GitHub`
-                    : "Open PR on GitHub"}
-                </TooltipContent>
-              </Tooltip>
+                    : "Open PR on GitHub"
+                }
+              >
+                <PrStatusIcon state={workspace.pr_state} size={3} />
+                {workspace.pr_number != null && (
+                  <span className="tabular-nums">#{workspace.pr_number}</span>
+                )}
+              </Button>
               {workspace.pr_state === "OPEN" && workspace.pr_number != null && (
                 <DropdownMenu>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <DropdownMenuTrigger asChild>
-                        <Button
-                          variant="outline"
-                          size="icon-xs"
-                          className="size-6 p-0 rounded-l-none"
-                          disabled={mergingPr !== null}
-                          aria-label="Merge PR"
-                        >
-                          {mergingPr !== null ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <ChevronDown className="h-3 w-3" />
-                          )}
-                        </Button>
-                      </DropdownMenuTrigger>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom" className="text-xs">
-                      Merge PR
-                    </TooltipContent>
-                  </Tooltip>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon-xs"
+                      className="size-6 p-0 rounded-l-none"
+                      disabled={mergingPr !== null}
+                      aria-label="Merge PR"
+                    >
+                      {mergingPr !== null ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <ChevronDown className="h-3 w-3" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-fit">
                     <DropdownMenuItem
                       onClick={() => handleMergePr("squash")}
