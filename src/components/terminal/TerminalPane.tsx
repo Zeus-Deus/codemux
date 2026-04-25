@@ -1,10 +1,5 @@
 import { useEffect, useRef, useCallback } from "react";
-import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
-import { FitAddon } from "@xterm/addon-fit";
-import { SerializeAddon } from "@xterm/addon-serialize";
-import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebglAddon } from "@xterm/addon-webgl";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -12,9 +7,6 @@ import {
   BACKSPACE_CODEPOINT,
   csiUModifier,
   csiUSequence,
-  scanKittySequences,
-  applyKittyStack,
-  kittyFlags,
 } from "@/lib/kitty-keyboard";
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
@@ -26,17 +18,15 @@ import {
 import {
   writeToPty,
   resizePty,
-  detachPtyOutput,
-  attachPtyOutput,
   getTerminalStatus,
   clearAgentStatus,
-  getTerminalScrollback,
-  cacheTerminalScrollback,
-  uncacheTerminalScrollback,
-  Channel,
-  type ScrollbackPayload,
 } from "@/tauri/commands";
-import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
+import {
+  getOrCreateTerminal,
+  attachToContainer,
+  detachFromContainer,
+  type CachedTerminal,
+} from "@/components/terminal/terminal-cache";
 import { useAppStore } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
@@ -101,44 +91,13 @@ function buildThemeFromCSS(): ITheme {
   };
 }
 
-// TODO: re-enable as "system theme" option in settings
-// function buildXtermTheme(t: ThemeColors): ITheme {
-//   return {
-//     background: t.background, foreground: t.foreground, cursor: t.cursor,
-//     selectionBackground: t.selection_background, selectionForeground: t.selection_foreground,
-//     black: t.color0, red: t.color1, green: t.color2, yellow: t.color3,
-//     blue: t.color4, magenta: t.color5, cyan: t.color6, white: t.color7,
-//     brightBlack: t.color8, brightRed: t.color9, brightGreen: t.color10, brightYellow: t.color11,
-//     brightBlue: t.color12, brightMagenta: t.color13, brightCyan: t.color14, brightWhite: t.color15,
-//   };
-// }
-
-function extractBytes(payload: unknown): Uint8Array | null {
-  if (payload instanceof Uint8Array) return payload;
-  if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
-  if (Array.isArray(payload)) return new Uint8Array(payload as number[]);
-  if (typeof payload === "string") return new TextEncoder().encode(payload);
-  return null;
-}
-
 export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
-  // TODO: re-enable as "system theme" option in settings
-  // const { theme, shellAppearance } = useThemeColors();
-
-  // Refs for mutable state that persists across renders
+  // Refs for DOM and per-mount state. The xterm Terminal instance, addons,
+  // PTY channel, and serialize registration live in the module-level cache
+  // (see terminal-cache.ts) so they survive workspace switches.
   const shellRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<Terminal | null>(null);
-  const fitAddonRef = useRef<FitAddon | null>(null);
-  const serializeAddonRef = useRef<SerializeAddon | null>(null);
-  const attachedSessionRef = useRef<string | null>(null);
-  // Adapter captures from the scrollback restore — persists across tab switches
-  // even when the pane state (layout.json) doesn't have them.
-  const restoredCapturesRef = useRef<Record<string, string>>({});
-  const kittyStackRef = useRef<number[]>([]);
-  const kittyLevelRef = useRef(0);
-  const pendingPtyWrites = useRef<Uint8Array[]>([]);
-  const ptyWriteFrameRef = useRef<number | null>(null);
+  const entryRef = useRef<CachedTerminal | null>(null);
   const statusRef = useRef<TerminalStatusPayload>({
     session_id: sessionId,
     state: "starting",
@@ -146,97 +105,35 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     exit_code: null,
   });
   const statusOverlayRef = useRef<HTMLDivElement>(null);
-  const ptyDecoderRef = useRef(new TextDecoder("utf-8", { fatal: false }));
   const blockNewlineRef = useRef<((e: Event) => void) | null>(null);
-  const dataDisposableRef = useRef<{ dispose: () => void } | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const windowResizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Track latest sessionId for closures
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
-  // Track props for closures
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
-
-  // ── Kitty protocol scanning ──
-  const scanKittyProtocol = useCallback((data: Uint8Array | string) => {
-    const str =
-      typeof data === "string"
-        ? data
-        : ptyDecoderRef.current.decode(data);
-
-    const scan = scanKittySequences(str);
-
-    // Respond to Kitty keyboard protocol query (\x1b[?u) with current flags.
-    // Apps (Claude Code, nvim, etc.) send this to check if the terminal
-    // supports enhanced key reporting before pushing Kitty mode.
-    if (scan.hasQuery) {
-      writeToPty(
-        sessionIdRef.current,
-        `\x1b[?${kittyFlags(kittyStackRef.current)}u`,
-      ).catch(console.error);
-    }
-
-    // Apply push/pop/reset. DA query from a new shell resets stale state.
-    kittyStackRef.current = applyKittyStack(
-      kittyStackRef.current,
-      scan.pushValues,
-      scan.popCount,
-      scan.hasDAQuery,
-    );
-    kittyLevelRef.current = kittyFlags(kittyStackRef.current);
-  }, []);
-
-  // ── PTY output batching ──
-  const flushPtyWrites = useCallback(() => {
-    ptyWriteFrameRef.current = null;
-    const term = termRef.current;
-    const pending = pendingPtyWrites.current;
-    if (!term || pending.length === 0) return;
-
-    if (pending.length === 1) {
-      term.write(pending[0]);
-    } else {
-      let totalLen = 0;
-      for (const chunk of pending) totalLen += chunk.length;
-      const combined = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const chunk of pending) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-      term.write(combined);
-    }
-    pendingPtyWrites.current = [];
-  }, []);
-
-  const writePtyChunk = useCallback(
-    (payload: unknown) => {
-      if (!termRef.current) return;
-      const bytes = extractBytes(payload);
-      if (!bytes) return;
-
-      scanKittyProtocol(bytes);
-      pendingPtyWrites.current.push(bytes);
-      if (ptyWriteFrameRef.current === null) {
-        ptyWriteFrameRef.current = requestAnimationFrame(flushPtyWrites);
-      }
-    },
-    [scanKittyProtocol, flushPtyWrites],
-  );
+  const paneIdRef = useRef(paneId);
+  paneIdRef.current = paneId;
 
   // ── Resize sync ──
+  // Only emits resizePty when dims actually changed (no-op detection).
+  // No-op when the container has zero dims — the ResizeObserver will fire
+  // again once layout completes.
   const syncTerminalSize = useCallback(async () => {
-    const term = termRef.current;
-    const fitAddon = fitAddonRef.current;
-    if (!term || !fitAddon || !visibleRef.current) return;
+    const entry = entryRef.current;
+    const containerEl = containerRef.current;
+    if (!entry || !containerEl || !visibleRef.current) return;
+    if (containerEl.clientWidth === 0 || containerEl.clientHeight === 0) return;
 
-    fitAddon.fit();
-    if (term.cols === 0 || term.rows === 0) return;
+    entry.fitAddon.fit();
+    const { cols, rows } = entry.terminal;
+    if (cols === 0 || rows === 0) return;
+    if (cols === entry.lastDims.cols && rows === entry.lastDims.rows) return;
 
+    entry.lastDims = { cols, rows };
     try {
-      await resizePty(sessionIdRef.current, term.cols, term.rows);
+      await resizePty(sessionIdRef.current, cols, rows);
     } catch (err) {
       console.error("Failed to resize PTY:", err);
     }
@@ -286,286 +183,156 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     const containerEl = containerRef.current;
     if (!containerEl) return;
 
-    // ── Create terminal ──
-    const term = new Terminal({
-      fontFamily: getTerminalFontFamily(),
-      theme: buildThemeFromCSS(),
-      convertEol: false,
-      cursorBlink: true,
-      cursorWidth: 2,
-      lineHeight: 1.15,
-      letterSpacing: 0,
-      fontSize: getTerminalFontSize(),
-      cursorStyle: getTerminalCursorStyle() as "bar" | "block" | "underline",
-      altClickMovesCursor: true,
-    });
-
-    const fitAddon = new FitAddon();
-    const serializeAddon = new SerializeAddon();
-    const unicode11Addon = new Unicode11Addon();
-    term.loadAddon(unicode11Addon);
-    term.unicode.activeVersion = "11";
-    term.loadAddon(fitAddon);
-    term.loadAddon(serializeAddon);
-    term.open(containerEl);
-
-    try {
-      const webgl = new WebglAddon();
-      webgl.onContextLoss(() => {
-        webgl.dispose();
-      });
-      term.loadAddon(webgl);
-    } catch (err) {
-      console.warn(
-        "[Codemux] WebGL renderer unavailable, falling back to DOM",
-        err,
-      );
-    }
-
-    termRef.current = term;
-    fitAddonRef.current = fitAddon;
-    serializeAddonRef.current = serializeAddon;
-    kittyStackRef.current = [];
-    kittyLevelRef.current = 0;
-
-    // ── Custom key handler ──
-    term.attachCustomKeyEventHandler((ev) => {
-      // Escape / Ctrl+C — clear this pane's Working/Permission status.
-      // Claude Code's Stop hook does NOT fire on user interrupts (Ctrl+C, Escape).
-      // Check this specific pane's status to avoid false positives (e.g. vim).
-      if (ev.type === "keydown" && paneId) {
-        const isInterrupt =
-          ev.key === "Escape" ||
-          (ev.key === "c" && ev.ctrlKey && !ev.shiftKey && !ev.altKey);
-        if (isInterrupt) {
-          const status =
-            useAppStore.getState().appState?.pane_statuses[paneId];
-          if (status === "working" || status === "permission") {
-            clearAgentStatus(sid).catch(console.error);
-          }
-          return true; // let the key pass through to the terminal
-        }
-      }
-      // App-level shortcuts — must fire BEFORE CSI u encoding so that
-      // Ctrl+K (command palette) etc. are never sent to the terminal.
-      if (isAppShortcut(ev)) return false;
-      // Modern terminals unconditionally send CSI u for modified
-      // functional keys (Enter, Tab, Space). This lets CLI apps like
-      // Claude Code distinguish Shift+Enter from Enter without
-      // requiring Kitty protocol negotiation.
-      // Backspace is only CSI-u-encoded when Kitty mode is active so
-      // that backward-kill-word (Ctrl+Backspace → \x17) still works
-      // in plain shells.
-      {
-        const codepoint = KITTY_FUNCTIONAL_KEYS.get(ev.key);
-        const mod = csiUModifier(ev);
-        if (codepoint !== undefined && mod > 1) {
-          const isBackspace = codepoint === BACKSPACE_CODEPOINT;
-          if (!isBackspace || kittyLevelRef.current > 0) {
-            if (ev.type === "keydown") {
-              writeToPty(sid, csiUSequence(codepoint, mod)).catch(console.error);
-            }
-            ev.preventDefault?.();
-            return false;
-          }
-        }
-      }
-      // Terminal-level shortcuts (resolved from keybind registry)
-      const overrides = useSyncedSettingsStore.getState().settings.keyboard.shortcuts;
-      const resolved = resolveKeybinds(overrides);
-      const killCombo = resolved.getKeysForAction("backwardKillWord");
-      const copyCombo = resolved.getKeysForAction("copySelection");
-      const pasteCombo = resolved.getKeysForAction("pasteTerminal");
-
-      if (killCombo && matchesKeyCombo(ev, killCombo)) {
-        if (ev.type === "keydown") {
-          writeToPty(sid, "\x17").catch(console.error);
-        }
-        ev.preventDefault?.();
-        return false;
-      }
-      if (copyCombo && matchesKeyCombo(ev, copyCombo)) {
-        if (ev.type === "keydown") {
-          const selection = term.getSelection();
-          if (selection) navigator.clipboard.writeText(selection).catch(console.error);
-        }
-        ev.preventDefault?.();
-        return false;
-      }
-      if (pasteCombo && matchesKeyCombo(ev, pasteCombo)) {
-        if (ev.type === "keydown") {
-          navigator.clipboard
-            .readText()
-            .then((text) => { if (text) term.paste(text); })
-            .catch(console.error);
-        }
-        ev.preventDefault?.();
-        return false;
-      }
-      return true;
-    });
-
-    // ── WKWebView newline bug workaround ──
-    const blockNewline = (e: Event) => {
-      if (kittyLevelRef.current <= 0) return;
-      const ie = e as InputEvent;
-      if (
-        ie.inputType === "insertLineBreak" ||
-        ie.inputType === "insertParagraph" ||
-        (ie.inputType === "insertText" && ie.data === "\n")
-      ) {
-        e.stopPropagation();
-        e.preventDefault();
-      }
-    };
-    containerEl.addEventListener("input", blockNewline, true);
-    blockNewlineRef.current = blockNewline;
-
-    // ── User input handler ──
-    let pendingInput = "";
-    let inputQueued = false;
-    const dataDisposable = term.onData((data) => {
-      pendingInput += data;
-      if (!inputQueued) {
-        inputQueued = true;
-        queueMicrotask(() => {
-          const batch = pendingInput;
-          pendingInput = "";
-          inputQueued = false;
-          writeToPty(sid, batch).catch((err) => {
-            console.error(`Failed to write to PTY for ${sid}:`, err);
-          });
-        });
-      }
-    });
-    dataDisposableRef.current = dataDisposable;
-
-    // ── Scrollback serialization helper ──
-    // Shared between the live-serialize registry (on close) and the unmount
-    // cache path (on tab/workspace switch).
-    const buildScrollbackPayload = (): ScrollbackPayload | null => {
-      const t = termRef.current;
-      const sa = serializeAddonRef.current;
-      if (!t || !sa) return null;
-
-      const appState = useAppStore.getState().appState;
-      if (!appState) return null;
-
-      const session = appState.terminal_sessions.find(
-        (s) => s.session_id === sid,
-      );
-      if (!session) return null;
-
-      const workspace = appState.workspaces.find((ws) =>
-        ws.surfaces.some((surf) => {
-          const json = JSON.stringify(surf.root);
-          return json.includes(sid);
-        }),
-      );
-
-      // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.)
-      const isAlternateBuffer = t.buffer.active.type === "alternate";
-
-      const scrollbackLines = useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
-      const data = sa.serialize({ scrollback: scrollbackLines });
-
-      return {
-        pane_id: paneId ?? sid,
-        session_id: sid,
-        workspace_id: workspace?.workspace_id ?? "",
-        working_directory: session.cwd,
-        original_command: session.original_command,
-        cols: session.cols,
-        rows: session.rows,
-        data,
-        adapter_captures: {
-          ...restoredCapturesRef.current,
-          ...(session.adapter_captures ?? {}),
-        },
-        adapter_id: null,
-        alternate_buffer: isAlternateBuffer,
-      };
-    };
-
-    // Register for live serialization on close
-    const unregisterSerialize = registerTerminalForSerialize(sid, buildScrollbackPayload);
-
-    // Clear any stale cached scrollback for this session (we're live now)
-    uncacheTerminalScrollback(sid).catch(() => {});
-
-    // ── Attach PTY session ──
-    //
-    // Restore scrollback, then attach PTY output and fit the pane.
     let cancelled = false;
 
     (async () => {
+      let entry: CachedTerminal;
+      let isNew: boolean;
       try {
-        const appState = useAppStore.getState().appState;
-        const workspace = appState?.workspaces.find((ws) =>
-          ws.surfaces.some((surf) => {
-            const json = JSON.stringify(surf.root);
-            return json.includes(sid);
-          }),
-        );
-        const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
-
-        if (restoreEnabled && workspace && paneId) {
-          const scrollback = await getTerminalScrollback(workspace.workspace_id, paneId);
-          if (scrollback && !cancelled) {
-            const { meta } = scrollback;
-            // Cache captures from scrollback metadata — these survive tab switches
-            // even when layout.json doesn't persist adapter_captures.
-            if (meta.adapter_captures && Object.keys(meta.adapter_captures).length > 0) {
-              restoredCapturesRef.current = meta.adapter_captures;
-            }
-            if (!meta.alternate_buffer && scrollback.data) {
-              term.write(scrollback.data);
-              term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");
-            }
-          }
-        }
-      } catch {
-        // Scrollback restore failed — continue with fresh pane
-      }
-
-      // Attach PTY — never blocked by adapter checks
-      try {
-        const status = await getTerminalStatus(sid);
-        if (cancelled) return;
-        updateStatusOverlay(status);
-      } catch {
-        if (cancelled) return;
-        updateStatusOverlay({
-          session_id: sid,
-          state: "failed",
-          message: "Failed to read terminal status",
-          exit_code: null,
+        const result = await getOrCreateTerminal(sid, {
+          paneId: paneIdRef.current ?? null,
+          fontFamily: getTerminalFontFamily(),
+          fontSize: getTerminalFontSize(),
+          cursorStyle: getTerminalCursorStyle() as
+            | "bar"
+            | "block"
+            | "underline",
+          theme: buildThemeFromCSS(),
         });
-      }
-
-      const channel = new Channel<unknown>((payload) => {
-        writePtyChunk(payload);
-      });
-
-      try {
-        await attachPtyOutput(sid, channel);
-        if (cancelled) return;
-        attachedSessionRef.current = sid;
+        entry = result.entry;
+        isNew = result.isNew;
       } catch (err) {
         if (cancelled) return;
         updateStatusOverlay({
           session_id: sid,
           state: "failed",
-          message: `Failed to attach terminal output: ${String(err)}`,
+          message: `Failed to initialize terminal: ${String(err)}`,
           exit_code: null,
         });
         return;
       }
-
-      fitAddon.fit();
-      if (term.cols > 0 && term.rows > 0) {
-        resizePty(sid, term.cols, term.rows).catch(console.error);
+      if (cancelled) {
+        // The component unmounted during async init. Park the wrapper.
+        detachFromContainer(sid);
+        return;
       }
+      // Race: the session may have been GC'd by useTerminalCacheGc while we
+      // were awaiting (PTY exit, close_pane, workspace deletion).
+      // Calling methods on a disposed Terminal throws.
+      if (entry.disposed) return;
+
+      entryRef.current = entry;
+      attachToContainer(sid, containerEl);
+
+      // Custom key handler depends on paneId, which can plausibly differ
+      // between mounts of the same session (it doesn't today, but the cache
+      // shouldn't pin paneId to a single value). Re-register on each mount.
+      entry.terminal.attachCustomKeyEventHandler((ev) => {
+        if (ev.type === "keydown" && paneIdRef.current) {
+          const isInterrupt =
+            ev.key === "Escape" ||
+            (ev.key === "c" && ev.ctrlKey && !ev.shiftKey && !ev.altKey);
+          if (isInterrupt) {
+            const status =
+              useAppStore.getState().appState?.pane_statuses[paneIdRef.current];
+            if (status === "working" || status === "permission") {
+              clearAgentStatus(sid).catch(console.error);
+            }
+            return true;
+          }
+        }
+        if (isAppShortcut(ev)) return false;
+        {
+          const codepoint = KITTY_FUNCTIONAL_KEYS.get(ev.key);
+          const mod = csiUModifier(ev);
+          if (codepoint !== undefined && mod > 1) {
+            const isBackspace = codepoint === BACKSPACE_CODEPOINT;
+            if (!isBackspace || entry.kittyLevel > 0) {
+              if (ev.type === "keydown") {
+                writeToPty(sid, csiUSequence(codepoint, mod)).catch(
+                  console.error,
+                );
+              }
+              ev.preventDefault?.();
+              return false;
+            }
+          }
+        }
+        const overrides =
+          useSyncedSettingsStore.getState().settings.keyboard.shortcuts;
+        const resolved = resolveKeybinds(overrides);
+        const killCombo = resolved.getKeysForAction("backwardKillWord");
+        const copyCombo = resolved.getKeysForAction("copySelection");
+        const pasteCombo = resolved.getKeysForAction("pasteTerminal");
+
+        if (killCombo && matchesKeyCombo(ev, killCombo)) {
+          if (ev.type === "keydown") {
+            writeToPty(sid, "\x17").catch(console.error);
+          }
+          ev.preventDefault?.();
+          return false;
+        }
+        if (copyCombo && matchesKeyCombo(ev, copyCombo)) {
+          if (ev.type === "keydown") {
+            const selection = entry.terminal.getSelection();
+            if (selection)
+              navigator.clipboard.writeText(selection).catch(console.error);
+          }
+          ev.preventDefault?.();
+          return false;
+        }
+        if (pasteCombo && matchesKeyCombo(ev, pasteCombo)) {
+          if (ev.type === "keydown") {
+            navigator.clipboard
+              .readText()
+              .then((text) => {
+                if (text) entry.terminal.paste(text);
+              })
+              .catch(console.error);
+          }
+          ev.preventDefault?.();
+          return false;
+        }
+        return true;
+      });
+
+      // ── WKWebView newline bug workaround ──
+      const blockNewline = (e: Event) => {
+        if (entry.kittyLevel <= 0) return;
+        const ie = e as InputEvent;
+        if (
+          ie.inputType === "insertLineBreak" ||
+          ie.inputType === "insertParagraph" ||
+          (ie.inputType === "insertText" && ie.data === "\n")
+        ) {
+          e.stopPropagation();
+          e.preventDefault();
+        }
+      };
+      containerEl.addEventListener("input", blockNewline, true);
+      blockNewlineRef.current = blockNewline;
+
+      // Refresh status from backend (catches state changes that happened
+      // while this component was unmounted).
+      try {
+        const status = await getTerminalStatus(sid);
+        if (!cancelled) updateStatusOverlay(status);
+      } catch {
+        if (!cancelled && isNew) {
+          updateStatusOverlay({
+            session_id: sid,
+            state: "failed",
+            message: "Failed to read terminal status",
+            exit_code: null,
+          });
+        }
+      }
+
+      // Initial fit + resize. Backend already knows the prior dims; we only
+      // emit resize if the container has actual dims and they differ.
+      syncTerminalSize();
+
+      if (focused) entry.terminal.focus();
     })();
 
     // ── ResizeObserver ──
@@ -588,7 +355,8 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     // ── Window resize handler ──
     const windowResize = () => {
       if (!visibleRef.current) return;
-      if (windowResizeTimerRef.current) clearTimeout(windowResizeTimerRef.current);
+      if (windowResizeTimerRef.current)
+        clearTimeout(windowResizeTimerRef.current);
       windowResizeTimerRef.current = setTimeout(() => {
         windowResizeTimerRef.current = null;
         syncTerminalSize();
@@ -597,24 +365,20 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     window.addEventListener("resize", windowResize);
 
     // ── Cleanup ──
+    // IMPORTANT: do NOT term.dispose() and do NOT detachPtyOutput here.
+    // The terminal stays alive in the cache; we only park its wrapper so the
+    // React DOM can be collected. The xterm keeps consuming PTY bytes from
+    // the still-attached channel — this is the whole reason workspace
+    // switches no longer corrupt alt-screen TUIs.
     return () => {
       cancelled = true;
 
-      if (attachedSessionRef.current) {
-        detachPtyOutput(attachedSessionRef.current).catch(console.error);
-        attachedSessionRef.current = null;
+      const containerNow = containerEl;
+      const blockNewline = blockNewlineRef.current;
+      if (blockNewline) {
+        containerNow.removeEventListener("input", blockNewline, true);
+        blockNewlineRef.current = null;
       }
-      dataDisposable.dispose();
-      dataDisposableRef.current = null;
-
-      if (ptyWriteFrameRef.current !== null) {
-        cancelAnimationFrame(ptyWriteFrameRef.current);
-        ptyWriteFrameRef.current = null;
-      }
-      pendingPtyWrites.current = [];
-
-      containerEl.removeEventListener("input", blockNewline, true);
-      blockNewlineRef.current = null;
 
       if (resizeTimerRef.current !== null) {
         clearTimeout(resizeTimerRef.current);
@@ -627,50 +391,20 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
-
       window.removeEventListener("resize", windowResize);
 
-      // Cache scrollback BEFORE disposing xterm — the serialize addon needs
-      // the live terminal buffer. This covers tab switches and workspace switches.
-      const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
-      if (restoreEnabled) {
-        const payload = buildScrollbackPayload();
-        if (payload && payload.data) {
-          cacheTerminalScrollback(payload).catch(() => {});
-        }
-      }
-
-      unregisterSerialize();
-      serializeAddonRef.current = null;
-      fitAddonRef.current = null;
-      kittyStackRef.current = [];
-      kittyLevelRef.current = 0;
-      term.dispose();
-      termRef.current = null;
+      detachFromContainer(sid);
+      entryRef.current = null;
     };
-    // Intentionally depend only on sessionId — theme updates are handled separately
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
-
-  // TODO: re-enable as "system theme" option in settings
-  // useEffect(() => {
-  //   if (termRef.current) {
-  //     termRef.current.options.theme = buildXtermTheme(theme);
-  //   }
-  // }, [theme]);
-  //
-  // useEffect(() => {
-  //   if (termRef.current) {
-  //     termRef.current.options.fontFamily = shellAppearance.font_family || "monospace";
-  //     fitAddonRef.current?.fit();
-  //   }
-  // }, [shellAppearance]);
 
   // ── Re-read CSS variables when theme class/style changes ──
   useEffect(() => {
     const observer = new MutationObserver(() => {
-      if (termRef.current) {
-        termRef.current.options.theme = buildThemeFromCSS();
+      const entry = entryRef.current;
+      if (entry) {
+        entry.terminal.options.theme = buildThemeFromCSS();
       }
     });
     observer.observe(document.documentElement, {
@@ -682,16 +416,20 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
   // ── Focus management ──
   useEffect(() => {
-    if (focused && termRef.current) {
-      termRef.current.focus();
+    const entry = entryRef.current;
+    if (focused && entry) {
+      entry.terminal.focus();
     }
   }, [focused]);
 
   return (
-    <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background">
+    <div
+      ref={shellRef}
+      className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background"
+    >
       <div
         ref={containerRef}
-        className="block flex-1 w-full h-full min-w-0 min-h-0 overflow-hidden px-2 py-1.5 box-border [&_.xterm]:h-full [&_.xterm]:w-full [&_.xterm-viewport]:!bg-transparent"
+        className="block flex-1 w-full h-full min-w-0 min-h-0 overflow-hidden px-2 py-1.5 box-border [&_.codemux-terminal-wrapper]:h-full [&_.codemux-terminal-wrapper]:w-full [&_.xterm]:h-full [&_.xterm]:w-full [&_.xterm-viewport]:!bg-transparent"
       />
       <div
         ref={statusOverlayRef}

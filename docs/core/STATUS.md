@@ -46,6 +46,7 @@ The repo structure is clean and domain-split:
 - Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
 - MCP server exposing 29 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
 - Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
+- Terminal pane persistence across workspace switch: xterm.js Terminal instance + PTY-output channel survive component unmount via the module-level cache in `src/components/terminal/terminal-cache.ts`. Workspace switches reparent the wrapper into a hidden parking node instead of disposing, so alt-screen TUIs (Claude Code, lazygit, btop, vim) keep rendering correctly on return. Disposal is driven by AppState diffs in `useTerminalCacheGc` so close-pane / close-tab / close-workspace / PTY-exit all reach `disposeTerminal`.
 
 ## Partial / Being Hardened
 

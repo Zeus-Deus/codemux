@@ -20,7 +20,7 @@ The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYVW). State managemen
 
 - shadcn primitives: `src/components/ui/` (button, tabs, sidebar, resizable, badge, tooltip, etc.)
 - app shell layout: `src/components/layout/` (AppSidebar, PaneNode, TabBar, WorkspaceMain, RightPanel)
-- terminal integration: `src/components/terminal/TerminalPane.tsx` (xterm.js + PTY via Tauri Channel)
+- terminal integration: `src/components/terminal/TerminalPane.tsx` (thin DOM-attach wrapper) + `src/components/terminal/terminal-cache.ts` (module-level cache that owns the xterm.js Terminal, addons, wrapper `<div>`, and PTY-output channel for the lifetime of the PTY session). Workspace switches reparent the wrapper into a hidden `#codemux-terminal-parking` node instead of disposing — this is the load-bearing invariant that keeps alt-screen TUIs (Claude Code, lazygit, vim) coherent across switches. Disposal is driven by AppState diffs in `src/hooks/use-terminal-cache-gc.ts`.
 - React hooks: `src/hooks/` (useTauriEvent, useAppStateInit, useKeyboardShortcuts, useThemeColors)
 - zustand stores: `src/stores/` (app-store.ts for AppStateSnapshot, ui-store.ts for local UI state)
 - Tauri bridge: `src/tauri/commands.ts` (120+ typed invoke wrappers), `src/tauri/events.ts` (12 event helpers), `src/tauri/types.ts` (all shared types)
