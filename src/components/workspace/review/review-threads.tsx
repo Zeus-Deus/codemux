@@ -126,8 +126,18 @@ export function ReviewThreads({ reviews, inlineComments }: Props) {
   return (
     <CollapsibleSection label="Reviews" count={totalCount}>
       <div className="px-1.5 space-y-2">
-        {grouped.map((g, idx) => (
-          <div key={g.review.id || `group-${idx}`} className="space-y-1">
+        {grouped.map((g) => (
+          // Composite key (`review.id` is unique within reviews; orphan
+          // group falls back to its first inline comment's id since array
+          // index would lose collapse state on reorder — analysis §4).
+          <div
+            key={
+              g.review.id !== 0
+                ? `review-${g.review.id}`
+                : `orphan-${g.inlineComments[0]?.id ?? "empty"}`
+            }
+            className="space-y-1"
+          >
             {/* Review header */}
             <div className="flex items-center gap-1.5 px-1">
               <AuthorAvatar name={g.review.author} />
@@ -154,8 +164,13 @@ export function ReviewThreads({ reviews, inlineComments }: Props) {
 
             {/* Inline comments */}
             {g.inlineComments.map((ic) => (
+              // Composite key prevents collisions when the same inline
+              // comment id is re-used across review threads (rare but
+              // GitHub does it for "comment on the same line in two
+              // reviews"). `g.review.id` is 0 for the orphan group;
+              // that's still unique relative to keyed reviews.
               <div
-                key={ic.id}
+                key={`${g.review.id}-${ic.id}`}
                 className="group/comment ml-7 mr-1 border-l-2 border-border/50 pl-2 space-y-0.5"
               >
                 <div className="flex items-center gap-1">
