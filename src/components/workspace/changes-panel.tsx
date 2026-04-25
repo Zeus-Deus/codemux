@@ -1817,7 +1817,7 @@ export function ChangesPanel({ workspace }: Props) {
                       disabled={mergingPr !== null}
                       className="text-xs"
                     >
-                      <GitMerge className="h-3.5 w-3.5" />
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
                       Squash and merge
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -1825,7 +1825,7 @@ export function ChangesPanel({ workspace }: Props) {
                       disabled={mergingPr !== null}
                       className="text-xs"
                     >
-                      <GitMerge className="h-3.5 w-3.5" />
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
                       Create merge commit
                     </DropdownMenuItem>
                     <DropdownMenuItem
@@ -1833,7 +1833,7 @@ export function ChangesPanel({ workspace }: Props) {
                       disabled={mergingPr !== null}
                       className="text-xs"
                     >
-                      <GitMerge className="h-3.5 w-3.5" />
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
                       Rebase and merge
                     </DropdownMenuItem>
                   </DropdownMenuContent>
