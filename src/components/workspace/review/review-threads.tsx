@@ -1,5 +1,6 @@
 import { useState, useMemo } from "react";
 import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   ShieldCheck,
   ShieldAlert,
@@ -73,6 +74,7 @@ function CopyButton({ text }: { text: string }) {
 interface Props {
   reviews: ReviewComment[];
   inlineComments: InlineReviewComment[];
+  isLoading?: boolean;
 }
 
 interface GroupedReview {
@@ -80,7 +82,7 @@ interface GroupedReview {
   inlineComments: InlineReviewComment[];
 }
 
-export function ReviewThreads({ reviews, inlineComments }: Props) {
+export function ReviewThreads({ reviews, inlineComments, isLoading = false }: Props) {
   const grouped = useMemo(() => {
     // Group inline comments by pull_request_review_id
     const inlineByReview = new Map<number, InlineReviewComment[]>();
@@ -121,12 +123,23 @@ export function ReviewThreads({ reviews, inlineComments }: Props) {
 
   const totalCount = reviews.length + inlineComments.filter((c) => !c.in_reply_to_id).length;
 
-  if (totalCount === 0) return null;
-
   return (
-    <CollapsibleSection label="Reviews" count={totalCount}>
+    <CollapsibleSection label="Comments" count={totalCount}>
       <div className="px-1.5 space-y-2">
-        {grouped.map((g) => (
+        {totalCount === 0 ? (
+          isLoading ? (
+            <>
+              <Skeleton className="h-4 w-3/4 mx-1 my-0.5" />
+              <Skeleton className="h-4 w-2/3 mx-1 my-0.5" />
+              <Skeleton className="h-4 w-1/2 mx-1 my-0.5" />
+            </>
+          ) : (
+            <p className="text-xs text-muted-foreground px-1 py-0.5">
+              No comments yet.
+            </p>
+          )
+        ) : null}
+        {totalCount > 0 && grouped.map((g) => (
           // Composite key (`review.id` is unique within reviews; orphan
           // group falls back to its first inline comment's id since array
           // index would lose collapse state on reorder — analysis §4).

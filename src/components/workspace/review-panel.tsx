@@ -26,7 +26,6 @@ import {
   getPullRequestChecks,
   getPrReviewComments,
   getPrInlineComments,
-  getPrDeployments,
   listBranches,
   refreshWorkspacePr,
   getDefaultBranch,
@@ -38,14 +37,10 @@ import type {
   CheckInfo,
   ReviewComment,
   InlineReviewComment,
-  DeploymentInfo,
 } from "@/tauri/types";
 import { ReviewHeader } from "./review/review-header";
 import { ReviewChecks } from "./review/review-checks";
 import { ReviewThreads } from "./review/review-threads";
-import { ReviewActions } from "./review/review-actions";
-import { ReviewDeployments } from "./review/review-deployments";
-import { ReviewMergeControls } from "./review/review-merge-controls";
 import { IncomingPrsView } from "./review/incoming-prs-view";
 
 interface Props {
@@ -326,46 +321,36 @@ function ReviewView({
   checks,
   reviews,
   inlineComments,
-  deployments,
-  cwd,
-  onRefresh,
+  checksLoading,
+  commentsLoading,
 }: {
   pr: PullRequestInfo;
   checks: CheckInfo[];
   reviews: ReviewComment[];
   inlineComments: InlineReviewComment[];
-  deployments: DeploymentInfo[];
-  cwd: string;
-  onRefresh: () => void;
+  checksLoading: boolean;
+  commentsLoading: boolean;
 }) {
+  // Stripped to match Superset's resting layout: title + status badge
+  // + checks + comments only. Composer (Approve / Request changes /
+  // Comment), merge controls, and deployments were intentionally
+  // removed — composer because Superset has no equivalent (verified
+  // against the reference clone), merge controls because the Changes
+  // panel toolbar already has a merge dropdown, deployments because
+  // it's not part of Superset's Review surface. Backends for the
+  // composer and merge are retained for potential future re-wire.
   return (
     <div className="space-y-2 p-3">
       <ReviewHeader pr={pr} />
 
       <div className="border-t border-border/30" />
 
-      <ReviewChecks checks={checks} />
-      <ReviewThreads reviews={reviews} inlineComments={inlineComments} />
-
-      {pr.state === "OPEN" && (
-        <>
-          <div className="border-t border-border/30" />
-          <ReviewActions
-            cwd={cwd}
-            prNumber={pr.number}
-            onSubmitted={onRefresh}
-          />
-        </>
-      )}
-
-      <ReviewDeployments deployments={deployments} />
-
-      {pr.state === "OPEN" && (
-        <>
-          <div className="border-t border-border/30" />
-          <ReviewMergeControls pr={pr} cwd={cwd} onRefresh={onRefresh} />
-        </>
-      )}
+      <ReviewChecks checks={checks} isLoading={checksLoading} />
+      <ReviewThreads
+        reviews={reviews}
+        inlineComments={inlineComments}
+        isLoading={commentsLoading}
+      />
     </div>
   );
 }
@@ -489,29 +474,15 @@ export function ReviewPanel({ workspace }: Props) {
     refetchInterval: 30_000,
   });
 
-  const deploysQuery = useQuery({
-    queryKey: ["pr", "deploys", workspace.workspace_id, workspace.pr_number] as const,
-    queryFn: () => {
-      const num = workspace.pr_number;
-      if (num == null) return Promise.resolve([] as DeploymentInfo[]);
-      return getPrDeployments(cwd, num);
-    },
-    enabled: detailsEnabled && workspace.pr_number != null,
-    staleTime: 10_000,
-    refetchInterval: 10_000,
-  });
-
   const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
   const checks: CheckInfo[] = checksQuery.data ?? [];
   const reviews: ReviewComment[] = reviewsQuery.data ?? [];
   const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
-  const deployments: DeploymentInfo[] = deploysQuery.data ?? [];
   const detailLoading =
     prDetailQuery.isFetching ||
     checksQuery.isFetching ||
     reviewsQuery.isFetching ||
-    inlineQuery.isFetching ||
-    deploysQuery.isFetching;
+    inlineQuery.isFetching;
   // The error banner surfaces (a) the primary detail query's error,
   // and (b) errors from the manual-refresh PR-discovery path
   // (`refresh_workspace_pr`) which lives outside React Query because
@@ -640,9 +611,8 @@ export function ReviewPanel({ workspace }: Props) {
           checks={checks}
           reviews={reviews}
           inlineComments={inlineComments}
-          deployments={deployments}
-          cwd={cwd}
-          onRefresh={handleRefresh}
+          checksLoading={checksQuery.isFetching}
+          commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
         />
       ) : hasPr && !pr ? (
         <ReviewSkeleton />

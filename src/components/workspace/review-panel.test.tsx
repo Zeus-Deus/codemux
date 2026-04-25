@@ -21,7 +21,6 @@ const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
 const mockGetPullRequestChecks = vi.fn().mockResolvedValue([]);
 const mockGetPrReviewComments = vi.fn().mockResolvedValue([]);
 const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
-const mockGetPrDeployments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
 const mockCreatePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockGetDefaultBranch = vi.fn().mockResolvedValue("main");
@@ -34,7 +33,6 @@ vi.mock("@/tauri/commands", () => ({
   getPullRequestChecks: (...args: unknown[]) => mockGetPullRequestChecks(...args),
   getPrReviewComments: (...args: unknown[]) => mockGetPrReviewComments(...args),
   getPrInlineComments: (...args: unknown[]) => mockGetPrInlineComments(...args),
-  getPrDeployments: (...args: unknown[]) => mockGetPrDeployments(...args),
   listBranches: (...args: unknown[]) => mockListBranches(...args),
   createPullRequest: (...args: unknown[]) => mockCreatePullRequest(...args),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
@@ -44,9 +42,6 @@ vi.mock("@/tauri/commands", () => ({
 vi.mock("./review/review-header", () => ({ ReviewHeader: () => <div data-testid="pr-header" /> }));
 vi.mock("./review/review-checks", () => ({ ReviewChecks: () => <div data-testid="pr-checks" /> }));
 vi.mock("./review/review-threads", () => ({ ReviewThreads: () => <div data-testid="pr-reviews" /> }));
-vi.mock("./review/review-actions", () => ({ ReviewActions: () => <div data-testid="pr-review-actions" /> }));
-vi.mock("./review/review-deployments", () => ({ ReviewDeployments: () => <div data-testid="pr-deployments" /> }));
-vi.mock("./review/review-merge-controls", () => ({ ReviewMergeControls: () => <div data-testid="pr-merge-controls" /> }));
 vi.mock("./review/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
 
 import { ReviewPanel } from "./review-panel";
@@ -132,7 +127,6 @@ beforeEach(() => {
   mockGetPullRequestChecks.mockResolvedValue([]);
   mockGetPrReviewComments.mockResolvedValue([]);
   mockGetPrInlineComments.mockResolvedValue([]);
-  mockGetPrDeployments.mockResolvedValue([]);
   mockGetDefaultBranch.mockResolvedValue("main");
 });
 
