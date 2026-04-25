@@ -143,6 +143,7 @@ vi.mock("@/stores/ai-merge-store", () => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ChangesPanel } from "./changes-panel";
 import { toast as mockToast } from "@/lib/toast";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -176,11 +177,25 @@ const mockWorkspace: WorkspaceSnapshot = {
   surfaces: [],
 };
 
+// Each test gets a fresh QueryClient — required since ChangesPanel
+// now calls `useQueryClient` (Phase 3.3) to invalidate Review-tab
+// queries on commit / push / pull / merge. Disable retries + auto
+// refetch so query state doesn't leak between tests.
+function makeTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+    },
+  });
+}
+
 function renderPanel() {
   return render(
-    <TooltipProvider>
-      <ChangesPanel workspace={mockWorkspace} />
-    </TooltipProvider>,
+    <QueryClientProvider client={makeTestQueryClient()}>
+      <TooltipProvider>
+        <ChangesPanel workspace={mockWorkspace} />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -776,9 +791,11 @@ describe("Changes panel PR split-button", () => {
     overrides: Partial<WorkspaceSnapshot> = { pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" },
   ) {
     return render(
-      <TooltipProvider>
-        <ChangesPanel workspace={{ ...mockWorkspace, ...overrides }} />
-      </TooltipProvider>,
+      <QueryClientProvider client={makeTestQueryClient()}>
+        <TooltipProvider>
+          <ChangesPanel workspace={{ ...mockWorkspace, ...overrides }} />
+        </TooltipProvider>
+      </QueryClientProvider>,
     );
   }
 
