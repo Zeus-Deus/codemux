@@ -1,15 +1,21 @@
 import { useMemo } from "react";
-import { CheckCircle2, XCircle, Clock } from "lucide-react";
+import { CheckCircle2, XCircle, Loader2, Minus } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import type { CheckInfo } from "@/tauri/types";
 import { CollapsibleSection } from "./collapsible-section";
 
+// Per-row check icon. Matches the tab-badge spinner so the same color
+// + motion appears in both places when checks are running.
 function CheckIcon({ status }: { status: string }) {
-  if (status === "pass" || status === "success" || status === "SUCCESS")
+  const s = status.toLowerCase();
+  if (s === "pass" || s === "success")
     return <CheckCircle2 className="h-3 w-3 text-success shrink-0" />;
-  if (status === "fail" || status === "failure" || status === "FAILURE")
+  if (s === "fail" || s === "failure")
     return <XCircle className="h-3 w-3 text-danger shrink-0" />;
-  return <Clock className="h-3 w-3 text-warning shrink-0" />;
+  if (s === "skipping" || s === "skipped" || s === "cancel" || s === "cancelled")
+    return <Minus className="h-3 w-3 text-muted-foreground shrink-0" />;
+  // pending / queued / in-progress / anything else → spinning amber loader
+  return <Loader2 className="h-3 w-3 text-amber-500 shrink-0 animate-spin" />;
 }
 
 interface Props {
