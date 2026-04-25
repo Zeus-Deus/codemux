@@ -2,6 +2,7 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/dm-sans";
 @import "@xterm/xterm/css/xterm.css";
 
 /* `@tailwindcss/typography` — drives the `prose` utility used by
@@ -14,6 +15,7 @@
 
 @theme inline {
     --font-heading: var(--font-mono);
+    --font-sans: 'DM Sans Variable', ui-sans-serif, system-ui, sans-serif;
     --font-mono: 'JetBrains Mono Variable', monospace;
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
@@ -171,9 +173,12 @@ body.pane-resizing iframe {
     }
   body {
     @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     }
   html {
-    @apply font-mono;
+    @apply font-sans;
     }
 }
 

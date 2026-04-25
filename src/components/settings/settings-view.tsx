@@ -712,7 +712,7 @@ export function SettingsView() {
               </SettingRow>
               <Separator />
               <SettingRow label="Font family" description="Applied to the entire app shell and terminal.">
-                <span className="text-sm text-muted-foreground">JetBrains Mono Variable</span>
+                <span className="text-sm text-muted-foreground">DM Sans Variable</span>
               </SettingRow>
               <Separator />
               <SettingRow label="Border radius" description="Controls the roundness of all UI elements.">
