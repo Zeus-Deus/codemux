@@ -465,43 +465,28 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                         />
                       )}
                       {showPrIcon && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <button
-                              type="button"
-                              onClick={handlePrClick}
-                              disabled={!workspace.pr_url}
-                              aria-label={
-                                workspace.pr_number
-                                  ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
-                                  : `Pull request — ${prHumanState ?? ""}`
-                              }
-                              className={cn(
-                                "inline-flex items-center gap-0.5 rounded-full px-1.5 py-px transition-opacity",
-                                prToneCls,
-                                workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
-                              )}
-                            >
-                              <PrStatusIcon state={workspace.pr_state} size={3} />
-                              {workspace.pr_number && (
-                                <span className="text-[10px] tabular-nums text-muted-foreground/60">
-                                  #{workspace.pr_number}
-                                </span>
-                              )}
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent side="right" sideOffset={4} className="text-xs">
-                            <div>
-                              {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
-                              {prHumanState ?? "Pull request"}
-                            </div>
-                            {workspace.pr_url && (
-                              <div className="text-muted-foreground text-[10px]">
-                                Click to open on GitHub
-                              </div>
-                            )}
-                          </TooltipContent>
-                        </Tooltip>
+                        <button
+                          type="button"
+                          onClick={handlePrClick}
+                          disabled={!workspace.pr_url}
+                          aria-label={
+                            workspace.pr_number
+                              ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
+                              : `Open pull request on GitHub — ${prHumanState ?? ""}`
+                          }
+                          className={cn(
+                            "inline-flex items-center gap-0.5 rounded-full px-1.5 py-px transition-opacity",
+                            prToneCls,
+                            workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
+                          )}
+                        >
+                          <PrStatusIcon state={workspace.pr_state} size={3} />
+                          {workspace.pr_number && (
+                            <span className="text-[10px] tabular-nums text-muted-foreground/60">
+                              #{workspace.pr_number}
+                            </span>
+                          )}
+                        </button>
                       )}
                     </div>
                   )}
