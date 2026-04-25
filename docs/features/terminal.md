@@ -14,6 +14,14 @@ The terminal system provides multi-session PTY terminals rendered with xterm.js 
 
 The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a master PTY handle, a read thread, and a write path. The frontend uses xterm.js with the WebGL renderer for GPU-accelerated display. Data flows: PTY read thread -> Tauri channel -> xterm.js write. User input flows: xterm.js onData -> Tauri command `write_to_pty` -> PTY master write.
 
+### Terminal Pane Persistence
+
+The xterm.js `Terminal` instance, its addons, the persistent wrapper `<div>`, and the PTY-output `Channel` all live in a module-level cache (`src/components/terminal/terminal-cache.ts`) keyed by `sessionId`. The cache lifetime equals the PTY session lifetime; `TerminalPane.tsx` is a thin DOM-attach wrapper that reparents the cached wrapper between its layout container and a body-level `#codemux-terminal-parking` node on mount/unmount.
+
+This is the load-bearing invariant: bytes flowing in from a long-running alt-screen TUI (Claude Code's "Simmering…", lazygit, vim, btop) keep being processed by the same xterm even while the React component is unmounted, so its mode flags / cursor / cell grid stay in sync with the PTY producer. Workspace switches no longer cause garbled or misaligned rendering on return.
+
+Disposal is driven by `useTerminalCacheGc` in `src/hooks/use-terminal-cache-gc.ts`: it diffs `AppState.terminal_sessions` and calls `disposeTerminal(sid)` for any session that disappears, covering close-pane / close-tab / close-workspace / PTY-exit. Because the channel stays attached for the session's lifetime, the Rust-side `pending_output` buffer (`src-tauri/src/terminal/mod.rs`) is effectively a cold-start replay window only; the `dropped_chunks` counter on `SessionRuntime` is a regression signal — non-zero means the channel was somehow detached when the buffer overflowed.
+
 ## What Works Today
 
 - multiple concurrent terminal sessions per workspace
@@ -46,8 +54,10 @@ Note: terminal scrollback is saved and restored across app restarts. See `docs/f
 
 ## Important Touch Points
 
-- `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks
+- `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks, dropped-chunk observability counter
 - `src-tauri/src/commands/workspace.rs` — `create_terminal_session`, `write_to_pty`, `resize_pty`, `attach_pty_output`
-- `src/components/terminal/TerminalPane.tsx` — xterm.js rendering, WebGL, input handling
+- `src/components/terminal/TerminalPane.tsx` — DOM-attach wrapper, ResizeObserver, focus, status overlay, custom key handler
+- `src/components/terminal/terminal-cache.ts` — module-level Terminal cache, parking node, attach/detach/dispose API
+- `src/hooks/use-terminal-cache-gc.ts` — disposes cache entries when sessions disappear from AppState
 - `src/lib/app-shortcuts.ts` — terminal-specific keyboard shortcuts
 - `src-tauri/src/agent_context.rs` — environment variable injection for terminal sessions
