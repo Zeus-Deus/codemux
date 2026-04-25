@@ -373,53 +373,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-foreground rounded-r" />
             )}
 
-            {/* Icon — size-6 container matches project header avatar width.
-                When the workspace has a PR, the host-type icon is replaced
-                with a clickable PR-status icon (open → emerald, merged →
-                purple, etc.) that opens the PR on GitHub. */}
+            {/* Icon — size-6 container matches project header avatar width */}
             <div className="relative size-6 flex items-center justify-center shrink-0 mr-2.5">
               {workspaceStatus === "working" ? (
                 <AsciiSpinner />
-              ) : showPrIcon ? (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <button
-                      type="button"
-                      onClick={handlePrClick}
-                      disabled={!workspace.pr_url}
-                      aria-label={
-                        workspace.pr_number
-                          ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
-                          : `Pull request — ${prHumanState ?? ""}`
-                      }
-                      className={cn(
-                        "rounded p-0.5 hover:bg-foreground/10 transition-colors flex items-center justify-center",
-                        !workspace.pr_url && "cursor-not-allowed opacity-60",
-                      )}
-                    >
-                      <PrStatusIcon state={workspace.pr_state} />
-                    </button>
-                  </TooltipTrigger>
-                  <TooltipContent side="right" sideOffset={4} className="text-xs">
-                    <div>
-                      {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
-                      {prHumanState ?? "Pull request"}
-                    </div>
-                    {workspace.pr_url && (
-                      <div className="text-muted-foreground text-[10px]">
-                        Click to open on GitHub
-                      </div>
-                    )}
-                  </TooltipContent>
-                </Tooltip>
               ) : (
-                icon
-              )}
-              {workspaceStatus && workspaceStatus !== "working" && (
-                <StatusIndicator
-                  status={workspaceStatus}
-                  className="absolute -top-0.5 -right-0.5"
-                />
+                <>
+                  {icon}
+                  {workspaceStatus && (
+                    <StatusIndicator
+                      status={workspaceStatus}
+                      className="absolute -top-0.5 -right-0.5"
+                    />
+                  )}
+                </>
               )}
             </div>
 
@@ -489,6 +456,44 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                       workspaceId={workspace.workspace_id}
                       issue={workspace.linked_issue}
                     />
+                  )}
+                  {showPrIcon && (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={handlePrClick}
+                          disabled={!workspace.pr_url}
+                          aria-label={
+                            workspace.pr_number
+                              ? `PR #${workspace.pr_number} — ${prHumanState ?? "Pull request"}`
+                              : `Pull request — ${prHumanState ?? ""}`
+                          }
+                          className={cn(
+                            "ml-auto inline-flex items-center gap-0.5 shrink-0 rounded px-0.5 hover:bg-foreground/10 transition-colors",
+                            !workspace.pr_url && "cursor-not-allowed opacity-60",
+                          )}
+                        >
+                          <PrStatusIcon state={workspace.pr_state} size={3} />
+                          {workspace.pr_number && (
+                            <span className="text-[10px] tabular-nums">
+                              #{workspace.pr_number}
+                            </span>
+                          )}
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="right" sideOffset={4} className="text-xs">
+                        <div>
+                          {workspace.pr_number ? `#${workspace.pr_number} — ` : ""}
+                          {prHumanState ?? "Pull request"}
+                        </div>
+                        {workspace.pr_url && (
+                          <div className="text-muted-foreground text-[10px]">
+                            Click to open on GitHub
+                          </div>
+                        )}
+                      </TooltipContent>
+                    </Tooltip>
                   )}
                 </div>
               )}
