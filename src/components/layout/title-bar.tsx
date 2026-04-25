@@ -31,7 +31,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { useUIStore } from "@/stores/ui-store";
-import { useAppStore } from "@/stores/app-store";
+import { useAppStore, useActiveWorkspace } from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
@@ -43,20 +43,31 @@ import type { EditorInfo } from "@/tauri/types";
 function SearchTrigger() {
   const { getKeysForAction } = useResolvedKeybinds();
   const toggleCombo = getKeysForAction("commandPalette");
+  const workspace = useActiveWorkspace();
 
   const handleClick = useCallback(() => {
     useUIStore.getState().toggleCommandPalette();
   }, []);
+
+  const projectName = workspace?.project_root
+    ? workspace.project_root.split(/[\\/]/).filter(Boolean).pop() ?? null
+    : null;
+  const branch = workspace?.git_branch ?? null;
+  const label = projectName
+    ? branch
+      ? `Search ${projectName} - ${branch}`
+      : `Search ${projectName}`
+    : "Search...";
 
   return (
     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
       <button
         type="button"
         onClick={handleClick}
-        className="pointer-events-auto flex items-center gap-2 h-6 px-2.5 rounded-md border border-border/50 bg-muted/50 text-muted-foreground text-xs transition-colors duration-150 hover:bg-muted hover:text-foreground cursor-pointer min-w-[120px] max-w-[260px]"
+        className="pointer-events-auto flex items-center gap-2 h-6 px-2.5 rounded-md border border-border/50 bg-muted/50 text-muted-foreground text-xs transition-colors duration-150 hover:bg-muted hover:text-foreground cursor-pointer min-w-[240px] max-w-[420px]"
       >
         <Search className="h-3 w-3 shrink-0" />
-        <span className="truncate">Search...</span>
+        <span className="truncate">{label}</span>
         {toggleCombo && (
           <kbd className="ml-auto shrink-0 text-[10px] text-muted-foreground/60 border border-border/40 rounded px-1 py-px">
             {toggleCombo}
