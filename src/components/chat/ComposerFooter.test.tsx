@@ -106,15 +106,24 @@ describe("ComposerFooter — Stage 3 mode selector", () => {
     expect(onModeActivate).toHaveBeenCalledWith("plan");
   });
 
-  it("Ask and Debug dropdown items are disabled in Stage 3", async () => {
+  it("dropdown Ask item fires onModeActivate('ask') (Stage 4)", async () => {
+    const user = userEvent.setup();
+    const onModeActivate = vi.fn();
+    renderFooter({ mode: "default", onModeActivate });
+    await user.click(
+      screen.getByRole("button", { name: /Activate mode/i }),
+    );
+    await user.click(await screen.findByRole("menuitem", { name: /Ask/ }));
+    expect(onModeActivate).toHaveBeenCalledWith("ask");
+  });
+
+  it("Debug dropdown item is disabled (Stage 6)", async () => {
     const user = userEvent.setup();
     renderFooter({ mode: "default" });
     await user.click(
       screen.getByRole("button", { name: /Activate mode/i }),
     );
-    const ask = await screen.findByRole("menuitem", { name: /Ask/ });
     const debug = await screen.findByRole("menuitem", { name: /Debug/ });
-    expect(ask.getAttribute("aria-disabled")).toBe("true");
     expect(debug.getAttribute("aria-disabled")).toBe("true");
   });
 

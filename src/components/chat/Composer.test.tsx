@@ -324,7 +324,7 @@ describe("Composer", () => {
       expect(onDraftChange).toHaveBeenCalledWith("/plan twice");
     });
 
-    it("'/ask' strips the command but does not activate in Stage 3", () => {
+    it("'/ask ' at draft start activates Ask mode and strips the command", () => {
       const onDraftChange = vi.fn();
       const onModeActivate = vi.fn();
       const { container } = renderComposer({
@@ -342,12 +342,32 @@ describe("Composer", () => {
       setter?.call(textarea, "/ask when does the release ship?");
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
-      // Stage 3: /ask is reserved — strip the command but do not fire
-      // onModeActivate (Stage 4 will wire the prompt-wrapper path).
-      expect(onModeActivate).not.toHaveBeenCalled();
+      expect(onModeActivate).toHaveBeenCalledWith("ask");
       expect(onDraftChange).toHaveBeenCalledWith(
         "when does the release ship?",
       );
+    });
+
+    it("'/debug' still strips the command but does not activate (Stage 6)", () => {
+      const onDraftChange = vi.fn();
+      const onModeActivate = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        onDraftChange,
+        onModeActivate,
+      });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      setter?.call(textarea, "/debug crash trace");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+      expect(onModeActivate).not.toHaveBeenCalled();
+      expect(onDraftChange).toHaveBeenCalledWith("crash trace");
     });
   });
 });

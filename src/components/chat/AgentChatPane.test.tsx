@@ -6,6 +6,19 @@ let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
 // tests can observe which slice AgentChatPane subscribes to.
 let currentThreadsMap: Record<string, unknown[]> = {};
+// Per-thread slice field overrides (mode, permissionMode, etc.)
+// used by the mode-pill removal tests to seed an "ask" or "plan"
+// pill state before the X-button click.
+type SliceOverrides = {
+  mode?: "default" | "plan" | "ask" | "debug";
+  modePriorPermissionMode?: string | null;
+  permissionMode?: string;
+  sessionLaunchMode?: string;
+  model?: string | null;
+  effort?: string | null;
+  contextWindow?: string | null;
+};
+let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
   string,
   { draftId: string; threadId: string; promotedTo: { workspaceId: string } | null }
@@ -18,6 +31,12 @@ const setActiveDraftMock = vi.fn();
 // Stable across selector calls — the agent-chat-store mock below
 // reuses this exact spy in every state object it produces.
 const setModelMock = vi.fn();
+// Same hoisting pattern for the mode-pill removal tests so they can
+// assert which slice setters were called with which values.
+const setModeMock = vi.fn();
+const setModePriorMock = vi.fn();
+const setPermissionModeMock = vi.fn();
+const markRequestResolvedMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -26,15 +45,43 @@ vi.mock("./ChatHomeLanding", () => ({
 }));
 
 vi.mock("./ChatTranscript", () => ({
-  ChatTranscript: ({ messages }: { messages: unknown[] }) => (
-    <div data-testid="transcript" data-message-count={messages.length} />
+  ChatTranscript: ({
+    messages,
+    onAcceptPlan,
+  }: {
+    messages: unknown[];
+    onAcceptPlan: (requestId: string) => void;
+  }) => (
+    <div data-testid="transcript" data-message-count={messages.length}>
+      <button
+        data-testid="accept-plan"
+        onClick={() => onAcceptPlan("req-1")}
+      />
+    </div>
   ),
 }));
 
 vi.mock("./Composer", () => ({
-  Composer: ({ zone1Override }: { zone1Override?: React.ReactNode }) => (
+  Composer: ({
+    zone1Override,
+    onModeRemove,
+    onModeActivate,
+  }: {
+    zone1Override?: React.ReactNode;
+    onModeRemove: () => void;
+    onModeActivate: (mode: "plan" | "ask" | "debug") => void;
+  }) => (
     <div data-testid="composer">
       <div data-testid="zone1">{zone1Override}</div>
+      <button data-testid="mode-remove" onClick={() => onModeRemove()} />
+      <button
+        data-testid="mode-activate-plan"
+        onClick={() => onModeActivate("plan")}
+      />
+      <button
+        data-testid="mode-activate-ask"
+        onClick={() => onModeActivate("ask")}
+      />
     </div>
   ),
 }));
@@ -118,6 +165,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
+  agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
 }));
@@ -195,27 +243,37 @@ vi.mock("@/stores/chat-draft-store", () => ({
 }));
 
 vi.mock("@/stores/agent-chat-store", () => {
-  function makeSlice(messages: unknown[]) {
+  function makeSlice(messages: unknown[], overrides: SliceOverrides = {}) {
     return {
       messages,
       inputDraft: "",
       streaming: false,
       activeTurnId: null,
-      model: null,
-      permissionMode: "bypassPermissions",
-      sessionLaunchMode: "bypassPermissions",
+      model: overrides.model ?? null,
+      permissionMode: overrides.permissionMode ?? "bypassPermissions",
+      sessionLaunchMode:
+        overrides.sessionLaunchMode ?? "bypassPermissions",
       resumeCursor: null,
+      mode: overrides.mode ?? "default",
+      modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
+      effort: overrides.effort ?? null,
+      contextWindow: overrides.contextWindow ?? null,
     };
   }
   function buildThreads() {
     // Merge the legacy `thread-x` (used by existing tests) with any
     // per-test `currentThreadsMap` entries so new tests can seed a
-    // specific thread id like `draft-thread-42`.
+    // specific thread id like `draft-thread-42`. Per-thread slice
+    // overrides come from `currentSliceOverrides` so a test can seed
+    // mode / modePriorPermissionMode without touching the messages map.
     const threads: Record<string, unknown> = {
-      "thread-x": makeSlice(currentMessages),
+      "thread-x": makeSlice(
+        currentMessages,
+        currentSliceOverrides["thread-x"],
+      ),
     };
     for (const [tid, msgs] of Object.entries(currentThreadsMap)) {
-      threads[tid] = makeSlice(msgs);
+      threads[tid] = makeSlice(msgs, currentSliceOverrides[tid]);
     }
     return threads;
   }
@@ -226,11 +284,16 @@ vi.mock("@/stores/agent-chat-store", () => {
         ensureThread: vi.fn(),
         setInputDraft: vi.fn(),
         setModel: setModelMock,
-        setPermissionMode: vi.fn(),
+        setPermissionMode: setPermissionModeMock,
         setSessionLaunchMode: vi.fn(),
+        setEffort: vi.fn(),
+        setContextWindow: vi.fn(),
+        setMode: setModeMock,
+        setModePriorPermissionMode: setModePriorMock,
         migrateThreadId: vi.fn(),
         appendUserMessage: vi.fn(),
         markRequestResponding: vi.fn(),
+        markRequestResolved: markRequestResolvedMock,
         applyEvent: vi.fn(),
       };
       return selector(state);
@@ -254,7 +317,11 @@ vi.mock("@/stores/agent-chat-store", () => {
 });
 
 import { AgentChatPane } from "./AgentChatPane";
-import { agentChatStartSession } from "@/tauri/commands";
+import {
+  agentChatSetPermissionMode,
+  agentChatStartSession,
+  agentChatStopSession,
+} from "@/tauri/commands";
 
 const pane = {
   kind: "agent_chat" as const,
@@ -798,5 +865,128 @@ describe("AgentChatPane default-model seed effect", () => {
     expect(setModelMock).toHaveBeenCalled();
     const [, model] = setModelMock.mock.calls[0];
     expect(model).toBe("gpt-5.4");
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Mode pill removal — the SDK rejects live `setPermissionMode` calls
+// that would land on `bypassPermissions` even when the session was
+// originally launched with `--dangerously-skip-permissions`. The
+// removal handler therefore restores the prior mode via a silent
+// session restart instead of the live setter. These tests guard that
+// routing decision and the slice cleanup that follows.
+// ─────────────────────────────────────────────────────────────────────
+
+describe("AgentChatPane handleModeRemove silent-restart", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    setModeMock.mockClear();
+    setModePriorMock.mockClear();
+    setPermissionModeMock.mockClear();
+    setModelMock.mockClear();
+    markRequestResolvedMock.mockClear();
+    vi.mocked(agentChatStartSession).mockClear().mockResolvedValue("thread-restarted");
+    vi.mocked(agentChatStopSession).mockClear().mockResolvedValue(undefined);
+    vi.mocked(agentChatSetPermissionMode).mockClear().mockResolvedValue(undefined);
+  });
+  afterEach(() => cleanup());
+
+  it("removing Ask pill with prior bypassPermissions restarts the session — does NOT call agentChatSetPermissionMode", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "ask",
+        modePriorPermissionMode: "bypassPermissions",
+        permissionMode: "plan", // session is currently in plan
+        sessionLaunchMode: "plan",
+      },
+    };
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    // restartSessionWith fires-and-forgets an async IIFE — yield once
+    // to let the agentChatStartSession await resolve.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The bug we are guarding against: live setter would reject with
+    // "Cannot set permission mode to bypassPermissions because the
+    // session was not launched with --dangerously-skip-permissions".
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+    // Silent restart re-launches with the prior mode in launch params
+    // so the SDK re-applies `--dangerously-skip-permissions`.
+    expect(agentChatStartSession).toHaveBeenCalled();
+    const startInput = vi.mocked(agentChatStartSession).mock.calls[0][2];
+    expect(startInput.permission_mode).toBe("bypassPermissions");
+    // UI snap: slice.permissionMode flips immediately, slice.mode
+    // returns to "default", priorPermissionMode is cleared.
+    expect(setPermissionModeMock).toHaveBeenCalledWith(
+      "thread-x",
+      "bypassPermissions",
+    );
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+    expect(setModePriorMock).toHaveBeenCalledWith("thread-x", null);
+  });
+
+  it("removing Plan pill with prior 'default' uses the same restart pattern", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "default",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+    expect(agentChatStartSession).toHaveBeenCalled();
+    const startInput = vi.mocked(agentChatStartSession).mock.calls[0][2];
+    expect(startInput.permission_mode).toBe("default");
+    expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "default");
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+  });
+
+  it("regression guard: handleAcceptPlan still uses the live setPermissionMode (plan → default is allowed by the SDK)", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "plan",
+        modePriorPermissionMode: "bypassPermissions",
+        permissionMode: "plan",
+        sessionLaunchMode: "plan",
+      },
+    };
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const acceptBtn = container.querySelector(
+      '[data-testid="accept-plan"]',
+    ) as HTMLButtonElement;
+    acceptBtn.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The accept-plan path deliberately stays on the live setter
+    // because the SDK only blocks live transitions TO bypassPermissions
+    // — going plan → default is allowed. Routing this through the
+    // restart helper would needlessly tear down the session right
+    // before the synthetic "Proceed with the plan." turn fires.
+    expect(agentChatSetPermissionMode).toHaveBeenCalled();
+    const [, , acceptMode] = vi.mocked(agentChatSetPermissionMode).mock.calls[0];
+    expect(acceptMode).toBe("default");
+    expect(agentChatStartSession).not.toHaveBeenCalled();
+    expect(agentChatStopSession).not.toHaveBeenCalled();
   });
 });

@@ -8,6 +8,7 @@ import {
   planPermissionModeChange,
   planSubmit,
 } from "@/lib/agent-chat/chat-pane-plans";
+import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
@@ -311,12 +312,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const rawText = draft.trim();
     if (!rawText) return;
     const plan = planSubmit({ rawText, provider, effort });
+    // Mode wrappers (Stage 4 onward) live SDK-side only — the
+    // transcript stores the unwrapped (ultrathink-only) text so users
+    // see what they typed, not the framing we layered on top.
+    const sdkText = applyAllPrefixes(rawText, mode, effort);
     sendInFlightRef.current = true;
     setIsSending(true);
     appendUserMessage(threadId, plan.text);
     const input = {
       thread_id: threadId,
-      text: plan.text,
+      text: sdkText,
       model_override: null,
       effort_override: plan.effortOverride,
     };
@@ -325,7 +330,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       sendInFlightRef.current = false;
       setIsSending(false);
     });
-  }, [threadId, draft, provider, effort, appendUserMessage]);
+  }, [threadId, draft, provider, effort, mode, appendUserMessage]);
 
   // Clear the optimistic send flag the moment the backend
   // acknowledges the turn via Running (streaming=true in the store).
@@ -428,6 +433,78 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, provider, markRequestResponding],
   );
 
+  /**
+   * Shared silent-restart helper. Permission-mode, effort, and
+   * context-window all trigger the same flow on Claude: stop the
+   * current session, start a new one with the updated launch params,
+   * migrate the thread id. Transcript + model + draft survive via
+   * `migrateThreadId`; resume cursor carries session state when
+   * available. Codex-side callers don't route through here.
+   *
+   * Declared above the mode handlers so `handleModeRemove` can use
+   * it for the silent-restart restore path (the SDK rejects live
+   * `setPermissionMode("bypassPermissions")` even when the launch
+   * carried `--dangerously-skip-permissions`).
+   */
+  const restartSessionWith = useCallback(
+    (updates: {
+      permissionMode?: string;
+      effort?: string | null;
+      contextWindow?: string | null;
+    }) => {
+      if (!threadId) return;
+      const currentSlice = useAgentChatStore.getState().threads[threadId];
+      if (!currentSlice) return;
+      if (restarting) return;
+      setRestarting(true);
+      const resumeCursor = currentSlice.resumeCursor;
+      const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
+      const nextMode = updates.permissionMode ?? currentSlice.permissionMode;
+      const nextEffort =
+        updates.effort !== undefined ? updates.effort : currentSlice.effort;
+      const nextContext =
+        updates.contextWindow !== undefined
+          ? updates.contextWindow
+          : currentSlice.contextWindow;
+      void (async () => {
+        try {
+          await agentChatStopSession(provider, threadId);
+        } catch (err) {
+          console.warn("[agent-chat] stop_session during restart failed", err);
+        }
+        try {
+          const newId = await agentChatStartSession(pane.pane_id, provider, {
+            thread_id: newLocalThreadId,
+            cwd: cwd ?? "",
+            model: currentSlice.model,
+            resume_cursor: resumeCursor,
+            permission_mode: nextMode,
+            effort: nextEffort,
+            context_window: nextContext,
+            additional_directories: [],
+            env: null,
+          });
+          migrateThreadId(threadId, newId);
+          setThreadId(newId);
+          setSessionLaunchMode(newId, nextMode);
+        } catch (err) {
+          toast.error(`Failed to restart session: ${err}`);
+        } finally {
+          setRestarting(false);
+        }
+      })();
+    },
+    [
+      threadId,
+      provider,
+      cwd,
+      pane.pane_id,
+      restarting,
+      migrateThreadId,
+      setSessionLaunchMode,
+    ],
+  );
+
   // Plan-accept: flip the live session to `default` permission mode
   // (Claude adapter wires `query.setPermissionMode` directly — no
   // session restart) and send a synthetic "Proceed with the plan."
@@ -508,34 +585,36 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, provider, markRequestResolved],
   );
 
-  // Composer-level mode pill activation. Plan pill flips the live
-  // session to `permission_mode: "plan"` via `setPermissionMode` (no
-  // restart per Research 1). The prior picker value is stashed on
-  // the slice so toggle-off can restore it. Ask / Debug land in
-  // Stages 4 & 6 — they currently no-op past the slice update so
-  // the UI still shows the pill.
+  // Composer-level mode pill activation. Plan and Ask both flip the
+  // live session to `permission_mode: "plan"` via `setPermissionMode`
+  // (no restart per Research 1) — Plan because the SDK enforces the
+  // read-only contract via the picker semantics, Ask because we want
+  // the same SDK-level write enforcement under the hood (the per-turn
+  // prompt wrapper handled in `applyAllPrefixes` tells the model to
+  // answer conversationally instead of calling ExitPlanMode). The
+  // prior picker value is stashed so toggle-off can restore it.
+  // Debug lands in Stage 6 — currently no-ops past the slice update.
   const handleModeActivate = useCallback(
     async (newMode: ActivePillMode) => {
       if (!threadId) return;
       const currentSlice = useAgentChatStore.getState().threads[threadId];
       if (!currentSlice) return;
       if (currentSlice.mode === newMode) return;
-      if (newMode === "plan") {
+      if (newMode === "plan" || newMode === "ask") {
         const priorMode = currentSlice.permissionMode;
         try {
           await agentChatSetPermissionMode(provider, threadId, "plan");
         } catch (err) {
-          toast.error(`Failed to activate Plan mode: ${err}`);
+          const label = newMode === "plan" ? "Plan" : "Ask";
+          toast.error(`Failed to activate ${label} mode: ${err}`);
           return;
         }
         setStoreModePriorPermissionMode(threadId, priorMode);
         setStorePermissionMode(threadId, "plan");
         setSessionLaunchMode(threadId, "plan");
-        setStoreMode(threadId, "plan");
+        setStoreMode(threadId, newMode);
       } else {
-        // Ask / Debug: state-only flip in Stage 3. Stages 4 and 6
-        // will layer prompt-wrappers on top; for now the pill
-        // provides discoverability only.
+        // Debug: state-only flip until Stage 6 wires its wrapper.
         setStoreMode(threadId, newMode);
       }
     },
@@ -549,36 +628,38 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
-  // Composer-level mode pill removal. Plan pill restores the stashed
-  // prior `permissionMode` live; Ask / Debug just flip the slice
-  // back to `default`. Missing prior falls back to the provider's
+  // Composer-level mode pill removal. Plan and Ask both restore the
+  // stashed prior `permissionMode` via a silent session restart
+  // rather than the live `setPermissionMode` setter — the SDK only
+  // honours `--dangerously-skip-permissions` at launch time, so a
+  // live switch BACK to `bypassPermissions` is rejected even though
+  // the session was originally launched with the flag. Restarting
+  // with the prior mode in launch params re-applies the flag
+  // correctly. Transcript + pickers carry across via
+  // `migrateThreadId`. Debug just flips the slice back to `default`
+  // until Stage 6. Missing prior falls back to the provider's
   // default mode so the session is never left in an orphan state.
-  const handleModeRemove = useCallback(async () => {
+  const handleModeRemove = useCallback(() => {
     if (!threadId) return;
     const currentSlice = useAgentChatStore.getState().threads[threadId];
     if (!currentSlice) return;
-    if (currentSlice.mode === "plan") {
+    if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
       const restore =
         currentSlice.modePriorPermissionMode ??
         DEFAULT_THREAD_PERMISSION_MODE;
-      try {
-        await agentChatSetPermissionMode(provider, threadId, restore);
-      } catch (err) {
-        toast.error(`Failed to exit Plan mode: ${err}`);
-        return;
-      }
+      // Snap the slice for immediate UI feedback (picker reappears,
+      // pill drops). The restart sets sessionLaunchMode itself.
       setStorePermissionMode(threadId, restore);
-      setSessionLaunchMode(threadId, restore);
+      restartSessionWith({ permissionMode: restore });
     }
     setStoreMode(threadId, "default");
     setStoreModePriorPermissionMode(threadId, null);
   }, [
     threadId,
-    provider,
     setStorePermissionMode,
-    setSessionLaunchMode,
     setStoreMode,
     setStoreModePriorPermissionMode,
+    restartSessionWith,
   ]);
 
   const handleModelChange = useCallback(
@@ -615,73 +696,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
-    ],
-  );
-
-  /**
-   * Shared silent-restart helper. Permission-mode, effort, and
-   * context-window all trigger the same flow on Claude: stop the
-   * current session, start a new one with the updated launch params,
-   * migrate the thread id. Transcript + model + draft survive via
-   * `migrateThreadId`; resume cursor carries session state when
-   * available. Codex-side callers don't route through here.
-   */
-  const restartSessionWith = useCallback(
-    (updates: {
-      permissionMode?: string;
-      effort?: string | null;
-      contextWindow?: string | null;
-    }) => {
-      if (!threadId) return;
-      const currentSlice = useAgentChatStore.getState().threads[threadId];
-      if (!currentSlice) return;
-      if (restarting) return;
-      setRestarting(true);
-      const resumeCursor = currentSlice.resumeCursor;
-      const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
-      const nextMode = updates.permissionMode ?? currentSlice.permissionMode;
-      const nextEffort =
-        updates.effort !== undefined ? updates.effort : currentSlice.effort;
-      const nextContext =
-        updates.contextWindow !== undefined
-          ? updates.contextWindow
-          : currentSlice.contextWindow;
-      void (async () => {
-        try {
-          await agentChatStopSession(provider, threadId);
-        } catch (err) {
-          console.warn("[agent-chat] stop_session during restart failed", err);
-        }
-        try {
-          const newId = await agentChatStartSession(pane.pane_id, provider, {
-            thread_id: newLocalThreadId,
-            cwd: cwd ?? "",
-            model: currentSlice.model,
-            resume_cursor: resumeCursor,
-            permission_mode: nextMode,
-            effort: nextEffort,
-            context_window: nextContext,
-            additional_directories: [],
-            env: null,
-          });
-          migrateThreadId(threadId, newId);
-          setThreadId(newId);
-          setSessionLaunchMode(newId, nextMode);
-        } catch (err) {
-          toast.error(`Failed to restart session: ${err}`);
-        } finally {
-          setRestarting(false);
-        }
-      })();
-    },
-    [
-      threadId,
-      provider,
-      cwd,
-      pane.pane_id,
-      restarting,
-      migrateThreadId,
-      setSessionLaunchMode,
     ],
   );
 

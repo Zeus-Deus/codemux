@@ -17,6 +17,7 @@ import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 
 import { deriveTitleFromFirstMessage } from "./derive-title";
+import { applyAllPrefixes } from "./mode-prefix";
 
 /**
  * Mutations performed as `materializeAndSend` progresses. Kept as a bag
@@ -167,11 +168,13 @@ export async function materializeAndSend(
     return { success: false, error: message };
   }
 
-  // 5. Send the first turn.
+  // 5. Send the first turn. Mode wrappers (ASK / DEBUG) live SDK-side
+  //    only — the transcript above stored the user's raw text so the
+  //    framing we layered on top doesn't echo back into the UI.
   try {
     await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
-      text,
+      text: applyAllPrefixes(text, draft.mode, draft.effort),
       model_override: null,
       effort_override: draft.effort,
       permission_mode_override: null,
@@ -330,7 +333,7 @@ export async function materializeWithPreset(
       try {
         await agentChatSendTurn(draft.provider, {
           thread_id: draft.threadId,
-          text: prompt,
+          text: applyAllPrefixes(prompt, draft.mode, draft.effort),
           model_override: null,
           effort_override: draft.effort,
           permission_mode_override: null,
@@ -423,13 +426,14 @@ function seedSliceFromDraft(
 }
 
 /** Resolve the permission_mode the SDK session should launch with.
- *  Plan-mode pill wins: if the user activated Plan on the draft,
- *  the SDK boots in `"plan"` mode regardless of the picker value
- *  (the picker is hidden while the pill is active anyway). Ask and
- *  Debug modes do NOT override permission_mode in Stage 3 — those
- *  paths land in Stages 4 and 6. */
+ *  Plan and Ask both force `"plan"` so the SDK boots with write
+ *  operations locked off (Plan because that's the contract; Ask
+ *  because we want SDK-level read-only enforcement on top of the
+ *  per-turn prompt wrapper that nudges the model away from
+ *  ExitPlanMode). The picker is hidden behind the pill while either
+ *  is active. Debug remains a state-only flip until Stage 6. */
 export function effectivePermissionMode(draft: ChatDraft): string {
-  if (draft.mode === "plan") return "plan";
+  if (draft.mode === "plan" || draft.mode === "ask") return "plan";
   return draft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
 }
 

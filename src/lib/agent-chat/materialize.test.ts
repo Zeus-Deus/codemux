@@ -931,6 +931,93 @@ describe("materializeWithPreset", () => {
     });
   });
 
+  describe("Stage 4 — Ask mode", () => {
+    it("draft.mode='ask' overrides permission_mode to 'plan' on start_session (SDK enforcement)", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions",
+        mode: "ask",
+      });
+
+      await materializeAndSend(draft, "what does X do?", "/projects/foo", actions);
+
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "claude",
+        expect.objectContaining({ permission_mode: "plan" }),
+      );
+    });
+
+    it("slice seeding mirrors the effective permission_mode (Ask boots into plan, slice.mode='ask')", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions",
+        mode: "ask",
+      });
+
+      await materializeAndSend(draft, "hi", "/projects/foo", actions);
+
+      expect(actions.setPermissionMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "plan",
+      );
+      expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "plan",
+      );
+      expect(actions.setMode).toHaveBeenCalledWith(draft.threadId, "ask");
+    });
+
+    it("send_turn applies the ASK_WRAPPER while the optimistic transcript stores raw user text", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        mode: "ask",
+      });
+      const userText = "what does PlanProposalBlock do?";
+
+      await materializeAndSend(draft, userText, "/projects/foo", actions);
+
+      // Transcript echo: raw user text (no ASK wrapper).
+      expect(actions.appendUserMessage).toHaveBeenCalledWith(
+        draft.threadId,
+        userText,
+      );
+
+      // SDK send: wrapper applied.
+      const sendCall = vi.mocked(agentChatSendTurn).mock.calls[0]!;
+      const sentText = (sendCall[1] as { text: string }).text;
+      expect(sentText).toContain("You are in ASK mode");
+      expect(sentText).toContain("Do not call ExitPlanMode");
+      expect(sentText.endsWith(userText)).toBe(true);
+    });
+
+    it("ChatAgent preset path also honours draft.mode='ask'", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        permissionMode: "bypassPermissions",
+        mode: "ask",
+      });
+      const preset = makePreset({ kind: "chat_agent" });
+
+      await materializeWithPreset(draft, preset, "any open questions?", actions);
+
+      expect(agentChatStartSession).toHaveBeenCalledWith(
+        "pane-new",
+        "claude",
+        expect.objectContaining({ permission_mode: "plan" }),
+      );
+      expect(actions.setMode).toHaveBeenCalledWith(draft.threadId, "ask");
+
+      const sendCall = vi.mocked(agentChatSendTurn).mock.calls[0]!;
+      const sentText = (sendCall[1] as { text: string }).text;
+      expect(sentText).toContain("You are in ASK mode");
+    });
+  });
+
   describe("activateWorkspace is non-fatal for either dispatch", () => {
     it("CLI: preset still dispatches when activateWorkspace rejects", async () => {
       vi.mocked(activateWorkspace).mockRejectedValueOnce(new Error("boom"));
