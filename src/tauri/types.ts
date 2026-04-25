@@ -477,14 +477,6 @@ export interface InlineReviewComment {
   pull_request_review_id: number | null;
 }
 
-export interface DeploymentInfo {
-  id: number;
-  environment: string;
-  state: string;
-  url: string | null;
-  created_at: string;
-}
-
 export type IssueState = "Open" | "Closed";
 
 export interface GitHubIssue {

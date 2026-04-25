@@ -110,15 +110,6 @@ pub struct InlineReviewComment {
     pub pull_request_review_id: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DeploymentInfo {
-    pub id: u64,
-    pub environment: String,
-    pub state: String,
-    pub url: Option<String>,
-    pub created_at: String,
-}
-
 pub fn check_gh_status() -> GhStatus {
     if !gh_available() {
         return GhStatus::NotInstalled;
@@ -537,6 +528,13 @@ pub fn list_incoming_prs(
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
 
+// NOTE: As of 2026-04-26 the Review tab UI no longer exposes its own
+// merge controls — that section was removed in the visual-match PR
+// (`feature/review-tab-visual-match`). The Changes panel toolbar's
+// split-button merge dropdown still uses this command, so this is not
+// dead code; it's the active merge surface for Codemux. Comment kept
+// for future archeology in case someone wonders why the Review tab
+// doesn't have its own merge UI.
 pub fn merge_pull_request(
     repo_path: &Path,
     pr_number: u32,
@@ -662,6 +660,12 @@ pub fn get_pr_inline_comments(
         .collect())
 }
 
+// NOTE: As of 2026-04-26 the Review tab UI no longer exposes review
+// submission — the composer was removed in the visual-match PR
+// (`feature/review-tab-visual-match`) to mirror Superset's resting
+// layout. This command is retained intact in case the UI is restored
+// later (e.g. command palette action, modal, or context menu). Don't
+// delete without confirming with the maintainer.
 pub fn submit_pr_review(
     repo_path: &Path,
     pr_number: u32,
@@ -681,78 +685,6 @@ pub fn submit_pr_review(
     }
     run_gh(repo_path, &args)?;
     Ok(())
-}
-
-pub fn get_pr_deployments(
-    repo_path: &Path,
-    pr_number: u32,
-) -> Result<Vec<DeploymentInfo>, String> {
-    let nwo = get_repo_nwo(repo_path)?;
-
-    // Get the PR head SHA to filter deployments
-    let pr_json = run_gh_optional(
-        repo_path,
-        &["pr", "view", &pr_number.to_string(), "--json", "headRefOid", "--jq", ".headRefOid"],
-    );
-
-    let endpoint = if let Some(sha) = &pr_json {
-        format!("repos/{}/deployments?per_page=5&sha={}", nwo, sha)
-    } else {
-        format!("repos/{}/deployments?per_page=5", nwo)
-    };
-
-    let output = run_gh_optional(repo_path, &["api", &endpoint]);
-    let Some(json_str) = output else {
-        return Ok(Vec::new());
-    };
-    if json_str.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let v: serde_json::Value =
-        serde_json::from_str(&json_str).map_err(|e| format!("Failed to parse deployments JSON: {e}"))?;
-    let arr = v.as_array().ok_or("Expected JSON array from deployments API")?;
-
-    let mut deployments = Vec::new();
-    for d in arr {
-        let dep_id = d["id"].as_u64().unwrap_or(0);
-        let environment = d["environment"].as_str().unwrap_or("").to_string();
-        let created_at = d["created_at"].as_str().unwrap_or("").to_string();
-
-        // Fetch the latest status to get target_url
-        let status_endpoint = format!("repos/{}/deployments/{}/statuses?per_page=1", nwo, dep_id);
-        let status_output = run_gh_optional(repo_path, &["api", &status_endpoint]);
-
-        let (state, url) = if let Some(status_json) = status_output {
-            if let Ok(sv) = serde_json::from_str::<serde_json::Value>(&status_json) {
-                if let Some(first) = sv.as_array().and_then(|a| a.first()) {
-                    let st = first["state"].as_str().unwrap_or("unknown").to_string();
-                    let u = first["target_url"]
-                        .as_str()
-                        .or_else(|| first["environment_url"].as_str())
-                        .map(|s| s.to_string())
-                        .filter(|s| !s.is_empty());
-                    (st, u)
-                } else {
-                    ("unknown".to_string(), None)
-                }
-            } else {
-                ("unknown".to_string(), None)
-            }
-        } else {
-            ("unknown".to_string(), None)
-        };
-
-        deployments.push(DeploymentInfo {
-            id: dep_id,
-            environment,
-            state,
-            url,
-            created_at,
-        });
-    }
-
-    Ok(deployments)
 }
 
 fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
@@ -916,21 +848,6 @@ mod tests {
         assert_eq!(comment.path, "src/main.rs");
         assert_eq!(comment.line, Some(42));
         assert_eq!(comment.pull_request_review_id, Some(200));
-    }
-
-    #[test]
-    fn test_parse_deployment_info() {
-        let json = r#"{
-            "id": 500,
-            "environment": "preview",
-            "state": "success",
-            "url": "https://preview.example.com",
-            "created_at": "2026-01-20T12:00:00Z"
-        }"#;
-        let dep: DeploymentInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(dep.id, 500);
-        assert_eq!(dep.environment, "preview");
-        assert_eq!(dep.url.as_deref(), Some("https://preview.example.com"));
     }
 
     #[test]

@@ -969,7 +969,6 @@ pub fn run() {
             commands::get_pr_review_comments,
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
-            commands::get_pr_deployments,
             commands::list_github_issues,
             commands::list_github_issues_by_path,
             commands::get_github_issue_by_path,
