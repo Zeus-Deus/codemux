@@ -4,7 +4,7 @@
 - Audience: Anyone working on git integration or the changes panel UI.
 - Authority: Canonical feature-level reality doc.
 - Update when: Staging, commit, merge, or diff behavior changes.
-- Read next: `docs/features/diff-viewer.md`, `docs/features/pr-integration.md`, `docs/plans/git-bot.md`
+- Read next: `docs/features/diff-viewer.md`, `docs/features/review-integration.md`, `docs/plans/git-bot.md`
 
 ## What This Feature Is
 

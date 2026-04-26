@@ -107,6 +107,7 @@ import {
   VscCopy,
 } from "react-icons/vsc";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { useQueryClient } from "@tanstack/react-query";
 import { PrStatusIcon } from "@/components/github/pr-status-icon";
 import { cn } from "@/lib/utils";
 import { useDiffStore } from "@/stores/diff-store";
@@ -999,6 +1000,16 @@ function FileSection({
 
 export function ChangesPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
+  const queryClient = useQueryClient();
+  // Invalidates every Review-tab query for this workspace so the
+  // panel refetches the moment a commit / push / pull / merge lands.
+  // Mirrors Superset's onRefresh wiring at CommitInput.tsx:57-101.
+  const invalidateReviewQueries = useCallback(() => {
+    queryClient.invalidateQueries({
+      predicate: (q) =>
+        q.queryKey[0] === "pr" && q.queryKey[2] === workspace.workspace_id,
+    });
+  }, [queryClient, workspace.workspace_id]);
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
@@ -1172,6 +1183,7 @@ export function ChangesPanel({ workspace }: Props) {
       setExpandedFile(null);
       refresh();
       refreshBaseDiff();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1188,6 +1200,7 @@ export function ChangesPanel({ workspace }: Props) {
       await gitPushChanges(cwd, !!needsPublish);
       refresh();
       refreshBaseDiff();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1202,6 +1215,7 @@ export function ChangesPanel({ workspace }: Props) {
     try {
       await gitPullChanges(cwd);
       refresh();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1241,6 +1255,7 @@ export function ChangesPanel({ workspace }: Props) {
       refreshWorkspacePr(workspace.workspace_id).catch(console.error);
       refresh();
       refreshBaseDiff();
+      invalidateReviewQueries();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       toast.error(`Couldn't merge PR: ${msg}`);

@@ -48,7 +48,6 @@ function makeWs(id: string): WorkspaceSnapshot {
     pr_number: null,
     pr_state: null,
     pr_url: null,
-    pr_branch: null,
     linked_issue: null,
     notification_count: 0,
     latest_agent_state: null,

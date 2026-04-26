@@ -539,13 +539,16 @@ pub fn run() {
                                     None
                                 }
                             };
-                            let current_branch = crate::git::git_branch_info(&path)
-                                .ok()
-                                .and_then(|i| i.branch);
-                            let pr_tuple = pr_info
-                                .as_ref()
-                                .map(|p| (p.number, p.display_state(), p.url.clone()));
-                            state.apply_pr_refresh(&workspace_id, current_branch.as_deref(), pr_tuple);
+                            // Only update PR info if we found a PR, or if none was
+                            // previously set.  This prevents the background refresh from
+                            // wiping a pr_number that was explicitly stored during
+                            // PR-checkout (fork branches where `gh pr view` can't resolve).
+                            if pr_info.is_some() {
+                                let pr_number = pr_info.as_ref().map(|p| p.number);
+                                let pr_state = pr_info.as_ref().map(|p| p.display_state());
+                                let pr_url = pr_info.as_ref().map(|p| p.url.clone());
+                                state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+                            }
 
                             // Refresh linked issue state (lightweight: only if workspace has one)
                             let issue_number = {
@@ -671,29 +674,28 @@ pub fn run() {
                         let pr_result = tokio::time::timeout(
                             std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
                             tokio::task::spawn_blocking(move || {
-                                let branch = crate::git::git_branch_info(&path_for_pr)
-                                    .ok()
-                                    .and_then(|i| i.branch);
-                                let pr = github::get_branch_pr(&path_for_pr);
-                                (branch, pr)
+                                github::get_branch_pr(&path_for_pr)
                             }),
                         )
                         .await;
 
                         match pr_result {
-                            Ok(Ok((current_branch, Ok(pr_info)))) => {
-                                let pr_tuple = pr_info
-                                    .as_ref()
-                                    .map(|p| (p.number, p.display_state(), p.url.clone()));
-                                if state.apply_pr_refresh(
+                            Ok(Ok(Ok(Some(pr)))) => {
+                                state.update_workspace_pr_info(
                                     &workspace_id,
-                                    current_branch.as_deref(),
-                                    pr_tuple,
-                                ) {
-                                    refreshed += 1;
-                                }
+                                    Some(pr.number),
+                                    Some(pr.display_state()),
+                                    Some(pr.url.clone()),
+                                );
+                                refreshed += 1;
                             }
-                            Ok(Ok((_, Err(e)))) => {
+                            Ok(Ok(Ok(None))) => {
+                                // No PR — leave existing pr_number alone.
+                                // Matches refresh_workspace_pr's behavior of
+                                // not clearing fork-branch PRs that gh can't
+                                // resolve.
+                            }
+                            Ok(Ok(Err(e))) => {
                                 eprintln!(
                                     "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
                                 );
@@ -967,7 +969,6 @@ pub fn run() {
             commands::get_pr_review_comments,
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
-            commands::get_pr_deployments,
             commands::list_github_issues,
             commands::list_github_issues_by_path,
             commands::get_github_issue_by_path,

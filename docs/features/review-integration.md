@@ -1,14 +1,16 @@
-# PR Integration
+# Review Integration
 
-- Purpose: Describe the current capability and constraints of the pull request panel.
-- Audience: Anyone working on GitHub integration or the PR panel UI.
+- Purpose: Describe the current capability and constraints of the Review tab (pull request review surface).
+- Audience: Anyone working on GitHub integration or the Review panel UI.
 - Authority: Canonical feature-level reality doc.
 - Update when: PR display, review, merge, or checks behavior changes.
 - Read next: `docs/features/changes-panel.md`, `docs/features/merge-resolver.md`
 
 ## What This Feature Is
 
-The PR panel is a right-sidebar tab that displays pull request details, reviews, checks, deployments, and merge controls for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+The Review tab is a right-sidebar surface that displays pull request details, reviews, checks, deployments, and merge controls for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+
+> The tab was previously named "PR." It was renamed to "Review" in Phase 3 of the right-sidebar work to match Superset's terminology. The underlying data flow and feature set are unchanged; only the tab id, label, and component file names moved (`pr-panel.tsx` → `review-panel.tsx`, `pr/` subfolder → `review/`).
 
 ## Current Model
 

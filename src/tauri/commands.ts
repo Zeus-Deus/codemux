@@ -36,7 +36,6 @@ import type {
   IncomingPrItem,
   ReviewComment,
   InlineReviewComment,
-  DeploymentInfo,
   MergeState,
   MergeIntoBaseResult,
   ConflictCheckResult,
@@ -319,9 +318,6 @@ export const getPrInlineComments = (path: string, prNumber: number) =>
 
 export const submitPrReview = (path: string, prNumber: number, event: string, body: string) =>
   invoke("submit_pr_review", { path, prNumber, event, body });
-
-export const getPrDeployments = (path: string, prNumber: number) =>
-  invoke<DeploymentInfo[]>("get_pr_deployments", { path, prNumber });
 
 // ── GitHub Issues ──
 
