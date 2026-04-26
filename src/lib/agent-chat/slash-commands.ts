@@ -32,6 +32,11 @@ export interface SlashCommandItem {
   /** Section heading. Stage 8 ships only `"MODES"`; Step 7 will add
    *  `"SKILLS"`. Free-form so future categories can slot in. */
   group: string;
+  /** Step 8 Stage 3 — when true, the row renders muted and is
+   *  non-selectable. Used for "coming soon" entries (Issue / PR /
+   *  Image kinds before their respective stages light them up).
+   *  Defaults to false; back-compatible with all existing call sites. */
+  disabled?: boolean;
 }
 
 export interface SlashAnchor {

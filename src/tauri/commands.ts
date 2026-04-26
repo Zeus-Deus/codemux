@@ -19,6 +19,8 @@ import type {
   FileAttachmentInfo,
   FileEntry,
   FileMatch,
+  FolderAttachmentInfo,
+  FolderMatch,
   GhStatus,
   GitHubIssue,
   GitBranchInfo,
@@ -88,6 +90,30 @@ export const readFileForAttachment = (
   invoke<FileAttachmentInfo>("read_file_for_attachment", {
     absolutePath,
     cwd,
+  });
+
+/** Distinct project folders derived from the same walk cache as
+ *  `listProjectFiles`. Used by the `+ → Folder…` picker (Step 8
+ *  Stage 3). Empty / null `query` returns alphabetical paths. */
+export const listProjectFolders = (
+  cwd: string,
+  query: string | null,
+  limit: number,
+) =>
+  invoke<FolderMatch[]>("list_project_folders", { cwd, query, limit });
+
+/** Read a folder for attachment — depth-bounded walk that produces a
+ *  pre-rendered unicode tree. The agent uses the path to explore via
+ *  `Read` / `Grep` once attached. */
+export const readFolderForAttachment = (
+  absolutePath: string,
+  cwd: string | null,
+  maxDepth: number,
+) =>
+  invoke<FolderAttachmentInfo>("read_folder_for_attachment", {
+    absolutePath,
+    cwd,
+    maxDepth,
   });
 
 // ── Auth ──

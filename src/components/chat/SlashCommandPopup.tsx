@@ -146,17 +146,30 @@ export function SlashCommandPopup({
               >
                 {groupItems.map((item) => {
                   const Icon = item.icon;
+                  const disabled = item.disabled === true;
                   return (
                     <CommandPrimitive.Item
                       key={item.id}
                       value={item.id}
-                      onSelect={() => onSelect(item)}
+                      // Step 8 Stage 3 — disabled rows skip onSelect
+                      // entirely so accidental clicks on "coming soon"
+                      // entries don't activate them. cmdk's built-in
+                      // `disabled` prop also prevents selection-state
+                      // updates, which keeps the highlight from
+                      // landing on un-pickable items via mouse hover.
+                      disabled={disabled}
+                      onSelect={() => {
+                        if (disabled) return;
+                        onSelect(item);
+                      }}
                       data-testid={`slash-item-${item.id}`}
+                      data-disabled={disabled || undefined}
                       className={cn(
                         "flex items-center gap-2 rounded px-2 py-1.5 text-sm",
                         "cursor-pointer outline-none select-none",
                         "data-[selected=true]:bg-muted",
                         "data-[selected=true]:text-foreground",
+                        disabled && "opacity-50 cursor-not-allowed",
                       )}
                     >
                       {Icon && (

@@ -215,6 +215,54 @@ describe("Composer", () => {
     });
   });
 
+  describe("mode pill above textarea (Step 8 Stage 3 refactor)", () => {
+    // Stage 3 retired the `+ Mode` dropdown; the active mode chip
+    // moved out of the footer and now lives in the strip above the
+    // textarea, alongside any image attachment chips.
+    it("renders the strip with a Plan mode pill when mode is plan", () => {
+      const { getByTestId, getByRole } = renderComposer({ mode: "plan" });
+      expect(getByTestId("composer-attachment-strip")).toBeInTheDocument();
+      expect(
+        getByRole("status", { name: /Plan mode active/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("renders no strip when mode is default and no image attachments are staged", () => {
+      const { queryByTestId } = renderComposer({ mode: "default" });
+      expect(queryByTestId("composer-attachment-strip")).toBeNull();
+    });
+
+    it("the mode pill renders before image attachment chips in the strip", () => {
+      const { getByTestId } = renderComposer({
+        mode: "ask",
+        stagedAttachments: [
+          {
+            id: "img-1",
+            kind: "image",
+            ref: "image:1",
+            metadata: { label: "shot.png" },
+          },
+        ],
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      const text = strip.textContent ?? "";
+      const askIdx = text.indexOf("Ask");
+      const imgIdx = text.indexOf("shot.png");
+      expect(askIdx).toBeGreaterThanOrEqual(0);
+      expect(imgIdx).toBeGreaterThan(askIdx);
+    });
+
+    it("clicking X on the mode pill calls onModeRemove", () => {
+      const onModeRemove = vi.fn();
+      const { getByLabelText } = renderComposer({
+        mode: "debug",
+        onModeRemove,
+      });
+      fireEvent.click(getByLabelText(/Remove Debug mode/i));
+      expect(onModeRemove).toHaveBeenCalled();
+    });
+  });
+
   describe("inline attachment chip in the mirror (Step 8 Stage 2.1)", () => {
     // The mirror overlay paints a chip-style background on
     // `@<basename>` tokens whose basename matches a staged

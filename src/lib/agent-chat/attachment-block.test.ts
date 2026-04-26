@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
+  buildFolderResolvedContent,
 } from "./attachment-block";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { Attachment } from "@/stores/agent-chat-store";
@@ -165,6 +166,70 @@ describe("buildFileResolvedContent", () => {
     );
     // Empty fence = "```\n" (no language hint).
     expect(out).toMatch(/```\n/);
+  });
+});
+
+describe("buildFolderResolvedContent (Step 8 Stage 3)", () => {
+  it("renders the tree fenced + a Read/Grep tool hint with the absolute path", () => {
+    const out = buildFolderResolvedContent({
+      absolutePath: "/repo/src/components/chat",
+      relativePath: "src/components/chat",
+      tree: "chat\n├── Composer.tsx\n└── pickers/",
+      itemCount: 4,
+    });
+    expect(out).toContain("Tree (depth-bounded, 4 items):");
+    expect(out).toContain("```");
+    expect(out).toContain("├── Composer.tsx");
+    expect(out).toContain("└── pickers/");
+    expect(out).toContain('Use the Read or Grep tool with path "/repo/src/components/chat"');
+  });
+
+  it("uses singular form when itemCount is 1", () => {
+    const out = buildFolderResolvedContent({
+      absolutePath: "/repo/loner",
+      relativePath: "loner",
+      tree: "loner\n└── only.txt",
+      itemCount: 1,
+    });
+    expect(out).toContain("1 item):");
+    expect(out).not.toContain("1 items");
+  });
+});
+
+describe("buildAttachmentBlock with folder kind (Step 8 Stage 3)", () => {
+  function makeFolderAtt(overrides: Partial<Attachment> = {}): Attachment {
+    return {
+      id: "folder-1",
+      kind: "folder",
+      ref: "/repo/src/components/chat",
+      metadata: { label: "chat" },
+      resolvedContent: "Tree (depth-bounded, 3 items):\n```\nchat\n├── A.tsx\n└── B.tsx\n```\nUse the Read or Grep tool with path \"/repo/src/components/chat\" to explore further.",
+      ...overrides,
+    };
+  }
+
+  it("wraps a folder attachment with the ## Folder: header + path", () => {
+    const block = buildAttachmentBlock([makeFolderAtt()]);
+    expect(block).not.toBeNull();
+    expect(block!).toContain("## Folder: chat");
+    expect(block!).toContain("Path: /repo/src/components/chat");
+    expect(block!).toContain("Tree (depth-bounded");
+    expect(block!).toContain("=== Attached context ===");
+  });
+
+  it("interleaves files + folders in source order", () => {
+    const file = makeFileAttachment({
+      id: "f",
+      ref: "/abs/Composer.tsx",
+      metadata: { label: "Composer.tsx", lineCount: 100 },
+      resolvedContent: "```tsx\nfile body\n```",
+    });
+    const folder = makeFolderAtt({ id: "fo" });
+    const block = buildAttachmentBlock([file, folder]);
+    const fileIdx = block!.indexOf("## File: Composer.tsx");
+    const folderIdx = block!.indexOf("## Folder: chat");
+    expect(fileIdx).toBeGreaterThanOrEqual(0);
+    expect(folderIdx).toBeGreaterThan(fileIdx);
   });
 });
 

@@ -1,7 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { cleanup, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -40,8 +39,6 @@ function baseProps(): FooterProps {
     canSubmit: true,
     showProviderPicker: false,
     mode: "default",
-    onModeActivate: vi.fn(),
-    onModeRemove: vi.fn(),
     onProviderChange: vi.fn(),
     onModelChange: vi.fn(),
     onPermissionModeChange: vi.fn(),
@@ -61,81 +58,80 @@ function renderFooter(props: Partial<FooterProps> = {}) {
   );
 }
 
-describe("ComposerFooter — Stage 3 mode selector", () => {
-  it("renders the '+ Mode' dropdown trigger when mode is default", () => {
+describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
+  it("does NOT render the legacy '+ Mode' dropdown trigger", () => {
+    // The Stage 3 refactor moved mode selection into the unified `+`
+    // popup. This test is a regression guard so the dropdown can't
+    // creep back.
     renderFooter({ mode: "default" });
     expect(
-      screen.getByRole("button", { name: /Activate mode/i }),
-    ).toBeInTheDocument();
-    // PermissionModePicker renders in default mode — its label
-    // "Full access" should be visible somewhere.
-    expect(screen.getByText("Full access")).toBeInTheDocument();
+      screen.queryByRole("button", { name: /Activate mode/i }),
+    ).toBeNull();
   });
 
-  it("renders the ModePill when mode is active, hides the '+ Mode' trigger", () => {
-    const { queryByRole } = renderFooter({ mode: "plan" });
-    // ModePill renders under role="status" with a Plan label.
-    expect(screen.getByRole("status", { name: /Plan mode active/i })).toBeInTheDocument();
-    // The trigger is gone.
-    expect(queryByRole("button", { name: /Activate mode/i })).toBeNull();
-  });
-
-  it("keeps the PermissionModePicker visible but disabled while a mode pill is active", () => {
-    // Prior behavior was to unmount the picker, which surprised
-    // users ("my picker disappeared"). Current design: picker stays
-    // on-screen for discoverability; clicks are disabled so it can't
-    // contradict the pill that has commandeered the live permission
-    // mode.
+  it("does NOT render an inline ModePill (it lives above the textarea now)", () => {
     renderFooter({ mode: "plan" });
-    const button = screen.getByRole("button", { name: /Full access/i });
-    expect(button).toBeInTheDocument();
-    expect(button).toBeDisabled();
+    expect(
+      screen.queryByRole("status", { name: /Plan mode active/i }),
+    ).toBeNull();
   });
 
-  it("dropdown Plan item fires onModeActivate('plan')", async () => {
-    const user = userEvent.setup();
-    const onModeActivate = vi.fn();
-    renderFooter({ mode: "default", onModeActivate });
-    // Radix Dropdown uses pointer events — fireEvent.click doesn't
-    // open the menu; userEvent.click dispatches the full pointer
-    // sequence.
-    await user.click(
-      screen.getByRole("button", { name: /Activate mode/i }),
-    );
-    await user.click(await screen.findByRole("menuitem", { name: /Plan/ }));
-    expect(onModeActivate).toHaveBeenCalledWith("plan");
+  it("renders the + button when onAttachClick is provided", () => {
+    renderFooter({ onAttachClick: vi.fn() });
+    const btn = screen.getByTestId("composer-attach-button");
+    expect(btn).toBeInTheDocument();
   });
 
-  it("dropdown Ask item fires onModeActivate('ask') (Stage 4)", async () => {
-    const user = userEvent.setup();
-    const onModeActivate = vi.fn();
-    renderFooter({ mode: "default", onModeActivate });
-    await user.click(
-      screen.getByRole("button", { name: /Activate mode/i }),
-    );
-    await user.click(await screen.findByRole("menuitem", { name: /Ask/ }));
-    expect(onModeActivate).toHaveBeenCalledWith("ask");
+  it("the + button matches the Send button shape (h-7 w-7 circle)", () => {
+    renderFooter({ onAttachClick: vi.fn() });
+    const attach = screen.getByTestId("composer-attach-button");
+    const send = screen.getByRole("button", { name: "Send" });
+    // Both share the same fixed circle dimensions; identical shape
+    // is what makes them read as a visual pair.
+    expect(attach.className).toContain("h-7");
+    expect(attach.className).toContain("w-7");
+    expect(attach.className).toContain("rounded-full");
+    expect(send.className).toContain("h-7");
+    expect(send.className).toContain("w-7");
+    expect(send.className).toContain("rounded-full");
   });
 
-  it("dropdown Debug item fires onModeActivate('debug') (Stage 6)", async () => {
-    const user = userEvent.setup();
-    const onModeActivate = vi.fn();
-    renderFooter({ mode: "default", onModeActivate });
-    await user.click(
-      screen.getByRole("button", { name: /Activate mode/i }),
-    );
-    const debug = await screen.findByRole("menuitem", { name: /Debug/ });
-    expect(debug.getAttribute("aria-disabled")).not.toBe("true");
-    await user.click(debug);
-    expect(onModeActivate).toHaveBeenCalledWith("debug");
+  it("the + button is hidden when onAttachClick is omitted (back-compat)", () => {
+    renderFooter();
+    expect(screen.queryByTestId("composer-attach-button")).toBeNull();
   });
 
-  it("clicking the pill's X calls onModeRemove", () => {
-    const onModeRemove = vi.fn();
-    renderFooter({ mode: "plan", onModeRemove });
-    fireEvent.click(
-      screen.getByRole("button", { name: /Remove Plan mode/i }),
-    );
-    expect(onModeRemove).toHaveBeenCalled();
+  it("PermissionModePicker is enabled in default mode", () => {
+    renderFooter({ mode: "default" });
+    const picker = screen.getByRole("button", { name: /Full access/i });
+    expect(picker).not.toBeDisabled();
+  });
+
+  it("PermissionModePicker stays visible but disabled when a mode is active", () => {
+    // Plan / Ask / Debug commandeer permission mode at the SDK
+    // boundary; the picker stays on-screen for discoverability but
+    // can't override the pill that's driving the policy.
+    renderFooter({ mode: "plan" });
+    const picker = screen.getByRole("button", { name: /Full access/i });
+    expect(picker).toBeInTheDocument();
+    expect(picker).toBeDisabled();
+  });
+
+  it("the Send button is rendered and enabled when canSubmit is true", () => {
+    renderFooter({ canSubmit: true });
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).not.toBeDisabled();
+  });
+
+  it("the Stop button replaces Send while streaming", () => {
+    renderFooter({ streaming: true });
+    expect(screen.getByRole("button", { name: "Stop" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
+  });
+
+  it("controlsDisabled disables the + button", () => {
+    renderFooter({ controlsDisabled: true, onAttachClick: vi.fn() });
+    const attach = screen.getByTestId("composer-attach-button");
+    expect(attach).toBeDisabled();
   });
 });

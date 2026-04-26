@@ -861,6 +861,33 @@ export interface OutlineEntry {
   line: number;
 }
 
+/** Result row from `list_project_folders` (Step 8 Stage 3). Used for
+ *  the `+ → Folder…` picker. Derives directory prefixes from the
+ *  same file-walk cache as `FileMatch`. */
+export interface FolderMatch {
+  /** Path relative to cwd, no trailing slash. */
+  path: string;
+  /** Absolute, canonicalized path. */
+  absolute_path: string;
+  /** Fuzzy-match score; `0` for empty-query / alphabetical. */
+  score: number;
+  /** Immediate-children count (files + dirs at depth 1). */
+  item_count: number;
+}
+
+/** Backend response for `read_folder_for_attachment` (Step 8 Stage 3).
+ *  Carries a pre-rendered unicode tree (depth-bounded) plus the true
+ *  pre-truncation item count. */
+export interface FolderAttachmentInfo {
+  absolutePath: string;
+  relativePath: string | null;
+  /** Pre-rendered unicode tree, depth-bounded by the caller's
+   *  `max_depth`. Truncated at 100 entries with a trailing
+   *  "… N more entries" marker. */
+  tree: string;
+  itemCount: number;
+}
+
 /** Backend response for `read_file_for_attachment` (Step 8 Stage 2).
  *  Reports text/binary, full-vs-truncated content, and an outline
  *  when truncated. The frontend's chip preview + injection block both

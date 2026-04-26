@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
+  buildFolderResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
@@ -29,8 +30,9 @@ import {
 import {
   activateWorkspace,
   readFileForAttachment,
+  readFolderForAttachment,
 } from "@/tauri/commands";
-import type { FileMatch } from "@/tauri/types";
+import type { FileMatch, FolderMatch } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
@@ -380,6 +382,56 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     ],
   );
 
+  /** Step 8 Stage 3 — folder counterpart for the draft surface.
+   *  Uses `draft.threadId` so chips survive the materialize → real
+   *  thread transition without a transfer step. */
+  const handleAttachFolder = useCallback(
+    (match: FolderMatch) => {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const basename = match.path.split("/").pop() ?? match.path;
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "folder",
+        ref: match.absolute_path,
+        metadata: { label: basename, isLoading: true },
+      });
+      void (async () => {
+        try {
+          const info = await readFolderForAttachment(
+            match.absolute_path,
+            displayCwd ?? null,
+            2,
+          );
+          updateStagedAttachment(draft.threadId, id, {
+            resolvedContent: buildFolderResolvedContent(info),
+            metadata: {
+              label: basename,
+              isLoading: false,
+              fetchedAt: Date.now(),
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(draft.threadId, id, {
+            metadata: {
+              label: basename,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [
+      draft.threadId,
+      displayCwd,
+      addStagedAttachment,
+      updateStagedAttachment,
+    ],
+  );
+
   // The textarea onStop is a no-op during a draft — there's no session
   // to interrupt. The button only shows when streaming=true, which we
   // set only during the in-flight materialise window. Stopping
@@ -566,6 +618,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         removeStagedAttachment(draft.threadId, id)
       }
       onAttachFile={handleAttachFile}
+      onAttachFolder={handleAttachFolder}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}

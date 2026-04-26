@@ -1,4 +1,13 @@
-import { File as FileIcon } from "lucide-react";
+import {
+  Bug,
+  CircleDot,
+  File as FileIcon,
+  FolderOpen,
+  GitPullRequest,
+  Image as ImageIcon,
+  ListTodo,
+  MessageCircleQuestion,
+} from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
@@ -19,21 +28,23 @@ import {
   selectActiveSkills,
   useSkillsStore,
 } from "@/stores/skills-store";
-import { listProjectFiles } from "@/tauri/commands";
+import { listProjectFiles, listProjectFolders } from "@/tauri/commands";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
   FileMatch,
+  FolderMatch,
   PermissionModeOption,
 } from "@/tauri/types";
 
 import { AttachmentChip } from "./AttachmentChip";
 import { ComposerFooter } from "./ComposerFooter";
-import type { ActivePillMode } from "./pickers/ModePill";
+import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
+const EMPTY_FOLDER_MATCHES: FolderMatch[] = [];
 /** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
  *  typing doesn't flood the backend during the popup's open lifetime. */
 const MENTION_FETCH_DEBOUNCE_MS = 100;
@@ -41,6 +52,15 @@ const MENTION_FETCH_DEBOUNCE_MS = 100;
  *  matcher already pre-sorts by score, so the first 20 are always the
  *  highest-ranked relative to the query. */
 const MENTION_FETCH_LIMIT = 20;
+/** Step 8 Stage 3 — `+` popup browses alphabetical without live
+ *  search (search lives on `@`). 30 entries fits the popup's max-h
+ *  cap with room to scroll. */
+const ATTACH_BROWSE_LIMIT = 30;
+
+/** Three views the `+` popup can show. `main` lists categories +
+ *  navigation nudges; `file` and `folder` list browsable rows that
+ *  insert an inline `@<basename>` token on pick. */
+type AttachSubmode = "main" | "file" | "folder";
 
 interface Props {
   draft: string;
@@ -82,11 +102,14 @@ interface Props {
    *  interactive; if omitted, the X button is a no-op. */
   onRemoveAttachment?: (attachmentId: string) => void;
   /** Step 8 Stage 2 — invoked when the user picks a file from the `@`
-   *  mention popup. The Composer has already stripped the `@<query>`
-   *  token from the textarea by the time this fires, so the parent
-   *  just needs to stage the chip + drive the readFileForAttachment
-   *  resolution. Optional so existing call sites keep compiling. */
+   *  mention popup OR the `+ → File…` browser. The Composer inserts
+   *  the inline `@<basename>` token; the parent stages the chip +
+   *  drives the readFileForAttachment resolution. Optional so
+   *  existing call sites keep compiling. */
   onAttachFile?: (match: FileMatch) => void;
+  /** Step 8 Stage 3 — invoked when the user picks a folder from the
+   *  `+ → Folder…` browser. Mirrors `onAttachFile` for folders. */
+  onAttachFolder?: (match: FolderMatch) => void;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -123,6 +146,7 @@ export function Composer({
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onAttachFile,
+  onAttachFolder,
   onDraftChange,
   onSubmit,
   onStop,
@@ -171,6 +195,23 @@ export function Composer({
   const [fileMatches, setFileMatches] = useState<FileMatch[]>(EMPTY_FILE_MATCHES);
   const mentionOpen = mentionAnchor !== null;
   const mentionQuery = mentionAnchor?.query ?? "";
+
+  // ─── Attach (+) popup state — Step 8 Stage 3 ─────────────────────
+  // Triggered by the `+` button in the footer (button-anchored, not
+  // textarea-anchored). Submode pivots in-place inside the same
+  // popup: main → file/folder → pick → close. Mutual exclusion with
+  // slash + mention popups is enforced at the toggle point.
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [attachSubmode, setAttachSubmode] = useState<AttachSubmode>("main");
+  const [attachHighlighted, setAttachHighlighted] = useState<string | null>(
+    null,
+  );
+  const [attachFileMatches, setAttachFileMatches] = useState<FileMatch[]>(
+    EMPTY_FILE_MATCHES,
+  );
+  const [attachFolderMatches, setAttachFolderMatches] = useState<FolderMatch[]>(
+    EMPTY_FOLDER_MATCHES,
+  );
 
   const modeCommands = useMemo(
     () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
@@ -307,6 +348,109 @@ export function Composer({
     setFileMatches(EMPTY_FILE_MATCHES);
   }, []);
 
+  const closeAttachPopup = useCallback(() => {
+    setAttachOpen(false);
+    setAttachSubmode("main");
+    setAttachHighlighted(null);
+    // Keep the cached match arrays so reopening the popup is snappy;
+    // the next open's effect re-fetches anyway when cwd / submode
+    // changes invalidate them.
+  }, []);
+
+  // Insert text at the textarea's current cursor, preserving prose
+  // around the insertion point. Schedules a focus + caret restore
+  // via rAF so React's render flush doesn't fight us.
+  const insertAtCursor = useCallback(
+    (insertion: string) => {
+      const ta = textareaRef.current;
+      const cursor = ta?.selectionStart ?? draft.length;
+      const before = draft.slice(0, cursor);
+      const after = draft.slice(cursor);
+      const next = before + insertion + after;
+      onDraftChange(next);
+      const newCursor = (before + insertion).length;
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(newCursor, newCursor);
+      });
+    },
+    [draft, onDraftChange],
+  );
+
+  // Insert an inline `@<basename> ` token at the cursor, used by the
+  // `+ → File…` and `+ → Folder…` paths. Mirrors the strip-and-
+  // insert flow that the `@` mention popup uses, minus the strip.
+  const insertInlineToken = useCallback(
+    (basename: string) => {
+      const ta = textareaRef.current;
+      const cursor = ta?.selectionStart ?? draft.length;
+      const after = draft.slice(cursor);
+      const insertion = `@${basename}${after.startsWith(" ") ? "" : " "}`;
+      insertAtCursor(insertion);
+    },
+    [draft, insertAtCursor],
+  );
+
+  // Toggle the `+` popup. Closes any open slash / mention popup so
+  // only one popup is visible at a time. Resets the submode so the
+  // user always lands on the main category list.
+  const handleAttachClick = useCallback(() => {
+    if (attachOpen) {
+      closeAttachPopup();
+      return;
+    }
+    setAttachOpen(true);
+    setAttachSubmode("main");
+    setAttachHighlighted(null);
+    if (slashAnchor) {
+      setSlashAnchor(null);
+      setSlashHighlighted(null);
+    }
+    if (mentionAnchor) closeMention();
+  }, [
+    attachOpen,
+    closeAttachPopup,
+    slashAnchor,
+    mentionAnchor,
+    closeMention,
+  ]);
+
+  // Lazy-fetch the `+` popup's file or folder list when its submode
+  // changes. Uses alphabetical ordering (no live search) — the user
+  // searches via `@`. 30 entries is the popup's browse cap.
+  useEffect(() => {
+    if (!attachOpen) return;
+    if (attachSubmode === "main") return;
+    if (!cwd) {
+      if (attachSubmode === "file") setAttachFileMatches(EMPTY_FILE_MATCHES);
+      else setAttachFolderMatches(EMPTY_FOLDER_MATCHES);
+      return;
+    }
+    let cancelled = false;
+    if (attachSubmode === "file") {
+      void listProjectFiles(cwd, null, ATTACH_BROWSE_LIMIT)
+        .then((matches) => {
+          if (!cancelled) setAttachFileMatches(matches);
+        })
+        .catch(() => {
+          if (!cancelled) setAttachFileMatches(EMPTY_FILE_MATCHES);
+        });
+    } else {
+      void listProjectFolders(cwd, null, ATTACH_BROWSE_LIMIT)
+        .then((matches) => {
+          if (!cancelled) setAttachFolderMatches(matches);
+        })
+        .catch(() => {
+          if (!cancelled) setAttachFolderMatches(EMPTY_FOLDER_MATCHES);
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [attachOpen, attachSubmode, cwd]);
+
   // Build SlashCommandItem[] from the fuzzy matches. The popup
   // component renders these generically — no file-specific knowledge.
   // `onSelect` is intentionally a no-op here because the popup-side
@@ -338,6 +482,230 @@ export function Composer({
     }
     return null;
   }, [cwd]);
+
+  // ─── Attach popup items + pick handler ───────────────────────────
+  // Items are derived per-submode. The `main` view is static
+  // (categories + nav nudges); `file` and `folder` map the cached
+  // match arrays into picker rows. Disabled rows render muted and
+  // skip selection (Stage 4–6 promise; the popup discovers them now
+  // so users see what's coming without the row being live).
+  const attachPopupItems = useMemo<SlashCommandItem[]>(() => {
+    if (attachSubmode === "main") {
+      // MODES come first (primary affordance — the popup is the
+      // canonical mode selector now that the `+ Mode` dropdown is
+      // gone). The currently-active mode is disabled so users can't
+      // double-activate it. ATTACH follows; the disabled coming-soon
+      // entries (Issue/PR/Image) stay for discoverability ahead of
+      // Stages 4–6.
+      return [
+        {
+          id: "mode:plan",
+          label: "Plan",
+          description: "Plan and design before coding",
+          command: "/plan",
+          icon: ListTodo,
+          group: "MODES",
+          disabled: mode === "plan",
+          onSelect: () => {},
+        },
+        {
+          id: "mode:debug",
+          label: "Debug",
+          description: "Add diagnostic logs to find bugs",
+          command: "/debug",
+          icon: Bug,
+          group: "MODES",
+          disabled: mode === "debug",
+          onSelect: () => {},
+        },
+        {
+          id: "mode:ask",
+          label: "Ask",
+          description: "Read-only conversational mode",
+          command: "/ask",
+          icon: MessageCircleQuestion,
+          group: "MODES",
+          disabled: mode === "ask",
+          onSelect: () => {},
+        },
+        {
+          id: "attach:file",
+          label: "File…",
+          description: "Pick a file from your project",
+          command: "",
+          icon: FileIcon,
+          group: "ATTACH",
+          onSelect: () => {},
+        },
+        {
+          id: "attach:folder",
+          label: "Folder…",
+          description: "Attach a directory tree",
+          command: "",
+          icon: FolderOpen,
+          group: "ATTACH",
+          onSelect: () => {},
+        },
+        {
+          id: "attach:issue",
+          label: "GitHub Issue…",
+          description: "coming soon",
+          command: "",
+          icon: CircleDot,
+          group: "ATTACH",
+          disabled: true,
+          onSelect: () => {},
+        },
+        {
+          id: "attach:pr",
+          label: "GitHub PR…",
+          description: "coming soon",
+          command: "",
+          icon: GitPullRequest,
+          group: "ATTACH",
+          disabled: true,
+          onSelect: () => {},
+        },
+        {
+          id: "attach:image",
+          label: "Image…",
+          description: "coming soon",
+          command: "",
+          icon: ImageIcon,
+          group: "ATTACH",
+          disabled: true,
+          onSelect: () => {},
+        },
+      ];
+    }
+    if (attachSubmode === "file") {
+      return attachFileMatches.map((match) => ({
+        id: `attach-file:${match.absolute_path}`,
+        label: match.path,
+        command: "",
+        icon: FileIcon,
+        group: "FILES",
+        onSelect: () => {},
+      }));
+    }
+    return attachFolderMatches.map((match) => ({
+      id: `attach-folder:${match.absolute_path}`,
+      label: match.path,
+      description: `${match.item_count} item${match.item_count === 1 ? "" : "s"}`,
+      command: "",
+      icon: FolderOpen,
+      group: "FOLDERS",
+      onSelect: () => {},
+    }));
+  }, [attachSubmode, attachFileMatches, attachFolderMatches, mode]);
+
+  const attachPopupFooter = useMemo(() => {
+    if (attachSubmode === "main") return null;
+    if (!cwd) {
+      return {
+        tone: "muted" as const,
+        message: "Open this chat in a project to browse.",
+      };
+    }
+    if (attachSubmode === "file" && attachFileMatches.length === 0) {
+      return {
+        tone: "muted" as const,
+        message: "Loading files… (Esc to go back)",
+      };
+    }
+    if (attachSubmode === "folder" && attachFolderMatches.length === 0) {
+      return {
+        tone: "muted" as const,
+        message: "Loading folders… (Esc to go back)",
+      };
+    }
+    return {
+      tone: "muted" as const,
+      message: "Esc to go back",
+    };
+  }, [attachSubmode, cwd, attachFileMatches.length, attachFolderMatches.length]);
+
+  // Initialise / sync the attach-popup highlight to the first
+  // enabled item whenever the visible item list shifts.
+  useEffect(() => {
+    if (!attachOpen) return;
+    const enabledIds = attachPopupItems
+      .filter((i) => !i.disabled)
+      .map((i) => i.id);
+    if (attachHighlighted && enabledIds.includes(attachHighlighted)) return;
+    setAttachHighlighted(enabledIds[0] ?? null);
+  }, [attachOpen, attachPopupItems, attachHighlighted]);
+
+  const handleAttachPopupSelect = useCallback(
+    (item: SlashCommandItem) => {
+      if (item.disabled) return;
+      // Submode pivots
+      if (item.id === "attach:file") {
+        setAttachSubmode("file");
+        setAttachHighlighted(null);
+        return;
+      }
+      if (item.id === "attach:folder") {
+        setAttachSubmode("folder");
+        setAttachHighlighted(null);
+        return;
+      }
+      // Mode picks — close the popup and activate the mode. The
+      // mode pill renders in the chip strip above the textarea
+      // (Stage 3 refactor); the footer no longer carries a mode
+      // selector after the `+ Mode` dropdown was retired.
+      if (item.id === "mode:plan") {
+        closeAttachPopup();
+        onModeActivate("plan");
+        return;
+      }
+      if (item.id === "mode:debug") {
+        closeAttachPopup();
+        onModeActivate("debug");
+        return;
+      }
+      if (item.id === "mode:ask") {
+        closeAttachPopup();
+        onModeActivate("ask");
+        return;
+      }
+      // File / folder picks: insert the inline token, dispatch the
+      // resolve callback to the parent, close the popup.
+      if (item.id.startsWith("attach-file:")) {
+        const match = attachFileMatches.find(
+          (m) => `attach-file:${m.absolute_path}` === item.id,
+        );
+        if (match) {
+          const filename = match.path.split("/").pop() ?? match.path;
+          insertInlineToken(filename);
+          onAttachFile?.(match);
+        }
+        closeAttachPopup();
+        return;
+      }
+      if (item.id.startsWith("attach-folder:")) {
+        const match = attachFolderMatches.find(
+          (m) => `attach-folder:${m.absolute_path}` === item.id,
+        );
+        if (match) {
+          const basename = match.path.split("/").pop() ?? match.path;
+          insertInlineToken(basename);
+          onAttachFolder?.(match);
+        }
+        closeAttachPopup();
+        return;
+      }
+    },
+    [
+      attachFileMatches,
+      attachFolderMatches,
+      insertInlineToken,
+      closeAttachPopup,
+      onAttachFile,
+      onAttachFolder,
+      onModeActivate,
+    ],
+  );
 
   // Keep the highlighted file id valid as the match list shifts.
   useEffect(() => {
@@ -487,6 +855,58 @@ export function Composer({
       }
     }
 
+    if (attachOpen) {
+      // Esc inside a submode walks back to main; Esc on main closes
+      // the popup. Mirrors the macOS / Slack-style nested-menu UX.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        if (attachSubmode !== "main") {
+          setAttachSubmode("main");
+          setAttachHighlighted(null);
+        } else {
+          closeAttachPopup();
+        }
+        return;
+      }
+      // Arrow nav skips disabled rows entirely. Enter activates the
+      // currently highlighted (enabled) row via the same dispatch
+      // path the mouse-click would use.
+      const enabledIds = attachPopupItems
+        .filter((i) => !i.disabled)
+        .map((i) => i.id);
+      if (enabledIds.length > 0) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          const idx = attachHighlighted
+            ? enabledIds.indexOf(attachHighlighted)
+            : -1;
+          const next = enabledIds[(idx + 1) % enabledIds.length];
+          if (next) setAttachHighlighted(next);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          const idx = attachHighlighted
+            ? enabledIds.indexOf(attachHighlighted)
+            : 0;
+          const next =
+            enabledIds[(idx - 1 + enabledIds.length) % enabledIds.length];
+          if (next) setAttachHighlighted(next);
+          return;
+        }
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          const item = attachPopupItems.find(
+            (i) => i.id === attachHighlighted,
+          );
+          if (item) handleAttachPopupSelect(item);
+          return;
+        }
+      }
+      // Other keys (typing, etc.) pass through to the textarea so
+      // the user can keep editing prose while the popup is open.
+    }
+
     if (mentionOpen) {
       // Esc closes the mention popup; falls through to the normal
       // Enter-to-submit path when the filter returned no matches so
@@ -545,12 +965,14 @@ export function Composer({
     if (slashHit) {
       setSlashAnchor(slashHit);
       if (mentionAnchor) closeMention();
+      if (attachOpen) closeAttachPopup();
     } else if (mentionHit) {
       setMentionAnchor(mentionHit);
       if (slashAnchor) {
         setSlashAnchor(null);
         setSlashHighlighted(null);
       }
+      if (attachOpen) closeAttachPopup();
     } else {
       if (slashAnchor) {
         setSlashAnchor(null);
@@ -628,6 +1050,14 @@ export function Composer({
             open={mentionOpen}
             footerNote={mentionPopupFooter}
           />
+          <SlashCommandPopup
+            items={attachPopupItems}
+            highlightedId={attachHighlighted}
+            onHighlightChange={setAttachHighlighted}
+            onSelect={handleAttachPopupSelect}
+            open={attachOpen}
+            footerNote={attachPopupFooter}
+          />
           {errorMessage && (
             <div
               role="alert"
@@ -639,17 +1069,25 @@ export function Composer({
               </span>
             </div>
           )}
-          {/* Step 8 Stage 2.1 — file/folder chips render INSIDE the
-              textarea via the mirror overlay below. The strip above
-              stays reserved for image attachments (Stage 6) which
-              can't live inline as text. Files/folders are filtered
-              out here so two chips never visually represent the
-              same file. */}
-          {stagedAttachments.some((a) => a.kind === "image") && (
+          {/* Step 8 Stage 3 refactor — strip above textarea hosts
+              the active mode pill + image attachment chips. File /
+              folder chips render INSIDE the textarea via the mirror
+              overlay below; images can't live inline as text so they
+              stay here. The mode pill moved out of the footer when
+              the `+ Mode` dropdown was retired in favour of the
+              unified `+` popup. */}
+          {(mode !== "default" ||
+            stagedAttachments.some((a) => a.kind === "image")) && (
             <div
               data-testid="composer-attachment-strip"
               className="flex flex-wrap gap-1.5 px-3 pt-2"
             >
+              {mode !== "default" && (
+                <ModePill
+                  mode={mode as ActivePillMode}
+                  onRemove={onModeRemove}
+                />
+              )}
               {stagedAttachments
                 .filter((a) => a.kind === "image")
                 .map((attachment) => (
@@ -780,8 +1218,6 @@ export function Composer({
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
             mode={mode}
-            onModeActivate={onModeActivate}
-            onModeRemove={onModeRemove}
             onProviderChange={onProviderChange}
             onModelChange={onModelChange}
             onPermissionModeChange={onPermissionModeChange}
@@ -790,6 +1226,8 @@ export function Composer({
             onSubmit={onSubmit}
             onStop={onStop}
             controlsDisabled={!sessionReady}
+            onAttachClick={handleAttachClick}
+            attachOpen={attachOpen}
           />
         </div>
       </div>

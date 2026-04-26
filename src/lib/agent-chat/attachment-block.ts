@@ -15,7 +15,10 @@
  */
 
 import type { Attachment } from "@/stores/agent-chat-store";
-import type { FileAttachmentInfo } from "@/tauri/types";
+import type {
+  FileAttachmentInfo,
+  FolderAttachmentInfo,
+} from "@/tauri/types";
 
 /** Render a fenced full-content block for small files — agent sees
  *  the whole file. */
@@ -59,6 +62,27 @@ export function buildFileResolvedContent(info: FileAttachmentInfo): string {
     return "[binary file — use Read tool to access]";
   }
   return info.truncated ? renderTruncatedFile(info) : renderFullFile(info);
+}
+
+/**
+ * Convert the backend-resolved folder metadata into the body that
+ * lands inside `attachment.resolvedContent`. The composer calls this
+ * after `read_folder_for_attachment` returns.
+ *
+ * Folder injection is intentionally tree-only: the agent gets the
+ * directory shape and an explicit pointer to use Read/Grep for any
+ * file content it actually needs. Avoids the "full folder content"
+ * footgun that bloats prompts when a folder has dozens of files.
+ */
+export function buildFolderResolvedContent(info: FolderAttachmentInfo): string {
+  return [
+    `Tree (depth-bounded, ${info.itemCount} item${info.itemCount === 1 ? "" : "s"}):`,
+    "```",
+    info.tree,
+    "```",
+    "",
+    `Use the Read or Grep tool with path "${info.absolutePath}" to explore further.`,
+  ].join("\n");
 }
 
 function formatFileAttachment(att: Attachment): string {

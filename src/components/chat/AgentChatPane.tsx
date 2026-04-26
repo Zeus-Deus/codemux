@@ -11,6 +11,7 @@ import {
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
+  buildFolderResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
@@ -50,12 +51,14 @@ import {
   agentChatStopSession,
   grepCountPattern,
   readFileForAttachment,
+  readFolderForAttachment,
 } from "@/tauri/commands";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   FileMatch,
+  FolderMatch,
   PaneNodeSnapshot,
 } from "@/tauri/types";
 
@@ -502,6 +505,49 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           updateStagedAttachment(threadId, id, {
             metadata: {
               label: filename,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [threadId, cwd, addStagedAttachment, updateStagedAttachment],
+  );
+
+  /** Step 8 Stage 3 — folder counterpart to handleAttachFile.
+   *  Stages with isLoading=true, fires read_folder_for_attachment
+   *  with depth 2 (research-locked), then patches the chip with the
+   *  rendered tree. */
+  const handleAttachFolder = useCallback(
+    (match: FolderMatch) => {
+      if (!threadId) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const basename = match.path.split("/").pop() ?? match.path;
+      addStagedAttachment(threadId, {
+        id,
+        kind: "folder",
+        ref: match.absolute_path,
+        metadata: { label: basename, isLoading: true },
+      });
+      void (async () => {
+        try {
+          const info = await readFolderForAttachment(match.absolute_path, cwd, 2);
+          updateStagedAttachment(threadId, id, {
+            resolvedContent: buildFolderResolvedContent(info),
+            metadata: {
+              label: basename,
+              isLoading: false,
+              fetchedAt: Date.now(),
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(threadId, id, {
+            metadata: {
+              label: basename,
               isLoading: false,
               error: String(err),
             },
@@ -1198,6 +1244,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         removeStagedAttachment(threadId, id);
       }}
       onAttachFile={handleAttachFile}
+      onAttachFolder={handleAttachFolder}
       onDraftChange={(next) => {
         if (!threadId) return;
         setInputDraft(threadId, next);

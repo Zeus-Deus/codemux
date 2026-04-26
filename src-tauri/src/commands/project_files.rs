@@ -8,7 +8,7 @@
 //! both — purpose-built for fast filename autocomplete with fuzzy
 //! ranking + 60s in-memory cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +26,13 @@ const FULL_CONTENT_BYTES_LIMIT: u64 = 200 * 1024;
 const FULL_CONTENT_LINE_LIMIT: usize = 1500;
 const TRUNCATED_PREVIEW_LINES: usize = 50;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Step 8 Stage 3 — folder-tree rendering caps. Walking is bounded by
+/// the caller's `max_depth`; truncation kicks in at this many entries
+/// to keep injected blocks budget-friendly. The walker itself
+/// continues so `item_count` reflects the true total — only the
+/// rendered tree is cut.
+const FOLDER_TREE_MAX_ENTRIES: usize = 100;
 
 /// Cache TTL for the per-cwd file list. Aligns with the frontend skills
 /// store TTL (60s) so the user's mental model of "freshness" is
@@ -206,6 +213,362 @@ fn walk_project(cwd: &Path) -> CacheEntry {
         absolute: sorted_absolute,
         scanned_at: Instant::now(),
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FolderMatch {
+    /// Directory path relative to cwd, no trailing slash.
+    pub path: String,
+    /// Absolute, canonicalized path.
+    pub absolute_path: String,
+    /// Fuzzy-match score; `0` for empty-query / alphabetical.
+    pub score: u32,
+    /// Immediate-children count (files + dirs at depth 1).
+    pub item_count: usize,
+}
+
+/// List directories under `cwd`, fuzzy-ranked by `query` if present.
+/// Reuses the file-walk cache from `list_project_files`: directory
+/// prefixes are derived from the cached relative paths, so calling
+/// this command after a recent file-list call is essentially free
+/// (no second walk).
+#[tauri::command]
+pub async fn list_project_folders(
+    cwd: String,
+    query: Option<String>,
+    limit: usize,
+) -> Result<Vec<FolderMatch>, String> {
+    let cwd_path = Path::new(&cwd);
+    if !cwd_path.is_dir() {
+        return Ok(Vec::new());
+    }
+    let canonical_cwd = cwd_path
+        .canonicalize()
+        .unwrap_or_else(|_| cwd_path.to_path_buf());
+    let limit = limit.min(MAX_LIMIT);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Reuse the same cache the file walker maintains. If absent, walk
+    // once now — single source of truth means folder ↔ file lists
+    // never drift.
+    let paths = {
+        let mut cache = CACHE.lock().unwrap();
+        let needs_refresh = cache
+            .get(&canonical_cwd)
+            .map(|e| e.scanned_at.elapsed() >= CACHE_TTL)
+            .unwrap_or(true);
+        if needs_refresh {
+            let entry = walk_project(&canonical_cwd);
+            cache.insert(canonical_cwd.clone(), entry);
+        }
+        cache.get(&canonical_cwd).unwrap().paths.clone()
+    };
+
+    // Derive directory prefixes + immediate-children counts from the
+    // cached file list. Walking the path components builds every
+    // ancestor directory; counting "immediate" entries requires only
+    // counting paths whose parent equals each candidate dir.
+    let mut item_counts: HashMap<String, usize> = HashMap::new();
+    let mut dirs: HashSet<String> = HashSet::new();
+    for rel in &paths {
+        let mut current = String::new();
+        let segments: Vec<&str> = rel.split('/').collect();
+        // Every prefix except the last (which is the file itself) is
+        // a directory.
+        for seg in &segments[..segments.len().saturating_sub(1)] {
+            if !current.is_empty() {
+                current.push('/');
+            }
+            current.push_str(seg);
+            dirs.insert(current.clone());
+        }
+        // Tally the file's immediate parent so we can surface
+        // item_count in the popup chip preview.
+        let parent = if segments.len() <= 1 {
+            ""
+        } else {
+            // Reconstruct the parent by joining all but the last segment.
+            // Doing it this way avoids allocating per-segment.
+            let last = segments.last().unwrap();
+            &rel[..rel.len() - last.len() - if rel.contains('/') { 1 } else { 0 }]
+        };
+        *item_counts.entry(parent.to_string()).or_insert(0) += 1;
+    }
+
+    // Fold "" (the root) into the dirs map so it can be returned too
+    // when the user wants to attach the workspace root itself.
+    dirs.insert(String::new());
+
+    // Counts also need to include subdirectories as items of their parents.
+    // For each dir, count direct subdirectories whose parent equals it.
+    for dir in &dirs {
+        let parent = match dir.rfind('/') {
+            Some(i) => &dir[..i],
+            None => "",
+        };
+        if dir == parent {
+            continue; // skip self-reference (the root entry)
+        }
+        if !dirs.contains(parent) && !parent.is_empty() {
+            // Dir's parent isn't yet a known directory entry; still count it.
+        }
+        *item_counts.entry(parent.to_string()).or_insert(0) += 1;
+    }
+
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let trimmed_query = query.as_deref().map(str::trim).unwrap_or("");
+
+    // Skip the empty-string root entry from the surfaced list — users
+    // typically don't want to "attach the project root" via a popup
+    // pick (they'd just message the agent without an attachment).
+    let candidate_dirs: Vec<String> = dirs.into_iter().filter(|d| !d.is_empty()).collect();
+    let mut sorted_dirs = candidate_dirs.clone();
+    sorted_dirs.sort();
+
+    let make_match = |dir: &str, score: u32| -> FolderMatch {
+        let abs = canonical_cwd.join(dir).to_string_lossy().to_string();
+        FolderMatch {
+            path: dir.to_string(),
+            absolute_path: abs,
+            score,
+            item_count: *item_counts.get(dir).unwrap_or(&0),
+        }
+    };
+
+    if trimmed_query.is_empty() {
+        return Ok(sorted_dirs
+            .iter()
+            .take(limit)
+            .map(|d| make_match(d, 0))
+            .collect());
+    }
+
+    let pattern = Pattern::parse(trimmed_query, CaseMatching::Smart, Normalization::Smart);
+    let dir_to_idx: HashMap<&str, usize> = candidate_dirs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
+    let scored = pattern.match_list(candidate_dirs.iter().map(String::as_str), &mut matcher);
+    let results: Vec<FolderMatch> = scored
+        .into_iter()
+        .take(limit)
+        .filter_map(|(matched_str, score)| {
+            dir_to_idx
+                .get(matched_str)
+                .map(|&i| make_match(&candidate_dirs[i], score))
+        })
+        .collect();
+    Ok(results)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderAttachmentInfo {
+    pub absolute_path: String,
+    pub relative_path: Option<String>,
+    /// Pre-rendered unicode tree, depth-bounded by the caller's
+    /// `max_depth`. Truncated at FOLDER_TREE_MAX_ENTRIES with a
+    /// trailing "… N more entries" marker; `item_count` reports the
+    /// true total before truncation.
+    pub tree: String,
+    pub item_count: usize,
+}
+
+/// Read a folder for attachment. Walks the directory depth-bounded
+/// (caller-supplied `max_depth`), respects `.gitignore` via the same
+/// `ignore` walker as the file list, renders a unicode-tree preview,
+/// and reports the true item count even when the tree is truncated.
+#[tauri::command]
+pub async fn read_folder_for_attachment(
+    absolute_path: String,
+    cwd: Option<String>,
+    max_depth: usize,
+) -> Result<FolderAttachmentInfo, String> {
+    let path = Path::new(&absolute_path);
+    if !path.is_dir() {
+        return Err(format!("not a directory: {absolute_path}"));
+    }
+    let depth = max_depth.max(1);
+
+    let mut entries: Vec<(PathBuf, bool)> = Vec::new();
+    let walker = WalkBuilder::new(path)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .ignore(true)
+        .parents(true)
+        .follow_links(false)
+        .max_depth(Some(depth))
+        .build();
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        // The walker emits the root itself first — skip it; we only
+        // want descendants.
+        if entry.depth() == 0 {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let p = entry.path().to_path_buf();
+        // Skip nested .git contents defensively (gitignore catches the
+        // top-level case, but not always the inner objects on bare repos).
+        let rel = p.strip_prefix(path).unwrap_or(&p);
+        if rel.components().any(|c| {
+            matches!(c, std::path::Component::Normal(s) if s == ".git")
+        }) {
+            continue;
+        }
+        entries.push((p, is_dir));
+    }
+
+    // Sort: directories first, then files; alphabetical within each
+    // group at every depth level.
+    entries.sort_by(|(a, a_dir), (b, b_dir)| {
+        let a_rel = a.strip_prefix(path).unwrap_or(a).to_string_lossy().to_string();
+        let b_rel = b.strip_prefix(path).unwrap_or(b).to_string_lossy().to_string();
+        let a_segments: Vec<&str> = a_rel.split('/').collect();
+        let b_segments: Vec<&str> = b_rel.split('/').collect();
+        let n = a_segments.len().min(b_segments.len());
+        for i in 0..n {
+            let same = a_segments[i] == b_segments[i];
+            if !same {
+                // At this divergence point, prefer dirs over files
+                // only if we're at the LAST segment (the diverged
+                // entries themselves). Otherwise alphabetic.
+                let a_at_end = i + 1 == a_segments.len();
+                let b_at_end = i + 1 == b_segments.len();
+                if a_at_end && b_at_end {
+                    return b_dir.cmp(a_dir).then(a_segments[i].cmp(b_segments[i]));
+                }
+                return a_segments[i].cmp(b_segments[i]);
+            }
+        }
+        a_segments.len().cmp(&b_segments.len())
+    });
+
+    let item_count = entries.len();
+    let tree = render_tree(path, &entries, FOLDER_TREE_MAX_ENTRIES);
+
+    let relative_path = cwd
+        .as_deref()
+        .map(Path::new)
+        .and_then(|c| c.canonicalize().ok())
+        .and_then(|canonical_cwd| {
+            path.canonicalize().ok().and_then(|canonical_path| {
+                canonical_path
+                    .strip_prefix(&canonical_cwd)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().to_string())
+            })
+        });
+
+    Ok(FolderAttachmentInfo {
+        absolute_path,
+        relative_path,
+        tree,
+        item_count,
+    })
+}
+
+/// Render a sorted entry list as a unicode tree. Each line carries
+/// the appropriate `├──`, `└──`, or `│   ` prefix based on its
+/// relationship to siblings at the same depth.
+fn render_tree(root: &Path, entries: &[(PathBuf, bool)], cap: usize) -> String {
+    if entries.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    // For a tree renderer to compute the right prefix at each depth,
+    // we need to know which entries are the LAST in their parent's
+    // child group. Walk the sorted list and, for each entry, find
+    // whether the next entry shares the same parent — if not, this
+    // entry is the last sibling.
+    let mut last_at_depth: Vec<bool> = Vec::with_capacity(entries.len());
+    for i in 0..entries.len() {
+        let (cur, _) = &entries[i];
+        let cur_parent = cur.parent();
+        let mut is_last = true;
+        for j in (i + 1)..entries.len() {
+            let (next, _) = &entries[j];
+            if next.parent() == cur_parent {
+                is_last = false;
+                break;
+            }
+            // If the next entry is deeper than current's parent, keep
+            // scanning — they're descendants of `cur`, not later
+            // siblings.
+            let next_depth = next.iter().count();
+            let parent_depth = cur_parent.map(|p| p.iter().count()).unwrap_or(0);
+            if next_depth <= parent_depth {
+                break;
+            }
+        }
+        last_at_depth.push(is_last);
+    }
+
+    let truncated = entries.len() > cap;
+    let visible = if truncated { &entries[..cap] } else { entries };
+
+    let mut out = Vec::with_capacity(visible.len() + 2);
+    out.push(
+        root.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| root.display().to_string()),
+    );
+
+    // Track the "is this depth's lineage last?" stack so we know when
+    // to draw `│` vs space at each level above the current entry.
+    let mut ancestor_is_last: Vec<bool> = Vec::new();
+
+    for (idx, (entry_path, is_dir)) in visible.iter().enumerate() {
+        let rel = entry_path.strip_prefix(root).unwrap_or(entry_path);
+        let depth = rel.components().count();
+        // Sync the ancestor stack so its length == depth - 1.
+        ancestor_is_last.truncate(depth.saturating_sub(1));
+        while ancestor_is_last.len() < depth.saturating_sub(1) {
+            // Look UP for the immediate parent's last-flag. The parent
+            // is whatever entry has path == rel.parent() prefixed with
+            // root. We can get it by walking back through `visible`.
+            let parent_components = rel.components().count() - 1;
+            let mut parent_last = false;
+            for back in (0..idx).rev() {
+                let (p, _) = &visible[back];
+                let prel = p.strip_prefix(root).unwrap_or(p);
+                if prel.components().count() == parent_components {
+                    parent_last = last_at_depth.get(back).copied().unwrap_or(false);
+                    break;
+                }
+            }
+            ancestor_is_last.push(parent_last);
+        }
+
+        let mut line = String::new();
+        for &anc_last in &ancestor_is_last {
+            line.push_str(if anc_last { "    " } else { "│   " });
+        }
+        let here_last = last_at_depth.get(idx).copied().unwrap_or(false);
+        line.push_str(if here_last { "└── " } else { "├── " });
+        let name = rel
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if *is_dir {
+            line.push_str(&format!("{name}/"));
+        } else {
+            line.push_str(&name);
+        }
+        out.push(line);
+    }
+
+    if truncated {
+        let more = entries.len() - cap;
+        out.push(format!("… {more} more entries"));
+    }
+
+    out.join("\n")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -961,6 +1324,244 @@ mod tests {
     #[allow(dead_code)]
     fn _unused_write_lines_marker(p: &Path, n: usize) {
         write_lines(p, n);
+    }
+
+    // ───── list_project_folders + read_folder_for_attachment (Step 8 Stage 3) ─────
+
+    #[tokio::test]
+    async fn list_project_folders_empty_query_returns_alphabetical_dirs() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = list_project_folders(cwd, None, 50).await.unwrap();
+        let paths: Vec<&str> = out.iter().map(|m| m.path.as_str()).collect();
+        // Distinct directory prefixes derived from the file walk.
+        assert!(paths.contains(&"src"));
+        assert!(paths.contains(&"src/components"));
+        assert!(paths.contains(&"src/components/chat"));
+        assert!(paths.contains(&"src/lib"));
+        // node_modules is gitignored — its dir prefix MUST NOT appear.
+        assert!(!paths.iter().any(|p| p.contains("node_modules")));
+        // Sorted alphabetically.
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted);
+        // Empty-query returns score = 0.
+        assert!(out.iter().all(|m| m.score == 0));
+    }
+
+    #[tokio::test]
+    async fn list_project_folders_fuzzy_query_ranks_match_high() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = list_project_folders(cwd, Some("chat".into()), 10)
+            .await
+            .unwrap();
+        assert!(!out.is_empty(), "expected at least one folder match");
+        let top: Vec<&str> = out.iter().take(3).map(|m| m.path.as_str()).collect();
+        assert!(
+            top.iter().any(|p| p.contains("chat")),
+            "expected a `chat` folder in top 3, got {top:?}"
+        );
+        assert!(out.iter().any(|m| m.score > 0));
+    }
+
+    #[tokio::test]
+    async fn list_project_folders_item_count_reflects_immediate_children() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = list_project_folders(cwd, Some("chat".into()), 10)
+            .await
+            .unwrap();
+        let chat = out
+            .iter()
+            .find(|m| m.path == "src/components/chat")
+            .expect("src/components/chat should be in results");
+        // seed_project drops Composer.tsx + AttachmentChip.tsx into chat/.
+        assert_eq!(chat.item_count, 2);
+    }
+
+    #[tokio::test]
+    async fn list_project_folders_returns_empty_for_nonexistent_cwd() {
+        let out = list_project_folders(
+            "/this/path/does/not/exist/codemux-folders".into(),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_project_folders_excludes_root_entry() {
+        let dir = tempdir().unwrap();
+        seed_project(dir.path());
+        let cwd = dir.path().to_string_lossy().to_string();
+        let out = list_project_folders(cwd, None, 50).await.unwrap();
+        // The root ("") is filtered out — users don't pick the root
+        // through the popup.
+        assert!(out.iter().all(|m| !m.path.is_empty()));
+    }
+
+    fn seed_folder_tree(root: &Path) {
+        // A small tree with predictable depth-1 and depth-2 entries.
+        // Walker should pick up these and render in the right order
+        // (dirs first, then files; alphabetical within group).
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::create_dir_all(root.join("c")).unwrap();
+        fs::write(root.join("a/x.txt"), "x").unwrap();
+        fs::write(root.join("a/b/deep.txt"), "deep").unwrap();
+        fs::write(root.join("c/y.txt"), "y").unwrap();
+        fs::write(root.join("z.txt"), "z").unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_folder_renders_unicode_tree() {
+        let dir = tempdir().unwrap();
+        seed_folder_tree(dir.path());
+        let info = read_folder_for_attachment(
+            dir.path().to_string_lossy().to_string(),
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        // Header is the directory name; descendants follow.
+        let lines: Vec<&str> = info.tree.lines().collect();
+        assert!(!lines.is_empty());
+        // Each non-header line carries one of the box-drawing prefixes.
+        for line in &lines[1..] {
+            assert!(
+                line.contains("├──") || line.contains("└──") || line.contains("│"),
+                "tree line missing box-drawing prefix: {line}"
+            );
+        }
+        // Top-level entries appear: a/, c/, z.txt.
+        assert!(info.tree.contains("a/"));
+        assert!(info.tree.contains("c/"));
+        assert!(info.tree.contains("z.txt"));
+        // Depth-2 entries appear because max_depth=2.
+        assert!(info.tree.contains("x.txt"));
+        assert!(info.tree.contains("y.txt"));
+        assert!(info.tree.contains("b/"));
+        // Depth-3 deep.txt should NOT appear (b/ is depth 2; deep.txt is depth 3).
+        assert!(
+            !info.tree.contains("deep.txt"),
+            "depth-3 entry leaked into depth-2 tree"
+        );
+        assert!(info.item_count > 0);
+    }
+
+    #[tokio::test]
+    async fn read_folder_respects_max_depth_one() {
+        let dir = tempdir().unwrap();
+        seed_folder_tree(dir.path());
+        let info = read_folder_for_attachment(
+            dir.path().to_string_lossy().to_string(),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        // Only depth-1 entries: a/, c/, z.txt. Depth-2 children
+        // x.txt, y.txt, b/ shouldn't appear.
+        assert!(info.tree.contains("a/"));
+        assert!(info.tree.contains("z.txt"));
+        assert!(!info.tree.contains("x.txt"));
+        assert!(!info.tree.contains("b/"));
+    }
+
+    #[tokio::test]
+    async fn read_folder_truncates_at_100_entries() {
+        let dir = tempdir().unwrap();
+        for i in 0..150 {
+            fs::write(dir.path().join(format!("file_{i:03}.txt")), "x").unwrap();
+        }
+        let info = read_folder_for_attachment(
+            dir.path().to_string_lossy().to_string(),
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.item_count, 150);
+        assert!(
+            info.tree.contains("more entries"),
+            "truncation marker missing: tree starts with {}",
+            info.tree.lines().next().unwrap_or("")
+        );
+        // The "more" line wraps the truncated count.
+        assert!(info.tree.contains("50 more"));
+    }
+
+    #[tokio::test]
+    async fn read_folder_empty_returns_empty_marker() {
+        let dir = tempdir().unwrap();
+        let info = read_folder_for_attachment(
+            dir.path().to_string_lossy().to_string(),
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.item_count, 0);
+        assert!(info.tree.contains("(empty)"));
+    }
+
+    #[tokio::test]
+    async fn read_folder_errors_on_non_directory() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("notadir.txt");
+        fs::write(&f, "x").unwrap();
+        let err = read_folder_for_attachment(
+            f.to_string_lossy().to_string(),
+            None,
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
+
+    #[tokio::test]
+    async fn read_folder_returns_relative_path_when_under_cwd() {
+        let dir = tempdir().unwrap();
+        let nested = dir.path().join("a/b");
+        fs::create_dir_all(&nested).unwrap();
+        let info = read_folder_for_attachment(
+            nested.to_string_lossy().to_string(),
+            Some(dir.path().to_string_lossy().to_string()),
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.relative_path.as_deref(), Some("a/b"));
+    }
+
+    #[tokio::test]
+    async fn read_folder_respects_gitignore() {
+        let dir = tempdir().unwrap();
+        // The `ignore` crate activates .gitignore parsing only when a
+        // .git directory exists in the tree (otherwise .gitignore is
+        // dormant). Mirroring `seed_project`, create a stub .git so
+        // the walker recognises this tempdir as a git repo.
+        fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        fs::write(dir.path().join("node_modules/foo.js"), "x").unwrap();
+        fs::write(dir.path().join("real.txt"), "x").unwrap();
+        fs::write(dir.path().join(".gitignore"), "node_modules\n").unwrap();
+        let info = read_folder_for_attachment(
+            dir.path().to_string_lossy().to_string(),
+            None,
+            2,
+        )
+        .await
+        .unwrap();
+        assert!(!info.tree.contains("node_modules"));
+        assert!(info.tree.contains("real.txt"));
     }
 
     #[tokio::test]
