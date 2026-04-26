@@ -114,6 +114,10 @@ pub struct SessionRuntime {
     pub writer: Option<Box<dyn Write + Send>>,
     pub master: Option<Box<dyn MasterPty + Send>>,
     pub output_channel: Option<Channel<Vec<u8>>>,
+    /// Monotonic generation for the currently installed output channel.
+    /// Incremented on attach/detach so a failed send from an old cloned
+    /// channel cannot clear a newer channel that attached concurrently.
+    pub output_channel_generation: u64,
     pub pending_output: VecDeque<Vec<u8>>,
     /// Cumulative count of chunks evicted from `pending_output` because the
     /// buffer hit `OUTPUT_BUFFER_LIMIT` while no consumer was attached. With
@@ -144,6 +148,7 @@ impl SessionRuntime {
             writer: None,
             master: None,
             output_channel: None,
+            output_channel_generation: 0,
             pending_output: VecDeque::new(),
             dropped_chunks: 0,
             last_status: TerminalStatusPayload {
@@ -385,7 +390,7 @@ fn queue_or_send_output(
     session_id: &str,
     chunk: Vec<u8>,
 ) {
-    with_session_runtime(
+    let channel_to_send = with_session_runtime(
         sessions,
         session_id,
         || SessionRuntime::new(session_id),
@@ -393,29 +398,48 @@ fn queue_or_send_output(
             runtime.pending_output.push_back(chunk.clone());
             while runtime.pending_output.len() > OUTPUT_BUFFER_LIMIT {
                 runtime.pending_output.pop_front();
-                let dropped = runtime.dropped_chunks.saturating_add(1);
-                runtime.dropped_chunks = dropped;
-                // Log on the first drop and then on each power-of-two boundary
-                // so a chatty regression doesn't spam stderr but is still
-                // discoverable. A single line is enough — the count is the
-                // signal; the rest is in the bug.
-                if dropped == 1 || dropped.is_power_of_two() {
-                    eprintln!(
-                        "[codemux::terminal] session={session_id} dropped pending_output \
-                         chunk (cumulative={dropped}). Indicates the frontend was \
-                         detached when the buffer overflowed."
-                    );
+                if runtime.output_channel.is_none() {
+                    let dropped = runtime.dropped_chunks.saturating_add(1);
+                    runtime.dropped_chunks = dropped;
+                    // Log on the first drop and then on each power-of-two boundary
+                    // so a chatty regression doesn't spam stderr but is still
+                    // discoverable. A single line is enough — the count is the
+                    // signal; the rest is in the bug.
+                    if dropped == 1 || dropped.is_power_of_two() {
+                        eprintln!(
+                            "[codemux::terminal] session={session_id} dropped pending_output \
+                             chunk (cumulative={dropped}). Indicates the frontend was \
+                             detached when the buffer overflowed."
+                        );
+                    }
                 }
             }
 
-            if let Some(channel) = runtime.output_channel.clone() {
-                if let Err(error) = channel.send(chunk) {
-                    eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
-                    runtime.output_channel = None;
-                }
-            }
+            runtime
+                .output_channel
+                .clone()
+                .map(|channel| (channel, runtime.output_channel_generation))
         },
     );
+
+    let Some((channel, generation)) = channel_to_send else {
+        return;
+    };
+
+    // Tauri IPC delivery can be slower than the in-memory bookkeeping above,
+    // especially when the WebView is busy parsing terminal output. Never hold
+    // the global sessions mutex while sending, otherwise active keystrokes
+    // (`write_to_pty`) block behind unrelated PTY output from other sessions.
+    if let Err(error) = channel.send(chunk) {
+        eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
+        with_existing_session_runtime(sessions, session_id, |runtime| {
+            if runtime.output_channel_generation == generation {
+                runtime.output_channel = None;
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+            }
+        });
+    }
 }
 
 /// Flush accumulated PTY output as a single batched chunk.
@@ -1562,6 +1586,8 @@ pub fn attach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = Some(channel.clone());
+            runtime.output_channel_generation =
+                runtime.output_channel_generation.saturating_add(1);
             if skip_pending.unwrap_or(false) {
                 vec![]
             } else {
@@ -1599,6 +1625,8 @@ pub fn detach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = None;
+            runtime.output_channel_generation =
+                runtime.output_channel_generation.saturating_add(1);
         },
     );
 
@@ -2809,6 +2837,8 @@ mod tests {
             || SessionRuntime::new("replay"),
             |runtime| {
                 runtime.output_channel = Some(channel.clone());
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
                 runtime.pending_output.iter().cloned().collect::<Vec<_>>()
             },
         );
@@ -2831,8 +2861,8 @@ mod tests {
     /// session lifetime. Once attached, every subsequent chunk produced by
     /// the reader thread (modeled here as direct `queue_or_send_output`
     /// calls) is forwarded to the consumer immediately. The pending_output
-    /// buffer is the cold-start replay window only — it must not grow once
-    /// a live channel is installed.
+    /// buffer remains a bounded replay window; live delivery is separate and
+    /// must not count normal ring-buffer eviction as dropped frontend output.
     #[test]
     fn test_attached_channel_receives_live_writes() {
         use std::sync::Mutex as StdMutex;
@@ -2858,18 +2888,20 @@ mod tests {
             || SessionRuntime::new("live"),
             |runtime| {
                 runtime.output_channel = Some(channel);
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
             },
         );
 
         // Drive the same path the reader thread uses for each batched flush.
-        for i in 0..20u8 {
-            queue_or_send_output(&sessions, "live", vec![i]);
+        for i in 0..OUTPUT_BUFFER_LIMIT + 5 {
+            queue_or_send_output(&sessions, "live", vec![i as u8]);
         }
 
         let received = captured.lock().unwrap().clone();
         assert_eq!(
             received.len(),
-            20,
+            OUTPUT_BUFFER_LIMIT + 5,
             "channel should receive every chunk synchronously when attached"
         );
         for (i, chunk) in received.iter().enumerate() {
@@ -2886,7 +2918,48 @@ mod tests {
         assert!(runtime.pending_output.len() <= OUTPUT_BUFFER_LIMIT);
         assert_eq!(
             runtime.dropped_chunks, 0,
-            "no drops with channel attached and buffer well under limit"
+            "bounded replay eviction is not dropped live output while channel is attached"
+        );
+    }
+
+    #[test]
+    fn test_attached_channel_send_happens_outside_sessions_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "live-lock",
+            || SessionRuntime::new("live-lock"),
+            |_| {},
+        );
+
+        let send_observed_unlocked_mutex = Arc::new(AtomicBool::new(false));
+        let observed = send_observed_unlocked_mutex.clone();
+        let sessions_for_handler = sessions.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |_| {
+            if sessions_for_handler.try_lock().is_ok() {
+                observed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+
+        with_session_runtime(
+            &sessions,
+            "live-lock",
+            || SessionRuntime::new("live-lock"),
+            |runtime| {
+                runtime.output_channel = Some(channel);
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+            },
+        );
+
+        queue_or_send_output(&sessions, "live-lock", vec![42]);
+
+        assert!(
+            send_observed_unlocked_mutex.load(Ordering::SeqCst),
+            "channel.send must not run while the global sessions mutex is held"
         );
     }
 

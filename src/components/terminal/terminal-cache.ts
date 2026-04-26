@@ -11,41 +11,31 @@
  * the session ends (close button, workspace delete, app shutdown).
  *
  * Park / activate semantics: workspace switches reparent the wrapper into a
- * hidden parking node but NEVER call term.dispose(). While parked, the PTY
- * channel keeps streaming bytes from Rust — but instead of writing each chunk
- * straight into xterm (which would parse ANSI for an invisible buffer and
- * also drag the WebGL context along), we accumulate bytes in
- * `pendingParkedBytes`. The kitty keyboard state machine still ticks at
- * receive time so the per-PTY kitty stack stays in sync with the agent.
+ * hidden parking node but NEVER call term.dispose(). Unlike the first
+ * v0.1.30 persistence implementation, parking DOES detach the PTY output
+ * channel so hidden workspaces do not keep pushing bytes through Tauri IPC
+ * and xterm parsing on the renderer main thread. On activate we reattach the
+ * channel and Rust replays pending_output into the SAME xterm instance, so
+ * mode flags / cursor / alt-screen state still advance from the correct prior
+ * state instead of replaying into a fresh terminal.
  *
- * On reactivate (attachToContainer when transitioning out of `parked`), we
- * concatenate the buffered bytes into a single terminal.write — xterm
- * processes them in order, so the final visible state is identical to what
- * you would see if writes had happened live. We also reload the WebGL addon
- * which we disposed on park (browsers cap concurrent WebGL contexts at ~16;
- * leaving them alive on every parked terminal is the typing-lag cliff this
- * caching strategy fell into in 0.1.30).
- *
- * Buffer cap: PARKED_BUFFER_CAP guards against pathological agents that
- * dump megabytes while the workspace sits parked. On overflow we drop the
- * oldest chunk — xterm's scrollback would discard those lines anyway and a
- * TUI repaint on next user interaction reconciles any lost frames.
+ * Phantom query replies (the `?62;...` glitch class that 0.1.30 was working
+ * around) are prevented at the xterm parser layer via suppressQueryResponses()
+ * — see ./query-suppression.ts.
  *
  * Design references:
- * - /tmp/terminal-rendering-analysis.md §5.1 (xterm-instance-lifetime split)
+ * - v0.1.29 TerminalPane: detach PTY output on unmount for low input latency
  * - Superset's apps/desktop/.../v1-terminal-cache.ts: same wrapper-div pattern
- *   for the same reason. We do not transplant; we reimplement for our React
- *   + Tauri stack.
  */
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
-import { WebglAddon } from "@xterm/addon-webgl";
 import {
   writeToPty,
   attachPtyOutput,
+  detachPtyOutput,
   getTerminalScrollback,
   cacheTerminalScrollback,
   uncacheTerminalScrollback,
@@ -60,19 +50,28 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
+import { suppressQueryResponses } from "./query-suppression";
 
 const PARKING_NODE_ID = "codemux-terminal-parking";
 
 /**
- * Cap (in bytes) on how much PTY output we'll buffer for a single parked
- * terminal before we start dropping the oldest chunk. 16 MB is enormously
- * larger than any practical TUI redraw cycle yet small enough that a
- * runaway agent can't OOM the renderer process.
- *
- * Tunable via _setParkedBufferCapForTest from tests; runtime callers should
- * never touch it. Module-level `let` (not const) only for that reason.
+ * One shared TextDecoder for every channel callback for every session.
+ * Allocating a fresh `new TextDecoder()` per chunk was measurable main-thread
+ * overhead under load. With `stream: false` (the default for `decode()`),
+ * each call is independent — no cross-call state to worry about.
  */
-let PARKED_BUFFER_CAP = 16 * 1024 * 1024;
+const SHARED_DECODER = new TextDecoder("utf-8", { fatal: false });
+
+function maybeKittyOrDA(data: Uint8Array): boolean {
+  const last = data.length - 2;
+  for (let i = 0; i < last; i++) {
+    if (data[i] === 0x1b && data[i + 1] === 0x5b) {
+      const c = data[i + 2];
+      if (c === 0x3e || c === 0x3c || c === 0x3f || c === 0x63) return true;
+    }
+  }
+  return false;
+}
 
 export interface TerminalCreateOptions {
   paneId: string | null;
@@ -89,37 +88,29 @@ export interface CachedTerminal {
   fitAddon: FitAddon;
   serializeAddon: SerializeAddon;
   unicode11Addon: Unicode11Addon;
-  webglAddon: WebglAddon | null;
   /** Last cols/rows pushed to the backend; used for resize no-op detection. */
   lastDims: { cols: number; rows: number };
   /** Latest pane ID this session is rendered under. Updated on each attach
    *  because the custom key handler (interrupt-clears) consults pane status. */
   paneId: string | null;
-  /** Cleared by disposeTerminal so RAFs queued from the channel callback
-   *  short-circuit instead of writing into a disposed Terminal. */
+  /** Cleared by disposeTerminal so a late channel callback short-circuits
+   *  instead of writing into a disposed Terminal. */
   disposed: boolean;
-  /** True when the wrapper has been moved to the parking node and the entry
-   *  should buffer PTY bytes instead of writing them. Flipped by
-   *  detachFromContainer / attachToContainer. */
+  /** True when the wrapper has been moved to the parking node. Bytes still
+   *  flow into xterm regardless — this is purely a DOM-location signal. */
   parked: boolean;
-  /** Frame ID for the pending PTY-write batch (only used while not parked). */
-  ptyWriteFrame: number | null;
-  pendingPtyWrites: Uint8Array[];
-  /** Bytes received from the PTY while parked, awaiting drain on next
-   *  attachToContainer. Capped at PARKED_BUFFER_CAP bytes total — see the
-   *  module header. */
-  pendingParkedBytes: Uint8Array[];
-  pendingParkedSize: number;
-  /** Set whenever enqueueParkedBytes had to drop a chunk because the cap was
-   *  exceeded. Logged on drain so a regression in the cap surfaces in
-   *  devtools instead of silently shaving lines off scrollback. */
-  parkedOverflow: boolean;
+  /** True after Rust has a live output_channel for this session. */
+  outputAttached: boolean;
+  /** In-flight attach promise to avoid duplicate attach_pty_output calls. */
+  outputAttachPromise: Promise<void> | null;
+  /** Incremented on detach/dispose so stale async attach completions are ignored. */
+  outputAttachEpoch: number;
   /** Kitty keyboard protocol stack (push/pop/reset).
    *  Stays per-session because the agent-side stack is per-PTY. */
   kittyStack: number[];
   kittyLevel: number;
   /** Disposers for resources the cache owns (input handler, serialize
-   *  registration). Called from disposeTerminal. */
+   *  registration, query-suppression handlers). Called from disposeTerminal. */
   cleanups: Array<() => void>;
 }
 
@@ -161,142 +152,9 @@ function extractBytes(payload: unknown): Uint8Array | null {
   return null;
 }
 
-/**
- * Load the WebGL renderer onto an open xterm. Safe no-op if it's already
- * loaded. Failure to load (jsdom, no GPU, blocked context) is swallowed —
- * xterm falls back to its DOM renderer transparently.
- */
-function loadWebglAddon(entry: CachedTerminal): void {
-  if (entry.webglAddon || entry.disposed) return;
-  try {
-    const addon = new WebglAddon();
-    addon.onContextLoss(() => {
-      try {
-        addon.dispose();
-      } catch {
-        // ignore — context-loss already torpedoed it
-      }
-      if (entry.webglAddon === addon) entry.webglAddon = null;
-    });
-    entry.terminal.loadAddon(addon);
-    entry.webglAddon = addon;
-  } catch (err) {
-    console.warn(
-      "[Codemux] WebGL renderer unavailable, falling back to DOM",
-      err,
-    );
-    entry.webglAddon = null;
-  }
-}
-
-/**
- * Tear down the WebGL renderer. Called on park (so the GPU context is freed
- * for the active workspace's terminals) and on dispose. xterm reverts to its
- * DOM renderer automatically.
- */
-function unloadWebglAddon(entry: CachedTerminal): void {
-  if (!entry.webglAddon) return;
-  try {
-    entry.webglAddon.dispose();
-  } catch (err) {
-    console.error("[Codemux] webgl dispose failed", err);
-  }
-  entry.webglAddon = null;
-}
-
-/**
- * Append a PTY chunk to the parked buffer, dropping the oldest chunks if the
- * total would exceed PARKED_BUFFER_CAP. Sets parkedOverflow on first drop so
- * drainParkedBytes can warn.
- */
-function enqueueParkedBytes(entry: CachedTerminal, bytes: Uint8Array): void {
-  entry.pendingParkedBytes.push(bytes);
-  entry.pendingParkedSize += bytes.length;
-  while (
-    entry.pendingParkedSize > PARKED_BUFFER_CAP &&
-    entry.pendingParkedBytes.length > 1
-  ) {
-    const dropped = entry.pendingParkedBytes.shift();
-    if (!dropped) break;
-    entry.pendingParkedSize -= dropped.length;
-    entry.parkedOverflow = true;
-  }
-}
-
-/**
- * Concatenate every buffered chunk into one Uint8Array and write it to xterm
- * in a single call. xterm's parser handles large batched writes far better
- * than many small ones — this is the whole point of the buffer.
- *
- * No-op when the queue is empty.
- */
-function drainParkedBytes(entry: CachedTerminal): void {
-  // Defensive re-check: disposeTerminal could have been invoked between
-  // attachToContainer's top-of-function disposed guard and now (e.g. the
-  // terminal-cache GC reacting to a session vanishing from app-state). xterm
-  // throws on write-after-dispose, so bail before we do that.
-  if (entry.disposed) return;
-  if (entry.pendingParkedBytes.length === 0) {
-    entry.parkedOverflow = false;
-    return;
-  }
-  const totalLen = entry.pendingParkedSize;
-  const combined = new Uint8Array(totalLen);
-  let offset = 0;
-  for (const chunk of entry.pendingParkedBytes) {
-    combined.set(chunk, offset);
-    offset += chunk.length;
-  }
-  const overflowed = entry.parkedOverflow;
-  entry.pendingParkedBytes = [];
-  entry.pendingParkedSize = 0;
-  entry.parkedOverflow = false;
-  entry.terminal.write(combined);
-  if (overflowed) {
-    console.warn(
-      `[Codemux] parked terminal ${entry.sessionId} exceeded buffer cap; oldest scrollback dropped`,
-    );
-  }
-}
-
-function flushPtyWrites(entry: CachedTerminal) {
-  entry.ptyWriteFrame = null;
-  if (entry.disposed) return;
-  // Defensive: detachFromContainer cancels the queued RAF, but if the cancel
-  // raced with an already-running frame (rare — single-threaded JS makes
-  // this hard) we'd otherwise write into a parked terminal whose WebGL
-  // context has been torn down. Move the bytes into the parked queue so the
-  // next reactivate still drains them.
-  if (entry.parked) {
-    if (entry.pendingPtyWrites.length > 0) {
-      for (const chunk of entry.pendingPtyWrites) {
-        enqueueParkedBytes(entry, chunk);
-      }
-      entry.pendingPtyWrites = [];
-    }
-    return;
-  }
-  const pending = entry.pendingPtyWrites;
-  if (pending.length === 0) return;
-
-  if (pending.length === 1) {
-    entry.terminal.write(pending[0]);
-  } else {
-    let totalLen = 0;
-    for (const chunk of pending) totalLen += chunk.length;
-    const combined = new Uint8Array(totalLen);
-    let offset = 0;
-    for (const chunk of pending) {
-      combined.set(chunk, offset);
-      offset += chunk.length;
-    }
-    entry.terminal.write(combined);
-  }
-  entry.pendingPtyWrites = [];
-}
-
 function scanKittyProtocol(entry: CachedTerminal, data: Uint8Array) {
-  const decoded = new TextDecoder("utf-8", { fatal: false }).decode(data);
+  if (!maybeKittyOrDA(data)) return;
+  const decoded = SHARED_DECODER.decode(data);
   const scan = scanKittySequences(decoded);
 
   if (scan.hasQuery) {
@@ -407,24 +265,20 @@ function createCachedTerminal(
     fitAddon,
     serializeAddon,
     unicode11Addon,
-    webglAddon: null,
     lastDims: { cols: 0, rows: 0 },
     paneId: options.paneId,
     disposed: false,
-    parked: false,
-    ptyWriteFrame: null,
-    pendingPtyWrites: [],
-    pendingParkedBytes: [],
-    pendingParkedSize: 0,
-    parkedOverflow: false,
+    parked: true,
+    outputAttached: false,
+    outputAttachPromise: null,
+    outputAttachEpoch: 0,
     kittyStack: [],
     kittyLevel: 0,
     cleanups: [],
   };
 
-  // Cold-start WebGL load. Done after the entry exists so the load helper
-  // can store the addon onto entry.webglAddon directly.
-  loadWebglAddon(entry);
+  const cleanupQuerySuppression = suppressQueryResponses(terminal);
+  entry.cleanups.push(cleanupQuerySuppression);
 
   // ── User input handler ──
   // Stable: sessionId never changes for a given cache entry.
@@ -459,11 +313,15 @@ function createCachedTerminal(
 }
 
 /**
- * Wire up the PTY → xterm channel for a freshly-created cache entry. This
- * runs once per session (cold start). Stays attached for the entire session
- * lifetime — workspace switches do NOT detach.
+ * Wire up the PTY → xterm channel while the terminal is visible. Hidden panes
+ * detach the backend channel to preserve v0.1.29 input latency; reattach uses
+ * Rust's pending_output replay and writes into the same xterm instance.
  */
 async function attachPtyChannel(entry: CachedTerminal): Promise<void> {
+  if (entry.disposed || entry.outputAttached) return;
+  if (entry.outputAttachPromise) return entry.outputAttachPromise;
+
+  const epoch = entry.outputAttachEpoch;
   const channel = new Channel<unknown>((payload) => {
     if (entry.disposed) return;
     const bytes = extractBytes(payload);
@@ -472,16 +330,37 @@ async function attachPtyChannel(entry: CachedTerminal): Promise<void> {
     // the input handler reads kittyLevel synchronously on every keystroke and
     // a stale stack would send the wrong CSI-u sequences.
     scanKittyProtocol(entry, bytes);
-    if (entry.parked) {
-      enqueueParkedBytes(entry, bytes);
-      return;
-    }
-    entry.pendingPtyWrites.push(bytes);
-    if (entry.ptyWriteFrame === null) {
-      entry.ptyWriteFrame = requestAnimationFrame(() => flushPtyWrites(entry));
-    }
+    // Write straight into xterm regardless of mount state. xterm.js's parser
+    // consumes bytes into its internal buffer and doesn't paint when the
+    // wrapper is detached.
+    entry.terminal.write(bytes);
   });
-  await attachPtyOutput(entry.sessionId, channel);
+
+  const promise = attachPtyOutput(entry.sessionId, channel)
+    .then(() => {
+      if (entry.disposed || entry.outputAttachEpoch !== epoch) {
+        detachPtyOutput(entry.sessionId).catch(console.error);
+        return;
+      }
+      entry.outputAttached = true;
+    })
+    .finally(() => {
+      if (entry.outputAttachPromise === promise) {
+        entry.outputAttachPromise = null;
+      }
+    });
+
+  entry.outputAttachPromise = promise;
+  return promise;
+}
+
+function detachPtyChannel(entry: CachedTerminal): void {
+  entry.outputAttachEpoch += 1;
+  const shouldDetach = entry.outputAttached || entry.outputAttachPromise !== null;
+  entry.outputAttached = false;
+  if (shouldDetach) {
+    detachPtyOutput(entry.sessionId).catch(console.error);
+  }
 }
 
 /**
@@ -577,15 +456,10 @@ export function attachToContainer(
     containerEl.appendChild(entry.wrapperEl);
   }
 
-  // Transitioning out of parked: reload WebGL (we dropped the GPU context on
-  // detach) and drain the buffered PTY bytes into a single xterm.write so the
-  // visible frame catches up to the live stream.
-  const wasParked = entry.parked;
   entry.parked = false;
-  if (wasParked) {
-    loadWebglAddon(entry);
-    drainParkedBytes(entry);
-  }
+  attachPtyChannel(entry).catch((err) => {
+    console.error(`Failed to attach terminal output for ${sessionId}:`, err);
+  });
 
   const { clientWidth, clientHeight } = containerEl;
   if (clientWidth > 0 && clientHeight > 0) {
@@ -595,37 +469,21 @@ export function attachToContainer(
 }
 
 /**
- * Reparent the wrapperEl back to the parking node and put the entry into
- * parked mode: PTY bytes will be buffered (not written to xterm) and the
- * WebGL renderer is torn down to free the GPU context.
- *
- * Any pending RAF batch is canceled and its bytes migrated into the parked
- * queue so we don't lose output mid-flush.
+ * Reparent the wrapperEl back to the parking node and detach the PTY output
+ * channel. xterm stays alive; Rust buffers output until the next attach.
  *
  * Idempotent — calling on an already-parked entry is a no-op.
  */
 export function detachFromContainer(sessionId: string): void {
   const entry = cache.get(sessionId);
   if (!entry || entry.disposed) return;
-  if (entry.parked) return;
+  if (entry.parked) {
+    detachPtyChannel(entry);
+    return;
+  }
 
   entry.parked = true;
-
-  // Cancel the in-flight RAF; its bytes have to go into the parked queue
-  // because once we unload WebGL we don't want them rendered until reactivate.
-  if (entry.ptyWriteFrame !== null) {
-    cancelAnimationFrame(entry.ptyWriteFrame);
-    entry.ptyWriteFrame = null;
-  }
-  if (entry.pendingPtyWrites.length > 0) {
-    for (const chunk of entry.pendingPtyWrites) {
-      enqueueParkedBytes(entry, chunk);
-    }
-    entry.pendingPtyWrites = [];
-  }
-
-  unloadWebglAddon(entry);
-
+  detachPtyChannel(entry);
   const parking = ensureParkingNode();
   if (entry.wrapperEl.parentElement !== parking) {
     parking.appendChild(entry.wrapperEl);
@@ -656,15 +514,7 @@ export function disposeTerminal(sessionId: string): void {
 
   entry.disposed = true;
   cache.delete(sessionId);
-
-  if (entry.ptyWriteFrame !== null) {
-    cancelAnimationFrame(entry.ptyWriteFrame);
-    entry.ptyWriteFrame = null;
-  }
-  entry.pendingPtyWrites = [];
-  entry.pendingParkedBytes = [];
-  entry.pendingParkedSize = 0;
-  entry.parkedOverflow = false;
+  detachPtyChannel(entry);
 
   for (const cleanup of entry.cleanups) {
     try {
@@ -674,11 +524,6 @@ export function disposeTerminal(sessionId: string): void {
     }
   }
   entry.cleanups = [];
-
-  // Drop the WebGL context before tearing down the terminal so the GPU
-  // resource is released even if terminal.dispose's internal addon cleanup
-  // misses it.
-  unloadWebglAddon(entry);
 
   try {
     entry.terminal.dispose();
@@ -721,13 +566,4 @@ export function peekCachedTerminal(sessionId: string): CachedTerminal | null {
 /** Test-only helper: count of live cache entries. */
 export function _cacheSize(): number {
   return cache.size;
-}
-
-/**
- * Test-only helper: override the parked-buffer cap so overflow behavior can
- * be exercised without pumping 16 MB through a mock channel. Pass null to
- * restore the production default.
- */
-export function _setParkedBufferCapForTest(cap: number | null): void {
-  PARKED_BUFFER_CAP = cap ?? 16 * 1024 * 1024;
 }

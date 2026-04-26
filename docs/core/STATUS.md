@@ -18,7 +18,7 @@ The repo structure is clean and domain-split:
 ## Solid — Daily-Drivable Features
 
 - Workspace shell, sidebar, workspace sections with color coding and drag-drop
-- Multi-session terminals with xterm.js, WebGL rendering, kitty protocol
+- Multi-session terminals with xterm.js, DOM rendering, kitty protocol
 - Tab bar with terminal, browser, editor, and diff tab types
 - Pane splits, resize, drag-swap, close
 - Git worktree-based workspaces (create from new/existing branch, import orphans)
@@ -106,7 +106,7 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - App shell: shadcn Sidebar with collapsible workspace sections, tab bar, right panel
 - Workspace list from real Tauri backend data (zustand + app-state-changed events)
-- Terminal panes with xterm.js + WebGL renderer + PTY via Tauri Channel
+- Terminal panes with xterm.js DOM renderer + PTY via Tauri Channel
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
 - Right panel with Changes panel, File tree, and PR panel tabs
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph

@@ -8,11 +8,11 @@
 
 ## What This Feature Is
 
-The terminal system provides multi-session PTY terminals rendered with xterm.js and WebGL. Every terminal tab is a real pseudoterminal spawned by the Rust backend, with data streamed to the React frontend via Tauri channels.
+The terminal system provides multi-session PTY terminals rendered with xterm.js. Every terminal tab is a real pseudoterminal spawned by the Rust backend, with data streamed to the React frontend via Tauri channels.
 
 ## Current Model
 
-The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a master PTY handle, a read thread, and a write path. The frontend uses xterm.js with the WebGL renderer for GPU-accelerated display. Data flows: PTY read thread -> Tauri channel -> xterm.js write. User input flows: xterm.js onData -> Tauri command `write_to_pty` -> PTY master write.
+The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a master PTY handle, a read thread, and a write path. The frontend uses xterm.js's DOM renderer for display, matching the pre-`v0.1.30` latency profile. Data flows: PTY read thread -> Tauri channel -> xterm.js write. User input flows: xterm.js onData -> Tauri command `write_to_pty` -> PTY master write. PTY output delivery clones the Tauri channel under the session lock and sends outside that lock, so active keystrokes do not block behind IPC delivery for busy terminals.
 
 ### Terminal Pane Persistence
 
@@ -29,7 +29,7 @@ Disposal is driven by `useTerminalCacheGc` in `src/hooks/use-terminal-cache-gc.t
   - **Unix**: respects `$SHELL` and falls back to `/bin/bash`
   - **Windows**: prefers `pwsh.exe` (PowerShell 7+) when on `PATH`, falls back to `powershell.exe` (Windows PowerShell 5.1, pre-installed on every supported Windows version), then `%COMSPEC%`, then literal `"cmd.exe"`. PowerShell wins because the Windows preset wrappers emit PowerShell `$env:VAR` syntax for context injection — see `agent_context.rs` and `docs/features/presets.md`
 - PTY resize on pane/window resize
-- xterm.js WebGL renderer with kitty keyboard protocol support
+- xterm.js renderer with kitty keyboard protocol support
 - terminal theme reads dynamically from CSS variables via MutationObserver
 - session state tracking (running, exited, error)
 - environment injection: `CODEMUX`, `CODEMUX_VERSION`, `CODEMUX_WORKSPACE_ID`, `CODEMUX_BROWSER_CMD`, `BROWSER`, `CODEMUX_AGENT_CONTEXT`

@@ -18,9 +18,8 @@ import { Terminal } from "@xterm/xterm";
 //
 // `attachPtyOutput` records the channel's handler keyed by sessionId so tests
 // can drive bytes into the cache via `__test_emitChannelBytes(sid, bytes)`.
-// This is the only way to exercise the parked-buffer / drain code paths
-// because the channel object the cache constructs is otherwise opaque to
-// callers.
+// This is the only way to exercise the PTY-output routing path because the
+// channel object the cache constructs is otherwise opaque to callers.
 vi.mock("@/tauri/commands", () => {
   type Handler = (payload: unknown) => void;
   const handlers = new Map<string, Handler>();
@@ -43,6 +42,9 @@ vi.mock("@/tauri/commands", () => {
         handlers.set(sid, lastConstructedHandler);
         lastConstructedHandler = null;
       }
+    }),
+    detachPtyOutput: vi.fn().mockImplementation(async (sid: string) => {
+      handlers.delete(sid);
     }),
     getTerminalScrollback: vi.fn().mockResolvedValue(null),
     cacheTerminalScrollback: vi.fn().mockResolvedValue(undefined),
@@ -113,7 +115,6 @@ import {
   peekCachedTerminal,
   applyThemeToAllTerminals,
   _cacheSize,
-  _setParkedBufferCapForTest,
 } from "./terminal-cache";
 import * as commands from "@/tauri/commands";
 
@@ -139,7 +140,6 @@ describe("terminal-cache", () => {
     // is body-mounted on first use; we wipe the body to drop it.
     document.body.innerHTML = "";
     resetChannels();
-    _setParkedBufferCapForTest(null);
   });
 
   it("getOrCreateTerminal returns the same instance for repeat calls with the same sessionId", async () => {
@@ -304,191 +304,54 @@ describe("terminal-cache", () => {
   });
 
   // ── Park-mode behavior ──────────────────────────────────────────────
-  // The lag regression fix in this commit gates two things on the `parked`
-  // flag: (a) PTY bytes received while parked accumulate in
-  // `pendingParkedBytes` instead of being written to xterm, and (b) the
-  // WebGL renderer is dropped on park and reloaded on activate. These tests
-  // pin the byte-routing contract — WebGL specifics aren't observable in
-  // jsdom (the addon throws on construct, so webglAddon is always null).
+  // Park keeps the xterm instance alive but detaches the Rust output channel.
+  // That restores v0.1.29 input latency: hidden terminals do not push bytes
+  // through Tauri IPC or xterm parsing. Reattach replays pending_output from
+  // Rust into the same parser state.
 
-  it("bytes received while parked accumulate in the parked buffer instead of pendingPtyWrites", async () => {
-    const sid = "session-park-buffer";
+  it("detach parks the wrapper and detaches PTY output", async () => {
+    const sid = "session-park-detach-output";
     const container = document.createElement("div");
     document.body.appendChild(container);
     const { entry } = await getOrCreateTerminal(sid, baseOptions);
     attachToContainer(sid, container);
 
-    // Park the entry — bytes should now route into pendingParkedBytes.
+    const detachMock = vi.mocked(commands.detachPtyOutput);
+    detachMock.mockClear();
+
     detachFromContainer(sid);
     expect(entry.parked).toBe(true);
-
-    const chunkA = new TextEncoder().encode("hello ");
-    const chunkB = new TextEncoder().encode("world");
-    emitChannelBytes(sid, chunkA);
-    emitChannelBytes(sid, chunkB);
-
-    expect(entry.pendingParkedBytes.length).toBe(2);
-    expect(entry.pendingParkedSize).toBe(chunkA.length + chunkB.length);
-    // Live RAF queue must stay empty so a stale flush can't fire on the
-    // parked terminal between detach and reattach.
-    expect(entry.pendingPtyWrites.length).toBe(0);
-    expect(entry.ptyWriteFrame).toBeNull();
+    expect(detachMock).toHaveBeenCalledWith(sid);
+    expect(() =>
+      emitChannelBytes(sid, new TextEncoder().encode("hidden-output")),
+    ).toThrow("no channel handler");
 
     disposeTerminal(sid);
   });
 
-  it("attachToContainer drains the parked buffer into a single terminal.write", async () => {
-    const sid = "session-drain";
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const { entry } = await getOrCreateTerminal(sid, baseOptions);
-    attachToContainer(sid, container);
-
-    detachFromContainer(sid);
-    const writeSpy = vi.spyOn(entry.terminal, "write");
-    emitChannelBytes(sid, new TextEncoder().encode("alpha"));
-    emitChannelBytes(sid, new TextEncoder().encode("beta"));
-    emitChannelBytes(sid, new TextEncoder().encode("gamma"));
-
-    // No write yet — we're parked.
-    expect(writeSpy).not.toHaveBeenCalled();
-
-    attachToContainer(sid, container);
-
-    // Exactly one write — the whole point of the buffer is to coalesce.
-    expect(writeSpy).toHaveBeenCalledTimes(1);
-    const arg = writeSpy.mock.calls[0]?.[0] as Uint8Array;
-    expect(arg).toBeInstanceOf(Uint8Array);
-    expect(new TextDecoder().decode(arg)).toBe("alphabetagamma");
-
-    // Buffer state has to reset so the next park cycle starts clean.
-    expect(entry.parked).toBe(false);
-    expect(entry.pendingParkedBytes.length).toBe(0);
-    expect(entry.pendingParkedSize).toBe(0);
-    expect(entry.parkedOverflow).toBe(false);
-
-    disposeTerminal(sid);
-  });
-
-  it("parked-buffer overflow drops the oldest chunk and sets parkedOverflow", async () => {
-    const sid = "session-overflow";
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const { entry } = await getOrCreateTerminal(sid, baseOptions);
-    attachToContainer(sid, container);
-    detachFromContainer(sid);
-
-    // Tiny cap so we don't have to pump megabytes through the mock.
-    _setParkedBufferCapForTest(8);
-
-    emitChannelBytes(sid, new TextEncoder().encode("AAAA")); // size 4 → total 4
-    emitChannelBytes(sid, new TextEncoder().encode("BBBB")); // size 4 → total 8 (at cap, no drop)
-    emitChannelBytes(sid, new TextEncoder().encode("CCCC")); // size 4 → total 12, drops "AAAA"
-
-    expect(entry.parkedOverflow).toBe(true);
-    expect(entry.pendingParkedSize).toBe(8);
-
-    const concatenated = entry.pendingParkedBytes
-      .map((c) => new TextDecoder().decode(c))
-      .join("");
-    expect(concatenated).toBe("BBBBCCCC");
-
-    disposeTerminal(sid);
-  });
-
-  it("kitty stack still advances on bytes received while parked", async () => {
-    // Kitty CSI-u state has to track the agent even when we're not rendering.
-    // The escape sequence below is `CSI > 1 u` which pushes flag value 1 onto
-    // the stack — picked because scanKittySequences recognizes it without
-    // needing a full DA reply.
-    const sid = "session-kitty-park";
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const { entry } = await getOrCreateTerminal(sid, baseOptions);
-    attachToContainer(sid, container);
-
-    expect(entry.kittyStack.length).toBe(0);
-    expect(entry.kittyLevel).toBe(0);
-
-    detachFromContainer(sid);
-    emitChannelBytes(sid, new TextEncoder().encode("\x1b[>1u"));
-
-    // Even though we're parked, kitty bookkeeping has run.
-    expect(entry.kittyStack.length).toBeGreaterThan(0);
-    expect(entry.kittyLevel).toBeGreaterThan(0);
-
-    disposeTerminal(sid);
-  });
-
-  it("detachFromContainer is idempotent — second call does not re-process state", async () => {
+  it("detachFromContainer is idempotent — second call is a no-op", async () => {
     const sid = "session-detach-idem";
     const container = document.createElement("div");
     document.body.appendChild(container);
     const { entry } = await getOrCreateTerminal(sid, baseOptions);
     attachToContainer(sid, container);
     detachFromContainer(sid);
-    emitChannelBytes(sid, new TextEncoder().encode("x"));
-    expect(entry.pendingParkedBytes.length).toBe(1);
+    expect(entry.parked).toBe(true);
 
-    // Second detach should be a no-op — must not flush, clear, or move
-    // the wrapper since it's already parked.
+    const parkingNode = document.getElementById("codemux-terminal-parking");
+    const childCountBefore = parkingNode?.children.length ?? 0;
+
     detachFromContainer(sid);
     expect(entry.parked).toBe(true);
-    expect(entry.pendingParkedBytes.length).toBe(1);
-
-    disposeTerminal(sid);
-  });
-
-  it("disposeTerminal clears any buffered parked bytes", async () => {
-    const sid = "session-park-dispose";
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const { entry } = await getOrCreateTerminal(sid, baseOptions);
-    attachToContainer(sid, container);
-    detachFromContainer(sid);
-    emitChannelBytes(sid, new TextEncoder().encode("buffered"));
-    expect(entry.pendingParkedBytes.length).toBeGreaterThan(0);
-
-    disposeTerminal(sid);
-
-    expect(entry.disposed).toBe(true);
-    expect(entry.pendingParkedBytes.length).toBe(0);
-    expect(entry.pendingParkedSize).toBe(0);
-  });
-
-  it("detachFromContainer migrates unflushed pendingPtyWrites into the parked queue", async () => {
-    // Cold start has parked=false, so bytes from the channel queue into
-    // pendingPtyWrites + a RAF. If the user switches workspaces before that
-    // RAF fires, detach has to migrate the in-flight bytes — otherwise they
-    // disappear silently and the next reactivate shows a stale frame.
-    const sid = "session-migrate";
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    const { entry } = await getOrCreateTerminal(sid, baseOptions);
-    attachToContainer(sid, container);
-
-    emitChannelBytes(sid, new TextEncoder().encode("preempted"));
-    expect(entry.pendingPtyWrites.length).toBe(1);
-    expect(entry.ptyWriteFrame).not.toBeNull();
-
-    detachFromContainer(sid);
-
-    // RAF cancelled, queue empty, bytes now in the parked queue.
-    expect(entry.ptyWriteFrame).toBeNull();
-    expect(entry.pendingPtyWrites.length).toBe(0);
-    expect(entry.pendingParkedBytes.length).toBe(1);
-    expect(new TextDecoder().decode(entry.pendingParkedBytes[0])).toBe(
-      "preempted",
-    );
+    expect(parkingNode?.children.length ?? 0).toBe(childCountBefore);
 
     disposeTerminal(sid);
   });
 
   it("kitty query while parked still triggers writeToPty (response to agent)", async () => {
-    // The agent issues `\x1b[?u` to ask what kitty level we support. Even
-    // when the workspace isn't visible, we still have to answer or the agent
-    // will hang waiting for the reply. This pins the contract that scanning
-    // happens at receive time, not drain time.
+    // Hidden terminals detach output, but replay on the next attach still
+    // flows through scanKittyProtocol before xterm.write, so agent queries
+    // that arrived while hidden get answered during the catch-up replay.
     const sid = "session-kitty-query";
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -499,6 +362,9 @@ describe("terminal-cache", () => {
     writeMock.mockClear();
 
     detachFromContainer(sid);
+    attachToContainer(sid, container);
+    await Promise.resolve();
+    await Promise.resolve();
     emitChannelBytes(sid, new TextEncoder().encode("\x1b[?u"));
 
     expect(writeMock).toHaveBeenCalledTimes(1);
@@ -507,12 +373,10 @@ describe("terminal-cache", () => {
     disposeTerminal(sid);
   });
 
-  it("warm reattach (not previously parked) does not double-drain", async () => {
+  it("warm reattach (not previously parked) does not duplicate work", async () => {
     // attachToContainer can be called when we're already attached (e.g. a
     // resize observer that re-runs the mount effect). In that case wasParked
-    // is false and we must skip drainParkedBytes — otherwise an empty drain
-    // would still call entry.parkedOverflow=false (harmless) but the more
-    // important guarantee is no spurious WebGL reload churn.
+    // is false and we must not churn terminal.write or WebGL reload.
     const sid = "session-warm-reattach";
     const container = document.createElement("div");
     document.body.appendChild(container);
@@ -521,19 +385,22 @@ describe("terminal-cache", () => {
     expect(entry.parked).toBe(false);
 
     const writeSpy = vi.spyOn(entry.terminal, "write");
+    const loadAddonSpy = vi.spyOn(Terminal.prototype, "loadAddon");
     attachToContainer(sid, container); // re-attach without detach
     expect(writeSpy).not.toHaveBeenCalled();
+    expect(loadAddonSpy).not.toHaveBeenCalled();
     expect(entry.parked).toBe(false);
 
+    writeSpy.mockRestore();
+    loadAddonSpy.mockRestore();
     disposeTerminal(sid);
   });
 
-  it("attachToContainer transitioning out of parked invokes loadAddon (WebGL reload)", async () => {
-    // jsdom has no WebGL context so entry.webglAddon is always null after
-    // load — but Terminal.prototype.loadAddon is still called. Spying on it
-    // is the only way to verify the reload path actually runs without
-    // standing up a real GPU.
-    const sid = "session-webgl-reload";
+  it("park / activate does NOT load addons", async () => {
+    // v0.1.30 added WebGL; on WebKitGTK/Wayland that is a likely source of
+    // terminal input latency. The cache now sticks to xterm's DOM renderer,
+    // matching v0.1.29's performance profile.
+    const sid = "session-no-webgl";
     const container = document.createElement("div");
     document.body.appendChild(container);
     await getOrCreateTerminal(sid, baseOptions);
@@ -541,56 +408,31 @@ describe("terminal-cache", () => {
 
     const loadAddonSpy = vi.spyOn(Terminal.prototype, "loadAddon");
     detachFromContainer(sid);
-    expect(loadAddonSpy).not.toHaveBeenCalled(); // detach unloads, doesn't load
-
     attachToContainer(sid, container);
-    // Exactly one loadAddon call on un-park: the WebGL reload.
-    expect(loadAddonSpy).toHaveBeenCalledTimes(1);
+    detachFromContainer(sid);
+    attachToContainer(sid, container);
+
+    expect(loadAddonSpy).not.toHaveBeenCalled();
 
     loadAddonSpy.mockRestore();
     disposeTerminal(sid);
   });
 
-  it("flushPtyWrites short-circuits if the entry was parked between RAF schedule and fire", async () => {
-    // Defensive contract: if a RAF was scheduled before park (and somehow
-    // survived cancelAnimationFrame — single-threaded JS makes this almost
-    // impossible but we guard anyway), it must not write into a parked
-    // terminal. Instead it migrates its bytes into the parked queue.
-    const sid = "session-flush-park";
+  it("reattach reconnects PTY output and writes replay into the same xterm", async () => {
+    const sid = "session-reattach-write";
     const container = document.createElement("div");
     document.body.appendChild(container);
     const { entry } = await getOrCreateTerminal(sid, baseOptions);
     attachToContainer(sid, container);
+    detachFromContainer(sid);
 
-    emitChannelBytes(sid, new TextEncoder().encode("ghost"));
-    expect(entry.pendingPtyWrites.length).toBe(1);
-
-    // Flip park manually without going through detachFromContainer so we can
-    // observe what flushPtyWrites does on its own — modeling the race.
-    entry.parked = true;
     const writeSpy = vi.spyOn(entry.terminal, "write");
+    attachToContainer(sid, container);
+    await Promise.resolve();
+    await Promise.resolve();
+    emitChannelBytes(sid, new TextEncoder().encode("replayed-output"));
 
-    // Internal flushPtyWrites isn't exported; trigger it via a fresh emit
-    // that schedules a new RAF, then manually invoke through the existing
-    // frame. Easier path: import flushPtyWrites? No — keep it black-box and
-    // rely on the public observable: the parked queue should have absorbed
-    // ghost bytes when we dispatch a fresh emit (the channel callback
-    // already routes parked-state correctly), but the existing pendingPtyWrites
-    // should also drain via flushPtyWrites's parked branch on next RAF.
-    // Simulate the RAF by directly calling a fresh emit (which is parked-
-    // routed) plus a wait for the RAF callback our test environment runs.
-    await new Promise<void>((resolve) =>
-      requestAnimationFrame(() => resolve()),
-    );
-
-    // Either the RAF ran and migrated, or cancelAnimationFrame dropped it —
-    // both outcomes leave no terminal.write call against the parked terminal.
-    expect(writeSpy).not.toHaveBeenCalled();
-    // ghost bytes have to be reachable on next attach: either still in
-    // pendingPtyWrites (RAF cancelled) or in pendingParkedBytes (RAF migrated).
-    const reachable =
-      entry.pendingPtyWrites.length + entry.pendingParkedBytes.length;
-    expect(reachable).toBeGreaterThan(0);
+    expect(writeSpy).toHaveBeenCalledTimes(1);
 
     writeSpy.mockRestore();
     disposeTerminal(sid);
