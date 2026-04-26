@@ -417,6 +417,7 @@ describe("materializeAndSend", () => {
       expect(actions.setEffort).not.toHaveBeenCalled();
       expect(actions.setContextWindow).not.toHaveBeenCalled();
     });
+
   });
 
   describe("failure paths", () => {

@@ -9,6 +9,8 @@ import {
   planSubmit,
 } from "@/lib/agent-chat/chat-pane-plans";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
+import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
+import { useSkillsStore } from "@/stores/skills-store";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
@@ -187,6 +189,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const setStoreDebugActivityResolved = useAgentChatStore(
     (s) => s.setDebugActivityResolved,
   );
+  // Skills registry for send-time `/skill-name` token resolution. The
+  // store dedupes loads behind a 60s TTL, so reading without a load
+  // call is fine — Composer's slash-popup effect ensures the registry
+  // is hydrated by the time the user picks a skill.
+  const skillsRegistry = useSkillsStore((s) => s.skills);
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const markRequestResponding = useAgentChatStore(
@@ -379,7 +386,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // Mode wrappers (Stage 4 onward) live SDK-side only — the
     // transcript stores the unwrapped (ultrathink-only) text so users
     // see what they typed, not the framing we layered on top.
-    const sdkText = applyAllPrefixes(rawText, mode, effort);
+    // Parse `/skill-name` tokens out of the raw text and resolve their
+    // bodies against the skills registry. Unmatched tokens (typos, or
+    // skills not in the registry) silently pass through as plain prose.
+    const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
+    const sdkText = applyAllPrefixes(rawText, mode, effort, skillBodies);
     sendInFlightRef.current = true;
     setIsSending(true);
     appendUserMessage(threadId, plan.text);
@@ -394,7 +405,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       sendInFlightRef.current = false;
       setIsSending(false);
     });
-  }, [threadId, draft, provider, effort, mode, appendUserMessage]);
+  }, [
+    threadId,
+    draft,
+    provider,
+    effort,
+    mode,
+    skillsRegistry,
+    appendUserMessage,
+  ]);
 
   // Clear the optimistic send flag the moment the backend
   // acknowledges the turn via Running (streaming=true in the store).

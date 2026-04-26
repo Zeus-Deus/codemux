@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
+import { segmentForHighlight } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   filterSlashItems,
@@ -10,6 +12,7 @@ import {
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
 import type { ChatMode } from "@/stores/agent-chat-store";
+import { useSkillsStore } from "@/stores/skills-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -122,8 +125,54 @@ export function Composer({
     () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
     [mode, onModeActivate],
   );
-  // Stage 8 ships only mode commands. Step 7 (skills) appends here.
-  const allSlashItems = modeCommands;
+
+  // ─── Skills (Cursor-style inline tokens) ─────────────────────────
+  // Lazy-load on first popup open. Picking a skill expands the typed
+  // `/<query>` to the full `/<skill-name>` in the textarea — the slash
+  // command stays as literal text, syntax-highlighted by the mirror
+  // overlay below. At send time the parent parses the text against the
+  // skills registry and injects matched skill bodies as a per-turn
+  // prefix (no separate chip / staging state needed).
+  const skills = useSkillsStore((s) => s.skills);
+  const loadSkills = useSkillsStore((s) => s.loadSkills);
+  const skillsLoading = useSkillsStore((s) => s.loading);
+  const skillsLoaded = useSkillsStore((s) => s.loaded);
+  const skillsError = useSkillsStore((s) => s.error);
+
+  // The popup-side `onInvoke` handler is a no-op signal: the actual
+  // textarea mutation happens inside `handleSlashSelect` based on the
+  // item's id prefix. Modes still need their `onSelect` activator.
+  const skillItems = useMemo(
+    () => buildSkillCommands({ skills, onInvoke: () => {} }),
+    [skills],
+  );
+
+  // Highlight segments for the mirror overlay. Recomputed on every
+  // keystroke; cheap (one regex pass + map) for realistic draft sizes.
+  const highlightSegments = useMemo(
+    () => segmentForHighlight(draft, skills),
+    [draft, skills],
+  );
+
+  const allSlashItems = useMemo(
+    () => [...modeCommands, ...skillItems],
+    [modeCommands, skillItems],
+  );
+
+  // Surface skill-loading + skill-error in the popup footer so the user
+  // never sees a silent empty `SKILLS` group on first open or a quiet
+  // failure when the backend scan errors. Loading shows only while the
+  // skills haven't loaded yet — refreshes after the first success
+  // populate in the background without a UI hint.
+  const slashPopupFooter = useMemo(() => {
+    if (skillsError) {
+      return { tone: "error" as const, message: `Skills: ${skillsError}` };
+    }
+    if (skillsLoading && !skillsLoaded) {
+      return { tone: "muted" as const, message: "Loading skills…" };
+    }
+    return null;
+  }, [skillsError, skillsLoading, skillsLoaded]);
 
   const filteredItems = useMemo(
     () => filterSlashItems(allSlashItems, slashAnchor?.query ?? ""),
@@ -147,6 +196,14 @@ export function Composer({
   // context) or explicit Esc.
   const slashOpen = slashAnchor !== null;
 
+  // First-open lazy load. The store guards against double-fetch via TTL +
+  // in-flight loading flag, so re-firing this effect on every open is
+  // harmless and keeps the popup snappy after the initial scan.
+  useEffect(() => {
+    if (!slashOpen) return;
+    void loadSkills(cwd ?? null);
+  }, [slashOpen, cwd, loadSkills]);
+
   const closeSlash = () => {
     setSlashAnchor(null);
     setSlashHighlighted(null);
@@ -154,17 +211,40 @@ export function Composer({
 
   const handleSlashSelect = (item: SlashCommandItem) => {
     if (slashAnchor) {
-      // Strip the typed `/<query>` from the textarea — anything before
-      // the slash and anything after the cursor is preserved verbatim.
       const consumedLength = 1 + slashAnchor.query.length;
       const before = draft.slice(0, slashAnchor.start);
       const after = draft.slice(slashAnchor.start + consumedLength);
-      onDraftChange(before + after);
+
+      if (item.id.startsWith("skill:")) {
+        // Cursor-style inline expansion. Replace the typed `/<query>`
+        // with the full `/<skill-name> ` (trailing space so the user can
+        // keep typing context after the token without an extra
+        // keystroke). The mirror overlay highlights it; send-time
+        // parsing resolves it to the skill body.
+        const skillName = item.command.replace(/^\//, "");
+        const insertion = `/${skillName}${after.startsWith(" ") ? "" : " "}`;
+        const next = before + insertion + after;
+        onDraftChange(next);
+        // Cursor lands right after the inserted token (and the space we
+        // added, if any). Schedule for after onDraftChange propagates.
+        const newCursor = (before + insertion).length;
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (!el) return;
+          el.focus();
+          el.setSelectionRange(newCursor, newCursor);
+        });
+      } else {
+        // Mode picks (and any future non-text-token items) strip the
+        // typed `/<query>` because the activation is state-only.
+        onDraftChange(before + after);
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      }
+    } else {
+      requestAnimationFrame(() => textareaRef.current?.focus());
     }
     closeSlash();
     item.onSelect();
-    // Refocus the textarea so the user can keep typing.
-    requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const canSubmit = sessionReady && !streaming && draft.trim().length > 0;
@@ -291,6 +371,7 @@ export function Composer({
             onHighlightChange={setSlashHighlighted}
             onSelect={handleSlashSelect}
             open={slashOpen}
+            footerNote={slashPopupFooter}
           />
           {errorMessage && (
             <div
@@ -303,38 +384,79 @@ export function Composer({
               </span>
             </div>
           )}
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={handleTextareaChange}
-            onSelect={handleSelect}
-            onKeyDown={handleKeyDown}
-            onCompositionStart={() => {
-              composingRef.current = true;
-            }}
-            onCompositionEnd={(e) => {
-              composingRef.current = false;
-              // After composition ends, run detection on the now-final
-              // value so popup state catches up with what was typed.
-              const el = e.currentTarget;
-              const anchor = findSlashAtCursor(
-                el.value,
-                el.selectionStart ?? el.value.length,
-              );
-              if (anchor) setSlashAnchor(anchor);
-              else closeSlash();
-            }}
-            placeholder={
-              sessionReady ? placeholderForMode(mode) : "Starting session…"
-            }
-            rows={1}
-            className={cn(
-              "w-full resize-none bg-transparent px-3 py-2.5",
-              "text-sm text-foreground placeholder:text-muted-foreground/60",
-              "outline-none",
-            )}
-            style={{ maxHeight: `${MAX_ROWS_APPROX_PX}px` }}
-          />
+          <div className="relative">
+            {/*
+              Mirror overlay: renders the same text as the textarea but
+              with `/skill-name` tokens wrapped in a colored span. The
+              textarea on top has transparent text + a visible caret, so
+              the user sees the highlighted mirror through the
+              transparent layer. Critical that the two layers share
+              identical padding/font/line-height so cursor and mirror
+              stay glued together at every position.
+            */}
+            <div
+              aria-hidden
+              data-testid="composer-highlight-mirror"
+              className={cn(
+                "pointer-events-none absolute inset-0 px-3 py-2.5",
+                "whitespace-pre-wrap break-words",
+                "text-sm text-foreground",
+                "overflow-hidden",
+              )}
+            >
+              {highlightSegments.map((seg, i) =>
+                seg.kind === "skill" ? (
+                  <span
+                    key={i}
+                    className="text-amber-500 dark:text-amber-400"
+                  >
+                    {seg.text}
+                  </span>
+                ) : (
+                  <Fragment key={i}>{seg.text}</Fragment>
+                ),
+              )}
+              {/* Trailing newline doesn't render unless followed by a
+                  glyph — pad with a zero-width space so the mirror's
+                  height matches the textarea's after a fresh Enter. */}
+              {draft.endsWith("\n") || draft === "" ? "​" : null}
+            </div>
+            <textarea
+              ref={textareaRef}
+              value={draft}
+              onChange={handleTextareaChange}
+              onSelect={handleSelect}
+              onKeyDown={handleKeyDown}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={(e) => {
+                composingRef.current = false;
+                // After composition ends, run detection on the now-final
+                // value so popup state catches up with what was typed.
+                const el = e.currentTarget;
+                const anchor = findSlashAtCursor(
+                  el.value,
+                  el.selectionStart ?? el.value.length,
+                );
+                if (anchor) setSlashAnchor(anchor);
+                else closeSlash();
+              }}
+              placeholder={
+                sessionReady ? placeholderForMode(mode) : "Starting session…"
+              }
+              rows={1}
+              className={cn(
+                "relative w-full resize-none bg-transparent px-3 py-2.5",
+                // Transparent text — the colored mirror behind shows
+                // through. Caret stays visible via `caret-foreground`.
+                "text-sm text-transparent caret-foreground",
+                "placeholder:text-muted-foreground/60",
+                "outline-none",
+              )}
+              style={{ maxHeight: `${MAX_ROWS_APPROX_PX}px` }}
+            />
+          </div>
           <ComposerFooter
             provider={provider}
             model={model}

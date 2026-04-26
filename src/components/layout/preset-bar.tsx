@@ -19,7 +19,9 @@ import { PresetIcon } from "@/components/icons/preset-icon";
 import { RunButton } from "./run-button";
 import { cn } from "@/lib/utils";
 import { materializeWithPreset } from "@/lib/agent-chat/materialize";
+import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { useSkillsStore } from "@/stores/skills-store";
 import {
   useChatDraftStore,
   type DraftId,
@@ -149,19 +151,30 @@ export function PresetBar({
     if (!draft) return;
     const chat = useAgentChatStore.getState();
 
-    void materializeWithPreset(draft, preset, draft.inputDraft, {
-      markPromoting: state.markPromoting,
-      markPromoted: state.markPromoted,
-      markSendFailed: state.markSendFailed,
-      ensureThread: chat.ensureThread,
-      appendUserMessage: chat.appendUserMessage,
-      setModel: chat.setModel,
-      setPermissionMode: chat.setPermissionMode,
-      setSessionLaunchMode: chat.setSessionLaunchMode,
-      setEffort: chat.setEffort,
-      setContextWindow: chat.setContextWindow,
-      setMode: chat.setMode,
-    }).then((result) => {
+    const skillBodies = resolveSkillBodies(
+      draft.inputDraft,
+      useSkillsStore.getState().skills,
+    );
+
+    void materializeWithPreset(
+      draft,
+      preset,
+      draft.inputDraft,
+      {
+        markPromoting: state.markPromoting,
+        markPromoted: state.markPromoted,
+        markSendFailed: state.markSendFailed,
+        ensureThread: chat.ensureThread,
+        appendUserMessage: chat.appendUserMessage,
+        setModel: chat.setModel,
+        setPermissionMode: chat.setPermissionMode,
+        setSessionLaunchMode: chat.setSessionLaunchMode,
+        setEffort: chat.setEffort,
+        setContextWindow: chat.setContextWindow,
+        setMode: chat.setMode,
+      },
+      skillBodies,
+    ).then((result) => {
       if (result.success) {
         // Same transition cleanup DraftChatSurface uses on composer
         // submit: clear the active draft immediately so the router

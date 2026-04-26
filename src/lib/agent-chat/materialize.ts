@@ -97,6 +97,10 @@ export async function materializeAndSend(
   text: string,
   cwd: string,
   actions: MaterializeActions,
+  /** Concatenated skill bodies extracted from `text` by the caller —
+   *  caller parses against its own skills registry so this lib stays
+   *  free of store imports. `null` when the draft mentions no skills. */
+  skillBodies: string | null = null,
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -170,11 +174,13 @@ export async function materializeAndSend(
 
   // 5. Send the first turn. Mode wrappers (ASK / DEBUG) live SDK-side
   //    only — the transcript above stored the user's raw text so the
-  //    framing we layered on top doesn't echo back into the UI.
+  //    framing we layered on top doesn't echo back into the UI. Skill
+  //    bodies (if the user mentioned `/skill-name` tokens) were
+  //    parsed by the caller and arrive via `skillBodies`.
   try {
     await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
-      text: applyAllPrefixes(text, draft.mode, draft.effort),
+      text: applyAllPrefixes(text, draft.mode, draft.effort, skillBodies),
       model_override: null,
       effort_override: draft.effort,
       permission_mode_override: null,
@@ -235,6 +241,9 @@ export async function materializeWithPreset(
   preset: TerminalPreset,
   initialPrompt: string,
   actions: MaterializeActions,
+  /** Concatenated skill bodies extracted from `initialPrompt` by the
+   *  caller. `null` when the prompt mentions no skills. */
+  skillBodies: string | null = null,
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -333,7 +342,7 @@ export async function materializeWithPreset(
       try {
         await agentChatSendTurn(draft.provider, {
           thread_id: draft.threadId,
-          text: applyAllPrefixes(prompt, draft.mode, draft.effort),
+          text: applyAllPrefixes(prompt, draft.mode, draft.effort, skillBodies),
           model_override: null,
           effort_override: draft.effort,
           permission_mode_override: null,

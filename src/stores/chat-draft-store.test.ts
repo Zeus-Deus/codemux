@@ -143,6 +143,7 @@ describe("chat-draft-store", () => {
       expect(next.model).toBe("claude-sonnet-4-6");
       expect(next.effort).toBe("high");
     });
+
   });
 
   describe("promotion lifecycle", () => {

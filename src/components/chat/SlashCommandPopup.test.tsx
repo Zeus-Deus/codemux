@@ -149,6 +149,74 @@ describe("SlashCommandPopup", () => {
     );
   });
 
+  it("renders footerNote in muted tone for loading state", () => {
+    render(
+      <SlashCommandPopup
+        items={makeItems()}
+        highlightedId="mode:plan"
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+        footerNote={{ tone: "muted", message: "Loading skills…" }}
+      />,
+    );
+    const footer = screen.getByTestId("slash-popup-footer");
+    expect(footer).toHaveAttribute("data-tone", "muted");
+    expect(footer).toHaveTextContent("Loading skills…");
+  });
+
+  it("renders footerNote in error tone with destructive color class", () => {
+    render(
+      <SlashCommandPopup
+        items={makeItems()}
+        highlightedId="mode:plan"
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+        footerNote={{ tone: "error", message: "Skills: scan failed" }}
+      />,
+    );
+    const footer = screen.getByTestId("slash-popup-footer");
+    expect(footer).toHaveAttribute("data-tone", "error");
+    expect(footer).toHaveTextContent("Skills: scan failed");
+    expect(footer.className).toContain("text-destructive");
+  });
+
+  it("renders footerNote alongside the empty-state message when items are empty", () => {
+    // Empty filter and footer are orthogonal: the empty state describes
+    // the filter, the footer describes the skill-loading pipeline. Both
+    // render so the user knows why nothing matched AND what's happening
+    // with skills.
+    render(
+      <SlashCommandPopup
+        items={[]}
+        highlightedId={null}
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+        footerNote={{ tone: "muted", message: "Loading skills…" }}
+      />,
+    );
+    expect(screen.getByText(/No commands match/i)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-popup-footer")).toHaveTextContent(
+      "Loading skills…",
+    );
+  });
+
+  it("omits footerNote node entirely when prop is null", () => {
+    render(
+      <SlashCommandPopup
+        items={makeItems()}
+        highlightedId="mode:plan"
+        onHighlightChange={vi.fn()}
+        onSelect={vi.fn()}
+        open
+        footerNote={null}
+      />,
+    );
+    expect(screen.queryByTestId("slash-popup-footer")).not.toBeInTheDocument();
+  });
+
   it("preserves group insertion order (MODES before SKILLS)", () => {
     render(
       <SlashCommandPopup

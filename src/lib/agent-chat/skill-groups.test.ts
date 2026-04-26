@@ -1,0 +1,120 @@
+import { describe, expect, it } from "vitest";
+
+import type { Skill, SkillProvider, SkillScope } from "@/tauri/commands";
+
+import {
+  GROUP_ORDER,
+  groupHeadingFor,
+  groupSkillsByScope,
+} from "./skill-groups";
+
+function makeSkill(
+  name: string,
+  provider: SkillProvider,
+  scope: SkillScope,
+  pluginSlug: string | null = null,
+): Skill {
+  return {
+    id: `id-${name}`,
+    name,
+    description: null,
+    provider,
+    scope,
+    skillDir: `/skills/${name}`,
+    filePath: `/skills/${name}/SKILL.md`,
+    body: "",
+    rawFrontmatter: {},
+    bundledFiles: [],
+    compatibility: "compatible",
+    compatibilitySignals: [],
+    symlinked: false,
+    pluginSlug,
+  };
+}
+
+describe("groupHeadingFor", () => {
+  it("emits 'Scope · Provider' for non-plugin skills", () => {
+    expect(groupHeadingFor(makeSkill("a", "claude", "user"))).toBe(
+      "User · Claude",
+    );
+    expect(groupHeadingFor(makeSkill("a", "codex", "user"))).toBe(
+      "User · Codex",
+    );
+    expect(groupHeadingFor(makeSkill("a", "claude", "project"))).toBe(
+      "Project · Claude",
+    );
+    expect(groupHeadingFor(makeSkill("a", "codemux", "user"))).toBe(
+      "User · Codemux",
+    );
+    expect(groupHeadingFor(makeSkill("a", "opencode", "project"))).toBe(
+      "Project · OpenCode",
+    );
+  });
+
+  it("collapses every plugin scope into a single 'Plugin' bucket", () => {
+    expect(
+      groupHeadingFor(makeSkill("a", "claude", "plugin", "frontend-design")),
+    ).toBe("Plugin");
+  });
+});
+
+describe("groupSkillsByScope", () => {
+  it("returns groups in GROUP_ORDER, dropping empty buckets", () => {
+    const groups = groupSkillsByScope([
+      makeSkill("plugin-skill", "claude", "plugin", "frontend-design"),
+      makeSkill("user-codex", "codex", "user"),
+      makeSkill("user-claude", "claude", "user"),
+    ]);
+    expect(groups.map((g) => g.heading)).toEqual([
+      "User · Claude",
+      "User · Codex",
+      "Plugin",
+    ]);
+  });
+
+  it("sorts skills within a group alphabetically (case-insensitive)", () => {
+    const groups = groupSkillsByScope([
+      makeSkill("Zeta", "claude", "user"),
+      makeSkill("alpha", "claude", "user"),
+      makeSkill("beta", "claude", "user"),
+    ]);
+    expect(groups[0].skills.map((s) => s.name)).toEqual([
+      "alpha",
+      "beta",
+      "Zeta",
+    ]);
+  });
+
+  it("returns an empty array when no skills are passed", () => {
+    expect(groupSkillsByScope([])).toEqual([]);
+  });
+
+  it("emits all 9 known groups in the locked order when skills span them", () => {
+    const skills: Skill[] = [
+      makeSkill("a", "claude", "user"),
+      makeSkill("b", "codex", "user"),
+      makeSkill("c", "opencode", "user"),
+      makeSkill("d", "codemux", "user"),
+      makeSkill("e", "claude", "project"),
+      makeSkill("f", "codex", "project"),
+      makeSkill("g", "opencode", "project"),
+      makeSkill("h", "codemux", "project"),
+      makeSkill("i", "claude", "plugin", "p"),
+    ];
+    const groups = groupSkillsByScope(skills);
+    expect(groups.map((g) => g.heading)).toEqual([...GROUP_ORDER]);
+  });
+
+  it("produces independent arrays per group (mutating one doesn't bleed)", () => {
+    const groups = groupSkillsByScope([
+      makeSkill("a", "claude", "user"),
+      makeSkill("b", "claude", "user"),
+    ]);
+    groups[0].skills.pop();
+    const groupsAgain = groupSkillsByScope([
+      makeSkill("a", "claude", "user"),
+      makeSkill("b", "claude", "user"),
+    ]);
+    expect(groupsAgain[0].skills).toHaveLength(2);
+  });
+});

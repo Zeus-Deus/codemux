@@ -3,10 +3,13 @@ import { describe, it, expect } from "vitest";
 import {
   applyAllPrefixes,
   applyModePrefix,
+  applySkillPrefix,
   ASK_WRAPPER,
   DEBUG_WRAPPER,
 } from "./mode-prefix";
 import { ULTRATHINK_PROMPT_PREFIX } from "./ultrathink";
+
+const SKILL_BODY = "You are running the codemux-release skill. First, run gh release create.";
 
 describe("applyModePrefix", () => {
   it("prepends ASK_WRAPPER for ask mode", () => {
@@ -118,5 +121,96 @@ describe("applyAllPrefixes", () => {
   it("returns empty for empty input regardless of mode / effort", () => {
     expect(applyAllPrefixes("", "ask", "ultrathink")).toBe("");
     expect(applyAllPrefixes("   ", "default", "ultrathink")).toBe("");
+  });
+});
+
+describe("applySkillPrefix", () => {
+  it("prepends a trimmed skill body framed by ---", () => {
+    expect(applySkillPrefix("do the thing", `${SKILL_BODY}\n\n`)).toBe(
+      `${SKILL_BODY}\n\n---\n\ndo the thing`,
+    );
+  });
+
+  it("returns text unchanged when stagedSkillBody is null/undefined", () => {
+    expect(applySkillPrefix("do the thing", null)).toBe("do the thing");
+    expect(applySkillPrefix("do the thing", undefined)).toBe("do the thing");
+  });
+
+  it("returns text unchanged when stagedSkillBody is empty / whitespace", () => {
+    expect(applySkillPrefix("do the thing", "")).toBe("do the thing");
+    expect(applySkillPrefix("do the thing", "   \n  ")).toBe("do the thing");
+  });
+
+  it("is idempotent — re-applying the same skill body does not double-prepend", () => {
+    const once = applySkillPrefix("do the thing", SKILL_BODY);
+    const twice = applySkillPrefix(once, SKILL_BODY);
+    expect(twice).toBe(once);
+  });
+});
+
+describe("applyAllPrefixes — staged skill composition", () => {
+  it("skill alone (no mode, no ultrathink): skill body + --- + user text", () => {
+    expect(
+      applyAllPrefixes("do the thing", "default", null, SKILL_BODY),
+    ).toBe(`${SKILL_BODY}\n\n---\n\ndo the thing`);
+  });
+
+  it("skill + ask mode: ASK wrapper above skill above user text", () => {
+    expect(applyAllPrefixes("do the thing", "ask", null, SKILL_BODY)).toBe(
+      `${ASK_WRAPPER}\n\n${SKILL_BODY}\n\n---\n\ndo the thing`,
+    );
+  });
+
+  it("skill + debug mode: DEBUG wrapper above skill above user text", () => {
+    expect(applyAllPrefixes("do the thing", "debug", null, SKILL_BODY)).toBe(
+      `${DEBUG_WRAPPER}\n\n${SKILL_BODY}\n\n---\n\ndo the thing`,
+    );
+  });
+
+  it("skill + ultrathink + ask: full stack in locked order", () => {
+    expect(
+      applyAllPrefixes("do the thing", "ask", "ultrathink", SKILL_BODY),
+    ).toBe(
+      `${ULTRATHINK_PROMPT_PREFIX}${ASK_WRAPPER}\n\n${SKILL_BODY}\n\n---\n\ndo the thing`,
+    );
+  });
+
+  it("skill + ultrathink + debug: full stack in locked order", () => {
+    expect(
+      applyAllPrefixes("crash on submit", "debug", "ultrathink", SKILL_BODY),
+    ).toBe(
+      `${ULTRATHINK_PROMPT_PREFIX}${DEBUG_WRAPPER}\n\n${SKILL_BODY}\n\n---\n\ncrash on submit`,
+    );
+  });
+
+  it("skill + plan mode: skill applied (Plan has no wrapper); ultrathink lands on top", () => {
+    expect(
+      applyAllPrefixes("design X", "plan", "ultrathink", SKILL_BODY),
+    ).toBe(`${ULTRATHINK_PROMPT_PREFIX}${SKILL_BODY}\n\n---\n\ndesign X`);
+  });
+
+  it("no skill (null) keeps existing behavior unchanged", () => {
+    expect(applyAllPrefixes("hello", "default", null, null)).toBe("hello");
+    expect(applyAllPrefixes("ask q", "ask", "ultrathink", null)).toBe(
+      `${ULTRATHINK_PROMPT_PREFIX}${ASK_WRAPPER}\n\nask q`,
+    );
+  });
+
+  it("empty skill body falls through to existing behavior", () => {
+    expect(applyAllPrefixes("hello", "default", null, "")).toBe("hello");
+    expect(applyAllPrefixes("hello", "ask", null, "  \n  ")).toBe(
+      `${ASK_WRAPPER}\n\nhello`,
+    );
+  });
+
+  it("idempotent under repeated application when only the skill is in play", () => {
+    // Cross-layer idempotency (skill + mode + ultrathink stacked) isn't
+    // achievable without each layer reaching into the others; the send
+    // path only ever calls this fn once per turn so it isn't needed.
+    // The per-layer guarantee (applySkillPrefix on its own output) is
+    // covered above and is sufficient for the real call site.
+    const once = applyAllPrefixes("do the thing", "default", null, SKILL_BODY);
+    const twice = applyAllPrefixes(once, "default", null, SKILL_BODY);
+    expect(twice).toBe(once);
   });
 });

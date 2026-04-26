@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
+import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
   useChatDraftStore,
@@ -215,19 +217,33 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
 
     sendInFlightRef.current = true;
     const chat = useAgentChatStore.getState();
-    void materializeAndSend(currentDraft, text, cwdForSession, {
-      markPromoting: state.markPromoting,
-      markPromoted: state.markPromoted,
-      markSendFailed: state.markSendFailed,
-      ensureThread: chat.ensureThread,
-      appendUserMessage: chat.appendUserMessage,
-      setModel: chat.setModel,
-      setPermissionMode: chat.setPermissionMode,
-      setSessionLaunchMode: chat.setSessionLaunchMode,
-      setEffort: chat.setEffort,
-      setContextWindow: chat.setContextWindow,
-      setMode: chat.setMode,
-    })
+    // Resolve any `/skill-name` tokens in the draft text against the
+    // skills registry. Same parser the live pane uses; bodies are
+    // injected as a per-turn prefix by `materializeAndSend`.
+    const skillBodies = resolveSkillBodies(
+      text,
+      useSkillsStore.getState().skills,
+    );
+
+    void materializeAndSend(
+      currentDraft,
+      text,
+      cwdForSession,
+      {
+        markPromoting: state.markPromoting,
+        markPromoted: state.markPromoted,
+        markSendFailed: state.markSendFailed,
+        ensureThread: chat.ensureThread,
+        appendUserMessage: chat.appendUserMessage,
+        setModel: chat.setModel,
+        setPermissionMode: chat.setPermissionMode,
+        setSessionLaunchMode: chat.setSessionLaunchMode,
+        setEffort: chat.setEffort,
+        setContextWindow: chat.setContextWindow,
+        setMode: chat.setMode,
+      },
+      skillBodies,
+    )
       .then((result) => {
         if (result.success) {
           setActiveDraft(null);

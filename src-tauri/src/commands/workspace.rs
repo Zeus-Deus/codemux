@@ -1170,7 +1170,16 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
     let mut cmd = std::process::Command::new(&editor.command);
     cmd.arg(&path);
-    crate::execution::sanitize_gui_env_std(&mut cmd);
+    // Intentionally NOT calling `sanitize_gui_env_std` here. The
+    // standing project rule strips DISPLAY/WAYLAND_DISPLAY/XDG_* so
+    // agent-spawned processes can't pop windows on the user's
+    // session — but `open_in_editor` is the *opposite* case: the
+    // user explicitly clicked "open this file in my editor" and the
+    // editor must inherit the GUI env to render a window. Stripping
+    // it here makes the spawn succeed silently with no visible
+    // result (Wayland/X11 reject the window because the env was
+    // unset). Same exception class as `hyprctl` / `ydotool` /
+    // `systemctl` / `loginctl` documented in CLAUDE.md.
     cmd.spawn()
         .map_err(|e| format!("Failed to open editor: {e}"))?;
     Ok(())

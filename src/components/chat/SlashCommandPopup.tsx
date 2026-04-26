@@ -1,10 +1,21 @@
 import { Command as CommandPrimitive } from "cmdk";
+import { useEffect, useRef } from "react";
 
 import { cn } from "@/lib/utils";
 import {
   groupSlashItems,
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
+
+/**
+ * Optional muted footer row appended below all items. Used by Step 7
+ * (skills) to communicate the lazy-load progress and surface errors
+ * without blocking modes from being picked. Non-selectable.
+ */
+export interface SlashCommandFooterNote {
+  tone: "muted" | "error";
+  message: string;
+}
 
 interface Props {
   /** Filtered items to show. Filtering happens in the parent so the
@@ -23,6 +34,8 @@ interface Props {
   onSelect: (item: SlashCommandItem) => void;
   /** Hide / show. */
   open: boolean;
+  /** Optional muted/error annotation rendered after the items list. */
+  footerNote?: SlashCommandFooterNote | null;
 }
 
 /**
@@ -47,7 +60,25 @@ export function SlashCommandPopup({
   onHighlightChange,
   onSelect,
   open,
+  footerNote = null,
 }: Props) {
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  // cmdk's built-in scrollIntoView only fires when cmdk itself handles
+  // the keyboard event. Because the textarea keeps focus and the parent
+  // drives highlight via the controlled `value` prop, cmdk never sees
+  // ArrowUp/Down — so we replicate the scroll-into-view ourselves
+  // whenever the highlighted item changes.
+  useEffect(() => {
+    if (!open || !highlightedId) return;
+    const list = listRef.current;
+    if (!list) return;
+    const target = list.querySelector<HTMLElement>(
+      `[data-testid="slash-item-${CSS.escape(highlightedId)}"]`,
+    );
+    target?.scrollIntoView({ block: "nearest" });
+  }, [highlightedId, open]);
+
   if (!open) return null;
 
   const groups = groupSlashItems(items);
@@ -80,8 +111,15 @@ export function SlashCommandPopup({
         className="text-popover-foreground"
       >
         <CommandPrimitive.List
+          ref={listRef}
           className={cn(
-            "max-h-72 overflow-y-auto outline-none",
+            // Fixed cap (~320px) so the popup never grows tall enough to
+            // overflow the top of the viewport when the textarea is
+            // centered (e.g., the empty-chat draft surface). The arrow-
+            // key handler in Composer drives the highlight, and the
+            // useEffect above scrolls the active item into view as the
+            // user navigates past the visible window.
+            "max-h-80 overflow-y-auto outline-none",
             "no-scrollbar",
           )}
         >
@@ -141,6 +179,20 @@ export function SlashCommandPopup({
                 })}
               </CommandPrimitive.Group>
             ))
+          )}
+          {footerNote && (
+            <div
+              data-testid="slash-popup-footer"
+              data-tone={footerNote.tone}
+              className={cn(
+                "px-3 py-2 text-[11px] border-t border-border/40",
+                footerNote.tone === "error"
+                  ? "text-destructive"
+                  : "text-muted-foreground/80",
+              )}
+            >
+              {footerNote.message}
+            </div>
           )}
         </CommandPrimitive.List>
       </CommandPrimitive>

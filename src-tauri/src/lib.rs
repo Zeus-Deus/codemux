@@ -27,6 +27,7 @@ pub mod presets;
 pub mod project;
 pub mod scripts;
 pub mod scrollback;
+pub mod skills;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod state;
@@ -794,6 +795,7 @@ pub fn run() {
             commands::update_permission_policy,
             commands::list_tool_permissions,
             commands::remove_tool_permission,
+            commands::list_skills,
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,

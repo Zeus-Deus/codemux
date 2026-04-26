@@ -1034,3 +1034,31 @@ export const removeToolPermission = (
   projectRoot: string | null,
 ) =>
   invoke<void>("remove_tool_permission", { rule, projectRoot });
+
+// ── Skills ──
+
+export type SkillProvider = "claude" | "codex" | "opencode" | "codemux";
+export type SkillScope = "user" | "project" | "plugin";
+export type SkillCompatibility = "compatible" | "soft-warn" | "hard-warn";
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string | null;
+  provider: SkillProvider;
+  scope: SkillScope;
+  skillDir: string;
+  filePath: string;
+  body: string;
+  rawFrontmatter: unknown;
+  bundledFiles: string[];
+  compatibility: SkillCompatibility;
+  compatibilitySignals: string[];
+  symlinked: boolean;
+  pluginSlug: string | null;
+}
+
+export const listSkills = (
+  projectRoot: string | null,
+  includePlugins: boolean,
+) => invoke<Skill[]>("list_skills", { projectRoot, includePlugins });

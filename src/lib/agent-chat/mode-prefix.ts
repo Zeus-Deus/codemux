@@ -50,6 +50,31 @@ export function applyModePrefix(text: string, mode: ChatMode): string {
 }
 
 /**
+ * Prepend a staged-skill body to `text`, framed by a markdown rule so
+ * the model can clearly distinguish the procedural skill content from
+ * the user's actual request.
+ *
+ * Composition order, top-to-bottom (when chained with mode + ultrathink):
+ *   1. `Ultrathink:` directive
+ *   2. Mode wrapper (ASK / DEBUG)
+ *   3. Skill body (this fn)
+ *   4. `---` separator
+ *   5. User text
+ *
+ * This places the skill *between* high-level framing and the user's
+ * literal ask, matching how Claude itself injects skill content when it
+ * auto-triggers a skill. Idempotent: re-applying the same skill body to
+ * an already-prefixed string is a no-op.
+ */
+export function applySkillPrefix(text: string, skillBody: string | null | undefined): string {
+  if (!skillBody) return text;
+  const trimmedBody = skillBody.trim();
+  if (!trimmedBody) return text;
+  if (text.startsWith(trimmedBody)) return text;
+  return `${trimmedBody}\n\n---\n\n${text}`;
+}
+
+/**
  * Compose mode wrapper + ultrathink prefix in the locked order:
  *   `Ultrathink:\n${MODE_WRAPPER}\n\n${user text}`
  *
@@ -64,8 +89,10 @@ export function applyAllPrefixes(
   text: string,
   mode: ChatMode,
   effort: string | null | undefined,
+  stagedSkillBody?: string | null,
 ): string {
   const base = effort === "ultrathink" ? stripClaudeUltrathinkPrefix(text) : text;
-  const withMode = applyModePrefix(base, mode);
+  const withSkill = applySkillPrefix(base, stagedSkillBody);
+  const withMode = applyModePrefix(withSkill, mode);
   return applyClaudePromptEffortPrefix(withMode, effort);
 }
