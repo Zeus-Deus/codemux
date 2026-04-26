@@ -116,6 +116,7 @@ export function ComposerFooter({
                   "disabled:opacity-50 disabled:pointer-events-none",
                 )}
                 aria-label="Activate mode"
+                title="Activate mode (Shift+Tab to cycle)"
               >
                 <Plus className="h-3 w-3" />
                 <span>Mode</span>

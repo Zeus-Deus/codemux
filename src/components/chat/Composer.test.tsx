@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
@@ -223,61 +223,88 @@ describe("Composer", () => {
       expect(getByPlaceholderText("Message the agent…")).toBeInTheDocument();
     });
 
-    it("'/plan ' at draft start activates Plan mode and strips the command", () => {
-      const onDraftChange = vi.fn();
-      const onModeActivate = vi.fn();
-      const { container } = renderComposer({
-        mode: "default",
-        onDraftChange,
-        onModeActivate,
-      });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      // Simulate the user typing "/plan refactor me" into the empty
-      // textarea. The ChangeEvent reports the full composed value.
-      textarea.dispatchEvent(
-        new (window as unknown as { Event: typeof Event }).Event("input", {
-          bubbles: true,
-        }),
-      );
-      // The simpler path: fire a native change via React Testing Library.
-      // Simulating a change via dispatchEvent + value set covers the
-      // React controlled-input path.
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      nativeInputValueSetter?.call(textarea, "/plan refactor me");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    // Stage 8 replaces the auto-activate-on-typing flow with a popup.
+    // See the "Stage 8 — slash command popup" describe block below.
+  });
 
-      expect(onModeActivate).toHaveBeenCalledWith("plan");
-      expect(onDraftChange).toHaveBeenCalledWith("refactor me");
-    });
-
-    it("'/plan' on its own strips to empty and activates", () => {
-      const onDraftChange = vi.fn();
-      const onModeActivate = vi.fn();
-      const { container } = renderComposer({
-        mode: "default",
-        onDraftChange,
-        onModeActivate,
-      });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
+  describe("Stage 8 — slash command popup", () => {
+    /**
+     * Helper: simulate the user typing into the textarea. Sets the
+     * native value and fires an `input` event so React's controlled-
+     * input handlers run, plus updates `selectionStart` so the
+     * cursor-aware slash detection can find the slash.
+     */
+    function type(textarea: HTMLTextAreaElement, value: string, cursor?: number) {
       const setter = Object.getOwnPropertyDescriptor(
         window.HTMLTextAreaElement.prototype,
         "value",
       )?.set;
-      setter?.call(textarea, "/plan");
+      setter?.call(textarea, value);
+      const cur = cursor ?? value.length;
+      textarea.setSelectionRange(cur, cur);
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    }
 
-      expect(onModeActivate).toHaveBeenCalledWith("plan");
-      expect(onDraftChange).toHaveBeenCalledWith("");
+    function getTextarea(container: HTMLElement) {
+      return container.querySelector("textarea") as HTMLTextAreaElement;
+    }
+
+    it("typing '/' at the start opens the popup with all three modes", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "default" });
+      expect(queryByTestId("slash-command-popup")).toBeNull();
+      type(getTextarea(container), "/");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:debug")).not.toBeNull();
     });
 
-    it("slash-commands are ignored mid-draft (only at position 0)", () => {
+    it("filters items as the user types (/pl → only Plan)", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "/pl");
+      expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).toBeNull();
+      expect(queryByTestId("slash-item-mode:debug")).toBeNull();
+    });
+
+    it("opens the popup when '/' is typed mid-prose after a space", () => {
+      const { container, queryByTestId } = renderComposer({
+        mode: "default",
+        draft: "hello ",
+      });
+      const textarea = getTextarea(container);
+      type(textarea, "hello /pl");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+    });
+
+    it("does NOT open when '/' is inside a word", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "a/b");
+      expect(queryByTestId("slash-command-popup")).toBeNull();
+    });
+
+    it("Enter on a highlighted item activates the mode and strips the slash text", () => {
+      const onDraftChange = vi.fn();
+      const onModeActivate = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        onDraftChange,
+        onModeActivate,
+      });
+      const textarea = getTextarea(container);
+      type(textarea, "/pl");
+      // After filter, only Plan is visible — auto-highlighted by the
+      // useEffect that initialises highlight to the first visible item.
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onModeActivate).toHaveBeenCalledWith("plan");
+      // Composer asks the parent to drop the typed `/pl` from the draft.
+      expect(onDraftChange).toHaveBeenLastCalledWith("");
+    });
+
+    it("Enter mid-prose preserves text before the slash", () => {
       const onDraftChange = vi.fn();
       const onModeActivate = vi.fn();
       const { container } = renderComposer({
@@ -286,110 +313,237 @@ describe("Composer", () => {
         onDraftChange,
         onModeActivate,
       });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(textarea, "hello /plan world");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-
-      expect(onModeActivate).not.toHaveBeenCalled();
-      // Passed through to the parent verbatim.
-      expect(onDraftChange).toHaveBeenCalledWith("hello /plan world");
+      const textarea = getTextarea(container);
+      type(textarea, "hello /pl");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onModeActivate).toHaveBeenCalledWith("plan");
+      // Last call from the picker handler — the text before the slash
+      // is preserved verbatim, the slash and "pl" are stripped.
+      expect(onDraftChange).toHaveBeenLastCalledWith("hello ");
     });
 
-    it("slash-commands are ignored when a mode pill is already active", () => {
-      const onModeActivate = vi.fn();
-      const onDraftChange = vi.fn();
-      const { container } = renderComposer({
-        mode: "plan",
-        onDraftChange,
-        onModeActivate,
-      });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(textarea, "/plan twice");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-
-      expect(onModeActivate).not.toHaveBeenCalled();
-      // Text passes through so the user can still type literal /.
-      expect(onDraftChange).toHaveBeenCalledWith("/plan twice");
-    });
-
-    it("'/ask ' at draft start activates Ask mode and strips the command", () => {
+    it("Esc closes the popup, and the slash is reported back to the parent (preserved)", () => {
       const onDraftChange = vi.fn();
       const onModeActivate = vi.fn();
-      const { container } = renderComposer({
+      const { container, queryByTestId } = renderComposer({
         mode: "default",
         onDraftChange,
         onModeActivate,
       });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(textarea, "/ask when does the release ship?");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      const textarea = getTextarea(container);
+      type(textarea, "/");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      // The slash made it through to the parent — typing always reports
+      // the literal value; the popup is purely a UI layer.
+      expect(onDraftChange).toHaveBeenCalledWith("/");
 
-      expect(onModeActivate).toHaveBeenCalledWith("ask");
-      expect(onDraftChange).toHaveBeenCalledWith(
-        "when does the release ship?",
+      fireEvent.keyDown(textarea, { key: "Escape" });
+      expect(queryByTestId("slash-command-popup")).toBeNull();
+      // No mode activation happened, so the user's `/` survives in
+      // whatever state the parent decides to render.
+      expect(onModeActivate).not.toHaveBeenCalled();
+    });
+
+    it("Arrow keys move the highlight without leaving the textarea", () => {
+      const { container, getByTestId } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "/");
+      // First visible item is highlighted by default.
+      expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      expect(getByTestId("slash-item-mode:ask")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      // Wraps around to the top.
+      expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
+      fireEvent.keyDown(textarea, { key: "ArrowUp" });
+      // Wraps from top to bottom.
+      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
+        "data-selected",
+        "true",
       );
     });
 
-    it("'/debug ' at draft start activates Debug mode and strips the command", () => {
-      const onDraftChange = vi.fn();
-      const onModeActivate = vi.fn();
-      const { container } = renderComposer({
-        mode: "default",
-        onDraftChange,
-        onModeActivate,
-      });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(textarea, "/debug crash trace");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-
-      expect(onModeActivate).toHaveBeenCalledWith("debug");
-      expect(onDraftChange).toHaveBeenCalledWith("crash trace");
+    it("hides the active mode from the popup items", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "plan" });
+      const textarea = getTextarea(container);
+      type(textarea, "/");
+      expect(queryByTestId("slash-item-mode:plan")).toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:debug")).not.toBeNull();
     });
 
-    it("'/debug' on its own strips to empty and activates", () => {
-      const onDraftChange = vi.fn();
+    /**
+     * Regression for the user-reported bug where the popup auto-closed
+     * once the user typed past the slash. Mirrors a real-world typing
+     * pattern: each character arrives in its own input event.
+     */
+    it("popup stays open through incremental typing of '/', '/p', '/pl'", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "/");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      type(textarea, "/p");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      // After "/p" the filter narrows to Plan only.
+      expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).toBeNull();
+      type(textarea, "/pl");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).toBeNull();
+      expect(queryByTestId("slash-item-mode:debug")).toBeNull();
+    });
+
+    it("typing /de filters to Debug only and keeps the popup open", () => {
+      const { container, queryByTestId } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      type(textarea, "/de");
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:debug")).not.toBeNull();
+      expect(queryByTestId("slash-item-mode:plan")).toBeNull();
+      expect(queryByTestId("slash-item-mode:ask")).toBeNull();
+    });
+
+    it("typing /zzz keeps the popup open with the empty-state message", () => {
+      const { container, queryByTestId, getByText } = renderComposer({
+        mode: "default",
+      });
+      const textarea = getTextarea(container);
+      type(textarea, "/zzz");
+      // Popup stays mounted to surface "No commands match" instead of
+      // silently disappearing.
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+      expect(getByText(/No commands match/i)).toBeInTheDocument();
+      expect(queryByTestId("slash-item-mode:plan")).toBeNull();
+    });
+
+    it("Enter falls through to submit when popup is empty (no items to pick)", () => {
+      const onSubmit = vi.fn();
       const onModeActivate = vi.fn();
       const { container } = renderComposer({
         mode: "default",
-        onDraftChange,
+        draft: "/zzz",
+        onSubmit,
         onModeActivate,
       });
-      const textarea = container.querySelector(
-        "textarea",
-      ) as HTMLTextAreaElement;
-      const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLTextAreaElement.prototype,
-        "value",
-      )?.set;
-      setter?.call(textarea, "/debug");
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+      const textarea = getTextarea(container);
+      // Simulate the user being parked at "/zzz" with the empty-state
+      // popup visible. Pressing Enter should *send* the message —
+      // there's no item to activate.
+      type(textarea, "/zzz");
+      fireEvent.keyDown(textarea, { key: "Enter" });
+      expect(onModeActivate).not.toHaveBeenCalled();
+      expect(onSubmit).toHaveBeenCalled();
+    });
+  });
 
+  describe("Stage 8 — Shift+Tab mode cycling", () => {
+    function getTextarea(container: HTMLElement) {
+      return container.querySelector("textarea") as HTMLTextAreaElement;
+    }
+
+    it("cycles default → plan", () => {
+      const onModeActivate = vi.fn();
+      const onModeRemove = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        onModeActivate,
+        onModeRemove,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
+      expect(onModeActivate).toHaveBeenCalledWith("plan");
+      expect(onModeRemove).not.toHaveBeenCalled();
+    });
+
+    it("cycles plan → ask", () => {
+      const onModeActivate = vi.fn();
+      const { container } = renderComposer({
+        mode: "plan",
+        onModeActivate,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
+      expect(onModeActivate).toHaveBeenCalledWith("ask");
+    });
+
+    it("cycles ask → debug", () => {
+      const onModeActivate = vi.fn();
+      const { container } = renderComposer({
+        mode: "ask",
+        onModeActivate,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
       expect(onModeActivate).toHaveBeenCalledWith("debug");
-      expect(onDraftChange).toHaveBeenCalledWith("");
+    });
+
+    it("cycles debug → default (calls onModeRemove, not onModeActivate)", () => {
+      const onModeActivate = vi.fn();
+      const onModeRemove = vi.fn();
+      const { container } = renderComposer({
+        mode: "debug",
+        onModeActivate,
+        onModeRemove,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Tab", shiftKey: true });
+      expect(onModeRemove).toHaveBeenCalled();
+      expect(onModeActivate).not.toHaveBeenCalled();
+    });
+
+    it("preventDefault is called on the keydown so native focus-tab nav doesn't run", () => {
+      const { container } = renderComposer({ mode: "default" });
+      const textarea = getTextarea(container);
+      const event = new KeyboardEvent("keydown", {
+        key: "Tab",
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      textarea.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    });
+  });
+
+  describe("Stage 8 — submit flow regression", () => {
+    function getTextarea(container: HTMLElement) {
+      return container.querySelector("textarea") as HTMLTextAreaElement;
+    }
+
+    it("Enter still submits when popup is closed", () => {
+      const onSubmit = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        draft: "hello",
+        onSubmit,
+      });
+      fireEvent.keyDown(getTextarea(container), { key: "Enter" });
+      expect(onSubmit).toHaveBeenCalled();
+    });
+
+    it("Shift+Enter does NOT submit (newline path preserved)", () => {
+      const onSubmit = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        draft: "hello",
+        onSubmit,
+      });
+      fireEvent.keyDown(getTextarea(container), {
+        key: "Enter",
+        shiftKey: true,
+      });
+      expect(onSubmit).not.toHaveBeenCalled();
     });
   });
 });
