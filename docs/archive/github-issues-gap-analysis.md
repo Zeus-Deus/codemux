@@ -4,7 +4,7 @@
 - Audience: Anyone implementing or reviewing the issue linking feature.
 - Authority: Active work plan only, not current truth.
 - Update when: Priorities, open questions, or likely touch points change.
-- Read next: `docs/features/pr-integration.md`, `docs/core/STATUS.md`
+- Read next: `docs/features/review-integration.md`, `docs/core/STATUS.md`
 
 ## Goal
 

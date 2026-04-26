@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -14,7 +15,6 @@ import {
 import {
   GitPullRequest,
   AlertCircle,
-  RefreshCw,
   ChevronLeft,
 } from "lucide-react";
 import {
@@ -25,9 +25,7 @@ import {
   getPullRequestChecks,
   getPrReviewComments,
   getPrInlineComments,
-  getPrDeployments,
   listBranches,
-  refreshWorkspacePr,
   getDefaultBranch,
 } from "@/tauri/commands";
 import type {
@@ -37,15 +35,11 @@ import type {
   CheckInfo,
   ReviewComment,
   InlineReviewComment,
-  DeploymentInfo,
 } from "@/tauri/types";
-import { PrHeader } from "./pr/pr-header";
-import { PrChecks } from "./pr/pr-checks";
-import { PrReviews } from "./pr/pr-reviews";
-import { PrReviewActions } from "./pr/pr-review-actions";
-import { PrDeployments } from "./pr/pr-deployments";
-import { PrMergeControls } from "./pr/pr-merge-controls";
-import { IncomingPrsView } from "./pr/incoming-prs-view";
+import { ReviewHeader } from "./review/review-header";
+import { ReviewChecks } from "./review/review-checks";
+import { ReviewThreads } from "./review/review-threads";
+import { IncomingPrsView } from "./review/incoming-prs-view";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -126,7 +120,7 @@ function StatusMessage({
   );
 }
 
-function PrSkeleton() {
+function ReviewSkeleton() {
   return (
     <div className="space-y-3 p-3">
       <div className="space-y-1.5">
@@ -281,9 +275,9 @@ function CreatePrForm({
   );
 }
 
-// ── NoPrView ──
+// ── NoReviewView ──
 
-function NoPrView({
+function NoReviewView({
   cwd,
   branchName,
   onCreated,
@@ -318,60 +312,50 @@ function NoPrView({
   );
 }
 
-// ── PrView ──
+// ── ReviewView ──
 
-function PrView({
+function ReviewView({
   pr,
   checks,
   reviews,
   inlineComments,
-  deployments,
-  cwd,
-  onRefresh,
+  checksLoading,
+  commentsLoading,
 }: {
   pr: PullRequestInfo;
   checks: CheckInfo[];
   reviews: ReviewComment[];
   inlineComments: InlineReviewComment[];
-  deployments: DeploymentInfo[];
-  cwd: string;
-  onRefresh: () => void;
+  checksLoading: boolean;
+  commentsLoading: boolean;
 }) {
+  // Stripped to match Superset's resting layout: title + status badge
+  // + checks + comments only. Composer (Approve / Request changes /
+  // Comment), merge controls, and deployments were intentionally
+  // removed — composer because Superset has no equivalent (verified
+  // against the reference clone), merge controls because the Changes
+  // panel toolbar already has a merge dropdown, deployments because
+  // it's not part of Superset's Review surface. Backends for the
+  // composer and merge are retained for potential future re-wire.
   return (
     <div className="space-y-2 p-3">
-      <PrHeader pr={pr} />
+      <ReviewHeader pr={pr} />
 
       <div className="border-t border-border/30" />
 
-      <PrChecks checks={checks} />
-      <PrReviews reviews={reviews} inlineComments={inlineComments} />
-
-      {pr.state === "OPEN" && (
-        <>
-          <div className="border-t border-border/30" />
-          <PrReviewActions
-            cwd={cwd}
-            prNumber={pr.number}
-            onSubmitted={onRefresh}
-          />
-        </>
-      )}
-
-      <PrDeployments deployments={deployments} />
-
-      {pr.state === "OPEN" && (
-        <>
-          <div className="border-t border-border/30" />
-          <PrMergeControls pr={pr} cwd={cwd} onRefresh={onRefresh} />
-        </>
-      )}
+      <ReviewChecks checks={checks} isLoading={checksLoading} />
+      <ReviewThreads
+        reviews={reviews}
+        inlineComments={inlineComments}
+        isLoading={commentsLoading}
+      />
     </div>
   );
 }
 
-// ── Main PrPanel ──
+// ── Main ReviewPanel ──
 
-export function PrPanel({ workspace }: Props) {
+export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const hasPr = workspace.pr_number != null;
 
@@ -383,15 +367,13 @@ export function PrPanel({ workspace }: Props) {
     getCachedGhStatus() === null || getCachedRepoCheck(cwd) === undefined,
   );
 
-  const [pr, setPr] = useState<PullRequestInfo | null>(null);
-  const [checks, setChecks] = useState<CheckInfo[]>([]);
-  const [reviews, setReviews] = useState<ReviewComment[]>([]);
-  const [inlineComments, setInlineComments] = useState<InlineReviewComment[]>([]);
-  const [deployments, setDeployments] = useState<DeploymentInfo[]>([]);
-  const [detailLoading, setDetailLoading] = useState(false);
-  const [fetchError, setFetchError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
-  const [incomingRefreshKey, setIncomingRefreshKey] = useState(0);
+  // The IncomingPrsView used to be re-fetched via the now-removed
+  // refresh button. Auto-poll covers regular PR data; the incoming
+  // list relies on its own internal mount cycle (and on the 60s Rust
+  // background poll updating workspace.pr_state for each row).
+  const incomingRefreshKey = 0;
 
   const isBaseBranch = defaultBranch != null && workspace.git_branch === defaultBranch;
 
@@ -436,101 +418,107 @@ export function PrPanel({ workspace }: Props) {
     };
   }, [cwd]);
 
-  // Fetch full PR details when pr_number changes
-  const fetchDetails = useCallback(async () => {
-    if (!hasPr) {
-      setPr(null);
-      setChecks([]);
-      setReviews([]);
-      setInlineComments([]);
-      setDeployments([]);
-      return;
-    }
-    setDetailLoading(true);
-    try {
-      setFetchError(null);
-      const prNum = workspace.pr_number!;
-      const [prInfo, prChecks, prReviews, prInline, prDeploys] = await Promise.all([
-        getBranchPullRequest(cwd),
-        getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
-        getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
-        getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
-        getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
-      ]);
-      setPr(prInfo);
-      setChecks(prChecks);
-      setReviews(prReviews);
-      setInlineComments(prInline);
-      setDeployments(prDeploys);
-    } catch (err) {
-      console.warn("[pr-panel] fetchDetails failed:", err);
-      setFetchError(String(err));
-      setPr(null);
-      setChecks([]);
-      setReviews([]);
-      setInlineComments([]);
-      setDeployments([]);
-    } finally {
-      setDetailLoading(false);
-    }
-  }, [cwd, hasPr, workspace.pr_number]);
+  // ── React Query: PR data ──
+  //
+  // Each query is keyed by (workspaceId, pr_number) so switching
+  // workspaces auto-cancels in-flight calls for the previous workspace
+  // — the stale-data-flashing bug the analysis (§4) called out.
+  // staleTime + refetchInterval keep the surface honest without
+  // hammering `gh`. Reviews/inline comments are slower (30s) than
+  // PR/checks/deploys (10s) since they change less often.
+  //
+  // Caveat: AbortSignal is plumbed through but the underlying Rust
+  // commands are sync `pub fn` using `std::process::Command`, so a
+  // canceled query stops the JS from caring about the result; the
+  // `gh` subprocess keeps running until natural completion (already
+  // bounded by the existing 10s timeout in `run_gh_timed`). Wasted
+  // CPU on a stale call is minimal; the fix that matters here is that
+  // the *result* never lands in the new workspace's UI.
+  const detailsEnabled =
+    !initialLoading &&
+    ghStatus?.status === "Authenticated" &&
+    isGithubRepo === true &&
+    hasPr;
 
-  useEffect(() => {
-    if (initialLoading) return;
-    if (ghStatus?.status !== "Authenticated") return;
-    if (!isGithubRepo) return;
-    fetchDetails();
-  }, [fetchDetails, initialLoading, ghStatus, isGithubRepo]);
+  // Cadence per Superset (`ChangesView.tsx:105` polls at 2500ms when
+  // active). PR detail + checks update fast so the user sees their
+  // PR move from pending → success without a manual refresh.
+  // Reviews + inline comments stay at 30s — they change less often
+  // and the JSON payloads are larger.
+  const prDetailQuery = useQuery({
+    queryKey: ["pr", "detail", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getBranchPullRequest(cwd),
+    enabled: detailsEnabled,
+    staleTime: 2_500,
+    refetchInterval: 2_500,
+  });
 
-  const handleRefresh = useCallback(async () => {
-    setFetchError(null);
-    if (!hasPr && isBaseBranch) {
-      // On base branch — refresh incoming PR list
-      setIncomingRefreshKey((k) => k + 1);
-      return;
-    }
-    if (!hasPr) {
-      // No PR known — re-discover via backend (gh pr view)
-      setDetailLoading(true);
-      try {
-        // Bust caches so auth/repo re-check on next render cycle
-        ghStatusCache = null;
-        repoCheckCache.delete(cwd);
-        await refreshWorkspacePr(workspace.workspace_id);
-        // State update flows via app-state-changed → re-render.
-        // If PR found, hasPr becomes true → useEffect triggers fetchDetails.
-      } catch (err) {
-        console.warn("[pr-panel] refresh_workspace_pr failed:", err);
-        setFetchError(String(err));
-      } finally {
-        setDetailLoading(false);
-      }
-      return;
-    }
-    // PR exists — re-fetch full details
-    fetchDetails();
-  }, [hasPr, isBaseBranch, cwd, workspace.workspace_id, fetchDetails]);
+  const checksQuery = useQuery({
+    queryKey: ["pr", "checks", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getPullRequestChecks(cwd),
+    enabled: detailsEnabled,
+    staleTime: 2_500,
+    refetchInterval: 2_500,
+  });
+
+  const reviewsQuery = useQuery({
+    queryKey: ["pr", "reviews", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => getPrReviewComments(cwd),
+    enabled: detailsEnabled,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+
+  const inlineQuery = useQuery({
+    queryKey: ["pr", "inline", workspace.workspace_id, workspace.pr_number] as const,
+    queryFn: () => {
+      const num = workspace.pr_number;
+      if (num == null) return Promise.resolve([] as InlineReviewComment[]);
+      return getPrInlineComments(cwd, num);
+    },
+    enabled: detailsEnabled && workspace.pr_number != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+  });
+
+  const pr: PullRequestInfo | null = prDetailQuery.data ?? null;
+  const checks: CheckInfo[] = checksQuery.data ?? [];
+  const reviews: ReviewComment[] = reviewsQuery.data ?? [];
+  const inlineComments: InlineReviewComment[] = inlineQuery.data ?? [];
+  // Only the primary detail query's error feeds the banner — the
+  // others swallow their errors via empty-array fallbacks below since
+  // their failures are usually transient and the empty sections
+  // render fine.
+  const fetchError = prDetailQuery.error
+    ? String((prDetailQuery.error as Error).message ?? prDetailQuery.error)
+    : null;
+
+  // Helper to invalidate every PR query for this workspace at once —
+  // used by manual refresh and (in §3.3) by commit/push/merge events.
+  const invalidatePrQueries = useCallback(() => {
+    queryClient.invalidateQueries({
+      predicate: (q) =>
+        q.queryKey[0] === "pr" &&
+        q.queryKey[2] === workspace.workspace_id,
+    });
+  }, [queryClient, workspace.workspace_id]);
 
   const handlePrCreated = (newPr: PullRequestInfo) => {
-    setPr(newPr);
-    const prNum = newPr.number;
-    Promise.all([
-      getPullRequestChecks(cwd).catch((e) => { console.warn("[pr-panel] checks:", e); return [] as CheckInfo[]; }),
-      getPrReviewComments(cwd).catch((e) => { console.warn("[pr-panel] reviews:", e); return [] as ReviewComment[]; }),
-      getPrInlineComments(cwd, prNum).catch((e) => { console.warn("[pr-panel] inline:", e); return [] as InlineReviewComment[]; }),
-      getPrDeployments(cwd, prNum).catch((e) => { console.warn("[pr-panel] deploys:", e); return [] as DeploymentInfo[]; }),
-    ]).then(([c, r, ic, d]) => {
-      setChecks(c);
-      setReviews(r);
-      setInlineComments(ic);
-      setDeployments(d);
-    });
+    // Seed the detail cache directly so the user sees the new PR
+    // immediately without waiting for the workspace state push to
+    // flip pr_number. Then invalidate the rest so checks/reviews/
+    // deploys fetch fresh.
+    queryClient.setQueryData(
+      ["pr", "detail", workspace.workspace_id, newPr.number],
+      newPr,
+    );
+    invalidatePrQueries();
   };
 
   // ── Render ──
 
   if (initialLoading) {
-    return <PrSkeleton />;
+    return <ReviewSkeleton />;
   }
 
   if (ghStatus?.status === "NotInstalled") {
@@ -562,20 +550,9 @@ export function PrPanel({ workspace }: Props) {
 
   return (
     <ScrollArea className="h-full [&_[data-slot=scroll-area-viewport]>div]:!block">
-      <div className="flex items-center justify-end px-3 pt-2">
-        <Button
-          size="xs"
-          variant="ghost"
-          className="h-6 w-6 p-0"
-          onClick={handleRefresh}
-          title="Refresh"
-          disabled={detailLoading}
-        >
-          <RefreshCw
-            className={`h-3 w-3 ${detailLoading ? "animate-spin" : ""}`}
-          />
-        </Button>
-      </div>
+      {/* No refresh button — auto-poll handles freshness (2.5s for PR
+          detail and checks, 30s for reviews + inline comments while the
+          tab is active). Mirrors Superset's pattern. */}
       {fetchError && (
         <div className="mx-3 mb-1 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
           <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
@@ -583,17 +560,16 @@ export function PrPanel({ workspace }: Props) {
         </div>
       )}
       {hasPr && pr ? (
-        <PrView
+        <ReviewView
           pr={pr}
           checks={checks}
           reviews={reviews}
           inlineComments={inlineComments}
-          deployments={deployments}
-          cwd={cwd}
-          onRefresh={handleRefresh}
+          checksLoading={checksQuery.isFetching}
+          commentsLoading={reviewsQuery.isFetching || inlineQuery.isFetching}
         />
       ) : hasPr && !pr ? (
-        <PrSkeleton />
+        <ReviewSkeleton />
       ) : isBaseBranch ? (
         <IncomingPrsView
           cwd={cwd}
@@ -602,7 +578,7 @@ export function PrPanel({ workspace }: Props) {
           refreshKey={incomingRefreshKey}
         />
       ) : (
-        <NoPrView
+        <NoReviewView
           cwd={cwd}
           branchName={workspace.git_branch}
           onCreated={handlePrCreated}

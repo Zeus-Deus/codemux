@@ -3072,7 +3072,6 @@ mod tests {
             pr_number: None,
             pr_state: None,
             pr_url: None,
-            pr_branch: None,
             linked_issue: None,
             tabs: Vec::new(),
             active_tab_id: String::new(),

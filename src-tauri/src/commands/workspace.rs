@@ -276,13 +276,7 @@ pub fn create_worktree_workspace(
     populate_git_info(&state, &workspace_id.0, &wt_path_buf);
 
     if let Some(pr_num) = pr_number {
-        state.update_workspace_pr_info(
-            &workspace_id.0,
-            Some(pr_num),
-            None,
-            None,
-            Some(branch.clone()),
-        );
+        state.update_workspace_pr_info(&workspace_id.0, Some(pr_num), None, None);
     }
 
     let snapshot = state.snapshot();
