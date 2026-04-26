@@ -1,4 +1,4 @@
-import { BookOpen } from "lucide-react";
+import { BookOpen, Link2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -65,6 +65,16 @@ export function SkillViewModal({ skill, onClose }: Props) {
             >
               {skill.filePath}
             </span>
+            {skill.symlinked && (
+              <span
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground/80"
+                data-testid="skill-modal-symlink"
+              >
+                <Link2 className="h-3 w-3" aria-hidden />
+                Resolved from a symlink — the path above is the link
+                target, not where the entry lives in your skills folder.
+              </span>
+            )}
           </DialogDescription>
         </DialogHeader>
 

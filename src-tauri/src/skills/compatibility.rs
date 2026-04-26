@@ -47,7 +47,15 @@ pub fn classify_compatibility(
 ) -> (SkillCompatibility, Vec<String>) {
     let mut signals: Vec<String> = Vec::new();
     let mut hard = false;
-    let mut soft = false;
+    // Stage 5 refinement: distinguish *strong* soft signals (a single
+    // one is enough to escalate to soft-warn) from *weak* soft signals
+    // (need at least two to escalate). Stage 1 over-warned on skills
+    // like omarchy that mentioned `docker` once in prose without
+    // actually depending on it; this two-tier approach drops those to
+    // compatible while preserving warnings for skills with bash blocks
+    // or sibling-file references that are unambiguously tool-bound.
+    let mut strong_soft = 0usize;
+    let mut weak_soft = 0usize;
 
     // -- HARD signals ---------------------------------------------------
     if frontmatter.get("allowed-tools").is_some() {
@@ -80,25 +88,54 @@ pub fn classify_compatibility(
         }
     }
 
-    // -- SOFT signals ---------------------------------------------------
+    // -- STRONG soft signals (1 → soft-warn) ----------------------------
+    // Triple-backtick bash block — concrete shell instructions the
+    // skill expects to run.
     if SOFT_BASH_BLOCK.is_match(body) {
-        soft = true;
+        strong_soft += 1;
         signals.push("contains bash code blocks".to_string());
     }
-    if let Some(m) = SOFT_CLI_TOOLS.find(body) {
-        soft = true;
-        signals.push(format!("mentions CLI tool: {}", m.as_str()));
-    }
+    // References to the bundled-skill conventional subdirs. If the
+    // skill ships `scripts/foo.sh` or `references/bar.md` the model
+    // is meant to use them — the skill would degrade if those bundled
+    // files don't get carried along.
     if SOFT_SIBLING_FILES.is_match(body) {
-        soft = true;
-        signals.push("references sibling files (scripts/ or references/)".to_string());
+        strong_soft += 1;
+        signals
+            .push("references sibling files (scripts/ or references/)".to_string());
+    }
+
+    // -- WEAK soft signals (2+ → soft-warn) -----------------------------
+    // Single CLI mention is often incidental prose ("docker" in a
+    // changelog, "ssh" in a paragraph about server access). Counting
+    // every match individually so a skill that mentions both `gh` and
+    // `docker` in code-context actually trips the threshold.
+    let cli_count = SOFT_CLI_TOOLS.find_iter(body).count();
+    if cli_count > 0 {
+        weak_soft += cli_count;
+        // Surface a representative sample so the tooltip is concrete.
+        if let Some(first) = SOFT_CLI_TOOLS.find(body) {
+            signals.push(format!(
+                "mentions CLI tool: {}{}",
+                first.as_str(),
+                if cli_count > 1 {
+                    format!(" (and {} more)", cli_count - 1)
+                } else {
+                    String::new()
+                },
+            ));
+        }
     }
 
     let bucket = if hard {
         SkillCompatibility::HardWarn
-    } else if soft {
+    } else if strong_soft >= 1 || weak_soft >= 2 {
         SkillCompatibility::SoftWarn
     } else {
+        // A single weak signal (one CLI mention in prose) keeps the
+        // skill labelled compatible. Signals are still returned so the
+        // tooltip can show "we noticed this — but didn't promote it"
+        // if the UI ever wants to surface that.
         SkillCompatibility::Compatible
     };
 
@@ -143,6 +180,7 @@ mod tests {
 
     #[test]
     fn bash_block_is_soft_warn() {
+        // Strong signal — single bash block is enough.
         let body = "Run this:\n```bash\ngit status\n```\n";
         let (bucket, signals) =
             classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
@@ -164,16 +202,49 @@ mod tests {
     }
 
     #[test]
-    fn gh_cli_mention_is_soft_warn() {
+    fn single_cli_mention_in_prose_stays_compatible() {
+        // Stage 5 refinement: a lone CLI mention is often incidental
+        // ("docker" in a changelog, "ssh" in a paragraph about server
+        // access). The Stage 1 omarchy false-positive lived here.
+        // Signals are still recorded for tooltip reuse.
         let body = "First check `gh auth status` to confirm login.";
         let (bucket, signals) =
             classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
-        assert_eq!(bucket, SkillCompatibility::SoftWarn);
+        assert_eq!(bucket, SkillCompatibility::Compatible);
         assert!(signals.iter().any(|s| s.contains("gh")));
     }
 
     #[test]
+    fn two_cli_mentions_escalate_to_soft_warn() {
+        // Two weak signals = soft-warn (the threshold).
+        let body = "Run `gh release create`, then `docker push`.";
+        let (bucket, signals) =
+            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        assert_eq!(bucket, SkillCompatibility::SoftWarn);
+        assert!(signals.iter().any(|s| s.contains("(and 1 more)")));
+    }
+
+    #[test]
+    fn bash_block_alone_is_soft_warn_strong_signal() {
+        // A bash code block is a strong signal — one is enough.
+        let body = "Run this:\n```bash\nls\n```\n";
+        let (bucket, _) =
+            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        assert_eq!(bucket, SkillCompatibility::SoftWarn);
+    }
+
+    #[test]
+    fn sibling_files_alone_is_soft_warn_strong_signal() {
+        // Sibling-file refs imply the skill expects bundled assets.
+        let body = "See `references/elicitation.md` for examples.";
+        let (bucket, _) =
+            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        assert_eq!(bucket, SkillCompatibility::SoftWarn);
+    }
+
+    #[test]
     fn references_sibling_files_is_soft_warn() {
+        // Strong signal — sibling-file ref is enough on its own.
         let body = "See `references/elicitation.md` and run `scripts/build.sh`.";
         let (bucket, signals) =
             classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);

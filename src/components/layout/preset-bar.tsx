@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import { materializeWithPreset } from "@/lib/agent-chat/materialize";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
-import { useSkillsStore } from "@/stores/skills-store";
+import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   useChatDraftStore,
   type DraftId,
@@ -153,7 +153,7 @@ export function PresetBar({
 
     const skillBodies = resolveSkillBodies(
       draft.inputDraft,
-      useSkillsStore.getState().skills,
+      selectActiveSkills(useSkillsStore.getState()),
     );
 
     void materializeWithPreset(

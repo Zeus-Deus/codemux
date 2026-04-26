@@ -5,14 +5,25 @@ import { Loader2, RotateCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
-import { groupSkillsByScope } from "@/lib/agent-chat/skill-groups";
+import {
+  detectConflicts,
+  groupHeadingFor,
+  groupSkillsByScope,
+} from "@/lib/agent-chat/skill-groups";
 import { toast } from "@/lib/toast";
 import { useSkillsStore } from "@/stores/skills-store";
 import {
   selectDefaultEditor,
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
-import { detectEditors, openInEditor, type Skill } from "@/tauri/commands";
+import {
+  detectEditors,
+  openInEditor,
+  SKILLS_CHANGED_EVENT,
+  startSkillsWatcher,
+  type Skill,
+} from "@/tauri/commands";
+import { listen } from "@tauri-apps/api/event";
 
 import { SkillRow } from "./skill-row";
 import { SkillViewModal } from "./skill-view-modal";
@@ -44,6 +55,8 @@ export function SkillsSection({ projectRoot }: Props) {
   const includePlugins = useSkillsStore((s) => s.includePlugins);
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const setIncludePlugins = useSkillsStore((s) => s.setIncludePlugins);
+  const disabledIds = useSkillsStore((s) => s.disabledIds);
+  const toggleSkillDisabled = useSkillsStore((s) => s.toggleSkillDisabled);
 
   // Settings is the authoritative refresh path: every section mount
   // forces a fresh disk walk so users always see the current state of
@@ -56,7 +69,40 @@ export function SkillsSection({ projectRoot }: Props) {
     // re-load fires at the right moment.
   }, [projectRoot, includePlugins, loadSkills]);
 
+  // File watcher: on Settings mount, start watching every enumerated
+  // skill path and listen for Tauri events. When a file changes the
+  // backend emits `skills-changed`; we force-refresh so the user sees
+  // the new state without clicking Refresh. Unmount tears down the
+  // event listener; the Rust watcher itself stays alive (keeping it
+  // running across Settings open/close avoids re-walking inotify on
+  // every visit, and the cost is one inotify fd per watched dir).
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+
+    void startSkillsWatcher(projectRoot, includePlugins).catch((err) => {
+      console.warn("[skills] watcher failed to start:", err);
+    });
+
+    void listen(SKILLS_CHANGED_EVENT, () => {
+      if (cancelled) return;
+      void loadSkills(projectRoot, true);
+    }).then((dispose) => {
+      if (cancelled) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    });
+
+    return () => {
+      cancelled = true;
+      if (unlisten) unlisten();
+    };
+  }, [projectRoot, includePlugins, loadSkills]);
+
   const groups = useMemo(() => groupSkillsByScope(skills), [skills]);
+  const conflicts = useMemo(() => detectConflicts(skills), [skills]);
 
   const [pendingView, setPendingView] = useState<Skill | null>(null);
 
@@ -179,11 +225,20 @@ export function SkillsSection({ projectRoot }: Props) {
         </p>
       ) : (
         <div className="space-y-6">
+          {conflicts.size > 0 && (
+            <ConflictsSection
+              conflicts={conflicts}
+              onView={setPendingView}
+              onOpenFile={handleOpenFile}
+            />
+          )}
           {groups.map((group) => (
             <SkillsGroupSection
               key={group.heading}
               heading={group.heading}
               skills={group.skills}
+              disabledIds={disabledIds}
+              onToggleDisabled={toggleSkillDisabled}
               onView={setPendingView}
               onOpenFile={handleOpenFile}
             />
@@ -199,14 +254,121 @@ export function SkillsSection({ projectRoot }: Props) {
   );
 }
 
+function ConflictsSection({
+  conflicts,
+  onView,
+  onOpenFile,
+}: {
+  conflicts: Map<string, Skill[]>;
+  onView: (skill: Skill) => void;
+  onOpenFile: (skill: Skill) => void;
+}) {
+  // Render in alphabetical name order so the same conflict surfaces in
+  // the same place across refreshes, even as the underlying skill list
+  // changes order.
+  const entries = [...conflicts.entries()].sort(([a], [b]) =>
+    a.toLowerCase().localeCompare(b.toLowerCase()),
+  );
+  return (
+    <section data-testid="skills-conflicts">
+      <header className="mb-2 flex items-baseline justify-between">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+          Naming conflicts
+        </h3>
+        <span className="text-[10px] text-muted-foreground/70">
+          {entries.length} name{entries.length === 1 ? "" : "s"} clashing
+        </span>
+      </header>
+      <p className="mb-3 text-xs text-muted-foreground">
+        These skill names appear in more than one source. Both stay
+        available in the slash popup with a scope suffix; pick the one
+        you want explicitly.
+      </p>
+      <div className="space-y-3">
+        {entries.map(([name, skills]) => (
+          <div
+            key={name}
+            className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2"
+            data-testid={`conflict-group-${name}`}
+          >
+            <div className="mb-1.5 px-1 text-xs font-mono text-foreground">
+              {name}{" "}
+              <span className="text-muted-foreground">
+                ({skills.length} sources)
+              </span>
+            </div>
+            <ul className="divide-y divide-amber-500/20">
+              {skills.map((skill) => (
+                <li key={skill.id}>
+                  <ConflictRow
+                    skill={skill}
+                    onView={() => onView(skill)}
+                    onOpenFile={() => onOpenFile(skill)}
+                  />
+                </li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ConflictRow({
+  skill,
+  onView,
+  onOpenFile,
+}: {
+  skill: Skill;
+  onView: () => void;
+  onOpenFile: () => void;
+}) {
+  // Slim variant of SkillRow that always shows the scope heading
+  // inline (no hover required) since that's the whole point here.
+  return (
+    <div className="group flex items-center gap-3 px-2 py-1.5">
+      <span className="flex-1 truncate text-xs">
+        <span className="text-muted-foreground">{groupHeadingFor(skill)}</span>
+        {skill.description && (
+          <span className="ml-2 text-muted-foreground/70">
+            {skill.description}
+          </span>
+        )}
+      </span>
+      <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+        <button
+          type="button"
+          onClick={onView}
+          className="rounded px-2 py-0.5 text-xs hover:bg-foreground/10"
+        >
+          View
+        </button>
+        <button
+          type="button"
+          onClick={onOpenFile}
+          aria-label={`Open ${skill.name} in editor`}
+          className="rounded px-1 py-0.5 hover:bg-foreground/10"
+        >
+          ↗
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SkillsGroupSection({
   heading,
   skills,
+  disabledIds,
+  onToggleDisabled,
   onView,
   onOpenFile,
 }: {
   heading: string;
   skills: Skill[];
+  disabledIds: string[];
+  onToggleDisabled: (id: string) => void;
   onView: (skill: Skill) => void;
   onOpenFile: (skill: Skill) => void;
 }) {
@@ -225,6 +387,8 @@ function SkillsGroupSection({
           <li key={skill.id}>
             <SkillRow
               skill={skill}
+              enabled={!disabledIds.includes(skill.id)}
+              onToggleEnabled={() => onToggleDisabled(skill.id)}
               onView={() => onView(skill)}
               onOpenFile={() => onOpenFile(skill)}
             />

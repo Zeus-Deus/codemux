@@ -53,6 +53,29 @@ export interface SkillGroup {
 }
 
 /**
+ * Find skills that share a name across different scopes/providers.
+ * Returns a Map keyed by name → skills (always ≥2 entries per key).
+ * Skills with unique names are excluded entirely.
+ *
+ * Used by the Settings UI to surface naming clashes at the top of
+ * the page so users can disambiguate explicitly. The slash popup
+ * itself disambiguates inline via the description suffix (`provider
+ * · scope`) and never silently picks one over the other.
+ */
+export function detectConflicts(skills: Skill[]): Map<string, Skill[]> {
+  const byName = new Map<string, Skill[]>();
+  for (const skill of skills) {
+    const list = byName.get(skill.name);
+    if (list) list.push(skill);
+    else byName.set(skill.name, [skill]);
+  }
+  for (const name of [...byName.keys()]) {
+    if ((byName.get(name) ?? []).length <= 1) byName.delete(name);
+  }
+  return byName;
+}
+
+/**
  * Bucket skills by their group heading, returning groups in
  * `GROUP_ORDER`. Within each group skills are sorted alphabetically
  * by name (case-insensitive). Empty groups are dropped.

@@ -141,6 +141,7 @@ pub fn run() {
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        .manage(skills::watcher::SkillsWatcherState::new())
         // Phase 2 display-isolation: per-workspace virtual display manager.
         // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
         // prior Codemux crashes. Actual Xvfb spawning is lazy — first agent
@@ -796,6 +797,8 @@ pub fn run() {
             commands::list_tool_permissions,
             commands::remove_tool_permission,
             commands::list_skills,
+            commands::start_skills_watcher,
+            commands::stop_skills_watcher,
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,

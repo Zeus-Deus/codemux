@@ -9,6 +9,7 @@ pub mod compatibility;
 pub mod parser;
 pub mod paths;
 pub mod scanner;
+pub mod watcher;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

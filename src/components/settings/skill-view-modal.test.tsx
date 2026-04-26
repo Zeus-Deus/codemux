@@ -148,6 +148,21 @@ describe("SkillViewModal", () => {
     expect(screen.queryByText("Advanced metadata")).not.toBeInTheDocument();
   });
 
+  it("renders the symlink banner only when the skill is symlinked", () => {
+    const { rerender } = render(
+      <SkillViewModal skill={makeSkill()} onClose={vi.fn()} />,
+    );
+    expect(screen.queryByTestId("skill-modal-symlink")).not.toBeInTheDocument();
+
+    rerender(
+      <SkillViewModal
+        skill={makeSkill({ symlinked: true })}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("skill-modal-symlink")).toBeInTheDocument();
+  });
+
   it("explicit Close button calls onClose", () => {
     // Radix Dialog also renders an icon-X close button with the same
     // accessible name. Pick the footer button (variant=outline) so we

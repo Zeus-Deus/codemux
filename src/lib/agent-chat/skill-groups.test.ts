@@ -4,6 +4,7 @@ import type { Skill, SkillProvider, SkillScope } from "@/tauri/commands";
 
 import {
   GROUP_ORDER,
+  detectConflicts,
   groupHeadingFor,
   groupSkillsByScope,
 } from "./skill-groups";
@@ -103,6 +104,46 @@ describe("groupSkillsByScope", () => {
     ];
     const groups = groupSkillsByScope(skills);
     expect(groups.map((g) => g.heading)).toEqual([...GROUP_ORDER]);
+  });
+
+  it("detectConflicts returns nothing when every name is unique", () => {
+    const conflicts = detectConflicts([
+      makeSkill("alpha", "claude", "user"),
+      makeSkill("beta", "claude", "user"),
+      makeSkill("gamma", "codex", "user"),
+    ]);
+    expect(conflicts.size).toBe(0);
+  });
+
+  it("detectConflicts surfaces same-name skills across scopes", () => {
+    const userRelease = makeSkill("release", "claude", "user");
+    const projectRelease = makeSkill("release", "claude", "project");
+    const conflicts = detectConflicts([
+      userRelease,
+      projectRelease,
+      makeSkill("other", "claude", "user"),
+    ]);
+    expect(conflicts.size).toBe(1);
+    expect(conflicts.get("release")).toHaveLength(2);
+  });
+
+  it("detectConflicts surfaces same-name skills across providers", () => {
+    const conflicts = detectConflicts([
+      makeSkill("foo", "claude", "user"),
+      makeSkill("foo", "codex", "user"),
+    ]);
+    expect(conflicts.size).toBe(1);
+    expect(conflicts.get("foo")?.map((s) => s.provider).sort()).toEqual([
+      "claude",
+      "codex",
+    ]);
+  });
+
+  it("detectConflicts ignores skills that have only one entry per name", () => {
+    const conflicts = detectConflicts([
+      makeSkill("solo", "claude", "user"),
+    ]);
+    expect(conflicts.size).toBe(0);
   });
 
   it("produces independent arrays per group (mutating one doesn't bleed)", () => {

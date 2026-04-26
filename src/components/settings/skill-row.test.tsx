@@ -1,7 +1,14 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  type RenderResult,
+} from "@testing-library/react";
 
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Skill } from "@/tauri/commands";
 
 import { SkillRow } from "./skill-row";
@@ -28,42 +35,48 @@ function makeSkill(overrides: Partial<Skill> = {}): Skill {
   };
 }
 
+interface RenderOpts {
+  skill?: Skill;
+  enabled?: boolean;
+  onToggleEnabled?: () => void;
+  onView?: () => void;
+  onOpenFile?: () => void;
+}
+
+function renderRow(opts: RenderOpts = {}): RenderResult {
+  return render(
+    <TooltipProvider>
+      <SkillRow
+        skill={opts.skill ?? makeSkill()}
+        enabled={opts.enabled ?? true}
+        onToggleEnabled={opts.onToggleEnabled ?? vi.fn()}
+        onView={opts.onView ?? vi.fn()}
+        onOpenFile={opts.onOpenFile ?? vi.fn()}
+      />
+    </TooltipProvider>,
+  );
+}
+
 describe("SkillRow", () => {
   it("renders the skill name and description", () => {
-    render(
-      <SkillRow skill={makeSkill()} onView={vi.fn()} onOpenFile={vi.fn()} />,
-    );
+    renderRow();
     expect(screen.getByText("demo-skill")).toBeInTheDocument();
     expect(screen.getByText("Does demo things.")).toBeInTheDocument();
   });
 
   it("hides the description block when none is set", () => {
-    render(
-      <SkillRow
-        skill={makeSkill({ description: null })}
-        onView={vi.fn()}
-        onOpenFile={vi.fn()}
-      />,
-    );
+    renderRow({ skill: makeSkill({ description: null }) });
     expect(screen.getByText("demo-skill")).toBeInTheDocument();
     expect(screen.queryByText("Does demo things.")).not.toBeInTheDocument();
   });
 
   it("does NOT render the compatibility badge when compatibility is 'compatible'", () => {
-    render(
-      <SkillRow skill={makeSkill()} onView={vi.fn()} onOpenFile={vi.fn()} />,
-    );
+    renderRow();
     expect(screen.queryByTestId("compatibility-badge")).not.toBeInTheDocument();
   });
 
   it("renders soft-warn badge when compatibility is 'soft-warn'", () => {
-    render(
-      <SkillRow
-        skill={makeSkill({ compatibility: "soft-warn" })}
-        onView={vi.fn()}
-        onOpenFile={vi.fn()}
-      />,
-    );
+    renderRow({ skill: makeSkill({ compatibility: "soft-warn" }) });
     expect(screen.getByTestId("compatibility-badge")).toHaveAttribute(
       "data-level",
       "soft-warn",
@@ -71,13 +84,7 @@ describe("SkillRow", () => {
   });
 
   it("renders hard-warn badge when compatibility is 'hard-warn'", () => {
-    render(
-      <SkillRow
-        skill={makeSkill({ compatibility: "hard-warn" })}
-        onView={vi.fn()}
-        onOpenFile={vi.fn()}
-      />,
-    );
+    renderRow({ skill: makeSkill({ compatibility: "hard-warn" }) });
     expect(screen.getByTestId("compatibility-badge")).toHaveAttribute(
       "data-level",
       "hard-warn",
@@ -86,30 +93,65 @@ describe("SkillRow", () => {
 
   it("View button calls onView", () => {
     const onView = vi.fn();
-    render(
-      <SkillRow skill={makeSkill()} onView={onView} onOpenFile={vi.fn()} />,
-    );
+    renderRow({ onView });
     fireEvent.click(screen.getByRole("button", { name: /view/i }));
     expect(onView).toHaveBeenCalledTimes(1);
   });
 
   it("Open-in-editor button calls onOpenFile", () => {
     const onOpenFile = vi.fn();
-    render(
-      <SkillRow skill={makeSkill()} onView={vi.fn()} onOpenFile={onOpenFile} />,
+    renderRow({ onOpenFile });
+    fireEvent.click(
+      screen.getByRole("button", { name: /open demo-skill in editor/i }),
     );
-    fireEvent.click(screen.getByRole("button", { name: /open demo-skill in editor/i }));
     expect(onOpenFile).toHaveBeenCalledTimes(1);
   });
 
-  it("shows a 'symlinked' label when the skill came via a symlink", () => {
-    render(
-      <SkillRow
-        skill={makeSkill({ symlinked: true })}
-        onView={vi.fn()}
-        onOpenFile={vi.fn()}
-      />,
+  it("shows a Link2 icon (with tooltip) when the skill came via a symlink", () => {
+    renderRow({ skill: makeSkill({ symlinked: true }) });
+    const icon = screen.getByTestId("skill-row-symlink-icon");
+    expect(icon).toBeInTheDocument();
+    expect(icon).toHaveAttribute("aria-label", "Symlinked skill");
+  });
+
+  it("does NOT show the symlink icon for non-symlinked skills", () => {
+    renderRow();
+    expect(
+      screen.queryByTestId("skill-row-symlink-icon"),
+    ).not.toBeInTheDocument();
+  });
+
+  // ── Stage 5: disable toggle ──────────────────────────────────────
+
+  it("renders enabled by default with the switch checked", () => {
+    renderRow({ skill: makeSkill({ id: "demo" }) });
+    const sw = screen.getByTestId("skill-row-switch-demo");
+    expect(sw).toHaveAttribute("aria-checked", "true");
+    expect(
+      screen.queryByTestId("skill-row-disabled-badge"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders disabled state: line-through name + badge + greyed row", () => {
+    renderRow({ skill: makeSkill({ id: "demo" }), enabled: false });
+    const row = screen.getByTestId("skill-row-demo");
+    expect(row).toHaveAttribute("data-enabled", "false");
+    expect(row.className).toContain("opacity-50");
+    expect(screen.getByTestId("skill-row-disabled-badge")).toHaveTextContent(
+      /disabled/i,
     );
-    expect(screen.getByText("symlinked")).toBeInTheDocument();
+    const sw = screen.getByTestId("skill-row-switch-demo");
+    expect(sw).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("clicking the switch fires onToggleEnabled", () => {
+    const onToggleEnabled = vi.fn();
+    renderRow({
+      skill: makeSkill({ id: "demo" }),
+      enabled: true,
+      onToggleEnabled,
+    });
+    fireEvent.click(screen.getByTestId("skill-row-switch-demo"));
+    expect(onToggleEnabled).toHaveBeenCalledTimes(1);
   });
 });

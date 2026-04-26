@@ -11,7 +11,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
 });
 
 import { listSkills } from "@/tauri/commands";
-import { TTL_MS, useSkillsStore } from "./skills-store";
+import { TTL_MS, selectActiveSkills, useSkillsStore } from "./skills-store";
 
 const listSkillsMock = listSkills as unknown as ReturnType<typeof vi.fn>;
 
@@ -23,7 +23,17 @@ function resetStore() {
     error: null,
     loadedAt: 0,
     includePlugins: true,
+    disabledIds: [],
   });
+  // Persist middleware writes to localStorage; clear so a leftover
+  // entry from another test doesn't bleed into the next.
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.removeItem("codemux:skills:v1");
+    } catch {
+      // jsdom should always expose localStorage; ignore otherwise.
+    }
+  }
 }
 
 function makeSkill(name: string): Skill {
@@ -198,5 +208,71 @@ describe("skills-store", () => {
     listSkillsMock.mockResolvedValueOnce([makeSkill("a")]);
     await useSkillsStore.getState().loadSkills(null, true);
     expect(useSkillsStore.getState().error).toBeNull();
+  });
+});
+
+describe("skills-store · disable toggle (Stage 5)", () => {
+  beforeEach(() => {
+    resetStore();
+    listSkillsMock.mockReset();
+  });
+
+  it("disabledIds defaults to an empty array", () => {
+    expect(useSkillsStore.getState().disabledIds).toEqual([]);
+  });
+
+  it("toggleSkillDisabled adds the id and keeps the list sorted", () => {
+    useSkillsStore.getState().toggleSkillDisabled("zeta");
+    useSkillsStore.getState().toggleSkillDisabled("alpha");
+    useSkillsStore.getState().toggleSkillDisabled("mid");
+    expect(useSkillsStore.getState().disabledIds).toEqual([
+      "alpha",
+      "mid",
+      "zeta",
+    ]);
+  });
+
+  it("toggleSkillDisabled flips back when called twice on the same id", () => {
+    useSkillsStore.getState().toggleSkillDisabled("foo");
+    expect(useSkillsStore.getState().disabledIds).toEqual(["foo"]);
+    useSkillsStore.getState().toggleSkillDisabled("foo");
+    expect(useSkillsStore.getState().disabledIds).toEqual([]);
+  });
+
+  it("selectActiveSkills returns all skills when nothing is disabled", () => {
+    useSkillsStore.setState({
+      skills: [makeSkill("a"), makeSkill("b")],
+      disabledIds: [],
+    });
+    const active = selectActiveSkills(useSkillsStore.getState());
+    expect(active.map((s) => s.name)).toEqual(["a", "b"]);
+  });
+
+  it("selectActiveSkills filters out disabled ids", () => {
+    useSkillsStore.setState({
+      skills: [makeSkill("a"), makeSkill("b"), makeSkill("c")],
+      disabledIds: ["id-a", "id-c"],
+    });
+    const active = selectActiveSkills(useSkillsStore.getState());
+    expect(active.map((s) => s.name)).toEqual(["b"]);
+  });
+
+  it("disabled state persists to localStorage and rehydrates on a fresh import", async () => {
+    useSkillsStore.getState().toggleSkillDisabled("foo");
+    useSkillsStore.getState().setIncludePlugins(false);
+
+    // Simulate a reload by reading the persisted JSON directly. The
+    // persist middleware writes synchronously after the set call so
+    // localStorage is up to date by the time we read.
+    const raw = window.localStorage.getItem("codemux:skills:v1");
+    expect(raw).not.toBeNull();
+    const parsed = JSON.parse(raw!);
+    expect(parsed.state).toMatchObject({
+      disabledIds: ["foo"],
+      includePlugins: false,
+    });
+    // Loading/loaded/skills are intentionally NOT persisted.
+    expect(parsed.state.skills).toBeUndefined();
+    expect(parsed.state.loadedAt).toBeUndefined();
   });
 });

@@ -1062,3 +1062,18 @@ export const listSkills = (
   projectRoot: string | null,
   includePlugins: boolean,
 ) => invoke<Skill[]>("list_skills", { projectRoot, includePlugins });
+
+/** Start the file watcher. Returns the count of paths actually being
+ *  watched (paths that don't exist on disk are skipped silently).
+ *  Idempotent — re-calling with new args swaps the watcher's path set. */
+export const startSkillsWatcher = (
+  projectRoot: string | null,
+  includePlugins: boolean,
+) =>
+  invoke<number>("start_skills_watcher", { projectRoot, includePlugins });
+
+export const stopSkillsWatcher = () =>
+  invoke<void>("stop_skills_watcher");
+
+/** Tauri event name emitted whenever a watched skill file changes. */
+export const SKILLS_CHANGED_EVENT = "skills-changed";

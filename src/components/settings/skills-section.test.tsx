@@ -17,8 +17,14 @@ vi.mock("@/tauri/commands", async (importActual) => {
     listSkills: vi.fn(),
     detectEditors: vi.fn(),
     openInEditor: vi.fn(),
+    startSkillsWatcher: vi.fn().mockResolvedValue(0),
+    stopSkillsWatcher: vi.fn().mockResolvedValue(undefined),
   };
 });
+
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => {}),
+}));
 
 vi.mock("@/lib/toast", () => ({
   toast: {
@@ -36,7 +42,9 @@ import {
   detectEditors,
   listSkills,
   openInEditor,
+  startSkillsWatcher,
 } from "@/tauri/commands";
+import { listen } from "@tauri-apps/api/event";
 import { toast } from "@/lib/toast";
 import { useSkillsStore } from "@/stores/skills-store";
 import {
@@ -296,6 +304,108 @@ describe("SkillsSection", () => {
         "code",
         "/skills/demo/SKILL.md",
       );
+    });
+  });
+
+  it("renders a 'Naming conflicts' section at the top when same-name skills exist", async () => {
+    listSkillsMock.mockResolvedValue([
+      makeSkill({
+        id: "u-release",
+        name: "release",
+        provider: "claude",
+        scope: "user",
+        description: "User-wide release",
+      }),
+      makeSkill({
+        id: "p-release",
+        name: "release",
+        provider: "claude",
+        scope: "project",
+        description: "Project release",
+      }),
+      makeSkill({ id: "alone", name: "lonely", provider: "claude", scope: "user" }),
+    ]);
+
+    render(<SkillsSection projectRoot={null} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("skills-conflicts")).toBeInTheDocument();
+    });
+    const conflictGroup = screen.getByTestId("conflict-group-release");
+    expect(conflictGroup).toHaveTextContent("release");
+    expect(conflictGroup).toHaveTextContent("User · Claude");
+    expect(conflictGroup).toHaveTextContent("Project · Claude");
+
+    // The unique-named skill stays in its normal scope group, not in
+    // the conflict block.
+    expect(
+      screen.queryByTestId("conflict-group-lonely"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("lonely")).toBeInTheDocument();
+  });
+
+  it("toggling a per-row switch flips disabled state in the store", async () => {
+    listSkillsMock.mockResolvedValue([
+      makeSkill({ id: "demo", name: "demo-skill" }),
+    ]);
+    render(<SkillsSection projectRoot={null} />);
+    await waitFor(() => {
+      expect(screen.getByText("demo-skill")).toBeInTheDocument();
+    });
+
+    expect(useSkillsStore.getState().disabledIds).toEqual([]);
+    fireEvent.click(screen.getByTestId("skill-row-switch-demo"));
+
+    await waitFor(() => {
+      expect(useSkillsStore.getState().disabledIds).toEqual(["demo"]);
+    });
+    // Row stays rendered, just visually disabled.
+    expect(screen.getByText("demo-skill")).toBeInTheDocument();
+    expect(screen.getByTestId("skill-row-disabled-badge")).toBeInTheDocument();
+  });
+
+  it("does NOT render the conflicts section when every name is unique", async () => {
+    listSkillsMock.mockResolvedValue([
+      makeSkill({ id: "a", name: "alpha", provider: "claude", scope: "user" }),
+      makeSkill({ id: "b", name: "beta", provider: "codex", scope: "user" }),
+    ]);
+    render(<SkillsSection projectRoot={null} />);
+    await waitFor(() => {
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId("skills-conflicts")).not.toBeInTheDocument();
+  });
+
+  it("starts the file watcher on mount", async () => {
+    listSkillsMock.mockResolvedValue([]);
+    render(<SkillsSection projectRoot="/proj" />);
+    await waitFor(() => {
+      expect(startSkillsWatcher).toHaveBeenCalledWith("/proj", true);
+    });
+  });
+
+  it("re-loads skills when a 'skills-changed' event fires", async () => {
+    let capturedHandler: ((e: { payload: unknown }) => void) | null = null;
+    (listen as ReturnType<typeof vi.fn>).mockImplementation(
+      (_event: string, handler: (e: { payload: unknown }) => void) => {
+        capturedHandler = handler;
+        return Promise.resolve(() => {});
+      },
+    );
+    listSkillsMock.mockResolvedValue([]);
+
+    render(<SkillsSection projectRoot={null} />);
+    await waitFor(() => {
+      expect(capturedHandler).not.toBeNull();
+    });
+
+    // Initial mount load + the includePlugins-triggered load happen on
+    // first render. Reset so we can isolate the watcher-driven refresh.
+    const callsBefore = listSkillsMock.mock.calls.length;
+
+    capturedHandler!({ payload: undefined });
+    await waitFor(() => {
+      expect(listSkillsMock.mock.calls.length).toBeGreaterThan(callsBefore);
     });
   });
 

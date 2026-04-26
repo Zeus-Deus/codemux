@@ -10,7 +10,10 @@ import {
 } from "@/lib/agent-chat/chat-pane-plans";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
-import { useSkillsStore } from "@/stores/skills-store";
+import {
+  selectActiveSkills,
+  useSkillsStore,
+} from "@/stores/skills-store";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
@@ -193,7 +196,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // store dedupes loads behind a 60s TTL, so reading without a load
   // call is fine — Composer's slash-popup effect ensures the registry
   // is hydrated by the time the user picks a skill.
-  const skillsRegistry = useSkillsStore((s) => s.skills);
+  // `selectActiveSkills` filters out user-disabled skills so a
+  // disabled `/release` token in the textarea is treated as plain
+  // prose, not silently injected.
+  const skillsRegistry = useSkillsStore(selectActiveSkills);
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const markRequestResponding = useAgentChatStore(

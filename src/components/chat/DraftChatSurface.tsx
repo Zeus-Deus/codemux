@@ -7,7 +7,7 @@ import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
-import { useSkillsStore } from "@/stores/skills-store";
+import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
   selectActiveDraft,
   useChatDraftStore,
@@ -222,7 +222,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // injected as a per-turn prefix by `materializeAndSend`.
     const skillBodies = resolveSkillBodies(
       text,
-      useSkillsStore.getState().skills,
+      selectActiveSkills(useSkillsStore.getState()),
     );
 
     void materializeAndSend(

@@ -3,9 +3,14 @@
 // Stage 1 ships only `list_skills`. Stage 2 wires the result into the
 // frontend slash popup; Stage 4 wires it into the Settings UI.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::skills::{paths::enumerate_scan_paths, scanner::scan_directory, Skill, SkillProvider, SkillScope};
+use tauri::{AppHandle, State};
+
+use crate::skills::{
+    paths::enumerate_scan_paths, scanner::scan_directory, watcher::SkillsWatcherState, Skill,
+    SkillProvider, SkillScope,
+};
 
 /// Discover all skills under the locked directories and return them as a
 /// flat list. The frontend deduplicates / groups; the backend stays
@@ -64,4 +69,27 @@ fn scope_rank(s: SkillScope) -> u8 {
         SkillScope::User => 1,
         SkillScope::Plugin => 2,
     }
+}
+
+/// Start the skills file watcher. Idempotent — calling again with new
+/// `project_root` / `include_plugins` re-watches the new path set.
+/// Returns the count of paths actually being watched (paths that
+/// don't exist on disk are skipped silently).
+#[tauri::command]
+pub async fn start_skills_watcher(
+    app: AppHandle,
+    state: State<'_, SkillsWatcherState>,
+    project_root: Option<String>,
+    include_plugins: bool,
+) -> Result<usize, String> {
+    let project_path = project_root.map(PathBuf::from);
+    state.start(app, project_path, include_plugins)
+}
+
+/// Stop the skills file watcher. Safe to call when not running.
+#[tauri::command]
+pub async fn stop_skills_watcher(
+    state: State<'_, SkillsWatcherState>,
+) -> Result<(), String> {
+    state.stop()
 }

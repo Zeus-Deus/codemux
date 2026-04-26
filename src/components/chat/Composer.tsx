@@ -12,7 +12,10 @@ import {
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
 import type { ChatMode } from "@/stores/agent-chat-store";
-import { useSkillsStore } from "@/stores/skills-store";
+import {
+  selectActiveSkills,
+  useSkillsStore,
+} from "@/stores/skills-store";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -133,7 +136,10 @@ export function Composer({
   // overlay below. At send time the parent parses the text against the
   // skills registry and injects matched skill bodies as a per-turn
   // prefix (no separate chip / staging state needed).
-  const skills = useSkillsStore((s) => s.skills);
+  // `selectActiveSkills` already filters out disabled ids — Composer
+  // never sees disabled skills, so highlight + picker + send-time
+  // injection all stay consistent.
+  const skills = useSkillsStore(selectActiveSkills);
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const skillsLoading = useSkillsStore((s) => s.loading);
   const skillsLoaded = useSkillsStore((s) => s.loaded);
