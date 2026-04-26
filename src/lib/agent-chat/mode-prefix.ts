@@ -3,7 +3,7 @@
  *
  * Mirrors `ultrathink.ts`: each mode contributes a prefix that the
  * send-path composes onto the user's raw text. Stage 4 ships ASK;
- * Stage 6 will fill DEBUG. Composition order with ultrathink is
+ * Stage 6 fills DEBUG. Composition order with ultrathink is
  * locked: `Ultrathink:` lives at the very top, then the mode wrapper,
  * then the user's text — so the model sees the high-level "think
  * hard" directive first, the framing second, and the question last.
@@ -24,13 +24,16 @@ import {
 export const ASK_WRAPPER =
   "You are in ASK mode. Answer questions directly and concisely about the code, files, or concepts in question. Do not make any changes to code or files. Do not call ExitPlanMode — this is a conversational question, not a planning session.";
 
-export const DEBUG_WRAPPER = "";
+export const DEBUG_WRAPPER = `You are in DEBUG mode. To help diagnose this issue:
+1. Add diagnostic log statements tagged with \`CODEMUX_DEBUG\` using the appropriate comment syntax for each language.
+2. Make logs descriptive — include relevant variable values and execution context.
+3. When the bug is resolved, the user will trigger cleanup. You don't need to remove logs manually until then.`;
 
 /**
- * Apply the per-mode wrapper to `text`. `default` and (for now)
- * `debug` pass through unchanged. Empty / whitespace-only input
- * returns unchanged so the call site doesn't fire a wrapper-only
- * payload at the SDK.
+ * Apply the per-mode wrapper to `text`. `default` and `plan` pass
+ * through unchanged (Plan uses SDK enforcement, not a wrapper).
+ * Empty / whitespace-only input returns unchanged so the call site
+ * doesn't fire a wrapper-only payload at the SDK.
  */
 export function applyModePrefix(text: string, mode: ChatMode): string {
   const trimmed = text.trim();
@@ -38,6 +41,10 @@ export function applyModePrefix(text: string, mode: ChatMode): string {
   if (mode === "ask") {
     if (trimmed.startsWith(ASK_WRAPPER)) return trimmed;
     return `${ASK_WRAPPER}\n\n${trimmed}`;
+  }
+  if (mode === "debug") {
+    if (trimmed.startsWith(DEBUG_WRAPPER)) return trimmed;
+    return `${DEBUG_WRAPPER}\n\n${trimmed}`;
   }
   return trimmed;
 }

@@ -4,6 +4,7 @@ import {
   applyAllPrefixes,
   applyModePrefix,
   ASK_WRAPPER,
+  DEBUG_WRAPPER,
 } from "./mode-prefix";
 import { ULTRATHINK_PROMPT_PREFIX } from "./ultrathink";
 
@@ -22,8 +23,10 @@ describe("applyModePrefix", () => {
     expect(applyModePrefix("draft a plan", "plan")).toBe("draft a plan");
   });
 
-  it("passes through unchanged for debug mode (Stage 6 placeholder)", () => {
-    expect(applyModePrefix("crash trace", "debug")).toBe("crash trace");
+  it("prepends DEBUG_WRAPPER for debug mode", () => {
+    expect(applyModePrefix("crash on submit", "debug")).toBe(
+      `${DEBUG_WRAPPER}\n\ncrash on submit`,
+    );
   });
 
   it("is idempotent — re-applying ask wrapper does not double-wrap", () => {
@@ -32,15 +35,26 @@ describe("applyModePrefix", () => {
     expect(twice).toBe(once);
   });
 
+  it("is idempotent — re-applying debug wrapper does not double-wrap", () => {
+    const once = applyModePrefix("crash on submit", "debug");
+    const twice = applyModePrefix(once, "debug");
+    expect(twice).toBe(once);
+  });
+
   it("trims whitespace around the body before wrapping", () => {
     expect(applyModePrefix("   investigate  ", "ask")).toBe(
       `${ASK_WRAPPER}\n\ninvestigate`,
+    );
+    expect(applyModePrefix("   investigate  ", "debug")).toBe(
+      `${DEBUG_WRAPPER}\n\ninvestigate`,
     );
   });
 
   it("returns empty for empty / whitespace-only inputs", () => {
     expect(applyModePrefix("", "ask")).toBe("");
     expect(applyModePrefix("   ", "ask")).toBe("");
+    expect(applyModePrefix("", "debug")).toBe("");
+    expect(applyModePrefix("   ", "debug")).toBe("");
   });
 });
 
@@ -76,9 +90,28 @@ describe("applyAllPrefixes", () => {
     );
   });
 
+  it("composes debug wrapper + ultrathink in the locked order: ultrathink → mode → user text", () => {
+    const result = applyAllPrefixes("crash on submit", "debug", "ultrathink");
+    expect(result).toBe(
+      `${ULTRATHINK_PROMPT_PREFIX}${DEBUG_WRAPPER}\n\ncrash on submit`,
+    );
+  });
+
+  it("debug alone wraps without ultrathink prefix", () => {
+    expect(applyAllPrefixes("crash on submit", "debug", null)).toBe(
+      `${DEBUG_WRAPPER}\n\ncrash on submit`,
+    );
+  });
+
   it("is idempotent under repeated application", () => {
     const once = applyAllPrefixes("ask question", "ask", "ultrathink");
     const twice = applyAllPrefixes(once, "ask", "ultrathink");
+    expect(twice).toBe(once);
+  });
+
+  it("is idempotent under repeated application for debug + ultrathink", () => {
+    const once = applyAllPrefixes("crash on submit", "debug", "ultrathink");
+    const twice = applyAllPrefixes(once, "debug", "ultrathink");
     expect(twice).toBe(once);
   });
 

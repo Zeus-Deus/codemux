@@ -905,6 +905,7 @@ pub fn run() {
             commands::search_file_names,
             commands::read_file,
             commands::write_file,
+            commands::grep_count_pattern,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,
             commands::signin_email,

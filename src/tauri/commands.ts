@@ -852,6 +852,9 @@ export const readFile = (path: string) =>
 export const writeFile = (path: string, content: string) =>
   invoke<void>("write_file", { path, content });
 
+export const grepCountPattern = (cwd: string, pattern: string) =>
+  invoke<number>("grep_count_pattern", { cwd, pattern });
+
 // ── Dialogs ──
 
 export const pickFolderDialog = (title: string) =>

@@ -117,14 +117,17 @@ describe("ComposerFooter — Stage 3 mode selector", () => {
     expect(onModeActivate).toHaveBeenCalledWith("ask");
   });
 
-  it("Debug dropdown item is disabled (Stage 6)", async () => {
+  it("dropdown Debug item fires onModeActivate('debug') (Stage 6)", async () => {
     const user = userEvent.setup();
-    renderFooter({ mode: "default" });
+    const onModeActivate = vi.fn();
+    renderFooter({ mode: "default", onModeActivate });
     await user.click(
       screen.getByRole("button", { name: /Activate mode/i }),
     );
     const debug = await screen.findByRole("menuitem", { name: /Debug/ });
-    expect(debug.getAttribute("aria-disabled")).toBe("true");
+    expect(debug.getAttribute("aria-disabled")).not.toBe("true");
+    await user.click(debug);
+    expect(onModeActivate).toHaveBeenCalledWith("debug");
   });
 
   it("clicking the pill's X calls onModeRemove", () => {

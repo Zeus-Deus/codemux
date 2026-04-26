@@ -25,6 +25,9 @@ describe("agent-chat-store", () => {
       expect(slice.contextWindow).toBeNull();
       expect(slice.permissionMode).toBe(DEFAULT_THREAD_PERMISSION_MODE);
       expect(slice.model).toBeNull();
+      // Stage 6 debug-flag defaults.
+      expect(slice.hasDebugActivity).toBe(false);
+      expect(slice.debugActivityResolved).toBe(false);
     });
 
     it("is idempotent — ensuring twice keeps the same slice instance", () => {
@@ -135,6 +138,30 @@ describe("agent-chat-store", () => {
       useAgentChatStore.getState().setPermissionMode("t1", "workspace-write");
       const after = useAgentChatStore.getState().threads["t1"];
       expect(after).toBe(before);
+    });
+  });
+
+  describe("setHasDebugActivity / setDebugActivityResolved", () => {
+    it("setHasDebugActivity flips the slice flag and is a no-op on unchanged value", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore.getState().setHasDebugActivity("t1", true);
+      expect(
+        useAgentChatStore.getState().threads["t1"].hasDebugActivity,
+      ).toBe(true);
+      const before = useAgentChatStore.getState().threads["t1"];
+      useAgentChatStore.getState().setHasDebugActivity("t1", true);
+      expect(useAgentChatStore.getState().threads["t1"]).toBe(before);
+    });
+
+    it("setDebugActivityResolved flips the resolved flag and is a no-op on unchanged value", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore.getState().setDebugActivityResolved("t1", true);
+      expect(
+        useAgentChatStore.getState().threads["t1"].debugActivityResolved,
+      ).toBe(true);
+      const before = useAgentChatStore.getState().threads["t1"];
+      useAgentChatStore.getState().setDebugActivityResolved("t1", true);
+      expect(useAgentChatStore.getState().threads["t1"]).toBe(before);
     });
   });
 

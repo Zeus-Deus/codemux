@@ -58,6 +58,11 @@ export interface ChatThreadSlice extends ChatThreadState {
    *  affordance. Defined on the slice from Stage 3 onward but
    *  unused until Stage 6. */
   hasDebugActivity: boolean;
+  /** Set to `true` once the background grep-on-open has finished
+   *  (success or failure). The Cleanup banner / exit dialog only
+   *  trust `hasDebugActivity` once this flips, so a slow grep can't
+   *  cause us to flash a stale "no markers" state. */
+  debugActivityResolved: boolean;
 }
 
 function emptySlice(): ChatThreadSlice {
@@ -74,6 +79,7 @@ function emptySlice(): ChatThreadSlice {
     mode: "default",
     modePriorPermissionMode: null,
     hasDebugActivity: false,
+    debugActivityResolved: false,
   };
 }
 
@@ -139,6 +145,8 @@ interface AgentChatStore {
   /** Flip the `hasDebugActivity` flag (Stage 6). Defined on the
    *  store now so Stage 3 doesn't need another migration. */
   setHasDebugActivity: (threadId: string, value: boolean) => void;
+  /** Mark the background debug-marker grep as finished. Stage 6. */
+  setDebugActivityResolved: (threadId: string, value: boolean) => void;
 }
 
 function updateSlice(
@@ -347,6 +355,15 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         slice.hasDebugActivity === value
           ? slice
           : { ...slice, hasDebugActivity: value },
+      ),
+    ),
+
+  setDebugActivityResolved: (threadId, value) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.debugActivityResolved === value
+          ? slice
+          : { ...slice, debugActivityResolved: value },
       ),
     ),
 }));

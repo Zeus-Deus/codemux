@@ -37,6 +37,7 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  grepCountPattern,
 } from "@/tauri/commands";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
@@ -48,6 +49,8 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import { DebugCleanupBanner } from "./DebugCleanupBanner";
+import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
   type AskUserQuestionOutput,
   ComposerPendingInputPanel,
@@ -66,6 +69,11 @@ type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 // Codex's set_permission_mode currently rejects unknown strings. Hide
 // the provider picker until the backend exposes a capability probe.
 const ENABLE_PROVIDER_PICKER = false;
+
+/** Synthetic user prompt fired when the user invokes Debug-mode
+ *  cleanup. The grep pattern carries no comment-prefix so the model
+ *  finds CODEMUX_DEBUG markers across every language Claude touched. */
+const CLEANUP_PROMPT = `Search for \`CODEMUX_DEBUG\` across the project and remove every line containing that marker. Also remove any surrounding debug-only scaffolding (variable declarations, imports) that were added solely to support those markers. After removing, run a final grep to verify zero matches remain.`;
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
@@ -86,6 +94,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // flag the first one just set. We do the same.
   const [isSending, setIsSending] = useState(false);
   const sendInFlightRef = useRef(false);
+
+  // Stage 6 Debug-mode cleanup affordances. The exit dialog opens when
+  // the user removes the Debug pill while CODEMUX_DEBUG markers exist;
+  // the busy flag disables the in-banner Clean up button while the
+  // synthetic cleanup turn is in flight.
+  const [debugExitDialog, setDebugExitDialog] = useState<{
+    resolve: (choice: DebugExitChoice) => void;
+  } | null>(null);
+  // The `cleanupInFlight` state drives the banner's busy label; the
+  // ref is the synchronous race guard. Same trick as `sendInFlightRef`
+  // — React state updates aren't visible to a second click that fires
+  // in the same tick (the closure already captured `cleanupInFlight =
+  // false`), so the ref provides the actual single-fire guarantee.
+  const [cleanupInFlight, setCleanupInFlight] = useState(false);
+  const cleanupInFlightRef = useRef(false);
 
   const fallbackCwd = useAppStore((s) => {
     if (!s.appState) return null;
@@ -158,6 +181,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const setStoreModePriorPermissionMode = useAgentChatStore(
     (s) => s.setModePriorPermissionMode,
   );
+  const setStoreHasDebugActivity = useAgentChatStore(
+    (s) => s.setHasDebugActivity,
+  );
+  const setStoreDebugActivityResolved = useAgentChatStore(
+    (s) => s.setDebugActivityResolved,
+  );
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
   const markRequestResponding = useAgentChatStore(
@@ -187,6 +216,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const effort = slice?.effort ?? null;
   const contextWindow = slice?.contextWindow ?? null;
   const mode = slice?.mode ?? "default";
+  const hasDebugActivity = slice?.hasDebugActivity ?? false;
+  const debugActivityResolved = slice?.debugActivityResolved ?? false;
   const activeModel = selectModel(capabilities, model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
@@ -233,6 +264,39 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (model !== null) return;
     setStoreModel(threadId, defaultModelForProvider(provider));
   }, [threadId, model, provider, setStoreModel]);
+
+  // Stage 6 grep-on-chat-open: when the pane mounts (or the project
+  // root changes), background-check whether the workspace already
+  // contains `CODEMUX_DEBUG` markers from a previous debug session.
+  // The result drives the cleanup banner / exit dialog. Failures are
+  // soft: we treat them as "no markers" so a missing ripgrep binary
+  // can't pin the cleanup affordance on forever.
+  useEffect(() => {
+    if (!threadId) return;
+    if (!workspaceProjectRoot) return;
+    let cancelled = false;
+    setStoreDebugActivityResolved(threadId, false);
+    grepCountPattern(workspaceProjectRoot, "CODEMUX_DEBUG")
+      .then((count) => {
+        if (cancelled) return;
+        setStoreHasDebugActivity(threadId, count > 0);
+        setStoreDebugActivityResolved(threadId, true);
+      })
+      .catch((err) => {
+        console.warn("[agent-chat] debug-marker grep failed:", err);
+        if (cancelled) return;
+        setStoreHasDebugActivity(threadId, false);
+        setStoreDebugActivityResolved(threadId, true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    threadId,
+    workspaceProjectRoot,
+    setStoreHasDebugActivity,
+    setStoreDebugActivityResolved,
+  ]);
 
   // Subscribe to provider events for this thread. The handler reads
   // store actions via `getState()` so it stays stable across
@@ -593,7 +657,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // prompt wrapper handled in `applyAllPrefixes` tells the model to
   // answer conversationally instead of calling ExitPlanMode). The
   // prior picker value is stashed so toggle-off can restore it.
-  // Debug lands in Stage 6 — currently no-ops past the slice update.
+  // Debug doesn't override permission_mode — it's prompt-wrapper-only
+  // enforcement, so the slice flip is the entire activation.
   const handleModeActivate = useCallback(
     async (newMode: ActivePillMode) => {
       if (!threadId) return;
@@ -614,7 +679,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setSessionLaunchMode(threadId, "plan");
         setStoreMode(threadId, newMode);
       } else {
-        // Debug: state-only flip until Stage 6 wires its wrapper.
         setStoreMode(threadId, newMode);
       }
     },
@@ -628,6 +692,63 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
+  /** Synthetic cleanup turn. Switches the slice off Debug first so
+   *  the wrapper doesn't re-instruct the model to add markers, then
+   *  asks the model to grep+remove every CODEMUX_DEBUG line and any
+   *  scaffolding that supported them.
+   *
+   *  Optimistic-clear caveat: `hasDebugActivity` flips to false the
+   *  moment `agentChatSendTurn` resolves (which is RPC-accept, not
+   *  turn-completion). If Claude leaves stragglers, the banner
+   *  disappears even though markers remain. The next mount-effect
+   *  re-grep on chat-open reconciles this — so the stale state is
+   *  bounded to the current pane lifetime.
+   *
+   *  Deferred: a post-`turn_completed` verification grep would close
+   *  this gap inside the current session. Wiring it requires a
+   *  one-shot listener tied to the turn id returned from
+   *  `agentChatSendTurn` (events flow through `useAgentChatEvents`
+   *  → `applyEvent`; nothing currently subscribes per-turn). The
+   *  marginal value is low — Claude's cleanup is reliable in
+   *  practice and the user can always click Clean up again — so
+   *  this stays out of Stage 6. */
+  const triggerDebugCleanup = useCallback(async () => {
+    if (!threadId) return;
+    if (cleanupInFlightRef.current) return;
+    cleanupInFlightRef.current = true;
+    setCleanupInFlight(true);
+    setStoreMode(threadId, "default");
+    try {
+      await agentChatSendTurn(provider, {
+        thread_id: threadId,
+        text: CLEANUP_PROMPT,
+        model_override: null,
+        effort_override: null,
+        permission_mode_override: null,
+      });
+      setStoreHasDebugActivity(threadId, false);
+    } catch (err) {
+      toast.error(`Failed to start debug cleanup: ${err}`);
+    } finally {
+      cleanupInFlightRef.current = false;
+      setCleanupInFlight(false);
+    }
+  }, [threadId, provider, setStoreMode, setStoreHasDebugActivity]);
+
+  /** Open the exit-confirmation dialog and resolve with the user's
+   *  pick. Caller awaits the choice and dispatches accordingly. The
+   *  dialog itself unmounts the moment a choice resolves. */
+  const confirmDebugExit = useCallback((): Promise<DebugExitChoice> => {
+    return new Promise((resolve) => {
+      setDebugExitDialog({
+        resolve: (choice) => {
+          setDebugExitDialog(null);
+          resolve(choice);
+        },
+      });
+    });
+  }, []);
+
   // Composer-level mode pill removal. Plan and Ask both restore the
   // stashed prior `permissionMode` via a silent session restart
   // rather than the live `setPermissionMode` setter — the SDK only
@@ -636,10 +757,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // the session was originally launched with the flag. Restarting
   // with the prior mode in launch params re-applies the flag
   // correctly. Transcript + pickers carry across via
-  // `migrateThreadId`. Debug just flips the slice back to `default`
-  // until Stage 6. Missing prior falls back to the provider's
-  // default mode so the session is never left in an orphan state.
-  const handleModeRemove = useCallback(() => {
+  // `migrateThreadId`. Debug pops the cleanup-or-leave dialog when
+  // markers exist; otherwise it just flips the slice back to default.
+  // Missing prior falls back to the provider's default mode so the
+  // session is never left in an orphan state.
+  const handleModeRemove = useCallback(async () => {
     if (!threadId) return;
     const currentSlice = useAgentChatStore.getState().threads[threadId];
     if (!currentSlice) return;
@@ -651,6 +773,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // pill drops). The restart sets sessionLaunchMode itself.
       setStorePermissionMode(threadId, restore);
       restartSessionWith({ permissionMode: restore });
+      setStoreMode(threadId, "default");
+      setStoreModePriorPermissionMode(threadId, null);
+      return;
+    }
+    if (currentSlice.mode === "debug") {
+      if (
+        currentSlice.hasDebugActivity &&
+        currentSlice.debugActivityResolved
+      ) {
+        const choice = await confirmDebugExit();
+        if (choice === "cancel") return;
+        if (choice === "cleanup") {
+          await triggerDebugCleanup();
+          return;
+        }
+        // "leave" — fall through to the default pill-drop below.
+      }
+      setStoreMode(threadId, "default");
+      return;
     }
     setStoreMode(threadId, "default");
     setStoreModePriorPermissionMode(threadId, null);
@@ -660,6 +801,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreMode,
     setStoreModePriorPermissionMode,
     restartSessionWith,
+    confirmDebugExit,
+    triggerDebugCleanup,
   ]);
 
   const handleModelChange = useCallback(
@@ -949,6 +1092,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     />
   );
 
+  const debugBannerEl =
+    mode === "debug" && hasDebugActivity && debugActivityResolved ? (
+      <DebugCleanupBanner
+        onCleanup={triggerDebugCleanup}
+        busy={cleanupInFlight}
+      />
+    ) : null;
+
   return (
     <div className="flex h-full w-full flex-col bg-background">
       {messages.length === 0 ? (
@@ -963,9 +1114,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             onRejectPlan={handleRejectPlan}
           />
           {pendingInputPanelEl}
+          {debugBannerEl}
           {composerEl}
         </>
       )}
+      <DebugExitDialog
+        open={debugExitDialog !== null}
+        onChoose={(choice) => debugExitDialog?.resolve(choice)}
+      />
     </div>
   );
 }

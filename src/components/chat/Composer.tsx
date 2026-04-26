@@ -108,10 +108,7 @@ export function Composer({
 
   // Slash-command interception — only at draft start, only when no
   // mode pill is active (can't re-activate what's already on).
-  //
-  // Stages 3 + 4 wire `/plan` and `/ask`. `/debug` is reserved
-  // (Stage 6) — typing it strips the slash-command but does nothing
-  // so users who discover it early don't get yelled at.
+  // Stages 3, 4 and 6 wire `/plan`, `/ask`, and `/debug`.
   const handleTextareaChange = (
     e: React.ChangeEvent<HTMLTextAreaElement>,
   ) => {
@@ -124,9 +121,9 @@ export function Composer({
           onModeActivate("plan");
         } else if (match[1] === "ask") {
           onModeActivate("ask");
+        } else if (match[1] === "debug") {
+          onModeActivate("debug");
         }
-        // /debug intentionally no-ops until Stage 6 — still strip
-        // the command so the textarea clears.
         onDraftChange(rest);
         return;
       }

@@ -348,7 +348,7 @@ describe("Composer", () => {
       );
     });
 
-    it("'/debug' still strips the command but does not activate (Stage 6)", () => {
+    it("'/debug ' at draft start activates Debug mode and strips the command", () => {
       const onDraftChange = vi.fn();
       const onModeActivate = vi.fn();
       const { container } = renderComposer({
@@ -366,8 +366,30 @@ describe("Composer", () => {
       setter?.call(textarea, "/debug crash trace");
       textarea.dispatchEvent(new Event("input", { bubbles: true }));
 
-      expect(onModeActivate).not.toHaveBeenCalled();
+      expect(onModeActivate).toHaveBeenCalledWith("debug");
       expect(onDraftChange).toHaveBeenCalledWith("crash trace");
+    });
+
+    it("'/debug' on its own strips to empty and activates", () => {
+      const onDraftChange = vi.fn();
+      const onModeActivate = vi.fn();
+      const { container } = renderComposer({
+        mode: "default",
+        onDraftChange,
+        onModeActivate,
+      });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+      const setter = Object.getOwnPropertyDescriptor(
+        window.HTMLTextAreaElement.prototype,
+        "value",
+      )?.set;
+      setter?.call(textarea, "/debug");
+      textarea.dispatchEvent(new Event("input", { bubbles: true }));
+
+      expect(onModeActivate).toHaveBeenCalledWith("debug");
+      expect(onDraftChange).toHaveBeenCalledWith("");
     });
   });
 });

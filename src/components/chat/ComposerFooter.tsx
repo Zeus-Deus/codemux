@@ -142,11 +142,14 @@ export function ComposerFooter({
                   /ask
                 </span>
               </DropdownMenuItem>
-              <DropdownMenuItem disabled className="text-xs gap-2">
+              <DropdownMenuItem
+                onClick={() => onModeActivate("debug")}
+                className="text-xs gap-2"
+              >
                 <Bug className="h-3.5 w-3.5" />
                 <span>Debug</span>
                 <span className="ml-auto text-[10px] text-muted-foreground">
-                  coming soon
+                  /debug
                 </span>
               </DropdownMenuItem>
             </DropdownMenuContent>

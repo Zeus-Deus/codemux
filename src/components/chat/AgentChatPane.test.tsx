@@ -17,6 +17,8 @@ type SliceOverrides = {
   model?: string | null;
   effort?: string | null;
   contextWindow?: string | null;
+  hasDebugActivity?: boolean;
+  debugActivityResolved?: boolean;
 };
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
@@ -37,6 +39,8 @@ const setModeMock = vi.fn();
 const setModePriorMock = vi.fn();
 const setPermissionModeMock = vi.fn();
 const markRequestResolvedMock = vi.fn();
+const setHasDebugActivityMock = vi.fn();
+const setDebugActivityResolvedMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -61,6 +65,55 @@ vi.mock("./ChatTranscript", () => ({
   ),
 }));
 
+vi.mock("./DebugCleanupBanner", () => ({
+  DebugCleanupBanner: ({
+    onCleanup,
+    busy,
+  }: {
+    onCleanup: () => void;
+    busy?: boolean;
+  }) => (
+    <button
+      data-testid="debug-cleanup-banner"
+      data-busy={busy ? "true" : "false"}
+      onClick={onCleanup}
+    />
+  ),
+}));
+
+let lastDebugExitOpen = false;
+let lastDebugExitOnChoose:
+  | ((choice: "cleanup" | "leave" | "cancel") => void)
+  | null = null;
+vi.mock("./DebugExitDialog", () => ({
+  DebugExitDialog: ({
+    open,
+    onChoose,
+  }: {
+    open: boolean;
+    onChoose: (choice: "cleanup" | "leave" | "cancel") => void;
+  }) => {
+    lastDebugExitOpen = open;
+    lastDebugExitOnChoose = onChoose;
+    return open ? (
+      <div data-testid="debug-exit-dialog">
+        <button
+          data-testid="debug-exit-cleanup"
+          onClick={() => onChoose("cleanup")}
+        />
+        <button
+          data-testid="debug-exit-leave"
+          onClick={() => onChoose("leave")}
+        />
+        <button
+          data-testid="debug-exit-cancel"
+          onClick={() => onChoose("cancel")}
+        />
+      </div>
+    ) : null;
+  },
+}));
+
 vi.mock("./Composer", () => ({
   Composer: ({
     zone1Override,
@@ -81,6 +134,10 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="mode-activate-ask"
         onClick={() => onModeActivate("ask")}
+      />
+      <button
+        data-testid="mode-activate-debug"
+        onClick={() => onModeActivate("debug")}
       />
     </div>
   ),
@@ -168,6 +225,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  grepCountPattern: vi.fn().mockResolvedValue(0),
 }));
 
 const HOME_APP_STATE = {
@@ -258,6 +316,8 @@ vi.mock("@/stores/agent-chat-store", () => {
       modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
       effort: overrides.effort ?? null,
       contextWindow: overrides.contextWindow ?? null,
+      hasDebugActivity: overrides.hasDebugActivity ?? false,
+      debugActivityResolved: overrides.debugActivityResolved ?? false,
     };
   }
   function buildThreads() {
@@ -290,6 +350,8 @@ vi.mock("@/stores/agent-chat-store", () => {
         setContextWindow: vi.fn(),
         setMode: setModeMock,
         setModePriorPermissionMode: setModePriorMock,
+        setHasDebugActivity: setHasDebugActivityMock,
+        setDebugActivityResolved: setDebugActivityResolvedMock,
         migrateThreadId: vi.fn(),
         appendUserMessage: vi.fn(),
         markRequestResponding: vi.fn(),
@@ -318,9 +380,11 @@ vi.mock("@/stores/agent-chat-store", () => {
 
 import { AgentChatPane } from "./AgentChatPane";
 import {
+  agentChatSendTurn,
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  grepCountPattern,
 } from "@/tauri/commands";
 
 const pane = {
@@ -960,6 +1024,23 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
   });
 
+  it("activating Debug pill flips slice.mode without an SDK setPermissionMode call", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const activateBtn = container.querySelector(
+      '[data-testid="mode-activate-debug"]',
+    ) as HTMLButtonElement;
+    activateBtn.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(agentChatSetPermissionMode).not.toHaveBeenCalled();
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "debug");
+    expect(setPermissionModeMock).not.toHaveBeenCalledWith(
+      "thread-x",
+      "plan",
+    );
+  });
+
   it("regression guard: handleAcceptPlan still uses the live setPermissionMode (plan → default is allowed by the SDK)", async () => {
     currentSliceOverrides = {
       "thread-x": {
@@ -988,5 +1069,309 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(acceptMode).toBe("default");
     expect(agentChatStartSession).not.toHaveBeenCalled();
     expect(agentChatStopSession).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Stage 6 — Debug-mode cleanup affordances. These tests cover the
+// grep-on-mount hook that seeds hasDebugActivity, the exit-dialog
+// branch on pill-removal, the cleanup turn synthesis, and the banner
+// visibility gate.
+// ─────────────────────────────────────────────────────────────────────
+
+describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    setModeMock.mockClear();
+    setHasDebugActivityMock.mockClear();
+    setDebugActivityResolvedMock.mockClear();
+    lastDebugExitOpen = false;
+    lastDebugExitOnChoose = null;
+    vi.mocked(grepCountPattern).mockClear().mockResolvedValue(0);
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue("turn-1");
+  });
+  afterEach(() => cleanup());
+
+  it("grep-on-mount fires with the workspace project root and CODEMUX_DEBUG pattern", async () => {
+    render(<AgentChatPane pane={pane} />);
+    await Promise.resolve();
+    expect(grepCountPattern).toHaveBeenCalledWith(
+      "/home/user",
+      "CODEMUX_DEBUG",
+    );
+  });
+
+  it("grep-on-mount with hits flips hasDebugActivity true and marks resolved", async () => {
+    vi.mocked(grepCountPattern).mockResolvedValue(3);
+    render(<AgentChatPane pane={pane} />);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setHasDebugActivityMock).toHaveBeenCalledWith("thread-x", true);
+    expect(setDebugActivityResolvedMock).toHaveBeenCalledWith(
+      "thread-x",
+      true,
+    );
+  });
+
+  it("grep-on-mount failure soft-fails: hasDebugActivity stays false, resolved still flips", async () => {
+    vi.mocked(grepCountPattern).mockRejectedValue(new Error("rg missing"));
+    render(<AgentChatPane pane={pane} />);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setHasDebugActivityMock).toHaveBeenCalledWith("thread-x", false);
+    expect(setDebugActivityResolvedMock).toHaveBeenCalledWith(
+      "thread-x",
+      true,
+    );
+  });
+
+  it("Debug-pill removal with no detected markers skips the dialog and just flips slice.mode", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: false,
+        debugActivityResolved: true,
+      },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(lastDebugExitOpen).toBe(false);
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+  });
+
+  it("Debug-pill removal with markers opens the exit dialog and pauses on Cancel", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    expect(lastDebugExitOpen).toBe(true);
+    // Cancel keeps the pill: setMode("default") never fires for this thread.
+    setModeMock.mockClear();
+    lastDebugExitOnChoose?.("cancel");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setModeMock).not.toHaveBeenCalledWith("thread-x", "default");
+  });
+
+  it("Debug-pill removal — Leave them path drops the pill without firing a cleanup turn", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    setModeMock.mockClear();
+    lastDebugExitOnChoose?.("leave");
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+    expect(agentChatSendTurn).not.toHaveBeenCalled();
+  });
+
+  it("Debug-pill removal — Remove markers path fires the cleanup turn and clears hasDebugActivity", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    lastDebugExitOnChoose?.("cleanup");
+    // Two awaits for setMode + send-turn promise + finally.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Cleanup flips slice.mode to default first so the wrapper isn't
+    // re-applied to the cleanup prompt itself, then sends the turn.
+    expect(setModeMock).toHaveBeenCalledWith("thread-x", "default");
+    expect(agentChatSendTurn).toHaveBeenCalled();
+    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
+    expect(sendInput.text).toContain("CODEMUX_DEBUG");
+    expect(setHasDebugActivityMock).toHaveBeenCalledWith("thread-x", false);
+  });
+
+  it("DebugCleanupBanner only renders when mode=debug AND hasDebugActivity AND debugActivityResolved", async () => {
+    // Combo 1: all three true → banner visible.
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    const { container, rerender } = render(<AgentChatPane pane={pane} />);
+    expect(
+      container.querySelector('[data-testid="debug-cleanup-banner"]'),
+    ).not.toBeNull();
+
+    // Combo 2: resolution still pending → banner hidden.
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: false,
+      },
+    };
+    rerender(<AgentChatPane pane={pane} />);
+    expect(
+      container.querySelector('[data-testid="debug-cleanup-banner"]'),
+    ).toBeNull();
+
+    // Combo 3: mode=debug, resolved=true, but hasDebugActivity=false
+    // (no markers in workspace) → banner hidden.
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: false,
+        debugActivityResolved: true,
+      },
+    };
+    rerender(<AgentChatPane pane={pane} />);
+    expect(
+      container.querySelector('[data-testid="debug-cleanup-banner"]'),
+    ).toBeNull();
+
+    // Combo 4: mode=default with markers → still hidden (banner is
+    // strictly debug-mode-only — it's an exit affordance, not a global
+    // janitor).
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "default",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    rerender(<AgentChatPane pane={pane} />);
+    expect(
+      container.querySelector('[data-testid="debug-cleanup-banner"]'),
+    ).toBeNull();
+  });
+
+  it("triggerDebugCleanup is single-fire — clicking the banner twice in the same tick fires only one cleanup turn", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    // Slow-walk the send-turn promise so the second click definitely
+    // lands while the first is still in flight.
+    const sendDeferred: { resolve: ((v: string) => void) | null } = {
+      resolve: null,
+    };
+    vi.mocked(agentChatSendTurn).mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          sendDeferred.resolve = resolve;
+        }),
+    );
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const banner = container.querySelector(
+      '[data-testid="debug-cleanup-banner"]',
+    ) as HTMLButtonElement;
+    expect(banner).not.toBeNull();
+    // Two synchronous clicks — same tick. The ref guard must reject
+    // the second.
+    banner.click();
+    banner.click();
+    expect(agentChatSendTurn).toHaveBeenCalledTimes(1);
+    sendDeferred.resolve?.("turn-done");
+  });
+
+  it("cleanup ordering: setMode('default') is called BEFORE agentChatSendTurn so the wrapper does not re-instruct", async () => {
+    currentSliceOverrides = {
+      "thread-x": {
+        mode: "debug",
+        hasDebugActivity: true,
+        debugActivityResolved: true,
+      },
+    };
+    const callOrder: string[] = [];
+    setModeMock.mockImplementation((_tid: string, mode: string) => {
+      if (mode === "default") callOrder.push("setMode(default)");
+    });
+    vi.mocked(agentChatSendTurn).mockImplementation(async () => {
+      callOrder.push("agentChatSendTurn");
+      return "turn-1";
+    });
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const removeBtn = container.querySelector(
+      '[data-testid="mode-remove"]',
+    ) as HTMLButtonElement;
+    removeBtn.click();
+    await Promise.resolve();
+    lastDebugExitOnChoose?.("cleanup");
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const setModeIdx = callOrder.indexOf("setMode(default)");
+    const sendTurnIdx = callOrder.indexOf("agentChatSendTurn");
+    expect(setModeIdx).toBeGreaterThanOrEqual(0);
+    expect(sendTurnIdx).toBeGreaterThanOrEqual(0);
+    expect(setModeIdx).toBeLessThan(sendTurnIdx);
+  });
+
+  it("grep cancellation: the cancelled-flag cleanup prevents stale slice writes after unmount", async () => {
+    // Hold the grep promise so we can unmount BEFORE it resolves.
+    const grepDeferred: { resolve: ((v: number) => void) | null } = {
+      resolve: null,
+    };
+    vi.mocked(grepCountPattern).mockImplementation(
+      () =>
+        new Promise<number>((resolve) => {
+          grepDeferred.resolve = resolve;
+        }),
+    );
+    const { unmount } = render(<AgentChatPane pane={pane} />);
+    // Effect ran and called setDebugActivityResolved(threadId, false)
+    // synchronously to mark "in flight". Clear the spy so we only
+    // observe writes that happen AFTER unmount.
+    setHasDebugActivityMock.mockClear();
+    setDebugActivityResolvedMock.mockClear();
+    unmount();
+    // Now resolve the grep — the cleanup ran, `cancelled` is true,
+    // and neither setter should fire.
+    grepDeferred.resolve?.(7);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(setHasDebugActivityMock).not.toHaveBeenCalled();
+    expect(setDebugActivityResolvedMock).not.toHaveBeenCalled();
   });
 });
