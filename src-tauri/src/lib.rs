@@ -17,6 +17,7 @@ pub mod diagnostics;
 pub mod execution;
 pub mod indexing;
 pub mod memory;
+pub mod notifications;
 pub mod openflow;
 pub mod observability;
 pub mod os_input;

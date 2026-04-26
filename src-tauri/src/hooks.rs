@@ -118,22 +118,32 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
     let state: tauri::State<'_, AppStateStore> = app.state();
 
     // For Stop events, check if the pane is in the active workspace+tab — if so, go idle
-    let resolved_status = if status == PaneStatus::Review {
-        let snapshot = state.snapshot();
-        let is_active = is_pane_active_for_session(&snapshot, session_id);
-        if is_active {
-            PaneStatus::Idle
-        } else {
-            PaneStatus::Review
-        }
+    let snapshot = state.snapshot();
+    let is_active = if status == PaneStatus::Review {
+        is_pane_active_for_session(&snapshot, session_id)
     } else {
-        status
+        false
+    };
+    let resolved_status = if status == PaneStatus::Review && is_active {
+        PaneStatus::Idle
+    } else {
+        status.clone()
     };
 
     let is_active_status =
         matches!(resolved_status, PaneStatus::Working | PaneStatus::Permission);
     state.set_pane_status_by_session(session_id, resolved_status.clone());
     state::emit_app_state(app);
+
+    // Fire desktop notification on agent completion when the user can't already
+    // see the pane. Mirrors Superset's "suppress if visible" behavior.
+    if status == PaneStatus::Review
+        && !crate::notifications::should_suppress(app, is_active)
+    {
+        let workspace_title = workspace_title_for_session(&snapshot, session_id)
+            .unwrap_or_else(|| "Workspace".to_string());
+        crate::notifications::dispatch_agent_complete(app, &workspace_title);
+    }
 
     // When status becomes Working/Permission, start monitoring for agent exit.
     // This catches cases where the agent exits without sending a Stop hook
@@ -144,6 +154,21 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
             start_agent_exit_monitor(app.clone(), session_id.to_string(), shell_pid);
         }
     }
+}
+
+/// Return the title of the workspace containing the given session, if any.
+fn workspace_title_for_session(
+    snapshot: &state::AppStateSnapshot,
+    session_id: &str,
+) -> Option<String> {
+    for ws in &snapshot.workspaces {
+        for surface in &ws.surfaces {
+            if find_session_in_node(&surface.root, session_id) {
+                return Some(ws.title.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Check if the pane for a session is in the currently active workspace.
