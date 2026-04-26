@@ -38,6 +38,7 @@ import type {
 import type { ApprovalDecision } from "@/tauri/events";
 
 import { ToolCallBlock } from "./ToolCallBlock";
+import { ToolCallBody } from "./ToolCallBodies";
 import { ToolCallStatus } from "./ToolCallStatus";
 
 interface Props {
@@ -171,19 +172,10 @@ export function ToolCallCard({ item, approval, onDecide }: Props) {
         </div>
       )}
 
-      {/* Result body when expanded */}
+      {/* Result body when expanded — known tools get a polished
+          renderer, unknown tools fall back to the raw JSON dump. */}
       {expanded && !isPendingApproval && !isResponding && !isDenied && (
-        <>
-          {inputText !== null && !hasResultBody && (
-            <ToolCallBlock content={null} text={inputText} />
-          )}
-          {hasResultBody && (
-            <ToolCallBlock
-              content={item.result_content}
-              error={isError}
-            />
-          )}
-        </>
+        <ToolCallBody item={item} />
       )}
     </div>
   );

@@ -278,6 +278,47 @@ describe("ComposerPendingInputPanel", () => {
     expect(send).toBeDisabled();
   });
 
+  it("renders an option.preview popover only for options that supplied one", async () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "Branch",
+            question: "Pick a branch:",
+            multiSelect: false,
+            options: [
+              {
+                label: "main",
+                description: "primary",
+                preview: "diff: 12 files changed",
+              },
+              { label: "draft", description: "wip" },
+            ],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+
+    // The preview content lives inside a Radix HoverCard portal that
+    // mounts only after hover; verify the preview is wired by looking
+    // for the test-id that we attach to the HoverCardContent.
+    expect(screen.queryByTestId("aq-option-preview-0-0")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("aq-option-preview-0-1")).not.toBeInTheDocument();
+
+    // Triggering the open state directly via Radix would require
+    // pointer events that jsdom doesn't fully simulate. Instead we
+    // assert that only the option with a preview is wrapped in a
+    // HoverCard trigger by checking the data-state attribute Radix
+    // adds.
+    const optionWithPreview = screen.getByTestId("aq-option-0-0");
+    const optionWithoutPreview = screen.getByTestId("aq-option-0-1");
+    // Radix HoverCardTrigger sets `data-state` on the slot element it
+    // wraps; the bare label without a preview has no such attribute.
+    expect(optionWithPreview).toHaveAttribute("data-state");
+    expect(optionWithoutPreview).not.toHaveAttribute("data-state");
+  });
+
   it("returns null when the resolution is no longer pending (panel dismounts cleanly)", () => {
     const { container } = render(
       <ComposerPendingInputPanel
@@ -293,5 +334,103 @@ describe("ComposerPendingInputPanel", () => {
     // The panel should render nothing — the transcript marker in
     // MessageList owns the resolved state.
     expect(container.firstChild).toBeNull();
+  });
+
+  // ----- option.preview edge cases -----------------------------------
+
+  it("an option whose preview is the empty string is treated as no preview (no popover wrapper)", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "X",
+            question: "Pick:",
+            multiSelect: false,
+            options: [
+              { label: "blank", description: "", preview: "" },
+              { label: "real", description: "", preview: "stuff" },
+            ],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    // The blank-preview option must NOT be wrapped in a HoverCard
+    // trigger (no `data-state` attribute from Radix). The real-preview
+    // option must be.
+    const blank = screen.getByTestId("aq-option-0-0");
+    const real = screen.getByTestId("aq-option-0-1");
+    expect(blank).not.toHaveAttribute("data-state");
+    expect(real).toHaveAttribute("data-state");
+  });
+
+  it("an option with a non-string preview (number, object) is ignored", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "X",
+            question: "Pick:",
+            multiSelect: false,
+            options: [
+              // Non-string previews — extractQuestions must coerce
+              // these to null so the row stays a bare label.
+              { label: "num", description: "", preview: 42 },
+              { label: "obj", description: "", preview: { nested: "yo" } },
+              { label: "ok", description: "", preview: "real preview" },
+            ],
+          },
+        ],
+      } as unknown as PermissionRequestItem["payload"],
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    expect(screen.getByTestId("aq-option-0-0")).not.toHaveAttribute(
+      "data-state",
+    );
+    expect(screen.getByTestId("aq-option-0-1")).not.toHaveAttribute(
+      "data-state",
+    );
+    expect(screen.getByTestId("aq-option-0-2")).toHaveAttribute("data-state");
+  });
+
+  it("multi-question payload: previews attach to the correct option on the correct question", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "Q1",
+            question: "Q1?",
+            multiSelect: false,
+            options: [
+              { label: "A1", description: "", preview: "preview-A1" },
+              { label: "A2", description: "" },
+            ],
+          },
+          {
+            header: "Q2",
+            question: "Q2?",
+            multiSelect: false,
+            options: [
+              { label: "B1", description: "" },
+              { label: "B2", description: "", preview: "preview-B2" },
+            ],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    // Q1 page: option 0 has preview, option 1 does not.
+    expect(screen.getByTestId("aq-option-0-0")).toHaveAttribute("data-state");
+    expect(screen.getByTestId("aq-option-0-1")).not.toHaveAttribute(
+      "data-state",
+    );
+    // Advance to Q2.
+    fireEvent.click(screen.getByText("A1"));
+    fireEvent.click(screen.getByText("Next"));
+    // Q2 page: option 0 has no preview, option 1 has the preview.
+    expect(screen.getByTestId("aq-option-1-0")).not.toHaveAttribute(
+      "data-state",
+    );
+    expect(screen.getByTestId("aq-option-1-1")).toHaveAttribute("data-state");
   });
 });

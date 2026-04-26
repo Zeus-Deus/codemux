@@ -9,6 +9,11 @@ import {
 } from "react";
 
 import { Button } from "@/components/ui/button";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
 import { cn } from "@/lib/utils";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
 
@@ -311,6 +316,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
                 shortcut={oi + 1}
                 label={opt.label}
                 description={opt.description}
+                preview={opt.preview}
                 checked={picks[qi]?.has(opt.label) ?? false}
                 multiSelect={q.multiSelect}
                 onToggle={() => togglePick(opt.label, q.multiSelect)}
@@ -399,6 +405,10 @@ interface OptionRowProps {
   shortcut: number;
   label: string;
   description: string;
+  /** Optional `option.preview` from the SDK. When non-null the row is
+   *  wrapped in a HoverCard so the user can preview the underlying
+   *  payload before committing to the choice. */
+  preview: string | null;
   checked: boolean;
   multiSelect: boolean;
   onToggle: () => void;
@@ -416,14 +426,16 @@ function OptionRow({
   shortcut,
   label,
   description,
+  preview,
   checked,
   multiSelect,
   onToggle,
 }: OptionRowProps) {
   const inputId = `aq-${questionIndex}-${optionIndex}`;
-  return (
+  const row = (
     <label
       htmlFor={inputId}
+      data-testid={`aq-option-${questionIndex}-${optionIndex}`}
       className={cn(
         "group flex w-full items-start gap-3 rounded-md border px-3 py-2 cursor-pointer transition-colors",
         checked
@@ -459,6 +471,27 @@ function OptionRow({
         )}
       </div>
     </label>
+  );
+
+  if (!preview) return row;
+
+  return (
+    <HoverCard openDelay={300}>
+      <HoverCardTrigger asChild>{row}</HoverCardTrigger>
+      <HoverCardContent
+        align="start"
+        side="right"
+        className="w-80"
+        data-testid={`aq-option-preview-${questionIndex}-${optionIndex}`}
+      >
+        <p className="mb-1 text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
+          Preview
+        </p>
+        <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-5 text-foreground">
+          {preview}
+        </pre>
+      </HoverCardContent>
+    </HoverCard>
   );
 }
 
@@ -527,7 +560,7 @@ interface Question {
   header: string;
   question: string;
   multiSelect: boolean;
-  options: { label: string; description: string }[];
+  options: { label: string; description: string; preview: string | null }[];
 }
 
 function extractQuestions(payload: unknown): Question[] {
@@ -554,7 +587,11 @@ function extractQuestions(payload: unknown): Question[] {
           typeof o["description"] === "string"
             ? (o["description"] as string)
             : "";
-        options.push({ label, description });
+        const preview =
+          typeof o["preview"] === "string" && (o["preview"] as string).length > 0
+            ? (o["preview"] as string)
+            : null;
+        options.push({ label, description, preview });
       }
     }
     out.push({ header, question, multiSelect, options });

@@ -1011,3 +1011,26 @@ export const agentChatDeleteSession = (threadId: string) =>
  */
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
+
+// ── Tool permissions ──
+
+/** Mirrors the Rust `PermissionRule` struct. `scope` is the file the
+ *  rule lives in: `user` = ~/.claude/settings.json, `project` =
+ *  project-shared `.claude/settings.json`, `local` = gitignored
+ *  `.claude/settings.local.json`. */
+export interface PermissionRule {
+  tool_name: string;
+  rule_content: string | null;
+  behavior: "allow" | "deny" | "ask";
+  scope: "user" | "project" | "local";
+  source_path: string;
+}
+
+export const listToolPermissions = (projectRoot: string | null) =>
+  invoke<PermissionRule[]>("list_tool_permissions", { projectRoot });
+
+export const removeToolPermission = (
+  rule: PermissionRule,
+  projectRoot: string | null,
+) =>
+  invoke<void>("remove_tool_permission", { rule, projectRoot });

@@ -792,6 +792,8 @@ pub fn run() {
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
             commands::update_permission_policy,
+            commands::list_tool_permissions,
+            commands::remove_tool_permission,
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,

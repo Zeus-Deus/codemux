@@ -43,6 +43,7 @@ import {
   LogOut,
   Globe,
   RotateCcw,
+  ShieldCheck,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -87,7 +88,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -111,6 +112,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "projects", label: "Projects", icon: FolderCog },
       { id: "git", label: "Git", icon: GitBranch },
       { id: "agent", label: "Agent", icon: Bot },
+      { id: "permissions", label: "Permissions", icon: ShieldCheck },
       { id: "browser", label: "Browser", icon: Globe },
       { id: "session_restore", label: "Session Restore", icon: RotateCcw },
     ],
@@ -120,6 +122,7 @@ const NAV_GROUPS: NavGroup[] = [
 const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
 
 import { KeybindEditor } from "./keybind-editor";
+import { PermissionsSection } from "./permissions-section";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -1072,6 +1075,9 @@ export function SettingsView() {
             </div>
           </div>
         );
+
+      case "permissions":
+        return <PermissionsSection projectRoot={projectRoot} />;
 
       case "browser":
         return <BrowserSection />;
