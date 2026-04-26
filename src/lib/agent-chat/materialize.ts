@@ -101,6 +101,12 @@ export async function materializeAndSend(
    *  caller parses against its own skills registry so this lib stays
    *  free of store imports. `null` when the draft mentions no skills. */
   skillBodies: string | null = null,
+  /** Step 8 Stage 2 — pre-built attachment block from the draft's
+   *  staged attachments. Caller is responsible for snapshotting
+   *  `stagedAttachments` and running `buildAttachmentBlock` so this
+   *  lib stays free of store imports. `null` when the draft has no
+   *  attachments. */
+  attachmentBlock: string | null = null,
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -180,7 +186,13 @@ export async function materializeAndSend(
   try {
     await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
-      text: applyAllPrefixes(text, draft.mode, draft.effort, skillBodies),
+      text: applyAllPrefixes(
+        text,
+        draft.mode,
+        draft.effort,
+        skillBodies,
+        attachmentBlock,
+      ),
       model_override: null,
       effort_override: draft.effort,
       permission_mode_override: null,

@@ -3,7 +3,18 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   useAgentChatStore,
+  type Attachment,
 } from "./agent-chat-store";
+
+function makeFileAttachment(overrides: Partial<Attachment> = {}): Attachment {
+  return {
+    id: "att-1",
+    kind: "file",
+    ref: "src/components/chat/Composer.tsx",
+    metadata: { label: "Composer.tsx", lineCount: 421 },
+    ...overrides,
+  };
+}
 
 // Reset the store between tests — Zustand's singleton keeps state
 // across test cases inside the same suite otherwise.
@@ -277,6 +288,158 @@ describe("agent-chat-store", () => {
       expect(slice).toBeDefined();
       expect(slice.messages).toEqual([]);
       expect(slice.streaming).toBe(false);
+    });
+  });
+
+  describe("stagedAttachments (Step 8 Stage 1)", () => {
+    it("seeds a fresh slice with an empty stagedAttachments array", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const slice = useAgentChatStore.getState().threads["t1"];
+      expect(slice.stagedAttachments).toEqual([]);
+    });
+
+    it("addStagedAttachment appends to the array", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const att = makeFileAttachment();
+      useAgentChatStore.getState().addStagedAttachment("t1", att);
+      const slice = useAgentChatStore.getState().threads["t1"];
+      expect(slice.stagedAttachments).toEqual([att]);
+    });
+
+    it("addStagedAttachment creates a slice if the thread is unknown", () => {
+      const att = makeFileAttachment();
+      useAgentChatStore.getState().addStagedAttachment("new-thread", att);
+      const slice = useAgentChatStore.getState().threads["new-thread"];
+      expect(slice).toBeDefined();
+      expect(slice.stagedAttachments).toEqual([att]);
+    });
+
+    it("preserves insertion order across multiple adds", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const a = makeFileAttachment({ id: "a", metadata: { label: "A.ts" } });
+      const b = makeFileAttachment({ id: "b", metadata: { label: "B.ts" } });
+      const c = makeFileAttachment({ id: "c", metadata: { label: "C.ts" } });
+      useAgentChatStore.getState().addStagedAttachment("t1", a);
+      useAgentChatStore.getState().addStagedAttachment("t1", b);
+      useAgentChatStore.getState().addStagedAttachment("t1", c);
+      const ids = useAgentChatStore
+        .getState()
+        .threads["t1"].stagedAttachments.map((x) => x.id);
+      expect(ids).toEqual(["a", "b", "c"]);
+    });
+
+    it("updateStagedAttachment patches metadata without clobbering siblings", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const att = makeFileAttachment({
+        metadata: { label: "Composer.tsx", lineCount: 421, isLoading: true },
+      });
+      useAgentChatStore.getState().addStagedAttachment("t1", att);
+      useAgentChatStore.getState().updateStagedAttachment("t1", "att-1", {
+        metadata: { label: "Composer.tsx", isLoading: false, fetchedAt: 123 },
+      });
+      const next = useAgentChatStore
+        .getState()
+        .threads["t1"].stagedAttachments[0];
+      expect(next.metadata.isLoading).toBe(false);
+      expect(next.metadata.fetchedAt).toBe(123);
+      // lineCount survives the patch (one-level merge).
+      expect(next.metadata.lineCount).toBe(421);
+    });
+
+    it("updateStagedAttachment patches resolvedContent", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore.getState().addStagedAttachment("t1", makeFileAttachment());
+      useAgentChatStore
+        .getState()
+        .updateStagedAttachment("t1", "att-1", {
+          resolvedContent: "// composer body",
+        });
+      const next = useAgentChatStore
+        .getState()
+        .threads["t1"].stagedAttachments[0];
+      expect(next.resolvedContent).toBe("// composer body");
+    });
+
+    it("updateStagedAttachment is a no-op for unknown id", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore.getState().addStagedAttachment("t1", makeFileAttachment());
+      const before = useAgentChatStore.getState().threads["t1"];
+      useAgentChatStore.getState().updateStagedAttachment("t1", "nope", {
+        metadata: { label: "ghost" },
+      });
+      const after = useAgentChatStore.getState().threads["t1"];
+      expect(after).toBe(before);
+    });
+
+    it("removeStagedAttachment drops a single attachment by id", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const a = makeFileAttachment({ id: "a", metadata: { label: "A.ts" } });
+      const b = makeFileAttachment({ id: "b", metadata: { label: "B.ts" } });
+      useAgentChatStore.getState().addStagedAttachment("t1", a);
+      useAgentChatStore.getState().addStagedAttachment("t1", b);
+      useAgentChatStore.getState().removeStagedAttachment("t1", "a");
+      const ids = useAgentChatStore
+        .getState()
+        .threads["t1"].stagedAttachments.map((x) => x.id);
+      expect(ids).toEqual(["b"]);
+    });
+
+    it("removeStagedAttachment is a no-op for unknown id (same reference)", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore.getState().addStagedAttachment("t1", makeFileAttachment());
+      const before = useAgentChatStore.getState().threads["t1"];
+      useAgentChatStore.getState().removeStagedAttachment("t1", "nope");
+      const after = useAgentChatStore.getState().threads["t1"];
+      expect(after).toBe(before);
+    });
+
+    it("clearStagedAttachments empties the array", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      useAgentChatStore
+        .getState()
+        .addStagedAttachment("t1", makeFileAttachment({ id: "a" }));
+      useAgentChatStore
+        .getState()
+        .addStagedAttachment("t1", makeFileAttachment({ id: "b" }));
+      useAgentChatStore.getState().clearStagedAttachments("t1");
+      expect(
+        useAgentChatStore.getState().threads["t1"].stagedAttachments,
+      ).toEqual([]);
+    });
+
+    it("clearStagedAttachments is a no-op when already empty (same reference)", () => {
+      useAgentChatStore.getState().ensureThread("t1");
+      const before = useAgentChatStore.getState().threads["t1"];
+      useAgentChatStore.getState().clearStagedAttachments("t1");
+      const after = useAgentChatStore.getState().threads["t1"];
+      expect(after).toBe(before);
+    });
+
+    it("does not enforce a cap — slice accepts 21+ attachments", () => {
+      // Cap (20 hard / 10 soft warn) is enforced by the composer UI,
+      // not by the slice. Tests should not see ergonomic rejection.
+      useAgentChatStore.getState().ensureThread("t1");
+      for (let i = 0; i < 25; i += 1) {
+        useAgentChatStore
+          .getState()
+          .addStagedAttachment(
+            "t1",
+            makeFileAttachment({ id: `a-${i}`, metadata: { label: `f${i}` } }),
+          );
+      }
+      expect(
+        useAgentChatStore.getState().threads["t1"].stagedAttachments,
+      ).toHaveLength(25);
+    });
+
+    it("survives migrateThreadId — the silent restart preserves attachments", () => {
+      useAgentChatStore.getState().ensureThread("old");
+      useAgentChatStore.getState().addStagedAttachment("old", makeFileAttachment());
+      useAgentChatStore.getState().migrateThreadId("old", "new");
+      expect(useAgentChatStore.getState().threads["old"]).toBeUndefined();
+      expect(
+        useAgentChatStore.getState().threads["new"].stagedAttachments,
+      ).toHaveLength(1);
     });
   });
 });

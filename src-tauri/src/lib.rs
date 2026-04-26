@@ -767,6 +767,8 @@ pub fn run() {
             commands::rebuild_project_index,
             commands::get_project_index_status,
             commands::search_project_index,
+            commands::list_project_files,
+            commands::read_file_for_attachment,
             commands::get_openflow_design_spec,
             commands::get_openflow_runtime_snapshot,
             commands::create_openflow_run,

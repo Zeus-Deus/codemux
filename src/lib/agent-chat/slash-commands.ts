@@ -35,21 +35,51 @@ export interface SlashCommandItem {
 }
 
 export interface SlashAnchor {
-  /** Index of the `/` character in the value. */
+  /** Index of the trigger character (`/` or `@`) in the value. */
   start: number;
-  /** Substring between the `/` and the cursor. Empty when the user
-   *  has just typed the slash. */
+  /** Substring between the trigger and the cursor. Empty when the
+   *  user has just typed the trigger. */
   query: string;
+}
+
+/** Mention anchors share the SlashAnchor shape — both record the
+ *  trigger position and the query suffix. Aliased so call-sites read
+ *  cleanly when handling `@` mentions specifically. */
+export type MentionAnchor = SlashAnchor;
+
+/**
+ * Walk back from the cursor to find the trigger character that opens
+ * a command. Generalised over `/` (slash commands) and `@` (mentions)
+ * so Step 8 can reuse the same primitive without forking detection.
+ *
+ * Returns `null` when the cursor isn't currently inside a trigger
+ * context. A trigger is "in command" only when:
+ *   - The trigger itself is at start-of-text or preceded by whitespace
+ *     (newlines included), AND
+ *   - There is no whitespace between the trigger and the cursor.
+ */
+export function findTriggerAtCursor(
+  value: string,
+  cursor: number,
+  trigger: "/" | "@",
+): SlashAnchor | null {
+  if (cursor < 0 || cursor > value.length) return null;
+  for (let i = cursor - 1; i >= 0; i--) {
+    const ch = value[i];
+    if (ch === trigger) {
+      const before = i === 0 ? "" : value[i - 1];
+      if (before === "" || /\s/.test(before)) {
+        return { start: i, query: value.slice(i + 1, cursor) };
+      }
+      return null;
+    }
+    if (ch && /\s/.test(ch)) return null;
+  }
+  return null;
 }
 
 /**
  * Walk back from the cursor to find the slash that opens a command.
- *
- * Returns `null` when the cursor isn't currently inside a slash
- * command. The slash is "in command" only when:
- *   - The slash itself is at start-of-text or preceded by whitespace
- *     (newlines included), AND
- *   - There is no whitespace between the slash and the cursor.
  *
  * Examples:
  *   `""`              → null
@@ -63,19 +93,29 @@ export function findSlashAtCursor(
   value: string,
   cursor: number,
 ): SlashAnchor | null {
-  if (cursor < 0 || cursor > value.length) return null;
-  for (let i = cursor - 1; i >= 0; i--) {
-    const ch = value[i];
-    if (ch === "/") {
-      const before = i === 0 ? "" : value[i - 1];
-      if (before === "" || /\s/.test(before)) {
-        return { start: i, query: value.slice(i + 1, cursor) };
-      }
-      return null;
-    }
-    if (ch && /\s/.test(ch)) return null;
-  }
-  return null;
+  return findTriggerAtCursor(value, cursor, "/");
+}
+
+/**
+ * Walk back from the cursor to find the `@` that opens a mention
+ * (Step 8). Same rules as `findSlashAtCursor` — the `@` must be at
+ * start-of-text or after whitespace, and there can be no whitespace
+ * between the `@` and the cursor.
+ *
+ * Examples:
+ *   `"@"`               → { start: 0, query: "" }
+ *   `"@composer"` c=9   → { start: 0, query: "composer" }
+ *   `"hi @comp"` c=8    → { start: 3, query: "comp" }
+ *   `"a@b"` c=3         → null (`@` inside a word)
+ *   `"/foo @bar"` c=9   → { start: 5, query: "bar" } (the `@` wins
+ *                          when the cursor is past the space + at
+ *                          the bar)
+ */
+export function findMentionAtCursor(
+  value: string,
+  cursor: number,
+): MentionAnchor | null {
+  return findTriggerAtCursor(value, cursor, "@");
 }
 
 /**

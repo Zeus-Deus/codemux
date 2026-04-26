@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 import { Composer } from "./Composer";
 import type { ChatModelInfo } from "@/tauri/types";
+import type { Attachment } from "@/stores/agent-chat-store";
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
@@ -119,6 +120,168 @@ describe("Composer", () => {
       const { container } = renderComposer({ cwd: null });
       // Nothing rendered above the textarea.
       expect(container.textContent).not.toContain("Home");
+    });
+  });
+
+  describe("staged attachment chip strip (Step 8 Stage 1 — image-only post-2.1)", () => {
+    // Stage 2.1 moved file/folder chips inside the textarea (rendered
+    // by the mirror overlay). The above-textarea strip is now
+    // reserved for image attachments, which can't live inline as
+    // text. These tests use image kind so the strip mechanism stays
+    // covered for Stage 6.
+    function makeImageAttachment(overrides: Partial<Attachment> = {}): Attachment {
+      return {
+        id: "img-1",
+        kind: "image",
+        ref: "image:1",
+        metadata: { label: "screenshot.png" },
+        ...overrides,
+      };
+    }
+
+    it("does not render the strip when stagedAttachments is empty", () => {
+      const { queryByTestId } = renderComposer();
+      expect(queryByTestId("composer-attachment-strip")).toBeNull();
+    });
+
+    it("does not render the strip when only file/folder kinds are staged (those go inline)", () => {
+      const { queryByTestId } = renderComposer({
+        stagedAttachments: [
+          {
+            id: "a",
+            kind: "file",
+            ref: "/repo/Composer.tsx",
+            metadata: { label: "Composer.tsx" },
+          },
+        ],
+      });
+      expect(queryByTestId("composer-attachment-strip")).toBeNull();
+    });
+
+    it("renders one chip per image attachment in the strip", () => {
+      const { getByTestId, getByText } = renderComposer({
+        stagedAttachments: [
+          makeImageAttachment({ id: "a", metadata: { label: "a.png" } }),
+          makeImageAttachment({ id: "b", metadata: { label: "b.png" } }),
+          makeImageAttachment({ id: "c", metadata: { label: "c.png" } }),
+        ],
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      expect(strip).toBeInTheDocument();
+      expect(getByText("a.png")).toBeInTheDocument();
+      expect(getByText("b.png")).toBeInTheDocument();
+      expect(getByText("c.png")).toBeInTheDocument();
+    });
+
+    it("file attachments are NOT rendered in the strip even if interleaved with images", () => {
+      const { getByTestId, getByText, queryByText } = renderComposer({
+        stagedAttachments: [
+          {
+            id: "f",
+            kind: "file",
+            ref: "/repo/Composer.tsx",
+            metadata: { label: "Composer.tsx" },
+          },
+          makeImageAttachment({ id: "i", metadata: { label: "shot.png" } }),
+        ],
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      expect(strip).toBeInTheDocument();
+      expect(getByText("shot.png")).toBeInTheDocument();
+      // The file's basename never reaches the strip. The mirror
+      // shows it inline only when the matching `@<basename>` token
+      // is in the textarea — empty draft means no chip anywhere.
+      expect(queryByText("Composer.tsx")).toBeNull();
+    });
+
+    it("calls onRemoveAttachment with the chip id when X is clicked on an image chip", () => {
+      const onRemoveAttachment = vi.fn();
+      const { getByLabelText } = renderComposer({
+        stagedAttachments: [makeImageAttachment()],
+        onRemoveAttachment,
+      });
+      fireEvent.click(getByLabelText("Remove screenshot.png"));
+      expect(onRemoveAttachment).toHaveBeenCalledWith("img-1");
+    });
+
+    it("the strip wraps gracefully (chip strip uses flex-wrap)", () => {
+      const { getByTestId } = renderComposer({
+        stagedAttachments: Array.from({ length: 8 }).map((_, i) =>
+          makeImageAttachment({ id: `img-${i}`, metadata: { label: `i${i}.png` } }),
+        ),
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      expect(strip.className).toContain("flex-wrap");
+    });
+  });
+
+  describe("inline attachment chip in the mirror (Step 8 Stage 2.1)", () => {
+    // The mirror overlay paints a chip-style background on
+    // `@<basename>` tokens whose basename matches a staged
+    // file/folder attachment. Verifies the token is recognised and
+    // the chip's loading/error state classes apply.
+    it("does not paint a chip when the token has no matching attachment", () => {
+      const { container } = renderComposer({ draft: "@unknown.ts" });
+      // A bare `@unknown.ts` with no slice match falls through as
+      // plain prose — no chip span.
+      expect(
+        container.querySelector('[data-testid^="composer-attachment-token-"]'),
+      ).toBeNull();
+    });
+
+    it("paints a chip on @<basename> when the staged attachment matches", () => {
+      const { getByTestId } = renderComposer({
+        draft: "look at @Composer.tsx now",
+        stagedAttachments: [
+          {
+            id: "f",
+            kind: "file",
+            ref: "/repo/src/components/chat/Composer.tsx",
+            metadata: { label: "Composer.tsx" },
+          },
+        ],
+      });
+      const chip = getByTestId("composer-attachment-token-Composer.tsx");
+      expect(chip).toBeInTheDocument();
+      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip.textContent).toBe("@Composer.tsx");
+    });
+
+    it("dims the chip when the attachment is loading", () => {
+      const { getByTestId } = renderComposer({
+        draft: "look at @Composer.tsx",
+        stagedAttachments: [
+          {
+            id: "f",
+            kind: "file",
+            ref: "/repo/Composer.tsx",
+            metadata: { label: "Composer.tsx", isLoading: true },
+          },
+        ],
+      });
+      const chip = getByTestId("composer-attachment-token-Composer.tsx");
+      expect(chip.className).toContain("opacity-60");
+      expect(chip.getAttribute("data-loading")).toBe("true");
+    });
+
+    it("renders a destructive chip when the attachment has an error", () => {
+      const { getByTestId } = renderComposer({
+        draft: "look at @Composer.tsx",
+        stagedAttachments: [
+          {
+            id: "f",
+            kind: "file",
+            ref: "/repo/Composer.tsx",
+            metadata: {
+              label: "Composer.tsx",
+              error: "permission denied",
+            },
+          },
+        ],
+      });
+      const chip = getByTestId("composer-attachment-token-Composer.tsx");
+      expect(chip.className).toContain("text-destructive");
+      expect(chip.getAttribute("data-error")).toBe("true");
     });
   });
 

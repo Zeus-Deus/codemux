@@ -1,30 +1,46 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { File as FileIcon } from "lucide-react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { cn } from "@/lib/utils";
+import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
-import { segmentForHighlight } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   filterSlashItems,
+  findMentionAtCursor,
   findSlashAtCursor,
   nextModeInCycle,
+  type MentionAnchor,
   type SlashAnchor,
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
-import type { ChatMode } from "@/stores/agent-chat-store";
+import type { Attachment, ChatMode } from "@/stores/agent-chat-store";
 import {
   selectActiveSkills,
   useSkillsStore,
 } from "@/stores/skills-store";
+import { listProjectFiles } from "@/tauri/commands";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
+  FileMatch,
   PermissionModeOption,
 } from "@/tauri/types";
 
+import { AttachmentChip } from "./AttachmentChip";
 import { ComposerFooter } from "./ComposerFooter";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
+
+const EMPTY_ATTACHMENTS: Attachment[] = [];
+const EMPTY_FILE_MATCHES: FileMatch[] = [];
+/** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
+ *  typing doesn't flood the backend during the popup's open lifetime. */
+const MENTION_FETCH_DEBOUNCE_MS = 100;
+/** How many file matches the `@` popup requests at most. The fuzzy
+ *  matcher already pre-sorts by score, so the first 20 are always the
+ *  highest-ranked relative to the query. */
+const MENTION_FETCH_LIMIT = 20;
 
 interface Props {
   draft: string;
@@ -57,6 +73,20 @@ interface Props {
    *  a project picker in when the draft target is Home. Pass `null`
    *  (or omit) to keep the default cwd label. */
   zone1Override?: React.ReactNode;
+  /** Step 8 Stage 1 — staged attachments rendered as a chip strip
+   *  inside the composer card, above the textarea. Empty array hides
+   *  the strip. Defaults to `[]` so existing call sites keep working
+   *  without changes. */
+  stagedAttachments?: Attachment[];
+  /** Step 8 Stage 1 — chip removal callback. Required for chips to be
+   *  interactive; if omitted, the X button is a no-op. */
+  onRemoveAttachment?: (attachmentId: string) => void;
+  /** Step 8 Stage 2 — invoked when the user picks a file from the `@`
+   *  mention popup. The Composer has already stripped the `@<query>`
+   *  token from the textarea by the time this fires, so the parent
+   *  just needs to stage the chip + drive the readFileForAttachment
+   *  resolution. Optional so existing call sites keep compiling. */
+  onAttachFile?: (match: FileMatch) => void;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -90,6 +120,9 @@ export function Composer({
   errorMessage = null,
   showStopButton = true,
   zone1Override = null,
+  stagedAttachments = EMPTY_ATTACHMENTS,
+  onRemoveAttachment,
+  onAttachFile,
   onDraftChange,
   onSubmit,
   onStop,
@@ -124,6 +157,21 @@ export function Composer({
   // popup unexpectedly.
   const composingRef = useRef(false);
 
+  // ─── Mention (@) popup state — Step 8 Stage 2 ────────────────────
+  // Parallel to slashAnchor: opens when the textarea contains `@`
+  // followed by a query at the cursor (start-of-line or after
+  // whitespace). Files are fetched asynchronously via
+  // `listProjectFiles`, debounced so fast typing doesn't flood the
+  // backend. Only one of slash/mention can be open at a time —
+  // `handleTextareaChange` enforces mutual exclusion.
+  const [mentionAnchor, setMentionAnchor] = useState<MentionAnchor | null>(null);
+  const [mentionHighlighted, setMentionHighlighted] = useState<string | null>(
+    null,
+  );
+  const [fileMatches, setFileMatches] = useState<FileMatch[]>(EMPTY_FILE_MATCHES);
+  const mentionOpen = mentionAnchor !== null;
+  const mentionQuery = mentionAnchor?.query ?? "";
+
   const modeCommands = useMemo(
     () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
     [mode, onModeActivate],
@@ -155,9 +203,12 @@ export function Composer({
 
   // Highlight segments for the mirror overlay. Recomputed on every
   // keystroke; cheap (one regex pass + map) for realistic draft sizes.
+  // Step 8 Stage 2.1 — folds attachment tokens into the same segment
+  // stream so `@filename` mentions render as inline chips alongside
+  // `/skill-name` highlights.
   const highlightSegments = useMemo(
-    () => segmentForHighlight(draft, skills),
-    [draft, skills],
+    () => segmentDraftHighlight(draft, skills, stagedAttachments),
+    [draft, skills, stagedAttachments],
   );
 
   const allSlashItems = useMemo(
@@ -210,10 +261,138 @@ export function Composer({
     void loadSkills(cwd ?? null);
   }, [slashOpen, cwd, loadSkills]);
 
+  // ─── Mention popup: debounced file fetch ─────────────────────────
+  // Fires on every query change while the popup is open. The 100ms
+  // debounce is short enough for the popup to feel live while still
+  // collapsing burst typing to a single backend roundtrip. When `cwd`
+  // is null (Home draft, no project anchored), don't fetch — the
+  // footer note tells the user to anchor a project first.
+  useEffect(() => {
+    if (!mentionOpen) return;
+    if (!cwd) {
+      setFileMatches(EMPTY_FILE_MATCHES);
+      return;
+    }
+    let cancelled = false;
+    const trimmed = mentionQuery.trim();
+    const timer = setTimeout(async () => {
+      try {
+        const matches = await listProjectFiles(
+          cwd,
+          trimmed.length > 0 ? trimmed : null,
+          MENTION_FETCH_LIMIT,
+        );
+        if (!cancelled) setFileMatches(matches);
+      } catch {
+        // Backend errors (missing project, transient I/O, etc.) just
+        // empty the popup. The "No matches" empty state is good enough
+        // signal — no need to surface the raw error to the user.
+        if (!cancelled) setFileMatches(EMPTY_FILE_MATCHES);
+      }
+    }, MENTION_FETCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [mentionOpen, mentionQuery, cwd]);
+
   const closeSlash = () => {
     setSlashAnchor(null);
     setSlashHighlighted(null);
   };
+
+  const closeMention = useCallback(() => {
+    setMentionAnchor(null);
+    setMentionHighlighted(null);
+    setFileMatches(EMPTY_FILE_MATCHES);
+  }, []);
+
+  // Build SlashCommandItem[] from the fuzzy matches. The popup
+  // component renders these generically — no file-specific knowledge.
+  // `onSelect` is intentionally a no-op here because the popup-side
+  // dispatch goes through `handleMentionPopupSelect`, which has the
+  // full anchor + draft state in scope (the per-item closure would
+  // capture stale values otherwise).
+  const fileItems = useMemo<SlashCommandItem[]>(
+    () =>
+      fileMatches.map((match) => ({
+        id: `file:${match.absolute_path}`,
+        label: match.path,
+        command: `@${match.path.split("/").pop() ?? match.path}`,
+        icon: FileIcon,
+        group: "FILES",
+        onSelect: () => {},
+      })),
+    [fileMatches],
+  );
+
+  // Footer hint when the chat isn't anchored to a project — the user
+  // can still type `@`, but file matches won't load until they pick
+  // a target directory.
+  const mentionPopupFooter = useMemo(() => {
+    if (!cwd) {
+      return {
+        tone: "muted" as const,
+        message: "Open this chat in a project to attach files.",
+      };
+    }
+    return null;
+  }, [cwd]);
+
+  // Keep the highlighted file id valid as the match list shifts.
+  useEffect(() => {
+    if (!mentionOpen) return;
+    const ids = fileItems.map((item) => item.id);
+    if (mentionHighlighted && ids.includes(mentionHighlighted)) return;
+    setMentionHighlighted(ids[0] ?? null);
+  }, [mentionOpen, fileItems, mentionHighlighted]);
+
+  const handleMentionPopupSelect = useCallback(
+    (item: SlashCommandItem) => {
+      const match = fileMatches.find(
+        (m) => `file:${m.absolute_path}` === item.id,
+      );
+      if (!match) {
+        closeMention();
+        return;
+      }
+      // Step 8 Stage 2.1 — inline insertion. Replace the typed
+      // `@<query>` with `@<basename> ` so the token stays in the
+      // textarea and the mirror renders it as a chip. The trailing
+      // space lets the user keep typing context without an extra
+      // keystroke (collapsed when the next char is already a space).
+      // Mirrors the skill-insertion pattern at the slash popup —
+      // both inline-token systems share the same shape.
+      if (mentionAnchor) {
+        const consumed = 1 + mentionAnchor.query.length;
+        const before = draft.slice(0, mentionAnchor.start);
+        const after = draft.slice(mentionAnchor.start + consumed);
+        const filename = match.path.split("/").pop() ?? match.path;
+        const insertion = `@${filename}${after.startsWith(" ") ? "" : " "}`;
+        const next = before + insertion + after;
+        onDraftChange(next);
+        const cursor = (before + insertion).length;
+        requestAnimationFrame(() => {
+          const el = textareaRef.current;
+          if (!el) return;
+          el.focus();
+          el.setSelectionRange(cursor, cursor);
+        });
+      } else {
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      }
+      closeMention();
+      onAttachFile?.(match);
+    },
+    [
+      fileMatches,
+      mentionAnchor,
+      draft,
+      onDraftChange,
+      onAttachFile,
+      closeMention,
+    ],
+  );
 
   const handleSlashSelect = (item: SlashCommandItem) => {
     if (slashAnchor) {
@@ -308,16 +487,52 @@ export function Composer({
       }
     }
 
+    if (mentionOpen) {
+      // Esc closes the mention popup; falls through to the normal
+      // Enter-to-submit path when the filter returned no matches so
+      // an "@unknown" mention can still be sent as plain prose.
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeMention();
+        return;
+      }
+      if (fileItems.length > 0) {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          const ids = fileItems.map((i) => i.id);
+          const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : -1;
+          const next = ids[(idx + 1) % ids.length];
+          if (next) setMentionHighlighted(next);
+          return;
+        }
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          const ids = fileItems.map((i) => i.id);
+          const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : 0;
+          const next = ids[(idx - 1 + ids.length) % ids.length];
+          if (next) setMentionHighlighted(next);
+          return;
+        }
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          const item = fileItems.find((i) => i.id === mentionHighlighted);
+          if (item) handleMentionPopupSelect(item);
+          return;
+        }
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       if (canSubmit) onSubmit();
     }
   };
 
-  // ─── Slash detection on text change ──────────────────────────────
-  // Pure cursor-aware detection — handles slash-at-position-0,
-  // slash-after-whitespace, and refuses slash-inside-word. See
-  // `findSlashAtCursor` for the full table of cases.
+  // ─── Slash & mention detection on text change ────────────────────
+  // Pure cursor-aware detection — handles trigger-at-position-0,
+  // trigger-after-whitespace, and refuses trigger-inside-word.
+  // Mutual exclusion enforced: at most one popup is open at any time
+  // (the cursor walk-back can only land on one trigger character).
   const handleTextareaChange = (
     e: React.ChangeEvent<HTMLTextAreaElement>,
   ) => {
@@ -325,33 +540,59 @@ export function Composer({
     const cursor = e.target.selectionStart ?? value.length;
     onDraftChange(value);
     if (composingRef.current) return;
-    const anchor = findSlashAtCursor(value, cursor);
-    if (anchor) {
-      setSlashAnchor(anchor);
+    const slashHit = findSlashAtCursor(value, cursor);
+    const mentionHit = findMentionAtCursor(value, cursor);
+    if (slashHit) {
+      setSlashAnchor(slashHit);
+      if (mentionAnchor) closeMention();
+    } else if (mentionHit) {
+      setMentionAnchor(mentionHit);
+      if (slashAnchor) {
+        setSlashAnchor(null);
+        setSlashHighlighted(null);
+      }
     } else {
-      setSlashAnchor(null);
-      setSlashHighlighted(null);
+      if (slashAnchor) {
+        setSlashAnchor(null);
+        setSlashHighlighted(null);
+      }
+      if (mentionAnchor) closeMention();
     }
   };
 
   // Selection changes (arrow keys, mouse click) can move the cursor
-  // out of a slash command without changing the text — close the popup
-  // when that happens.
+  // out of a trigger context without changing the text — close
+  // whichever popup was open when that happens.
   const handleSelect = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
     if (composingRef.current) return;
     const el = e.currentTarget;
-    const anchor = findSlashAtCursor(el.value, el.selectionStart ?? 0);
-    if (!anchor) {
-      if (slashAnchor !== null) closeSlash();
+    const cursor = el.selectionStart ?? 0;
+    const slashHit = findSlashAtCursor(el.value, cursor);
+    const mentionHit = findMentionAtCursor(el.value, cursor);
+    if (slashHit) {
+      if (
+        !slashAnchor ||
+        slashHit.start !== slashAnchor.start ||
+        slashHit.query !== slashAnchor.query
+      ) {
+        setSlashAnchor(slashHit);
+      }
+      if (mentionAnchor) closeMention();
       return;
     }
-    if (
-      !slashAnchor ||
-      anchor.start !== slashAnchor.start ||
-      anchor.query !== slashAnchor.query
-    ) {
-      setSlashAnchor(anchor);
+    if (mentionHit) {
+      if (
+        !mentionAnchor ||
+        mentionHit.start !== mentionAnchor.start ||
+        mentionHit.query !== mentionAnchor.query
+      ) {
+        setMentionAnchor(mentionHit);
+      }
+      if (slashAnchor) closeSlash();
+      return;
     }
+    if (slashAnchor !== null) closeSlash();
+    if (mentionAnchor !== null) closeMention();
   };
 
   return (
@@ -379,6 +620,14 @@ export function Composer({
             open={slashOpen}
             footerNote={slashPopupFooter}
           />
+          <SlashCommandPopup
+            items={fileItems}
+            highlightedId={mentionHighlighted}
+            onHighlightChange={setMentionHighlighted}
+            onSelect={handleMentionPopupSelect}
+            open={mentionOpen}
+            footerNote={mentionPopupFooter}
+          />
           {errorMessage && (
             <div
               role="alert"
@@ -388,6 +637,28 @@ export function Composer({
               <span className="text-muted-foreground/80">
                 Press Enter to retry.
               </span>
+            </div>
+          )}
+          {/* Step 8 Stage 2.1 — file/folder chips render INSIDE the
+              textarea via the mirror overlay below. The strip above
+              stays reserved for image attachments (Stage 6) which
+              can't live inline as text. Files/folders are filtered
+              out here so two chips never visually represent the
+              same file. */}
+          {stagedAttachments.some((a) => a.kind === "image") && (
+            <div
+              data-testid="composer-attachment-strip"
+              className="flex flex-wrap gap-1.5 px-3 pt-2"
+            >
+              {stagedAttachments
+                .filter((a) => a.kind === "image")
+                .map((attachment) => (
+                  <AttachmentChip
+                    key={attachment.id}
+                    attachment={attachment}
+                    onRemove={(id) => onRemoveAttachment?.(id)}
+                  />
+                ))}
             </div>
           )}
           <div className="relative">
@@ -410,18 +681,42 @@ export function Composer({
                 "overflow-hidden",
               )}
             >
-              {highlightSegments.map((seg, i) =>
-                seg.kind === "skill" ? (
-                  <span
-                    key={i}
-                    className="text-amber-500 dark:text-amber-400"
-                  >
-                    {seg.text}
-                  </span>
-                ) : (
-                  <Fragment key={i}>{seg.text}</Fragment>
-                ),
-              )}
+              {highlightSegments.map((seg, i) => {
+                if (seg.kind === "skill") {
+                  return (
+                    <span
+                      key={i}
+                      className="text-amber-500 dark:text-amber-400"
+                    >
+                      {seg.text}
+                    </span>
+                  );
+                }
+                if (seg.kind === "attachment") {
+                  // Inline chip rendering. Background fills the text
+                  // bounding box only — no padding tricks — so the
+                  // mirror's character widths stay glued to the
+                  // textarea's caret positions. Loading state dims
+                  // the chip; an unresolvable read renders red.
+                  return (
+                    <span
+                      key={i}
+                      data-testid={`composer-attachment-token-${seg.basename}`}
+                      data-loading={seg.isLoading || undefined}
+                      data-error={seg.hasError || undefined}
+                      className={cn(
+                        "rounded-sm bg-foreground/10 text-foreground",
+                        seg.isLoading && "opacity-60",
+                        seg.hasError &&
+                          "bg-destructive/15 text-destructive",
+                      )}
+                    >
+                      {seg.text}
+                    </span>
+                  );
+                }
+                return <Fragment key={i}>{seg.text}</Fragment>;
+              })}
               {/* Trailing newline doesn't render unless followed by a
                   glyph — pad with a zero-width space so the mirror's
                   height matches the textarea's after a fresh Enter. */}
@@ -441,12 +736,19 @@ export function Composer({
                 // After composition ends, run detection on the now-final
                 // value so popup state catches up with what was typed.
                 const el = e.currentTarget;
-                const anchor = findSlashAtCursor(
-                  el.value,
-                  el.selectionStart ?? el.value.length,
-                );
-                if (anchor) setSlashAnchor(anchor);
-                else closeSlash();
+                const cursor = el.selectionStart ?? el.value.length;
+                const slashHit = findSlashAtCursor(el.value, cursor);
+                const mentionHit = findMentionAtCursor(el.value, cursor);
+                if (slashHit) {
+                  setSlashAnchor(slashHit);
+                  if (mentionAnchor) closeMention();
+                } else if (mentionHit) {
+                  setMentionAnchor(mentionHit);
+                  if (slashAnchor) closeSlash();
+                } else {
+                  closeSlash();
+                  closeMention();
+                }
               }}
               placeholder={
                 sessionReady ? placeholderForMode(mode) : "Starting session…"

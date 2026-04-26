@@ -8,6 +8,11 @@ import {
   planPermissionModeChange,
   planSubmit,
 } from "@/lib/agent-chat/chat-pane-plans";
+import {
+  buildAttachmentBlock,
+  buildFileResolvedContent,
+} from "@/lib/agent-chat/attachment-block";
+import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -26,6 +31,7 @@ import {
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
   useAgentChatStore,
+  type Attachment,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
@@ -43,11 +49,13 @@ import {
   agentChatStartSession,
   agentChatStopSession,
   grepCountPattern,
+  readFileForAttachment,
 } from "@/tauri/commands";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
+  FileMatch,
   PaneNodeSnapshot,
 } from "@/tauri/types";
 
@@ -180,6 +188,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const setSessionLaunchMode = useAgentChatStore(
     (s) => s.setSessionLaunchMode,
   );
+  const removeStagedAttachment = useAgentChatStore(
+    (s) => s.removeStagedAttachment,
+  );
+  const addStagedAttachment = useAgentChatStore((s) => s.addStagedAttachment);
+  const updateStagedAttachment = useAgentChatStore(
+    (s) => s.updateStagedAttachment,
+  );
+  const clearStagedAttachments = useAgentChatStore(
+    (s) => s.clearStagedAttachments,
+  );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
@@ -231,6 +249,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const mode = slice?.mode ?? "default";
   const hasDebugActivity = slice?.hasDebugActivity ?? false;
   const debugActivityResolved = slice?.debugActivityResolved ?? false;
+  const stagedAttachments = slice?.stagedAttachments ?? EMPTY_ATTACHMENTS;
   const activeModel = selectModel(capabilities, model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
@@ -396,10 +415,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // bodies against the skills registry. Unmatched tokens (typos, or
     // skills not in the registry) silently pass through as plain prose.
     const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
-    const sdkText = applyAllPrefixes(rawText, mode, effort, skillBodies);
+    // Snapshot staged attachments AT submit time so the block we
+    // inject reflects exactly what the user has staged. Reading from
+    // the live store via getState() avoids stale closure bugs if a
+    // chip resolved between the last render and Enter. Step 8 Stage
+    // 2.1 — filter to attachments whose `@<basename>` token still
+    // appears in the textarea (`rawText`); deleting a token excludes
+    // its file from the prompt without an explicit chip-removal.
+    const liveSlice = useAgentChatStore.getState().threads[threadId];
+    const liveAttachments = liveSlice?.stagedAttachments ?? [];
+    const attachmentBlock = buildAttachmentBlock(
+      activeAttachments(rawText, liveAttachments),
+    );
+    const sdkText = applyAllPrefixes(
+      rawText,
+      mode,
+      effort,
+      skillBodies,
+      attachmentBlock,
+    );
     sendInFlightRef.current = true;
     setIsSending(true);
     appendUserMessage(threadId, plan.text);
+    // Clear chips per-turn (matches the inputDraft = "" reset that
+    // appendUserMessage already does for the textarea).
+    clearStagedAttachments(threadId);
     const input = {
       thread_id: threadId,
       text: sdkText,
@@ -419,7 +459,58 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     mode,
     skillsRegistry,
     appendUserMessage,
+    clearStagedAttachments,
   ]);
+
+  /** Step 8 Stage 2 — orchestrates the chip lifecycle when the user
+   *  picks a file from the `@` mention popup. The Composer has
+   *  already stripped the `@<query>` token from the textarea by the
+   *  time this fires, so we just stage the chip with isLoading=true,
+   *  fire `read_file_for_attachment`, then patch the chip with the
+   *  resolved content (or an error indicator if the read failed). */
+  const handleAttachFile = useCallback(
+    (match: FileMatch) => {
+      if (!threadId) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const filename = match.path.split("/").pop() ?? match.path;
+      addStagedAttachment(threadId, {
+        id,
+        kind: "file",
+        ref: match.absolute_path,
+        metadata: {
+          label: filename,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          const info = await readFileForAttachment(match.absolute_path, cwd);
+          updateStagedAttachment(threadId, id, {
+            resolvedContent: buildFileResolvedContent(info),
+            metadata: {
+              label: filename,
+              lineCount: info.lineCount,
+              bytes: info.bytes,
+              isLoading: false,
+              fetchedAt: Date.now(),
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(threadId, id, {
+            metadata: {
+              label: filename,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [threadId, cwd, addStagedAttachment, updateStagedAttachment],
+  );
 
   // Clear the optimistic send flag the moment the backend
   // acknowledges the turn via Running (streaming=true in the store).
@@ -1101,6 +1192,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
+      stagedAttachments={stagedAttachments}
+      onRemoveAttachment={(id) => {
+        if (!threadId) return;
+        removeStagedAttachment(threadId, id);
+      }}
+      onAttachFile={handleAttachFile}
       onDraftChange={(next) => {
         if (!threadId) return;
         setInputDraft(threadId, next);
@@ -1152,3 +1249,4 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 }
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
+const EMPTY_ATTACHMENTS: Attachment[] = [];

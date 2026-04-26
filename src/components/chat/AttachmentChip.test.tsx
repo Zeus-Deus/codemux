@@ -1,0 +1,200 @@
+/// <reference types="@testing-library/jest-dom/vitest" />
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render } from "@testing-library/react";
+
+import { AttachmentChip } from "./AttachmentChip";
+import type { Attachment } from "@/stores/agent-chat-store";
+
+afterEach(() => cleanup());
+
+function makeAttachment(overrides: Partial<Attachment> = {}): Attachment {
+  return {
+    id: "att-1",
+    kind: "file",
+    ref: "src/components/chat/Composer.tsx",
+    metadata: { label: "Composer.tsx", lineCount: 421 },
+    ...overrides,
+  };
+}
+
+describe("AttachmentChip", () => {
+  describe("file kind (Stage 1 fully-tested path)", () => {
+    it("renders the label and line count", () => {
+      const { getByText } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+      );
+      expect(getByText("Composer.tsx")).toBeInTheDocument();
+      expect(getByText("421L")).toBeInTheDocument();
+    });
+
+    it("uses neutral color for files (no accent)", () => {
+      const { getByRole } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+      );
+      const chip = getByRole("status");
+      expect(chip.className).toContain("bg-foreground/10");
+      expect(chip.className).toContain("text-foreground");
+    });
+
+    it("omits the line-count slot when lineCount is undefined", () => {
+      const { queryByText } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: { label: "image.png" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(queryByText(/L$/)).toBeNull();
+    });
+  });
+
+  describe("loading state", () => {
+    it("renders a spinner instead of the kind icon when isLoading is true", () => {
+      const { getByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: { label: "Loading…", isLoading: true },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByTestId("attachment-chip-spinner")).toBeInTheDocument();
+    });
+  });
+
+  describe("error state", () => {
+    it("renders an error indicator when metadata.error is set", () => {
+      const { getByLabelText } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: { label: "broken.ts", error: "fetch failed" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByLabelText("error: fetch failed")).toBeInTheDocument();
+    });
+  });
+
+  describe("removal", () => {
+    it("calls onRemove with the attachment id when X is clicked", () => {
+      const onRemove = vi.fn();
+      const { getByLabelText } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={onRemove} />,
+      );
+      fireEvent.click(getByLabelText("Remove Composer.tsx"));
+      expect(onRemove).toHaveBeenCalledWith("att-1");
+    });
+
+    it("stops propagation so the chip-body click handler does not also fire", () => {
+      const onRemove = vi.fn();
+      const onChipClick = vi.fn();
+      const { getByLabelText, getByRole } = render(
+        <div onClick={onChipClick}>
+          <AttachmentChip attachment={makeAttachment()} onRemove={onRemove} />
+        </div>,
+      );
+      const chip = getByRole("status");
+      const x = getByLabelText("Remove Composer.tsx");
+      // Click the chip body — outer handler fires.
+      fireEvent.click(chip);
+      expect(onChipClick).toHaveBeenCalledTimes(1);
+      onChipClick.mockClear();
+      // Click the X — outer handler should NOT fire.
+      fireEvent.click(x);
+      expect(onChipClick).not.toHaveBeenCalled();
+      expect(onRemove).toHaveBeenCalledWith("att-1");
+    });
+  });
+
+  describe("kind variants render distinct icons + colors", () => {
+    it("folder uses the same neutral color as files but a different icon", () => {
+      const { getByRole, getByLabelText } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "folder",
+            metadata: { label: "src/components" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("bg-foreground/10");
+      expect(getByLabelText(/folder attachment/)).toBeInTheDocument();
+    });
+
+    it("open issue uses the warning accent", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "issue",
+            metadata: { label: "#123 · bug", state: "open" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("bg-warning/15");
+    });
+
+    it("closed issue falls back to muted neutral", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "issue",
+            metadata: { label: "#123 · bug", state: "closed" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("text-muted-foreground");
+    });
+
+    it("open PR uses the primary accent", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "pr",
+            metadata: { label: "#42 · feature", state: "open" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("bg-primary/15");
+    });
+
+    it("merged PR falls back to muted neutral", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "pr",
+            metadata: { label: "#42 · feature", state: "merged" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("text-muted-foreground");
+    });
+
+    it("image uses the accent variant", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "image",
+            metadata: { label: "screenshot.png" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain("bg-accent/15");
+    });
+  });
+
+  it("exposes the kind via data-attachment-kind for parent styling", () => {
+    const { container } = render(
+      <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+    );
+    expect(
+      container.querySelector('[data-attachment-kind="file"]'),
+    ).not.toBeNull();
+  });
+});

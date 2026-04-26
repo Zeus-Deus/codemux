@@ -16,7 +16,9 @@ import type {
   CliToolInfo,
   CommLogEntry,
   EditorInfo,
+  FileAttachmentInfo,
   FileEntry,
+  FileMatch,
   GhStatus,
   GitHubIssue,
   GitBranchInfo,
@@ -62,6 +64,31 @@ import type {
 // bash wrappers). Safe to call before the rest of the app has initialized.
 export const getPlatform = () =>
   invoke<string>("get_platform");
+
+// ── Project files (Step 8 — attachments) ──
+
+/** Fuzzy-ranked list of project files for the chat composer's `@`
+ *  mention popup. Walks `cwd` respecting `.gitignore` (60s in-process
+ *  cache). Empty / null `query` returns alphabetical paths. */
+export const listProjectFiles = (
+  cwd: string,
+  query: string | null,
+  limit: number,
+) =>
+  invoke<FileMatch[]>("list_project_files", { cwd, query, limit });
+
+/** Read a file for attachment — full content for small files, first
+ *  50 lines + outline for large ones. Used when the user picks a file
+ *  in the `@` popup; the resulting body becomes
+ *  `attachment.resolvedContent` and is injected at send time. */
+export const readFileForAttachment = (
+  absolutePath: string,
+  cwd: string | null,
+) =>
+  invoke<FileAttachmentInfo>("read_file_for_attachment", {
+    absolutePath,
+    cwd,
+  });
 
 // ── Auth ──
 

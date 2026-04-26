@@ -27,6 +27,50 @@ export const DEFAULT_THREAD_PERMISSION_MODE = "bypassPermissions";
  *  means "no pill — regular agent behavior". */
 export type ChatMode = "default" | "plan" | "ask" | "debug";
 
+/** Step 8 Stage 1 — attachment kinds drive icon + color in the chip,
+ *  injection format at send time (Stage 2+), and UI affordances
+ *  (e.g. images need paste/drop handlers, others don't). */
+export type AttachmentKind = "file" | "folder" | "issue" | "pr" | "image";
+
+export interface AttachmentMetadata {
+  /** Chip display text. For files: filename; for issues/PRs:
+   *  `#1234 · title`. Required so a chip always has something to render
+   *  even before async fetches resolve. */
+  label: string;
+  /** File-only: line count for the chip's secondary metric ("421L"). */
+  lineCount?: number;
+  /** File / image: byte size for the chip tooltip and 5MB warning. */
+  bytes?: number;
+  /** Issue / PR state — drives chip color (open vs closed/merged). */
+  state?: "open" | "closed" | "merged";
+  /** When the resolved content was fetched, for the
+   *  re-fetch-if-older-than-60s rule (Stage 4–5). Files re-read at
+   *  send unconditionally so this is mainly for GitHub kinds. */
+  fetchedAt?: number;
+  /** While the chip is waiting on an async fetch (issues / PRs). */
+  isLoading?: boolean;
+  /** Display an error indicator on the chip (e.g. fetch failed). */
+  error?: string;
+}
+
+export interface Attachment {
+  /** Stable id for chip dedup + removal. Caller-generated (uuid). */
+  id: string;
+  kind: AttachmentKind;
+  /** Discriminator-specific reference: path | "#1234" | "image:<id>". */
+  ref: string;
+  metadata: AttachmentMetadata;
+  /** Resolved text payload for files / folders / issues / PRs. Populated
+   *  at attach time for files, at fetch time for GitHub kinds. */
+  resolvedContent?: string;
+  /** Image-only: decoded bytes. Not persisted; re-attached if the user
+   *  re-pastes after a session restart. */
+  resolvedImage?: {
+    mime: string;
+    bytes: Uint8Array;
+  };
+}
+
 export interface ChatThreadSlice extends ChatThreadState {
   model: string | null;
   /** User's current choice from the picker. */
@@ -63,6 +107,12 @@ export interface ChatThreadSlice extends ChatThreadState {
    *  trust `hasDebugActivity` once this flips, so a slow grep can't
    *  cause us to flash a stale "no markers" state. */
   debugActivityResolved: boolean;
+  /** Step 8 Stage 1 — attachments staged for the next turn (files,
+   *  folders, issues, PRs, images). Renders as a chip strip above the
+   *  textarea. Cleared on send by the parent surface (Stage 2 wires
+   *  this); Stage 1 only exposes the slice + actions. The slice itself
+   *  imposes no cap — UI layer enforces 20 hard / 10 soft warn. */
+  stagedAttachments: Attachment[];
 }
 
 function emptySlice(): ChatThreadSlice {
@@ -80,6 +130,7 @@ function emptySlice(): ChatThreadSlice {
     modePriorPermissionMode: null,
     hasDebugActivity: false,
     debugActivityResolved: false,
+    stagedAttachments: [],
   };
 }
 
@@ -147,6 +198,25 @@ interface AgentChatStore {
   setHasDebugActivity: (threadId: string, value: boolean) => void;
   /** Mark the background debug-marker grep as finished. Stage 6. */
   setDebugActivityResolved: (threadId: string, value: boolean) => void;
+  /** Step 8 Stage 1 — append a fresh attachment chip to the staging
+   *  list. Caller is responsible for generating `id` and ensuring it
+   *  doesn't collide. Cap (20) is enforced by the composer UI, not
+   *  here, so tests can stage 21+ without the slice rejecting. */
+  addStagedAttachment: (threadId: string, attachment: Attachment) => void;
+  /** Patch metadata or resolved content on a staged attachment. Used
+   *  by async fetches for issues/PRs to flip `isLoading` → resolved
+   *  state once `gh` returns. Unknown id is a no-op. */
+  updateStagedAttachment: (
+    threadId: string,
+    id: string,
+    patch: Partial<Attachment>,
+  ) => void;
+  /** Remove a staged attachment by id (X button on the chip). Unknown
+   *  id is a no-op. */
+  removeStagedAttachment: (threadId: string, id: string) => void;
+  /** Clear all staged attachments. Called by Stage 2's send-handler
+   *  alongside the existing `inputDraft = ""` reset. */
+  clearStagedAttachments: (threadId: string) => void;
 }
 
 function updateSlice(
@@ -364,6 +434,51 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         slice.debugActivityResolved === value
           ? slice
           : { ...slice, debugActivityResolved: value },
+      ),
+    ),
+
+  addStagedAttachment: (threadId, attachment) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        stagedAttachments: [...slice.stagedAttachments, attachment],
+      })),
+    ),
+
+  updateStagedAttachment: (threadId, id, patch) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => {
+        const idx = slice.stagedAttachments.findIndex((a) => a.id === id);
+        if (idx < 0) return slice;
+        const existing = slice.stagedAttachments[idx];
+        const next: Attachment = {
+          ...existing,
+          ...patch,
+          // Merge metadata at one level so callers can patch a single
+          // metadata field without clobbering the whole object.
+          metadata: { ...existing.metadata, ...(patch.metadata ?? {}) },
+        };
+        const nextList = [...slice.stagedAttachments];
+        nextList[idx] = next;
+        return { ...slice, stagedAttachments: nextList };
+      }),
+    ),
+
+  removeStagedAttachment: (threadId, id) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => {
+        const next = slice.stagedAttachments.filter((a) => a.id !== id);
+        if (next.length === slice.stagedAttachments.length) return slice;
+        return { ...slice, stagedAttachments: next };
+      }),
+    ),
+
+  clearStagedAttachments: (threadId) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.stagedAttachments.length === 0
+          ? slice
+          : { ...slice, stagedAttachments: [] },
       ),
     ),
 }));

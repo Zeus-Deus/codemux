@@ -834,3 +834,55 @@ export interface FileEntry {
   size: number | null;
   is_gitignored: boolean;
 }
+
+/** Result row from `list_project_files` (Step 8 Stage 1). Used for the
+ *  `@` mention popup and `+ → File…` picker in the chat composer. */
+export interface FileMatch {
+  /** Path relative to cwd. */
+  path: string;
+  /** Absolute, canonicalized path. */
+  absolute_path: string;
+  /** Fuzzy-match score; higher is better. `0` for empty-query / alphabetical. */
+  score: number;
+}
+
+/** Top-level outline entry surfaced when a large file is truncated.
+ *  Step 8 Stage 2: regex-extracted declarations per language; Stage 7
+ *  promotes to tree-sitter for richer extraction. */
+export interface OutlineEntry {
+  /** Coarse declaration kind: "function", "class", "type", "trait",
+   *  "impl", "mod", "enum", "struct", "interface", "heading", etc.
+   *  Free-form by design — UI just displays as-is. */
+  kind: string;
+  /** Symbol name (the captured identifier or, for headings, the
+   *  heading text). */
+  name: string;
+  /** 1-indexed line number where the declaration was found. */
+  line: number;
+}
+
+/** Backend response for `read_file_for_attachment` (Step 8 Stage 2).
+ *  Reports text/binary, full-vs-truncated content, and an outline
+ *  when truncated. The frontend's chip preview + injection block both
+ *  derive from this struct. */
+export interface FileAttachmentInfo {
+  /** Echo of the input absolute path — agent uses this for Read/Grep. */
+  absolutePath: string;
+  /** Path relative to `cwd` if the file is under it; else null. */
+  relativePath: string | null;
+  /** Total line count of the file (not of the truncated preview). */
+  lineCount: number;
+  /** File size in bytes. */
+  bytes: number;
+  /** File extension as a hint for code fences. `null` for extension-less files. */
+  language: string | null;
+  /** False for binary files (null-byte sniff in first 8KB). */
+  isText: boolean;
+  /** Full text for ≤200KB / ≤1500-line files; first-50-lines preview for
+   *  larger files; empty for binaries. */
+  content: string;
+  /** True when `content` is a preview, not the full file. */
+  truncated: boolean;
+  /** Top-level declarations extracted when truncated. Null otherwise. */
+  outline: OutlineEntry[] | null;
+}

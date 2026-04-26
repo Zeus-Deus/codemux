@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 
 import {
   applyAllPrefixes,
+  applyAttachmentPrefix,
   applyModePrefix,
   applySkillPrefix,
   ASK_WRAPPER,
@@ -212,5 +213,90 @@ describe("applyAllPrefixes — staged skill composition", () => {
     const once = applyAllPrefixes("do the thing", "default", null, SKILL_BODY);
     const twice = applyAllPrefixes(once, "default", null, SKILL_BODY);
     expect(twice).toBe(once);
+  });
+});
+
+describe("applyAttachmentPrefix (Step 8 Stage 2)", () => {
+  const BLOCK = "=== Attached context ===\n\nfile body\n\n=== End context ===";
+
+  it("returns the text unchanged when block is null/undefined/empty", () => {
+    expect(applyAttachmentPrefix("hello", null)).toBe("hello");
+    expect(applyAttachmentPrefix("hello", undefined)).toBe("hello");
+    expect(applyAttachmentPrefix("hello", "")).toBe("hello");
+    expect(applyAttachmentPrefix("hello", "   \n  ")).toBe("hello");
+  });
+
+  it("prepends the trimmed block with a markdown rule separator", () => {
+    expect(applyAttachmentPrefix("question?", BLOCK)).toBe(
+      `${BLOCK}\n\n---\n\nquestion?`,
+    );
+  });
+
+  it("is idempotent — re-applying the same block does not double-wrap", () => {
+    const once = applyAttachmentPrefix("question?", BLOCK);
+    const twice = applyAttachmentPrefix(once, BLOCK);
+    expect(twice).toBe(once);
+  });
+});
+
+describe("applyAllPrefixes — attachment block ordering (Step 8 Stage 2)", () => {
+  const BLOCK = "=== Attached context ===\n\nFILE\n\n=== End context ===";
+  const QUESTION = "explain this code";
+
+  it("places the attachment block between skill body and user text", () => {
+    const out = applyAllPrefixes(QUESTION, "default", null, SKILL_BODY, BLOCK);
+    // Skill body precedes attachment block precedes user text.
+    const skillIdx = out.indexOf(SKILL_BODY);
+    const blockIdx = out.indexOf(BLOCK);
+    const userIdx = out.indexOf(QUESTION);
+    expect(skillIdx).toBeGreaterThanOrEqual(0);
+    expect(blockIdx).toBeGreaterThan(skillIdx);
+    expect(userIdx).toBeGreaterThan(blockIdx);
+  });
+
+  it("composes correctly with mode wrapper outside skill + attachments", () => {
+    const out = applyAllPrefixes(QUESTION, "ask", null, SKILL_BODY, BLOCK);
+    expect(out.startsWith(ASK_WRAPPER)).toBe(true);
+    const askIdx = out.indexOf(ASK_WRAPPER);
+    const skillIdx = out.indexOf(SKILL_BODY);
+    const blockIdx = out.indexOf(BLOCK);
+    const userIdx = out.indexOf(QUESTION);
+    expect(askIdx).toBeLessThan(skillIdx);
+    expect(skillIdx).toBeLessThan(blockIdx);
+    expect(blockIdx).toBeLessThan(userIdx);
+  });
+
+  it("composes correctly with ultrathink at the very top", () => {
+    const out = applyAllPrefixes(
+      QUESTION,
+      "default",
+      "ultrathink",
+      SKILL_BODY,
+      BLOCK,
+    );
+    expect(out.startsWith(ULTRATHINK_PROMPT_PREFIX)).toBe(true);
+    const blockIdx = out.indexOf(BLOCK);
+    const userIdx = out.indexOf(QUESTION);
+    expect(blockIdx).toBeGreaterThan(0);
+    expect(userIdx).toBeGreaterThan(blockIdx);
+  });
+
+  it("works without a skill body — attachments still wrap before user text", () => {
+    const out = applyAllPrefixes(QUESTION, "default", null, null, BLOCK);
+    expect(out.startsWith(BLOCK)).toBe(true);
+    expect(out.endsWith(QUESTION)).toBe(true);
+  });
+
+  it("works without an attachment block — falls back to existing pipeline", () => {
+    const out = applyAllPrefixes(QUESTION, "default", null, SKILL_BODY, null);
+    expect(out.startsWith(SKILL_BODY)).toBe(true);
+    expect(out.endsWith(QUESTION)).toBe(true);
+    expect(out).not.toContain("Attached context");
+  });
+
+  it("treats undefined attachmentBlock as a no-op (back-compat)", () => {
+    const withUndef = applyAllPrefixes(QUESTION, "default", null, SKILL_BODY);
+    const withNull = applyAllPrefixes(QUESTION, "default", null, SKILL_BODY, null);
+    expect(withUndef).toBe(withNull);
   });
 });

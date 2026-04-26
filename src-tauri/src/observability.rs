@@ -256,8 +256,8 @@ fn default_snapshot() -> ObservabilitySnapshot {
             unstable_openflow: true,
             unstable_browser_automation: true,
             unstable_indexing: true,
-            enable_agent_chat: false,
-            enable_lazy_workspace_creation: false,
+            enable_agent_chat: true,
+            enable_lazy_workspace_creation: true,
         },
         permission_policy: PermissionPolicy {
             require_risky_action_approval: true,

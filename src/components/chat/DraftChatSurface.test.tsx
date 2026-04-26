@@ -19,6 +19,23 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
+  // Step 8 Stage 2 — Composer's mention popup useEffect calls
+  // `listProjectFiles` whenever `@` is open; default to an empty
+  // resolution so the popup-not-opened tests don't flap.
+  // `readFileForAttachment` is exercised by the attachment-wiring
+  // regression below.
+  listProjectFiles: vi.fn().mockResolvedValue([]),
+  readFileForAttachment: vi.fn().mockResolvedValue({
+    absolutePath: "/repo/src/components/chat/Composer.tsx",
+    relativePath: "src/components/chat/Composer.tsx",
+    lineCount: 421,
+    bytes: 16384,
+    language: "tsx",
+    isText: true,
+    content: "// composer body\n",
+    truncated: false,
+    outline: null,
+  }),
 }));
 
 vi.mock("@/lib/agent-chat/materialize", () => ({
@@ -219,6 +236,53 @@ describe("DraftChatSurface", () => {
       const { container } = renderSurface();
       const ta = container.querySelector("textarea") as HTMLTextAreaElement;
       expect(ta.value).toBe("typed so far");
+    });
+
+    // Step 8 Stage 2.1 — regression for the bug where DraftChatSurface
+    // forgot to forward `stagedAttachments` / `onAttachFile` to its
+    // Composer. Symptom was: typing `@filename` and picking a row
+    // closed the popup but no chip appeared. Stage 2.1 moved file
+    // chips INSIDE the textarea (mirror overlay), so the regression
+    // assertion now checks the inline token rendering rather than
+    // the (now image-only) strip above the textarea. If the surface
+    // ever drops the prop again, this test catches it.
+    it("renders the inline mirror chip when a file token is in the draft and matches a staged attachment", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      // Seed the textarea text with a `@<basename>` token AND stage
+      // the matching attachment on the pre-minted threadId — same key
+      // the surface uses internally.
+      useChatDraftStore
+        .getState()
+        .updateDraftInput(draft.draftId, "look at @Composer.tsx please");
+      useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "att-regression-1",
+        kind: "file",
+        ref: "/repo/src/components/chat/Composer.tsx",
+        metadata: { label: "Composer.tsx", lineCount: 421 },
+      });
+      const { getByTestId } = renderSurface();
+      const chip = getByTestId("composer-attachment-token-Composer.tsx");
+      expect(chip).toBeInTheDocument();
+      expect(chip.textContent).toBe("@Composer.tsx");
+      expect(chip.className).toContain("bg-foreground/10");
+    });
+
+    it("the inline mirror chip vanishes when the file token is removed from the draft text", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      useAgentChatStore.getState().addStagedAttachment(draft.threadId, {
+        id: "att-regression-2",
+        kind: "file",
+        ref: "/repo/src/lib/utils.ts",
+        metadata: { label: "utils.ts" },
+      });
+      // Empty draft means no `@utils.ts` token → no inline chip even
+      // though the slice still has the attachment.
+      const { queryByTestId } = renderSurface();
+      expect(
+        queryByTestId("composer-attachment-token-utils.ts"),
+      ).toBeNull();
     });
 
     it("surfaces the draft's lastSendError in the composer banner", () => {

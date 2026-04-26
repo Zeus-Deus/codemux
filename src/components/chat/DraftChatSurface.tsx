@@ -1,11 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  buildAttachmentBlock,
+  buildFileResolvedContent,
+} from "@/lib/agent-chat/attachment-block";
+import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { toast } from "@/lib/toast";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
+import {
+  useAgentChatStore,
+  type Attachment,
+} from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
 import {
@@ -18,7 +26,11 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
-import { activateWorkspace } from "@/tauri/commands";
+import {
+  activateWorkspace,
+  readFileForAttachment,
+} from "@/tauri/commands";
+import type { FileMatch } from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
@@ -32,6 +44,11 @@ import { WorktreePicker } from "./pickers/WorktreePicker";
  *  in-flight selector a chance to observe the promotion before the
  *  draft is swept. Matches the window called out in §9 of the plan. */
 const CLEAR_AFTER_PROMOTION_MS = 5000;
+
+/** Stable empty array so the attachment-slice selector doesn't return
+ *  a fresh reference every render and retrigger the chip-strip render
+ *  effect in an infinite loop. */
+const EMPTY_ATTACHMENTS: Attachment[] = [];
 
 /**
  * Top-level draft surface. Reads the active draft, wires a Composer
@@ -59,6 +76,26 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const updateDraftTarget = useChatDraftStore((s) => s.updateDraftTarget);
   const setActiveDraft = useChatDraftStore((s) => s.setActiveDraft);
   const clearDraft = useChatDraftStore((s) => s.clearDraft);
+
+  // Step 8 Stage 2 — staged attachments live on the agent-chat slice
+  // keyed by `draft.threadId` (pre-minted; survives materialize). The
+  // chip strip + popup pick → onAttachFile flow is identical to
+  // AgentChatPane's; the only divergence is that the attachment block
+  // is forwarded to `materializeAndSend` rather than read from a
+  // mounted slice's `handleSubmit`.
+  const stagedAttachments = useAgentChatStore(
+    (s) => s.threads[draft.threadId]?.stagedAttachments ?? EMPTY_ATTACHMENTS,
+  );
+  const addStagedAttachment = useAgentChatStore((s) => s.addStagedAttachment);
+  const updateStagedAttachment = useAgentChatStore(
+    (s) => s.updateStagedAttachment,
+  );
+  const removeStagedAttachment = useAgentChatStore(
+    (s) => s.removeStagedAttachment,
+  );
+  const clearStagedAttachments = useAgentChatStore(
+    (s) => s.clearStagedAttachments,
+  );
 
   // Home directory is hydrated once at App mount into useAppStore.
   // Reading it from there (rather than re-fetching via a local Tauri
@@ -224,6 +261,17 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       text,
       selectActiveSkills(useSkillsStore.getState()),
     );
+    // Step 8 Stage 2 — snapshot staged attachments at submit time
+    // (live store read avoids stale closure if a chip resolved
+    // between the last render and Enter). Stage 2.1: filter to
+    // attachments whose `@<basename>` token is still in the textarea
+    // text, so deleting a token excludes the file from the first
+    // turn injection.
+    const liveSlice = useAgentChatStore.getState().threads[currentDraft.threadId];
+    const liveAttachments = liveSlice?.stagedAttachments ?? [];
+    const attachmentBlock = buildAttachmentBlock(
+      activeAttachments(text, liveAttachments),
+    );
 
     void materializeAndSend(
       currentDraft,
@@ -243,10 +291,14 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         setMode: chat.setMode,
       },
       skillBodies,
+      attachmentBlock,
     )
       .then((result) => {
         if (result.success) {
           setActiveDraft(null);
+          // Clear the chips per-turn so the fresh AgentChatPane mount
+          // doesn't render leftover chips from the draft surface.
+          clearStagedAttachments(currentDraft.threadId);
           // §9: keep the draft entry for a grace period so any in-
           // flight UI can still observe the promotion before cleanup.
           const draftIdToClear = currentDraft.draftId;
@@ -266,7 +318,67 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     activeSidebarProjectPath,
     setActiveDraft,
     clearDraft,
+    clearStagedAttachments,
   ]);
+
+  // Step 8 Stage 2 — chip lifecycle for the `@` mention popup.
+  // Mirrors AgentChatPane's `handleAttachFile`: stage with
+  // isLoading=true, fire `read_file_for_attachment`, patch the chip
+  // with the resolved body (or an error indicator on failure). The
+  // slice key is `draft.threadId` (pre-minted; reused by materialize)
+  // so chips survive the draft → real-thread transition without
+  // a separate transfer step.
+  const handleAttachFile = useCallback(
+    (match: FileMatch) => {
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const filename = match.path.split("/").pop() ?? match.path;
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "file",
+        ref: match.absolute_path,
+        metadata: { label: filename, isLoading: true },
+      });
+      void (async () => {
+        try {
+          // `displayCwd` is the resolved cwd for the draft; null when
+          // Home is selected. Passing null means relative_path comes
+          // back null, which is fine — the chip falls back to the
+          // filename and the agent reads via absolute path anyway.
+          const info = await readFileForAttachment(
+            match.absolute_path,
+            displayCwd ?? null,
+          );
+          updateStagedAttachment(draft.threadId, id, {
+            resolvedContent: buildFileResolvedContent(info),
+            metadata: {
+              label: filename,
+              lineCount: info.lineCount,
+              bytes: info.bytes,
+              isLoading: false,
+              fetchedAt: Date.now(),
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(draft.threadId, id, {
+            metadata: {
+              label: filename,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [
+      draft.threadId,
+      displayCwd,
+      addStagedAttachment,
+      updateStagedAttachment,
+    ],
+  );
 
   // The textarea onStop is a no-op during a draft — there's no session
   // to interrupt. The button only shows when streaming=true, which we
@@ -449,6 +561,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       errorMessage={draft.lastSendError}
       zone1Override={zone1Override}
       mode={draft.mode}
+      stagedAttachments={stagedAttachments}
+      onRemoveAttachment={(id) =>
+        removeStagedAttachment(draft.threadId, id)
+      }
+      onAttachFile={handleAttachFile}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}

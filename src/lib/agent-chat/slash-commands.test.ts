@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildModeCommands,
   filterSlashItems,
+  findMentionAtCursor,
   findSlashAtCursor,
+  findTriggerAtCursor,
   groupSlashItems,
   MODE_CYCLE_ORDER,
   nextModeInCycle,
@@ -36,6 +38,57 @@ describe("findSlashAtCursor", () => {
 
   it("treats tabs and multi-char whitespace runs as separators", () => {
     expect(findSlashAtCursor("hi\t/x", 5)).toEqual({ start: 3, query: "x" });
+  });
+});
+
+describe("findMentionAtCursor (Step 8 Stage 2)", () => {
+  it.each<[string, number, ReturnType<typeof findMentionAtCursor>]>([
+    ["", 0, null],
+    ["@", 1, { start: 0, query: "" }],
+    ["@composer", 9, { start: 0, query: "composer" }],
+    ["hi @", 4, { start: 3, query: "" }],
+    ["hi @comp", 8, { start: 3, query: "comp" }],
+    ["a@b", 3, null], // `@` inside a word — must not open
+    ["hi@", 3, null], // `@` glued to a word
+    ["@a @b", 5, { start: 3, query: "b" }], // cursor on second mention wins
+    ["hello world\n@file", 17, { start: 12, query: "file" }],
+    ["@a b", 4, null], // cursor past the space
+    [" @", 2, { start: 1, query: "" }],
+    ["abc @xy", 7, { start: 4, query: "xy" }],
+    ["abc\t@xy", 7, { start: 4, query: "xy" }],
+  ])("findMentionAtCursor(%j, %i)", (value, cursor, expected) => {
+    expect(findMentionAtCursor(value, cursor)).toEqual(expected);
+  });
+
+  it("returns null when cursor is out of bounds", () => {
+    expect(findMentionAtCursor("@", -1)).toBeNull();
+    expect(findMentionAtCursor("@", 99)).toBeNull();
+  });
+
+  it("does not fire on slash characters", () => {
+    expect(findMentionAtCursor("/foo", 4)).toBeNull();
+    expect(findMentionAtCursor("/", 1)).toBeNull();
+  });
+});
+
+describe("findTriggerAtCursor (shared primitive)", () => {
+  it("backs both findSlashAtCursor and findMentionAtCursor", () => {
+    expect(findTriggerAtCursor("/foo", 4, "/")).toEqual({
+      start: 0,
+      query: "foo",
+    });
+    expect(findTriggerAtCursor("@foo", 4, "@")).toEqual({
+      start: 0,
+      query: "foo",
+    });
+    // Crossed triggers: `/foo` queried with `@` returns null.
+    expect(findTriggerAtCursor("/foo", 4, "@")).toBeNull();
+    expect(findTriggerAtCursor("@foo", 4, "/")).toBeNull();
+  });
+
+  it("never matches when whitespace separates the trigger from the cursor", () => {
+    expect(findTriggerAtCursor("/x foo", 6, "/")).toBeNull();
+    expect(findTriggerAtCursor("@x foo", 6, "@")).toBeNull();
   });
 });
 
