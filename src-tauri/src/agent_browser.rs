@@ -291,6 +291,7 @@ fn extract_eval_result(stdout: &str) -> String {
 /// 2. Tauri sidecar — bundled next to the executable in AppImage/deb/rpm
 /// 3. node_modules — dev mode (`npm run tauri dev`)
 /// 4. npx fallback — always works if Node.js + npm are present
+#[cfg_attr(target_os = "windows", allow(unreachable_code))]
 fn resolve_binary() -> String {
     // 1. System PATH (AUR/system package, cargo install, manual install).
     //
@@ -314,6 +315,65 @@ fn resolve_binary() -> String {
                 return path;
             }
         }
+    }
+
+    // Windows takes a different discovery path because the rest of this
+    // function is shaped around the Linux/macOS sidecar naming convention
+    // (`agent-browser-{triple}` next to the main exe) and the bash `which`
+    // probe at the top. Specifically:
+    //   1. Tauri's Windows bundler copies the staged sidecar
+    //      `src-tauri/binaries/agent-browser-x86_64-pc-windows-msvc.exe` to
+    //      `target/{debug,release}/agent-browser.exe` (drops the triple,
+    //      keeps `.exe`) — so the runtime lookup must match THAT name.
+    //   2. The original target_triple match below has no Windows branch and
+    //      hard-returns `"npx agent-browser"`, which `Command::new("npx")`
+    //      can't actually spawn because Windows only auto-appends `.exe` and
+    //      `npx` ships as `npx.cmd` (per microsoft/CreateProcessW docs).
+    //   3. The `which` crate (already a dep) honors PATHEXT and is the
+    //      canonical Windows-safe way to probe for an executable on PATH.
+    #[cfg(target_os = "windows")]
+    {
+        // (a) Tauri runtime convention — sidecar copied next to main exe.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let candidate = dir.join("agent-browser.exe");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
+                }
+            }
+        }
+        // (b) Dev mode — npm-installed binary in node_modules.
+        let npm_binary = "agent-browser-win32-x64.exe";
+        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            search_dirs.push(cwd.clone());
+            if let Some(parent) = cwd.parent() {
+                search_dirs.push(parent.to_path_buf());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                search_dirs.push(dir.to_path_buf());
+            }
+        }
+        for base in &search_dirs {
+            let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+        // (c) Native install on PATH — `which` honors PATHEXT so this finds
+        //     `agent-browser.exe`/`.cmd` without explicit suffix probing.
+        if let Ok(path) = which::which("agent-browser") {
+            return path.to_string_lossy().to_string();
+        }
+        // (d) Last-resort npx fallback. Use `npx.cmd` (not `npx`) because
+        //     CreateProcessW won't auto-append `.cmd`. `which::which("npx")`
+        //     resolves to the right shim with PATHEXT, so prefer it.
+        if let Ok(npx_path) = which::which("npx") {
+            return format!("{} agent-browser", npx_path.to_string_lossy());
+        }
+        return "npx.cmd agent-browser".to_string();
     }
 
     // Determine the platform-specific sidecar name
