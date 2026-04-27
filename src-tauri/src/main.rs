@@ -17,6 +17,31 @@ fn openflow_agent_label() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+fn hide_console_for_release_build() {
+    // Raw FFI to kernel32 + user32 — kept inline to avoid pulling in winapi/
+    // windows-sys as an explicit dep (both are already in the transitive tree
+    // but we don't depend on them directly).
+    use std::ffi::c_void;
+    type HWND = *mut c_void;
+    type BOOL = i32;
+    const SW_HIDE: i32 = 0;
+    extern "system" {
+        fn AllocConsole() -> BOOL;
+        fn GetConsoleWindow() -> HWND;
+        fn ShowWindow(hwnd: HWND, ncmdshow: i32) -> BOOL;
+    }
+    unsafe {
+        // AllocConsole returns FALSE if the process already has a console;
+        // either way we just need a console *handle* to hide.
+        let _ = AllocConsole();
+        let hwnd = GetConsoleWindow();
+        if !hwnd.is_null() {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
 #[cfg(all(debug_assertions, unix))]
 mod native_signal_log {
     use std::env;
@@ -231,6 +256,21 @@ fn main() {
 
     #[cfg(all(debug_assertions, unix))]
     native_signal_log::install();
+
+    // Allocate a hidden console for ConPTY children to inherit.
+    // Release builds use `windows_subsystem = "windows"` (no console attached),
+    // which causes the Windows pseudoconsole API to allocate a fallback visible
+    // console window per spawned child. portable-pty 0.8.1 honors the
+    // pseudoconsole attribute correctly when the parent has *some* console;
+    // by allocating one here and immediately hiding it, ConPTY children inherit
+    // the hidden console handle and no popup appears. This is the same pattern
+    // node-pty / VS Code use for Windows ConPTY in GUI-subsystem hosts.
+    //
+    // Skipped in debug builds because cargo run inherits the developer's
+    // terminal; allocating a second console would orphan keystrokes and SW_HIDE
+    // would hide the wrong window.
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    hide_console_for_release_build();
 
     codemux_lib::run();
 
