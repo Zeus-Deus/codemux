@@ -3548,7 +3548,7 @@ dependencies = [
 [[package]]
 name = "portable-pty"
 version = "0.8.1"
-source = "git+https://github.com/Zeus-Deus/portable-pty?branch=codemux-0.8.1-no-window#a5022fec34dd6a97ecaf16fd8d799434371adb07"
+source = "git+https://github.com/Zeus-Deus/portable-pty?rev=60bc6ba2aed811801e4619787efa2290f232c85d#60bc6ba2aed811801e4619787efa2290f232c85d"
 dependencies = [
  "anyhow",
  "bitflags 1.3.2",
