@@ -118,7 +118,44 @@ mod windows_transport {
 
     pub async fn connect(path: &Path) -> std::io::Result<ClientStream> {
         let pipe_name = path.to_string_lossy().into_owned();
-        ClientOptions::new().open(&pipe_name)
+
+        // Windows named pipes do NOT queue pending connections the way Unix
+        // sockets do — there's a brief window between the server's `accept()`
+        // returning a connected instance and the bind of the next instance,
+        // during which a client `open()` call gets ERROR_PIPE_BUSY (raw OS
+        // error 231). This surfaces in practice when a Claude Code subagent
+        // fires multiple `codemux <subcommand>` invocations rapidly: each
+        // spawns a fresh CLI client process, and the second/third arrive
+        // before the server has re-armed.
+        //
+        // The documented Windows pattern (per MSDN's WaitNamedPipe page) is
+        // to wait briefly and retry. We use exponential backoff capped at
+        // 200ms with a total worst-case budget of ~385ms before giving up,
+        // which is well under the human-perceptible threshold for a CLI
+        // command and effectively eliminates the race in normal use.
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let backoffs_ms: [u64; 5] = [10, 25, 50, 100, 200];
+
+        let mut last_err: Option<std::io::Error> = None;
+        for delay_ms in std::iter::once(0).chain(backoffs_ms.iter().copied()) {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(stream) => return Ok(stream),
+                Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
+                    last_err = Some(err);
+                    continue;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "control pipe busy after retries",
+            )
+        }))
     }
 
     /// Blocking probe: does a server respond on this pipe right now?
