@@ -92,16 +92,57 @@ pub fn kill_stream_daemons() {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let _ = std::process::Command::new("taskkill")
-            .args(["/IM", "agent-browser.exe", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        // The Tauri-bundled sidecar is renamed to `agent-browser.exe`, but
+        // the dev-mode binary at `node_modules/agent-browser/bin/...` keeps
+        // its full name `agent-browser-win32-x64.exe`. Kill both forms so
+        // restarts don't leak daemons in either deployment mode.
+        for image in ["agent-browser.exe", "agent-browser-win32-x64.exe"] {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", image])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+
+        // After killing the processes, sweep the per-session lock files
+        // agent-browser leaves under `%USERPROFILE%\.agent-browser\`. The
+        // CLI trusts those `.pid`/`.port`/`.engine`/`.stream` files as
+        // proof that a daemon is alive — when they outlive the process
+        // (e.g. previous codemux exited without cleanup), every new
+        // `agent-browser open` for that session prints
+        // "daemon already running" and times out trying to connect to a
+        // ghost. We just killed every agent-browser, so any lock file
+        // here is by definition stale.
+        cleanup_agent_browser_lock_files();
     }
     #[cfg(not(windows))]
     {
         let _ = std::process::Command::new("sh")
             .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
             .output();
+    }
+}
+
+/// Remove all lock/session files in `%USERPROFILE%\.agent-browser\`.
+/// Windows-only because Linux daemons clean up properly on SIGTERM via
+/// the `pkill -f` path above; this gap only exists on Windows where
+/// `kill_session_tree` is a no-op (no Job Object support yet).
+#[cfg(windows)]
+fn cleanup_agent_browser_lock_files() {
+    let Ok(home) = std::env::var("USERPROFILE") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".agent-browser");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if matches!(ext, "pid" | "port" | "engine" | "stream") {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -563,12 +604,16 @@ fn build_agent_browser_argv_groups(
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank")
                 .to_string();
-            let mut open_argv: Vec<String> = vec!["open".into(), url];
-            // Auto-detect installed Brave/Chrome/Edge and pass via
-            // --executable-path so users don't need `agent-browser install`
-            // when they already have a Chromium browser on disk.
-            open_argv.extend(windows_executable_path_args());
-            open_argv.extend(["--session".into(), s.clone()]);
+            // `--executable-path` is a TOP-LEVEL agent-browser flag, so it
+            // must precede the subcommand (`open`). Putting it after
+            // `open` makes clap reject the argv as an unknown flag for
+            // the `open` subcommand and the binary exits silently —
+            // exactly the "no log activity, browser never loads" mode
+            // the user hit.
+            let mut open_argv: Vec<String> = windows_executable_path_args();
+            open_argv.extend(["open".into(), url, "--session".into(), s.clone()]);
+            // The follow-up `wait --load load` doesn't need
+            // --executable-path; it talks to the already-running daemon.
             vec![
                 open_argv,
                 vec![
@@ -991,10 +1036,17 @@ impl AgentBrowserManager {
     /// Returns the existing port if already allocated, or assigns the next
     /// available port in the range [DEFAULT_STREAM_PORT, MAX_STREAM_PORT].
     ///
-    /// Does NOT check if the port is free — start_stream uses fuser -k to
-    /// reclaim ports occupied by stale daemons. A try-bind check here would
-    /// skip our own stale daemon's port, causing the agent-browser CLI to
-    /// reuse the stale daemon while BrowserPane connects to the wrong port.
+    /// On Unix the loop only checks our in-memory session map and relies on
+    /// `start_stream`'s `fuser -k` to reclaim ports occupied by stale
+    /// daemons that the kernel/process table will let us kill.
+    ///
+    /// On Windows ghost ports are real: `kill_session_tree` is a no-op (no
+    /// Job Object support yet — see TODO in `terminal/mod.rs`), so when the
+    /// codemux app exits its agent-browser daemons leak. The OS keeps the
+    /// ports listening on dead PIDs and `kill_process_on_port` can't kill
+    /// what's already gone. So on Windows we additionally try-bind each
+    /// candidate port and skip ones that fail — that way the stuck ports
+    /// just get skipped and the next free one (9225+, 9226+, etc.) is used.
     pub async fn allocate_port(&self, session_key: &str) -> Result<u16, String> {
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(session_key) {
@@ -1013,6 +1065,16 @@ impl AgentBrowserManager {
             }
             // Check no other session already owns this port
             if sessions.values().any(|s| s.port == port) {
+                continue;
+            }
+
+            // Windows-only: try-bind to filter out ghost-occupied ports.
+            // We bind a TcpListener to 127.0.0.1:<port> and immediately
+            // drop it; if the bind fails, some other process (often a
+            // dead-PID-owned leak from a previous codemux run) is on it
+            // and we should skip to the next.
+            #[cfg(target_os = "windows")]
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
                 continue;
             }
 
@@ -1055,9 +1117,12 @@ impl AgentBrowserManager {
 
         #[cfg(target_os = "windows")]
         let output = {
-            let mut argv: Vec<String> = vec!["open".into(), "about:blank".into()];
-            argv.extend(windows_executable_path_args());
+            // `--executable-path` is a top-level flag — must come before
+            // the `open` subcommand or clap rejects it.
+            let mut argv: Vec<String> = windows_executable_path_args();
             argv.extend([
+                "open".into(),
+                "about:blank".into(),
                 "--headless".into(),
                 "--session".into(),
                 session.to_string(),
@@ -1239,9 +1304,12 @@ impl AgentBrowserManager {
             let _ = run_agent_browser_native(
                 &bin,
                 &{
-                    let mut argv: Vec<String> = vec!["open".into(), "about:blank".into()];
-                    argv.extend(windows_executable_path_args());
+                    // Top-level flag before subcommand; see commit
+                    // history note in build_agent_browser_argv_groups.
+                    let mut argv: Vec<String> = windows_executable_path_args();
                     argv.extend([
+                        "open".into(),
+                        "about:blank".into(),
                         "--headless".into(),
                         "--session".into(),
                         session.to_string(),

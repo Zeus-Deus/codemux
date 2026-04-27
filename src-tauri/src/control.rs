@@ -621,6 +621,10 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .unwrap_or("open_url")
                 .to_string();
 
+            eprintln!(
+                "[codemux::browser] handler received action={action_kind} workspace_id={workspace_id}"
+            );
+
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
 
             // Resolve the CLI session name to use for agent-browser commands.
