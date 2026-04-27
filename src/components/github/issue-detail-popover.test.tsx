@@ -30,6 +30,9 @@ const FULL_ISSUE: GitHubIssue = {
   assignees: ["zeus", "alice"],
   url: "https://github.com/org/repo/issues/104",
   body: "We need dark mode support.\n\nAcceptance criteria:\n- Toggle in settings\n- Persists across sessions",
+  comments: [],
+  totalComments: 0,
+  updatedAt: null,
 };
 
 function renderPopover() {

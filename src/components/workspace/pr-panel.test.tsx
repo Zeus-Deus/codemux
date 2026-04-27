@@ -106,6 +106,10 @@ const mockPr: PullRequestInfo = {
   review_decision: null,
   checks_passing: null,
   updated_at: "2026-04-09T00:00:00Z",
+  body: null,
+  comments: [],
+  totalComments: 0,
+  author: null,
 };
 
 beforeEach(() => {

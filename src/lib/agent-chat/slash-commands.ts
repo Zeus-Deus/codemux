@@ -25,6 +25,11 @@ export interface SlashCommandItem {
   command: string;
   /** Lucide icon. Optional; some skills may not have an icon. */
   icon?: LucideIcon;
+  /** Tailwind classes applied to the icon, overriding the popup's
+   *  default `text-muted-foreground`. Used to tint state-bearing
+   *  icons (e.g. green for open issues, muted for closed). Optional;
+   *  rows that don't supply this fall back to the popup default. */
+  iconClassName?: string;
   /** What happens when the user picks this item. The composer wires
    *  this to the appropriate handler (mode activation, skill invoke,
    *  …). */
@@ -99,6 +104,34 @@ export function findSlashAtCursor(
   cursor: number,
 ): SlashAnchor | null {
   return findTriggerAtCursor(value, cursor, "/");
+}
+
+/** Step 8 Stage 4 — category prefix parsed off a `@` mention query.
+ *  `file` is the default; `issue` and `pr` route to GitHub-backed
+ *  popups (Stage 4 ships `issue`, Stage 5 wires `pr`). `folder` is
+ *  reserved so the future `@folder:` autocomplete can use the same
+ *  routing without a second parser. */
+export type MentionCategory = "file" | "folder" | "issue" | "pr";
+
+export interface ParsedMentionQuery {
+  category: MentionCategory;
+  /** Substring after the `<category>:` prefix. Equals the raw query
+   *  when no prefix was supplied (default file behaviour). */
+  filter: string;
+}
+
+/** Parse a mention query into a `(category, filter)` pair. Recognised
+ *  prefixes: `file:`, `folder:`, `issue:`, `pr:`. Anything else is
+ *  treated as a bare file query so existing `@<name>` autocomplete
+ *  keeps working unchanged. The category match is case-insensitive
+ *  to forgive copy-pastes from a stylised hint. */
+export function parseMentionQuery(query: string): ParsedMentionQuery {
+  const match = query.match(/^(file|folder|issue|pr):(.*)$/i);
+  if (match) {
+    const category = match[1]!.toLowerCase() as MentionCategory;
+    return { category, filter: match[2] ?? "" };
+  }
+  return { category: "file", filter: query };
 }
 
 /**

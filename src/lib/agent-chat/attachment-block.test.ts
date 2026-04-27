@@ -4,10 +4,55 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildIssueResolvedContent,
+  buildPrResolvedContent,
 } from "./attachment-block";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { Attachment } from "@/stores/agent-chat-store";
-import type { FileAttachmentInfo } from "@/tauri/types";
+import type {
+  FileAttachmentInfo,
+  GitHubIssue,
+  PullRequestInfo,
+} from "@/tauri/types";
+
+function makePrDetail(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
+  return {
+    number: 42,
+    url: "https://github.com/u/r/pull/42",
+    state: "OPEN",
+    title: "Add dark mode",
+    head_branch: "feat/dark",
+    base_branch: "main",
+    is_draft: false,
+    mergeable: "MERGEABLE",
+    additions: 100,
+    deletions: 5,
+    review_decision: "APPROVED",
+    checks_passing: null,
+    updated_at: null,
+    body: "PR body here",
+    comments: [],
+    totalComments: 0,
+    author: "alice",
+    ...overrides,
+  };
+}
+
+function makeIssueDetail(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
+  return {
+    number: 42,
+    title: "Add dark mode",
+    state: "Open",
+    labels: ["enhancement"],
+    assignees: ["zeus"],
+    url: "https://github.com/u/r/issues/42",
+    body: "Body line 1\nBody line 2",
+    comments: [],
+    totalComments: 0,
+    updatedAt: null,
+    ...overrides,
+  };
+}
 
 function makeFileAttachment(
   overrides: Partial<Attachment> = {},
@@ -279,5 +324,173 @@ describe("Stage 2 sample — full applyAllPrefixes pipeline with file attachment
     expect(wrapped).toContain("```tsx");
     expect(wrapped).toContain("=== End context ===");
     expect(wrapped).toContain("explain this file's main responsibilities");
+  });
+});
+
+describe("buildIssueResolvedContent", () => {
+  it("renders state, url, body and skips empty comment section", () => {
+    const out = buildIssueResolvedContent(makeIssueDetail());
+    expect(out).toContain("State: Open");
+    expect(out).toContain("URL: https://github.com/u/r/issues/42");
+    expect(out).toContain("### Body");
+    expect(out).toContain("Body line 1");
+    expect(out).not.toContain("### Comments");
+  });
+
+  it("falls back to '(no body)' when body is empty", () => {
+    const out = buildIssueResolvedContent(makeIssueDetail({ body: null }));
+    expect(out).toContain("(no body)");
+    const out2 = buildIssueResolvedContent(makeIssueDetail({ body: "" }));
+    expect(out2).toContain("(no body)");
+  });
+
+  it("renders comments section with author / timestamp / body", () => {
+    const out = buildIssueResolvedContent(
+      makeIssueDetail({
+        comments: [
+          {
+            author: "alice",
+            body: "agreed!",
+            createdAt: "2026-01-02T00:00:00Z",
+          },
+        ],
+        totalComments: 1,
+      }),
+    );
+    expect(out).toContain(
+      "### Comments (1 total, showing first 1)",
+    );
+    expect(out).toContain("**alice** (2026-01-02T00:00:00Z):");
+    expect(out).toContain("agreed!");
+    // Only one comment shown total — no truncation footer.
+    expect(out).not.toContain("more comment");
+  });
+
+  it("includes a truncation footer when totalComments exceeds shown", () => {
+    const comments = Array.from({ length: 20 }, (_, i) => ({
+      author: `u${i}`,
+      body: `c${i}`,
+      createdAt: "2026-01-01T00:00:00Z",
+    }));
+    const out = buildIssueResolvedContent(
+      makeIssueDetail({ comments, totalComments: 132 }),
+    );
+    expect(out).toContain("(132 total, showing first 20)");
+    expect(out).toContain(
+      "112 more comments not shown. Use `gh issue view 42 --comments`",
+    );
+  });
+
+  it("singular phrasing when exactly one comment is hidden", () => {
+    const comments = Array.from({ length: 20 }, (_, i) => ({
+      author: `u${i}`,
+      body: `c${i}`,
+      createdAt: "2026-01-01T00:00:00Z",
+    }));
+    const out = buildIssueResolvedContent(
+      makeIssueDetail({ comments, totalComments: 21 }),
+    );
+    expect(out).toContain("1 more comment not shown");
+  });
+
+  it("includes labels and assignees in the header when present", () => {
+    const out = buildIssueResolvedContent(makeIssueDetail());
+    expect(out).toContain("Labels: enhancement");
+    expect(out).toContain("Assignees: zeus");
+  });
+
+  it("formats the wrapper block via formatIssueAttachment", () => {
+    const issueAttachment: Attachment = {
+      id: "att-issue",
+      kind: "issue",
+      ref: "#42",
+      metadata: { label: "#42 Add dark mode", state: "open" },
+      resolvedContent: buildIssueResolvedContent(makeIssueDetail()),
+    };
+    const block = buildAttachmentBlock([issueAttachment]);
+    expect(block).not.toBeNull();
+    expect(block).toContain("=== Attached context ===");
+    expect(block).toContain("## Issue #42 Add dark mode [open]");
+    expect(block).toContain("State: Open");
+    expect(block).toContain("=== End context ===");
+  });
+});
+
+describe("buildPrResolvedContent", () => {
+  it("renders state, branches, author, diff stat, and body", () => {
+    const out = buildPrResolvedContent(makePrDetail(), "");
+    expect(out).toContain("State: OPEN");
+    expect(out).toContain("URL: https://github.com/u/r/pull/42");
+    expect(out).toContain("Author: alice");
+    expect(out).toContain("Branches: main ← feat/dark");
+    expect(out).toContain("Diff stat: +100 / -5");
+    expect(out).toContain("Review: APPROVED");
+    expect(out).toContain("Mergeable: MERGEABLE");
+    expect(out).toContain("PR body here");
+  });
+
+  it("flags drafts in the state header", () => {
+    const out = buildPrResolvedContent(
+      makePrDetail({ is_draft: true }),
+      "",
+    );
+    expect(out).toContain("State: OPEN (draft)");
+  });
+
+  it("renders name-only diff as a bulleted list with file count", () => {
+    const diff = "src/foo.ts\nsrc/bar.ts\nREADME.md";
+    const out = buildPrResolvedContent(makePrDetail(), diff);
+    expect(out).toContain("### Files changed (3)");
+    expect(out).toContain("- src/foo.ts");
+    expect(out).toContain("- src/bar.ts");
+    expect(out).toContain("- README.md");
+    expect(out).toContain("Use `gh pr diff 42`");
+  });
+
+  it("renders a fenced unified diff when fullDiff option is set", () => {
+    const diff = "diff --git a/x b/x\n@@ -1,1 +1,1 @@\n-old\n+new";
+    const out = buildPrResolvedContent(makePrDetail(), diff, {
+      fullDiff: true,
+    });
+    expect(out).toContain("### Diff (full)");
+    expect(out).toContain("```diff");
+    expect(out).toContain("diff --git a/x b/x");
+    // Name-only files-changed list must NOT appear when fullDiff=true.
+    expect(out).not.toContain("### Files changed");
+  });
+
+  it("falls back to '(no body)' when body is empty", () => {
+    expect(
+      buildPrResolvedContent(makePrDetail({ body: null }), ""),
+    ).toContain("(no body)");
+  });
+
+  it("renders comments + truncation footer for long threads", () => {
+    const comments = Array.from({ length: 20 }, (_, i) => ({
+      author: `u${i}`,
+      body: `c${i}`,
+      createdAt: "2026-01-01T00:00:00Z",
+    }));
+    const out = buildPrResolvedContent(
+      makePrDetail({ comments, totalComments: 51 }),
+      "",
+    );
+    expect(out).toContain("(51 total, showing first 20)");
+    expect(out).toContain(
+      "31 more comments not shown. Use `gh pr view 42 --comments`",
+    );
+  });
+
+  it("formats the wrapper block via formatPrAttachment", () => {
+    const att: Attachment = {
+      id: "att-pr",
+      kind: "pr",
+      ref: "!42",
+      metadata: { label: "#42 Add dark mode", state: "open" },
+      resolvedContent: buildPrResolvedContent(makePrDetail(), ""),
+    };
+    const block = buildAttachmentBlock([att]);
+    expect(block).toContain("## Pull Request #42 Add dark mode [open]");
+    expect(block).toContain("State: OPEN");
   });
 });

@@ -17,6 +17,8 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listProjectFiles: vi.fn(),
+    listGithubIssuesByPath: vi.fn().mockResolvedValue([]),
+    getGithubIssueByPath: vi.fn(),
     // Skills loader is unrelated but the Composer pulls it from the
     // store on slash-popup open; stub it so we don't trip the real
     // invoke from inside the mention tests.
@@ -25,12 +27,37 @@ vi.mock("@/tauri/commands", async (importActual) => {
 });
 
 import { Composer } from "./Composer";
-import { listProjectFiles } from "@/tauri/commands";
+import {
+  getGithubIssueByPath,
+  listGithubIssuesByPath,
+  listProjectFiles,
+} from "@/tauri/commands";
+import type { GitHubIssue } from "@/tauri/types";
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
 const listProjectFilesMock =
   listProjectFiles as unknown as ReturnType<typeof vi.fn>;
+const listGithubIssuesMock =
+  listGithubIssuesByPath as unknown as ReturnType<typeof vi.fn>;
+const getGithubIssueMock =
+  getGithubIssueByPath as unknown as ReturnType<typeof vi.fn>;
+
+function makeIssue(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
+  return {
+    number: 1234,
+    title: "Login redirect bug",
+    state: "Open",
+    labels: ["bug"],
+    assignees: [],
+    url: "https://github.com/u/r/issues/1234",
+    body: null,
+    comments: [],
+    totalComments: 0,
+    updatedAt: null,
+    ...overrides,
+  };
+}
 
 function makeMatch(overrides: Partial<FileMatch> = {}): FileMatch {
   return {
@@ -114,6 +141,9 @@ function renderControlled(
 beforeEach(() => {
   listProjectFilesMock.mockReset();
   listProjectFilesMock.mockResolvedValue([]);
+  listGithubIssuesMock.mockReset();
+  listGithubIssuesMock.mockResolvedValue([]);
+  getGithubIssueMock.mockReset();
 });
 
 afterEach(() => cleanup());
@@ -256,5 +286,115 @@ describe("Composer @ mention popup (Step 8 Stage 2)", () => {
     // The slash popup uses a different fetch path; mention's listProjectFiles
     // mock should not have been touched.
     expect(listProjectFilesMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
+  it("routes @issue:<query> through listGithubIssuesByPath", async () => {
+    listGithubIssuesMock.mockResolvedValue([makeIssue({ title: "bug fix" })]);
+    renderComposer({ isGithubRepo: true, ghAuthenticated: true });
+    typeIntoTextarea("@issue:bug");
+    await waitFor(() => {
+      expect(listGithubIssuesMock).toHaveBeenCalled();
+    });
+    const [pathArg, searchArg] = listGithubIssuesMock.mock.calls[0]!;
+    expect(pathArg).toBe("/repo");
+    expect(searchArg).toBe("bug");
+    // File search must NOT fire for issue-prefixed mentions.
+    expect(listProjectFilesMock).not.toHaveBeenCalled();
+  });
+
+  it("direct-fetches when the filter is numeric (@issue:1234)", async () => {
+    getGithubIssueMock.mockResolvedValue(makeIssue());
+    renderComposer({ isGithubRepo: true, ghAuthenticated: true });
+    typeIntoTextarea("@issue:1234");
+    await waitFor(() => {
+      expect(getGithubIssueMock).toHaveBeenCalled();
+    });
+    const [pathArg, numArg] = getGithubIssueMock.mock.calls[0]!;
+    expect(pathArg).toBe("/repo");
+    expect(numArg).toBe(1234);
+    // The list path is bypassed for numeric direct fetches.
+    expect(listGithubIssuesMock).not.toHaveBeenCalled();
+  });
+
+  it("renders fetched issues as picker rows", async () => {
+    listGithubIssuesMock.mockResolvedValue([
+      makeIssue({ number: 92, title: "Backend endpoints" }),
+      makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
+    ]);
+    const { findByText } = renderComposer({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    typeIntoTextarea("@issue:");
+    expect(await findByText("Backend endpoints")).toBeInTheDocument();
+    expect(await findByText("Dark mode toggle")).toBeInTheDocument();
+  });
+
+  it("calls onAttachIssue and inserts an @#<n> token on pick", async () => {
+    const issue = makeIssue({ number: 92, title: "Backend endpoints" });
+    listGithubIssuesMock.mockResolvedValue([issue]);
+    const onAttachIssue = vi.fn();
+    const onDraftChange = vi.fn();
+    const { findByText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+      onAttachIssue,
+      onDraftChange,
+    });
+    typeIntoTextarea("@issue:back");
+    const row = await findByText("Backend endpoints");
+    fireEvent.click(row);
+    expect(onAttachIssue).toHaveBeenCalledWith(issue);
+    const finalDraft =
+      onDraftChange.mock.calls[onDraftChange.mock.calls.length - 1]?.[0];
+    expect(finalDraft).toBe("@#92 ");
+  });
+
+  it("shows the not-a-github-repo footer when preflight reports false", async () => {
+    const { findByText } = renderComposer({ isGithubRepo: false });
+    typeIntoTextarea("@issue:foo");
+    expect(await findByText("Not a GitHub repo.")).toBeInTheDocument();
+    // Don't call gh when we already know it'd fail.
+    expect(listGithubIssuesMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the gh-auth footer when authentication is missing", async () => {
+    const { findByText } = renderComposer({
+      isGithubRepo: true,
+      ghAuthenticated: false,
+    });
+    typeIntoTextarea("@issue:foo");
+    expect(await findByText("Sign in with: gh auth login")).toBeInTheDocument();
+    expect(listGithubIssuesMock).not.toHaveBeenCalled();
+  });
+
+  it("renders open issues with CircleDot + text-success and closed with CircleCheck + muted", async () => {
+    // Stage 4 polish — the mention popup must visually match the
+    // IssuePickerPanel that the `+ → Issue…` path mounts. Both
+    // surfaces use CircleDot (filled) tinted `text-success` for open
+    // and CircleCheck (with tick) muted for closed, so users get a
+    // consistent open/closed signal regardless of how they reached
+    // the picker.
+    listGithubIssuesMock.mockResolvedValue([
+      makeIssue({ number: 92, title: "Open thing", state: "Open" }),
+      makeIssue({ number: 70, title: "Closed thing", state: "Closed" }),
+    ]);
+    const { container, findByText } = renderComposer({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    typeIntoTextarea("@issue:");
+    await findByText("Open thing");
+    await findByText("Closed thing");
+    expect(
+      container.querySelectorAll("svg.lucide-circle-dot.text-success").length,
+    ).toBe(1);
+    expect(
+      container.querySelectorAll(
+        "svg.lucide-circle-check.text-muted-foreground",
+      ).length,
+    ).toBe(1);
   });
 });

@@ -174,7 +174,12 @@ export function SlashCommandPopup({
                     >
                       {Icon && (
                         <Icon
-                          className="h-3.5 w-3.5 shrink-0 text-muted-foreground"
+                          className={cn(
+                            "h-3.5 w-3.5 shrink-0",
+                            // Per-item override (e.g. green for open
+                            // issues) wins; otherwise default muted.
+                            item.iconClassName ?? "text-muted-foreground",
+                          )}
                           aria-hidden
                         />
                       )}

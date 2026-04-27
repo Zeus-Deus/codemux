@@ -312,6 +312,56 @@ pub fn sanitize_gui_env_tokio(cmd: &mut tokio::process::Command) {
     }
 }
 
+/// Variant of `sanitize_gui_env_std` that *preserves* the DBus session
+/// bus address.
+///
+/// Use this for credential-handling CLIs (`gh`, `git credential-libsecret`,
+/// `glab`, `aws sso` w/ keyring, etc.) that round-trip to a keyring
+/// daemon over DBus — `gnome-keyring-daemon`, `kwalletd5/6`,
+/// `keepassxc-secret-service`, anything implementing the freedesktop
+/// `org.freedesktop.secrets` API. The default sanitiser overrides
+/// `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null` so that arbitrary
+/// agent-spawned children can't escape via portals/dbus-activation;
+/// trusted internal CLIs that store their own token in the user's
+/// keyring legitimately need bus access to fetch it back, otherwise
+/// `gh auth status` reports unauthenticated even when `gh auth login`
+/// previously succeeded.
+///
+/// Strips/sets the same keys as `sanitize_gui_env_std` minus
+/// `DBUS_SESSION_BUS_ADDRESS`. Display/wayland/portal hygiene is
+/// preserved; only the bus address is allowed through.
+pub fn sanitize_gui_env_std_keep_dbus(cmd: &mut std::process::Command) {
+    for key in gui_env_keys() {
+        if *key == "DBUS_SESSION_BUS_ADDRESS" {
+            continue;
+        }
+        cmd.env_remove(key);
+    }
+    for (k, v) in gui_env_overrides() {
+        if *k == "DBUS_SESSION_BUS_ADDRESS" {
+            continue;
+        }
+        cmd.env(k, v);
+    }
+}
+
+/// Tokio variant of `sanitize_gui_env_std_keep_dbus`. See that function
+/// for the rationale and the exhaustive call-site policy.
+pub fn sanitize_gui_env_tokio_keep_dbus(cmd: &mut tokio::process::Command) {
+    for key in gui_env_keys() {
+        if *key == "DBUS_SESSION_BUS_ADDRESS" {
+            continue;
+        }
+        cmd.env_remove(key);
+    }
+    for (k, v) in gui_env_overrides() {
+        if *k == "DBUS_SESSION_BUS_ADDRESS" {
+            continue;
+        }
+        cmd.env(k, v);
+    }
+}
+
 pub fn prepare_agent_command(
     executable: String,
     args: Vec<String>,
@@ -703,6 +753,72 @@ mod tests {
         // integration tests. Here we simply verify the function returns
         // without panicking and builds a valid command.
         let _program = cmd.get_program().to_string_lossy().into_owned();
+    }
+
+    /// `Command::get_envs()` reports the per-command env mutations made
+    /// via `.env()` / `.env_remove()`:
+    ///   - `(K, Some(V))` for `cmd.env(K, V)`
+    ///   - `(K, None)`    for `cmd.env_remove(K)`
+    ///   - keys absent entirely → child inherits the parent's value
+    ///
+    /// We use that to assert the keep-dbus variant leaves
+    /// `DBUS_SESSION_BUS_ADDRESS` untouched (so the parent's bus
+    /// address passes through to the child) while still applying the
+    /// rest of the GUI hygiene.
+    #[test]
+    fn sanitize_gui_env_std_keep_dbus_preserves_bus_address() {
+        use std::ffi::OsStr;
+        use std::process::Command;
+        let mut cmd = Command::new("true");
+        sanitize_gui_env_std_keep_dbus(&mut cmd);
+
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = cmd.get_envs().collect();
+
+        // Bus address must NOT be touched — neither stripped nor
+        // overridden — so the child inherits the user's session bus.
+        assert!(
+            !envs
+                .iter()
+                .any(|(k, _)| *k == OsStr::new("DBUS_SESSION_BUS_ADDRESS")),
+            "keep_dbus must not touch DBUS_SESSION_BUS_ADDRESS, got envs: {envs:?}",
+        );
+
+        // Sanity: other GUI keys are still stripped (env_remove → None).
+        let display_entry = envs
+            .iter()
+            .find(|(k, _)| *k == OsStr::new("DISPLAY"))
+            .expect("DISPLAY should be stripped by keep_dbus");
+        assert_eq!(display_entry.1, None);
+
+        // Sanity: non-DBus overrides are still applied.
+        let browser_entry = envs
+            .iter()
+            .find(|(k, _)| *k == OsStr::new("BROWSER"))
+            .expect("BROWSER override should still be set by keep_dbus");
+        assert_eq!(browser_entry.1, Some(OsStr::new("true")));
+    }
+
+    /// Companion test against the strict variant — proves the contract
+    /// difference between the two. The strict sanitiser DOES override
+    /// the bus address; the keep-dbus variant does not.
+    #[test]
+    fn sanitize_gui_env_std_overrides_bus_address() {
+        use std::ffi::OsStr;
+        use std::process::Command;
+        let mut cmd = Command::new("true");
+        sanitize_gui_env_std(&mut cmd);
+
+        let envs: Vec<(&OsStr, Option<&OsStr>)> = cmd.get_envs().collect();
+
+        let bus_entry = envs
+            .iter()
+            .find(|(k, _)| *k == OsStr::new("DBUS_SESSION_BUS_ADDRESS"))
+            .expect("strict sanitiser must override DBUS_SESSION_BUS_ADDRESS");
+        // The override value documented in `gui_env_overrides()`.
+        assert_eq!(
+            bus_entry.1,
+            Some(OsStr::new("unix:path=/dev/null")),
+        );
     }
 
     #[test]

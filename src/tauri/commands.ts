@@ -364,6 +364,22 @@ export const createPullRequest = (
 export const listPullRequests = (path: string, state: string) =>
   invoke<PullRequestInfo[]>("list_pull_requests", { path, state });
 
+/** Stage 5 — single PR detail (body + first 20 comments) by repo
+ *  path. Cached: 5 min TTL. Path-based so the chat composer can
+ *  call before a workspace exists. */
+export const getGithubPrByPath = (path: string, prNumber: number) =>
+  invoke<PullRequestInfo>("get_github_pr_by_path", { path, prNumber });
+
+/** Stage 5 — PR diff body. `full=false` → `--name-only` (cheap,
+ *  fits in a chip preview); `full=true` → unified diff capped at
+ *  100 KB. Cached separately per (number, full). */
+export const getGithubPrDiffByPath = (
+  path: string,
+  prNumber: number,
+  full: boolean,
+) =>
+  invoke<string>("get_github_pr_diff_by_path", { path, prNumber, full });
+
 export const listIncomingPrs = (path: string, baseBranch: string) =>
   invoke<IncomingPrItem[]>("list_incoming_prs", { path, baseBranch });
 

@@ -4,6 +4,8 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildIssueResolvedContent,
+  buildPrResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
@@ -29,10 +31,20 @@ import {
 } from "@/stores/provider-capabilities-store";
 import {
   activateWorkspace,
+  checkGhStatus,
+  checkGithubRepo,
+  getGithubIssueByPath,
+  getGithubPrByPath,
+  getGithubPrDiffByPath,
   readFileForAttachment,
   readFolderForAttachment,
 } from "@/tauri/commands";
-import type { FileMatch, FolderMatch } from "@/tauri/types";
+import type {
+  FileMatch,
+  FolderMatch,
+  GitHubIssue,
+  PullRequestInfo,
+} from "@/tauri/types";
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
@@ -432,6 +444,166 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     ],
   );
 
+  /** Step 8 Stage 4 — issue counterpart for the draft surface. Same
+   *  loading-then-resolved chip lifecycle as AgentChatPane; targets
+   *  `draft.threadId` so chips survive the materialize handoff. */
+  const handleAttachIssue = useCallback(
+    (summary: GitHubIssue) => {
+      if (!displayCwd) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const initialState = (summary.state.toLowerCase() === "closed"
+        ? "closed"
+        : "open") as "open" | "closed";
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "issue",
+        ref: `#${summary.number}`,
+        metadata: {
+          label: `#${summary.number} ${summary.title}`,
+          state: initialState,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          const detail = await getGithubIssueByPath(displayCwd, summary.number);
+          updateStagedAttachment(draft.threadId, id, {
+            resolvedContent: buildIssueResolvedContent(detail),
+            metadata: {
+              label: `#${detail.number} ${detail.title}`,
+              state: (detail.state.toLowerCase() === "closed"
+                ? "closed"
+                : "open") as "open" | "closed",
+              fetchedAt: Date.now(),
+              isLoading: false,
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(draft.threadId, id, {
+            metadata: {
+              label: `#${summary.number} ${summary.title}`,
+              state: initialState,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [
+      draft.threadId,
+      displayCwd,
+      addStagedAttachment,
+      updateStagedAttachment,
+    ],
+  );
+
+  /** Step 8 Stage 5 — PR counterpart for the draft surface. */
+  const handleAttachPr = useCallback(
+    (summary: PullRequestInfo) => {
+      if (!displayCwd) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const upper = summary.state.toUpperCase();
+      const initialState: "open" | "closed" | "merged" | "draft" =
+        upper === "MERGED"
+          ? "merged"
+          : upper === "CLOSED"
+            ? "closed"
+            : summary.is_draft
+              ? "draft"
+              : "open";
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "pr",
+        ref: `!${summary.number}`,
+        metadata: {
+          label: `#${summary.number} ${summary.title}`,
+          state: initialState,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          const [detail, diff] = await Promise.all([
+            getGithubPrByPath(displayCwd, summary.number),
+            getGithubPrDiffByPath(displayCwd, summary.number, false),
+          ]);
+          const detailUpper = detail.state.toUpperCase();
+          const resolvedState: "open" | "closed" | "merged" | "draft" =
+            detailUpper === "MERGED"
+              ? "merged"
+              : detailUpper === "CLOSED"
+                ? "closed"
+                : detail.is_draft
+                  ? "draft"
+                  : "open";
+          updateStagedAttachment(draft.threadId, id, {
+            resolvedContent: buildPrResolvedContent(detail, diff),
+            metadata: {
+              label: `#${detail.number} ${detail.title}`,
+              state: resolvedState,
+              fetchedAt: Date.now(),
+              isLoading: false,
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(draft.threadId, id, {
+            metadata: {
+              label: `#${summary.number} ${summary.title}`,
+              state: initialState,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [
+      draft.threadId,
+      displayCwd,
+      addStagedAttachment,
+      updateStagedAttachment,
+    ],
+  );
+
+  // Step 8 Stage 4 — preflight GitHub status. Mirrors AgentChatPane.
+  // `null` means "not yet known"; the popup keeps GitHub entries
+  // disabled while the preflight is in flight to avoid a flicker.
+  const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(null);
+  const [ghAuthenticated, setGhAuthenticated] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!displayCwd) {
+      setIsGithubRepo(false);
+      setGhAuthenticated(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [repo, gh] = await Promise.all([
+          checkGithubRepo(displayCwd),
+          checkGhStatus(),
+        ]);
+        if (cancelled) return;
+        setIsGithubRepo(repo);
+        setGhAuthenticated(gh.status === "Authenticated");
+      } catch {
+        if (cancelled) return;
+        setIsGithubRepo(false);
+        setGhAuthenticated(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [displayCwd]);
+
   // The textarea onStop is a no-op during a draft — there's no session
   // to interrupt. The button only shows when streaming=true, which we
   // set only during the in-flight materialise window. Stopping
@@ -619,6 +791,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       }
       onAttachFile={handleAttachFile}
       onAttachFolder={handleAttachFolder}
+      onAttachIssue={handleAttachIssue}
+      onAttachPr={handleAttachPr}
+      isGithubRepo={isGithubRepo}
+      ghAuthenticated={ghAuthenticated}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}

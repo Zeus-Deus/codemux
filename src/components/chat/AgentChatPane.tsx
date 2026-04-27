@@ -12,6 +12,8 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildIssueResolvedContent,
+  buildPrResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
@@ -49,6 +51,11 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  checkGhStatus,
+  checkGithubRepo,
+  getGithubIssueByPath,
+  getGithubPrByPath,
+  getGithubPrDiffByPath,
   grepCountPattern,
   readFileForAttachment,
   readFolderForAttachment,
@@ -59,7 +66,9 @@ import type {
   AgentChatProviderKind,
   FileMatch,
   FolderMatch,
+  GitHubIssue,
   PaneNodeSnapshot,
+  PullRequestInfo,
 } from "@/tauri/types";
 
 import { ChatTranscript } from "./ChatTranscript";
@@ -134,6 +143,42 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     return ws?.cwd ?? null;
   });
   const cwd = pane.cwd ?? fallbackCwd;
+
+  // Step 8 Stage 4 — preflight GitHub status. We check on mount + on
+  // cwd change so a workspace swap doesn't leave the popup acting on
+  // a stale answer. `null` means "not yet known" — the popup keeps
+  // GitHub entries disabled while we wait so the user never sees the
+  // entry flip from enabled to disabled. Errors fall back to `false`
+  // (treat as not-a-github-repo) which gives the user a reachable
+  // disabled-state instead of a crashing popup.
+  const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(null);
+  const [ghAuthenticated, setGhAuthenticated] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (!cwd) {
+      setIsGithubRepo(false);
+      setGhAuthenticated(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [repo, gh] = await Promise.all([
+          checkGithubRepo(cwd),
+          checkGhStatus(),
+        ]);
+        if (cancelled) return;
+        setIsGithubRepo(repo);
+        setGhAuthenticated(gh.status === "Authenticated");
+      } catch {
+        if (cancelled) return;
+        setIsGithubRepo(false);
+        setGhAuthenticated(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [cwd]);
 
   // Stage C race fix: when the pane was just created by
   // `materializeAndSend` → `agent_chat_create_pane`, its `thread_id`
@@ -548,6 +593,136 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           updateStagedAttachment(threadId, id, {
             metadata: {
               label: basename,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [threadId, cwd, addStagedAttachment, updateStagedAttachment],
+  );
+
+  /** Step 8 Stage 4 — issue counterpart. Stages with isLoading=true,
+   *  fires the cached detail fetch, then patches the chip with the
+   *  fully resolved body + metadata (state, fetchedAt). Errors render
+   *  the chip muted with the error string in the tooltip. */
+  const handleAttachIssue = useCallback(
+    (summary: GitHubIssue) => {
+      if (!threadId) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const initialState = (summary.state.toLowerCase() === "closed"
+        ? "closed"
+        : "open") as "open" | "closed";
+      addStagedAttachment(threadId, {
+        id,
+        kind: "issue",
+        ref: `#${summary.number}`,
+        metadata: {
+          label: `#${summary.number} ${summary.title}`,
+          state: initialState,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          // Fall back to the workspace cwd when project_root isn't on
+          // hand; backend `_by_path` accepts either as long as it's a
+          // git checkout the user has gh access to.
+          const repoPath = cwd ?? "";
+          const detail = await getGithubIssueByPath(repoPath, summary.number);
+          updateStagedAttachment(threadId, id, {
+            resolvedContent: buildIssueResolvedContent(detail),
+            metadata: {
+              label: `#${detail.number} ${detail.title}`,
+              state: (detail.state.toLowerCase() === "closed"
+                ? "closed"
+                : "open") as "open" | "closed",
+              fetchedAt: Date.now(),
+              isLoading: false,
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(threadId, id, {
+            metadata: {
+              label: `#${summary.number} ${summary.title}`,
+              state: initialState,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [threadId, cwd, addStagedAttachment, updateStagedAttachment],
+  );
+
+  /** Step 8 Stage 5 — PR counterpart. Fetches detail + name-only
+   *  diff in parallel; resolves the chip with both. The diff is
+   *  capped at 100 KB on the Rust side so the prompt budget stays
+   *  bounded even for monorepo migrations. */
+  const handleAttachPr = useCallback(
+    (summary: PullRequestInfo) => {
+      if (!threadId) return;
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const upper = summary.state.toUpperCase();
+      const initialState: "open" | "closed" | "merged" | "draft" =
+        upper === "MERGED"
+          ? "merged"
+          : upper === "CLOSED"
+            ? "closed"
+            : summary.is_draft
+              ? "draft"
+              : "open";
+      addStagedAttachment(threadId, {
+        id,
+        kind: "pr",
+        ref: `!${summary.number}`,
+        metadata: {
+          label: `#${summary.number} ${summary.title}`,
+          state: initialState,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          const repoPath = cwd ?? "";
+          // Detail + name-only diff fetched concurrently — both are
+          // path-cached separately so a re-pick of the same PR
+          // returns from cache after the first call.
+          const [detail, diff] = await Promise.all([
+            getGithubPrByPath(repoPath, summary.number),
+            getGithubPrDiffByPath(repoPath, summary.number, false),
+          ]);
+          const detailUpper = detail.state.toUpperCase();
+          const resolvedState: "open" | "closed" | "merged" | "draft" =
+            detailUpper === "MERGED"
+              ? "merged"
+              : detailUpper === "CLOSED"
+                ? "closed"
+                : detail.is_draft
+                  ? "draft"
+                  : "open";
+          updateStagedAttachment(threadId, id, {
+            resolvedContent: buildPrResolvedContent(detail, diff),
+            metadata: {
+              label: `#${detail.number} ${detail.title}`,
+              state: resolvedState,
+              fetchedAt: Date.now(),
+              isLoading: false,
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(threadId, id, {
+            metadata: {
+              label: `#${summary.number} ${summary.title}`,
+              state: initialState,
               isLoading: false,
               error: String(err),
             },
@@ -1245,6 +1420,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }}
       onAttachFile={handleAttachFile}
       onAttachFolder={handleAttachFolder}
+      onAttachIssue={handleAttachIssue}
+      onAttachPr={handleAttachPr}
+      isGithubRepo={isGithubRepo}
+      ghAuthenticated={ghAuthenticated}
       onDraftChange={(next) => {
         if (!threadId) return;
         setInputDraft(threadId, next);

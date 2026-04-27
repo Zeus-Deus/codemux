@@ -47,20 +47,26 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
   },
 };
 
-/** Closed/merged issues + PRs render with a muted neutral instead of
- *  their open-state accent. Keeps the chip strip from feeling like a
- *  status billboard when half the attachments are closed. */
+/** State-aware tint resolution. Open issues + open non-draft PRs use
+ *  their accent; everything else (closed, merged, draft) gets a
+ *  muted treatment so the chip strip doesn't look like a status
+ *  billboard. Merged PRs get a one-off purple fallback so a merged
+ *  ref is still visually distinct from a closed/draft one — matches
+ *  the picker's GitMerge tint. */
 function classNameForAttachment(attachment: Attachment): string {
-  const base = KIND_CONFIG[attachment.kind].className;
   const state = attachment.metadata.state;
-  if (
-    (attachment.kind === "issue" || attachment.kind === "pr") &&
-    state &&
-    state !== "open"
-  ) {
+  if (attachment.kind === "issue" && state === "closed") {
     return "bg-foreground/10 text-muted-foreground";
   }
-  return base;
+  if (attachment.kind === "pr") {
+    if (state === "merged") {
+      return "bg-chart-4/15 text-chart-4";
+    }
+    if (state === "closed" || state === "draft") {
+      return "bg-foreground/10 text-muted-foreground";
+    }
+  }
+  return KIND_CONFIG[attachment.kind].className;
 }
 
 interface AttachmentChipProps {

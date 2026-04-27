@@ -1,4 +1,4 @@
-use crate::execution::sanitize_gui_env_std;
+use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Command;
@@ -28,6 +28,24 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
+    /// Stage 5 — populated by `get_pull_request` only; list paths
+    /// leave it `None` so a list query stays cheap. Body is truncated
+    /// to 50 KB at a char boundary, mirroring the issue path.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Stage 5 — first `MAX_ISSUE_COMMENTS` PR conversation comments
+    /// (review threads ship via the existing `get_pr_review_comments`
+    /// path). Reusing `IssueComment` because the gh JSON shape is
+    /// identical: `{author: {login}, body, createdAt}`.
+    #[serde(default)]
+    pub comments: Vec<IssueComment>,
+    /// Total comment count on the PR — equal to `comments.len()`
+    /// when under the cap, greater when truncated.
+    #[serde(default, rename = "totalComments")]
+    pub total_comments: u32,
+    /// Author login. Useful for chip tooltips + injection header.
+    #[serde(default)]
+    pub author: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +131,14 @@ pub fn check_gh_status() -> GhStatus {
 
     let mut cmd = Command::new("gh");
     cmd.args(["auth", "status"]);
-    sanitize_gui_env_std(&mut cmd);
+    // `gh` stores its token in the user's secret-service keyring on
+    // Linux desktops (gnome-keyring / kwallet / keepassxc-secret).
+    // Reading the token requires DBus session-bus access, so this
+    // call must use the keep-dbus variant — the default sanitiser
+    // overrides DBUS_SESSION_BUS_ADDRESS=/dev/null and would make
+    // every `gh auth status` look NotAuthenticated even after a
+    // successful `gh auth login`.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
     let output = cmd.output();
 
     let Ok(output) = output else {
@@ -142,7 +167,10 @@ pub fn check_gh_status() -> GhStatus {
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(args).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
+    // Keep DBus available so the secret-service keyring round-trip
+    // works — every gh subcommand pulls the auth token before
+    // hitting the API. See `check_gh_status` for the full rationale.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
     let output = cmd
         .output()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
@@ -168,7 +196,8 @@ fn run_gh_json(repo_path: &Path, args: &[&str]) -> Result<serde_json::Value, Str
 fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
     let mut cmd = Command::new("gh");
     cmd.args(args).current_dir(repo_path);
-    sanitize_gui_env_std(&mut cmd);
+    // Keep DBus available — see `check_gh_status` rationale.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
     cmd.output()
         .ok()
         .filter(|o| o.status.success())
@@ -185,7 +214,48 @@ pub fn gh_available() -> bool {
 }
 
 pub fn is_github_repo(repo_path: &Path) -> bool {
-    run_gh_optional(repo_path, &["repo", "view", "--json", "url"]).is_some()
+    // Pure-git check: does any remote URL point at github.com?
+    //
+    // We deliberately do NOT shell out to `gh repo view` here — that
+    // command requires `gh` to be installed AND authenticated, so a
+    // user with a perfectly valid GitHub remote but no `gh auth login`
+    // would otherwise see the preflight return `false` and the popup
+    // surface "Not a GitHub repo" copy. Auth state is a separate
+    // signal, surfaced via `check_gh_status()`; the UI disambiguates
+    // the two failure modes (not a github repo vs. needs auth).
+    let mut cmd = Command::new("git");
+    cmd.args(["remote", "-v"]).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    let Ok(output) = cmd.output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    remote_text_points_at_github(&text)
+}
+
+/// Pure helper so we can unit-test the URL-matching logic without
+/// spinning up a real git repo on disk. Accepts the raw stdout from
+/// `git remote -v` and returns true when any remote URL is hosted on
+/// github.com — both SSH (`git@github.com:…`) and HTTPS
+/// (`https://github.com/…`) forms count, in either fetch or push rows.
+/// We match the bare hostname rather than a full URL prefix so a stray
+/// remote-name containing "github.com" can't false-positive (the
+/// hostname always sits between protocol and path).
+pub(crate) fn remote_text_points_at_github(text: &str) -> bool {
+    text.lines().any(|line| {
+        // `git remote -v` rows look like:
+        //   origin\tgit@github.com:user/repo.git (fetch)
+        //   origin\thttps://github.com/user/repo (fetch)
+        // The URL is the second whitespace-delimited token.
+        let url = match line.split_whitespace().nth(1) {
+            Some(u) => u,
+            None => return false,
+        };
+        url.contains("github.com:") || url.contains("github.com/")
+    })
 }
 
 // ── GitHub Issues ──
@@ -214,6 +284,14 @@ impl std::fmt::Display for IssueState {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IssueComment {
+    pub author: String,
+    pub body: String,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GitHubIssue {
     pub number: u64,
@@ -226,6 +304,18 @@ pub struct GitHubIssue {
     pub url: String,
     #[serde(default)]
     pub body: Option<String>,
+    /// Stage 4 — populated by `get_github_issue` (detail fetch only;
+    /// `list_github_issues` leaves it empty). Capped at the first
+    /// `MAX_ISSUE_COMMENTS` items.
+    #[serde(default)]
+    pub comments: Vec<IssueComment>,
+    /// Total comment count on the issue. Equal to `comments.len()` when
+    /// the issue has fewer than `MAX_ISSUE_COMMENTS` comments; greater
+    /// when truncated.
+    #[serde(default, rename = "totalComments")]
+    pub total_comments: u32,
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<String>,
 }
 
 /// Cached display data for a workspace's linked issue.
@@ -240,6 +330,10 @@ pub struct LinkedIssue {
 
 const MAX_ISSUE_BODY_BYTES: usize = 50 * 1024; // 50 KB
 const ISSUE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Stage 4 — cap the comment list shipped to the agent so a long
+/// thread can't blow out the prompt. The full count is preserved in
+/// `total_comments` so the agent can still see "20 of 250 shown".
+pub const MAX_ISSUE_COMMENTS: usize = 20;
 
 /// Run `gh` with a timeout. Returns Err if the process doesn't finish in time.
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
@@ -248,7 +342,10 @@ fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<St
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    sanitize_gui_env_std(&mut cmd);
+    // Keep DBus available — issue list/view both pull the auth
+    // token from the user's secret-service keyring on Linux. See
+    // `check_gh_status` rationale.
+    sanitize_gui_env_std_keep_dbus(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to run gh: {e}"))?;
@@ -303,7 +400,7 @@ pub fn list_github_issues(
         GhStatus::Authenticated { .. } => {}
     }
 
-    let json_fields = "number,title,state,labels,assignees,url";
+    let json_fields = "number,title,state,labels,assignees,url,updatedAt";
 
     let output = if let Some(query) = search {
         run_gh_timed(
@@ -345,13 +442,20 @@ pub fn get_github_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, St
     if !gh_available() {
         return Err("gh CLI is not installed".into());
     }
+    match check_gh_status() {
+        GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
+        GhStatus::NotAuthenticated => {
+            return Err("gh CLI is not authenticated. Run: gh auth login".into())
+        }
+        GhStatus::Authenticated { .. } => {}
+    }
 
     let number_str = number.to_string();
     let output = run_gh_timed(
         repo_path,
         &[
             "issue", "view", &number_str,
-            "--json", "number,title,state,labels,assignees,url,body",
+            "--json", "number,title,state,labels,assignees,url,body,comments,updatedAt",
         ],
         ISSUE_FETCH_TIMEOUT,
     )?;
@@ -375,7 +479,35 @@ pub fn get_github_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, St
         issue.body = Some(truncated);
     }
 
+    // Populate comments. `gh issue view --json comments` emits the
+    // full thread; we cap at MAX_ISSUE_COMMENTS in the prompt-bound
+    // payload but preserve the true total in `total_comments` so the
+    // agent can see "showing 20 of 132".
+    let (comments, total) = parse_issue_comments(&v["comments"]);
+    issue.comments = comments;
+    issue.total_comments = total;
+
     Ok(issue)
+}
+
+/// Extract `IssueComment` entries from `gh`'s `--json comments` output.
+/// Returns (truncated comments slice, total count). Pure function so
+/// tests can hit it directly.
+fn parse_issue_comments(v: &serde_json::Value) -> (Vec<IssueComment>, u32) {
+    let Some(arr) = v.as_array() else {
+        return (Vec::new(), 0);
+    };
+    let total = arr.len() as u32;
+    let comments = arr
+        .iter()
+        .take(MAX_ISSUE_COMMENTS)
+        .map(|c| IssueComment {
+            author: c["author"]["login"].as_str().unwrap_or("").to_string(),
+            body: c["body"].as_str().unwrap_or("").to_string(),
+            created_at: c["createdAt"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+    (comments, total)
 }
 
 fn parse_issue_json(v: &serde_json::Value) -> GitHubIssue {
@@ -405,6 +537,9 @@ fn parse_issue_json(v: &serde_json::Value) -> GitHubIssue {
         assignees,
         url: v["url"].as_str().unwrap_or("").to_string(),
         body: None,
+        comments: Vec::new(),
+        total_comments: 0,
+        updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
     }
 }
 
@@ -452,6 +587,108 @@ pub fn suggest_branch_name(number: u64, title: &str) -> String {
     format!("feature/{number}-{title_slug}")
 }
 
+/// Fetch a single PR by number with body + first 20 conversation
+/// comments — Stage 5 detail path. Mirrors `get_github_issue`'s
+/// shape so the chat composer can reuse the same loading-then-resolve
+/// chip lifecycle. Body truncates at 50 KB on a char boundary.
+pub fn get_pull_request(repo_path: &Path, number: u32) -> Result<PullRequestInfo, String> {
+    if !gh_available() {
+        return Err("gh CLI is not installed".into());
+    }
+    match check_gh_status() {
+        GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
+        GhStatus::NotAuthenticated => {
+            return Err("gh CLI is not authenticated. Run: gh auth login".into())
+        }
+        GhStatus::Authenticated { .. } => {}
+    }
+
+    let number_str = number.to_string();
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr", "view", &number_str,
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,author,body,comments",
+        ],
+        ISSUE_FETCH_TIMEOUT,
+    )?;
+
+    let v: serde_json::Value = serde_json::from_str(&output)
+        .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+
+    let mut pr = parse_pr_json(&v);
+
+    if let Some(body) = v["body"].as_str() {
+        let truncated = if body.len() > MAX_ISSUE_BODY_BYTES {
+            let mut end = MAX_ISSUE_BODY_BYTES;
+            while end > 0 && !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…\n\n[Body truncated at 50KB]", &body[..end])
+        } else {
+            body.to_string()
+        };
+        pr.body = Some(truncated);
+    }
+
+    let (comments, total) = parse_issue_comments(&v["comments"]);
+    pr.comments = comments;
+    pr.total_comments = total;
+
+    Ok(pr)
+}
+
+/// Cap on the diff size we fetch in full mode. Anything bigger gets
+/// truncated to a head-anchored prefix with a "[diff truncated at
+/// 100KB]" trailer; the agent can still read the full diff via the
+/// suggested gh command. Chosen large enough that small/medium PRs
+/// always come through whole, small enough that a 5MB monorepo
+/// migration doesn't blow out the prompt.
+pub const MAX_PR_DIFF_BYTES: usize = 100 * 1024;
+
+/// Fetch the diff for a PR — `--name-only` by default (cheap, fits
+/// in a single chip preview), full unified diff when `full=true`.
+/// Truncates the full-diff variant at `MAX_PR_DIFF_BYTES` on a char
+/// boundary so the prompt stays bounded.
+pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, String> {
+    if !gh_available() {
+        return Err("gh CLI is not installed".into());
+    }
+    match check_gh_status() {
+        GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
+        GhStatus::NotAuthenticated => {
+            return Err("gh CLI is not authenticated. Run: gh auth login".into())
+        }
+        GhStatus::Authenticated { .. } => {}
+    }
+
+    let number_str = number.to_string();
+    let mut args: Vec<&str> = vec!["pr", "diff", &number_str];
+    if !full {
+        args.push("--name-only");
+    }
+    let output = run_gh_timed(repo_path, &args, ISSUE_FETCH_TIMEOUT)?;
+
+    if !full || output.len() <= MAX_PR_DIFF_BYTES {
+        return Ok(output);
+    }
+
+    // Full diff exceeded the cap — truncate at a char boundary and
+    // signpost what was cut so the agent doesn't silently miss
+    // hunks. The trailing pointer mirrors `get_github_issue`'s
+    // truncation marker.
+    let mut end = MAX_PR_DIFF_BYTES;
+    while end > 0 && !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(format!(
+        "{}\n\n[Diff truncated at {}KB — use `gh pr diff {}` for the full patch]",
+        &output[..end],
+        MAX_PR_DIFF_BYTES / 1024,
+        number,
+    ))
+}
+
 pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
     let output = run_gh_optional(
         repo_path,
@@ -496,13 +733,24 @@ pub fn list_pull_requests(
     repo_path: &Path,
     state: &str,
 ) -> Result<Vec<PullRequestInfo>, String> {
+    if !gh_available() {
+        return Err("gh CLI is not installed".into());
+    }
+    match check_gh_status() {
+        GhStatus::NotInstalled => return Err("gh CLI is not installed".into()),
+        GhStatus::NotAuthenticated => {
+            return Err("gh CLI is not authenticated. Run: gh auth login".into())
+        }
+        GhStatus::Authenticated { .. } => {}
+    }
+
     let v = run_gh_json(
         repo_path,
         &[
             "pr", "list",
             "--state", state,
-            "--limit", "30",
-            "--json", "number,url,state,title,headRefName,isDraft",
+            "--limit", "50",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,updatedAt,author",
         ],
     )?;
 
@@ -748,6 +996,14 @@ pub fn get_pr_deployments(
 }
 
 fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
+    // `author` may live at top level (`gh pr view --json author`) as
+    // `{login: …}` or be omitted entirely on list rows that didn't
+    // ask for it. Treat both as None-yielding.
+    let author = v["author"]["login"]
+        .as_str()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty());
+
     PullRequestInfo {
         number: v["number"].as_u64().unwrap_or(0) as u32,
         url: v["url"].as_str().unwrap_or("").to_string(),
@@ -762,6 +1018,12 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
         review_decision: v["reviewDecision"].as_str().map(|s| s.to_string()),
         checks_passing: None, // populated separately via get_pr_checks
         updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+        // Detail-only fields. List paths leave these None / empty so
+        // the cheap query stays cheap.
+        body: None,
+        comments: Vec::new(),
+        total_comments: 0,
+        author,
     }
 }
 
@@ -832,6 +1094,75 @@ mod tests {
         assert_eq!(pr.head_branch.as_deref(), Some("feature/auth"));
         assert_eq!(pr.additions, Some(150));
         assert_eq!(pr.review_decision.as_deref(), Some("APPROVED"));
+    }
+
+    #[test]
+    fn test_parse_pr_info_carries_author_when_present() {
+        // Stage 5 — `gh pr view --json author` emits `author.login`;
+        // the parser must thread it through so the chip header /
+        // tooltip can show "by alice".
+        let json = serde_json::json!({
+            "number": 7,
+            "url": "https://github.com/u/r/pull/7",
+            "state": "OPEN",
+            "title": "Tweak",
+            "author": {"login": "alice"},
+        });
+        let pr = parse_pr_json(&json);
+        assert_eq!(pr.author.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn test_parse_pr_info_treats_empty_author_login_as_none() {
+        // Edge: gh JSON sometimes emits `{"author": {"login": ""}}`
+        // for ghost users / deleted accounts. Empty string → None
+        // so the chip doesn't render "by " with an empty trailer.
+        let json = serde_json::json!({
+            "number": 1,
+            "url": "https://example",
+            "state": "OPEN",
+            "title": "T",
+            "author": {"login": ""},
+        });
+        let pr = parse_pr_json(&json);
+        assert!(pr.author.is_none());
+    }
+
+    #[test]
+    fn test_pr_detail_serialization_round_trip() {
+        // The Stage 5 detail fields must serialize with the
+        // camelCase shape the TS layer expects (`totalComments`).
+        let pr = PullRequestInfo {
+            number: 42,
+            url: "https://github.com/u/r/pull/42".into(),
+            state: "OPEN".into(),
+            title: "Add dark mode".into(),
+            head_branch: Some("feat/dark".into()),
+            base_branch: Some("main".into()),
+            is_draft: false,
+            mergeable: Some("MERGEABLE".into()),
+            additions: Some(100),
+            deletions: Some(5),
+            review_decision: Some("APPROVED".into()),
+            checks_passing: None,
+            updated_at: Some("2026-04-27T00:00:00Z".into()),
+            body: Some("PR body here".into()),
+            comments: vec![IssueComment {
+                author: "alice".into(),
+                body: "ship it".into(),
+                created_at: "2026-04-27T01:00:00Z".into(),
+            }],
+            total_comments: 1,
+            author: Some("zeus".into()),
+        };
+        let json = serde_json::to_string(&pr).unwrap();
+        assert!(json.contains("\"totalComments\":1"));
+        assert!(json.contains("\"createdAt\":"));
+        let back: PullRequestInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.body.as_deref(), Some("PR body here"));
+        assert_eq!(back.comments.len(), 1);
+        assert_eq!(back.total_comments, 1);
+        assert_eq!(back.author.as_deref(), Some("zeus"));
     }
 
     #[test]
@@ -1028,6 +1359,9 @@ mod tests {
             assignees: vec!["user1".into()],
             url: "https://github.com/u/r/issues/42".into(),
             body: Some("Issue body".into()),
+            comments: Vec::new(),
+            total_comments: 0,
+            updated_at: None,
         };
         let json = serde_json::to_string(&issue).unwrap();
         let deserialized: GitHubIssue = serde_json::from_str(&json).unwrap();
@@ -1162,6 +1496,161 @@ mod tests {
         let linked: LinkedIssue = serde_json::from_str(json).unwrap();
         assert_eq!(linked.number, 1);
         assert!(linked.labels.is_empty()); // default empty vec
+    }
+
+    #[test]
+    fn remote_text_points_at_github_ssh_form() {
+        let stdout = "\
+origin\tgit@github.com:user/repo.git (fetch)
+origin\tgit@github.com:user/repo.git (push)
+";
+        assert!(remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_https_form() {
+        let stdout = "\
+origin\thttps://github.com/user/repo (fetch)
+origin\thttps://github.com/user/repo.git (push)
+";
+        assert!(remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_mixed_remotes() {
+        // User has both an upstream (gitlab) and a fork (github). The
+        // GitHub remote alone is enough — the function only cares
+        // whether ANY remote points at github.com.
+        let stdout = "\
+upstream\thttps://gitlab.com/orig/repo (fetch)
+upstream\thttps://gitlab.com/orig/repo (push)
+fork\tgit@github.com:user/repo.git (fetch)
+fork\tgit@github.com:user/repo.git (push)
+";
+        assert!(remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_returns_false_for_non_github_remotes() {
+        let stdout = "\
+origin\tgit@gitlab.com:user/repo.git (fetch)
+origin\thttps://bitbucket.org/user/repo (push)
+";
+        assert!(!remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_returns_false_for_empty_input() {
+        assert!(!remote_text_points_at_github(""));
+        assert!(!remote_text_points_at_github("\n\n"));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_ignores_remote_names_that_contain_github() {
+        // Regression: a user could theoretically name a non-GitHub
+        // remote `github-old`. The match must look at the URL
+        // (second token), not the remote-name (first token).
+        let stdout = "\
+github-old\tgit@gitlab.com:user/repo.git (fetch)
+github-old\tgit@gitlab.com:user/repo.git (push)
+";
+        assert!(!remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn remote_text_points_at_github_handles_enterprise_lookalikes() {
+        // GHE on a custom hostname (e.g., `github.acme.internal`)
+        // looks like a github URL but isn't github.com — it's a
+        // separate product. We match the bare `github.com` host so
+        // GHE doesn't false-positive. Users on GHE can still attach
+        // issues via direct number entry; the popup hint is just
+        // informational.
+        let stdout = "\
+origin\thttps://github.acme.internal/user/repo (fetch)
+origin\thttps://github.acme.internal/user/repo (push)
+";
+        assert!(!remote_text_points_at_github(stdout));
+    }
+
+    #[test]
+    fn test_parse_issue_comments_basic() {
+        let v: serde_json::Value = serde_json::from_str(r#"[
+            {"author": {"login": "alice"}, "body": "first", "createdAt": "2026-01-01T00:00:00Z"},
+            {"author": {"login": "bob"}, "body": "second", "createdAt": "2026-01-02T00:00:00Z"}
+        ]"#).unwrap();
+        let (comments, total) = parse_issue_comments(&v);
+        assert_eq!(total, 2);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].author, "alice");
+        assert_eq!(comments[0].body, "first");
+        assert_eq!(comments[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(comments[1].author, "bob");
+    }
+
+    #[test]
+    fn test_parse_issue_comments_truncates_at_max() {
+        // Build 25 comments — total should be 25, returned slice 20.
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+        for i in 0..25 {
+            entries.push(serde_json::json!({
+                "author": {"login": format!("u{i}")},
+                "body": format!("c{i}"),
+                "createdAt": "2026-01-01T00:00:00Z"
+            }));
+        }
+        let v = serde_json::Value::Array(entries);
+        let (comments, total) = parse_issue_comments(&v);
+        assert_eq!(total, 25);
+        assert_eq!(comments.len(), MAX_ISSUE_COMMENTS);
+        assert_eq!(comments[0].author, "u0");
+        assert_eq!(comments[19].author, "u19");
+    }
+
+    #[test]
+    fn test_parse_issue_comments_empty_or_missing() {
+        let v = serde_json::Value::Null;
+        let (comments, total) = parse_issue_comments(&v);
+        assert!(comments.is_empty());
+        assert_eq!(total, 0);
+
+        let v = serde_json::json!([]);
+        let (comments, total) = parse_issue_comments(&v);
+        assert!(comments.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_parse_issue_json_with_updated_at() {
+        let json = r#"{
+            "number": 5,
+            "title": "Test",
+            "state": "OPEN",
+            "url": "https://github.com/u/r/issues/5",
+            "labels": [],
+            "assignees": [],
+            "updatedAt": "2026-04-01T12:00:00Z"
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let issue = parse_issue_json(&v);
+        assert_eq!(issue.updated_at.as_deref(), Some("2026-04-01T12:00:00Z"));
+        assert!(issue.comments.is_empty());
+        assert_eq!(issue.total_comments, 0);
+    }
+
+    #[test]
+    fn test_issue_comment_serializes_with_camelcase_created_at() {
+        let comment = IssueComment {
+            author: "alice".into(),
+            body: "hello".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let json = serde_json::to_string(&comment).unwrap();
+        // Must be camelCase to match the TS type.
+        assert!(json.contains("\"createdAt\""));
+        assert!(!json.contains("\"created_at\""));
+        // And round-trips back.
+        let parsed: IssueComment = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, comment);
     }
 
     #[test]

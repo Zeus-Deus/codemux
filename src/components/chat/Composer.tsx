@@ -1,9 +1,13 @@
 import {
   Bug,
+  CircleCheck,
   CircleDot,
   File as FileIcon,
   FolderOpen,
+  GitMerge,
   GitPullRequest,
+  GitPullRequestClosed,
+  GitPullRequestDraft,
   Image as ImageIcon,
   ListTodo,
   MessageCircleQuestion,
@@ -19,6 +23,7 @@ import {
   findMentionAtCursor,
   findSlashAtCursor,
   nextModeInCycle,
+  parseMentionQuery,
   type MentionAnchor,
   type SlashAnchor,
   type SlashCommandItem,
@@ -28,13 +33,24 @@ import {
   selectActiveSkills,
   useSkillsStore,
 } from "@/stores/skills-store";
-import { listProjectFiles, listProjectFolders } from "@/tauri/commands";
+import {
+  getGithubIssueByPath,
+  getGithubPrByPath,
+  listGithubIssuesByPath,
+  listProjectFiles,
+  listProjectFolders,
+  listPullRequests,
+} from "@/tauri/commands";
+import { IssuePickerPanel } from "@/components/github/issue-picker";
+import { PrPickerPanel } from "@/components/github/pr-picker";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
   FileMatch,
   FolderMatch,
+  GitHubIssue,
   PermissionModeOption,
+  PullRequestInfo,
 } from "@/tauri/types";
 
 import { AttachmentChip } from "./AttachmentChip";
@@ -45,6 +61,8 @@ import { SlashCommandPopup } from "./SlashCommandPopup";
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
 const EMPTY_FOLDER_MATCHES: FolderMatch[] = [];
+const EMPTY_ISSUE_MATCHES: GitHubIssue[] = [];
+const EMPTY_PR_MATCHES: PullRequestInfo[] = [];
 /** Step 8 Stage 2 — debounce window for `listProjectFiles` so fast
  *  typing doesn't flood the backend during the popup's open lifetime. */
 const MENTION_FETCH_DEBOUNCE_MS = 100;
@@ -57,10 +75,12 @@ const MENTION_FETCH_LIMIT = 20;
  *  cap with room to scroll. */
 const ATTACH_BROWSE_LIMIT = 30;
 
-/** Three views the `+` popup can show. `main` lists categories +
- *  navigation nudges; `file` and `folder` list browsable rows that
- *  insert an inline `@<basename>` token on pick. */
-type AttachSubmode = "main" | "file" | "folder";
+/** Views the `+` popup can show. `main` lists categories +
+ *  navigation nudges; `file` / `folder` list browsable rows that
+ *  insert an inline `@<basename>` token on pick; `issue` and `pr`
+ *  swap the row pipeline for a dedicated picker panel that owns
+ *  search + state colours. */
+type AttachSubmode = "main" | "file" | "folder" | "issue" | "pr";
 
 interface Props {
   draft: string;
@@ -110,6 +130,31 @@ interface Props {
   /** Step 8 Stage 3 — invoked when the user picks a folder from the
    *  `+ → Folder…` browser. Mirrors `onAttachFile` for folders. */
   onAttachFolder?: (match: FolderMatch) => void;
+  /** Step 8 Stage 4 — invoked when the user picks an issue from the
+   *  `+ → GitHub Issue…` browser OR an `@issue:` mention. The Composer
+   *  has already inserted the inline `@#<number>` token; the parent
+   *  stages the chip + drives the detail fetch. */
+  onAttachIssue?: (issue: GitHubIssue) => void;
+  /** Step 8 Stage 5 — invoked when the user picks a PR from the
+   *  `+ → GitHub PR…` browser OR an `@pr:` mention. The Composer
+   *  has already inserted the inline `@!<number>` token; the parent
+   *  stages the chip + drives the detail + diff fetch. */
+  onAttachPr?: (pr: PullRequestInfo) => void;
+  /** Step 8 Stage 4 — preflight result for `is_github_repo` on `cwd`.
+   *  Drives:
+   *   - `attach:issue` / `attach:pr` enable state in the `+` popup,
+   *   - whether `@issue:` autocomplete fetches at all.
+   *  `null` means "not yet known"; the parent runs the preflight on
+   *  mount and patches this in. While `null`, the popup keeps the
+   *  GitHub entries disabled so a slow preflight can't flash an
+   *  enabled-then-disabled affordance. */
+  isGithubRepo?: boolean | null;
+  /** Step 8 Stage 4 — when the user is in a GitHub repo but `gh` is
+   *  not authenticated, the popup footer surfaces the auth-recovery
+   *  hint. `null` (or true) means we have a usable `gh`; `false` means
+   *  the user needs to run `gh auth login` before the GitHub kinds
+   *  will work. */
+  ghAuthenticated?: boolean | null;
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
@@ -147,6 +192,10 @@ export function Composer({
   onRemoveAttachment,
   onAttachFile,
   onAttachFolder,
+  onAttachIssue,
+  onAttachPr,
+  isGithubRepo = null,
+  ghAuthenticated = null,
   onDraftChange,
   onSubmit,
   onStop,
@@ -193,8 +242,26 @@ export function Composer({
     null,
   );
   const [fileMatches, setFileMatches] = useState<FileMatch[]>(EMPTY_FILE_MATCHES);
+  /** Step 8 Stage 4 — `@issue:` mode. The mention popup decodes the
+   *  category prefix on every keystroke; when it lands on `issue`
+   *  these matches drive the popup rows instead of `fileMatches`. */
+  const [mentionIssueMatches, setMentionIssueMatches] = useState<GitHubIssue[]>(
+    EMPTY_ISSUE_MATCHES,
+  );
+  /** Stage 5 — `@pr:` mention popup. Mirrors the issue match state;
+   *  numeric direct-fetch produces a single-row result. */
+  const [mentionPrMatches, setMentionPrMatches] = useState<PullRequestInfo[]>(
+    EMPTY_PR_MATCHES,
+  );
   const mentionOpen = mentionAnchor !== null;
   const mentionQuery = mentionAnchor?.query ?? "";
+  /** Decode the category prefix once per render so popup item
+   *  derivation, fetch effects, and the keyboard handler all share
+   *  the same view of "what is this query asking for". */
+  const parsedMention = useMemo(
+    () => parseMentionQuery(mentionQuery),
+    [mentionQuery],
+  );
 
   // ─── Attach (+) popup state — Step 8 Stage 3 ─────────────────────
   // Triggered by the `+` button in the footer (button-anchored, not
@@ -212,6 +279,9 @@ export function Composer({
   const [attachFolderMatches, setAttachFolderMatches] = useState<FolderMatch[]>(
     EMPTY_FOLDER_MATCHES,
   );
+  // (issue submode renders <IssuePickerPanel /> directly, which
+  // owns its own list + loading + error state — no flat-row state
+  // needed at the Composer level.)
 
   const modeCommands = useMemo(
     () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
@@ -308,14 +378,18 @@ export function Composer({
   // collapsing burst typing to a single backend roundtrip. When `cwd`
   // is null (Home draft, no project anchored), don't fetch — the
   // footer note tells the user to anchor a project first.
+  // Stage 4 — only fires for the default `file` category. Issue/PR
+  // categories route to their own fetch effects so they don't fight
+  // over `fileMatches`.
   useEffect(() => {
     if (!mentionOpen) return;
+    if (parsedMention.category !== "file") return;
     if (!cwd) {
       setFileMatches(EMPTY_FILE_MATCHES);
       return;
     }
     let cancelled = false;
-    const trimmed = mentionQuery.trim();
+    const trimmed = parsedMention.filter.trim();
     const timer = setTimeout(async () => {
       try {
         const matches = await listProjectFiles(
@@ -335,7 +409,111 @@ export function Composer({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [mentionOpen, mentionQuery, cwd]);
+  }, [mentionOpen, parsedMention.category, parsedMention.filter, cwd]);
+
+  // ─── Mention popup: `@issue:<query>` fetch ───────────────────────
+  // Decoupled from the file fetch so we can branch on numeric query
+  // (direct fetch by number) vs text (gh search). Same 100ms debounce
+  // collapse so fast typing doesn't flood gh; cancellation flag
+  // prevents stale roundtrips from clobbering newer ones.
+  useEffect(() => {
+    if (!mentionOpen) return;
+    if (parsedMention.category !== "issue") return;
+    if (!cwd || isGithubRepo === false) {
+      setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
+      return;
+    }
+    if (ghAuthenticated === false) {
+      setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
+      return;
+    }
+    let cancelled = false;
+    const filter = parsedMention.filter.trim();
+    const timer = setTimeout(async () => {
+      try {
+        // Numeric filter → direct single-issue fetch. We surface the
+        // result as a one-row popup so the user can confirm before
+        // attaching, even when the issue isn't in the open list.
+        if (/^\d+$/.test(filter)) {
+          const num = Number.parseInt(filter, 10);
+          const issue = await getGithubIssueByPath(cwd, num);
+          if (!cancelled) setMentionIssueMatches([issue]);
+          return;
+        }
+        const matches = await listGithubIssuesByPath(
+          cwd,
+          filter.length > 0 ? filter : undefined,
+        );
+        if (!cancelled) setMentionIssueMatches(matches);
+      } catch {
+        if (!cancelled) setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
+      }
+    }, MENTION_FETCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    mentionOpen,
+    parsedMention.category,
+    parsedMention.filter,
+    cwd,
+    isGithubRepo,
+    ghAuthenticated,
+  ]);
+
+  // ─── Mention popup: `@pr:<query>` fetch ──────────────────────────
+  // Stage 5 mirror of the issue branch. Numeric → direct PR fetch;
+  // text → fuzzy filter against the open-PR list (gh `pr list`
+  // doesn't have a `--search` flag, so server-side text search isn't
+  // available — the local filter on titles is the best we can do).
+  useEffect(() => {
+    if (!mentionOpen) return;
+    if (parsedMention.category !== "pr") return;
+    if (!cwd || isGithubRepo === false) {
+      setMentionPrMatches(EMPTY_PR_MATCHES);
+      return;
+    }
+    if (ghAuthenticated === false) {
+      setMentionPrMatches(EMPTY_PR_MATCHES);
+      return;
+    }
+    let cancelled = false;
+    const filter = parsedMention.filter.trim();
+    const timer = setTimeout(async () => {
+      try {
+        if (/^\d+$/.test(filter)) {
+          const num = Number.parseInt(filter, 10);
+          const pr = await getGithubPrByPath(cwd, num);
+          if (!cancelled) setMentionPrMatches([pr]);
+          return;
+        }
+        const list = await listPullRequests(cwd, "open");
+        const filtered =
+          filter.length === 0
+            ? list
+            : list.filter(
+                (p) =>
+                  p.title.toLowerCase().includes(filter.toLowerCase()) ||
+                  String(p.number).includes(filter),
+              );
+        if (!cancelled) setMentionPrMatches(filtered);
+      } catch {
+        if (!cancelled) setMentionPrMatches(EMPTY_PR_MATCHES);
+      }
+    }, MENTION_FETCH_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    mentionOpen,
+    parsedMention.category,
+    parsedMention.filter,
+    cwd,
+    isGithubRepo,
+    ghAuthenticated,
+  ]);
 
   const closeSlash = () => {
     setSlashAnchor(null);
@@ -346,6 +524,8 @@ export function Composer({
     setMentionAnchor(null);
     setMentionHighlighted(null);
     setFileMatches(EMPTY_FILE_MATCHES);
+    setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
+    setMentionPrMatches(EMPTY_PR_MATCHES);
   }, []);
 
   const closeAttachPopup = useCallback(() => {
@@ -417,12 +597,15 @@ export function Composer({
     closeMention,
   ]);
 
-  // Lazy-fetch the `+` popup's file or folder list when its submode
+  // Lazy-fetch the `+` popup's file/folder list when its submode
   // changes. Uses alphabetical ordering (no live search) — the user
-  // searches via `@`. 30 entries is the popup's browse cap.
+  // searches via `@`. 30 entries is the popup's browse cap. The
+  // issue submode does NOT participate here: it mounts the
+  // `IssuePickerPanel` component which owns its own fetch + search +
+  // loading state.
   useEffect(() => {
     if (!attachOpen) return;
-    if (attachSubmode === "main") return;
+    if (attachSubmode !== "file" && attachSubmode !== "folder") return;
     if (!cwd) {
       if (attachSubmode === "file") setAttachFileMatches(EMPTY_FILE_MATCHES);
       else setAttachFolderMatches(EMPTY_FOLDER_MATCHES);
@@ -457,23 +640,110 @@ export function Composer({
   // dispatch goes through `handleMentionPopupSelect`, which has the
   // full anchor + draft state in scope (the per-item closure would
   // capture stale values otherwise).
-  const fileItems = useMemo<SlashCommandItem[]>(
-    () =>
-      fileMatches.map((match) => ({
-        id: `file:${match.absolute_path}`,
-        label: match.path,
-        command: `@${match.path.split("/").pop() ?? match.path}`,
-        icon: FileIcon,
-        group: "FILES",
-        onSelect: () => {},
-      })),
-    [fileMatches],
-  );
+  // Stage 4 — branched by `parsedMention.category`. The id prefix
+  // (`file:` vs `issue:`) routes the pick handler.
+  const mentionItems = useMemo<SlashCommandItem[]>(() => {
+    if (parsedMention.category === "issue") {
+      // Match the IssuePickerPanel's visual language so users see
+      // the same chrome whether they got here via `+` or `@`:
+      //   open  → CircleDot (filled circle), tinted `text-success`
+      //   closed → CircleCheck (circle with tick), muted
+      // The right-aligned `command` slot keeps the textual
+      // open/closed badge as a fallback for users with degraded
+      // colour perception.
+      return mentionIssueMatches.map((issue) => {
+        const isOpen = issue.state.toUpperCase() !== "CLOSED";
+        return {
+          id: `issue:${issue.number}`,
+          label: `#${issue.number}`,
+          description: issue.title,
+          command: isOpen ? "open" : "closed",
+          icon: isOpen ? CircleDot : CircleCheck,
+          iconClassName: isOpen ? "text-success" : "text-muted-foreground",
+          group: "ISSUES",
+          onSelect: () => {},
+        };
+      });
+    }
+    if (parsedMention.category === "pr") {
+      // Stage 5 — PR rows mirror the PrPickerPanel's icon mapping so
+      // both surfaces stay consistent. State + draft both contribute
+      // to the icon shape + tint.
+      return mentionPrMatches.map((pr) => {
+        const upper = pr.state.toUpperCase();
+        let Icon = GitPullRequest;
+        let iconClassName = "text-success";
+        let badge = "open";
+        if (upper === "MERGED") {
+          Icon = GitMerge;
+          iconClassName = "text-chart-4";
+          badge = "merged";
+        } else if (upper === "CLOSED") {
+          Icon = GitPullRequestClosed;
+          iconClassName = "text-destructive";
+          badge = "closed";
+        } else if (pr.is_draft) {
+          Icon = GitPullRequestDraft;
+          iconClassName = "text-muted-foreground";
+          badge = "draft";
+        }
+        return {
+          id: `pr:${pr.number}`,
+          label: `#${pr.number}`,
+          description: pr.title,
+          command: badge,
+          icon: Icon,
+          iconClassName,
+          group: "PULL REQUESTS",
+          onSelect: () => {},
+        };
+      });
+    }
+    return fileMatches.map((match) => ({
+      id: `file:${match.absolute_path}`,
+      label: match.path,
+      command: `@${match.path.split("/").pop() ?? match.path}`,
+      icon: FileIcon,
+      group: "FILES",
+      onSelect: () => {},
+    }));
+  }, [
+    parsedMention.category,
+    mentionIssueMatches,
+    mentionPrMatches,
+    fileMatches,
+  ]);
 
-  // Footer hint when the chat isn't anchored to a project — the user
-  // can still type `@`, but file matches won't load until they pick
-  // a target directory.
+  // Footer hint per category. File hints stay file-flavoured; issue
+  // and pr hints surface the GitHub-specific failure modes (not a
+  // repo, gh not authenticated). Keeps the user oriented when the
+  // popup is empty for *reasons* rather than just no-matches.
   const mentionPopupFooter = useMemo(() => {
+    if (
+      parsedMention.category === "issue" ||
+      parsedMention.category === "pr"
+    ) {
+      const noun = parsedMention.category === "issue" ? "issues" : "PRs";
+      if (!cwd) {
+        return {
+          tone: "muted" as const,
+          message: `Open this chat in a project to attach ${noun}.`,
+        };
+      }
+      if (isGithubRepo === false) {
+        return {
+          tone: "muted" as const,
+          message: "Not a GitHub repo.",
+        };
+      }
+      if (ghAuthenticated === false) {
+        return {
+          tone: "muted" as const,
+          message: "Sign in with: gh auth login",
+        };
+      }
+      return null;
+    }
     if (!cwd) {
       return {
         tone: "muted" as const,
@@ -481,7 +751,7 @@ export function Composer({
       };
     }
     return null;
-  }, [cwd]);
+  }, [parsedMention.category, cwd, isGithubRepo, ghAuthenticated]);
 
   // ─── Attach popup items + pick handler ───────────────────────────
   // Items are derived per-submode. The `main` view is static
@@ -549,21 +819,39 @@ export function Composer({
         {
           id: "attach:issue",
           label: "GitHub Issue…",
-          description: "coming soon",
+          // Stage 4 — three flavours of disabled-state copy so the
+          // user knows whether the row is hidden because they're
+          // off-GitHub, off-auth, or just waiting on the preflight.
+          // Once the preflight resolves to true + authenticated, the
+          // row enables and the description goes back to the active-
+          // affordance copy.
+          description:
+            isGithubRepo === false
+              ? "Not a GitHub repo"
+              : ghAuthenticated === false
+                ? "Run gh auth login"
+                : "Pick an issue from this repo",
           command: "",
           icon: CircleDot,
           group: "ATTACH",
-          disabled: true,
+          disabled:
+            isGithubRepo !== true || ghAuthenticated === false,
           onSelect: () => {},
         },
         {
           id: "attach:pr",
           label: "GitHub PR…",
-          description: "coming soon",
+          description:
+            isGithubRepo === false
+              ? "Not a GitHub repo"
+              : ghAuthenticated === false
+                ? "Run gh auth login"
+                : "Pick a pull request from this repo",
           command: "",
           icon: GitPullRequest,
           group: "ATTACH",
-          disabled: true,
+          disabled:
+            isGithubRepo !== true || ghAuthenticated === false,
           onSelect: () => {},
         },
         {
@@ -588,6 +876,9 @@ export function Composer({
         onSelect: () => {},
       }));
     }
+    // Folder submode — `attachSubmode === "folder"` is the only
+    // remaining branch (issue submode renders IssuePickerPanel
+    // outside this items pipeline).
     return attachFolderMatches.map((match) => ({
       id: `attach-folder:${match.absolute_path}`,
       label: match.path,
@@ -597,7 +888,14 @@ export function Composer({
       group: "FOLDERS",
       onSelect: () => {},
     }));
-  }, [attachSubmode, attachFileMatches, attachFolderMatches, mode]);
+  }, [
+    attachSubmode,
+    attachFileMatches,
+    attachFolderMatches,
+    mode,
+    isGithubRepo,
+    ghAuthenticated,
+  ]);
 
   const attachPopupFooter = useMemo(() => {
     if (attachSubmode === "main") return null;
@@ -623,7 +921,12 @@ export function Composer({
       tone: "muted" as const,
       message: "Esc to go back",
     };
-  }, [attachSubmode, cwd, attachFileMatches.length, attachFolderMatches.length]);
+  }, [
+    attachSubmode,
+    cwd,
+    attachFileMatches.length,
+    attachFolderMatches.length,
+  ]);
 
   // Initialise / sync the attach-popup highlight to the first
   // enabled item whenever the visible item list shifts.
@@ -647,6 +950,16 @@ export function Composer({
       }
       if (item.id === "attach:folder") {
         setAttachSubmode("folder");
+        setAttachHighlighted(null);
+        return;
+      }
+      if (item.id === "attach:issue") {
+        setAttachSubmode("issue");
+        setAttachHighlighted(null);
+        return;
+      }
+      if (item.id === "attach:pr") {
+        setAttachSubmode("pr");
         setAttachHighlighted(null);
         return;
       }
@@ -695,6 +1008,10 @@ export function Composer({
         closeAttachPopup();
         return;
       }
+      // Note: issue picks are handled by IssuePickerPanel directly,
+      // not via this items pipeline. The pivot above
+      // (`attach:issue` → setAttachSubmode("issue")) is the only
+      // entry point that touches this code path for issues.
     },
     [
       attachFileMatches,
@@ -710,13 +1027,70 @@ export function Composer({
   // Keep the highlighted file id valid as the match list shifts.
   useEffect(() => {
     if (!mentionOpen) return;
-    const ids = fileItems.map((item) => item.id);
+    const ids = mentionItems.map((item) => item.id);
     if (mentionHighlighted && ids.includes(mentionHighlighted)) return;
     setMentionHighlighted(ids[0] ?? null);
-  }, [mentionOpen, fileItems, mentionHighlighted]);
+  }, [mentionOpen, mentionItems, mentionHighlighted]);
+
+  /** Replace the typed `@<query>` with the picked token + trailing
+   *  space and keep the cursor right after the insertion. Shared
+   *  between file and issue picks so the inline-mirror stays in lock-
+   *  step regardless of which kind landed. */
+  const replaceMentionWithToken = useCallback(
+    (token: string) => {
+      if (!mentionAnchor) {
+        requestAnimationFrame(() => textareaRef.current?.focus());
+        return;
+      }
+      const consumed = 1 + mentionAnchor.query.length;
+      const before = draft.slice(0, mentionAnchor.start);
+      const after = draft.slice(mentionAnchor.start + consumed);
+      const insertion = `@${token}${after.startsWith(" ") ? "" : " "}`;
+      const next = before + insertion + after;
+      onDraftChange(next);
+      const cursor = (before + insertion).length;
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(cursor, cursor);
+      });
+    },
+    [mentionAnchor, draft, onDraftChange],
+  );
 
   const handleMentionPopupSelect = useCallback(
     (item: SlashCommandItem) => {
+      // Stage 4 — `@issue:` picks. Insert `@#<number>` as the
+      // inline token and let the parent stage the chip + drive the
+      // detail fetch. The id is `issue:<num>`, minted by the popup
+      // builder.
+      if (item.id.startsWith("issue:")) {
+        const num = Number.parseInt(item.id.slice("issue:".length), 10);
+        const issue = mentionIssueMatches.find((i) => i.number === num);
+        if (!issue) {
+          closeMention();
+          return;
+        }
+        replaceMentionWithToken(`#${issue.number}`);
+        closeMention();
+        onAttachIssue?.(issue);
+        return;
+      }
+      // Stage 5 — `@pr:` picks. Insert `@!<number>` (one-char
+      // distinct from issue tokens) and dispatch to onAttachPr.
+      if (item.id.startsWith("pr:")) {
+        const num = Number.parseInt(item.id.slice("pr:".length), 10);
+        const pr = mentionPrMatches.find((p) => p.number === num);
+        if (!pr) {
+          closeMention();
+          return;
+        }
+        replaceMentionWithToken(`!${pr.number}`);
+        closeMention();
+        onAttachPr?.(pr);
+        return;
+      }
       const match = fileMatches.find(
         (m) => `file:${m.absolute_path}` === item.id,
       );
@@ -731,33 +1105,19 @@ export function Composer({
       // keystroke (collapsed when the next char is already a space).
       // Mirrors the skill-insertion pattern at the slash popup —
       // both inline-token systems share the same shape.
-      if (mentionAnchor) {
-        const consumed = 1 + mentionAnchor.query.length;
-        const before = draft.slice(0, mentionAnchor.start);
-        const after = draft.slice(mentionAnchor.start + consumed);
-        const filename = match.path.split("/").pop() ?? match.path;
-        const insertion = `@${filename}${after.startsWith(" ") ? "" : " "}`;
-        const next = before + insertion + after;
-        onDraftChange(next);
-        const cursor = (before + insertion).length;
-        requestAnimationFrame(() => {
-          const el = textareaRef.current;
-          if (!el) return;
-          el.focus();
-          el.setSelectionRange(cursor, cursor);
-        });
-      } else {
-        requestAnimationFrame(() => textareaRef.current?.focus());
-      }
+      const filename = match.path.split("/").pop() ?? match.path;
+      replaceMentionWithToken(filename);
       closeMention();
       onAttachFile?.(match);
     },
     [
       fileMatches,
-      mentionAnchor,
-      draft,
-      onDraftChange,
+      mentionIssueMatches,
+      mentionPrMatches,
+      replaceMentionWithToken,
       onAttachFile,
+      onAttachIssue,
+      onAttachPr,
       closeMention,
     ],
   );
@@ -916,10 +1276,10 @@ export function Composer({
         closeMention();
         return;
       }
-      if (fileItems.length > 0) {
+      if (mentionItems.length > 0) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          const ids = fileItems.map((i) => i.id);
+          const ids = mentionItems.map((i) => i.id);
           const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : -1;
           const next = ids[(idx + 1) % ids.length];
           if (next) setMentionHighlighted(next);
@@ -927,7 +1287,7 @@ export function Composer({
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
-          const ids = fileItems.map((i) => i.id);
+          const ids = mentionItems.map((i) => i.id);
           const idx = mentionHighlighted ? ids.indexOf(mentionHighlighted) : 0;
           const next = ids[(idx - 1 + ids.length) % ids.length];
           if (next) setMentionHighlighted(next);
@@ -935,7 +1295,7 @@ export function Composer({
         }
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();
-          const item = fileItems.find((i) => i.id === mentionHighlighted);
+          const item = mentionItems.find((i) => i.id === mentionHighlighted);
           if (item) handleMentionPopupSelect(item);
           return;
         }
@@ -1043,21 +1403,70 @@ export function Composer({
             footerNote={slashPopupFooter}
           />
           <SlashCommandPopup
-            items={fileItems}
+            items={mentionItems}
             highlightedId={mentionHighlighted}
             onHighlightChange={setMentionHighlighted}
             onSelect={handleMentionPopupSelect}
             open={mentionOpen}
             footerNote={mentionPopupFooter}
           />
-          <SlashCommandPopup
-            items={attachPopupItems}
-            highlightedId={attachHighlighted}
-            onHighlightChange={setAttachHighlighted}
-            onSelect={handleAttachPopupSelect}
-            open={attachOpen}
-            footerNote={attachPopupFooter}
-          />
+          {/* Stage 4 polish — when the user lands on the issue
+              submode, mount the existing IssuePickerPanel instead of
+              the generic flat-row SlashCommandPopup. The picker
+              already has the affordances users expect from the rest
+              of the app: typeable search bar, debounced server-side
+              search, green CircleDot for open + muted CircleCheck for
+              closed, and a skeleton load. The same Tauri backend
+              (listGithubIssuesByPath / getGithubIssueByPath) powers
+              both surfaces — the cache layer added in Stage 4 makes
+              the second call cheap regardless of which surface
+              triggered the first. */}
+          {attachOpen && attachSubmode === "issue" ? (
+            <div
+              data-testid="composer-issue-picker"
+              className="absolute bottom-full left-0 right-0 mb-2 z-50 rounded-lg border border-border/60 bg-popover shadow-md overflow-hidden"
+              onMouseDown={(e) => e.preventDefault()}
+            >
+              <IssuePickerPanel
+                projectPath={cwd ?? ""}
+                open
+                onSelect={(issue) => {
+                  insertInlineToken(`#${issue.number}`);
+                  onAttachIssue?.(issue);
+                  closeAttachPopup();
+                }}
+                onClose={closeAttachPopup}
+              />
+            </div>
+          ) : attachOpen && attachSubmode === "pr" ? (
+            <div
+              data-testid="composer-pr-picker"
+              className="absolute bottom-full left-0 right-0 mb-2 z-50 rounded-lg border border-border/60 bg-popover shadow-md overflow-hidden"
+              onMouseDown={(e) => e.preventDefault()}
+            >
+              <PrPickerPanel
+                projectPath={cwd ?? ""}
+                open
+                onSelect={(pr) => {
+                  // Stage 5 — `@!<n>` is the inline token convention
+                  // for PRs (one-char distinct from `@#<n>` issues).
+                  insertInlineToken(`!${pr.number}`);
+                  onAttachPr?.(pr);
+                  closeAttachPopup();
+                }}
+                onClose={closeAttachPopup}
+              />
+            </div>
+          ) : (
+            <SlashCommandPopup
+              items={attachPopupItems}
+              highlightedId={attachHighlighted}
+              onHighlightChange={setAttachHighlighted}
+              onSelect={handleAttachPopupSelect}
+              open={attachOpen}
+              footerNote={attachPopupFooter}
+            />
+          )}
           {errorMessage && (
             <div
               role="alert"
@@ -1144,6 +1553,66 @@ export function Composer({
                       data-error={seg.hasError || undefined}
                       className={cn(
                         "rounded-sm bg-foreground/10 text-foreground",
+                        seg.isLoading && "opacity-60",
+                        seg.hasError &&
+                          "bg-destructive/15 text-destructive",
+                      )}
+                    >
+                      {seg.text}
+                    </span>
+                  );
+                }
+                if (seg.kind === "issue-attachment") {
+                  // Stage 4 — state-coloured pill. Open issues use the
+                  // warning token (amber) to match the chip strip
+                  // directly above; closed issues use a muted neutral
+                  // so the eye isn't drawn to them. Error / loading
+                  // states override the same way file tokens do.
+                  return (
+                    <span
+                      key={i}
+                      data-testid={`composer-issue-token-${seg.ref}`}
+                      data-state={seg.state}
+                      data-loading={seg.isLoading || undefined}
+                      data-error={seg.hasError || undefined}
+                      className={cn(
+                        "rounded-sm",
+                        seg.state === "open"
+                          ? "bg-warning/15 text-warning"
+                          : "bg-foreground/10 text-muted-foreground",
+                        seg.isLoading && "opacity-60",
+                        seg.hasError &&
+                          "bg-destructive/15 text-destructive",
+                      )}
+                    >
+                      {seg.text}
+                    </span>
+                  );
+                }
+                if (seg.kind === "pr-attachment") {
+                  // Stage 5 — PR pill. Four state branches, matching
+                  // the chip strip's colours so the inline token and
+                  // the staged chip read as the same thing.
+                  //   open    → primary blue   (active, mergeable)
+                  //   merged  → purple/chart-4 (canonical "merged" hue)
+                  //   closed  → muted          (unmerged, dropped)
+                  //   draft   → muted          (in-progress)
+                  const stateClass =
+                    seg.state === "open"
+                      ? "bg-primary/15 text-primary"
+                      : seg.state === "merged"
+                        ? "bg-chart-4/15 text-chart-4"
+                        : "bg-foreground/10 text-muted-foreground";
+                  return (
+                    <span
+                      key={i}
+                      data-testid={`composer-pr-token-${seg.ref}`}
+                      data-state={seg.state}
+                      data-loading={seg.isLoading || undefined}
+                      data-error={seg.hasError || undefined}
+                      className={cn(
+                        "rounded-sm",
+                        stateClass,
                         seg.isLoading && "opacity-60",
                         seg.hasError &&
                           "bg-destructive/15 text-destructive",

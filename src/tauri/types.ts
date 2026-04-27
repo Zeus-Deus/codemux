@@ -442,6 +442,18 @@ export interface PullRequestInfo {
   review_decision: string | null;
   checks_passing: boolean | null;
   updated_at: string | null;
+  /** Stage 5 — populated by `get_github_pr_by_path` only. List paths
+   *  leave it null so list queries stay cheap. Body is truncated at
+   *  50 KB on a char boundary, mirroring the issue path. */
+  body: string | null;
+  /** First 20 conversation comments. Empty for list rows. */
+  comments: IssueComment[];
+  /** Total conversation count — equals `comments.length` when under
+   *  the cap, exceeds it when truncated. */
+  totalComments: number;
+  /** PR author login. Null when gh JSON didn't carry the field
+   *  (e.g. ghost users / list rows that didn't request author). */
+  author: string | null;
 }
 
 export interface IncomingPrItem {
@@ -497,6 +509,12 @@ export interface DeploymentInfo {
 
 export type IssueState = "Open" | "Closed";
 
+export interface IssueComment {
+  author: string;
+  body: string;
+  createdAt: string;
+}
+
 export interface GitHubIssue {
   number: number;
   title: string;
@@ -505,6 +523,15 @@ export interface GitHubIssue {
   assignees: string[];
   url: string;
   body: string | null;
+  /** Stage 4 — populated by the detail fetch only. List queries return
+   *  an empty array. Capped at 20 by the backend. */
+  comments: IssueComment[];
+  /** Total comment count (may exceed `comments.length` when the
+   *  backend truncated the visible slice). */
+  totalComments: number;
+  /** ISO8601 last-update timestamp. Used to sort the issue popup by
+   *  recency. Null when `gh` didn't include the field. */
+  updatedAt: string | null;
 }
 
 export interface LinkedIssue {

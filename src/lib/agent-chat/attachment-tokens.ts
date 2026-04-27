@@ -33,6 +33,24 @@ export interface AttachmentTokenMatch {
 // or end-of-text, so trailing prose doesn't bleed into the token.
 const FILE_TOKEN_RE = /(?<=^|\s)@([A-Za-z0-9._-]+)(?=[^A-Za-z0-9._-]|$)/g;
 
+// `@#<number>` for GitHub issue refs (Stage 4). Kept as a separate
+// regex from FILE_TOKEN_RE because the leading `#` is significant —
+// reusing the file regex would either mis-match `@#21` as a literal
+// path or silently allow `@21` (no hash) to dereference an issue,
+// which the user never types. Trailing assertion `\D|$` stops the
+// match at whitespace / punctuation / EOL so prose like `@#21,` or
+// `@#21.` doesn't sweep the comma into the token text.
+const ISSUE_TOKEN_RE = /(?<=^|\s)@#(\d+)(?=\D|$)/g;
+
+// `@!<number>` for GitHub PR refs (Stage 5). One-char distinct from
+// the issue token (`#` vs `!`) so the segmenter, the user reading
+// their own draft, and the eventual model agent all have a stable
+// shape-level signal of "this is a PR, not an issue". The `!` sigil
+// follows the GitLab MR convention; on GitHub it's just a Codemux
+// convention — the resolved-content injection makes the PR-vs-issue
+// distinction explicit anyway.
+const PR_TOKEN_RE = /(?<=^|\s)@!(\d+)(?=\D|$)/g;
+
 /**
  * Find every `@<basename>` token in `text` whose basename matches a
  * staged file/folder attachment's `metadata.label`. Match order
@@ -77,6 +95,83 @@ export function parseFileTokens(
   return matches;
 }
 
+/** Stage 5 — find every `@!<number>` token in `text` whose number
+ *  matches a staged PR attachment's `ref` (e.g. `!21`). PR refs are
+ *  matched against the literal `ref` for the same reason issue refs
+ *  are: the user-facing label includes the title and would never
+ *  match a textarea token. */
+export function parsePrTokens(
+  text: string,
+  attachments: Attachment[],
+): AttachmentTokenMatch[] {
+  if (!text || attachments.length === 0) return [];
+
+  const byRef = new Map<string, Attachment>();
+  for (const a of attachments) {
+    if (a.kind !== "pr") continue;
+    byRef.set(a.ref, a);
+  }
+  if (byRef.size === 0) return [];
+
+  const matches: AttachmentTokenMatch[] = [];
+  PR_TOKEN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PR_TOKEN_RE.exec(text)) !== null) {
+    const number = m[1];
+    if (!number) continue;
+    const attachment = byRef.get(`!${number}`);
+    if (!attachment) continue;
+    matches.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      token: m[0],
+      basename: `!${number}`,
+      attachment,
+    });
+  }
+  return matches;
+}
+
+/** Find every `@#<number>` token in `text` whose number matches a
+ *  staged issue attachment's `ref` (e.g. `#21`). Issue refs are
+ *  matched against the literal `ref` rather than the label because
+ *  the user-facing label includes the title (`#21 Fix login bug`)
+ *  while the inline token only carries the number — the label would
+ *  never match a textarea token. */
+export function parseIssueTokens(
+  text: string,
+  attachments: Attachment[],
+): AttachmentTokenMatch[] {
+  if (!text || attachments.length === 0) return [];
+
+  const byRef = new Map<string, Attachment>();
+  for (const a of attachments) {
+    if (a.kind !== "issue") continue;
+    byRef.set(a.ref, a);
+  }
+  if (byRef.size === 0) return [];
+
+  const matches: AttachmentTokenMatch[] = [];
+  ISSUE_TOKEN_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ISSUE_TOKEN_RE.exec(text)) !== null) {
+    const number = m[1];
+    if (!number) continue;
+    const attachment = byRef.get(`#${number}`);
+    if (!attachment) continue;
+    matches.push({
+      start: m.index,
+      end: m.index + m[0].length,
+      token: m[0],
+      // For issue refs, `basename` is the bare `#N` so consumers can
+      // treat it the same shape-wise as file tokens.
+      basename: `#${number}`,
+      attachment,
+    });
+  }
+  return matches;
+}
+
 /**
  * Filter slice attachments to the subset whose `@<basename>` token
  * still appears in `text`. Used at send time so deleting a token
@@ -93,7 +188,16 @@ export function activeAttachments(
   attachments: Attachment[],
 ): Attachment[] {
   if (attachments.length === 0) return attachments;
-  const tokens = parseFileTokens(text, attachments);
+  // File/folder tokens (@<basename>), issue tokens (@#<n>), and PR
+  // tokens (@!<n>) are collected together so the same
+  // delete-token-to-exclude rule applies uniformly. Order follows
+  // source position across all kinds.
+  const fileTokens = parseFileTokens(text, attachments);
+  const issueTokens = parseIssueTokens(text, attachments);
+  const prTokens = parsePrTokens(text, attachments);
+  const tokens = [...fileTokens, ...issueTokens, ...prTokens].sort(
+    (a, b) => a.start - b.start,
+  );
   const seenIds = new Set<string>();
   const out: Attachment[] = [];
   for (const t of tokens) {
@@ -127,6 +231,28 @@ export type DraftHighlightSegment =
       kind: "attachment";
       text: string;
       basename: string;
+      isLoading: boolean;
+      hasError: boolean;
+    }
+  | {
+      // Stage 4 — separate kind so the renderer can apply a state-
+      // coloured pill (open=warning amber, closed=muted) without the
+      // file/folder branch having to learn about issue state.
+      kind: "issue-attachment";
+      text: string;
+      ref: string;
+      state: "open" | "closed";
+      isLoading: boolean;
+      hasError: boolean;
+    }
+  | {
+      // Stage 5 — PR pill carries 4 visual states: open / merged /
+      // closed / draft. Mirror the chip strip's colour rules so the
+      // staged chip and the inline token share a visual language.
+      kind: "pr-attachment";
+      text: string;
+      ref: string;
+      state: "open" | "merged" | "closed" | "draft";
       isLoading: boolean;
       hasError: boolean;
     };
@@ -163,6 +289,51 @@ export function segmentDraftHighlight(
         kind: "attachment",
         text: slice,
         basename: m.basename,
+        isLoading,
+        hasError,
+      }),
+    });
+  }
+  for (const m of parseIssueTokens(text, attachments)) {
+    const isLoading = m.attachment.metadata.isLoading === true;
+    const hasError = typeof m.attachment.metadata.error === "string";
+    // Default to "open" when state is unset — staged issues always
+    // carry state from the picker / mention pick, but this guards
+    // against a bare addStagedAttachment call that forgot to seed it.
+    const state: "open" | "closed" =
+      m.attachment.metadata.state === "closed" ? "closed" : "open";
+    annotations.push({
+      start: m.start,
+      end: m.end,
+      build: (slice) => ({
+        kind: "issue-attachment",
+        text: slice,
+        ref: m.basename,
+        state,
+        isLoading,
+        hasError,
+      }),
+    });
+  }
+  for (const m of parsePrTokens(text, attachments)) {
+    const isLoading = m.attachment.metadata.isLoading === true;
+    const hasError = typeof m.attachment.metadata.error === "string";
+    // PR state widens the issue palette — `metadata.state` carries
+    // one of "open"/"merged"/"closed"/"draft". Default to "open"
+    // (most common; mirrors the issue branch's safety net).
+    const raw = m.attachment.metadata.state;
+    const state: "open" | "merged" | "closed" | "draft" =
+      raw === "merged" || raw === "closed" || raw === "draft"
+        ? raw
+        : "open";
+    annotations.push({
+      start: m.start,
+      end: m.end,
+      build: (slice) => ({
+        kind: "pr-attachment",
+        text: slice,
+        ref: m.basename,
+        state,
         isLoading,
         hasError,
       }),

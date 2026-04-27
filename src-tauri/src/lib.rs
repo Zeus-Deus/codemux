@@ -14,6 +14,7 @@ pub mod database;
 pub mod config;
 pub mod git;
 pub mod github;
+pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
 pub mod execution;
@@ -881,6 +882,8 @@ pub fn run() {
             commands::get_branch_pull_request,
             commands::create_pull_request,
             commands::list_pull_requests,
+            commands::get_github_pr_by_path,
+            commands::get_github_pr_diff_by_path,
             commands::list_incoming_prs,
             commands::merge_pull_request,
             commands::get_pull_request_checks,

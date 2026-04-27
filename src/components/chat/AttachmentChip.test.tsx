@@ -162,7 +162,11 @@ describe("AttachmentChip", () => {
       expect(getByRole("status").className).toContain("bg-primary/15");
     });
 
-    it("merged PR falls back to muted neutral", () => {
+    it("merged PR uses the merged-purple variant (chart-4 token)", () => {
+      // Stage 5 — merged PRs were originally rendered with muted
+      // neutral, but that conflated them with closed/draft. The new
+      // contract: merged → `text-chart-4` purple to match the
+      // `GitMerge` icon tint in PrPickerPanel + the chip strip.
       const { getByRole } = render(
         <AttachmentChip
           attachment={makeAttachment({
@@ -172,7 +176,39 @@ describe("AttachmentChip", () => {
           onRemove={vi.fn()}
         />,
       );
-      expect(getByRole("status").className).toContain("text-muted-foreground");
+      const className = getByRole("status").className;
+      expect(className).toContain("text-chart-4");
+      expect(className).not.toContain("text-muted-foreground");
+    });
+
+    it("draft PR renders muted (in-progress, not yet up for review)", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "pr",
+            metadata: { label: "#42 · WIP", state: "draft" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain(
+        "text-muted-foreground",
+      );
+    });
+
+    it("closed PR renders muted neutral", () => {
+      const { getByRole } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "pr",
+            metadata: { label: "#42 · obsolete", state: "closed" },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByRole("status").className).toContain(
+        "text-muted-foreground",
+      );
     });
 
     it("image uses the accent variant", () => {

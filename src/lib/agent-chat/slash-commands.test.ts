@@ -9,6 +9,7 @@ import {
   groupSlashItems,
   MODE_CYCLE_ORDER,
   nextModeInCycle,
+  parseMentionQuery,
   type SlashCommandItem,
 } from "./slash-commands";
 
@@ -220,5 +221,56 @@ describe("groupSlashItems", () => {
 
   it("returns empty array for empty input", () => {
     expect(groupSlashItems([])).toEqual([]);
+  });
+});
+
+describe("parseMentionQuery", () => {
+  it("defaults to file when no prefix is supplied", () => {
+    expect(parseMentionQuery("foo.ts")).toEqual({
+      category: "file",
+      filter: "foo.ts",
+    });
+    expect(parseMentionQuery("")).toEqual({ category: "file", filter: "" });
+  });
+
+  it("parses recognised category prefixes", () => {
+    expect(parseMentionQuery("issue:1234")).toEqual({
+      category: "issue",
+      filter: "1234",
+    });
+    expect(parseMentionQuery("pr:bug")).toEqual({
+      category: "pr",
+      filter: "bug",
+    });
+    expect(parseMentionQuery("folder:src")).toEqual({
+      category: "folder",
+      filter: "src",
+    });
+    expect(parseMentionQuery("file:readme")).toEqual({
+      category: "file",
+      filter: "readme",
+    });
+  });
+
+  it("accepts an empty filter (popup-on-trigger)", () => {
+    expect(parseMentionQuery("issue:")).toEqual({
+      category: "issue",
+      filter: "",
+    });
+  });
+
+  it("is case-insensitive on the prefix", () => {
+    expect(parseMentionQuery("ISSUE:42")).toEqual({
+      category: "issue",
+      filter: "42",
+    });
+  });
+
+  it("treats unknown prefixes as plain filter text", () => {
+    // No special routing — caller falls back to file search.
+    expect(parseMentionQuery("user:zeus")).toEqual({
+      category: "file",
+      filter: "user:zeus",
+    });
   });
 });

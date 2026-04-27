@@ -18,17 +18,45 @@ vi.mock("@/tauri/commands", async (importActual) => {
     ...actual,
     listProjectFiles: vi.fn().mockResolvedValue([]),
     listProjectFolders: vi.fn().mockResolvedValue([]),
+    listGithubIssuesByPath: vi.fn().mockResolvedValue([]),
+    getGithubIssueByPath: vi.fn(),
     listSkills: vi.fn().mockResolvedValue([]),
   };
 });
 
 import { Composer } from "./Composer";
-import { listProjectFiles, listProjectFolders } from "@/tauri/commands";
+import {
+  getGithubIssueByPath,
+  listGithubIssuesByPath,
+  listProjectFiles,
+  listProjectFolders,
+} from "@/tauri/commands";
+import type { GitHubIssue } from "@/tauri/types";
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
 const listProjectFilesMock = listProjectFiles as unknown as ReturnType<typeof vi.fn>;
 const listProjectFoldersMock = listProjectFolders as unknown as ReturnType<typeof vi.fn>;
+const listGithubIssuesMock =
+  listGithubIssuesByPath as unknown as ReturnType<typeof vi.fn>;
+const getGithubIssueMock =
+  getGithubIssueByPath as unknown as ReturnType<typeof vi.fn>;
+
+function makeIssue(overrides: Partial<GitHubIssue> = {}): GitHubIssue {
+  return {
+    number: 1234,
+    title: "Login redirect bug",
+    state: "Open",
+    labels: ["bug"],
+    assignees: [],
+    url: "https://github.com/u/r/issues/1234",
+    body: null,
+    comments: [],
+    totalComments: 0,
+    updatedAt: "2026-04-20T00:00:00Z",
+    ...overrides,
+  };
+}
 
 function makeFile(overrides: Partial<FileMatch> = {}): FileMatch {
   return {
@@ -108,8 +136,11 @@ function renderControlled(
 beforeEach(() => {
   listProjectFilesMock.mockReset();
   listProjectFoldersMock.mockReset();
+  listGithubIssuesMock.mockReset();
+  getGithubIssueMock.mockReset();
   listProjectFilesMock.mockResolvedValue([]);
   listProjectFoldersMock.mockResolvedValue([]);
+  listGithubIssuesMock.mockResolvedValue([]);
 });
 
 afterEach(() => cleanup());
@@ -344,5 +375,178 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     fireEvent.click(getByTestId("slash-item-attach:file"));
     const footer = getByTestId("slash-popup-footer");
     expect(footer.textContent).toContain("project");
+  });
+});
+
+describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
+  it("disables the GitHub Issue row when isGithubRepo is false", () => {
+    const { getByTestId } = renderControlled({ isGithubRepo: false });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-attach:issue");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    expect(row.textContent).toContain("Not a GitHub repo");
+  });
+
+  it("disables the GitHub Issue row when gh is not authenticated", () => {
+    const { getByTestId } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: false,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-attach:issue");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    expect(row.textContent).toContain("gh auth login");
+  });
+
+  it("enables the GitHub Issue row when preflight passes", () => {
+    const { getByTestId } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-attach:issue");
+    // cmdk emits `data-disabled="false"` for enabled items; the
+    // composer-side gate sets the attr to "true" when disabled. Either
+    // a missing attribute or "false" both mean "enabled".
+    const attr = row.getAttribute("data-disabled");
+    expect(attr === null || attr === "false").toBe(true);
+    // The description copy must reflect the active affordance, not
+    // the disabled fallbacks.
+    expect(row.textContent).toContain("Pick an issue from this repo");
+  });
+
+  // Regression for Stage 4 bug: the user reported "Not a GitHub repo"
+  // copy on the row even though they were inside a verified GitHub
+  // repo. Root cause was Rust-side conflation between "is a GitHub
+  // repo" and "gh is authenticated". The Composer side of the contract
+  // is captured here: when the preflight result is `true`, the popup
+  // must NEVER show the "Not a GitHub repo" disabled copy regardless
+  // of the auth signal. (The backend test suite covers the matching
+  // contract on the Rust side via remote_text_points_at_github_*.)
+  it("never shows 'Not a GitHub repo' when isGithubRepo is true", () => {
+    for (const ghAuthenticated of [true, false, null] as const) {
+      cleanup();
+      const { getByTestId } = renderControlled({
+        isGithubRepo: true,
+        ghAuthenticated,
+      });
+      fireEvent.click(getByTestId("composer-attach-button"));
+      const row = getByTestId("slash-item-attach:issue");
+      expect(row.textContent).not.toContain("Not a GitHub repo");
+    }
+  });
+
+  it("clicking GitHub Issue → fetches issues and renders rows", async () => {
+    listGithubIssuesMock.mockResolvedValue([
+      makeIssue({ number: 92, title: "Backend endpoints" }),
+      makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
+    ]);
+    const { getByTestId, findByText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    await waitFor(() => {
+      expect(listGithubIssuesMock).toHaveBeenCalled();
+    });
+    expect(await findByText("Backend endpoints")).toBeInTheDocument();
+    expect(await findByText("Dark mode toggle")).toBeInTheDocument();
+  });
+
+  it("picking an issue calls onAttachIssue + inserts an @#<n> token", async () => {
+    const issue = makeIssue({ number: 92, title: "Backend endpoints" });
+    listGithubIssuesMock.mockResolvedValue([issue]);
+    const onAttachIssue = vi.fn();
+    const onDraftChange = vi.fn();
+    const { getByTestId, findByText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+      onAttachIssue,
+      onDraftChange,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    const row = await findByText("Backend endpoints");
+    fireEvent.click(row);
+    expect(onAttachIssue).toHaveBeenCalledWith(issue);
+    const finalDraft =
+      onDraftChange.mock.calls[onDraftChange.mock.calls.length - 1]?.[0];
+    expect(finalDraft).toBe("@#92 ");
+  });
+
+  it("surfaces an error message when gh fetch fails", async () => {
+    // The IssuePickerPanel maps 'rate-limited' → generic "Failed to
+    // load issues" copy. Auth-flavoured errors map to the "Connect
+    // GitHub to link issues" hint; missing-CLI maps to the install
+    // prompt. We pin the generic branch here.
+    listGithubIssuesMock.mockRejectedValue(new Error("rate-limited"));
+    const { getByTestId, findByText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    expect(await findByText("Failed to load issues")).toBeInTheDocument();
+  });
+
+  it("surfaces the auth-recovery hint when gh reports unauthenticated", async () => {
+    listGithubIssuesMock.mockRejectedValue(
+      new Error("gh CLI is not authenticated. Run: gh auth login"),
+    );
+    const { getByTestId, findByText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    expect(
+      await findByText("Connect GitHub to link issues"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders open issues with CircleDot + text-success and closed with CircleCheck + muted", async () => {
+    listGithubIssuesMock.mockResolvedValue([
+      makeIssue({ number: 92, title: "Backend endpoints", state: "Open" }),
+      makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
+    ]);
+    const { getByTestId, findByText, container } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    await findByText("Backend endpoints");
+    await findByText("Dark mode toggle");
+
+    // Lucide ships each icon with a `lucide-<name>` class. We assert
+    // that exactly one open-state icon (CircleDot) and one closed-
+    // state icon (CircleCheck) appear, each with the expected colour
+    // class — so a future tweak that drops the success tint, or
+    // confuses the open/closed icon shapes, fails this test.
+    const openIcons = container.querySelectorAll(
+      "svg.lucide-circle-dot.text-success",
+    );
+    expect(openIcons.length).toBe(1);
+    const closedIcons = container.querySelectorAll(
+      "svg.lucide-circle-check.text-muted-foreground",
+    );
+    expect(closedIcons.length).toBe(1);
+  });
+
+  it("mounts the IssuePickerPanel (with search input) on issue submode", async () => {
+    listGithubIssuesMock.mockResolvedValue([]);
+    const { getByTestId, getByPlaceholderText } = renderControlled({
+      isGithubRepo: true,
+      ghAuthenticated: true,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-attach:issue"));
+    // The picker panel renders a Search input — this is the canonical
+    // affordance the user reported missing in the prior flat-row
+    // implementation. If a future refactor regresses to flat rows
+    // this test catches it.
+    expect(getByPlaceholderText("Search issues...")).toBeInTheDocument();
+    expect(getByTestId("composer-issue-picker")).toBeInTheDocument();
   });
 });

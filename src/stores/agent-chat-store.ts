@@ -41,8 +41,10 @@ export interface AttachmentMetadata {
   lineCount?: number;
   /** File / image: byte size for the chip tooltip and 5MB warning. */
   bytes?: number;
-  /** Issue / PR state — drives chip color (open vs closed/merged). */
-  state?: "open" | "closed" | "merged";
+  /** Issue / PR state — drives chip color. PRs add `draft` (in-progress
+   *  open PR) so the chip can render with a dashed-circle icon and
+   *  muted tint; issues only ever take open/closed. */
+  state?: "open" | "closed" | "merged" | "draft";
   /** When the resolved content was fetched, for the
    *  re-fetch-if-older-than-60s rule (Stage 4–5). Files re-read at
    *  send unconditionally so this is mainly for GitHub kinds. */
