@@ -329,14 +329,69 @@ curl -s --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1 || true &
 exit 0
 "#;
 
-/// Write the hook notification script to ~/.codemux/hooks/notify.sh
+/// Windows equivalent of HOOK_SCRIPT — same protocol (read stdin JSON,
+/// extract session_id, fire-and-forget GET to the hook server) but in
+/// PowerShell so cmd.exe can invoke it without bash/curl/jq.
+#[cfg(target_os = "windows")]
+const HOOK_SCRIPT_PS1: &str = r#"# Codemux agent lifecycle hook (Windows / PowerShell)
+# Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
+$ErrorActionPreference = 'SilentlyContinue'
+if (-not $env:CODEMUX_HOOK_PORT)    { exit 0 }
+if (-not $env:CODEMUX_SESSION_ID)   { exit 0 }
+$eventType = if ($args.Count -gt 0) { $args[0] } else { '' }
+if (-not $eventType) { exit 0 }
+
+# Claude Code pipes JSON on stdin; extract session_id if present.
+$agentSid = ''
+try {
+    $raw = [Console]::In.ReadToEnd()
+    if ($raw) {
+        $obj = $raw | ConvertFrom-Json
+        if ($obj.session_id) { $agentSid = $obj.session_id }
+    }
+} catch {}
+
+$url = "http://127.0.0.1:$($env:CODEMUX_HOOK_PORT)/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
+if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
+
+# Fire-and-forget; ignore failures so a network blip never kills the agent.
+try { Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 | Out-Null } catch {}
+exit 0
+"#;
+
+/// Cross-platform "user home directory" lookup. On Unix this is `$HOME`,
+/// on Windows we prefer `$USERPROFILE` because `HOME` is not set unless
+/// the user explicitly configured it (e.g. for git/MSYS2 compatibility).
+fn user_home_dir() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return Some(profile);
+        }
+        // Fallback for users who do have HOME set (Git Bash, MSYS2 launches).
+        std::env::var("HOME").ok()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var("HOME").ok()
+    }
+}
+
+/// Write the hook notification script. On Unix this is `~/.codemux/hooks/notify.sh`;
+/// on Windows it's `~/.codemux/hooks/notify.ps1` (cmd.exe cannot execute `.sh`
+/// without explicit `bash` invocation, which would force a Git Bash dependency).
 pub fn ensure_hook_script() -> Option<String> {
-    let home = std::env::var("HOME").ok()?;
+    let home = user_home_dir()?;
     let hooks_dir = std::path::PathBuf::from(&home).join(".codemux/hooks");
     std::fs::create_dir_all(&hooks_dir).ok()?;
 
-    let script_path = hooks_dir.join("notify.sh");
-    std::fs::write(&script_path, HOOK_SCRIPT).ok()?;
+    #[cfg(target_os = "windows")]
+    let (script_name, script_body) = ("notify.ps1", HOOK_SCRIPT_PS1);
+    #[cfg(not(target_os = "windows"))]
+    let (script_name, script_body) = ("notify.sh", HOOK_SCRIPT);
+
+    let script_path = hooks_dir.join(script_name);
+    std::fs::write(&script_path, script_body).ok()?;
 
     // Make executable
     #[cfg(unix)]
@@ -349,13 +404,19 @@ pub fn ensure_hook_script() -> Option<String> {
 }
 
 /// Check if a hook entry (in Claude Code format) contains a codemux hook.
+/// Matches both the Unix `notify.sh` form and the Windows `notify.ps1` form
+/// so cleanup works regardless of which platform last registered the hook
+/// (e.g. dotfiles synced between Unix and Windows machines).
 fn entry_contains_codemux_hook(entry: &serde_json::Value) -> bool {
+    let is_codemux = |cmd: &str| {
+        cmd.contains(".codemux") && (cmd.contains("notify.sh") || cmd.contains("notify.ps1"))
+    };
     // Check the nested format: { "hooks": [{ "command": "...codemux..." }] }
     if let Some(hooks) = entry.get("hooks").and_then(|h| h.as_array()) {
         return hooks.iter().any(|h| {
             h.get("command")
                 .and_then(|c| c.as_str())
-                .map(|c| c.contains(".codemux/hooks/notify.sh"))
+                .map(is_codemux)
                 .unwrap_or(false)
         });
     }
@@ -363,8 +424,26 @@ fn entry_contains_codemux_hook(entry: &serde_json::Value) -> bool {
     entry
         .get("command")
         .and_then(|c| c.as_str())
-        .map(|c| c.contains(".codemux/hooks/notify.sh"))
+        .map(is_codemux)
         .unwrap_or(false)
+}
+
+/// Build the shell command Claude Code will invoke for a hook event.
+/// Unix: bash interprets the .sh script directly when run via the shell.
+/// Windows: cmd.exe cannot execute .ps1 directly, so we wrap it in a
+/// `powershell -NoProfile -ExecutionPolicy Bypass -File ...` invocation
+/// (matches the way other Tauri/Electron tools register PS hooks).
+fn build_hook_command(script_path: &str, event_type: &str) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{script_path}\" {event_type}"
+        )
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("{script_path} {event_type}")
+    }
 }
 
 /// Register hooks with Claude Code's settings.json (~/.claude/settings.json).
@@ -375,9 +454,9 @@ pub fn register_claude_code_hooks() {
         return;
     };
 
-    let home = match std::env::var("HOME") {
-        Ok(h) => h,
-        Err(_) => return,
+    let home = match user_home_dir() {
+        Some(h) => h,
+        None => return,
     };
 
     let settings_path = std::path::PathBuf::from(&home).join(".claude/settings.json");
@@ -411,7 +490,7 @@ pub fn register_claude_code_hooks() {
         .or_insert(serde_json::json!({}));
 
     for (event_name, event_type) in &hook_events {
-        let hook_cmd = format!("{script_path} {event_type}");
+        let hook_cmd = build_hook_command(&script_path, event_type);
 
         let hook_array = hooks
             .as_object_mut()
@@ -512,7 +591,7 @@ pub fn build_claude_hooks_json(script_path: &str) -> serde_json::Value {
 
     let mut hooks = serde_json::json!({});
     for (event_name, event_type) in &hook_events {
-        let hook_cmd = format!("{script_path} {event_type}");
+        let hook_cmd = build_hook_command(script_path, event_type);
         hooks[event_name] = serde_json::json!([{
             "matcher": "",
             "hooks": [{ "type": "command", "command": hook_cmd }]
