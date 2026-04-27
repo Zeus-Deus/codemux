@@ -208,6 +208,7 @@ fn session_name(browser_id: &str) -> &str {
     if browser_id.is_empty() { "default" } else { browser_id }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -381,6 +382,223 @@ fn resolve_binary() -> String {
     "npx agent-browser".to_string()
 }
 
+/// Split `resolve_binary()`'s return value into `(program, prefix_args)` so it
+/// can drive `Command::new(...).args(...)` directly on Windows. The function
+/// either returns a single binary path (most installs / dev) or the literal
+/// `"npx agent-browser"` fallback (no bundled sidecar AND no node_modules).
+/// In the npx case we want the spawn to be `npx -> agent-browser <action> ...`,
+/// not `Command::new("npx agent-browser")` which Windows treats as a single
+/// (nonexistent) executable name.
+#[cfg(target_os = "windows")]
+fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
+    let trimmed = bin.trim();
+    if let Some(idx) = trimmed.find(' ') {
+        let (program, rest) = trimmed.split_at(idx);
+        let prefix = rest
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        (program.to_string(), prefix)
+    } else {
+        (trimmed.to_string(), Vec::new())
+    }
+}
+
+/// Argv-form sibling of `build_agent_browser_command`. Returns a list of
+/// argument vectors, one per agent-browser invocation: most actions are
+/// single-shot, but the historical `open_url` shell form was
+/// `<bin> open <url> --session <sid> && <bin> wait --load load --session <sid>`,
+/// which becomes two sequential argv groups. Used only on Windows so we can
+/// spawn `agent-browser.exe` directly without going through `sh -c` (and
+/// therefore without depending on Git Bash being installed).
+#[cfg(target_os = "windows")]
+fn build_agent_browser_argv_groups(
+    session: &str,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<Vec<Vec<String>>, String> {
+    let s = session.to_string();
+    let groups: Vec<Vec<String>> = match action {
+        "open_url" | "open" => {
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("about:blank")
+                .to_string();
+            vec![
+                vec!["open".into(), url, "--session".into(), s.clone()],
+                vec![
+                    "wait".into(),
+                    "--load".into(),
+                    "load".into(),
+                    "--session".into(),
+                    s,
+                ],
+            ]
+        }
+        "screenshot" => vec![vec!["screenshot".into(), "--session".into(), s]],
+        "snapshot" | "accessibility_snapshot" => vec![vec![
+            "snapshot".into(),
+            "-i".into(),
+            "--session".into(),
+            s,
+        ]],
+        "click" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec!["click".into(), selector, "--session".into(), s]]
+        }
+        "fill" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            let value = params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec!["fill".into(), selector, value, "--session".into(), s]]
+        }
+        "type_text" => {
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec![
+                "type".into(),
+                "body".into(),
+                text,
+                "--session".into(),
+                s,
+            ]]
+        }
+        "console_logs" | "console" => vec![vec!["console".into(), "--session".into(), s]],
+        "evaluate" | "eval" => {
+            let script = params
+                .get("script")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec!["eval".into(), script, "--session".into(), s]]
+        }
+        "back" => vec![vec!["back".into(), "--session".into(), s]],
+        "forward" => vec![vec!["forward".into(), "--session".into(), s]],
+        "reload" => vec![vec!["reload".into(), "--session".into(), s]],
+        "viewport" => {
+            let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
+            let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
+            vec![vec![
+                "set".into(),
+                "viewport".into(),
+                w.to_string(),
+                h.to_string(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        "get_styles" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "styles".into(),
+                selector,
+                "--json".into(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        "wait" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = params.get("text").and_then(|v| v.as_str()).map(String::from);
+            if let Some(text) = text {
+                vec![vec![
+                    "wait".into(),
+                    "--text".into(),
+                    text,
+                    "--session".into(),
+                    s,
+                ]]
+            } else {
+                vec![vec!["wait".into(), selector, "--session".into(), s]]
+            }
+        }
+        "get_text" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "text".into(),
+                selector,
+                "--session".into(),
+                s,
+            ]]
+        }
+        "get_box" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "box".into(),
+                selector,
+                "--json".into(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        _ => return Err(format!("Unknown action: {}", action)),
+    };
+    Ok(groups)
+}
+
+/// Spawn agent-browser directly (no shell) on Windows with the standard
+/// stream-port + stealth env vars wired up. Used by the cfg-gated Windows
+/// branches at every shell-out site so we don't depend on Git Bash being
+/// installed for runtime browser control.
+#[cfg(target_os = "windows")]
+fn run_agent_browser_native(
+    bin: &str,
+    argv: &[String],
+    stream_port: u16,
+    discard_stderr: bool,
+) -> std::io::Result<std::process::Output> {
+    let (program, prefix_args) = split_resolved_binary(bin);
+    let mut cmd = std::process::Command::new(&program);
+    for a in &prefix_args {
+        cmd.arg(a);
+    }
+    for a in argv {
+        cmd.arg(a);
+    }
+    cmd.env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    if discard_stderr {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    cmd.output()
+}
+
+#[cfg(not(target_os = "windows"))]
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
     let bin = resolve_binary();
     let command = match action {
@@ -469,17 +687,43 @@ fn make_request_id() -> String {
 
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
-    let shell_cmd = build_agent_browser_command(session, action, &params)?;
-    let output = std::process::Command::new("sh")
-        .args(["-c", &shell_cmd])
-        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
-        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-        .output()
-        .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    #[cfg(target_os = "windows")]
+    let (stdout, stderr, status_success) = {
+        let bin = resolve_binary();
+        let groups = build_agent_browser_argv_groups(session, action, &params)?;
+        let mut combined_stdout = String::new();
+        let mut combined_stderr = String::new();
+        let mut all_ok = true;
+        for argv in &groups {
+            let out = run_agent_browser_native(&bin, argv, stream_port, false)
+                .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
+            combined_stdout.push_str(&String::from_utf8_lossy(&out.stdout));
+            combined_stderr.push_str(&String::from_utf8_lossy(&out.stderr));
+            if !out.status.success() {
+                all_ok = false;
+                break; // matches `cmd1 && cmd2` short-circuit semantics
+            }
+        }
+        (combined_stdout, combined_stderr, all_ok)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let (stdout, stderr, status_success) = {
+        let shell_cmd = build_agent_browser_command(session, action, &params)?;
+        let output = std::process::Command::new("sh")
+            .args(["-c", &shell_cmd])
+            .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+            .output()
+            .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.success(),
+        )
+    };
 
     // Debug logging for snapshot commands
     if action == "snapshot" || action == "accessibility_snapshot" {
@@ -489,7 +733,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         }
     }
 
-    if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
+    if !status_success && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
         return Err(format!("agent-browser failed: {} {}", stdout, stderr));
     }
 
@@ -500,8 +744,27 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     if (action == "snapshot" || action == "accessibility_snapshot") && needs_dom_fallback(&stdout) {
         eprintln!("[codemux::browser] ARIA snapshot empty, falling back to DOM query");
         let dom_params = serde_json::json!({ "script": DOM_SNAPSHOT_SCRIPT });
-        let dom_cmd = build_agent_browser_command(session, "eval", &dom_params)?;
-        if let Ok(dom_output) = std::process::Command::new("sh").args(["-c", &dom_cmd]).output() {
+
+        #[cfg(target_os = "windows")]
+        let dom_output_opt = {
+            let bin = resolve_binary();
+            match build_agent_browser_argv_groups(session, "eval", &dom_params) {
+                Ok(groups) if !groups.is_empty() => {
+                    run_agent_browser_native(&bin, &groups[0], stream_port, false).ok()
+                }
+                _ => None,
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let dom_output_opt = match build_agent_browser_command(session, "eval", &dom_params) {
+            Ok(dom_cmd) => std::process::Command::new("sh")
+                .args(["-c", &dom_cmd])
+                .output()
+                .ok(),
+            Err(_) => None,
+        };
+
+        if let Some(dom_output) = dom_output_opt {
             let dom_stdout = String::from_utf8_lossy(&dom_output.stdout).to_string();
             let dom_tree = extract_eval_result(&dom_stdout);
             if !dom_tree.is_empty() && dom_tree != "(no elements found)" {
@@ -537,7 +800,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         } else {
             stdout.clone()
         };
-        serde_json::json!({ "result": result_str, "success": output.status.success() })
+        serde_json::json!({ "result": result_str, "success": status_success })
     };
 
     Ok(BrowserAutomationResult {
@@ -646,6 +909,21 @@ impl AgentBrowserManager {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        let output = run_agent_browser_native(
+            &bin,
+            &[
+                "open".into(),
+                "about:blank".into(),
+                "--headless".into(),
+                "--session".into(),
+                session.to_string(),
+            ],
+            port,
+            false,
+        )
+        .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
+        #[cfg(not(target_os = "windows"))]
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
@@ -678,6 +956,19 @@ impl AgentBrowserManager {
         let bin = resolve_binary();
         let port = self.allocate_port(browser_id).await?;
 
+        #[cfg(target_os = "windows")]
+        let output = run_agent_browser_native(
+            &bin,
+            &[
+                "screenshot".into(),
+                "--session".into(),
+                session.to_string(),
+            ],
+            port,
+            false,
+        )
+        .map_err(|e| format!("Failed to get screenshot: {}", e))?;
+        #[cfg(not(target_os = "windows"))]
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("{} screenshot --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
@@ -724,6 +1015,19 @@ impl AgentBrowserManager {
             kill_process_on_port(s.port);
         }
 
+        #[cfg(target_os = "windows")]
+        {
+            // Port not strictly needed for `close` (no streaming), but the
+            // helper requires one — pass 0 since the daemon being closed
+            // already owns whatever port it was streaming on.
+            let _ = run_agent_browser_native(
+                &bin,
+                &["close".into(), "--session".into(), session.to_string()],
+                0,
+                false,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("{} close --session {}", bin, session)])
             .output();
@@ -763,6 +1067,18 @@ impl AgentBrowserManager {
         // The agent-browser CLI would then reuse the stale daemon (by session name)
         // while BrowserPane connects to the newly allocated (empty) port.
 
+        #[cfg(target_os = "windows")]
+        {
+            // discard_stderr=true mirrors the `2>/dev/null` redirect on the
+            // Unix shell form below — stale-close errors are noise.
+            let _ = run_agent_browser_native(
+                &bin,
+                &["close".into(), "--session".into(), session.to_string()],
+                0,
+                true,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
         let _ = std::process::Command::new("sh")
             .args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)])
             .output();
@@ -776,16 +1092,34 @@ impl AgentBrowserManager {
         // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and
         // streaming is enabled by default when AGENT_BROWSER_STREAM_PORT is set.
         eprintln!("[codemux::browser] Starting browser session={} port={}", session, port);
-        let launch_cmd = format!(
-            "{} open about:blank --headless --session {}",
-            bin, session
-        );
-        let _ = std::process::Command::new("sh")
-            .args(["-c", &launch_cmd])
-            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-            .output();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = run_agent_browser_native(
+                &bin,
+                &[
+                    "open".into(),
+                    "about:blank".into(),
+                    "--headless".into(),
+                    "--session".into(),
+                    session.to_string(),
+                ],
+                port,
+                false,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let launch_cmd = format!(
+                "{} open about:blank --headless --session {}",
+                bin, session
+            );
+            let _ = std::process::Command::new("sh")
+                .args(["-c", &launch_cmd])
+                .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+                .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+                .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+                .output();
+        }
 
         // Give the daemon a moment to start the WebSocket stream server.
         std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -845,6 +1179,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_open_chains_wait_load() {
         let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
@@ -856,17 +1191,85 @@ mod tests {
         assert!(!cmd.contains("stream disable"), "Should NOT restart stream: {}", cmd);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_viewport_uses_set_viewport() {
         let cmd = build_agent_browser_command("s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
         assert!(cmd.contains("set viewport 800 600"), "v0.24.0 uses 'set viewport', got: {}", cmd);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_unknown_action_returns_error() {
         let result = build_agent_browser_command("s", "nonexistent_action", &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown action"));
+    }
+
+    /// Windows-only sibling test that exercises the argv builder. The Linux
+    /// tests above assert shell-string shape; the argv form has different
+    /// semantics (no shell quoting, separate args), so this test asserts the
+    /// argv shape directly instead of trying to share assertions.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_open_chains_wait_load() {
+        let groups = build_agent_browser_argv_groups(
+            "test-session",
+            "open",
+            &serde_json::json!({"url": "https://example.com"}),
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2, "open should produce open + wait groups");
+        assert_eq!(groups[0][0], "open");
+        assert!(groups[0].contains(&"https://example.com".to_string()));
+        assert!(groups[0].contains(&"--session".to_string()));
+        assert!(groups[0].contains(&"test-session".to_string()));
+        assert_eq!(groups[1][0], "wait");
+        assert!(groups[1].contains(&"--load".to_string()));
+        assert!(groups[1].contains(&"load".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_viewport_uses_set_viewport() {
+        let groups = build_agent_browser_argv_groups(
+            "s",
+            "viewport",
+            &serde_json::json!({"width": 800, "height": 600}),
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        let argv = &groups[0];
+        assert_eq!(argv[0], "set");
+        assert_eq!(argv[1], "viewport");
+        assert_eq!(argv[2], "800");
+        assert_eq!(argv[3], "600");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_unknown_action_returns_error() {
+        let result =
+            build_agent_browser_argv_groups("s", "nonexistent_action", &serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown action"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn split_resolved_binary_handles_npx_fallback() {
+        let (program, prefix) = split_resolved_binary("npx agent-browser");
+        assert_eq!(program, "npx");
+        assert_eq!(prefix, vec!["agent-browser".to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn split_resolved_binary_handles_plain_path() {
+        let (program, prefix) =
+            split_resolved_binary(r"C:\Users\u\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
+        assert!(program.ends_with("agent-browser-win32-x64.exe"));
+        assert!(prefix.is_empty());
     }
 
     #[tokio::test]
