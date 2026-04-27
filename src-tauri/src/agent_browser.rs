@@ -464,6 +464,84 @@ fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
     }
 }
 
+/// Locate a Chromium-based browser executable on Windows. agent-browser
+/// auto-detects "system Chrome" but doesn't probe Brave / Edge / per-user
+/// Chrome installs — and codemux on Windows can't ship its own Chromium
+/// without a 150 MB download per machine. This helper makes the common
+/// case (user has Brave/Chrome/Edge already installed) Just Work without
+/// `agent-browser install` being a setup gotcha.
+///
+/// Order: Brave, Chrome (system + per-user), Edge. Edge always exists on
+/// Windows 10+, so it's the safety net — if everything else is missing
+/// the user still gets a working browser pane out of the box.
+///
+/// Override: respects `CODEMUX_BROWSER_EXECUTABLE` env var if set, so
+/// power users can point at a custom build (Vivaldi, Chromium nightly,
+/// portable installs, etc.) without editing settings.
+#[cfg(target_os = "windows")]
+fn find_chromium_browser_path() -> Option<String> {
+    use std::path::PathBuf;
+
+    if let Ok(custom) = std::env::var("CODEMUX_BROWSER_EXECUTABLE") {
+        let path = PathBuf::from(&custom);
+        if path.exists() {
+            return Some(custom);
+        }
+    }
+
+    let local_appdata = std::env::var("LOCALAPPDATA").ok();
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let program_files_x86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| "C:\\Program Files (x86)".into());
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Brave (per-user first — that's where the .exe Installer puts it for
+    // a single-user install; Brave's own default).
+    if let Some(ref local) = local_appdata {
+        candidates.push(
+            format!("{local}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe").into(),
+        );
+    }
+    candidates.push(
+        format!("{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe").into(),
+    );
+
+    // Google Chrome.
+    candidates.push(format!("{program_files}\\Google\\Chrome\\Application\\chrome.exe").into());
+    candidates
+        .push(format!("{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe").into());
+    if let Some(ref local) = local_appdata {
+        candidates.push(format!("{local}\\Google\\Chrome\\Application\\chrome.exe").into());
+    }
+
+    // Microsoft Edge — preinstalled on every Windows 10+ install. Last
+    // resort but guaranteed to exist if all else fails.
+    candidates
+        .push(format!("{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe").into());
+    candidates.push(format!("{program_files}\\Microsoft\\Edge\\Application\\msedge.exe").into());
+
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Build the `--executable-path <path>` arg pair to splice into an
+/// agent-browser argv when launching a session, or an empty Vec if
+/// auto-detection found nothing (in which case agent-browser will run
+/// its own probe and emit the "Chrome not found" error to surface the
+/// gap to the user). Windows-only because the override is only needed
+/// where agent-browser's own probe misses common installs.
+#[cfg(target_os = "windows")]
+fn windows_executable_path_args() -> Vec<String> {
+    match find_chromium_browser_path() {
+        Some(path) => vec!["--executable-path".into(), path],
+        None => Vec::new(),
+    }
+}
+
 /// Argv-form sibling of `build_agent_browser_command`. Returns a list of
 /// argument vectors, one per agent-browser invocation: most actions are
 /// single-shot, but the historical `open_url` shell form was
@@ -485,8 +563,14 @@ fn build_agent_browser_argv_groups(
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank")
                 .to_string();
+            let mut open_argv: Vec<String> = vec!["open".into(), url];
+            // Auto-detect installed Brave/Chrome/Edge and pass via
+            // --executable-path so users don't need `agent-browser install`
+            // when they already have a Chromium browser on disk.
+            open_argv.extend(windows_executable_path_args());
+            open_argv.extend(["--session".into(), s.clone()]);
             vec![
-                vec!["open".into(), url, "--session".into(), s.clone()],
+                open_argv,
                 vec![
                     "wait".into(),
                     "--load".into(),
@@ -970,19 +1054,17 @@ impl AgentBrowserManager {
         }
 
         #[cfg(target_os = "windows")]
-        let output = run_agent_browser_native(
-            &bin,
-            &[
-                "open".into(),
-                "about:blank".into(),
+        let output = {
+            let mut argv: Vec<String> = vec!["open".into(), "about:blank".into()];
+            argv.extend(windows_executable_path_args());
+            argv.extend([
                 "--headless".into(),
                 "--session".into(),
                 session.to_string(),
-            ],
-            port,
-            false,
-        )
-        .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
+            ]);
+            run_agent_browser_native(&bin, &argv, port, false)
+                .map_err(|e| format!("Failed to start agent-browser: {}", e))?
+        };
         #[cfg(not(target_os = "windows"))]
         let output = std::process::Command::new("sh")
             .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
@@ -1156,13 +1238,16 @@ impl AgentBrowserManager {
         {
             let _ = run_agent_browser_native(
                 &bin,
-                &[
-                    "open".into(),
-                    "about:blank".into(),
-                    "--headless".into(),
-                    "--session".into(),
-                    session.to_string(),
-                ],
+                &{
+                    let mut argv: Vec<String> = vec!["open".into(), "about:blank".into()];
+                    argv.extend(windows_executable_path_args());
+                    argv.extend([
+                        "--headless".into(),
+                        "--session".into(),
+                        session.to_string(),
+                    ]);
+                    argv
+                },
                 port,
                 false,
             );
