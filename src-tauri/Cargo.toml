@@ -60,6 +60,15 @@ tauri-plugin-dialog = { version = "2", default-features = false, features = ["xd
 
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-dialog = { version = "2" }
+# Used only by os_input.rs Tier-3 input injection — EnumWindows,
+# QueryFullProcessImageNameW, SetCursorPos, SendInput. Already in the
+# transitive tree; the explicit dep just lets us call the functions.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 mockito = "1"

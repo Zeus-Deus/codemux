@@ -304,6 +304,7 @@ fn start_agent_exit_monitor(app: AppHandle, session_id: String, shell_pid: u32) 
 
 // ── Hook script and agent registration ──
 
+#[cfg(not(target_os = "windows"))]
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux agent lifecycle hook — notifies the hook server of agent status changes.
 # Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
