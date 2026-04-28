@@ -1433,10 +1433,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(groups.len(), 2, "open should produce open + wait groups");
-        assert_eq!(groups[0][0], "open");
-        assert!(groups[0].contains(&"https://example.com".to_string()));
-        assert!(groups[0].contains(&"--session".to_string()));
-        assert!(groups[0].contains(&"test-session".to_string()));
+
+        // `windows_executable_path_args()` may prepend a global
+        // `--executable-path <path>` pair when Chrome / Brave / Edge is
+        // detected. The GitHub `windows-latest` runner ships Edge, so on
+        // CI this is always the case; on a developer box without any
+        // supported browser installed it's empty. The contract is: any
+        // global flags must precede the `open` subcommand, otherwise clap
+        // rejects them and agent-browser exits silently (the runtime bug
+        // the argv-position fix originally addressed). Assert both that
+        // `open` is present and that any `--executable-path` precedes it.
+        let argv = &groups[0];
+        let open_pos = argv
+            .iter()
+            .position(|a| a == "open")
+            .expect("open subcommand must appear in argv");
+        if let Some(exec_pos) = argv.iter().position(|a| a == "--executable-path") {
+            assert!(
+                exec_pos < open_pos,
+                "--executable-path must precede the `open` subcommand (clap requires global flags first); argv: {:?}",
+                argv
+            );
+        }
+        assert!(argv.contains(&"https://example.com".to_string()));
+        assert!(argv.contains(&"--session".to_string()));
+        assert!(argv.contains(&"test-session".to_string()));
         assert_eq!(groups[1][0], "wait");
         assert!(groups[1].contains(&"--load".to_string()));
         assert!(groups[1].contains(&"load".to_string()));
