@@ -96,10 +96,49 @@ type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 // the provider picker until the backend exposes a capability probe.
 const ENABLE_PROVIDER_PICKER = false;
 
+/** Step 8 Stage 7 — hard cap on staged attachments. Above this we
+ *  toast and reject the next attach so prompts can't silently grow
+ *  into a token-budget cliff. The matching soft-warning copy lives
+ *  in Composer.tsx (rendering concern); this constant gates the
+ *  attach handlers. */
+const ATTACHMENT_HARD_LIMIT = 20;
+/** Step 8 Stage 7 — issue/PR fetches go stale at this age. On send,
+ *  we re-fetch any GitHub-kind attachment whose `fetchedAt` is older
+ *  so the agent always sees fresh detail (state flips, new comments)
+ *  even if the user kept the picker open for a few minutes before
+ *  hitting Enter. Lines up with the gh detail cache TTL on the Rust
+ *  side so a re-fetch is cheap when the cached value is still warm. */
+const STALE_ATTACHMENT_THRESHOLD_MS = 60_000;
+
 /** Synthetic user prompt fired when the user invokes Debug-mode
  *  cleanup. The grep pattern carries no comment-prefix so the model
  *  finds CODEMUX_DEBUG markers across every language Claude touched. */
 const CLEANUP_PROMPT = `Search for \`CODEMUX_DEBUG\` across the project and remove every line containing that marker. Also remove any surrounding debug-only scaffolding (variable declarations, imports) that were added solely to support those markers. After removing, run a final grep to verify zero matches remain.`;
+
+/** Step 8 Stage 7 — animated GIF detection. Anthropic's image API
+ *  rejects animated GIFs (only the first frame is read, and that
+ *  often produces confusing errors). We detect at attach time and
+ *  reject with a clear toast rather than letting the SDK surface a
+ *  cryptic 400. The GIF89a spec frames each animation cycle with a
+ *  Graphic Control Extension marker (`0x21 0xF9 0x04`); a static
+ *  GIF has 0–1, an animated GIF has 2+. The scan walks the entire
+ *  file but bails early on the second hit so even multi-MB animated
+ *  GIFs cost milliseconds. */
+export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
+  const bytes = new Uint8Array(buffer);
+  let frameCount = 0;
+  for (let i = 0; i < bytes.length - 3; i++) {
+    if (
+      bytes[i] === 0x21 &&
+      bytes[i + 1] === 0xf9 &&
+      bytes[i + 2] === 0x04
+    ) {
+      frameCount++;
+      if (frameCount > 1) return true;
+    }
+  }
+  return false;
+}
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
@@ -457,65 +496,148 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const rawText = draft.trim();
     if (!rawText) return;
     const plan = planSubmit({ rawText, provider, effort });
-    // Mode wrappers (Stage 4 onward) live SDK-side only — the
-    // transcript stores the unwrapped (ultrathink-only) text so users
-    // see what they typed, not the framing we layered on top.
-    // Parse `/skill-name` tokens out of the raw text and resolve their
-    // bodies against the skills registry. Unmatched tokens (typos, or
-    // skills not in the registry) silently pass through as plain prose.
-    const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
-    // Snapshot staged attachments AT submit time so the block we
-    // inject reflects exactly what the user has staged. Reading from
-    // the live store via getState() avoids stale closure bugs if a
-    // chip resolved between the last render and Enter. Step 8 Stage
-    // 2.1 — filter to attachments whose `@<basename>` token still
-    // appears in the textarea (`rawText`); deleting a token excludes
-    // its file from the prompt without an explicit chip-removal.
-    const liveSlice = useAgentChatStore.getState().threads[threadId];
-    const liveAttachments = liveSlice?.stagedAttachments ?? [];
-    const attachmentBlock = buildAttachmentBlock(
-      activeAttachments(rawText, liveAttachments),
-    );
-    // Stage 6 — images travel as native multimodal content blocks at
-    // the SDK layer, NOT inside the text body. We pass the resolved
-    // bytes through `images` on SendTurnInput; the Rust adapters
-    // translate to provider-specific shapes (Claude `image/base64`,
-    // Codex `image_url` data URI).
-    const imagePayloads = buildImagePayloads(liveAttachments);
-    const sdkText = applyAllPrefixes(
-      rawText,
-      mode,
-      effort,
-      skillBodies,
-      attachmentBlock,
-    );
     sendInFlightRef.current = true;
     setIsSending(true);
-    appendUserMessage(threadId, plan.text);
-    // Clear chips per-turn (matches the inputDraft = "" reset that
-    // appendUserMessage already does for the textarea).
-    clearStagedAttachments(threadId);
-    const input = {
-      thread_id: threadId,
-      text: sdkText,
-      images: imagePayloads,
-      model_override: null,
-      effort_override: plan.effortOverride,
-    };
-    agentChatSendTurn(provider, input).catch((err) => {
-      toast.error(`Failed to send turn: ${err}`);
-      sendInFlightRef.current = false;
-      setIsSending(false);
-    });
+    void (async () => {
+      // Stage 7 — re-fetch any GitHub-kind chip whose detail is older
+      // than STALE_ATTACHMENT_THRESHOLD_MS so the agent sees fresh
+      // state (closed → reopened, new comments, label flips). Files
+      // are read fresh by the agent itself via the Read tool, so they
+      // don't need this. Failures here are non-fatal: we log and
+      // proceed with the stale resolved content rather than abort the
+      // turn — better to send something than to hard-block on a flaky
+      // gh call.
+      try {
+        const preStale = useAgentChatStore.getState().threads[threadId];
+        const staleList = (preStale?.stagedAttachments ?? []).filter((a) => {
+          if (a.kind !== "issue" && a.kind !== "pr") return false;
+          if (a.metadata.isLoading) return false;
+          const fetchedAt = a.metadata.fetchedAt ?? 0;
+          return Date.now() - fetchedAt > STALE_ATTACHMENT_THRESHOLD_MS;
+        });
+        if (staleList.length > 0) {
+          const repoPath = cwd ?? "";
+          await Promise.all(
+            staleList.map(async (att) => {
+              try {
+                if (att.kind === "issue") {
+                  const num = Number.parseInt(att.ref.replace(/^#/, ""), 10);
+                  if (!Number.isFinite(num)) return;
+                  const detail = await getGithubIssueByPath(repoPath, num);
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: buildIssueResolvedContent(detail),
+                    metadata: {
+                      ...att.metadata,
+                      label: `#${detail.number} ${detail.title}`,
+                      state: (detail.state.toLowerCase() === "closed"
+                        ? "closed"
+                        : "open") as "open" | "closed",
+                      fetchedAt: Date.now(),
+                    },
+                  });
+                } else {
+                  const num = Number.parseInt(att.ref.replace(/^!/, ""), 10);
+                  if (!Number.isFinite(num)) return;
+                  const fullDiff = att.metadata.expandFullDiff === true;
+                  const [detail, diff] = await Promise.all([
+                    getGithubPrByPath(repoPath, num),
+                    getGithubPrDiffByPath(repoPath, num, fullDiff),
+                  ]);
+                  const detailUpper = detail.state.toUpperCase();
+                  const resolvedState: "open" | "closed" | "merged" | "draft" =
+                    detailUpper === "MERGED"
+                      ? "merged"
+                      : detailUpper === "CLOSED"
+                        ? "closed"
+                        : detail.is_draft
+                          ? "draft"
+                          : "open";
+                  updateStagedAttachment(threadId, att.id, {
+                    resolvedContent: buildPrResolvedContent(detail, diff, {
+                      fullDiff,
+                    }),
+                    metadata: {
+                      ...att.metadata,
+                      label: `#${detail.number} ${detail.title}`,
+                      state: resolvedState,
+                      fetchedAt: Date.now(),
+                    },
+                  });
+                }
+              } catch (err) {
+                console.warn(
+                  `[agent-chat] stale re-fetch failed for ${att.ref}`,
+                  err,
+                );
+              }
+            }),
+          );
+        }
+      } catch (err) {
+        console.warn("[agent-chat] stale re-fetch outer failure", err);
+      }
+      // Mode wrappers (Stage 4 onward) live SDK-side only — the
+      // transcript stores the unwrapped (ultrathink-only) text so users
+      // see what they typed, not the framing we layered on top.
+      // Parse `/skill-name` tokens out of the raw text and resolve their
+      // bodies against the skills registry. Unmatched tokens (typos, or
+      // skills not in the registry) silently pass through as plain prose.
+      const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
+      // Snapshot staged attachments AT submit time so the block we
+      // inject reflects exactly what the user has staged. Reading from
+      // the live store via getState() avoids stale closure bugs if a
+      // chip resolved between the last render and Enter. Step 8 Stage
+      // 2.1 — filter to attachments whose `@<basename>` token still
+      // appears in the textarea (`rawText`); deleting a token excludes
+      // its file from the prompt without an explicit chip-removal.
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      const liveAttachments = liveSlice?.stagedAttachments ?? [];
+      const attachmentBlock = buildAttachmentBlock(
+        activeAttachments(rawText, liveAttachments),
+      );
+      // Stage 6 — images travel as native multimodal content blocks at
+      // the SDK layer, NOT inside the text body. We pass the resolved
+      // bytes through `images` on SendTurnInput; the Rust adapters
+      // translate to provider-specific shapes (Claude `image/base64`,
+      // Codex `image_url` data URI).
+      const imagePayloads = buildImagePayloads(liveAttachments);
+      const sdkText = applyAllPrefixes(
+        rawText,
+        mode,
+        effort,
+        skillBodies,
+        attachmentBlock,
+      );
+      appendUserMessage(threadId, plan.text);
+      // Clear chips per-turn (matches the inputDraft = "" reset that
+      // appendUserMessage already does for the textarea).
+      clearStagedAttachments(threadId);
+      const input = {
+        thread_id: threadId,
+        text: sdkText,
+        images: imagePayloads,
+        model_override: null,
+        effort_override: plan.effortOverride,
+      };
+      try {
+        await agentChatSendTurn(provider, input);
+      } catch (err) {
+        toast.error(`Failed to send turn: ${err}`);
+        sendInFlightRef.current = false;
+        setIsSending(false);
+      }
+    })();
   }, [
     threadId,
     draft,
     provider,
     effort,
     mode,
+    cwd,
     skillsRegistry,
     appendUserMessage,
     clearStagedAttachments,
+    updateStagedAttachment,
   ]);
 
   /** Step 8 Stage 2 — orchestrates the chip lifecycle when the user
@@ -527,6 +649,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAttachFile = useCallback(
     (match: FileMatch) => {
       if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      if ((liveSlice?.stagedAttachments.length ?? 0) >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
@@ -550,6 +679,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               label: filename,
               lineCount: info.lineCount,
               bytes: info.bytes,
+              isTruncated: info.truncated,
               isLoading: false,
               fetchedAt: Date.now(),
             },
@@ -575,6 +705,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAttachFolder = useCallback(
     (match: FolderMatch) => {
       if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      if ((liveSlice?.stagedAttachments.length ?? 0) >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
@@ -618,6 +755,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAttachIssue = useCallback(
     (summary: GitHubIssue) => {
       if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      if ((liveSlice?.stagedAttachments.length ?? 0) >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
@@ -675,6 +819,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAttachPr = useCallback(
     (summary: PullRequestInfo) => {
       if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      if ((liveSlice?.stagedAttachments.length ?? 0) >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
@@ -741,6 +892,75 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, cwd, addStagedAttachment, updateStagedAttachment],
   );
 
+  /** Step 8 Stage 7 — flip the `expandFullDiff` flag on a staged PR
+   *  attachment and re-resolve its content with the matching diff
+   *  shape. The chip's expand affordance calls this; the resolved
+   *  body the agent sees swaps from `### Files changed (N)` to
+   *  `### Diff (full)` (or vice-versa). The detail fetch is cached
+   *  on the Rust side so the second call after a toggle is cheap;
+   *  the diff fetch with `full=true` is uncached but capped at 100KB. */
+  const handleToggleExpandPr = useCallback(
+    (attachmentId: string) => {
+      if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      const att = liveSlice?.stagedAttachments.find((a) => a.id === attachmentId);
+      if (!att || att.kind !== "pr") return;
+      const num = Number.parseInt(att.ref.replace(/^!/, ""), 10);
+      if (!Number.isFinite(num)) return;
+      const currentLabel = att.metadata.label;
+      const currentState = att.metadata.state;
+      const newExpand = !att.metadata.expandFullDiff;
+      updateStagedAttachment(threadId, attachmentId, {
+        metadata: {
+          ...att.metadata,
+          expandFullDiff: newExpand,
+          isLoading: true,
+        },
+      });
+      void (async () => {
+        try {
+          const repoPath = cwd ?? "";
+          const [detail, diff] = await Promise.all([
+            getGithubPrByPath(repoPath, num),
+            getGithubPrDiffByPath(repoPath, num, newExpand),
+          ]);
+          const detailUpper = detail.state.toUpperCase();
+          const resolvedState: "open" | "closed" | "merged" | "draft" =
+            detailUpper === "MERGED"
+              ? "merged"
+              : detailUpper === "CLOSED"
+                ? "closed"
+                : detail.is_draft
+                  ? "draft"
+                  : "open";
+          updateStagedAttachment(threadId, attachmentId, {
+            resolvedContent: buildPrResolvedContent(detail, diff, {
+              fullDiff: newExpand,
+            }),
+            metadata: {
+              label: `#${detail.number} ${detail.title}`,
+              state: resolvedState,
+              expandFullDiff: newExpand,
+              fetchedAt: Date.now(),
+              isLoading: false,
+            },
+          });
+        } catch (err) {
+          updateStagedAttachment(threadId, attachmentId, {
+            metadata: {
+              label: currentLabel,
+              state: currentState,
+              expandFullDiff: newExpand,
+              isLoading: false,
+              error: String(err),
+            },
+          });
+        }
+      })();
+    },
+    [threadId, cwd, updateStagedAttachment],
+  );
+
   /** Step 8 Stage 6 — image attachment. Validates the MIME against
    *  the allowlist (png/jpeg/webp/gif), stages a chip with
    *  isLoading=true, then resolves with the decoded bytes. The
@@ -750,6 +970,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleAttachImage = useCallback(
     async (file: File) => {
       if (!threadId) return;
+      const liveSlice = useAgentChatStore.getState().threads[threadId];
+      if ((liveSlice?.stagedAttachments.length ?? 0) >= ATTACHMENT_HARD_LIMIT) {
+        toast.error("Attachment limit reached", {
+          description: `Remove some attachments before adding more (max ${ATTACHMENT_HARD_LIMIT}).`,
+        });
+        return;
+      }
       const allowed = [
         "image/png",
         "image/jpeg",
@@ -761,6 +988,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           description: `${file.type || "unknown type"} — supported: png, jpeg, webp, gif`,
         });
         return;
+      }
+      // Stage 7 — animated GIFs are silently rejected by Anthropic's
+      // image API. Detect at attach time so the user sees a clear
+      // toast instead of an opaque 400 at send time. Static GIFs
+      // (single frame) pass through unchanged.
+      let resolvedBuffer: ArrayBuffer | null = null;
+      if (file.type === "image/gif") {
+        try {
+          resolvedBuffer = await file.arrayBuffer();
+          if (detectAnimatedGif(resolvedBuffer)) {
+            toast.error("Animated GIFs not supported", {
+              description: "Save as PNG or JPEG instead.",
+            });
+            return;
+          }
+        } catch (err) {
+          toast.error("Failed to read image", { description: String(err) });
+          return;
+        }
       }
       const id =
         typeof crypto !== "undefined" && "randomUUID" in crypto
@@ -778,7 +1024,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         },
       });
       try {
-        const buffer = await file.arrayBuffer();
+        const buffer = resolvedBuffer ?? (await file.arrayBuffer());
         const bytes = new Uint8Array(buffer);
         updateStagedAttachment(threadId, id, {
           resolvedImage: { mime: file.type, bytes },
@@ -1488,6 +1734,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!threadId) return;
         removeStagedAttachment(threadId, id);
       }}
+      onToggleExpandPr={handleToggleExpandPr}
       onAttachFile={handleAttachFile}
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}

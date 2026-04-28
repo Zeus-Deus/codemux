@@ -53,6 +53,14 @@ export interface AttachmentMetadata {
   isLoading?: boolean;
   /** Display an error indicator on the chip (e.g. fetch failed). */
   error?: string;
+  /** Step 8 Stage 7 — file-only: backend reported `truncated: true`
+   *  (preview + outline rather than full content). Drives the
+   *  "first 50/N L" indicator on the chip. */
+  isTruncated?: boolean;
+  /** Step 8 Stage 7 — pr-only: user clicked the expand affordance to
+   *  swap from name-only diff to the full unified diff. Toggling this
+   *  triggers a re-fetch + re-render of the resolved content. */
+  expandFullDiff?: boolean;
 }
 
 export interface Attachment {

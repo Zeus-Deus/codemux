@@ -233,4 +233,171 @@ describe("AttachmentChip", () => {
       container.querySelector('[data-attachment-kind="file"]'),
     ).not.toBeNull();
   });
+
+  // ──────────────── Stage 7 polish ────────────────
+
+  describe("Stage 7 — truncation indicator", () => {
+    it("renders 'first 50/N L' when metadata.isTruncated is true", () => {
+      const { getByTestId, queryByText } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: {
+              label: "huge.ts",
+              lineCount: 3000,
+              isTruncated: true,
+            },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByTestId("attachment-chip-truncation").textContent).toBe(
+        "first 50/3000L",
+      );
+      // The plain "3000L" line-count slot is suppressed when truncated
+      // so we don't double-render the line count.
+      expect(queryByText("3000L")).toBeNull();
+    });
+
+    it("renders the plain line-count slot when not truncated", () => {
+      const { getByText, queryByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            metadata: { label: "small.ts", lineCount: 421 },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByText("421L")).toBeInTheDocument();
+      expect(queryByTestId("attachment-chip-truncation")).toBeNull();
+    });
+
+    it("hides the truncation slot for non-file kinds even when isTruncated is set", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "folder",
+            metadata: {
+              label: "src",
+              lineCount: 100,
+              isTruncated: true,
+            },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(queryByTestId("attachment-chip-truncation")).toBeNull();
+    });
+  });
+
+  describe("Stage 7 — PR expand affordance", () => {
+    function makePrAttachment(overrides: Partial<Attachment> = {}): Attachment {
+      return {
+        id: "pr-1",
+        kind: "pr",
+        ref: "!42",
+        metadata: { label: "#42 dark mode", state: "open" },
+        ...overrides,
+      };
+    }
+
+    it("renders the expand button only when kind is pr and onToggleExpand is wired", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip
+          attachment={makePrAttachment()}
+          onRemove={vi.fn()}
+          onToggleExpand={vi.fn()}
+        />,
+      );
+      expect(queryByTestId("attachment-chip-expand")).not.toBeNull();
+    });
+
+    it("omits the expand button when onToggleExpand is not provided", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip
+          attachment={makePrAttachment()}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(queryByTestId("attachment-chip-expand")).toBeNull();
+    });
+
+    it("omits the expand button on non-PR kinds", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({ kind: "file" })}
+          onRemove={vi.fn()}
+          onToggleExpand={vi.fn()}
+        />,
+      );
+      expect(queryByTestId("attachment-chip-expand")).toBeNull();
+    });
+
+    it("calls onToggleExpand with the attachment id and stops propagation", () => {
+      const onToggle = vi.fn();
+      const onChipClick = vi.fn();
+      const { getByTestId } = render(
+        <div onClick={onChipClick}>
+          <AttachmentChip
+            attachment={makePrAttachment()}
+            onRemove={vi.fn()}
+            onToggleExpand={onToggle}
+          />
+        </div>,
+      );
+      fireEvent.click(getByTestId("attachment-chip-expand"));
+      expect(onToggle).toHaveBeenCalledWith("pr-1");
+      expect(onChipClick).not.toHaveBeenCalled();
+    });
+
+    it("flips aria-pressed and tooltip copy when expandFullDiff is true", () => {
+      const { getByTestId } = render(
+        <AttachmentChip
+          attachment={makePrAttachment({
+            metadata: {
+              label: "#42 dark mode",
+              state: "open",
+              expandFullDiff: true,
+            },
+          })}
+          onRemove={vi.fn()}
+          onToggleExpand={vi.fn()}
+        />,
+      );
+      const btn = getByTestId("attachment-chip-expand");
+      expect(btn.getAttribute("aria-pressed")).toBe("true");
+      expect(btn.getAttribute("aria-label")).toBe("Show filenames only");
+    });
+
+    it("hides the expand button while loading so the user can't double-toggle", () => {
+      const { queryByTestId } = render(
+        <AttachmentChip
+          attachment={makePrAttachment({
+            metadata: {
+              label: "#42 dark mode",
+              state: "open",
+              isLoading: true,
+            },
+          })}
+          onRemove={vi.fn()}
+          onToggleExpand={vi.fn()}
+        />,
+      );
+      expect(queryByTestId("attachment-chip-expand")).toBeNull();
+    });
+  });
+
+  describe("Stage 7 — token-cost tooltip wrapper", () => {
+    it("wraps the chip in a Radix tooltip trigger", () => {
+      // Radix attaches `data-slot="tooltip-trigger"` to the trigger,
+      // and the trigger forwards refs onto the chip via asChild. We
+      // assert the trigger is present rather than opening the tooltip
+      // (which requires a hover gesture).
+      const { container } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+      );
+      expect(
+        container.querySelector('[data-slot="tooltip-trigger"]'),
+      ).not.toBeNull();
+    });
+  });
 });

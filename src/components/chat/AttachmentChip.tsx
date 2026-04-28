@@ -1,4 +1,5 @@
 import {
+  ChevronsUpDown,
   CircleDot,
   File as FileIcon,
   FolderOpen,
@@ -9,6 +10,12 @@ import {
   type LucideIcon,
 } from "lucide-react";
 
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { Attachment, AttachmentKind } from "@/stores/agent-chat-store";
 
@@ -69,9 +76,37 @@ function classNameForAttachment(attachment: Attachment): string {
   return KIND_CONFIG[attachment.kind].className;
 }
 
+/** Step 8 Stage 7 — rough token estimate for the tooltip preview.
+ *  Heuristic: bytes/4 for code, bytes/5 for prose. Image gets a flat
+ *  ~255 token estimate (3 tiles at ~85 tokens/tile per Claude's
+ *  formula) — exact tile count is provider-specific so the number
+ *  is intentionally a ballpark, not authoritative. Returns 0 when
+ *  the attachment hasn't resolved yet so the tooltip can swap in a
+ *  loading message. */
+function estimateTokens(att: Attachment): number {
+  if (att.kind === "image" && att.resolvedImage) {
+    return 255;
+  }
+  if (att.resolvedContent) {
+    const bytes = new TextEncoder().encode(att.resolvedContent).length;
+    const label = att.metadata.label ?? "";
+    const isCode =
+      att.kind === "file" &&
+      ["ts", "tsx", "rs", "py", "go", "js", "jsx", "java", "c", "cpp", "h"].some(
+        (ext) => label.toLowerCase().endsWith(`.${ext}`),
+      );
+    return Math.round(bytes / (isCode ? 4 : 5));
+  }
+  return 0;
+}
+
 interface AttachmentChipProps {
   attachment: Attachment;
   onRemove: (id: string) => void;
+  /** Step 8 Stage 7 — PR-only: toggle the full-diff flag on the
+   *  attachment. Wired by AgentChatPane.tsx; the chip just renders
+   *  the affordance. Optional so non-PR call sites stay terse. */
+  onToggleExpand?: (id: string) => void;
 }
 
 /** Compact chip rendered in the strip above the composer textarea
@@ -81,12 +116,35 @@ interface AttachmentChipProps {
  *  Stage 1 only exercises `kind: "file"` end-to-end — the other kinds
  *  render via the same component so Stages 2–6 can flip their flows
  *  on without touching this file. */
-export function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
+export function AttachmentChip({
+  attachment,
+  onRemove,
+  onToggleExpand,
+}: AttachmentChipProps) {
   const Icon = KIND_CONFIG[attachment.kind].icon;
   const { metadata } = attachment;
+  const isTruncatedFile =
+    attachment.kind === "file" &&
+    metadata.isTruncated === true &&
+    typeof metadata.lineCount === "number";
   const lineCountLabel =
-    typeof metadata.lineCount === "number" ? `${metadata.lineCount}L` : null;
-  return (
+    typeof metadata.lineCount === "number" && !isTruncatedFile
+      ? `${metadata.lineCount}L`
+      : null;
+  const truncationLabel = isTruncatedFile
+    ? `first 50/${metadata.lineCount}L`
+    : null;
+  const tokenEstimate = estimateTokens(attachment);
+  const showExpand =
+    attachment.kind === "pr" &&
+    typeof onToggleExpand === "function" &&
+    !metadata.isLoading;
+  const expandActive = metadata.expandFullDiff === true;
+  const expandTooltip = expandActive
+    ? "Show filenames only"
+    : "Show full diff";
+
+  const chip = (
     <div
       className={cn(
         "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs",
@@ -95,6 +153,8 @@ export function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
       role="status"
       aria-label={`${attachment.kind} attachment: ${metadata.label}`}
       data-attachment-kind={attachment.kind}
+      data-truncated={isTruncatedFile || undefined}
+      data-expanded={expandActive || undefined}
     >
       {metadata.isLoading ? (
         <Loader2
@@ -111,6 +171,15 @@ export function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
           {lineCountLabel}
         </span>
       )}
+      {truncationLabel && (
+        <span
+          className="text-[9px] opacity-60"
+          aria-hidden
+          data-testid="attachment-chip-truncation"
+        >
+          {truncationLabel}
+        </span>
+      )}
       {metadata.error && (
         <span
           className="text-destructive text-[10px]"
@@ -119,6 +188,25 @@ export function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
         >
           !
         </span>
+      )}
+      {showExpand && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onToggleExpand?.(attachment.id);
+          }}
+          className={cn(
+            "ml-0.5 rounded p-0.5 hover:bg-foreground/10",
+            expandActive && "bg-foreground/10",
+          )}
+          aria-label={expandTooltip}
+          aria-pressed={expandActive}
+          title={expandTooltip}
+          data-testid="attachment-chip-expand"
+        >
+          <ChevronsUpDown className="h-2.5 w-2.5" />
+        </button>
       )}
       <button
         type="button"
@@ -132,5 +220,45 @@ export function AttachmentChip({ attachment, onRemove }: AttachmentChipProps) {
         <X className="h-2.5 w-2.5" />
       </button>
     </div>
+  );
+
+  return (
+    <TooltipProvider delayDuration={250}>
+      <Tooltip>
+        <TooltipTrigger asChild>{chip}</TooltipTrigger>
+        <TooltipContent
+          side="top"
+          data-testid="attachment-chip-tooltip"
+          className="flex-col items-start gap-0.5 py-2"
+        >
+          <div className="font-mono text-[11px] truncate max-w-[260px]">
+            {metadata.label}
+          </div>
+          <div className="text-[10px] opacity-80">
+            {metadata.isLoading
+              ? "Resolving…"
+              : tokenEstimate > 0
+                ? `~${tokenEstimate.toLocaleString()} tokens`
+                : "—"}
+          </div>
+          {attachment.kind === "file" && typeof metadata.lineCount === "number" && (
+            <div className="text-[10px] opacity-70">
+              {metadata.lineCount.toLocaleString()} lines
+              {typeof metadata.bytes === "number"
+                ? ` · ${metadata.bytes.toLocaleString()} bytes`
+                : ""}
+            </div>
+          )}
+          {attachment.kind === "image" && typeof metadata.bytes === "number" && (
+            <div className="text-[10px] opacity-70">
+              {(metadata.bytes / 1024).toLocaleString(undefined, {
+                maximumFractionDigits: 1,
+              })}{" "}
+              KB
+            </div>
+          )}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }

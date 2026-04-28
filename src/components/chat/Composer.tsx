@@ -74,6 +74,14 @@ const MENTION_FETCH_LIMIT = 20;
  *  search (search lives on `@`). 30 entries fits the popup's max-h
  *  cap with room to scroll. */
 const ATTACH_BROWSE_LIMIT = 30;
+/** Step 8 Stage 7 — soft / hard caps for the staged-attachment list.
+ *  The pane handlers reject adds beyond the hard cap with a toast;
+ *  the composer surfaces the warning copy so the user knows where
+ *  they sit relative to those thresholds. Mirrors the constants in
+ *  AgentChatPane.tsx — kept in sync by hand because there's no other
+ *  shared module owning these values. */
+const ATTACHMENT_SOFT_LIMIT = 10;
+const ATTACHMENT_HARD_LIMIT = 20;
 
 /** Views the `+` popup can show. `main` lists categories +
  *  navigation nudges; `file` / `folder` list browsable rows that
@@ -121,6 +129,11 @@ interface Props {
   /** Step 8 Stage 1 — chip removal callback. Required for chips to be
    *  interactive; if omitted, the X button is a no-op. */
   onRemoveAttachment?: (attachmentId: string) => void;
+  /** Step 8 Stage 7 — PR-only: toggles the staged PR's `expandFullDiff`
+   *  flag, swapping its resolved content from name-only to full diff
+   *  (or vice-versa). The chip surfaces the affordance; this prop just
+   *  forwards the click. Optional so non-PR call sites stay terse. */
+  onToggleExpandPr?: (attachmentId: string) => void;
   /** Step 8 Stage 2 — invoked when the user picks a file from the `@`
    *  mention popup OR the `+ → File…` browser. The Composer inserts
    *  the inline `@<basename>` token; the parent stages the chip +
@@ -201,6 +214,7 @@ export function Composer({
   zone1Override = null,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
+  onToggleExpandPr,
   onAttachFile,
   onAttachFolder,
   onAttachIssue,
@@ -1234,8 +1248,24 @@ export function Composer({
     }
   }, []);
 
+  // Stage 7 — visual drop-target feedback. Counts enters/leaves so
+  // moving across child elements doesn't flicker the highlight on
+  // and off. Only counts file drags; ignores text/internal drags so
+  // the highlight never fires on selecting text in the textarea.
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    setDragDepth((d) => d + 1);
+  }, []);
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    setDragDepth((d) => Math.max(0, d - 1));
+  }, []);
+
   const handleDrop = useCallback(
     async (e: React.DragEvent) => {
+      // Always reset the drag highlight on drop, regardless of whether
+      // the payload is something we can attach.
+      setDragDepth(0);
       if (!onAttachImage) return;
       const files = Array.from(e.dataTransfer?.files ?? []);
       const imageFiles = files.filter((f) => f.type.startsWith("image/"));
@@ -1260,6 +1290,25 @@ export function Composer({
     [stagedAttachments],
   );
   const showImageSizeWarning = totalImageBytes > 5 * 1024 * 1024;
+
+  // Step 8 Stage 7 — soft warn at SOFT_LIMIT, hard cap at HARD_LIMIT.
+  // The pane handlers enforce HARD_LIMIT at attach time; here we just
+  // surface the "you're getting close" / "at the limit" copy so the
+  // user can self-correct before the next add bounces.
+  const stagedCount = stagedAttachments.length;
+  const showCountSoftWarning =
+    stagedCount >= ATTACHMENT_SOFT_LIMIT && stagedCount < ATTACHMENT_HARD_LIMIT;
+  const showCountHardWarning = stagedCount >= ATTACHMENT_HARD_LIMIT;
+
+  // Step 8 Stage 7 — drag-over state drives the wrapper's ring +
+  // background tint so the user gets a visible "drop here" target.
+  // Using a counter (rather than a bool) sidesteps the standard
+  // dragenter/dragleave glitch where moving over a child element
+  // fires `dragleave` on the parent before `dragenter` on the child:
+  // every enter increments, every leave decrements, and the visual
+  // is on whenever the count is > 0.
+  const [dragDepth, setDragDepth] = useState(0);
+  const isDragging = dragDepth > 0;
 
   const canSubmit = sessionReady && !streaming && draft.trim().length > 0;
 
@@ -1489,12 +1538,17 @@ export function Composer({
               </div>
             )}
         <div
+          data-testid="composer-wrapper"
+          data-dragging={isDragging || undefined}
           onDragOver={handleDragOver}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           className={cn(
             "relative",
             "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
-            "transition-shadow",
+            "transition-all",
+            isDragging && "ring-2 ring-primary bg-primary/5",
           )}
         >
           {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`
@@ -1612,7 +1666,9 @@ export function Composer({
               the `+ Mode` dropdown was retired in favour of the
               unified `+` popup. */}
           {(mode !== "default" ||
-            stagedAttachments.some((a) => a.kind === "image")) && (
+            stagedAttachments.some(
+              (a) => a.kind === "image" || a.kind === "pr",
+            )) && (
             <div
               data-testid="composer-attachment-strip"
               className="flex flex-wrap gap-1.5 px-3 pt-2"
@@ -1624,12 +1680,17 @@ export function Composer({
                 />
               )}
               {stagedAttachments
-                .filter((a) => a.kind === "image")
+                .filter((a) => a.kind === "image" || a.kind === "pr")
                 .map((attachment) => (
                   <AttachmentChip
                     key={attachment.id}
                     attachment={attachment}
                     onRemove={(id) => onRemoveAttachment?.(id)}
+                    onToggleExpand={
+                      attachment.kind === "pr" && onToggleExpandPr
+                        ? (id) => onToggleExpandPr(id)
+                        : undefined
+                    }
                   />
                 ))}
             </div>
@@ -1646,6 +1707,26 @@ export function Composer({
             >
               Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
               — consider reducing for faster requests
+            </div>
+          )}
+          {/* Step 8 Stage 7 — soft warning at the SOFT_LIMIT line so
+              the user can self-trim before the hard cap blocks the
+              next add. The hard-cap copy renders separately below. */}
+          {showCountSoftWarning && (
+            <div
+              data-testid="composer-attachment-count-warning"
+              className="px-3 pt-1 text-[10px] text-warning"
+            >
+              {stagedCount} attachments — consider trimming for cleaner prompts
+            </div>
+          )}
+          {showCountHardWarning && (
+            <div
+              data-testid="composer-attachment-count-hardcap"
+              className="px-3 pt-1 text-[10px] text-destructive"
+            >
+              {stagedCount} attachments — limit reached. Remove some to add
+              more.
             </div>
           )}
           <div className="relative">
