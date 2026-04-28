@@ -78,13 +78,16 @@ export interface SessionStartInput {
   extraArgs?: Record<string, string | null>;
 }
 
-/** Parameters for `send-turn`. Images are omitted for now — the UI
- *  does not yet need them. */
+/** Parameters for `send-turn`. */
 export interface SendTurnInput {
   /** User text. */
   text: string;
   /** Per-turn model override (falls back to the session default). */
   modelOverride?: string;
+  /** Inline image attachments. Bytes arrive base64-encoded so the
+   *  JSON-RPC frame stays text-only; this matches what the Anthropic
+   *  SDK consumes for `image/base64` content blocks. */
+  images?: Array<{ mediaType: string; dataBase64: string }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -361,11 +364,31 @@ export class ClaudeSession {
       }
     }
     const preparedText = applyClaudePromptEffortPrefix(input.text, this.effort);
+    // Stage 6 — when images are attached we build a multi-block
+    // content array per Anthropic's vision spec: image blocks come
+    // BEFORE the text block ("describe these images" pattern). The
+    // text-only fast path keeps the string-content shape so existing
+    // unit tests that match on `content === text` stay green.
+    const images = input.images ?? [];
+    const content =
+      images.length === 0
+        ? preparedText
+        : [
+            ...images.map((img) => ({
+              type: "image" as const,
+              source: {
+                type: "base64" as const,
+                media_type: img.mediaType,
+                data: img.dataBase64,
+              },
+            })),
+            { type: "text" as const, text: preparedText },
+          ];
     const msg: SDKUserMessage = {
       type: "user",
       message: {
         role: "user",
-        content: preparedText,
+        content: content as SDKUserMessage["message"]["content"],
       },
       parent_tool_use_id: null,
     };

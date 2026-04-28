@@ -4,6 +4,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
 } from "./attachment-block";
@@ -492,5 +493,101 @@ describe("buildPrResolvedContent", () => {
     const block = buildAttachmentBlock([att]);
     expect(block).toContain("## Pull Request #42 Add dark mode [open]");
     expect(block).toContain("State: OPEN");
+  });
+});
+
+describe("buildImagePayloads (Step 8 Stage 6)", () => {
+  // The wire shape `agent_chat_send_turn` expects: each entry is
+  // `{ data: number[], media_type: string }`. Bytes ride as a number
+  // array because Tauri's IPC layer can't carry Uint8Array directly;
+  // the Rust side reads it back into `Vec<u8>`.
+  function makeImageAttachment(
+    overrides: Partial<Attachment> = {},
+  ): Attachment {
+    return {
+      id: "img-1",
+      kind: "image",
+      ref: "image:img-1",
+      metadata: { label: "screenshot.png" },
+      resolvedImage: {
+        mime: "image/png",
+        bytes: new Uint8Array([1, 2, 3, 4]),
+      },
+      ...overrides,
+    };
+  }
+
+  it("returns empty array when no attachments are images", () => {
+    const file: Attachment = {
+      id: "f",
+      kind: "file",
+      ref: "x.ts",
+      metadata: { label: "x.ts" },
+      resolvedContent: "alpha",
+    };
+    expect(buildImagePayloads([file])).toEqual([]);
+  });
+
+  it("converts resolved image bytes to a numeric Vec<u8>-shaped payload", () => {
+    const out = buildImagePayloads([makeImageAttachment()]);
+    expect(out).toEqual([
+      { data: [1, 2, 3, 4], media_type: "image/png" },
+    ]);
+  });
+
+  it("preserves order across multiple resolved images", () => {
+    const a = makeImageAttachment({
+      id: "a",
+      resolvedImage: {
+        mime: "image/png",
+        bytes: new Uint8Array([1]),
+      },
+    });
+    const b = makeImageAttachment({
+      id: "b",
+      resolvedImage: {
+        mime: "image/jpeg",
+        bytes: new Uint8Array([2]),
+      },
+    });
+    const out = buildImagePayloads([a, b]);
+    expect(out).toEqual([
+      { data: [1], media_type: "image/png" },
+      { data: [2], media_type: "image/jpeg" },
+    ]);
+  });
+
+  it("skips images that are still loading (no resolvedImage)", () => {
+    // A half-resolved chip would crash the SDK call if we forwarded
+    // it. Filter it out here so the user can keep typing while the
+    // arrayBuffer() promise settles.
+    const loading: Attachment = {
+      id: "loading",
+      kind: "image",
+      ref: "image:loading",
+      metadata: { label: "pasting…", isLoading: true },
+    };
+    expect(buildImagePayloads([loading])).toEqual([]);
+  });
+
+  it("ignores non-image attachments entirely", () => {
+    const file: Attachment = {
+      id: "f",
+      kind: "file",
+      ref: "x.ts",
+      metadata: { label: "x.ts" },
+      resolvedContent: "alpha",
+    };
+    const folder: Attachment = {
+      id: "fo",
+      kind: "folder",
+      ref: "src",
+      metadata: { label: "src" },
+      resolvedContent: "tree",
+    };
+    const img = makeImageAttachment();
+    const out = buildImagePayloads([file, folder, img]);
+    expect(out).toHaveLength(1);
+    expect(out[0]?.media_type).toBe("image/png");
   });
 });

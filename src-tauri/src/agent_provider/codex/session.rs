@@ -315,6 +315,7 @@ impl CodexSession {
     pub async fn send_turn(
         &self,
         text: String,
+        images: Vec<crate::agent_provider::ImageInput>,
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
@@ -335,12 +336,30 @@ impl CodexSession {
             });
         }
 
+        // Codex's `turn/start` accepts a heterogeneous input array.
+        // The Responses-style format places images BEFORE text (per
+        // OpenAI's "describe these images" pattern) so the model has
+        // visual context anchored to the prompt that follows.
+        // Bytes are encoded as `data:` URIs inline — Codex's
+        // app-server doesn't expose a separate file-upload API, so
+        // base64-in-URL is the canonical local-bytes path.
+        use base64::Engine;
+        let mut input_items: Vec<TurnInputItem> = Vec::with_capacity(images.len() + 1);
+        for img in images {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(&img.data);
+            input_items.push(TurnInputItem::Image {
+                url: format!("data:{};base64,{}", img.media_type, encoded),
+            });
+        }
+        input_items.push(TurnInputItem::Text {
+            text,
+            text_elements: vec![],
+        });
+
         let params = TurnStartParams {
             thread_id: codex_thread_id,
-            input: vec![TurnInputItem::Text {
-                text,
-                text_elements: vec![],
-            }],
+            input: input_items,
             model: model_override.or(model_default),
             service_tier: None,
             effort: effort_override,

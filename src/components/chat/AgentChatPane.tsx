@@ -12,6 +12,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
@@ -475,6 +476,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const attachmentBlock = buildAttachmentBlock(
       activeAttachments(rawText, liveAttachments),
     );
+    // Stage 6 — images travel as native multimodal content blocks at
+    // the SDK layer, NOT inside the text body. We pass the resolved
+    // bytes through `images` on SendTurnInput; the Rust adapters
+    // translate to provider-specific shapes (Claude `image/base64`,
+    // Codex `image_url` data URI).
+    const imagePayloads = buildImagePayloads(liveAttachments);
     const sdkText = applyAllPrefixes(
       rawText,
       mode,
@@ -491,6 +498,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const input = {
       thread_id: threadId,
       text: sdkText,
+      images: imagePayloads,
       model_override: null,
       effort_override: plan.effortOverride,
     };
@@ -731,6 +739,68 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       })();
     },
     [threadId, cwd, addStagedAttachment, updateStagedAttachment],
+  );
+
+  /** Step 8 Stage 6 — image attachment. Validates the MIME against
+   *  the allowlist (png/jpeg/webp/gif), stages a chip with
+   *  isLoading=true, then resolves with the decoded bytes. The
+   *  resolved bytes are kept in-memory only (`resolvedImage` is
+   *  excluded from persistence) so a session restart re-prompts the
+   *  user to re-paste. */
+  const handleAttachImage = useCallback(
+    async (file: File) => {
+      if (!threadId) return;
+      const allowed = [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+      ];
+      if (!allowed.includes(file.type)) {
+        toast.error("Image type not supported", {
+          description: `${file.type || "unknown type"} — supported: png, jpeg, webp, gif`,
+        });
+        return;
+      }
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const label = file.name || `pasted-image-${Date.now()}.png`;
+      addStagedAttachment(threadId, {
+        id,
+        kind: "image",
+        ref: `image:${id}`,
+        metadata: {
+          label,
+          bytes: file.size,
+          isLoading: true,
+        },
+      });
+      try {
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        updateStagedAttachment(threadId, id, {
+          resolvedImage: { mime: file.type, bytes },
+          metadata: {
+            label,
+            bytes: file.size,
+            isLoading: false,
+            fetchedAt: Date.now(),
+          },
+        });
+      } catch (err) {
+        updateStagedAttachment(threadId, id, {
+          metadata: {
+            label,
+            bytes: file.size,
+            isLoading: false,
+            error: String(err),
+          },
+        });
+      }
+    },
+    [threadId, addStagedAttachment, updateStagedAttachment],
   );
 
   // Clear the optimistic send flag the moment the backend
@@ -1422,6 +1492,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
+      onAttachImage={handleAttachImage}
+      modelSupportsImages={activeModel?.supports_images ?? false}
       isGithubRepo={isGithubRepo}
       ghAuthenticated={ghAuthenticated}
       onDraftChange={(next) => {

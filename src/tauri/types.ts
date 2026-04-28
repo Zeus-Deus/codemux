@@ -580,6 +580,10 @@ export interface ChatModelInfo {
   supports_adaptive_thinking: boolean;
   supports_thinking_toggle: boolean;
   supports_fast_mode: boolean;
+  /** Step 8 Stage 6 — true when the model accepts image attachments.
+   *  Drives the `+ → Image…` enable state and whether the composer's
+   *  paste/drop handlers stage attachments at all. */
+  supports_images: boolean;
 }
 
 export interface PermissionModeOption {

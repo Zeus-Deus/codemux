@@ -51,6 +51,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: true,
+            supports_images: true,
         },
         ChatModelInfo {
             id: "gpt-5.4-mini".into(),
@@ -63,6 +64,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: true,
+            supports_images: true,
         },
         ChatModelInfo {
             id: "gpt-5.3-codex".into(),
@@ -75,6 +77,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            supports_images: true,
         },
         ChatModelInfo {
             id: "codex-mini-latest".into(),
@@ -87,6 +90,10 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            // codex-mini-latest is text-only — gate the picker so a
+            // user accidentally enabling images sees a disabled chip
+            // rather than a 400 from the API.
+            supports_images: false,
         },
     ]
 }
@@ -165,5 +172,19 @@ mod tests {
     fn gpt_54_is_present_as_default() {
         let caps = codex_fallback_capabilities();
         assert_eq!(caps.models.first().map(|m| m.id.as_str()), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn gpt_5_family_supports_images_codex_mini_does_not() {
+        // Stage 6: GPT-5.x supports vision; codex-mini-latest is
+        // text-only. The picker uses these flags directly so an API
+        // 400 is never the first signal of a wrong model choice.
+        let caps = codex_fallback_capabilities();
+        let by_id: std::collections::HashMap<_, _> =
+            caps.models.iter().map(|m| (m.id.as_str(), m)).collect();
+        assert!(by_id["gpt-5.4"].supports_images);
+        assert!(by_id["gpt-5.4-mini"].supports_images);
+        assert!(by_id["gpt-5.3-codex"].supports_images);
+        assert!(!by_id["codex-mini-latest"].supports_images);
     }
 }

@@ -652,6 +652,65 @@ mod tests {
         assert_eq!(v["url"], "data:image/png;base64,xxx");
     }
 
+    // Stage 6 — full TurnStartParams round-trip with images. Lives
+    // alongside the per-item tests above so we lock in the exact
+    // outer wire shape (image-before-text, data: URI form) the
+    // Codex app-server expects in production.
+    #[test]
+    fn turn_start_input_array_places_images_before_text() {
+        let params = TurnStartParams {
+            thread_id: "t-codex".into(),
+            input: vec![
+                TurnInputItem::Image {
+                    url: "data:image/png;base64,AAA".into(),
+                },
+                TurnInputItem::Image {
+                    url: "data:image/jpeg;base64,BBB".into(),
+                },
+                TurnInputItem::Text {
+                    text: "what's in these?".into(),
+                    text_elements: vec![],
+                },
+            ],
+            model: Some("gpt-5.4".into()),
+            service_tier: None,
+            effort: None,
+            collaboration_mode: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        let arr = v["input"].as_array().expect("input must be array");
+        assert_eq!(arr.len(), 3);
+        // Strict order: image, image, then text.
+        assert_eq!(arr[0]["type"], "image");
+        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[2]["type"], "text");
+        assert_eq!(arr[0]["url"], "data:image/png;base64,AAA");
+        assert_eq!(arr[2]["text"], "what's in these?");
+    }
+
+    #[test]
+    fn turn_start_input_text_only_path_keeps_legacy_shape() {
+        // Text-only regression check: when no images are passed the
+        // input array carries a single Text item — same shape as the
+        // pre-Stage-6 contract so we don't accidentally regress
+        // Codex chats that never touch images.
+        let params = TurnStartParams {
+            thread_id: "t-codex".into(),
+            input: vec![TurnInputItem::Text {
+                text: "hi".into(),
+                text_elements: vec![],
+            }],
+            model: None,
+            service_tier: None,
+            effort: None,
+            collaboration_mode: None,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        let arr = v["input"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "text");
+    }
+
     #[test]
     fn approval_response_from_allow_omits_message() {
         let r = ApprovalResponse::from(ApprovalDecision::Allow {

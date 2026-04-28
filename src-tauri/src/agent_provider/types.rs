@@ -227,6 +227,14 @@ pub struct ChatModelInfo {
     /// True when the model supports the fast-mode flag.
     #[serde(default)]
     pub supports_fast_mode: bool,
+    /// True when the model accepts image attachments (multimodal
+    /// input). Drives the `+ → Image…` enable state and whether the
+    /// composer's paste/drop handlers stage attachments at all.
+    /// Defaults to false so an unmapped model is never silently
+    /// surfaced as multimodal — the UI prefers a false-negative chip
+    /// to a 400-from-the-API.
+    #[serde(default)]
+    pub supports_images: bool,
 }
 
 /// Bundle of chat-side capability data for a single provider. Returned by

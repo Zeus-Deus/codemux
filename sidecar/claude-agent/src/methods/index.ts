@@ -166,6 +166,20 @@ const sendTurn: MethodHandler = async (params) => {
   const input: SendTurnInput = { text };
   const modelOverride = optString(p["modelOverride"], "modelOverride");
   if (modelOverride !== undefined) input.modelOverride = modelOverride;
+  // Stage 6 — image attachments. Bytes arrive base64-encoded so the
+  // JSON-RPC frame stays text-only; we don't decode them here, the
+  // SDK accepts the same shape verbatim as part of its multimodal
+  // user message content array.
+  const rawImages = optArray(p["images"], "images");
+  if (rawImages && rawImages.length > 0) {
+    input.images = rawImages.map((raw, idx) => {
+      const obj = asObject(raw, `images[${idx}]`);
+      return {
+        mediaType: asString(obj["mediaType"], `images[${idx}].mediaType`),
+        dataBase64: asString(obj["dataBase64"], `images[${idx}].dataBase64`),
+      };
+    });
+  }
   await session.sendTurn(input);
   return { turnStarted: true };
 };

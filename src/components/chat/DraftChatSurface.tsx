@@ -4,6 +4,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
 } from "@/lib/agent-chat/attachment-block";
@@ -286,6 +287,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     const attachmentBlock = buildAttachmentBlock(
       activeAttachments(text, liveAttachments),
     );
+    // Stage 6 — extract resolved image bytes for the multimodal SDK
+    // path. Empty array when no images staged.
+    const imagePayloads = buildImagePayloads(liveAttachments);
 
     void materializeAndSend(
       currentDraft,
@@ -306,6 +310,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       },
       skillBodies,
       attachmentBlock,
+      imagePayloads,
     )
       .then((result) => {
         if (result.success) {
@@ -392,6 +397,67 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       addStagedAttachment,
       updateStagedAttachment,
     ],
+  );
+
+  /** Step 8 Stage 6 — image counterpart for the draft surface.
+   *  Mirrors AgentChatPane's `handleAttachImage`: validates the MIME,
+   *  stages a chip with isLoading=true, resolves with the decoded
+   *  bytes. Uses `draft.threadId` so chips survive the materialize
+   *  transition. Resolved bytes live in-memory only — a session
+   *  restart re-prompts the user to re-paste. */
+  const handleAttachImage = useCallback(
+    async (file: File) => {
+      const allowed = [
+        "image/png",
+        "image/jpeg",
+        "image/webp",
+        "image/gif",
+      ];
+      if (!allowed.includes(file.type)) {
+        toast.error("Image type not supported", {
+          description: `${file.type || "unknown type"} — supported: png, jpeg, webp, gif`,
+        });
+        return;
+      }
+      const id =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const label = file.name || `pasted-image-${Date.now()}.png`;
+      addStagedAttachment(draft.threadId, {
+        id,
+        kind: "image",
+        ref: `image:${id}`,
+        metadata: {
+          label,
+          bytes: file.size,
+          isLoading: true,
+        },
+      });
+      try {
+        const buffer = await file.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        updateStagedAttachment(draft.threadId, id, {
+          resolvedImage: { mime: file.type, bytes },
+          metadata: {
+            label,
+            bytes: file.size,
+            isLoading: false,
+            fetchedAt: Date.now(),
+          },
+        });
+      } catch (err) {
+        updateStagedAttachment(draft.threadId, id, {
+          metadata: {
+            label,
+            bytes: file.size,
+            isLoading: false,
+            error: String(err),
+          },
+        });
+      }
+    },
+    [draft.threadId, addStagedAttachment, updateStagedAttachment],
   );
 
   /** Step 8 Stage 3 — folder counterpart for the draft surface.
@@ -793,6 +859,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}
       onAttachPr={handleAttachPr}
+      onAttachImage={handleAttachImage}
+      modelSupportsImages={activeModel?.supports_images ?? false}
       isGithubRepo={isGithubRepo}
       ghAuthenticated={ghAuthenticated}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}

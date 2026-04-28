@@ -75,6 +75,24 @@ pub struct SendTurnParams {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+    /// Inline image attachments. Empty list serializes verbatim so the
+    /// sidecar's strict shape validator can branch on length without
+    /// special-casing missing keys.
+    #[serde(default)]
+    pub images: Vec<SendTurnImage>,
+}
+
+/// Wire-shape of a single image attachment. Bytes are base64-encoded
+/// here (rather than at the SDK call site) so the JSON-RPC frame stays
+/// strictly text and the sidecar can pipe the data straight into the
+/// Anthropic SDK's `content` blocks without re-decoding.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendTurnImage {
+    /// Media type — "image/png", "image/jpeg", "image/webp", "image/gif".
+    pub media_type: String,
+    /// Standard (non-URL-safe) base64 of the raw bytes.
+    pub data_base64: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -399,6 +417,55 @@ impl SidecarNotification {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ─── Stage 6 — image attachments ───
+    // The wire contract: each image is a `{mediaType, dataBase64}`
+    // pair on the `images` array, alongside the existing text. The
+    // sidecar TS code converts these to Anthropic SDK `image/base64`
+    // content blocks; the Rust adapter is responsible for the
+    // base64 encoding so the JSON-RPC frame stays text-only.
+
+    #[test]
+    fn send_turn_serializes_empty_images_array_when_no_images() {
+        let p = SendTurnParams {
+            thread_id: "t1".into(),
+            text: "hi".into(),
+            model_override: None,
+            images: vec![],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["threadId"], "t1");
+        assert_eq!(v["text"], "hi");
+        // Empty list still serializes as a key — the sidecar's
+        // strict shape validator branches on length, not presence.
+        assert_eq!(v["images"], json!([]));
+    }
+
+    #[test]
+    fn send_turn_serializes_image_block_in_camel_case() {
+        let p = SendTurnParams {
+            thread_id: "t1".into(),
+            text: "describe this".into(),
+            model_override: None,
+            images: vec![
+                SendTurnImage {
+                    media_type: "image/png".into(),
+                    data_base64: "iVBORw0KGgo=".into(),
+                },
+                SendTurnImage {
+                    media_type: "image/jpeg".into(),
+                    data_base64: "/9j/4AA=".into(),
+                },
+            ],
+        };
+        let v = serde_json::to_value(&p).unwrap();
+        let imgs = v["images"].as_array().expect("images must be an array");
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(imgs[0]["mediaType"], "image/png");
+        assert_eq!(imgs[0]["dataBase64"], "iVBORw0KGgo=");
+        assert_eq!(imgs[1]["mediaType"], "image/jpeg");
+        assert_eq!(imgs[1]["dataBase64"], "/9j/4AA=");
+    }
 
     #[test]
     fn start_session_serializes_camel_case_and_skips_none() {

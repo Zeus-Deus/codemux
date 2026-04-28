@@ -140,6 +140,17 @@ interface Props {
    *  has already inserted the inline `@!<number>` token; the parent
    *  stages the chip + drives the detail + diff fetch. */
   onAttachPr?: (pr: PullRequestInfo) => void;
+  /** Step 8 Stage 6 — invoked when the user attaches an image via
+   *  paste, drag-drop, or the `+ → Image…` picker. Composer just
+   *  forwards the raw File; the parent runs the allowlist check and
+   *  drives the staging lifecycle (loading chip → resolved bytes). */
+  onAttachImage?: (file: File) => void | Promise<void>;
+  /** Step 8 Stage 6 — gates the image attach affordances. When false
+   *  (or null while capability data is loading) paste/drop are still
+   *  bound — the user just sees a disabled `+ → Image…` row with a
+   *  "doesn't support images" hint. The parent decides this from
+   *  `activeModel.supports_images`. */
+  modelSupportsImages?: boolean;
   /** Step 8 Stage 4 — preflight result for `is_github_repo` on `cwd`.
    *  Drives:
    *   - `attach:issue` / `attach:pr` enable state in the `+` popup,
@@ -194,6 +205,8 @@ export function Composer({
   onAttachFolder,
   onAttachIssue,
   onAttachPr,
+  onAttachImage,
+  modelSupportsImages = false,
   isGithubRepo = null,
   ghAuthenticated = null,
   onDraftChange,
@@ -208,6 +221,11 @@ export function Composer({
   onModeRemove,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Step 8 Stage 6 — hidden file input used by the `+ → Image…`
+  // picker. We trigger `.click()` from the popup's onSelect; the
+  // input's onChange forwards each picked File to onAttachImage.
+  // Kept hidden so the visible affordance stays the popup row.
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   // Auto-grow textarea up to ~8 rows.
   useEffect(() => {
@@ -857,11 +875,16 @@ export function Composer({
         {
           id: "attach:image",
           label: "Image…",
-          description: "coming soon",
+          // Stage 6 — capability gate. When `modelSupportsImages` is
+          // false the entry stays visible (so users discover that the
+          // affordance exists) but disabled with a model-specific hint.
+          description: modelSupportsImages
+            ? "Pick an image from disk"
+            : "Current model doesn't support images",
           command: "",
           icon: ImageIcon,
           group: "ATTACH",
-          disabled: true,
+          disabled: !modelSupportsImages,
           onSelect: () => {},
         },
       ];
@@ -961,6 +984,20 @@ export function Composer({
       if (item.id === "attach:pr") {
         setAttachSubmode("pr");
         setAttachHighlighted(null);
+        return;
+      }
+      // Stage 6 — `+ → Image…` triggers the hidden file input. Close
+      // the popup first so the file dialog doesn't render under it.
+      // The input's onChange handler dispatches each picked File to
+      // onAttachImage; the input's `accept` attribute enforces the
+      // png/jpeg/webp/gif allowlist on Linux/Windows file pickers
+      // (the parent re-validates anyway because some file dialogs
+      // ignore the hint).
+      if (item.id === "attach:image") {
+        closeAttachPopup();
+        // requestAnimationFrame so the popup unmount completes before
+        // the dialog opens; otherwise the dialog can flash under it.
+        requestAnimationFrame(() => imageInputRef.current?.click());
         return;
       }
       // Mode picks — close the popup and activate the mode. The
@@ -1159,6 +1196,70 @@ export function Composer({
     closeSlash();
     item.onSelect();
   };
+
+  // ─── Image attach: paste + drop wiring ───────────────────────────
+  // Stage 6 — listens on the textarea for paste events, on the
+  // composer wrapper for drops. Both paths defer file-type validation
+  // (and the unsupported-type toast) to the parent's onAttachImage so
+  // Composer stays display-only. When onAttachImage is undefined
+  // (e.g. older call sites that haven't wired Stage 6 yet) the
+  // handlers no-op rather than crash.
+  const handlePasteImage = useCallback(
+    async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      if (!onAttachImage) return;
+      const items = Array.from(e.clipboardData?.items ?? []);
+      const imageItems = items.filter(
+        (item) => item.kind === "file" && item.type.startsWith("image/"),
+      );
+      if (imageItems.length === 0) return;
+      // Prevent the data-URL fallback the browser would otherwise
+      // dump into the textarea. We still let plain-text paste work
+      // because that branch only fires when the clipboard has no
+      // image files in it.
+      e.preventDefault();
+      for (const item of imageItems) {
+        const file = item.getAsFile();
+        if (file) await onAttachImage(file);
+      }
+    },
+    [onAttachImage],
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes("Files")) {
+      // Without this preventDefault, the drop target rejects the
+      // operation and the user gets a "no-entry" cursor. Keep it
+      // permissive so the drop event below can decide what to do.
+      e.preventDefault();
+    }
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      if (!onAttachImage) return;
+      const files = Array.from(e.dataTransfer?.files ?? []);
+      const imageFiles = files.filter((f) => f.type.startsWith("image/"));
+      if (imageFiles.length === 0) return;
+      e.preventDefault();
+      for (const file of imageFiles) {
+        await onAttachImage(file);
+      }
+    },
+    [onAttachImage],
+  );
+
+  // Total bytes across staged image attachments. Drives the soft
+  // 5MB warning chip rendered below the strip — non-blocking, the
+  // user can still submit but the warning nudges them to compress
+  // before sending.
+  const totalImageBytes = useMemo(
+    () =>
+      stagedAttachments
+        .filter((a) => a.kind === "image")
+        .reduce((sum, a) => sum + (a.resolvedImage?.bytes.length ?? 0), 0),
+    [stagedAttachments],
+  );
+  const showImageSizeWarning = totalImageBytes > 5 * 1024 * 1024;
 
   const canSubmit = sessionReady && !streaming && draft.trim().length > 0;
 
@@ -1388,12 +1489,37 @@ export function Composer({
               </div>
             )}
         <div
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
           className={cn(
             "relative",
             "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
             "transition-shadow",
           )}
         >
+          {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`
+              row triggers .click() on this input to surface the
+              system file dialog. Multiple selection is allowed so
+              users can attach a batch in one go. The `accept` attr
+              filters png/jpeg/webp/gif at the OS picker level on
+              platforms that respect it; the parent's onAttachImage
+              re-validates because some platforms ignore the hint. */}
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            multiple
+            className="hidden"
+            data-testid="composer-image-file-input"
+            onChange={async (e) => {
+              const files = Array.from(e.target.files ?? []);
+              for (const file of files) {
+                if (onAttachImage) await onAttachImage(file);
+              }
+              // Reset so re-picking the same file fires onChange again.
+              e.target.value = "";
+            }}
+          />
           <SlashCommandPopup
             items={filteredItems}
             highlightedId={slashHighlighted}
@@ -1506,6 +1632,20 @@ export function Composer({
                     onRemove={(id) => onRemoveAttachment?.(id)}
                   />
                 ))}
+            </div>
+          )}
+          {/* Step 8 Stage 6 — soft 5MB warning. Non-blocking by
+              design: the user can still send, but a request that big
+              hits Anthropic's 32MB request cap fast and slows
+              response time noticeably. We show actual bytes so the
+              user can decide whether to compress before sending. */}
+          {showImageSizeWarning && (
+            <div
+              data-testid="composer-image-size-warning"
+              className="px-3 pt-1 text-[10px] text-warning"
+            >
+              Total image size: {(totalImageBytes / 1024 / 1024).toFixed(1)} MB
+              — consider reducing for faster requests
             </div>
           )}
           <div className="relative">
@@ -1635,6 +1775,7 @@ export function Composer({
               onChange={handleTextareaChange}
               onSelect={handleSelect}
               onKeyDown={handleKeyDown}
+              onPaste={handlePasteImage}
               onCompositionStart={() => {
                 composingRef.current = true;
               }}

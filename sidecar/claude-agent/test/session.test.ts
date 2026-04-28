@@ -81,6 +81,62 @@ test("sendTurn enqueues a user message that the fake query receives", async () =
   await session.close();
 });
 
+test("sendTurn text-only path keeps content as a plain string", async () => {
+  // Stage 6 regression: when no images are passed the user-message
+  // content stays string-shaped so the SDK's existing string-content
+  // fast-path (and any historical SDK assertions tied to it) remain
+  // unchanged.
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({ text: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  const enqueued = fake.capturedPrompts[0];
+  expect(enqueued?.type).toBe("user");
+  // Bun's structural typing on the SDK's discriminated content union
+  // keeps the type as `string | ContentBlock[]`. Walk the runtime
+  // shape directly.
+  expect(typeof (enqueued as { message: { content: unknown } }).message.content)
+    .toBe("string");
+  await session.close();
+});
+
+test("sendTurn with images builds a multi-block content array (image first, text last)", async () => {
+  // Locked Stage 6 wire shape: each image lands as
+  // `{type:"image", source:{type:"base64", media_type, data}}` and
+  // the text block is appended last per Anthropic's "describe these
+  // images" guidance.
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  await session.sendTurn({
+    text: "what's in this?",
+    images: [
+      { mediaType: "image/png", dataBase64: "AAA" },
+      { mediaType: "image/jpeg", dataBase64: "BBB" },
+    ],
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  const enqueued = fake.capturedPrompts[0];
+  const content = (enqueued as { message: { content: unknown } }).message
+    .content as Array<{
+    type: string;
+    source?: { type: string; media_type: string; data: string };
+    text?: string;
+  }>;
+  expect(Array.isArray(content)).toBe(true);
+  expect(content.length).toBe(3);
+  expect(content[0]?.type).toBe("image");
+  expect(content[0]?.source?.type).toBe("base64");
+  expect(content[0]?.source?.media_type).toBe("image/png");
+  expect(content[0]?.source?.data).toBe("AAA");
+  expect(content[1]?.type).toBe("image");
+  expect(content[1]?.source?.media_type).toBe("image/jpeg");
+  // Text comes last — Anthropic's recommended ordering for the
+  // "look at these and answer" prompt pattern.
+  expect(content[2]?.type).toBe("text");
+  expect(content[2]?.text).toBe("what's in this?");
+  await session.close();
+});
+
 test("sdk-session-id notification fires once, with the SDK message's session_id", async () => {
   const { emit, events } = recordingEmitter();
   const session = new ClaudeSession(minimalInput(), emit);

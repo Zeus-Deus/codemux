@@ -290,3 +290,25 @@ export function buildAttachmentBlock(
     "\n\n",
   );
 }
+
+/**
+ * Stage 6 — extract resolved image attachments into the wire shape
+ * `agent_chat_send_turn` expects (`{ data: number[], media_type:
+ * string }`). Skips chips that are still loading or whose read failed
+ * so a half-resolved image never lands on the SDK in a malformed
+ * state. Returns `[]` when no images are staged so callers can pass
+ * the result through without an `?? []`.
+ */
+export function buildImagePayloads(
+  attachments: Attachment[],
+): Array<{ data: number[]; media_type: string }> {
+  return attachments
+    .filter(
+      (a): a is Attachment & { resolvedImage: { mime: string; bytes: Uint8Array } } =>
+        a.kind === "image" && !!a.resolvedImage,
+    )
+    .map((a) => ({
+      data: Array.from(a.resolvedImage.bytes),
+      media_type: a.resolvedImage.mime,
+    }));
+}

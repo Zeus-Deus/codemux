@@ -207,7 +207,9 @@ impl AgentProvider for ClaudeAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: input.thread_id.clone(),
         })?;
-        let turn_id = session.send_turn(input.text, input.model_override).await?;
+        let turn_id = session
+            .send_turn(input.text, input.images, input.model_override)
+            .await?;
         Ok(TurnStartResult { turn_id })
     }
 

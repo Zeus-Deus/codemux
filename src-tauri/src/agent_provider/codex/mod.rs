@@ -220,7 +220,12 @@ impl AgentProvider for CodexAgentProvider {
             thread_id: input.thread_id.clone(),
         })?;
         let turn_id = session
-            .send_turn(input.text, input.model_override, input.effort_override)
+            .send_turn(
+                input.text,
+                input.images,
+                input.model_override,
+                input.effort_override,
+            )
             .await?;
         Ok(TurnStartResult { turn_id })
     }

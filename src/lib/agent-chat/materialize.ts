@@ -107,6 +107,11 @@ export async function materializeAndSend(
    *  lib stays free of store imports. `null` when the draft has no
    *  attachments. */
   attachmentBlock: string | null = null,
+  /** Step 8 Stage 6 — image attachments converted to the wire shape
+   *  agent_chat_send_turn expects. Caller pre-extracts via
+   *  `buildImagePayloads` so this lib stays free of store imports.
+   *  Defaults to empty so existing call sites keep compiling. */
+  images: Array<{ data: number[]; media_type: string }> = [],
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -193,6 +198,7 @@ export async function materializeAndSend(
         skillBodies,
         attachmentBlock,
       ),
+      images,
       model_override: null,
       effort_override: draft.effort,
       permission_mode_override: null,

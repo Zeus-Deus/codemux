@@ -277,6 +277,9 @@ describe("materializeAndSend", () => {
       expect(input).toEqual({
         thread_id: "tid-42",
         text: "first message",
+        // Stage 6 — images default to empty array when no
+        // attachments are passed to materializeAndSend.
+        images: [],
         model_override: null,
         effort_override: "high",
         permission_mode_override: null,

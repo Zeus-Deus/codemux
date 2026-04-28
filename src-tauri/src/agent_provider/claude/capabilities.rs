@@ -73,6 +73,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            supports_images: true,
         },
         // Opus 4.6 — default effort is high, supports fast mode + ultrathink + 1M.
         ChatModelInfo {
@@ -91,6 +92,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
             supports_fast_mode: true,
+            supports_images: true,
         },
         // Opus 4.5 — no ultrathink, no 1M context.
         ChatModelInfo {
@@ -109,6 +111,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: true,
+            supports_images: true,
         },
         // Sonnet 4.6 — narrower effort range, supports ultrathink + 1M.
         ChatModelInfo {
@@ -122,6 +125,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
             supports_fast_mode: false,
+            supports_images: true,
         },
         // Haiku 4.5 — no effort, no context-window picker. Has a thinking
         // toggle we don't render in MVP.
@@ -136,6 +140,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_adaptive_thinking: false,
             supports_thinking_toggle: true,
             supports_fast_mode: false,
+            supports_images: true,
         },
     ]
 }
@@ -306,6 +311,21 @@ mod tests {
         );
         assert_eq!(resolve_claude_api_model_id("claude-opus-4-7", None), "claude-opus-4-7");
         assert_eq!(resolve_claude_api_model_id("claude-sonnet-4-6", Some("")), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn every_listed_model_supports_images() {
+        // Stage 6: vision is universal across the Claude 4.x roster
+        // we expose. Lock the contract so a future model addition
+        // forces an explicit decision on whether vision is included.
+        let caps = claude_fallback_capabilities();
+        for model in &caps.models {
+            assert!(
+                model.supports_images,
+                "{} should expose supports_images=true",
+                model.id
+            );
+        }
     }
 
     #[test]

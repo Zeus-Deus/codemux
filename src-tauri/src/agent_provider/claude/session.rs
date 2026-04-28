@@ -29,13 +29,15 @@ use crate::agent_provider::{
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
-    InterruptParams, RespondToRequestParams, RespondToUserInputParams, SendTurnParams,
-    SetModelParams, SetPermissionModeParams, SidecarDecision, SidecarNotification,
-    StartSessionParams, StartSessionResponse, StopSessionParams, StopSessionResponse,
-    METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST, METHOD_RESPOND_TO_USER_INPUT,
-    METHOD_SEND_TURN, METHOD_SET_MODEL, METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION,
-    METHOD_STOP_SESSION,
+    InterruptParams, RespondToRequestParams, RespondToUserInputParams, SendTurnImage,
+    SendTurnParams, SetModelParams, SetPermissionModeParams, SidecarDecision,
+    SidecarNotification, StartSessionParams, StartSessionResponse, StopSessionParams,
+    StopSessionResponse, METHOD_INTERRUPT, METHOD_RESPOND_TO_REQUEST,
+    METHOD_RESPOND_TO_USER_INPUT, METHOD_SEND_TURN, METHOD_SET_MODEL,
+    METHOD_SET_PERMISSION_MODE, METHOD_START_SESSION, METHOD_STOP_SESSION,
 };
+use crate::agent_provider::ImageInput;
+use base64::Engine;
 use super::translate::translate_notification;
 
 /// Default per-RPC timeout for the sidecar. Matches the value
@@ -275,6 +277,7 @@ impl ClaudeSession {
     pub async fn send_turn(
         &self,
         text: String,
+        images: Vec<ImageInput>,
         model_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
         {
@@ -288,10 +291,22 @@ impl ClaudeSession {
                 });
             }
         }
+        // Encode raw bytes as standard base64 here so the JSON-RPC
+        // frame stays text-only and the sidecar pipes the data
+        // straight into Anthropic's `image/base64` content block
+        // shape without re-decoding.
+        let encoded_images = images
+            .into_iter()
+            .map(|img| SendTurnImage {
+                media_type: img.media_type,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(&img.data),
+            })
+            .collect();
         let params = SendTurnParams {
             thread_id: self.thread_id.0.clone(),
             text,
             model_override,
+            images: encoded_images,
         };
         self.sidecar
             .request(
