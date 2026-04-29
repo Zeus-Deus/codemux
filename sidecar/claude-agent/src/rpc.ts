@@ -58,14 +58,23 @@ export function isRequest(msg: JsonRpcIncoming): msg is JsonRpcRequest {
   return "id" in msg && (msg as { id?: unknown }).id !== undefined;
 }
 
+/** Stage 3: a parsed line is either an incoming request/notification
+ *  (the sidecar's pre-existing role as RPC server) OR a response to a
+ *  request the sidecar issued upstream (the sidecar's new role as RPC
+ *  client for tool callbacks). The dispatcher in `main.ts` picks the
+ *  right path based on whether `method` is present. */
+export type ParsedLine =
+  | { kind: "incoming"; msg: JsonRpcIncoming }
+  | { kind: "response"; msg: JsonRpcResponse };
+
 /**
  * Parse a single framed JSON-RPC line. Returns `null` for an empty /
  * whitespace-only line (which callers should simply skip). Throws a
- * plain `Error` for malformed JSON or protocol-level violations — the
- * caller maps the thrown message into a `-32700 Parse error` / `-32600
- * Invalid Request` response.
+ * plain `Error` for malformed JSON. Distinguishes incoming
+ * (request/notification) from response shapes for the bidirectional
+ * tool-call flow Stage 3 relies on.
  */
-export function parseLine(line: string): JsonRpcIncoming | null {
+export function parseLine(line: string): ParsedLine | null {
   const trimmed = line.trim();
   if (trimmed === "") return null;
 
@@ -77,10 +86,22 @@ export function parseLine(line: string): JsonRpcIncoming | null {
   if (obj["jsonrpc"] !== "2.0") {
     throw new Error("invalid or missing jsonrpc version");
   }
+
+  // Response shape: id present, method absent, has either `result` or
+  // `error`. These flow into the upstream-rpc pending map.
+  if (
+    typeof obj["method"] !== "string" &&
+    "id" in obj &&
+    ("result" in obj || "error" in obj)
+  ) {
+    return { kind: "response", msg: obj as unknown as JsonRpcResponse };
+  }
+
+  // Otherwise it must be a request or notification.
   if (typeof obj["method"] !== "string") {
     throw new Error("missing method");
   }
-  return obj as unknown as JsonRpcIncoming;
+  return { kind: "incoming", msg: obj as unknown as JsonRpcIncoming };
 }
 
 /**

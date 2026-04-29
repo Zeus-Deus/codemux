@@ -66,6 +66,42 @@ pub struct StartSessionParams {
     pub path_to_claude_code_executable: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_args: Option<serde_json::Map<String, Value>>,
+    /// Stage 3 — tools to register with the SDK as the in-process
+    /// `codemux` virtual MCP server. Each entry is one tool from the
+    /// MCP runtime registry, with its prefixed name. Empty when the
+    /// runtime has nothing to expose, or when the provider was
+    /// constructed without an `mcp_registry`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_tools: Vec<McpToolEntry>,
+}
+
+/// Method name for Stage 4 dynamic tool refresh. The Claude session
+/// listens to `McpRegistry::subscribe_status()`; on every transition
+/// it re-collects tools and pushes them via this RPC. Idempotent —
+/// the sidecar calls `query.setMcpServers(...)` with the latest
+/// snapshot.
+pub const METHOD_UPDATE_MCP_TOOLS: &str = "update-mcp-tools";
+
+/// Wire shape of `update-mcp-tools` request params.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMcpToolsParams {
+    pub thread_id: String,
+    pub mcp_tools: Vec<McpToolEntry>,
+}
+
+/// Wire shape of a single MCP tool registration. Mirrored on the
+/// sidecar side as `RegisteredMcpTool` (`mcp-bridge.ts`). The
+/// `prefixed_name` is what the agent sees and what permission rules
+/// key on; `input_schema` is opaque JSON Schema we forward verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolEntry {
+    pub name: String,
+    pub prefixed_name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+    pub server_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -482,6 +518,7 @@ mod tests {
             session_id: None,
             path_to_claude_code_executable: "/usr/bin/claude".into(),
             extra_args: None,
+            mcp_tools: Vec::new(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["threadId"], "t1");

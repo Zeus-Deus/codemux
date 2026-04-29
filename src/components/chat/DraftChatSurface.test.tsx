@@ -36,6 +36,14 @@ vi.mock("@/tauri/commands", () => ({
     truncated: false,
     outline: null,
   }),
+  // Step 9 Stage 4 — Composer mounts `useMcpRuntime` and the `+`
+  // popup MCP submode reads `listMcpServers`. Stub both as no-ops
+  // so render-only tests don't reach into a broken Tauri shim.
+  getMcpRuntimeStatus: vi.fn().mockResolvedValue([]),
+  setMcpDisabledIds: vi.fn().mockResolvedValue(undefined),
+  listMcpServers: vi.fn().mockResolvedValue([]),
+  MCP_STATUS_CHANGED_EVENT: "mcp-status-changed",
+  MCP_CODEMUX_SELF_ID: "codemux-self",
 }));
 
 vi.mock("@/lib/agent-chat/materialize", () => ({

@@ -45,6 +45,7 @@ import {
   RotateCcw,
   ShieldCheck,
   BookOpen,
+  Server,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -89,7 +90,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -115,6 +116,7 @@ const NAV_GROUPS: NavGroup[] = [
       { id: "agent", label: "Agent", icon: Bot },
       { id: "permissions", label: "Permissions", icon: ShieldCheck },
       { id: "skills", label: "Skills", icon: BookOpen },
+      { id: "mcp", label: "MCP Servers", icon: Server },
       { id: "browser", label: "Browser", icon: Globe },
       { id: "session_restore", label: "Session Restore", icon: RotateCcw },
     ],
@@ -124,8 +126,10 @@ const NAV_GROUPS: NavGroup[] = [
 const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
 
 import { KeybindEditor } from "./keybind-editor";
+import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
+import { SyncSection } from "./sync-section";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -682,6 +686,13 @@ export function SettingsView() {
                     </>
                   )}
                   <Separator />
+                  <div className="pt-4 pb-2">
+                    <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Skills sync
+                    </div>
+                    <SyncSection />
+                  </div>
+                  <Separator />
                   <div className="pt-4">
                     <Button
                       variant="ghost"
@@ -1084,6 +1095,9 @@ export function SettingsView() {
 
       case "skills":
         return <SkillsSection projectRoot={projectRoot} />;
+
+      case "mcp":
+        return <McpSection projectRoot={projectRoot} />;
 
       case "browser":
         return <BrowserSection />;

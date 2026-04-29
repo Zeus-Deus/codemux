@@ -91,6 +91,18 @@ export const onAuthStateChanged = (
 ): Promise<UnlistenFn> =>
   listen<AuthStatePayload>("auth-state-changed", (e) => cb(e.payload));
 
+// Stage 2 sync state changes: emitted by the backend after signin,
+// signout, sync setup, and sync repair.
+export interface SyncStateChangedPayload {
+  syncAvailable: boolean;
+  authMethod: "email" | "github" | null;
+}
+
+export const onSyncStateChanged = (
+  cb: EventCallback<SyncStateChangedPayload>,
+): Promise<UnlistenFn> =>
+  listen<SyncStateChangedPayload>("sync-state-changed", (e) => cb(e.payload));
+
 // ── Agent chat events ──
 //
 // Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload

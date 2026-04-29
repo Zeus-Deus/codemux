@@ -139,6 +139,117 @@ export const signOut = () =>
 export const getAuthToken = () =>
   invoke<string | null>("get_auth_token");
 
+// ── Skills Sync (Step 10 — Stage 2) ──
+//
+// `syncAvailable` reports whether the in-memory encryption key is
+// loaded — sync features can only fire when this is true. False
+// means either:
+//   - GitHub OAuth user who hasn't run `setupSyncPassword` yet
+//   - Local `sync-key.enc` was lost (call `providePasswordForSync`)
+//   - User just signed out
+//
+// `authMethod` distinguishes "needs setup" from "needs repair":
+//   - `"github"` + sync_available=false  → SetupSyncPasswordForm
+//   - `"email"` or null + sync_available=false → ProvidePasswordForm
+
+export interface SyncStatus {
+  syncAvailable: boolean;
+  authMethod: "email" | "github" | null;
+}
+
+/// Read the current sync state. Cheap, in-memory; no API roundtrip.
+/// Use this on Settings → Sync mount and after any setup/repair.
+export const getSyncStatus = () => invoke<SyncStatus>("get_sync_status");
+
+/// One-time GitHub-OAuth-user setup. Derives credentials from
+/// `(password, user.email)`, posts the AuthSecret to Better Auth's
+/// `/api/auth/set-password`, then persists the encryption key
+/// machine-bound at `~/.local/share/codemux/sync-key.enc` and loads
+/// it into in-process memory. Returns the updated SyncStatus.
+export const setupSyncPassword = (password: string) =>
+  invoke<SyncStatus>("setup_sync_password", { password });
+
+/// Repair flow: re-derive the encryption key when the local
+/// `sync-key.enc` file is missing or undecryptable. No server call;
+/// wrong password is detected lazily by Stage 3's first sync attempt.
+export const providePasswordForSync = (password: string) =>
+  invoke<SyncStatus>("provide_password_for_sync", { password });
+
+// ── Skills sync engine (Stage 3) ──
+//
+// `skills_sync_now` pulls every encrypted skill from /api/skills,
+// decrypts + writes to ~/.codemux/skills/, then walks every
+// syncable user-scope skill path and pushes anything that's
+// changed. Idempotent; safe to call back-to-back.
+//
+// `skills_sync_status` is a cheap status read for UI rendering.
+// The engine's state is also broadcast over the Tauri
+// `sync-state-changed` event after every cycle.
+
+export interface SkillsSyncResult {
+  pushedCount: number;
+  pulledCount: number;
+  conflictCount: number;
+  errorCount: number;
+}
+
+/// Discriminated union mirroring Rust's `SyncStateSnapshot`.
+/// `state="idle"` carries `lastSyncAtMillis` (number | null);
+/// `state="syncing"` carries `startedAtMillis`; `state="error"`
+/// carries `lastError` and `atMillis`.
+export type SkillsSyncStateSnapshot =
+  | { state: "idle"; lastSyncAtMillis: number | null }
+  | { state: "syncing"; startedAtMillis: number }
+  | { state: "error"; lastError: string; atMillis: number };
+
+export const skillsSyncNow = () =>
+  invoke<SkillsSyncResult>("skills_sync_now");
+
+export const skillsSyncStatus = () =>
+  invoke<SkillsSyncStateSnapshot>("skills_sync_status");
+
+// ── Skills sync — local export / import / reset (Stage 4) ──
+//
+// `exportSkillsToFile` pulls every encrypted skill, decrypts with
+// the in-memory key, and writes a plaintext JSON file at the
+// path the user picked via the OS save-dialog.
+//
+// `importSkillsFromFile` is the inverse: read a JSON backup,
+// re-encrypt every skill with the CURRENT key (post-reset), and
+// push to the server. Use `mismatchedEmail` to surface a soft
+// warning when the backup belongs to a different account.
+//
+// `wipeRemoteSkillsForReset` is the destructive helper used by
+// the reset-sync-password dialog: it wipes the server's
+// encrypted skills, clears the local key, and triggers Better
+// Auth's email-reset flow. The user finishes the reset by
+// clicking the link in their email and then signs back in here.
+
+export interface ExportSummary {
+  path: string;
+  skillCount: number;
+  bytesWritten: number;
+  failedCount: number;
+}
+
+export interface ImportSummary {
+  queuedCount: number;
+  failedCount: number;
+  mismatchedEmail: boolean;
+}
+
+export const getExportRecommendedFilename = () =>
+  invoke<string>("get_export_recommended_filename");
+
+export const exportSkillsToFile = (filePath: string) =>
+  invoke<ExportSummary>("export_skills_to_file", { filePath });
+
+export const importSkillsFromFile = (filePath: string) =>
+  invoke<ImportSummary>("import_skills_from_file", { filePath });
+
+export const wipeRemoteSkillsForReset = () =>
+  invoke<void>("wipe_remote_skills_for_reset");
+
 // ── Settings Sync ──
 
 export const getSyncedSettings = () =>
@@ -932,6 +1043,35 @@ export const pickFolderDialog = (title: string) =>
 export const pickFilesDialog = (title?: string) =>
   invoke<string[]>("pick_files_dialog", { title: title ?? null });
 
+/// OS save-as dialog. Returns `null` when the user cancels.
+export interface SaveDialogOptions {
+  title?: string;
+  defaultFilename?: string;
+  filterName?: string;
+  filterExtensions?: string[];
+}
+export const pickSaveFileDialog = (opts: SaveDialogOptions = {}) =>
+  invoke<string | null>("pick_save_file_dialog", {
+    title: opts.title ?? null,
+    defaultFilename: opts.defaultFilename ?? null,
+    filterName: opts.filterName ?? null,
+    filterExtensions: opts.filterExtensions ?? null,
+  });
+
+/// OS open-file dialog (single selection, optional extension
+/// filter). Returns `null` when the user cancels.
+export interface OpenDialogOptions {
+  title?: string;
+  filterName?: string;
+  filterExtensions?: string[];
+}
+export const pickOpenFileDialog = (opts: OpenDialogOptions = {}) =>
+  invoke<string | null>("pick_open_file_dialog", {
+    title: opts.title ?? null,
+    filterName: opts.filterName ?? null,
+    filterExtensions: opts.filterExtensions ?? null,
+  });
+
 // ── Update ──
 
 export const getPackageFormat = () =>
@@ -1146,3 +1286,131 @@ export const stopSkillsWatcher = () =>
 
 /** Tauri event name emitted whenever a watched skill file changes. */
 export const SKILLS_CHANGED_EVENT = "skills-changed";
+
+// ── MCP Servers ──
+
+export type McpConfigSource =
+  | "codemux"
+  | "codemuxUser"
+  | "codemuxProject"
+  | "claudeUser"
+  | "claudeLocal"
+  | "claudeProject"
+  | "cursorUser"
+  | "cursorProject";
+
+export type McpTransport = "stdio" | "http";
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  /** All locations this exact config was found in. Length 1 for normal
+   *  rows; > 1 when the same `(name, command, args, env)` shows up in
+   *  multiple files (e.g. the same MCP added to both Claude and Cursor).
+   *  `sources[0]` is the canonical (lowest-rank) source — the one the UI
+   *  uses to pick the row's group. */
+  sources: McpConfigSource[];
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  disabled: boolean;
+  transport: McpTransport;
+  raw: unknown;
+}
+
+/** Discover all configured MCP servers across providers, plus Codemux's
+ *  hardcoded entry. Stateless — no spawn, no caching. */
+export const listMcpServers = (
+  projectRoot: string | null,
+) => invoke<McpServerConfig[]>("list_mcp_servers", { projectRoot });
+
+// ── MCP runtime (Stage 2) ──
+
+/** Server-id reserved for Codemux's hardcoded always-on MCP. The frontend
+ *  uses this constant to suppress the toggle row and to guard against
+ *  accidentally adding it to the disabled set. */
+export const MCP_CODEMUX_SELF_ID = "codemux-self";
+
+/** Tauri event fired whenever an MCP server transitions state. Payload
+ *  is a single `McpServerRuntime`. The Settings panel listens to update
+ *  the relevant row without polling. */
+export const MCP_STATUS_CHANGED_EVENT = "mcp-status-changed";
+
+export type McpServerStatusKind =
+  | "discovered"
+  | "starting"
+  | "running"
+  | "errored"
+  | "stopped";
+
+/** Discriminated by `kind` so TS exhaustiveness checks catch missing
+ *  arms in the UI. Mirrors the Rust `McpServerStatus` enum. */
+export type McpServerStatus =
+  | { kind: "discovered" }
+  | { kind: "starting" }
+  | { kind: "running"; toolCount: number }
+  | { kind: "errored"; message: string }
+  | { kind: "stopped" };
+
+export interface McpServerRuntime {
+  id: string;
+  name: string;
+  status: McpServerStatus;
+  toolsCount: number;
+  errorMessage: string | null;
+  stderrTail: string | null;
+  startedAtMs: number | null;
+}
+
+export interface McpTool {
+  name: string;
+  prefixedName: string;
+  description: string | null;
+  inputSchema: unknown;
+  serverId: string;
+}
+
+/** Snapshot of every server's runtime state. Settings hydrates from
+ *  this on mount, then listens to {@link MCP_STATUS_CHANGED_EVENT}. */
+export const getMcpRuntimeStatus = () =>
+  invoke<McpServerRuntime[]>("get_mcp_runtime_status");
+
+/** Mirror the frontend zustand `disabledIds` into the Rust registry.
+ *  Idempotent — call this on mount and after every toggle. */
+export const setMcpDisabledIds = (ids: string[]) =>
+  invoke<void>("set_mcp_disabled_ids", { ids });
+
+/** Spawn every enabled MCP server discovered for the active project.
+ *  Idempotent — already-running servers are untouched. */
+export const primeMcpRuntime = (projectRoot: string | null) =>
+  invoke<McpServerRuntime[]>("prime_mcp_runtime", { projectRoot });
+
+export const startMcpServerCmd = (id: string, projectRoot: string | null) =>
+  invoke<McpServerRuntime>("start_mcp_server_cmd", { id, projectRoot });
+
+export const stopMcpServerCmd = (id: string) =>
+  invoke<McpServerRuntime>("stop_mcp_server_cmd", { id });
+
+export const restartMcpServerCmd = (id: string) =>
+  invoke<McpServerRuntime>("restart_mcp_server_cmd", { id });
+
+export const listMcpTools = () => invoke<McpTool[]>("list_mcp_tools");
+
+export interface CappedTools {
+  tools: McpTool[];
+  totalBeforeCap: number;
+  droppedCount: number;
+  droppedServers: string[];
+}
+
+/** Same as `listMcpTools` but returns the cap-info envelope so the
+ *  Settings UI can show a "N tools dropped to fit cap" banner. */
+export const listMcpToolsWithCapInfo = () =>
+  invoke<CappedTools>("list_mcp_tools_with_cap_info");
+
+/** Tools registered by a single server, uncapped. Drives the
+ *  Settings tool-list modal — the user sees the full surface even
+ *  when some tools were dropped from the agent's view to fit the
+ *  cap. */
+export const listMcpToolsForServer = (id: string) =>
+  invoke<McpTool[]>("list_mcp_tools_for_server", { id });

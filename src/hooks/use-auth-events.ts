@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useTauriEvent } from "./use-tauri-event";
-import { onAuthStateChanged, onSettingsSynced } from "@/tauri/events";
+import {
+  onAuthStateChanged,
+  onSettingsSynced,
+  onSyncStateChanged,
+  type SyncStateChangedPayload,
+} from "@/tauri/events";
 import { useAuthStore } from "@/stores/auth-store";
 import { useSyncedSettingsStore, DEFAULT_SETTINGS } from "@/stores/synced-settings-store";
 import type { AuthStatePayload, UserSettings } from "@/tauri/types";
@@ -43,6 +48,13 @@ export function useAuthEvents() {
   );
 
   useTauriEvent(onSettingsSynced, handleSettingsSynced, [handleSettingsSynced]);
+
+  // Handle Stage 2 sync state changes (signin, signout, sync setup, sync repair).
+  const handleSyncEvent = useCallback((payload: SyncStateChangedPayload) => {
+    useAuthStore.getState().setSyncStatus(payload);
+  }, []);
+
+  useTauriEvent(onSyncStateChanged, handleSyncEvent, [handleSyncEvent]);
 
   // Re-verify token on window focus (at most once per 5 minutes)
   useEffect(() => {

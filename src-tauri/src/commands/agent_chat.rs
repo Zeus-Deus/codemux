@@ -254,6 +254,42 @@ pub async fn agent_chat_start_session(
             "[codemux::agent_chat] start_session pane={pane_id} provider={provider:?} resume_cursor=(none)"
         ),
     }
+    // Lazy MCP spawn: first chat session triggers child-process startup
+    // for every enabled (non-disabled) MCP server discovered for this
+    // workspace. Stage 3 needs the spawn to COMPLETE before
+    // `start_session` runs so the tool snapshot the SDK sees actually
+    // contains the running MCPs — otherwise the agent boots with zero
+    // `mcp__codemux__*` tools and only sees the user's claude.ai
+    // managed connectors. We bound the wait so a slow handshake
+    // (`npx`-launched server pulling deps on first run) doesn't hang
+    // chat-start forever. After the budget elapses tools are
+    // registered with whatever has come up so far; servers that
+    // finish later only become visible to the agent on the next
+    // session start (Stage 4 polish will wire `setMcpServers` for
+    // dynamic registration).
+    {
+        use crate::mcp::registry::McpRegistry;
+        use std::time::Duration;
+        let mcp_registry: State<'_, McpRegistry> = app.state();
+        let registry = mcp_registry.inner().clone_handle();
+        let project_path = input.cwd.clone();
+        const MCP_PRIME_BUDGET: Duration = Duration::from_secs(8);
+        match tokio::time::timeout(
+            MCP_PRIME_BUDGET,
+            registry.prime_for_chat(Some(&app), Some(&project_path)),
+        )
+        .await
+        {
+            Ok(()) => eprintln!(
+                "[codemux::agent_chat] mcp prime_for_chat completed within budget"
+            ),
+            Err(_) => eprintln!(
+                "[codemux::agent_chat] mcp prime_for_chat exceeded {}s budget — \
+                 starting session with whatever tools are ready",
+                MCP_PRIME_BUDGET.as_secs()
+            ),
+        }
+    }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
     state.set_agent_chat_thread_id(&pane_id, Some(session.thread_id.0.clone()));

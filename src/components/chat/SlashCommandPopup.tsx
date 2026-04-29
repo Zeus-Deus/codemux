@@ -1,6 +1,7 @@
 import { Command as CommandPrimitive } from "cmdk";
 import { useEffect, useRef } from "react";
 
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import {
   groupSlashItems,
@@ -94,10 +95,25 @@ export function SlashCommandPopup({
       // Pointer events live on the popup itself; the textarea keeps
       // focus, so cmdk never gets keyboard input — the parent drives
       // highlight via the `value` prop.
+      //
+      // EXCEPTION: when the user clicks anywhere inside the
+      // `ScrollArea` scrollbar (track or thumb), we skip
+      // `preventDefault` so Radix's drag handling actually works.
+      // Without this exception, mousedown on the thumb is cancelled
+      // and the scrollbar can't be dragged — clicks on the track
+      // also misbehave (they end up jumping to extremes because
+      // Radix's offset calc reads stale pointer coords). We still
+      // preventDefault for everything else to keep the textarea
+      // focused.
       onMouseDown={(e) => {
-        // Mouse-down on the popup must not blur the textarea, otherwise
-        // the popup unmounts before the click resolves. preventDefault
-        // keeps focus where it is.
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.closest("[data-slot=scroll-area-scrollbar]") ||
+            target.closest("[data-slot=scroll-area-thumb]"))
+        ) {
+          return;
+        }
         e.preventDefault();
       }}
     >
@@ -110,19 +126,47 @@ export function SlashCommandPopup({
         }}
         className="text-popover-foreground"
       >
-        <CommandPrimitive.List
-          ref={listRef}
+        {/*
+          Stage 4 polish — wrap the cmdk list in shadcn `ScrollArea`
+          so the popup gets a visible (Radix-styled) scrollbar when
+          content overflows the 320 px cap. Previously the list had
+          `overflow-y-auto no-scrollbar`, which scrolled silently and
+          gave users no affordance that more rows existed below the
+          fold (notably: the new "MCP Servers…" attach row was
+          frequently below the fold). The ScrollArea owns the
+          scrolling ancestor; the cmdk List is a plain listbox inside
+          it. `scrollIntoView` from the keyboard-nav effect walks up
+          to the ScrollArea viewport unchanged.
+        */}
+        {/*
+          `type="always"` keeps the scrollbar permanently visible
+          whenever content overflows the 320 px cap (Radix's default
+          is `"hover"`, which fades the scrollbar out — invisible to
+          users who haven't moved the cursor over the right edge yet).
+          The wider scrollbar (`w-2`) gets explicit sizing via the
+          `[&_…scrollbar]` selectors below so it's a solid affordance
+          rather than a 1 px line.
+        */}
+        <ScrollArea
+          type="always"
           className={cn(
-            // Fixed cap (~320px) so the popup never grows tall enough to
-            // overflow the top of the viewport when the textarea is
-            // centered (e.g., the empty-chat draft surface). The arrow-
-            // key handler in Composer drives the highlight, and the
-            // useEffect above scrolls the active item into view as the
-            // user navigates past the visible window.
-            "max-h-80 overflow-y-auto outline-none",
-            "no-scrollbar",
+            "max-h-80",
+            // Viewport: cap height + force the inner div cmdk renders
+            // to sit on a single block (cmdk's <Command> spreads
+            // multi-children inside CommandList; the viewport's
+            // default flex layout otherwise stretches a single child).
+            "[&>[data-slot=scroll-area-viewport]]:max-h-80",
+            // Scrollbar: solid track + visible thumb in the popover's
+            // contrast tier so it reads against the dark popup bg.
+            "[&_[data-slot=scroll-area-scrollbar]]:w-2",
+            "[&_[data-slot=scroll-area-thumb]]:bg-foreground/30",
+            "[&_[data-slot=scroll-area-thumb]]:hover:bg-foreground/50",
           )}
         >
+          <CommandPrimitive.List
+            ref={listRef}
+            className="outline-none"
+          >
           {items.length === 0 ? (
             <div className="px-3 py-4 text-center text-xs text-muted-foreground">
               No commands match
@@ -189,9 +233,23 @@ export function SlashCommandPopup({
                           {item.description}
                         </span>
                       )}
-                      <span className="ml-auto font-mono text-[11px] text-muted-foreground/70">
-                        {item.command}
-                      </span>
+                      {item.rightAdornment ? (
+                        <span
+                          className="ml-auto"
+                          // Stop the trailing control's clicks from
+                          // bubbling up and triggering row selection
+                          // (e.g. inline Switch in the MCP submenu).
+                          onClick={(e) => e.stopPropagation()}
+                          onMouseDown={(e) => e.stopPropagation()}
+                          onPointerDown={(e) => e.stopPropagation()}
+                        >
+                          {item.rightAdornment}
+                        </span>
+                      ) : (
+                        <span className="ml-auto font-mono text-[11px] text-muted-foreground/70">
+                          {item.command}
+                        </span>
+                      )}
                     </CommandPrimitive.Item>
                   );
                 })}
@@ -212,7 +270,8 @@ export function SlashCommandPopup({
               {footerNote.message}
             </div>
           )}
-        </CommandPrimitive.List>
+          </CommandPrimitive.List>
+        </ScrollArea>
       </CommandPrimitive>
     </div>
   );

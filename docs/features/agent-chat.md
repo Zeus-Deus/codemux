@@ -469,6 +469,39 @@ sidebar in debug builds when `enable_agent_chat` is on. It invokes
 active workspace. This is a temporary affordance for manual testing
 before the real chat UI lands.
 
+## Step 9 — Cross-provider MCP server runtime (shipped)
+
+Codemux now hosts user-installed MCP servers as first-class
+infrastructure: discovers configs across Codemux/Claude/Cursor paths,
+spawns each server once, exposes their tools to Claude SDK sessions
+through an in-process facade, and surfaces enable/disable controls in
+both Settings and the composer's `+` popup. Stages 1–6 (config
+discovery → backend runtime → SDK facade → polish → Codex spike →
+cleanup) all shipped on this branch.
+
+See `docs/features/mcp-server.md` for the canonical feature description
+and `docs/plans/step-9-mcp-servers.md` for the original research +
+locked design decisions. The Stage 5 spike at
+`docs/plans/step-9-codex-mcp-spike.md` recommends Step 11 as the path
+to extend MCP host support to Codex via an HTTP gateway.
+
+## Roadmap (next steps)
+
+- **Step 10 — Skills sync** (planned). Mirror Step 9's cross-provider
+  pattern for skills: scan `~/.claude/skills/`, `~/.codex/skills/`,
+  `~/.opencode/skills/`, and `~/.codemux/skills/`; surface a unified
+  list with enable/disable + dedupe + sync-to-cloud. Touches the same
+  permission-system + SDK-options surface Step 9 used.
+- **Step 11 — Codex MCP via HTTP gateway** (planned). Codemux exposes
+  a localhost streamable HTTP MCP endpoint, writes
+  `[mcp_servers.codemux] url = "..."` into `~/.codex/config.toml`, and
+  hot-reloads via the `config/mcpServer/reload` RPC when the registry
+  changes. Reuses the entire Stage 1–4 stack (registry, dispatcher,
+  prefixing, dedupe, cap, approval flow). Estimated complexity 40–50%
+  of Stage 3 (Claude facade). Spike at
+  `docs/plans/step-9-codex-mcp-spike.md` for staging proposal +
+  Issue #11284 risk mitigation.
+
 ## Known follow-ups
 
 - **Step 2: visual chat UI.** Replace the stub renderer with the

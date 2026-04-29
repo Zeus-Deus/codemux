@@ -7,6 +7,7 @@ pub mod database;
 pub mod files;
 pub mod git;
 pub mod github;
+pub mod mcp;
 pub mod openflow;
 pub mod package_detect;
 pub mod permissions;
@@ -14,6 +15,7 @@ pub mod presets;
 pub mod project_files;
 pub mod settings_sync;
 pub mod skills;
+pub mod skills_sync;
 pub mod update;
 pub mod virtual_display;
 pub mod workspace;
@@ -27,6 +29,7 @@ pub use database::*;
 pub use files::*;
 pub use git::*;
 pub use github::*;
+pub use mcp::*;
 pub use openflow::*;
 pub use package_detect::*;
 pub use permissions::*;
@@ -34,6 +37,7 @@ pub use presets::*;
 pub use project_files::*;
 pub use settings_sync::*;
 pub use skills::*;
+pub use skills_sync::*;
 pub use update::*;
 pub use virtual_display::*;
 pub use workspace::*;
@@ -293,6 +297,89 @@ pub async fn pick_files_dialog<R: Runtime>(
                 .map(|ps| ps.into_iter().map(|p| p.to_string()).collect())
                 .unwrap_or_default(),
         );
+    });
+
+    rx.await.map_err(|error| error.to_string())
+}
+
+/// Save-as dialog. Used by the skills export flow (Stage 4).
+/// Caller passes a default filename (e.g.
+/// `codemux-skills-export-2026-04-29.json`) and an optional title.
+/// Returns `Some(path)` when the user picks one, `None` if they
+/// cancel.
+#[tauri::command]
+pub async fn pick_save_file_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+    default_filename: Option<String>,
+    filter_name: Option<String>,
+    filter_extensions: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Save as"));
+
+    if let Some(name) = default_filename.as_deref() {
+        builder = builder.set_file_name(name);
+    }
+    if let (Some(name), Some(exts)) = (filter_name.as_deref(), filter_extensions.as_ref()) {
+        let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        builder = builder.add_filter(name, &ext_refs);
+    }
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.save_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+
+    rx.await.map_err(|error| error.to_string())
+}
+
+/// Single-file open-dialog with filter. Used by the skills
+/// import flow (Stage 4) where the user is picking a previously-
+/// saved JSON backup. Returns `Some(path)` on selection, `None`
+/// on cancel.
+#[tauri::command]
+pub async fn pick_open_file_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+    filter_name: Option<String>,
+    filter_extensions: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Open"));
+
+    if let (Some(name), Some(exts)) = (filter_name.as_deref(), filter_extensions.as_ref()) {
+        let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        builder = builder.add_filter(name, &ext_refs);
+    }
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.pick_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
     });
 
     rx.await.map_err(|error| error.to_string())

@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useAuthEvents } from "@/hooks/use-auth-events";
+import { useSkillsSync } from "@/hooks/use-skills-sync";
 import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { AppShell } from "@/components/layout/app-shell";
 import { Toaster } from "@/components/ui/sonner";
@@ -30,6 +31,11 @@ function App() {
 
   // Listen for auth state changes from Tauri (OAuth callback, token expiry)
   useAuthEvents();
+
+  // Skills sync engine triggers: kick a sync after sync becomes
+  // available and after the file watcher reports `skills-changed`
+  // (debounced). Engine itself serializes concurrent calls.
+  useSkillsSync();
 
   // Cache $HOME at App mount. Downstream selectors (project-group
   // labelling, future Step-5 home-rooted chat detection) compare

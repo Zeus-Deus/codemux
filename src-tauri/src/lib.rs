@@ -17,8 +17,10 @@ pub mod github;
 pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
+pub mod encryption;
 pub mod execution;
 pub mod indexing;
+pub mod mcp;
 pub mod memory;
 pub mod openflow;
 pub mod observability;
@@ -29,6 +31,7 @@ pub mod project;
 pub mod scripts;
 pub mod scrollback;
 pub mod skills;
+pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod state;
@@ -141,6 +144,8 @@ pub fn run() {
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
+        .manage(encryption::EncryptionManager::default())
+        .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
         .manage(skills::watcher::SkillsWatcherState::new())
         // Phase 2 display-isolation: per-workspace virtual display manager.
@@ -808,6 +813,8 @@ pub fn run() {
             commands::add_replay_record,
             commands::pick_folder_dialog,
             commands::pick_files_dialog,
+            commands::pick_save_file_dialog,
+            commands::pick_open_file_dialog,
             commands::list_available_cli_tools,
             commands::list_models_for_tool,
             commands::list_thinking_modes_for_tool,
@@ -928,6 +935,15 @@ pub fn run() {
             commands::check_auth,
             commands::sign_out,
             commands::get_auth_token,
+            commands::get_sync_status,
+            commands::setup_sync_password,
+            commands::provide_password_for_sync,
+            commands::skills_sync_now,
+            commands::skills_sync_status,
+            commands::get_export_recommended_filename,
+            commands::export_skills_to_file,
+            commands::import_skills_from_file,
+            commands::wipe_remote_skills_for_reset,
             commands::get_synced_settings,
             commands::update_synced_settings,
             commands::update_setting,

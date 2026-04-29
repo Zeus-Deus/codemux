@@ -88,6 +88,13 @@ pub struct AuthState {
     /// 10-minute OAuth state token.
     pub(crate) csrf_states: Mutex<HashMap<String, SystemTime>>,
     callback_port: Mutex<Option<u16>>,
+    /// Tracks which signin path produced the current session —
+    /// `"email"` after email/password, `"github"` after OAuth, or
+    /// `None` after a cold-start `check_auth` (the path is not
+    /// persisted on disk; the frontend infers from sync state).
+    /// Cleared on `sign_out`. Mirrors Vexis's `AuthStatus.authMethod`
+    /// which drives the Settings → Sync section's UI fork.
+    auth_method: Mutex<Option<String>>,
 }
 
 impl Default for AuthState {
@@ -95,6 +102,7 @@ impl Default for AuthState {
         Self {
             csrf_states: Mutex::new(HashMap::new()),
             callback_port: Mutex::new(None),
+            auth_method: Mutex::new(None),
         }
     }
 }
@@ -133,6 +141,14 @@ impl AuthState {
 
     pub fn take_callback_port(&self) -> Option<u16> {
         self.callback_port.lock().unwrap().take()
+    }
+
+    pub fn set_auth_method(&self, method: Option<&str>) {
+        *self.auth_method.lock().unwrap() = method.map(|m| m.to_string());
+    }
+
+    pub fn auth_method(&self) -> Option<String> {
+        self.auth_method.lock().unwrap().clone()
     }
 }
 
@@ -281,6 +297,90 @@ pub fn is_token_expired(expires_at: &str) -> bool {
     chrono::DateTime::parse_from_rfc3339(expires_at)
         .map(|dt| dt < chrono::Utc::now())
         .unwrap_or(true)
+}
+
+// ── Sync encryption key (Stage 2) ────────────────────────────────
+//
+// The 32-byte symmetric `encryption_key` from
+// `derive_login_credentials` is persisted as a separate file at
+// `~/.local/share/codemux/sync-key.enc`, encrypted with the same
+// machine-bound AES-256-GCM wrap as the auth token. Mirrors Vexis's
+// `auth/token_store.rs::save_encryption_key` pattern.
+//
+// Why a separate file rather than alongside the auth token: the
+// auth token's lifecycle (signin, refresh, logout) is independent
+// of the sync key's lifecycle (setup, repair, reset_sync). Keeping
+// them in separate files means a partially-corrupted token file
+// doesn't take the sync key down with it and vice versa.
+//
+// Why the same machine-bound wrap: the threat model is identical —
+// neither file should be useful when copied to a different machine.
+// `derive_key(salt)` uses the host's `/etc/machine-id` (with macOS
+// and hostname fallbacks) as the master input, so a stolen
+// `sync-key.enc` from laptop A cannot be decrypted on laptop B.
+
+pub(crate) fn sync_key_file_path() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
+    data_dir.join("codemux").join("sync-key.enc")
+}
+
+/// Encrypt `key` with the machine-bound wrap and write to
+/// `sync-key.enc`. Returns the resolved path so callers can log it
+/// at info level (the path is not sensitive — only the file
+/// contents are, and those are already AES-GCM-wrapped).
+pub fn save_encryption_key(key: &[u8; 32]) -> Result<PathBuf, String> {
+    let path = sync_key_file_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
+    }
+    let encrypted = encrypt_data(key)?;
+    fs::write(&path, &encrypted).map_err(|e| format!("write sync-key.enc: {e}"))?;
+    Ok(path)
+}
+
+/// Read `sync-key.enc` if present and decrypt the 32-byte key.
+/// Returns `Ok(None)` if the file does not exist (fresh install,
+/// post-logout, or pre-setup state). Returns `Err` only on
+/// genuinely unexpected errors — a missing file is a normal state.
+///
+/// A decrypt failure also returns `Ok(None)` rather than `Err`: the
+/// most common cause is "file copied from another machine" or "the
+/// machine's `/etc/machine-id` was regenerated", in which case the
+/// only sane recovery is to treat the key as missing and prompt the
+/// user to re-derive via `provide_password_for_sync`.
+pub fn load_encryption_key() -> Result<Option<[u8; 32]>, String> {
+    let path = sync_key_file_path();
+    let data = match fs::read(&path) {
+        Ok(d) => d,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("read sync-key.enc: {err}")),
+    };
+    let plaintext = match decrypt_data(&data) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    if plaintext.len() != 32 {
+        // Wrong size means the file was tampered with or written by
+        // a different version. Treat as missing — Stage 3 will
+        // route the user through provide_password_for_sync.
+        return Ok(None);
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&plaintext);
+    Ok(Some(key))
+}
+
+/// Delete the persisted sync key. Used on logout and as part of
+/// the `reset_sync` recovery flow. Missing-file is treated as
+/// success — the caller wanted the file gone, and it is.
+pub fn delete_encryption_key() -> Result<(), String> {
+    let path = sync_key_file_path();
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("remove sync-key.enc: {err}")),
+    }
 }
 
 // ── Localhost callback server ────────────────────────────────────
@@ -472,6 +572,204 @@ p{opacity:.6;font-size:.9rem}
 <p>You can close this tab and return to the desktop app.</p>
 </div>
 </body></html>"#;
+
+// ────────────────────────────────────────────────────────────────
+// Zero-knowledge auth credential derivation (Step 10 — Skills Sync)
+// ────────────────────────────────────────────────────────────────
+//
+// TODO: relocate this entire section to `auth/derivation.rs` once
+// `feature/agent-chat` merges main, which carries the auth-module
+// refactor (single `auth.rs` → `auth/{api,derivation,mod}.rs`).
+// Until then, the derivation lives inline here so Stage 1 can ship
+// without pulling in 71 commits of unrelated main work. The
+// implementation matches `feature/skills-sync-stage-1`'s
+// `src-tauri/src/auth/derivation.rs` byte-for-byte at the protocol
+// level — both produce identical output for the same `(password,
+// email)`, pinned by `auth_secret_matches_vexis_for_known_input`
+// and `encryption_key_matches_vexis_for_known_input` below.
+//
+// Cross-product contract: `derive_login_credentials(password, email)`
+// returns an `AuthSecret` (sent to Better Auth in place of the raw
+// password) and a 32-byte `EncryptionKey` (kept on-device, used by
+// `crate::encryption` to encrypt synced skills before upload). The
+// HKDF info labels `codemux-api-master-v1`,
+// `codemux-api-auth-secret-v1`, and `codemux-api-encryption-key-v1`
+// are SHARED across every product authenticating to api.codemux.org
+// — Vexis uses them too. Any rotation must bump the `vN` suffix in
+// every product simultaneously.
+
+use argon2::{Algorithm, Argon2, Params, Version};
+use base64::Engine as _;
+use hkdf::Hkdf;
+
+const ARGON2_M_COST_KIB: u32 = 65_536; // 64 MiB
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 4;
+const AUTH_SECRET_LEN: usize = 32;
+const ENCRYPTION_KEY_LEN: usize = 32;
+
+const MASTER_SALT_DOMAIN: &[u8] = b"codemux-api-master-v1\0";
+const AUTH_SECRET_INFO: &[u8] = b"codemux-api-auth-secret-v1";
+const ENCRYPTION_KEY_INFO: &[u8] = b"codemux-api-encryption-key-v1";
+
+/// A base64-encoded 32-byte authentication secret derived from the
+/// user's password + email. Sent to Better Auth in place of the raw
+/// password, so the server only ever bcrypt-hashes this stretched
+/// value and never sees what the user actually typed.
+///
+/// The `Debug` impl deliberately redacts the value — a stray
+/// `println!("{:?}", secret)` won't leak the auth credential.
+#[derive(Clone)]
+pub struct AuthSecret(String);
+
+impl AuthSecret {
+    /// Borrow the base64 secret for transmission to the auth API.
+    /// `pub(crate)` so only code inside the codemux crate can read
+    /// it; external callers can't accidentally log or leak it.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Public escape hatch for integration test binaries (e.g. the
+    /// `skills_smoke` example) that need to forward the secret to
+    /// the live `/api/auth/desktop/signin` endpoint. Verbose name
+    /// keeps the call sites greppable.
+    pub fn expose_for_external_signin(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AuthSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AuthSecret(***)")
+    }
+}
+
+/// A 32-byte raw symmetric key derived alongside `AuthSecret` for
+/// products that ship client-side end-to-end encryption (Step 10
+/// skills sync, Vexis voice_*). Never sent to the server, never
+/// persisted in plaintext on disk, never logged.
+///
+/// `Drop` zeroes the bytes via `write_volatile` so a stack frame
+/// holding a transient `EncryptionKey` doesn't leave key material
+/// in memory after it goes out of scope. Not as airtight as the
+/// `zeroize` crate but sufficient for our threat model — brief
+/// in-stack lifetime, never crosses FFI.
+pub struct EncryptionKey([u8; ENCRYPTION_KEY_LEN]);
+
+impl EncryptionKey {
+    /// Borrow the raw key bytes for use with an AEAD cipher.
+    /// `pub(crate)` so the bytes don't leak past crate boundaries;
+    /// the public escape hatch below is for the smoke-test binary.
+    #[allow(dead_code)] // used by tests + Stage 2 sync layer (forthcoming)
+    pub(crate) fn as_bytes(&self) -> &[u8; ENCRYPTION_KEY_LEN] {
+        &self.0
+    }
+
+    /// Public escape hatch for the Stage 1 `skills_smoke` example
+    /// binary, which needs the raw bytes to feed
+    /// `crate::encryption::encrypt`. Verbose name keeps the
+    /// callsites greppable.
+    pub fn expose_for_smoke_test(&self) -> &[u8; ENCRYPTION_KEY_LEN] {
+        &self.0
+    }
+}
+
+impl Drop for EncryptionKey {
+    fn drop(&mut self) {
+        for byte in self.0.iter_mut() {
+            // Safety: writing to our own slot, no aliasing.
+            unsafe { core::ptr::write_volatile(byte, 0) };
+        }
+    }
+}
+
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EncryptionKey(***)")
+    }
+}
+
+/// Derive both halves of the login credentials from a single
+/// Argon2id stretch of `(password, email)`. Mirrors Vexis's
+/// `derive_login_credentials` and produces byte-identical output
+/// for the same inputs, which is what makes the shared Better Auth
+/// account work across both apps.
+///
+/// ```text
+/// master         = Argon2id(
+///     password,
+///     salt   = SHA256("codemux-api-master-v1\0" || normalize_email(email)),
+///     m=64MiB, t=3, p=4, L=32,
+/// )
+/// auth_secret    = base64_no_pad( HKDF-Expand(master, "codemux-api-auth-secret-v1",    32) )
+/// encryption_key =                HKDF-Expand(master, "codemux-api-encryption-key-v1", 32)
+/// ```
+///
+/// HKDF domain separation: observing one half tells an attacker
+/// nothing about the other. Server-stored AuthSecret cannot be
+/// used to derive any user's EncryptionKey.
+pub fn derive_login_credentials(
+    password: &str,
+    email: &str,
+) -> Result<(AuthSecret, EncryptionKey), String> {
+    let master = derive_master_material(password, email)?;
+    let hk = Hkdf::<Sha256>::from_prk(&master)
+        .map_err(|e| format!("hkdf from_prk: {e}"))?;
+
+    let mut auth_bytes = [0u8; AUTH_SECRET_LEN];
+    hk.expand(AUTH_SECRET_INFO, &mut auth_bytes)
+        .map_err(|e| format!("hkdf expand auth: {e}"))?;
+    let auth_secret = AuthSecret(
+        base64::engine::general_purpose::STANDARD_NO_PAD.encode(auth_bytes),
+    );
+
+    let mut key_bytes = [0u8; ENCRYPTION_KEY_LEN];
+    hk.expand(ENCRYPTION_KEY_INFO, &mut key_bytes)
+        .map_err(|e| format!("hkdf expand encryption-key: {e}"))?;
+    let encryption_key = EncryptionKey(key_bytes);
+
+    Ok((auth_secret, encryption_key))
+}
+
+/// Convenience wrapper for callers that only need the AuthSecret
+/// half (signin / signup / set-password). Discards the
+/// EncryptionKey; the Argon2id cost is paid once regardless.
+#[allow(dead_code)] // wired up in Stage 2 when settings UI calls it
+pub fn derive_auth_secret(password: &str, email: &str) -> Result<AuthSecret, String> {
+    let (auth, _key) = derive_login_credentials(password, email)?;
+    Ok(auth)
+}
+
+fn derive_master_material(password: &str, email: &str) -> Result<[u8; AUTH_SECRET_LEN], String> {
+    let normalized = normalize_email(email);
+
+    let mut hasher = Sha256::new();
+    hasher.update(MASTER_SALT_DOMAIN);
+    hasher.update(normalized.as_bytes());
+    let salt: [u8; 32] = hasher.finalize().into();
+
+    let params = Params::new(
+        ARGON2_M_COST_KIB,
+        ARGON2_T_COST,
+        ARGON2_P_COST,
+        Some(AUTH_SECRET_LEN),
+    )
+    .map_err(|e| format!("invalid argon2 params: {e}"))?;
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut out = [0u8; AUTH_SECRET_LEN];
+    argon
+        .hash_password_into(password.as_bytes(), &salt, &mut out)
+        .map_err(|e| format!("argon2 derive: {e}"))?;
+    Ok(out)
+}
+
+/// Lowercase + trim. Deliberately no NFKC/IDN normalization — Better
+/// Auth stores emails as submitted, and as long as every client
+/// uses this exact function multi-device determinism holds.
+pub(crate) fn normalize_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
 
 // ── Tests ────────────────────────────────────────────────────────
 
@@ -678,5 +976,202 @@ mod tests {
         // Empty database — no token stored
         assert!(load_token(&db).is_none());
         assert!(load_cached_user(&db).is_none());
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Derivation tests (Step 10 — Skills Sync)
+    //
+    // These pin the cross-product `codemux-api-*` derivation
+    // protocol against Vexis. Any drift in either implementation
+    // fails CI and signals that cross-product login or E2E sync
+    // for shared-account users is broken.
+    //
+    // Mirrors the test suite in
+    // `feature/skills-sync-stage-1`'s `auth/derivation.rs`. When
+    // the auth-module split lands on agent-chat (via main merge),
+    // these tests move along with the code.
+    // ────────────────────────────────────────────────────────────
+
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    use std::time::Instant;
+
+    const PASS: &str = "correct horse battery staple";
+    const PASS_WRONG: &str = "Tr0ub4dor&3";
+    const EMAIL: &str = "alice@example.com";
+    const EMAIL_OTHER: &str = "bob@example.com";
+
+    #[test]
+    fn auth_secret_is_valid_base64_of_32_bytes() {
+        let secret = derive_auth_secret(PASS, EMAIL).expect("derive");
+        let decoded = STANDARD_NO_PAD
+            .decode(secret.as_str())
+            .expect("auth_secret must be valid base64");
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn auth_secret_is_deterministic() {
+        let a = derive_auth_secret(PASS, EMAIL).unwrap();
+        let b = derive_auth_secret(PASS, EMAIL).unwrap();
+        assert_eq!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn different_password_yields_different_auth_secret() {
+        let a = derive_auth_secret(PASS, EMAIL).unwrap();
+        let b = derive_auth_secret(PASS_WRONG, EMAIL).unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn different_email_yields_different_auth_secret() {
+        let a = derive_auth_secret(PASS, EMAIL).unwrap();
+        let b = derive_auth_secret(PASS, EMAIL_OTHER).unwrap();
+        assert_ne!(a.as_str(), b.as_str());
+    }
+
+    #[test]
+    fn email_normalization_lowercases_and_trims() {
+        // `Alice@Example.COM` and `  alice@example.com  ` must
+        // produce the same AuthSecret — multi-device determinism.
+        let a = derive_auth_secret(PASS, "Alice@Example.COM").unwrap();
+        let b = derive_auth_secret(PASS, "  alice@example.com  ").unwrap();
+        let c = derive_auth_secret(PASS, "alice@example.com").unwrap();
+        assert_eq!(a.as_str(), b.as_str());
+        assert_eq!(b.as_str(), c.as_str());
+    }
+
+    #[test]
+    fn empty_password_does_not_panic() {
+        let secret = derive_auth_secret("", EMAIL).expect("derive empty");
+        let decoded = STANDARD_NO_PAD.decode(secret.as_str()).unwrap();
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn auth_secret_does_not_contain_password_substring() {
+        // HKDF output is indistinguishable from random — a leak of
+        // the raw password into the encoded AuthSecret would mean
+        // the derivation is broken.
+        let password = "super-distinctive-plaintext-password-12345";
+        let secret = derive_auth_secret(password, EMAIL).unwrap();
+        assert!(!secret.as_str().contains(password));
+    }
+
+    #[test]
+    fn auth_secret_debug_redacts() {
+        let secret = derive_auth_secret(PASS, EMAIL).unwrap();
+        let rendered = format!("{:?}", secret);
+        assert!(rendered.contains("***"));
+        assert!(!rendered.contains(secret.as_str()));
+    }
+
+    #[test]
+    fn derivation_timing_at_least_100ms() {
+        // Pins the Argon2id cost — drop below 100ms and dictionary
+        // attacks on weak passwords become feasible.
+        let start = Instant::now();
+        let _ = derive_auth_secret(PASS, EMAIL).expect("derive");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed.as_millis() >= 100,
+            "argon2id derivation should take ≥ 100ms (got {}ms)",
+            elapsed.as_millis()
+        );
+        assert!(elapsed.as_secs() < 30);
+    }
+
+    /// Cross-product AuthSecret pin — must match Vexis byte-for-byte.
+    /// The expected value comes from the `codemux-api-infrastructure`
+    /// skill's documented golden value.
+    #[test]
+    fn auth_secret_matches_vexis_for_known_input() {
+        let secret = derive_auth_secret(
+            "golden-test-password",
+            "golden-test@example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            secret.as_str(),
+            "9FxAbaiRLQfRmjpB6x4d3FuamAUojg9bh9dVfPYRfyI",
+            "Codemux derivation diverged from Vexis — cross-product login is broken"
+        );
+    }
+
+    // ── Encryption key half ─────────────────────────────────────
+
+    #[test]
+    fn encryption_key_is_32_raw_bytes() {
+        let (_auth, key) = derive_login_credentials(PASS, EMAIL).unwrap();
+        assert_eq!(key.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn encryption_key_is_deterministic() {
+        let (_a_auth, a_key) = derive_login_credentials(PASS, EMAIL).unwrap();
+        let (_b_auth, b_key) = derive_login_credentials(PASS, EMAIL).unwrap();
+        assert_eq!(a_key.as_bytes(), b_key.as_bytes());
+    }
+
+    #[test]
+    fn encryption_key_differs_from_auth_secret() {
+        // HKDF domain separation: the two halves come from different
+        // info labels and must produce different bytes. If they ever
+        // coincide, observing the server-visible AuthSecret would
+        // leak the client-only EncryptionKey — catastrophic.
+        let (auth, key) = derive_login_credentials(PASS, EMAIL).unwrap();
+        let auth_decoded = STANDARD_NO_PAD.decode(auth.as_str()).unwrap();
+        assert_ne!(auth_decoded.as_slice(), key.as_bytes().as_slice());
+    }
+
+    #[test]
+    fn encryption_key_changes_with_password() {
+        let (_a, key_a) = derive_login_credentials(PASS, EMAIL).unwrap();
+        let (_b, key_b) = derive_login_credentials(PASS_WRONG, EMAIL).unwrap();
+        assert_ne!(key_a.as_bytes(), key_b.as_bytes());
+    }
+
+    #[test]
+    fn encryption_key_changes_with_email() {
+        let (_a, key_a) = derive_login_credentials(PASS, EMAIL).unwrap();
+        let (_b, key_b) = derive_login_credentials(PASS, EMAIL_OTHER).unwrap();
+        assert_ne!(key_a.as_bytes(), key_b.as_bytes());
+    }
+
+    #[test]
+    fn encryption_key_email_normalization_matches() {
+        let (_a, key_a) = derive_login_credentials(PASS, "Alice@Example.COM").unwrap();
+        let (_b, key_b) = derive_login_credentials(PASS, "alice@example.com").unwrap();
+        assert_eq!(key_a.as_bytes(), key_b.as_bytes());
+    }
+
+    #[test]
+    fn encryption_key_debug_redacts() {
+        let (_auth, key) = derive_login_credentials(PASS, EMAIL).unwrap();
+        let rendered = format!("{:?}", key);
+        assert!(rendered.contains("***"));
+    }
+
+    /// **Cross-product encryption-key pin.** Must match Vexis
+    /// byte-for-byte. Expected hex from `codemux-api-infrastructure`
+    /// skill: this is the canary that catches any drift between
+    /// Codemux's and Vexis's encryption_key derivation.
+    #[test]
+    fn encryption_key_matches_vexis_for_known_input() {
+        let (_auth, key) = derive_login_credentials(
+            "golden-test-password",
+            "golden-test@example.com",
+        )
+        .unwrap();
+        let hex_str: String = key
+            .as_bytes()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect();
+        assert_eq!(
+            hex_str,
+            "0b03b2541a15d39e7a422df4a6e6ade56b371453d5b41c1ec117efa62db54534",
+            "Codemux encryption_key derivation diverged from Vexis — cross-product E2E sync is broken"
+        );
     }
 }

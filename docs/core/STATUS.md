@@ -40,11 +40,14 @@ The repo structure is clean and domain-split:
 - CLI and socket control
 - Global overlay manager (single overlay at a time)
 - Auth system: GitHub OAuth, email/password with email verification, encrypted token storage
+- Zero-knowledge auth derivation (Step 10): `derive_login_credentials(password, email)` produces both the server-visible `AuthSecret` (sent to Better Auth in place of the raw password) and a client-only `EncryptionKey` (32 raw bytes, never leaves the device). Cross-product byte-identical with Vexis via the shared `codemux-api-*` HKDF labels — pinned in CI.
+- End-to-end-encrypted skills sync (Step 10, Stages 1-6 shipped): cross-device sync of user-authored skills under `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.opencode/skills/`. XChaCha20-Poly1305 per blob, machine-bound key persistence at `~/.local/share/codemux/sync-key.enc` (AES-GCM under `/etc/machine-id`). Push triggered by file watcher (1.5s frontend debounce on top of the watcher's 300ms), 5-min periodic when window is visible, or manual "Sync now" button. Last-write-wins conflict resolution by `updated_at`. Settings → Account → Sync surfaces live status + relative-time + Export/Import/Forgot-password controls. Multi-step reset dialog enforces export-or-explicit-skip before the destructive wipe. Production-deployed and end-to-end smoked (`examples/stage5_smoke.rs` against `api.codemux.org`). Project-scoped sync planned for Step 10.5 (schema's `scope` field is forward-compat). See `docs/features/skills-sync.md`.
 - Per-user synced settings with server sync, offline cache, and dirty flag
 - Neutral dark shell theming with Omarchy accent sync
 - Sans-serif shell chrome, monospace terminals
 - Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
 - MCP server exposing 29 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
+- Cross-provider MCP server runtime (Claude-side): Codemux hosts user-installed MCP servers, discovers configs across Codemux / Claude / Cursor paths, spawns each child once, dedupes identical configs, exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh. Settings panel and `+` popup both surface enable/disable + status badges + tool list modal + 50-tool cap warning. Codex MCP support planned for Step 11 via HTTP gateway (see `docs/plans/step-9-codex-mcp-spike.md`).
 - Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
 
 ## Partial / Being Hardened

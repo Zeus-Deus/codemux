@@ -1,3 +1,5 @@
+import type * as React from "react";
+
 import {
   Bug,
   ListTodo,
@@ -42,6 +44,11 @@ export interface SlashCommandItem {
    *  Image kinds before their respective stages light them up).
    *  Defaults to false; back-compatible with all existing call sites. */
   disabled?: boolean;
+  /** Step 9 Stage 4 — opt-in trailing element rendered right-aligned
+   *  in the row, e.g. an inline Switch for the MCP servers submenu.
+   *  When present, the row's onSelect is suppressed because the
+   *  trailing control owns the click target. */
+  rightAdornment?: React.ReactNode;
 }
 
 export interface SlashAnchor {

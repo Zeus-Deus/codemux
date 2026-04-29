@@ -26,11 +26,22 @@ import {
   InvalidParamsError,
   type MethodHandler,
 } from "./methods/index.ts";
+import { setMcpBridgeWriter } from "./mcp-bridge.ts";
+import { dispatchResponse } from "./upstream-rpc.ts";
 import type { EventEmitter } from "./session.ts";
 
 function writeMessage(msg: JsonRpcOutgoing): void {
   process.stdout.write(formatMessage(msg));
 }
+
+/** Used by `upstream-rpc` and `mcp-bridge` to ship outbound requests
+ *  AND raw lines (including request shapes that `formatMessage`'s
+ *  union doesn't admit). Inlined here so the test harness can swap a
+ *  capture-buffer in via `setMcpBridgeWriter`. */
+function writeLine(line: string): void {
+  process.stdout.write(line);
+}
+setMcpBridgeWriter(writeLine);
 
 function writeParseError(line: string, err: unknown): void {
   writeMessage({
@@ -94,14 +105,24 @@ const emitter: EventEmitter = {
 const methods: Record<string, MethodHandler> = buildMethods(emitter);
 
 async function handleLine(raw: string): Promise<void> {
-  let msg;
+  let parsed;
   try {
-    msg = parseLine(raw);
+    parsed = parseLine(raw);
   } catch (err) {
     writeParseError(raw, err);
     return;
   }
-  if (msg === null) return;
+  if (parsed === null) return;
+
+  // Stage 3 — responses to upstream requests we issued (e.g.
+  // `mcp-tool-call`) flow through dispatchResponse. They never
+  // reach the method registry.
+  if (parsed.kind === "response") {
+    dispatchResponse(parsed.msg);
+    return;
+  }
+
+  const msg = parsed.msg;
 
   if (isRequest(msg)) {
     const handler = methods[msg.method];

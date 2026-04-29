@@ -52,6 +52,14 @@ pub struct ClaudeProviderConfig {
     /// the cost of memory; slow subscribers miss old events when
     /// the buffer wraps.
     pub event_channel_capacity: usize,
+    /// MCP runtime registry. When provided, the sidecar can RPC back
+    /// to Codemux with `mcp-tool-call` requests and they get routed
+    /// to the appropriate user-installed MCP child via
+    /// [`crate::mcp::registry::McpRegistry::dispatch_tool_call`].
+    /// `None` is fine for tests that don't exercise MCPs — sidecar
+    /// requests for `mcp-tool-call` will be rejected with
+    /// `method-not-found` semantics.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 /// `AgentProvider` implementation for Claude Code, backed by the
@@ -61,6 +69,7 @@ pub struct ClaudeAgentProvider {
     claude_binary: PathBuf,
     sessions: Arc<RwLock<HashMap<ThreadId, Arc<ClaudeSession>>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 impl ClaudeAgentProvider {
@@ -86,6 +95,7 @@ impl ClaudeAgentProvider {
             claude_binary,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
+            mcp_registry: config.mcp_registry,
         })
     }
 
@@ -93,6 +103,7 @@ impl ClaudeAgentProvider {
         ClaudeSpawnConfig {
             sidecar_binary: self.sidecar_binary.clone(),
             claude_binary: self.claude_binary.clone(),
+            mcp_registry: self.mcp_registry.clone(),
         }
     }
 

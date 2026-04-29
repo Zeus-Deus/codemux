@@ -11,6 +11,8 @@ import {
   Image as ImageIcon,
   ListTodo,
   MessageCircleQuestion,
+  Server,
+  Settings,
 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -37,10 +39,16 @@ import {
   getGithubIssueByPath,
   getGithubPrByPath,
   listGithubIssuesByPath,
+  listMcpServers,
   listProjectFiles,
   listProjectFolders,
   listPullRequests,
+  MCP_CODEMUX_SELF_ID,
+  type McpServerConfig,
 } from "@/tauri/commands";
+import { Switch } from "@/components/ui/switch";
+import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
+import { useMcpStore } from "@/stores/mcp-store";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
 import { PrPickerPanel } from "@/components/github/pr-picker";
 import type {
@@ -88,7 +96,7 @@ const ATTACHMENT_HARD_LIMIT = 20;
  *  insert an inline `@<basename>` token on pick; `issue` and `pr`
  *  swap the row pipeline for a dedicated picker panel that owns
  *  search + state colours. */
-type AttachSubmode = "main" | "file" | "folder" | "issue" | "pr";
+type AttachSubmode = "main" | "file" | "folder" | "issue" | "pr" | "mcp";
 
 interface Props {
   draft: string;
@@ -314,6 +322,18 @@ export function Composer({
   // (issue submode renders <IssuePickerPanel /> directly, which
   // owns its own list + loading + error state — no flat-row state
   // needed at the Composer level.)
+
+  // MCP submode (Stage 4) — fetched lazily on submode entry. The
+  // popup row uses `useMcpRuntime` for live status and the zustand
+  // store for the toggle persistence; the config list itself is
+  // refreshed each time the submode opens so toggles in another
+  // session show up here.
+  const [attachMcpServers, setAttachMcpServers] = useState<
+    McpServerConfig[]
+  >([]);
+  const { runtimes: mcpRuntimes } = useMcpRuntime();
+  const mcpDisabledIds = useMcpStore((s) => s.disabledIds);
+  const mcpToggleDisabled = useMcpStore((s) => s.toggleDisabled);
 
   const modeCommands = useMemo(
     () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
@@ -629,6 +649,25 @@ export function Composer({
     closeMention,
   ]);
 
+  // Lazy-fetch the `+` popup's MCP server list each time the
+  // submode opens. The store-level toggles fire updates back to the
+  // backend; the list itself is just a hydration of `list_mcp_servers`.
+  useEffect(() => {
+    if (!attachOpen) return;
+    if (attachSubmode !== "mcp") return;
+    let cancelled = false;
+    void listMcpServers(cwd ?? null)
+      .then((servers) => {
+        if (!cancelled) setAttachMcpServers(servers);
+      })
+      .catch((err) => {
+        console.warn("[mcp] listMcpServers (+ popup) failed:", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [attachOpen, attachSubmode, cwd]);
+
   // Lazy-fetch the `+` popup's file/folder list when its submode
   // changes. Uses alphabetical ordering (no live search) — the user
   // searches via `@`. 30 entries is the popup's browse cap. The
@@ -901,7 +940,55 @@ export function Composer({
           disabled: !modelSupportsImages,
           onSelect: () => {},
         },
+        {
+          id: "attach:mcp",
+          label: "MCP Servers…",
+          description: "Toggle integrations the agent can call",
+          command: "",
+          icon: Server,
+          group: "ATTACH",
+          onSelect: () => {},
+        },
       ];
+    }
+    if (attachSubmode === "mcp") {
+      const rows: SlashCommandItem[] = attachMcpServers.map((server) => {
+        const runtime = mcpRuntimes.get(server.id);
+        const isCodemuxSelf = server.id === MCP_CODEMUX_SELF_ID;
+        const isOff = mcpDisabledIds.includes(server.id);
+        return {
+          id: `mcp:${server.id}`,
+          label: server.name,
+          description: isCodemuxSelf
+            ? "always on · built-in"
+            : formatMcpRowStatus(runtime, isOff),
+          command: "",
+          icon: Server,
+          group: "MCP SERVERS",
+          // The Switch in `rightAdornment` owns the click; the row's
+          // own onSelect is intentionally a no-op so users don't
+          // accidentally toggle by hitting Enter on the highlighted row.
+          onSelect: () => {},
+          rightAdornment: isCodemuxSelf ? null : (
+            <Switch
+              checked={!isOff}
+              onCheckedChange={() => mcpToggleDisabled(server.id)}
+              aria-label={`Enable ${server.name}`}
+              data-testid={`attach-mcp-${server.id}-toggle`}
+            />
+          ),
+        };
+      });
+      rows.push({
+        id: "mcp:settings",
+        label: "Open MCP Settings",
+        description: "View tools and manage servers",
+        command: "",
+        icon: Settings,
+        group: "MCP SERVERS",
+        onSelect: () => {},
+      });
+      return rows;
     }
     if (attachSubmode === "file") {
       return attachFileMatches.map((match) => ({
@@ -929,9 +1016,14 @@ export function Composer({
     attachSubmode,
     attachFileMatches,
     attachFolderMatches,
+    attachMcpServers,
+    mcpRuntimes,
+    mcpDisabledIds,
+    mcpToggleDisabled,
     mode,
     isGithubRepo,
     ghAuthenticated,
+    modelSupportsImages,
   ]);
 
   const attachPopupFooter = useMemo(() => {
@@ -998,6 +1090,30 @@ export function Composer({
       if (item.id === "attach:pr") {
         setAttachSubmode("pr");
         setAttachHighlighted(null);
+        return;
+      }
+      if (item.id === "attach:mcp") {
+        setAttachSubmode("mcp");
+        setAttachHighlighted(null);
+        return;
+      }
+      if (item.id === "mcp:settings") {
+        // Navigate to Settings → MCP Servers and close the popup.
+        // Settings panel reads its initial section from the URL hash;
+        // the chat-pane shell exposes a "settings" event the AppShell
+        // listens to. Both work; we use the hash + window event fallback
+        // so this works whether or not the listener is wired in tests.
+        try {
+          window.location.hash = "#settings/mcp";
+        } catch {
+          // jsdom may not let us set location — ignore.
+        }
+        window.dispatchEvent(
+          new CustomEvent("codemux:open-settings", {
+            detail: { section: "mcp" },
+          }),
+        );
+        setAttachOpen(false);
         return;
       }
       // Stage 6 — `+ → Image…` triggers the hidden file input. Close
@@ -1930,6 +2046,31 @@ export function Composer({
  *  existing copy; Plan/Ask/Debug swap in mode-specific prompts so
  *  users see at a glance what the pill changes about their next
  *  message. */
+/** Step 9 Stage 4 — `+` popup MCP submode row description. Mirrors the
+ *  Settings status badges in plain text so the popup row can convey
+ *  the same state at a glance. */
+function formatMcpRowStatus(
+  runtime: import("@/tauri/commands").McpServerRuntime | undefined,
+  isOff: boolean,
+): string {
+  if (isOff) return "disabled";
+  if (!runtime) return "discovered";
+  switch (runtime.status.kind) {
+    case "running":
+      return `${runtime.status.toolCount} tool${
+        runtime.status.toolCount === 1 ? "" : "s"
+      } running`;
+    case "starting":
+      return "starting…";
+    case "errored":
+      return `errored — ${runtime.status.message}`;
+    case "stopped":
+      return "stopped";
+    case "discovered":
+      return "discovered";
+  }
+}
+
 function placeholderForMode(mode: ChatMode): string {
   switch (mode) {
     case "plan":

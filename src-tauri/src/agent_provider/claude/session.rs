@@ -56,6 +56,11 @@ pub struct ClaudeSpawnConfig {
     /// Path to the user's local `claude` CLI, forwarded to the SDK
     /// via `pathToClaudeCodeExecutable`.
     pub claude_binary: PathBuf,
+    /// Optional MCP registry. When set, the sidecar can issue
+    /// `mcp-tool-call` server-initiated requests and the session's
+    /// requests task forwards them to the registry's
+    /// `dispatch_tool_call`. Tests pass `None`.
+    pub mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 /// Mutable per-session state.
@@ -99,6 +104,11 @@ pub(crate) struct ClaudeSession {
     /// Flag telling the watchdog "closed on purpose, don't emit
     /// SessionStateChanged::Error on exit".
     intentionally_closed: Arc<RwLock<bool>>,
+    /// Optional MCP runtime registry — populated when the provider was
+    /// constructed with `mcp_registry: Some(...)`. Used by
+    /// `handle_mcp_tool_call` to route `mcp-tool-call` requests from
+    /// the sidecar to the right MCP child.
+    mcp_registry: Option<crate::mcp::registry::McpRegistry>,
 }
 
 impl ClaudeSession {
@@ -194,6 +204,13 @@ impl ClaudeSession {
                 .get("extraArgs")
                 .and_then(|v| v.as_object())
                 .cloned(),
+            // Stage 3 — snapshot every running MCP tool from the
+            // registry and pass it through to the sidecar so the SDK
+            // can register the in-process `codemux` virtual MCP
+            // server. Tools added after session start aren't visible
+            // until the chat is restarted (Stage 4 polish will add a
+            // `setMcpServers` push path so dynamic refreshes work).
+            mcp_tools: collect_mcp_tools(spawn.mcp_registry.as_ref()).await,
         };
         let params_value = serde_json::to_value(&params).map_err(|e| ProviderError::ProcessError {
             message: "failed to serialize start-session params".into(),
@@ -230,6 +247,7 @@ impl ClaudeSession {
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             intentionally_closed: Arc::new(RwLock::new(false)),
+            mcp_registry: spawn.mcp_registry.clone(),
         });
 
         // Announce the session up front.
@@ -261,12 +279,22 @@ impl ClaudeSession {
             event_tx.clone(),
             shutdown_tx.subscribe(),
         );
+        // Stage 4 — dynamic MCP tool refresh. Subscribe to the
+        // registry's status broadcaster; whenever a server transitions
+        // (Running ↔ Stopped / Errored), re-collect tools and push the
+        // fresh snapshot to the sidecar via `update-mcp-tools`. The
+        // task does nothing when no registry is configured.
+        let mcp_refresh_task = spawn_mcp_refresh_task(
+            Arc::clone(&session),
+            shutdown_tx.subscribe(),
+        );
 
         {
             let mut guard = session.tasks.lock().await;
             guard.push(notifications_task);
             guard.push(requests_task);
             guard.push(watchdog_task);
+            guard.push(mcp_refresh_task);
         }
 
         Ok(session)
@@ -678,11 +706,22 @@ fn spawn_incoming_requests_task(
                 _ = shutdown_rx.recv() => break,
                 maybe_req = incoming.recv() => {
                     let Some(req) = maybe_req else { break; };
-                    // Sidecar does not currently send
-                    // server-initiated requests — approvals flow via
-                    // notifications + client-sent respond-to-request.
-                    // Log a warning if one arrives so a sidecar
-                    // regression is visible.
+
+                    // Stage 3 — the sidecar issues `mcp-tool-call`
+                    // server-initiated requests to dispatch agent tool
+                    // calls back through the runtime registry. Each
+                    // request handler runs in its own task so a slow
+                    // tool doesn't block other incoming requests.
+                    if req.method == METHOD_MCP_TOOL_CALL {
+                        let session_for_task = Arc::clone(&session);
+                        let event_tx_for_task = event_tx.clone();
+                        tokio::spawn(async move {
+                            handle_mcp_tool_call(session_for_task, event_tx_for_task, req).await;
+                        });
+                        continue;
+                    }
+
+                    // Anything else is unexpected.
                     let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                         thread_id: Some(session.thread_id.clone()),
                         message: format!(
@@ -691,7 +730,6 @@ fn spawn_incoming_requests_task(
                         ),
                         original_payload: Some(req.params),
                     });
-                    // Respond with an error so the sidecar unblocks.
                     let _ = session
                         .sidecar
                         .respond(
@@ -707,6 +745,212 @@ fn spawn_incoming_requests_task(
             }
         }
     })
+}
+
+/// Method name the sidecar uses for tool dispatch. Centralised so the
+/// session and the sidecar share a single source of truth (mirrored in
+/// `sidecar/claude-agent/src/mcp-bridge.ts` as `METHOD_MCP_TOOL_CALL`).
+pub const METHOD_MCP_TOOL_CALL: &str = "mcp-tool-call";
+
+/// How long to wait between status events before issuing a refresh.
+/// Bursts during `prime_for_chat` arrive within ~50ms; debouncing
+/// prevents N rapid `setMcpServers` calls when the user toggles
+/// servers in quick succession.
+const MCP_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// Listen on the registry's status broadcaster and push fresh tool
+/// snapshots to the live SDK session whenever a server transitions.
+/// Debounced — bursty status changes coalesce into one refresh.
+fn spawn_mcp_refresh_task(
+    session: Arc<ClaudeSession>,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let Some(registry) = session.mcp_registry.clone() else {
+            // No registry — nothing to subscribe to. Task exits
+            // cleanly so the spawn is harmless even in tests.
+            return;
+        };
+        let mut rx = registry.subscribe_status();
+        loop {
+            tokio::select! {
+                _ = shutdown_rx.recv() => break,
+                event = rx.recv() => {
+                    match event {
+                        Ok(_row) => {
+                            // Coalesce rapid bursts. After a status event
+                            // arrives, wait MCP_REFRESH_DEBOUNCE for more
+                            // events; if any arrive, restart the timer.
+                            // Once silent for the debounce window, push
+                            // one refresh.
+                            loop {
+                                match tokio::time::timeout(
+                                    MCP_REFRESH_DEBOUNCE,
+                                    rx.recv(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => continue,
+                                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                                    Ok(Err(broadcast::error::RecvError::Closed)) => return,
+                                    Err(_) => break, // debounce window elapsed
+                                }
+                            }
+                            push_mcp_refresh(&session, &registry).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Snapshot the registry's tool list and ship it to the sidecar via
+/// `update-mcp-tools`. Failures are logged via a runtime warning so a
+/// transient sidecar hiccup doesn't kill the refresh task.
+async fn push_mcp_refresh(
+    session: &Arc<ClaudeSession>,
+    registry: &crate::mcp::registry::McpRegistry,
+) {
+    let tools = registry.list_all_tools().await;
+    let entries: Vec<super::protocol::McpToolEntry> = tools
+        .into_iter()
+        .map(|t| super::protocol::McpToolEntry {
+            name: t.name,
+            prefixed_name: t.prefixed_name,
+            description: t.description,
+            input_schema: t.input_schema,
+            server_id: t.server_id,
+        })
+        .collect();
+
+    let params = super::protocol::UpdateMcpToolsParams {
+        thread_id: session.thread_id.0.clone(),
+        mcp_tools: entries,
+    };
+    let params_value = match serde_json::to_value(&params) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    if let Err(err) = session
+        .sidecar
+        .request(
+            super::protocol::METHOD_UPDATE_MCP_TOOLS,
+            params_value,
+        )
+        .await
+    {
+        let _ = session.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(session.thread_id.clone()),
+            message: format!("update-mcp-tools failed: {err}"),
+            original_payload: None,
+        });
+    }
+}
+
+/// Snapshot every running MCP tool from the registry into the wire
+/// shape the sidecar expects. Returns an empty `Vec` when no registry
+/// is configured or no tools are running — both fine, the sidecar
+/// just doesn't register the in-process MCP server.
+async fn collect_mcp_tools(
+    registry: Option<&crate::mcp::registry::McpRegistry>,
+) -> Vec<super::protocol::McpToolEntry> {
+    let Some(registry) = registry else {
+        return Vec::new();
+    };
+    let tools = registry.list_all_tools().await;
+    tools
+        .into_iter()
+        .map(|t| super::protocol::McpToolEntry {
+            name: t.name,
+            prefixed_name: t.prefixed_name,
+            description: t.description,
+            input_schema: t.input_schema,
+            server_id: t.server_id,
+        })
+        .collect()
+}
+
+/// Format a tool result payload the way Anthropic's MCP SDK expects:
+/// `{ content: [{ type: "text", text: ... }], isError?: bool }`. The
+/// sidecar passes this verbatim to the SDK's tool callback.
+fn tool_result_text(text: impl Into<String>, is_error: bool) -> Value {
+    serde_json::json!({
+        "content": [{ "type": "text", "text": text.into() }],
+        "isError": is_error,
+    })
+}
+
+async fn handle_mcp_tool_call(
+    session: Arc<ClaudeSession>,
+    event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    req: crate::json_rpc_child::IncomingRequest,
+) {
+    // Validate params shape.
+    let params = req.params.clone();
+    let prefixed_name = match params.get("name").and_then(Value::as_str) {
+        Some(n) => n.to_string(),
+        None => {
+            let _ = session
+                .sidecar
+                .respond(
+                    req.id,
+                    Err(crate::json_rpc_child::RpcError {
+                        code: -32602,
+                        message: "mcp-tool-call requires a string `name`".into(),
+                        data: None,
+                    }),
+                )
+                .await;
+            return;
+        }
+    };
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // Look up the registry. If the provider was constructed without
+    // one (tests, headless contexts) surface a clean error to the
+    // SDK rather than panicking.
+    let Some(registry) = session.mcp_registry.clone() else {
+        let _ = session
+            .sidecar
+            .respond(
+                req.id,
+                Ok(tool_result_text(
+                    "MCP runtime not available in this Codemux build",
+                    true,
+                )),
+            )
+            .await;
+        return;
+    };
+
+    match registry.dispatch_tool_call(&prefixed_name, arguments).await {
+        Ok(result) => {
+            // The MCP child returns the full `tools/call` result —
+            // including `content` and optional `isError`. Forward it
+            // verbatim. If the shape is wrong (no `content` key)
+            // wrap it so the SDK still sees a valid shape.
+            let payload = if result.get("content").is_some() {
+                result
+            } else {
+                tool_result_text(result.to_string(), false)
+            };
+            let _ = session.sidecar.respond(req.id, Ok(payload)).await;
+        }
+        Err(message) => {
+            let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(session.thread_id.clone()),
+                message: format!("mcp-tool-call {prefixed_name} failed: {message}"),
+                original_payload: None,
+            });
+            let _ = session
+                .sidecar
+                .respond(req.id, Ok(tool_result_text(message, true)))
+                .await;
+        }
+    }
 }
 
 fn spawn_child_exit_watchdog(

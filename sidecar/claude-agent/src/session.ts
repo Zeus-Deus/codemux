@@ -31,6 +31,10 @@ import {
 
 import { AsyncPromptQueue } from "./async-queue.ts";
 import {
+  buildCodemuxMcpServer,
+  type RegisteredMcpTool,
+} from "./mcp-bridge.ts";
+import {
   makeCanUseTool,
   type ApprovalDecision,
   type PendingApprovals,
@@ -76,6 +80,11 @@ export interface SessionStartInput {
   /** Raw CLI flags the user added in settings. `null` value means
    *  the flag is a boolean. */
   extraArgs?: Record<string, string | null>;
+  /** Stage 3 — tools from Codemux's MCP runtime registry to register
+   *  with the SDK as the in-process `codemux` MCP server. Each
+   *  tool's prefixed name (`mcp__<server>__<tool>`) is what the
+   *  agent sees and what permission rules key on. */
+  mcpTools?: RegisteredMcpTool[];
 }
 
 /** Parameters for `send-turn`. */
@@ -193,6 +202,17 @@ function buildQueryOptions(
   }
   if (input.extraArgs && Object.keys(input.extraArgs).length > 0) {
     opts.extraArgs = { ...input.extraArgs };
+  }
+
+  // Stage 3 — register Codemux's in-process MCP facade so every
+  // user-installed MCP's tools surface to this Claude session via a
+  // single virtual server. Tool calls are dispatched back to Rust
+  // via the `mcp-tool-call` upstream RPC; see `mcp-bridge.ts`.
+  const mcpTools = input.mcpTools ?? [];
+  if (mcpTools.length > 0) {
+    opts.mcpServers = {
+      codemux: buildCodemuxMcpServer(mcpTools),
+    };
   }
 
   return opts as Options;
@@ -401,6 +421,31 @@ export class ClaudeSession {
   async interrupt(): Promise<void> {
     if (this.closed) return;
     await this.query.interrupt();
+  }
+
+  /** Stage 4 — push an updated MCP tool list to the live SDK
+   *  session. The Rust runtime calls this whenever a server
+   *  transitions Discovered → Running so tools that came up after
+   *  `start-session` become visible without forcing a chat restart.
+   *
+   *  Empty `tools` removes the codemux MCP entirely; the SDK
+   *  silently ignores requests for unregistered tool names so this
+   *  is the right shape for "user disabled all MCPs". Idempotent. */
+  async updateMcpTools(tools: RegisteredMcpTool[]): Promise<void> {
+    if (this.closed) return;
+    const servers: Record<string, ReturnType<typeof buildCodemuxMcpServer>> =
+      tools.length > 0 ? { codemux: buildCodemuxMcpServer(tools) } : {};
+    try {
+      await this.query.setMcpServers(
+        servers as unknown as Parameters<Query["setMcpServers"]>[0],
+      );
+    } catch (err) {
+      logger.warn("setMcpServers failed", {
+        threadId: this.threadId,
+        toolCount: tools.length,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   /** Swap the session's default model. `undefined` reverts to the

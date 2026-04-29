@@ -148,6 +148,29 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
         }),
       );
     }
+    // Stage 3 — MCP tools registered with the SDK as the in-process
+    // `codemux` virtual MCP server. Validation is structural only;
+    // each entry's prefixedName is the agent-facing identifier and
+    // the inputSchema is JSON Schema.
+    const rawMcpTools = optArray(p["mcpTools"], "mcpTools");
+    if (rawMcpTools && rawMcpTools.length > 0) {
+      input.mcpTools = rawMcpTools.map((raw, idx) => {
+        const obj = asObject(raw, `mcpTools[${idx}]`);
+        return {
+          name: asString(obj["name"], `mcpTools[${idx}].name`),
+          prefixedName: asString(
+            obj["prefixedName"],
+            `mcpTools[${idx}].prefixedName`,
+          ),
+          description:
+            obj["description"] === null || obj["description"] === undefined
+              ? null
+              : asString(obj["description"], `mcpTools[${idx}].description`),
+          inputSchema: obj["inputSchema"] ?? {},
+          serverId: asString(obj["serverId"], `mcpTools[${idx}].serverId`),
+        };
+      });
+    }
 
     const session = new ClaudeSession(input, emit);
     sessions.set(threadId, session);
@@ -200,6 +223,31 @@ const setModel: MethodHandler = async (params) => {
   const model = raw === null || raw === undefined ? undefined : asString(raw, "model");
   await session.setModel(model);
   return {};
+};
+
+const updateMcpTools: MethodHandler = async (params) => {
+  const p = asObject(params, "update-mcp-tools");
+  const threadId = asString(p["threadId"], "threadId");
+  const session = getSession(threadId);
+  const rawTools = optArray(p["mcpTools"], "mcpTools") ?? [];
+  const tools = rawTools.map((raw, idx) => {
+    const obj = asObject(raw, `mcpTools[${idx}]`);
+    return {
+      name: asString(obj["name"], `mcpTools[${idx}].name`),
+      prefixedName: asString(
+        obj["prefixedName"],
+        `mcpTools[${idx}].prefixedName`,
+      ),
+      description:
+        obj["description"] === null || obj["description"] === undefined
+          ? null
+          : asString(obj["description"], `mcpTools[${idx}].description`),
+      inputSchema: obj["inputSchema"] ?? {},
+      serverId: asString(obj["serverId"], `mcpTools[${idx}].serverId`),
+    };
+  });
+  await session.updateMcpTools(tools);
+  return { ok: true, count: tools.length };
 };
 
 const setPermissionMode: MethodHandler = async (params) => {
@@ -300,6 +348,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     interrupt,
     "set-model": setModel,
     "set-permission-mode": setPermissionMode,
+    "update-mcp-tools": updateMcpTools,
     "respond-to-request": respondToRequest,
     "respond-to-user-input": respondToUserInput,
     "initialization-result": initializationResult,
