@@ -7,6 +7,17 @@
 //! operations on `AppStateStore`, the [`ProviderRegistry`] routing
 //! with a `MockAgentProvider`, and the event-bridge forwarder
 //! reached through [`forward_event`].
+//!
+//! Unix-only: `tauri::test::mock_app()` (used by the event-bridge
+//! test) pulls in Tauri runtime imports that need WebView2Loader.dll
+//! at process startup on Windows — the GitHub Windows runner doesn't
+//! ship that, so the test binary fails with STATUS_ENTRYPOINT_NOT_FOUND
+//! before any test runs and skips the whole file's coverage. The
+//! orchestration logic under test is platform-agnostic, so Linux
+//! coverage is sufficient. Same gate pattern as `claude_adapter.rs`,
+//! `codex_adapter.rs`, and `sidecar_sdk.rs` in this directory.
+
+#![cfg(unix)]
 
 #[path = "helpers/mock_agent_provider.rs"]
 mod mock_agent_provider;
