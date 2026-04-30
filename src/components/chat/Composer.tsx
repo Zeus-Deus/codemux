@@ -589,6 +589,44 @@ export function Composer({
     // changes invalidate them.
   }, []);
 
+  // Dismiss any open popup when the user clicks outside of it. Without
+  // this, the only escape hatches are the textarea Escape handler or
+  // re-clicking the `+` trigger — clicking elsewhere on screen leaves
+  // the popup stranded. The trigger button is excluded so its own
+  // toggle handler fires unhindered; pickers' interior elements are
+  // excluded so dragging the scrollbar / clicking items still works.
+  useEffect(() => {
+    if (!attachOpen && !slashAnchor && !mentionAnchor) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      if (
+        target.closest('[data-testid="slash-command-popup"]') ||
+        target.closest('[data-testid="composer-issue-picker"]') ||
+        target.closest('[data-testid="composer-pr-picker"]') ||
+        target.closest('[data-testid="composer-attach-button"]')
+      ) {
+        return;
+      }
+      if (attachOpen) closeAttachPopup();
+      if (slashAnchor) {
+        setSlashAnchor(null);
+        setSlashHighlighted(null);
+      }
+      if (mentionAnchor) closeMention();
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+    };
+  }, [
+    attachOpen,
+    slashAnchor,
+    mentionAnchor,
+    closeAttachPopup,
+    closeMention,
+  ]);
+
   // Insert text at the textarea's current cursor, preserving prose
   // around the insertion point. Schedules a focus + caret restore
   // via rAF so React's render flush doesn't fight us.
