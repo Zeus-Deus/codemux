@@ -6,7 +6,9 @@ use std::time::{Instant, SystemTime};
 
 use tauri::Manager;
 
+use crate::commands::SyncStatus;
 use crate::database::DatabaseStore;
+use crate::encryption::EncryptionManager;
 
 // fs is used by machine_id() and token_file_path() (migration support)
 use std::fs;
@@ -70,6 +72,16 @@ struct StoredAuth {
     expires_at: String,
     #[serde(default)]
     user: Option<AuthUser>,
+    /// `"email"` or `"github"`. Persisted so a cold start can
+    /// restore which signin path produced this session — the
+    /// Settings → Sync section needs it to choose between the
+    /// SetupSyncPasswordForm (OAuth-only user, never set up sync)
+    /// and the ProvidePasswordForm (had sync, local key lost).
+    /// Field is `Option` for backward compat with auth tokens
+    /// written before this field existed; `#[serde(default)]`
+    /// means a missing field deserializes to `None`.
+    #[serde(default)]
+    auth_method: Option<String>,
 }
 
 // ── Auth State (managed by Tauri) ────────────────────────────────
@@ -258,11 +270,37 @@ pub fn save_auth(
     expires_at: &str,
     user: Option<&AuthUser>,
 ) -> Result<(), String> {
+    // Preserve any previously-persisted auth_method across token
+    // refreshes (signin → check_auth verify success → save_auth)
+    // so the value set by the signin path doesn't get clobbered.
+    // Callers that intend to set a new auth_method should follow
+    // this with `save_stored_auth_method`.
+    let existing_auth_method = load_stored_auth_method(db);
     let stored = StoredAuth {
         token: token.to_string(),
         expires_at: expires_at.to_string(),
         user: user.cloned(),
+        auth_method: existing_auth_method,
     };
+    let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
+    let encrypted = encrypt_data(&json)?;
+    db.save_auth_token(&encrypted)
+}
+
+/// Update only the `auth_method` field of the stored auth record,
+/// preserving token/expires_at/user. Called by the signin paths
+/// (email, github) and by `setup_sync_password` so the value
+/// survives a cold-start `check_auth` and the frontend can choose
+/// between SetupSyncPasswordForm and ProvidePasswordForm correctly.
+pub fn save_stored_auth_method(
+    db: &DatabaseStore,
+    method: Option<&str>,
+) -> Result<(), String> {
+    let data = db.load_auth_token().ok_or_else(|| "no stored auth".to_string())?;
+    let decrypted = decrypt_data(&data).map_err(|e| format!("decrypt: {e}"))?;
+    let mut stored: StoredAuth = serde_json::from_slice(&decrypted)
+        .map_err(|e| format!("parse stored auth: {e}"))?;
+    stored.auth_method = method.map(|s| s.to_string());
     let json = serde_json::to_vec(&stored).map_err(|e| format!("serialize: {e}"))?;
     let encrypted = encrypt_data(&json)?;
     db.save_auth_token(&encrypted)
@@ -280,6 +318,13 @@ pub fn load_cached_user(db: &DatabaseStore) -> Option<AuthUser> {
     let decrypted = decrypt_data(&data).ok()?;
     let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
     stored.user
+}
+
+pub fn load_stored_auth_method(db: &DatabaseStore) -> Option<String> {
+    let data = db.load_auth_token()?;
+    let decrypted = decrypt_data(&data).ok()?;
+    let stored: StoredAuth = serde_json::from_slice(&decrypted).ok()?;
+    stored.auth_method
 }
 
 pub fn clear_token(db: &DatabaseStore) {
@@ -485,8 +530,43 @@ pub fn start_callback_server(
                             eprintln!("[auth] Failed to save token in callback: {e}");
                         }
 
+                        // Tag the session as a GitHub OAuth signin and
+                        // persist that fact so a cold-start `check_auth`
+                        // can restore it. Without this the Settings →
+                        // Sync section sees `auth_method=null` after
+                        // OAuth and falls through to ProvidePasswordForm
+                        // (the repair flow) when it should show
+                        // SetupSyncPasswordForm (the initial-setup flow)
+                        // for users who have never set up sync.
+                        let auth_state_local: tauri::State<'_, AuthState> =
+                            handle_clone.state();
+                        auth_state_local.set_auth_method(Some("github"));
+                        if let Err(e) = save_stored_auth_method(&db, Some("github")) {
+                            eprintln!(
+                                "[auth] Failed to persist auth_method=github in callback: {e}"
+                            );
+                        }
+
                         // Emit auth event to frontend
                         emit_auth_state(&handle_clone, token, expires_at);
+
+                        // Mirror the signin_email pattern: tell the
+                        // frontend the sync state immediately. OAuth
+                        // signin doesn't load an encryption key (no
+                        // password was typed), so `sync_available`
+                        // is whatever EncryptionManager reports. The
+                        // important field for the Settings UI is
+                        // `auth_method=github` — that's what selects
+                        // SetupSyncPasswordForm.
+                        let encryption_local: tauri::State<'_, EncryptionManager> =
+                            handle_clone.state();
+                        let _ = handle_clone.emit(
+                            "sync-state-changed",
+                            &SyncStatus {
+                                sync_available: encryption_local.is_available(),
+                                auth_method: Some("github".into()),
+                            },
+                        );
 
                         let html = SUCCESS_HTML;
                         let resp = format!(
@@ -831,6 +911,32 @@ mod tests {
 
         clear_token(&db);
         assert!(load_token(&db).is_none());
+    }
+
+    #[test]
+    fn auth_method_persists_across_load() {
+        // Setup-state bug regression: an OAuth callback persists
+        // auth_method="github" so a cold-start `check_auth` can
+        // restore it. Without persistence, `Settings → Sync` falls
+        // through to ProvidePasswordForm for a brand-new OAuth user
+        // who has never set up sync.
+        let db = test_db();
+        save_token(&db, "tok-1", "2099-01-01T00:00:00Z").unwrap();
+        assert!(load_stored_auth_method(&db).is_none());
+
+        save_stored_auth_method(&db, Some("github")).unwrap();
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("github"));
+
+        // save_auth on token refresh must NOT clobber auth_method.
+        save_auth(&db, "tok-2", "2099-02-02T00:00:00Z", None).unwrap();
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("github"));
+
+        save_stored_auth_method(&db, Some("email")).unwrap();
+        assert_eq!(load_stored_auth_method(&db).as_deref(), Some("email"));
+
+        // Clearing the token wipes everything including auth_method.
+        clear_token(&db);
+        assert!(load_stored_auth_method(&db).is_none());
     }
 
     #[test]

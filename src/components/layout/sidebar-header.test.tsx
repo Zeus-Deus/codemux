@@ -59,7 +59,7 @@ function renderHeader() {
     </TooltipProvider>,
   );
   const plus = utils.container.querySelector(
-    'button[aria-label="New workspace"]',
+    'button[aria-label="New agent"]',
   ) as HTMLElement;
   return { ...utils, plus };
 }

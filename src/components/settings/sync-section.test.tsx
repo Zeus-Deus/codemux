@@ -77,7 +77,12 @@ describe("SyncSection — render fork", () => {
   it("renders SetupSyncPasswordForm for GitHub OAuth user without key", () => {
     useAuthStore.setState({ syncAvailable: false, authMethod: "github" });
     render(<SyncSection />);
-    expect(screen.getByText(/set up skills sync/i)).toBeInTheDocument();
+    // Stage 2 polish: heading is "Skills sync (optional)" with
+    // explanatory copy below — not a single "Set up skills sync"
+    // line. Match on the heading + explanation hooks.
+    expect(screen.getByText(/skills sync/i)).toBeInTheDocument();
+    expect(screen.getByText(/\(optional\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/end-to-end encrypted/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/^new password/i)).toBeInTheDocument();
     expect(screen.getByLabelText(/confirm password/i)).toBeInTheDocument();
   });

@@ -2,9 +2,9 @@ use tauri::{Emitter, State};
 
 use crate::auth::{
     api_base_url, clear_token, delete_encryption_key, derive_login_credentials,
-    is_token_expired, load_cached_user, load_encryption_key, load_token,
-    save_auth, save_encryption_key, AuthResponse, AuthState, AuthStatePayload,
-    AuthUser,
+    is_token_expired, load_cached_user, load_encryption_key, load_stored_auth_method,
+    load_token, save_auth, save_encryption_key, save_stored_auth_method, AuthResponse,
+    AuthState, AuthStatePayload, AuthUser,
 };
 use crate::database::DatabaseStore;
 use crate::encryption::EncryptionManager;
@@ -105,6 +105,14 @@ pub async fn signin_email(
     };
 
     save_auth(&db, &api_resp.token, &api_resp.expires_at, Some(&user))?;
+    // Persist auth_method so a cold-start `check_auth` can restore
+    // it; without this, an email user whose `sync-key.enc` was lost
+    // would still see the right form (ProvidePasswordForm) on cold
+    // start, but the value going through `sync-state-changed` would
+    // disagree with the persisted record. Keep them in sync.
+    if let Err(err) = save_stored_auth_method(&db, Some("email")) {
+        eprintln!("[signin_email] persist auth_method=email failed: {err}");
+    }
 
     // Email/password users get sync set up automatically on signin.
     // The same password they typed produces both the AuthSecret
@@ -258,12 +266,17 @@ pub async fn check_auth(
     // and `sync_available` reports false — Stage 3 will route the
     // user through `provide_password_for_sync` to repair.
     //
-    // Note: `auth_method` is intentionally NOT restored here because
-    // we don't persist it on disk (matches Vexis). The frontend
-    // distinguishes "needs setup" from "needs repair" using
-    // `auth_method` after a fresh signin; on cold start it's
-    // None, and Settings → Sync just shows the key as already
-    // loaded (no setup form needed).
+    // Restore auth_method from the stored auth so the Settings →
+    // Sync section can choose between SetupSyncPasswordForm (OAuth
+    // user who never set up sync) and ProvidePasswordForm (had sync,
+    // local key lost) on cold start. Legacy stored auths from before
+    // this field existed deserialize to None; the frontend treats
+    // that the same way it always has (defaults to ProvidePassword
+    // for back-compat with existing email-user installs).
+    if let Some(method) = load_stored_auth_method(&db) {
+        auth_state.set_auth_method(Some(&method));
+    }
+
     if let Ok(Some(key_bytes)) = load_encryption_key() {
         if let Err(err) = encryption.set_key(key_bytes) {
             eprintln!("[check_auth] EncryptionManager.set_key failed: {err}");
@@ -474,8 +487,12 @@ pub async fn setup_sync_password(
     // OAuth users are exactly the population that hits this flow,
     // so the auth_method is "github" by construction. (Email
     // users would have already had sync enabled at signin and
-    // would never reach setup_sync_password.)
+    // would never reach setup_sync_password.) Persist on disk too
+    // so cold-start `check_auth` restores the same value.
     auth_state.set_auth_method(Some("github"));
+    if let Err(err) = save_stored_auth_method(&db, Some("github")) {
+        eprintln!("[setup_sync_password] persist auth_method=github failed: {err}");
+    }
 
     let status = SyncStatus {
         sync_available: true,

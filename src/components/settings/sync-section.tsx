@@ -240,12 +240,21 @@ function SetupSyncPasswordForm({
     >
       <div className="flex items-center gap-2 text-sm font-medium">
         <Lock className="h-4 w-4" />
-        Set up skills sync
+        Skills sync
+        <span className="text-xs font-normal text-muted-foreground">
+          (optional)
+        </span>
       </div>
       <p className="text-xs text-muted-foreground">
-        Choose a password to encrypt your skills end-to-end. The
-        server stores opaque ciphertext only — your password and
-        encryption key never leave this device.
+        Back up your skills to your Codemux account so they follow
+        you across devices. Sync is end-to-end encrypted with a
+        password only you know — Codemux servers store opaque
+        ciphertext and cannot read your skills.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        You don't need to enable sync to use Codemux. Skip this for
+        now and come back later if you want it; nothing else
+        changes.
       </p>
       <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
         New password

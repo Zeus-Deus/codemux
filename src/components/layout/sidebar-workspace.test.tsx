@@ -298,12 +298,12 @@ describe("SidebarWorkspaceRow", () => {
     expect(branchIcon).toBeInTheDocument();
   });
 
-  it("shows remove button for primary checkout", () => {
+  it("hides remove button for primary checkout (Hide-only via right-click)", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
       <SidebarWorkspaceRow workspace={ws} isActive={false} />,
     );
-    expect(container.querySelector("[aria-label='Remove workspace']")).not.toBeNull();
+    expect(container.querySelector("[aria-label='Remove workspace']")).toBeNull();
   });
 
   it("shows remove button for worktree checkout", () => {

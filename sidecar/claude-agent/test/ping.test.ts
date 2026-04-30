@@ -225,15 +225,22 @@ describe("lifecycle", () => {
     expect(code).toBe(0);
   });
 
-  test("SIGTERM causes clean exit with code 0", async () => {
-    const s = spawnSidecar();
-    // Give main() a beat to install signal handlers.
-    await s.writeLine({ jsonrpc: "2.0", id: 1, method: "ping", params: {} });
-    await s.readNextJson();
-    s.proc.kill("SIGTERM");
-    const code = await s.proc.exited;
-    expect(code).toBe(0);
-  });
+  // Windows has no real POSIX signals — Bun's `proc.kill("SIGTERM")` ends
+  // up calling TerminateProcess(), which is unceremonious by design and
+  // exits with 143 (128+15). There's no graceful-shutdown path to assert
+  // against on that platform, so we only run this on POSIX.
+  test.skipIf(process.platform === "win32")(
+    "SIGTERM causes clean exit with code 0",
+    async () => {
+      const s = spawnSidecar();
+      // Give main() a beat to install signal handlers.
+      await s.writeLine({ jsonrpc: "2.0", id: 1, method: "ping", params: {} });
+      await s.readNextJson();
+      s.proc.kill("SIGTERM");
+      const code = await s.proc.exited;
+      expect(code).toBe(0);
+    },
+  );
 });
 
 describe("stdio discipline", () => {
