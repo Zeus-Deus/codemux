@@ -25,8 +25,10 @@ use codemux_lib::commands::agent_chat::{
     feature_flag_on, forward_event, thread_id_for_event, AgentChatEventPayload,
     ProviderRegistry, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
+use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
 use codemux_lib::state::AppStateStore;
+use tauri::Manager;
 
 use crate::mock_agent_provider::{MockAgentProvider, MockCall};
 
@@ -316,7 +318,14 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
     // Build a MockRuntime app, subscribe to the agent_chat_event
     // channel, and verify that forwarding a runtime event through
     // forward_event produces a matching AgentChatEventPayload.
+    //
+    // forward_event persists ItemCompleted via DatabaseStore::append_*,
+    // so the mock app must manage a DatabaseStore or `app.state::<…>`
+    // panics with "state() called before manage()". An in-memory store
+    // is sufficient — we're only asserting on the emitted event, not
+    // on what gets written to disk.
     let app = tauri::test::mock_app();
+    app.manage(DatabaseStore::new_in_memory());
     let handle = app.handle().clone();
 
     let received: Arc<tokio::sync::Mutex<Vec<AgentChatEventPayload>>> =

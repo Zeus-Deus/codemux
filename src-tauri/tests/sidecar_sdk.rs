@@ -13,6 +13,14 @@
 //! `sidecar_ping.rs`. If it does not exist at test time, every test
 //! here returns cleanly with a "build first" hint rather than
 //! failing.
+//!
+//! Unix-only: `fake_claude_script` writes a `#!/usr/bin/env bash`
+//! wrapper and chmods it with `std::os::unix::fs::PermissionsExt`.
+//! Windows has no analogue, and every probe test depends on the
+//! wrapper, so we gate the whole file rather than carry a parallel
+//! cmd.exe fixture.
+
+#![cfg(unix)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;

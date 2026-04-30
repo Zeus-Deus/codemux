@@ -7,6 +7,14 @@
 //! `FAKE_CODEX_SCRIPT`, which lets each test choreograph the exact
 //! sequence of notifications and server-initiated requests the fixture
 //! should emit.
+//!
+//! Unix-only: `wrapper_with_env` and `write_bash_script` both write
+//! `#!/usr/bin/env bash` files and chmod them with
+//! `std::os::unix::fs::PermissionsExt`. Windows has no analogue, and
+//! every test in this file depends on those wrappers, so we gate the
+//! whole file rather than carry parallel cmd.exe fixtures.
+
+#![cfg(unix)]
 
 use std::path::PathBuf;
 use std::sync::Arc;
