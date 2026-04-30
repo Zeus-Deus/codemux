@@ -7,6 +7,15 @@
 //! compiled sidecar (if present) to prove the auth-probe path works
 //! end-to-end; they skip with a clear message when the real binary
 //! is missing.
+//!
+//! Unix-only: every test here drives the provider through a bash
+//! wrapper script (`wrapper_with_env` + the auth_probe tests' inline
+//! `#!/usr/bin/env bash` mocks), and the chmod 755 on those scripts
+//! uses `std::os::unix::fs::PermissionsExt`. None of that has a
+//! Windows analogue, so we gate the whole file rather than carry
+//! parallel cmd.exe versions of every fixture.
+
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
