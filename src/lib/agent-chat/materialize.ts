@@ -27,6 +27,14 @@ import { applyAllPrefixes } from "./mode-prefix";
 export interface MaterializeActions {
   /** Marks the draft as in-flight. Called first. */
   markPromoting: (id: DraftId) => void;
+  /** Records the workspace + pane created by step 2 BEFORE the
+   *  session-start step. If a later step fails, this lets
+   *  AgentChatPane recover the orphaned partial-materialise on
+   *  click-into-workspace instead of leaving it permanently stuck. */
+  markMaterialized: (
+    id: DraftId,
+    materializedTo: NonNullable<ChatDraft["materializedTo"]>,
+  ) => void;
   /** Records the materialised workspace / pane / thread on the draft. */
   markPromoted: (
     id: DraftId,
@@ -146,6 +154,18 @@ export async function materializeAndSend(
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
+
+  // Record the partial materialisation BEFORE attempting the
+  // session-start step. If start_session or send_turn fails below,
+  // AgentChatPane reads `materializedTo.workspaceId` to find this
+  // draft when the user clicks the workspace in the sidebar, and
+  // finishes the half-completed materialise rather than minting a
+  // brand-new orphan thread alongside it.
+  actions.markMaterialized(draft.draftId, {
+    workspaceId,
+    paneId,
+    threadId: draft.threadId,
+  });
 
   // 3. Seed the transcript optimistically. `ensureThread` + slice
   //    creation happens implicitly inside `appendUserMessage` on the
@@ -327,6 +347,15 @@ export async function materializeWithPreset(
       actions.markSendFailed(draft.draftId, message);
       return { success: false, error: message };
     }
+
+    // Record the partial materialisation so AgentChatPane can recover
+    // it if start_session or send_turn fails below. See the matching
+    // call in `materializeAndSend` for the full rationale.
+    actions.markMaterialized(draft.draftId, {
+      workspaceId,
+      paneId,
+      threadId: draft.threadId,
+    });
 
     // Seed optimistic transcript only when there IS a first turn. A
     // preset click with an empty composer just opens an empty chat

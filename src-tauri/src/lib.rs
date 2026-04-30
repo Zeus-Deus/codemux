@@ -938,6 +938,7 @@ pub fn run() {
             commands::delete_preset,
             commands::set_preset_pinned,
             commands::set_preset_bar_visible,
+            commands::reorder_presets,
             commands::apply_preset,
             commands::get_workspace_config,
             commands::has_codemuxinclude,

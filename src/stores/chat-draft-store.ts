@@ -45,6 +45,20 @@ export interface ChatDraft {
     paneId: string;
     threadId: string;
   } | null;
+  /** Set once the workspace + pane resources have been created on the
+   *  backend, BEFORE the session-start step. Distinct from `promotedTo`,
+   *  which only fires on full success. If `start_session` or `send_turn`
+   *  fail, this stays set while `promotedTo` stays null — that's the
+   *  signal AgentChatPane uses to recover an orphaned partial
+   *  materialise: adopt the pre-minted thread id, start the session it
+   *  needs, then complete the promotion.
+   *
+   *  Cleared by `clearDraft`. */
+  materializedTo: {
+    workspaceId: string;
+    paneId: string;
+    threadId: string;
+  } | null;
   /** Non-null while materialise-and-send is in flight. */
   promoting: boolean;
   /** Last materialise-and-send error, surfaced as an inline retry
@@ -86,6 +100,14 @@ export interface ChatDraftStore {
 
   // Promotion lifecycle
   markPromoting: (draftId: DraftId) => void;
+  /** Records the backend resources created by materialize step 2
+   *  (workspace + pane). Called BEFORE the session-start step, so that
+   *  if start_session or send_turn fail later, AgentChatPane can find
+   *  the partial materialise on click-into-workspace and finish it. */
+  markMaterialized: (
+    draftId: DraftId,
+    materializedTo: NonNullable<ChatDraft["materializedTo"]>,
+  ) => void;
   markPromoted: (
     draftId: DraftId,
     promotedTo: NonNullable<ChatDraft["promotedTo"]>,
@@ -118,6 +140,32 @@ function newThreadId(): string {
   return crypto.randomUUID();
 }
 
+/** A draft is reusable by `getOrCreate*Draft` only when it has never
+ *  been sent (no `promotedTo`), never reached the workspace+pane stage
+ *  of a materialise (no `materializedTo`), and isn't currently mid-
+ *  flight (`promoting === false`). The combined gate matters because:
+ *
+ *  - `promotedTo` set → already a real workspace, the user is asking
+ *     for a NEW chat.
+ *  - `materializedTo` set without `promotedTo` → partial materialise
+ *     left an orphan workspace; the user can recover it by clicking
+ *     that workspace in the sidebar (AgentChatPane mount-effect handles
+ *     the recovery), but `+` should give them a fresh slate.
+ *  - `promoting === true` without resolution → a previous send hung or
+ *     was interrupted; reusing renders a permanently-greyed composer
+ *     because Send is disabled iff `draft.promoting`. Drafts can land
+ *     in this state across an app restart since `promoting` is
+ *     persisted via the zustand persist middleware.
+ */
+function isReusableDraft(draft: ChatDraft | undefined): draft is ChatDraft {
+  if (!draft) return false;
+  return (
+    draft.promotedTo === null &&
+    draft.materializedTo === null &&
+    !draft.promoting
+  );
+}
+
 function makeDraft(target: DraftTarget): ChatDraft {
   const provider: AgentChatProviderKind = "claude";
   // Fully-configure the draft from the capabilities store: default
@@ -142,6 +190,7 @@ function makeDraft(target: DraftTarget): ChatDraft {
     inputDraft: "",
     threadId: newThreadId(),
     promotedTo: null,
+    materializedTo: null,
     promoting: false,
     lastSendError: null,
   };
@@ -236,7 +285,13 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         const existingId = state.activeHomeDraftId;
         if (existingId) {
           const existing = state.draftsById[existingId];
-          if (existing && existing.promotedTo === null) return existing;
+          // Reuse only when the draft is still pristine: never sent,
+          // never partially materialised, not stuck mid-flight.
+          // Anything else is "spent" — clicking + means the user wants
+          // a fresh chat, and reusing a stuck draft would render a
+          // permanently-greyed composer (Send disabled iff
+          // `draft.promoting`).
+          if (isReusableDraft(existing)) return existing;
         }
         const draft = makeDraft({ kind: "home" });
         set({
@@ -251,7 +306,7 @@ export const useChatDraftStore = create<ChatDraftStore>()(
         const existingId = state.projectDraftIdByPath[projectPath];
         if (existingId) {
           const existing = state.draftsById[existingId];
-          if (existing && existing.promotedTo === null) return existing;
+          if (isReusableDraft(existing)) return existing;
         }
         const draft = makeDraft({ kind: "project", projectPath });
         set({
@@ -339,6 +394,18 @@ export const useChatDraftStore = create<ChatDraftStore>()(
                 promoting: true,
                 lastSendError: null,
               },
+            },
+          };
+        }),
+
+      markMaterialized: (draftId, materializedTo) =>
+        set((s) => {
+          const existing = s.draftsById[draftId];
+          if (!existing) return s;
+          return {
+            draftsById: {
+              ...s.draftsById,
+              [draftId]: { ...existing, materializedTo },
             },
           };
         }),

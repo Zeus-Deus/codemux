@@ -1,5 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Settings } from "lucide-react";
+import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  horizontalListSortingStrategy,
+  sortableKeyboardCoordinates,
+  useSortable,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,6 +48,7 @@ import {
   agentChatCreatePane,
   applyPreset,
   getPresets,
+  reorderPresets,
   setPresetBarVisible,
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
@@ -39,6 +57,59 @@ import type {
   TerminalPreset,
 } from "@/tauri/types";
 import { toast } from "@/lib/toast";
+
+/** Translate a "drop position N in the pinned-only bar" into the
+ *  splice index inside the GLOBAL preset Vec the backend stores.
+ *
+ *  The bar shows pinned presets only, but the global list also
+ *  contains unpinned items (which keep their slots). Reordering a
+ *  pinned preset in the bar should slide it to a new position
+ *  *relative to the other pinned items*, leaving unpinned items
+ *  exactly where they are.
+ *
+ *  Algorithm: look at the moved preset's neighbors in the new pinned
+ *  order. The global index it lands at is "just before its new
+ *  next-pinned neighbor" (or "just after its new previous-pinned
+ *  neighbor" if it's now last). Adjusts for the fact that
+ *  `Vec::remove(current) + Vec::insert(target)` shifts indices > current
+ *  down by one — so the post-removal target is `next - 1` if
+ *  current < next, else `next`.
+ *
+ *  Returns `null` if the preset id can't be found (caller should bail).
+ */
+function getTargetIndexForPinnedReorder(args: {
+  presets: TerminalPreset[];
+  pinnedPresetIds: string[];
+  presetId: string;
+  targetPinnedIndex: number;
+}): number | null {
+  const { presets, pinnedPresetIds, presetId, targetPinnedIndex } = args;
+  const currentIndex = presets.findIndex((p) => p.id === presetId);
+  if (currentIndex < 0) return null;
+
+  const previousPinnedId =
+    targetPinnedIndex > 0 ? pinnedPresetIds[targetPinnedIndex - 1] : undefined;
+  const nextPinnedId =
+    targetPinnedIndex < pinnedPresetIds.length - 1
+      ? pinnedPresetIds[targetPinnedIndex + 1]
+      : undefined;
+
+  if (nextPinnedId !== undefined) {
+    const nextIndex = presets.findIndex((p) => p.id === nextPinnedId);
+    if (nextIndex < 0) return null;
+    return currentIndex < nextIndex ? nextIndex - 1 : nextIndex;
+  }
+
+  if (previousPinnedId !== undefined) {
+    const previousIndex = presets.findIndex((p) => p.id === previousPinnedId);
+    if (previousIndex < 0) return null;
+    const adjustedPrev =
+      currentIndex < previousIndex ? previousIndex - 1 : previousIndex;
+    return adjustedPrev + 1;
+  }
+
+  return currentIndex;
+}
 
 interface PresetBarProps {
   /** Real workspace id, or `null` when the bar is rendered above a
@@ -77,9 +148,68 @@ export function PresetBar({
     draftId ? s.draftsById[draftId] ?? null : null,
   );
 
+  // Local pinned order — drives the visible bar. Lets a drag re-render
+  // smoothly without a server round-trip per pixel of motion. A
+  // `useEffect` below reconciles this with the server snapshot when it
+  // changes.
+  const [localPinnedOrder, setLocalPinnedOrder] = useState<string[]>([]);
+
+  const serverPinnedIds = useMemo(
+    () =>
+      (presetStore?.presets ?? [])
+        .filter((p) => p.pinned)
+        .map((p) => p.id),
+    [presetStore],
+  );
+
+  useEffect(() => {
+    setLocalPinnedOrder((current) => {
+      // Replace local order whenever the server's pinned set changes
+      // (different ids OR different order). A drag commits its result
+      // through the reorder mutation, so the next snapshot will already
+      // reflect it — this effect is the resync, not a fight with it.
+      if (
+        current.length === serverPinnedIds.length &&
+        current.every((id, i) => id === serverPinnedIds[i])
+      ) {
+        return current;
+      }
+      return serverPinnedIds;
+    });
+  }, [serverPinnedIds]);
+
+  // Click-vs-drag: only start a drag after 5px of pointer movement.
+  // Below that threshold the pointerup fires `onClick` on the inner
+  // button, so launching a preset still works while the wrapper is
+  // also a drag handle.
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
   if (!presetStore || !presetStore.bar_visible) return null;
 
-  const pinnedPresets = presetStore.presets.filter((p) => p.pinned);
+  // Resolve the pinned presets in local order, then append any
+  // server-pinned items not yet in local (newly-pinned via settings)
+  // so they show up immediately without waiting for the next render.
+  const presetById = new Map(presetStore.presets.map((p) => [p.id, p]));
+  const pinnedPresets: TerminalPreset[] = [];
+  const seen = new Set<string>();
+  for (const id of localPinnedOrder) {
+    const p = presetById.get(id);
+    if (p && p.pinned) {
+      pinnedPresets.push(p);
+      seen.add(id);
+    }
+  }
+  for (const p of presetStore.presets) {
+    if (p.pinned && !seen.has(p.id)) {
+      pinnedPresets.push(p);
+    }
+  }
+
   const inDraftMode = draftId != null;
   const isHomeDraft = inDraftMode && activeDraft?.target.kind === "home";
 
@@ -162,6 +292,7 @@ export function PresetBar({
       draft.inputDraft,
       {
         markPromoting: state.markPromoting,
+        markMaterialized: state.markMaterialized,
         markPromoted: state.markPromoted,
         markSendFailed: state.markSendFailed,
         ensureThread: chat.ensureThread,
@@ -202,6 +333,35 @@ export function PresetBar({
     setPresetBarVisible(checked).catch(console.error);
   };
 
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+
+    const activeId = String(active.id);
+    const overId = String(over.id);
+    const oldIndex = localPinnedOrder.indexOf(activeId);
+    const newIndex = localPinnedOrder.indexOf(overId);
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const nextOrder = arrayMove(localPinnedOrder, oldIndex, newIndex);
+    setLocalPinnedOrder(nextOrder);
+
+    if (!presetStore) return;
+    const targetIndex = getTargetIndexForPinnedReorder({
+      presets: presetStore.presets,
+      pinnedPresetIds: nextOrder,
+      presetId: activeId,
+      targetPinnedIndex: newIndex,
+    });
+    if (targetIndex === null) return;
+
+    reorderPresets(activeId, targetIndex).catch((err) => {
+      console.error("[preset-bar] reorderPresets failed:", err);
+      // Roll back local order if the server rejected the move.
+      setLocalPinnedOrder(serverPinnedIds);
+    });
+  };
+
   const setShowSettings = useUIStore.getState().setShowSettings;
 
   return (
@@ -238,40 +398,35 @@ export function PresetBar({
       {/* Divider */}
       <Separator orientation="vertical" className="!h-4 !self-auto mx-0.5" />
 
-      {/* Preset buttons */}
-      {pinnedPresets.map((preset) => {
-        const buttonDisabled = isPresetDisabled(preset);
-        const tooltip =
-          presetDisabledTooltip(preset) ??
-          (inDraftMode ? null : "Shift+click to split");
-        const button = (
-          <Button
-            variant="ghost"
-            size="xs"
-            className={cn(
-              "gap-1.5 shrink-0",
-              buttonDisabled && "opacity-40 cursor-not-allowed",
-            )}
-            disabled={buttonDisabled}
-            aria-disabled={buttonDisabled}
-            onClick={(e) => handleLaunch(preset, e)}
-          >
-            <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
-            <span className="truncate max-w-[120px]">{preset.name}</span>
-          </Button>
-        );
-        if (!tooltip) {
-          return <span key={preset.id}>{button}</span>;
-        }
-        return (
-          <Tooltip key={preset.id}>
-            <TooltipTrigger asChild>{button}</TooltipTrigger>
-            <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-              {tooltip}
-            </TooltipContent>
-          </Tooltip>
-        );
-      })}
+      {/* Preset buttons — drag to reorder. The 5px activation distance
+          (PointerSensor) means a normal click still launches the
+          preset; only sustained drag motion engages the sort. */}
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={pinnedPresets.map((p) => p.id)}
+          strategy={horizontalListSortingStrategy}
+        >
+          {pinnedPresets.map((preset) => {
+            const buttonDisabled = isPresetDisabled(preset);
+            const tooltip =
+              presetDisabledTooltip(preset) ??
+              (inDraftMode ? null : "Shift+click to split");
+            return (
+              <SortablePresetButton
+                key={preset.id}
+                preset={preset}
+                disabled={buttonDisabled}
+                tooltip={tooltip}
+                onClick={(e) => handleLaunch(preset, e)}
+              />
+            );
+          })}
+        </SortableContext>
+      </DndContext>
 
       {/* Spacer pushes run button right */}
       <div className="flex-1 min-w-0" />
@@ -283,6 +438,83 @@ export function PresetBar({
           <RunButton workspaceId={workspaceId} />
         </>
       )}
+    </div>
+  );
+}
+
+interface SortablePresetButtonProps {
+  preset: TerminalPreset;
+  disabled: boolean;
+  tooltip: string | null;
+  onClick: (e: React.MouseEvent) => void;
+}
+
+function SortablePresetButton({
+  preset,
+  disabled,
+  tooltip,
+  onClick,
+}: SortablePresetButtonProps) {
+  // `attributes` from useSortable is intentionally NOT spread — see
+  // the wrapper below for why.
+  const {
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: preset.id });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.4 : undefined,
+  };
+
+  const button = (
+    <Button
+      variant="ghost"
+      size="xs"
+      className={cn(
+        "gap-1.5 shrink-0",
+        disabled && "opacity-40 cursor-not-allowed",
+      )}
+      disabled={disabled}
+      aria-disabled={disabled}
+      onClick={onClick}
+    >
+      <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+      <span className="truncate max-w-[120px]">{preset.name}</span>
+    </Button>
+  );
+
+  const inner = tooltip ? (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
+  ) : (
+    button
+  );
+
+  // dnd-kit's `attributes` adds `role="button"` and `tabIndex=0` to
+  // the wrapper. Spreading them here would create a second focusable
+  // "button" with the same accessible name as the inner Button —
+  // confusing for screen readers and ambiguous for tests. We strip
+  // both so the inner Button stays the only semantic button; drag
+  // remains pointer-driven (mouse/touch), matching the existing UX.
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      {...listeners}
+      role={undefined}
+      tabIndex={-1}
+      className="shrink-0 touch-none"
+    >
+      {inner}
     </div>
   );
 }

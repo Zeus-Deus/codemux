@@ -297,6 +297,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       cwdForSession,
       {
         markPromoting: state.markPromoting,
+        markMaterialized: state.markMaterialized,
         markPromoted: state.markPromoted,
         markSendFailed: state.markSendFailed,
         ensureThread: chat.ensureThread,

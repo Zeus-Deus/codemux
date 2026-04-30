@@ -45,6 +45,7 @@ type SpyActions = {
 function makeActions(): SpyActions {
   return {
     markPromoting: vi.fn(),
+    markMaterialized: vi.fn(),
     markPromoted: vi.fn(),
     markSendFailed: vi.fn(),
     ensureThread: vi.fn(),
@@ -72,6 +73,7 @@ function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
     inputDraft: "hello",
     threadId: "pre-minted-thread-xyz",
     promotedTo: null,
+    materializedTo: null,
     promoting: false,
     lastSendError: null,
     ...overrides,

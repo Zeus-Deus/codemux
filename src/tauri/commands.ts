@@ -927,6 +927,9 @@ export const applyPreset = (
 export const setPresetBarVisible = (visible: boolean) =>
   invoke("set_preset_bar_visible", { visible });
 
+export const reorderPresets = (presetId: string, targetIndex: number) =>
+  invoke("reorder_presets", { presetId, targetIndex });
+
 // ── Terminal PTY ──
 
 export const writeToPty = (sessionId: string, data: string) =>

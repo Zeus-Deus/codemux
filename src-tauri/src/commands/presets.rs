@@ -171,6 +171,51 @@ pub fn set_preset_pinned(
     Ok(())
 }
 
+/// Reorder a preset to a new position in the global preset list.
+///
+/// `target_index` is in the global Vec, not the pinned-only view. The
+/// frontend translates pinned-bar drag indices to global indices before
+/// invoking this (see `getTargetIndexForPinnedReorder` in
+/// `preset-bar.tsx`); the settings list passes the global index
+/// directly. Either way the server's job is the same: splice the
+/// preset to its new position and persist.
+#[tauri::command]
+pub fn reorder_presets(
+    app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
+    presets: State<'_, PresetStoreState>,
+    preset_id: String,
+    target_index: usize,
+) -> Result<(), String> {
+    let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+    let current_index = store
+        .presets
+        .iter()
+        .position(|p| p.id == preset_id)
+        .ok_or_else(|| format!("Preset not found: {preset_id}"))?;
+
+    if target_index >= store.presets.len() {
+        return Err(format!(
+            "target_index {target_index} out of bounds (len={})",
+            store.presets.len()
+        ));
+    }
+
+    if current_index == target_index {
+        return Ok(());
+    }
+
+    let preset = store.presets.remove(current_index);
+    store.presets.insert(target_index, preset);
+
+    save_presets(&db, &store)?;
+    drop(store);
+
+    emit_presets_changed(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_preset_bar_visible(
     app: tauri::AppHandle,

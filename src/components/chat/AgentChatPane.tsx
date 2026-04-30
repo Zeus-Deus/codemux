@@ -38,6 +38,7 @@ import {
   type Attachment,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useShallow } from "zustand/react/shallow";
 import {
   selectCapabilities,
   selectModel,
@@ -250,6 +251,44 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     );
     return match?.threadId ?? null;
   });
+  // Recovery fallback: if materialize made it past pane-creation but
+  // failed during start_session / send_turn, the draft has
+  // `materializedTo` set and `promotedTo` still null. The existing
+  // `promotedDraftThreadId` selector above doesn't match — it only
+  // looks for fully-promoted drafts. The mount effect below uses this
+  // to finish the half-completed materialise: adopt the orphan thread
+  // id, start the session that step 3 never managed, and call
+  // `markPromoted` so we don't loop.
+  // `useShallow` is REQUIRED here. The selector synthesises a fresh
+  // object literal whenever a match exists, so default `Object.is`
+  // equality would treat every render as a state change and trigger
+  // an infinite re-render loop ("Maximum update depth exceeded").
+  // `useShallow` does a shallow per-key comparison and returns the
+  // previous reference when the field values are unchanged.
+  const recoveryDraft = useChatDraftStore(
+    useShallow((s) => {
+      if (!workspaceIdForPane) return null;
+      const match = Object.values(s.draftsById).find(
+        (d) =>
+          d.promotedTo === null &&
+          d.materializedTo?.workspaceId === workspaceIdForPane,
+      );
+      if (!match || !match.materializedTo) return null;
+      return {
+        draftId: match.draftId,
+        threadId: match.threadId,
+        paneId: match.materializedTo.paneId,
+        workspaceId: match.materializedTo.workspaceId,
+        provider: match.provider,
+        model: match.model,
+        permissionMode: match.permissionMode,
+        effort: match.effort,
+        contextWindow: match.contextWindow,
+      };
+    }),
+  );
+  const markDraftPromoted = useChatDraftStore((s) => s.markPromoted);
+  const clearDraft = useChatDraftStore((s) => s.clearDraft);
   // A pane is "home-rooted" if its workspace's project_root matches
   // the cached $HOME. This replaces the legacy `workspace_type ===
   // "home"` check since the Home singleton was retired in Stage B of
@@ -429,6 +468,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // Start a session on mount if the pane doesn't already have one.
   const startAttempted = useRef(false);
+  // Tracks whether we've already attempted to recover a partial
+  // materialise on this mount. Unlike `startAttempted` (which resets
+  // on failure to allow a hot retry), recovery is a one-shot per
+  // mount: if it fails, the draft stays in SendFailed state and the
+  // user can retry by re-opening the workspace.
+  const recoveryAttempted = useRef(false);
   useEffect(() => {
     if (threadId) {
       ensureThread(threadId);
@@ -440,6 +485,59 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (promotedDraftThreadId) {
       setThreadId(promotedDraftThreadId);
       ensureThread(promotedDraftThreadId);
+      return;
+    }
+    // Recovery: the draft completed step 2 (workspace + pane) but
+    // step 3 (start_session) or step 4 (send_turn) failed. Adopt
+    // the orphan thread id (which already has the user's optimistic
+    // message in its slice) and finish what materialize started.
+    if (recoveryDraft && !recoveryAttempted.current) {
+      if (starting) return;
+      if (!cwd) return;
+      recoveryAttempted.current = true;
+      startAttempted.current = true;
+      setStarting(true);
+      const recoveryMode =
+        recoveryDraft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+      const startInput = {
+        thread_id: recoveryDraft.threadId,
+        cwd,
+        model: recoveryDraft.model,
+        resume_cursor: null,
+        permission_mode: recoveryMode,
+        additional_directories: [],
+        env: null,
+      };
+      agentChatStartSession(pane.pane_id, provider, startInput)
+        .then((id) => {
+          setThreadId(id);
+          ensureThread(id);
+          if (recoveryDraft.model !== null) {
+            setStoreModel(id, recoveryDraft.model);
+          } else {
+            setStoreModel(id, defaultModelForProvider(provider));
+          }
+          setStorePermissionMode(id, recoveryMode);
+          setSessionLaunchMode(id, recoveryMode);
+          // Mark the draft as promoted so subsequent mounts take the
+          // existing promotedDraftThreadId branch above instead of
+          // re-attempting recovery.
+          markDraftPromoted(recoveryDraft.draftId, {
+            workspaceId: recoveryDraft.workspaceId,
+            paneId: recoveryDraft.paneId,
+            threadId: id,
+          });
+          // Sweep the now-promoted draft on the same 5s grace window
+          // the success path uses (DraftChatSurface.tsx, preset-bar.tsx).
+          const draftIdToClear = recoveryDraft.draftId;
+          setTimeout(() => clearDraft(draftIdToClear), 5000);
+        })
+        .catch((err) => {
+          toast.error(`Failed to recover chat session: ${err}`);
+          // Leave the draft in SendFailed state. The user can re-open
+          // the workspace to retry, or close it and start over.
+        })
+        .finally(() => setStarting(false));
       return;
     }
     if (starting || startAttempted.current) return;
@@ -475,6 +573,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [
     threadId,
     promotedDraftThreadId,
+    recoveryDraft,
     starting,
     pane.pane_id,
     provider,
@@ -483,6 +582,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModel,
     setStorePermissionMode,
     setSessionLaunchMode,
+    markDraftPromoted,
+    clearDraft,
   ]);
 
   const handleSubmit = useCallback(() => {
