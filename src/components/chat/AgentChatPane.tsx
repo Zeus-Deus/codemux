@@ -246,8 +246,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const promotedDraftThreadId = useChatDraftStore((s) => {
     if (!workspaceIdForPane) return null;
+    // Match must be both workspace AND pane-scoped. A pure workspace
+    // match would hand the FIRST pane's threadId to a freshly-created
+    // SECOND pane in the same workspace (e.g. a Chat Agent preset
+    // click on a workspace already hosting a chat), making the two
+    // panes mirror the same Zustand slice. CLI panes don't have this
+    // problem because each gets a uniquely-minted `session_id` —
+    // chats need the equivalent invariant scoped per pane id.
     const match = Object.values(s.draftsById).find(
-      (d) => d.promotedTo?.workspaceId === workspaceIdForPane,
+      (d) =>
+        d.promotedTo?.workspaceId === workspaceIdForPane &&
+        d.promotedTo.paneId === pane.pane_id,
     );
     return match?.threadId ?? null;
   });
@@ -268,10 +277,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const recoveryDraft = useChatDraftStore(
     useShallow((s) => {
       if (!workspaceIdForPane) return null;
+      // Pane-scoped match — see promotedDraftThreadId for the same
+      // rationale. A fresh second chat pane in the same workspace
+      // must NOT inherit the first pane's partially-materialised
+      // recovery state.
       const match = Object.values(s.draftsById).find(
         (d) =>
           d.promotedTo === null &&
-          d.materializedTo?.workspaceId === workspaceIdForPane,
+          d.materializedTo?.workspaceId === workspaceIdForPane &&
+          d.materializedTo.paneId === pane.pane_id,
       );
       if (!match || !match.materializedTo) return null;
       return {

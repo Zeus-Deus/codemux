@@ -137,6 +137,13 @@ async fn lookup_provider(
 ///
 /// Returns the new pane id on success. Fails cleanly when the
 /// feature flag is off or the workspace does not exist.
+///
+/// `launch_mode` controls placement when the workspace already has
+/// surfaces. `Some(NewTab)` opens a fresh tab; `Some(SplitPane)` (or
+/// `None`) splits the active surface — the default matches the
+/// historical behaviour relied on by materialise / sidebar / prestart
+/// paths, where the chat IS the workspace and a fresh tab/surface is
+/// created automatically when surfaces are empty.
 #[tauri::command]
 pub fn agent_chat_create_pane(
     app: AppHandle,
@@ -145,9 +152,10 @@ pub fn agent_chat_create_pane(
     workspace_id: String,
     provider: Option<ProviderKind>,
     cwd: Option<String>,
+    launch_mode: Option<crate::presets::LaunchMode>,
 ) -> Result<String, String> {
     feature_flag_on(&observability)?;
-    let pane_id = state.create_agent_chat_pane(&workspace_id, provider, cwd)?;
+    let pane_id = state.create_agent_chat_pane(&workspace_id, provider, cwd, launch_mode)?;
     crate::state::emit_app_state(&app);
     Ok(pane_id.0)
 }
@@ -197,7 +205,7 @@ pub fn dev_agent_chat_spawn_test_pane(
     if workspace_id.is_empty() {
         return Err("no_active_workspace".to_string());
     }
-    let pane_id = state.create_agent_chat_pane(&workspace_id, None, None)?;
+    let pane_id = state.create_agent_chat_pane(&workspace_id, None, None, None)?;
     eprintln!(
         "[codemux::agent_chat] dev_agent_chat_spawn_test_pane created pane {} in workspace {workspace_id}",
         pane_id.0

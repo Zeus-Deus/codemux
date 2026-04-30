@@ -1121,8 +1121,14 @@ export const agentChatCreatePane = (
   workspaceId: string,
   provider: AgentChatProviderKind | null = null,
   cwd: string | null = null,
+  launchMode: LaunchMode | null = null,
 ) =>
-  invoke<string>("agent_chat_create_pane", { workspaceId, provider, cwd });
+  invoke<string>("agent_chat_create_pane", {
+    workspaceId,
+    provider,
+    cwd,
+    launchMode,
+  });
 
 export const agentChatStartSession = (
   paneId: string,

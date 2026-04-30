@@ -460,10 +460,13 @@ describe("PresetBar — ChatAgent on a real workspace", () => {
     await userEvent.click(screen.getByRole("button", { name: /chat agent/i }));
     await flushPromises();
 
+    // Plain click → new tab (matches CLI preset semantics).
+    // Shift-click would pass `"split_pane"` instead.
     expect(mockAgentChatCreatePane).toHaveBeenCalledWith(
       "ws-real",
       "claude",
       null,
+      "new_tab",
     );
     // The CLI dispatch path must not fire for a ChatAgent preset.
     expect(mockApplyPreset).not.toHaveBeenCalled();

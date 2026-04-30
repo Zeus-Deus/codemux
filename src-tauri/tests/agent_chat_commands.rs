@@ -90,7 +90,7 @@ fn feature_flag_on_create_pane_succeeds() {
     let workspace_id = snapshot.active_workspace_id.0;
 
     let pane_id = store
-        .create_agent_chat_pane(&workspace_id, None, None)
+        .create_agent_chat_pane(&workspace_id, None, None, None)
         .expect("create_agent_chat_pane should succeed when flag is on");
 
     let after = store.snapshot();
@@ -109,7 +109,7 @@ fn feature_flag_on_create_pane_succeeds() {
 fn create_pane_in_nonexistent_workspace_errors() {
     let store = AppStateStore::default();
     let err = store
-        .create_agent_chat_pane("ws-does-not-exist", None, None)
+        .create_agent_chat_pane("ws-does-not-exist", None, None, None)
         .expect_err("unknown workspace should error");
     assert!(
         err.contains("ws-does-not-exist"),
@@ -127,7 +127,7 @@ fn close_pane_is_idempotent() {
     let snapshot = store.snapshot();
     let workspace_id = snapshot.active_workspace_id.0;
     let pane_id = store
-        .create_agent_chat_pane(&workspace_id, None, None)
+        .create_agent_chat_pane(&workspace_id, None, None, None)
         .expect("create pane");
 
     // First close succeeds.

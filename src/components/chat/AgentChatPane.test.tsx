@@ -23,7 +23,12 @@ type SliceOverrides = {
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
   string,
-  { draftId: string; threadId: string; promotedTo: { workspaceId: string } | null }
+  {
+    draftId: string;
+    threadId: string;
+    promotedTo: { workspaceId: string; paneId: string } | null;
+    materializedTo?: { workspaceId: string; paneId: string; threadId: string } | null;
+  }
 > = {};
 let workspaceIdForPaneOverride: string | null = "ws-home";
 const setShowNewWorkspaceDialogMock = vi.fn();
@@ -458,7 +463,11 @@ describe("AgentChatPane Stage C race fix", () => {
       "draft-1": {
         draftId: "draft-1",
         threadId: "draft-thread-42",
-        promotedTo: { workspaceId: "ws-home" },
+        // paneId must match `paneNoThread.pane_id` — the selector is
+        // pane-scoped (not just workspace-scoped) so a fresh second
+        // pane in the same workspace doesn't accidentally adopt the
+        // first pane's draft.
+        promotedTo: { workspaceId: "ws-home", paneId: "pane-new" },
       },
     };
     currentThreadsMap = {

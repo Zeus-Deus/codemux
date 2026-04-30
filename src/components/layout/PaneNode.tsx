@@ -294,7 +294,20 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         />
         <div className="flex-1 min-h-0 overflow-hidden">
-          <AgentChatPane pane={node} />
+          {/*
+            `key={node.pane_id}` is REQUIRED for per-pane isolation.
+            Without it, React reconciles the existing `AgentChatPane`
+            Fiber across pane swaps (e.g. switching tabs in a workspace
+            with multiple chat panes, or a Chat-Agent preset click that
+            opens a new tab): the JSX shape is the same so the prior
+            pane's `useState<threadId>` value survives onto the new
+            pane, the mount effect's `if (threadId) { ensureThread;
+            return; }` early-exit fires, and the new pane subscribes to
+            the previous pane's Zustand slice — so both panes render
+            the same chat. Keying by pane_id forces a clean unmount/
+            remount and matches CLI panes' per-session_id isolation.
+          */}
+          <AgentChatPane key={node.pane_id} pane={node} />
         </div>
       </div>
     );

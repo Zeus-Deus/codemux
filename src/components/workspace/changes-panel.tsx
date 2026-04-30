@@ -9,6 +9,19 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
   Tooltip,
   TooltipTrigger,
   TooltipContent,
@@ -1014,6 +1027,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [baseBranchFiles, setBaseBranchFiles] = useState<GitFileStatus[]>([]);
   const [baseBranchExpanded, setBaseBranchExpanded] = useState(false);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
+  const [baseBranchPickerOpen, setBaseBranchPickerOpen] = useState(false);
 
   const config = useAppStore((s) => s.appState?.config);
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
@@ -1087,6 +1101,16 @@ export function ChangesPanel({ workspace }: Props) {
   }, [cwd, baseBranch]);
 
   useEffect(() => { refreshBaseDiff(); }, [refreshBaseDiff]);
+
+  const sortedBaseBranches = useMemo(() => {
+    return [...remoteBranches].sort((a, b) => {
+      const aDefault = a === "main" || a === "master";
+      const bDefault = b === "main" || b === "master";
+      if (aDefault && !bDefault) return -1;
+      if (!aDefault && bDefault) return 1;
+      return a.localeCompare(b);
+    });
+  }, [remoteBranches]);
 
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
@@ -1584,32 +1608,60 @@ export function ChangesPanel({ workspace }: Props) {
         <div className="flex items-center gap-0.5 px-2 py-1.5">
           {/* Base branch selector */}
           {remoteBranches.length > 1 ? (
-            <DropdownMenu>
+            <Popover open={baseBranchPickerOpen} onOpenChange={setBaseBranchPickerOpen}>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>
+                  <PopoverTrigger asChild>
                     <Button variant="ghost" size="icon-xs" className="size-6 p-0">
                       <GitBranch className="h-3.5 w-3.5" />
                     </Button>
-                  </DropdownMenuTrigger>
+                  </PopoverTrigger>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="text-xs">
                   Base: {baseBranch}
                 </TooltipContent>
               </Tooltip>
-              <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
-                {remoteBranches.map((b) => (
-                  <DropdownMenuItem
-                    key={b}
-                    onClick={() => setBaseBranch(b)}
-                    className="text-xs"
+              <PopoverContent align="start" className="w-[260px] p-0">
+                <Command>
+                  <CommandInput placeholder="Search branches..." className="h-8" />
+                  <CommandList
+                    className="max-h-[300px] [scrollbar-width:thin]"
+                    onWheel={(e) => e.stopPropagation()}
                   >
-                    {b === baseBranch && <Check className="h-3 w-3 mr-1.5 shrink-0" />}
-                    <span className={b !== baseBranch ? "pl-[18px]" : ""}>{b}</span>
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                    <CommandEmpty>No branches match</CommandEmpty>
+                    <CommandGroup>
+                      {sortedBaseBranches.map((b) => {
+                        const isDefault = b === "main" || b === "master";
+                        const isSelected = b === baseBranch;
+                        return (
+                          <CommandItem
+                            key={b}
+                            value={b}
+                            onSelect={() => {
+                              setBaseBranch(b);
+                              setBaseBranchPickerOpen(false);
+                            }}
+                            className="h-8 text-xs gap-2 px-2"
+                          >
+                            <span className="flex-1 min-w-0 truncate font-mono">
+                              {b}
+                            </span>
+                            {isDefault && (
+                              <span className="text-[10px] text-muted-foreground shrink-0">
+                                default
+                              </span>
+                            )}
+                            {isSelected && (
+                              <Check className="h-3 w-3 shrink-0 text-foreground" />
+                            )}
+                          </CommandItem>
+                        );
+                      })}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
           ) : (
             <Tooltip>
               <TooltipTrigger asChild>

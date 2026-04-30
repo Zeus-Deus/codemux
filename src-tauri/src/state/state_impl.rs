@@ -946,6 +946,7 @@ impl AppStateStore {
         workspace_id: &str,
         provider: Option<crate::agent_provider::ProviderKind>,
         cwd: Option<String>,
+        launch_mode: Option<crate::presets::LaunchMode>,
     ) -> Result<PaneId, String> {
         let mut snapshot = self.inner.lock().unwrap();
 
@@ -971,11 +972,26 @@ impl AppStateStore {
             .get_mut(workspace_index)
             .ok_or_else(|| "Workspace disappeared while creating chat pane".to_string())?;
 
+        // Force a fresh tab+surface when the caller explicitly asks
+        // for `NewTab`. Without this the existing surface check below
+        // would split the active pane on a populated workspace —
+        // which is the right default for materialise / sidebar paths
+        // (the chat IS the workspace) but wrong when a Chat Agent
+        // preset button is clicked on a workspace the user is already
+        // working in: clicking the button should mirror CLI presets
+        // (new tab on plain click, split on shift+click), not always
+        // split.
+        let force_new_tab = matches!(
+            launch_mode,
+            Some(crate::presets::LaunchMode::NewTab)
+        );
+
         // Find the active surface. If the workspace has no surfaces
-        // (empty workspace state), create a fresh surface carrying the
-        // new chat pane as its only child. Otherwise split at the
-        // active pane, mirroring browser/terminal pane insertion.
-        if workspace.surfaces.is_empty() {
+        // (empty workspace state) OR the caller wants a new tab,
+        // create a fresh surface carrying the new chat pane as its
+        // only child. Otherwise split at the active pane, mirroring
+        // browser/terminal pane insertion.
+        if workspace.surfaces.is_empty() || force_new_tab {
             let surface_id = SurfaceId(next_id("surface"));
             let tab_id = next_id("tab");
             workspace.tabs.push(TabSnapshot {
@@ -4806,7 +4822,7 @@ mod tests {
         let workspace_id = snapshot.active_workspace_id.clone();
 
         let pane_id = store
-            .create_agent_chat_pane(&workspace_id.0, None, None)
+            .create_agent_chat_pane(&workspace_id.0, None, None, None)
             .expect("create_agent_chat_pane should succeed");
 
         let after = store.snapshot();
@@ -4820,7 +4836,7 @@ mod tests {
     fn create_agent_chat_pane_on_missing_workspace_errors() {
         let store = AppStateStore::default();
         let err = store
-            .create_agent_chat_pane("does-not-exist", None, None)
+            .create_agent_chat_pane("does-not-exist", None, None, None)
             .unwrap_err();
         assert!(err.contains("does-not-exist"));
     }
@@ -4831,7 +4847,7 @@ mod tests {
         let snapshot = store.snapshot();
         let workspace_id = snapshot.active_workspace_id.clone();
         let pane_id = store
-            .create_agent_chat_pane(&workspace_id.0, None, None)
+            .create_agent_chat_pane(&workspace_id.0, None, None, None)
             .unwrap();
 
         assert!(store.agent_chat_thread_id(&pane_id.0).is_none());

@@ -53,6 +53,7 @@ import {
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
 import type {
+  LaunchMode,
   PresetStoreSnapshot,
   TerminalPreset,
 } from "@/tauri/types";
@@ -239,10 +240,14 @@ export function PresetBar({
   const handleLaunchWorkspace = (preset: TerminalPreset, e: React.MouseEvent) => {
     if (!workspaceId) return;
     if (preset.kind === "chat_agent") {
-      // Spawn an agent_chat pane as a sibling in the current
-      // workspace. Uses the same primitives as `materializeAndSend`
-      // but with a freshly-minted thread id (no draft involved).
-      void launchChatAgentOnWorkspace(preset, workspaceId).catch((err) => {
+      // Match CLI preset semantics: plain click opens a new tab,
+      // shift+click splits the current surface. Without this, every
+      // Chat Agent click would split the active pane (the backend's
+      // create_agent_chat_pane defaults to split when surfaces
+      // already exist) — surprising when the user expected a fresh
+      // tab parallel to existing CLI preset launches.
+      const launchMode: LaunchMode = e.shiftKey ? "split_pane" : "new_tab";
+      void launchChatAgentOnWorkspace(preset, workspaceId, launchMode).catch((err) => {
         const message =
           typeof err === "string"
             ? err
@@ -531,6 +536,7 @@ function SortablePresetButton({
 async function launchChatAgentOnWorkspace(
   _preset: TerminalPreset,
   workspaceId: string,
+  launchMode: LaunchMode,
 ): Promise<void> {
-  await agentChatCreatePane(workspaceId, "claude", null);
+  await agentChatCreatePane(workspaceId, "claude", null, launchMode);
 }
