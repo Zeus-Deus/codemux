@@ -43,11 +43,21 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            file
+            file \
+            ripgrep
         # This matches the package list installed in release.yml so the CI
         # toolchain is a strict subset of what the release pipeline uses.
         # libfuse2 is excluded — it is only needed by `tauri build`'s
         # AppImage packager, not by `cargo check` or `cargo test`.
+        # ripgrep is required by `commands::files::tests::grep_count_pattern_*`,
+        # which shells out to `rg` to count CODEMUX_DEBUG markers.
+
+      - name: Install Windows system dependencies
+        if: matrix.os == 'windows-latest'
+        # Chocolatey is pre-installed on windows-latest runners. ripgrep
+        # is needed for the same `grep_count_pattern_*` tests as Linux.
+        run: choco install ripgrep -y --no-progress
+        shell: pwsh
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
