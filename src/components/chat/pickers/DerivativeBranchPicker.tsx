@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ChevronDown, GitBranch } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ChevronDown, FolderGit, GitBranch, Globe } from "lucide-react";
 
 import {
   Command,
@@ -14,9 +14,39 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { listBranches } from "@/tauri/commands";
+import { cn } from "@/lib/utils";
+import {
+  useAppStore,
+  useHomeDir,
+  useProjectGroupedWorkspaces,
+} from "@/stores/app-store";
+import { listBranchesDetailed } from "@/tauri/commands";
+import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
 
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+
+// Module-scoped stable empty array — see WorktreePicker for the same
+// pattern. Returning a fresh `[]` from a Zustand selector causes the
+// "getSnapshot should be cached" warning.
+const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
+
+type FilterMode = "all" | "worktrees";
+
+function formatRelativeTime(unixSeconds: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const diff = now - unixSeconds;
+  if (diff < 60) return "now";
+  const mins = Math.floor(diff / 60);
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo`;
+  const years = Math.floor(months / 12);
+  return `${years}y`;
+}
 
 interface Props {
   projectPath: string;
@@ -40,8 +70,27 @@ export function DerivativeBranchPicker({
   disabled,
 }: Props) {
   const [open, setOpen] = useState(false);
-  const [branches, setBranches] = useState<string[] | null>(null);
+  const [branches, setBranches] = useState<BranchDetail[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [filterMode, setFilterMode] = useState<FilterMode>("all");
+
+  // Worktrees that exist for this project — used to render the
+  // FolderGit icon and power the All/Worktrees tab filter. Sourced from
+  // the same app-store path as WorktreePicker so the two pills agree.
+  const homeDir = useHomeDir();
+  const workspaces = useAppStore(
+    (s) => s.appState?.workspaces ?? EMPTY_WORKSPACES,
+  );
+  const groups = useProjectGroupedWorkspaces(workspaces, homeDir);
+  const worktreeBranches = useMemo(() => {
+    const set = new Set<string>();
+    const group = groups.find((g) => g.projectPath === projectPath);
+    if (!group) return set;
+    for (const ws of group.workspaces) {
+      if (ws.git_branch) set.add(ws.git_branch);
+    }
+    return set;
+  }, [groups, projectPath]);
 
   // Fetch branches eagerly on mount — not just on popover open. The
   // seed value ("main" from the parent) is a guess that may not exist
@@ -53,15 +102,14 @@ export function DerivativeBranchPicker({
     if (branches !== null) return;
     let cancelled = false;
     setLoading(true);
-    Promise.all([
-      listBranches(projectPath, false).catch(() => [] as string[]),
-      listBranches(projectPath, true).catch(() => [] as string[]),
-    ])
-      .then(([local, remote]) => {
+    listBranchesDetailed(projectPath)
+      .then((rows) => {
         if (cancelled) return;
-        const deduped = new Set<string>(local);
-        for (const b of remote) deduped.add(b.replace(/^origin\//, ""));
-        setBranches(Array.from(deduped).sort());
+        setBranches(rows);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setBranches([]);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -73,16 +121,18 @@ export function DerivativeBranchPicker({
 
   // Auto-correct the seeded default when it doesn't exist in the
   // repo. Prefer `main`, then `master`, then the first available
-  // branch. Runs once per branch-list arrival; if the user picks a
-  // valid branch, `value` lands in the list and this no-ops.
+  // branch (most-recently-committed, since the list is recency-sorted).
+  // Runs once per branch-list arrival; if the user picks a valid
+  // branch, `value` lands in the list and this no-ops.
   useEffect(() => {
     if (!branches || branches.length === 0) return;
-    if (branches.includes(value)) return;
-    const best = branches.includes("main")
+    if (branches.some((b) => b.name === value)) return;
+    const names = branches.map((b) => b.name);
+    const best = names.includes("main")
       ? "main"
-      : branches.includes("master")
+      : names.includes("master")
         ? "master"
-        : branches[0];
+        : names[0];
     onChange(best);
   }, [branches, value, onChange]);
 
@@ -91,8 +141,25 @@ export function DerivativeBranchPicker({
     setOpen(false);
   };
 
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    if (!next) setFilterMode("all");
+  };
+
+  const allCount = branches?.length ?? 0;
+  const worktreeCount = useMemo(() => {
+    if (!branches) return 0;
+    return branches.filter((b) => worktreeBranches.has(b.name)).length;
+  }, [branches, worktreeBranches]);
+
+  const visibleBranches = useMemo(() => {
+    if (!branches) return [] as BranchDetail[];
+    if (filterMode === "all") return branches;
+    return branches.filter((b) => worktreeBranches.has(b.name));
+  }, [branches, filterMode, worktreeBranches]);
+
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <button
           type="button"
@@ -107,32 +174,76 @@ export function DerivativeBranchPicker({
         </button>
       </PopoverTrigger>
       <PopoverContent
-        className="w-[280px] p-0"
+        className="w-[340px] p-0"
         align="start"
         onOpenAutoFocus={focusCmdkRootOnOpen}
       >
         <Command>
-          <CommandInput placeholder="Search branches…" />
-          <CommandList className="max-h-[320px]">
+          <CommandInput placeholder="Search branches…" className="h-8" />
+          <div className="mx-2 mt-1 mb-1 flex items-center gap-0.5 rounded-md bg-muted/40 p-0.5">
+            <button
+              type="button"
+              className={cn(
+                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                filterMode === "all"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              onClick={() => setFilterMode("all")}
+            >
+              All <span className="text-[10px] opacity-60">{allCount}</span>
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "flex-1 rounded-md px-2 py-1 text-xs transition-colors",
+                filterMode === "worktrees"
+                  ? "bg-background text-foreground shadow-sm"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              onClick={() => setFilterMode("worktrees")}
+            >
+              Worktrees{" "}
+              <span className="text-[10px] opacity-60">{worktreeCount}</span>
+            </button>
+          </div>
+          <CommandList
+            className="max-h-[320px] overflow-y-auto [scrollbar-width:thin]"
+            onWheel={(e) => e.stopPropagation()}
+          >
             <CommandEmpty>
-              {loading ? "Loading…" : "No branches"}
+              {loading
+                ? "Loading…"
+                : filterMode === "worktrees"
+                  ? "No active worktrees"
+                  : "No branches"}
             </CommandEmpty>
-            {branches && branches.length > 0 && (
+            {visibleBranches.length > 0 && (
               <CommandGroup>
-                {branches.map((branch) => (
-                  <CommandItem
-                    key={branch}
-                    value={branch}
-                    onSelect={() => handleSelect(branch)}
-                    className="h-8 text-xs gap-2"
-                    data-checked={branch === value ? "true" : undefined}
-                  >
-                    <GitBranch className="size-3.5 text-muted-foreground" />
-                    <span className="flex-1 min-w-0 truncate font-mono">
-                      {branch}
-                    </span>
-                  </CommandItem>
-                ))}
+                {visibleBranches.map((branch) => {
+                  const hasWorktree = worktreeBranches.has(branch.name);
+                  return (
+                    <CommandItem
+                      key={branch.name}
+                      value={branch.name}
+                      onSelect={() => handleSelect(branch.name)}
+                      className="h-8 gap-2 px-2 text-xs"
+                      data-checked={branch.name === value ? "true" : undefined}
+                    >
+                      <BranchKindIcon
+                        hasWorktree={hasWorktree}
+                        isLocal={branch.is_local}
+                        isRemote={branch.is_remote}
+                      />
+                      <span className="min-w-0 flex-1 truncate font-mono">
+                        {branch.name}
+                      </span>
+                      <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground/60">
+                        {formatRelativeTime(branch.last_commit_unix)}
+                      </span>
+                    </CommandItem>
+                  );
+                })}
               </CommandGroup>
             )}
           </CommandList>
@@ -140,4 +251,25 @@ export function DerivativeBranchPicker({
       </PopoverContent>
     </Popover>
   );
+}
+
+function BranchKindIcon({
+  hasWorktree,
+  isLocal,
+  isRemote,
+}: {
+  hasWorktree: boolean;
+  isLocal: boolean;
+  isRemote: boolean;
+}) {
+  if (hasWorktree) {
+    return <FolderGit className="size-3.5 shrink-0 text-muted-foreground" />;
+  }
+  if (isRemote) {
+    return <Globe className="size-3.5 shrink-0 text-muted-foreground" />;
+  }
+  if (isLocal) {
+    return <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />;
+  }
+  return <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />;
 }

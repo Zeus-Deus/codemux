@@ -4,13 +4,29 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 vi.mock("@/tauri/commands", () => ({
-  listBranches: vi.fn(),
+  listBranchesDetailed: vi.fn(),
 }));
 
 import { DerivativeBranchPicker } from "./DerivativeBranchPicker";
-import { listBranches } from "@/tauri/commands";
+import { listBranchesDetailed } from "@/tauri/commands";
+import type { BranchDetail } from "@/tauri/types";
 
 afterEach(() => cleanup());
+
+const NOW = Math.floor(Date.now() / 1000);
+
+function detail(
+  name: string,
+  overrides: Partial<BranchDetail> = {},
+): BranchDetail {
+  return {
+    name,
+    last_commit_unix: NOW - 3600,
+    is_local: true,
+    is_remote: false,
+    ...overrides,
+  };
+}
 
 function renderPicker(
   overrides: Partial<Parameters<typeof DerivativeBranchPicker>[0]> = {},
@@ -32,13 +48,13 @@ function renderPicker(
 
 describe("DerivativeBranchPicker", () => {
   beforeEach(() => {
-    vi.mocked(listBranches).mockReset();
+    vi.mocked(listBranchesDetailed).mockReset();
   });
 
   it("renders the current value on the trigger pill", () => {
     // Pre-populate with the current value so the auto-correct effect
     // no-ops (we're testing display, not defaulting).
-    vi.mocked(listBranches).mockResolvedValue(["develop"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([detail("develop")]);
     const { trigger } = renderPicker({ value: "develop" });
     expect(trigger).not.toBeNull();
     expect(trigger!.textContent).toContain("develop");
@@ -46,38 +62,35 @@ describe("DerivativeBranchPicker", () => {
   });
 
   it("disabled prop disables the trigger", () => {
-    vi.mocked(listBranches).mockResolvedValue(["main"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([detail("main")]);
     const { trigger } = renderPicker({ disabled: true });
     expect(trigger!.disabled).toBe(true);
   });
 
-  it("opens the menu and lists branches (local + remote deduped, origin/ stripped)", async () => {
-    // First call → local; second → remote. The picker dedupes the two
-    // sets and strips the `origin/` prefix from remotes.
-    vi.mocked(listBranches).mockImplementation(async (_path, remote) =>
-      remote ? ["origin/main", "origin/dev"] : ["main", "feat/x"],
-    );
+  it("opens the menu and lists branches from the detailed source", async () => {
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("main", { is_local: true, is_remote: true }),
+      detail("feat/x", { is_local: true }),
+      detail("dev", { is_local: false, is_remote: true }),
+    ]);
     const user = userEvent.setup();
     const { trigger } = renderPicker();
     await user.click(trigger!);
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledWith("/projects/foo", false);
-    });
-    await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledWith("/projects/foo", true);
+      expect(listBranchesDetailed).toHaveBeenCalledWith("/projects/foo");
     });
     const options = await screen.findAllByRole("option");
     const labels = options.map((el) => el.textContent ?? "");
-    // 3 unique: main, feat/x, dev (origin/main de-duped with local main)
     expect(labels.some((t) => t.includes("main"))).toBe(true);
     expect(labels.some((t) => t.includes("feat/x"))).toBe(true);
     expect(labels.some((t) => t.includes("dev"))).toBe(true);
-    // No `origin/` prefix leaking through.
-    expect(labels.some((t) => t.includes("origin/"))).toBe(false);
   });
 
   it("clicking a branch row fires onChange with that branch", async () => {
-    vi.mocked(listBranches).mockResolvedValue(["main", "develop"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("main"),
+      detail("develop"),
+    ]);
     const user = userEvent.setup();
     const { trigger, onChange } = renderPicker();
     await user.click(trigger!);
@@ -87,28 +100,29 @@ describe("DerivativeBranchPicker", () => {
   });
 
   it("fetches branches eagerly on mount and does not refetch on reopen", async () => {
-    vi.mocked(listBranches).mockResolvedValue(["main"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([detail("main")]);
     const user = userEvent.setup();
     const { trigger } = renderPicker();
     // Eager fetch fires on mount, not on first open. This lets the
     // auto-correct effect run before the user can submit a "+ New
     // worktree…" with the wrong default base.
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranchesDetailed).toHaveBeenCalledTimes(1);
     });
     // Open and close — should not refetch.
     await user.click(trigger!);
     await user.keyboard("{Escape}");
     await user.click(trigger!);
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalledTimes(2);
+      expect(listBranchesDetailed).toHaveBeenCalledTimes(1);
     });
   });
 
   it("auto-corrects the default to 'master' when seeded value ('main') doesn't exist in the repo", async () => {
-    vi.mocked(listBranches).mockImplementation(async (_path, remote) =>
-      remote ? [] : ["master", "feat/x"],
-    );
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("master"),
+      detail("feat/x"),
+    ]);
     const onChange = vi.fn();
     renderPicker({ value: "main", onChange });
     await waitFor(() => {
@@ -117,7 +131,11 @@ describe("DerivativeBranchPicker", () => {
   });
 
   it("prefers 'main' over 'master' when both are present", async () => {
-    vi.mocked(listBranches).mockResolvedValue(["main", "master", "feat/x"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("main"),
+      detail("master"),
+      detail("feat/x"),
+    ]);
     const onChange = vi.fn();
     // Seed with a nonsense value so auto-correct triggers.
     renderPicker({ value: "__missing__", onChange });
@@ -126,42 +144,47 @@ describe("DerivativeBranchPicker", () => {
     });
   });
 
-  it("falls back to the first available branch when neither main nor master exists", async () => {
-    vi.mocked(listBranches).mockResolvedValue(["feat/x", "other-branch"]);
+  it("falls back to the most-recent branch when neither main nor master exists", async () => {
+    // listBranchesDetailed returns rows already sorted by recency, so
+    // we expect the picker to fall back to branches[0].
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("feat/x", { last_commit_unix: NOW - 60 }),
+      detail("other-branch", { last_commit_unix: NOW - 7200 }),
+    ]);
     const onChange = vi.fn();
     renderPicker({ value: "main", onChange });
     await waitFor(() => {
-      expect(onChange).toHaveBeenCalled();
+      expect(onChange).toHaveBeenCalledWith("feat/x");
     });
-    // Sorted list → "feat/x" is alphabetically first.
-    expect(onChange).toHaveBeenCalledWith("feat/x");
   });
 
   it("does NOT call onChange when the seeded value already exists in the branch list", async () => {
-    vi.mocked(listBranches).mockResolvedValue(["main", "master"]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("main"),
+      detail("master"),
+    ]);
     const onChange = vi.fn();
     renderPicker({ value: "main", onChange });
-    // Wait long enough for a spurious call to land.
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalled();
+      expect(listBranchesDetailed).toHaveBeenCalled();
     });
     await new Promise((r) => setTimeout(r, 30));
     expect(onChange).not.toHaveBeenCalled();
   });
 
   it("does not call onChange when the branch list comes back empty (e.g. fresh repo)", async () => {
-    vi.mocked(listBranches).mockResolvedValue([]);
+    vi.mocked(listBranchesDetailed).mockResolvedValue([]);
     const onChange = vi.fn();
     renderPicker({ value: "main", onChange });
     await waitFor(() => {
-      expect(listBranches).toHaveBeenCalled();
+      expect(listBranchesDetailed).toHaveBeenCalled();
     });
     await new Promise((r) => setTimeout(r, 30));
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("handles listBranches failure gracefully (no branches listed, no crash)", async () => {
-    vi.mocked(listBranches).mockRejectedValue(new Error("git error"));
+  it("handles listBranchesDetailed failure gracefully (no branches listed, no crash)", async () => {
+    vi.mocked(listBranchesDetailed).mockRejectedValue(new Error("git error"));
     const user = userEvent.setup();
     const { trigger } = renderPicker();
     await user.click(trigger!);
@@ -169,5 +192,25 @@ describe("DerivativeBranchPicker", () => {
     await waitFor(() => {
       expect(screen.getByText(/No branches/i)).toBeInTheDocument();
     });
+  });
+
+  it("shows All / Worktrees tab counts and filters when Worktrees is selected", async () => {
+    vi.mocked(listBranchesDetailed).mockResolvedValue([
+      detail("main"),
+      detail("feat/x"),
+      detail("old/cleanup"),
+    ]);
+    const user = userEvent.setup();
+    const { trigger } = renderPicker();
+    await user.click(trigger!);
+    // Without a populated app store, no branches map to worktrees,
+    // so the All count is 3 and the Worktrees count is 0.
+    const allTab = await screen.findByRole("button", { name: /^All\s*3$/ });
+    expect(allTab).toBeInTheDocument();
+    const worktreesTab = screen.getByRole("button", {
+      name: /^Worktrees\s*0$/,
+    });
+    await user.click(worktreesTab);
+    expect(screen.getByText(/No active worktrees/i)).toBeInTheDocument();
   });
 });
