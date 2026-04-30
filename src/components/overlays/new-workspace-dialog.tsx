@@ -232,7 +232,19 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     // Fetch presets
     getPresets()
       .then((snap) => {
-        if (!cancelled) setPresets(snap.presets.filter((p) => p.pinned));
+        if (cancelled) return;
+        const cliPresets = snap.presets.filter(
+          (p) => p.pinned && p.kind === "cli",
+        );
+        setPresets(cliPresets);
+        setSelectedAgentId((prev) => {
+          if (prev && cliPresets.some((p) => p.id === prev)) return prev;
+          return (
+            cliPresets.find((p) => p.id === "builtin-claude")?.id ??
+            cliPresets[0]?.id ??
+            "builtin-claude"
+          );
+        });
       })
       .catch(() => {});
 
