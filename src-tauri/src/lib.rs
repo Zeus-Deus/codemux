@@ -147,6 +147,13 @@ pub fn run() {
         .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        // MCP runtime registry. `agent_chat_start_session` reads this
+        // via `app.state::<McpRegistry>()` to lazily prime servers
+        // before launching a chat, and the `commands::mcp::*` Tauri
+        // commands take it via `State<'_, McpRegistry>`. Registering
+        // it here is mandatory — without `.manage()` the first
+        // `state()` call panics with "state() called before manage()".
+        .manage(mcp::registry::McpRegistry::default())
         .manage(skills::watcher::SkillsWatcherState::new())
         // Phase 2 display-isolation: per-workspace virtual display manager.
         // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
@@ -708,6 +715,21 @@ pub fn run() {
             commands::create_empty_workspace,
             commands::get_or_create_home_workspace,
             commands::regenerate_mcp_config,
+            // MCP runtime registry commands. Frontend invokes these via
+            // `src/tauri/commands.ts` and `src/hooks/use-mcp-runtime.ts`.
+            // Defined in `commands/mcp.rs`; missing registration is what
+            // produced the "Command get_mcp_runtime_status not found"
+            // warnings.
+            commands::list_mcp_servers,
+            commands::get_mcp_runtime_status,
+            commands::set_mcp_disabled_ids,
+            commands::prime_mcp_runtime,
+            commands::start_mcp_server_cmd,
+            commands::stop_mcp_server_cmd,
+            commands::restart_mcp_server_cmd,
+            commands::list_mcp_tools,
+            commands::list_mcp_tools_with_cap_info,
+            commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,
             commands::create_openflow_workspace,
             commands::activate_workspace,
