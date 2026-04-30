@@ -541,8 +541,18 @@ mod tests {
 
     #[tokio::test]
     async fn grep_count_pattern_rejects_missing_dir() {
+        // Build an absolute, definitely-not-existing path that's valid
+        // on any platform — joining a fresh tempdir with a fake subdir
+        // yields an absolute path on Linux (`/tmp/.tmpXXXX/missing`)
+        // and Windows (`C:\Users\...\Temp\.tmpXXXX\missing`). The
+        // hardcoded POSIX `/this/path/...` form failed the early
+        // `is_absolute()` check on Windows and surfaced a different
+        // error string ("cwd must be absolute") that didn't match this
+        // assertion.
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("definitely-not-here");
         let err = grep_count_pattern(
-            "/this/path/does/not/exist/codemux-test".to_string(),
+            nonexistent.to_string_lossy().to_string(),
             "X".to_string(),
         )
         .await

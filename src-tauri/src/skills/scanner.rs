@@ -88,7 +88,30 @@ fn build_skill(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| skill_dir.to_path_buf());
 
-    let symlinked = canonical_md != *skill_md_path;
+    // Detect whether the SKILL.md file or any ancestor directory is a
+    // symlink. The earlier implementation compared `canonical_md`
+    // against `skill_md_path` directly, but Windows's `canonicalize`
+    // returns `\\?\C:\…`-prefixed paths even when nothing is
+    // symlinked, which made every Windows path look symlinked. Walk
+    // ancestors with `symlink_metadata` instead so neither the
+    // verbatim prefix nor case-fold differences pollute the answer.
+    let symlinked = {
+        let mut found = false;
+        let mut cursor: &Path = skill_md_path;
+        loop {
+            if let Ok(md) = std::fs::symlink_metadata(cursor) {
+                if md.file_type().is_symlink() {
+                    found = true;
+                    break;
+                }
+            }
+            match cursor.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => cursor = parent,
+                _ => break,
+            }
+        }
+        found
+    };
 
     let content = std::fs::read_to_string(&canonical_md)
         .map_err(|e| format!("read SKILL.md failed: {e}"))?;

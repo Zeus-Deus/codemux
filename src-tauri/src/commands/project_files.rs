@@ -34,6 +34,21 @@ const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// rendered tree is cut.
 const FOLDER_TREE_MAX_ENTRIES: usize = 100;
 
+/// Convert a `Path` (or path string) to a forward-slash-separated string
+/// for the frontend. On Linux/macOS this is a no-op. On Windows the
+/// native separator is `\`, which would surface as `src\lib\foo.ts` in
+/// the picker UI and break frontend assertions written for POSIX-style
+/// paths. The frontend always expects `/`, so we normalize at the
+/// boundary instead of asking every caller to remember.
+fn to_forward_slash(p: impl AsRef<Path>) -> String {
+    let s = p.as_ref().to_string_lossy().into_owned();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
 /// Cache TTL for the per-cwd file list. Aligns with the frontend skills
 /// store TTL (60s) so the user's mental model of "freshness" is
 /// consistent across cached lookups.
@@ -186,13 +201,12 @@ fn walk_project(cwd: &Path) -> CacheEntry {
             continue;
         }
         let abs = entry.path().to_path_buf();
-        let rel = abs
-            .strip_prefix(cwd)
-            .unwrap_or(&abs)
-            .to_string_lossy()
-            .to_string();
+        let rel = to_forward_slash(abs.strip_prefix(cwd).unwrap_or(&abs));
         // Skip the `.git` directory contents — `ignore` already handles
-        // top-level `.git`, but be defensive for nested git repos.
+        // top-level `.git`, but be defensive for nested git repos. The
+        // `rel` string is forward-slash-normalized above so this prefix
+        // check works on Windows too (where the raw walk produced
+        // `.git\foo`).
         if rel.starts_with(".git/") || rel == ".git" {
             continue;
         }
@@ -461,7 +475,7 @@ pub async fn read_folder_for_attachment(
                 canonical_path
                     .strip_prefix(&canonical_cwd)
                     .ok()
-                    .map(|rel| rel.to_string_lossy().to_string())
+                    .map(to_forward_slash)
             })
         });
 
@@ -629,7 +643,7 @@ pub async fn read_file_for_attachment(
                 canonical_path
                     .strip_prefix(&canonical_cwd)
                     .ok()
-                    .map(|rel| rel.to_string_lossy().to_string())
+                    .map(to_forward_slash)
             })
         });
 

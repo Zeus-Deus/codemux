@@ -384,14 +384,21 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join(".claude.json");
         let project_root = tmp.path().join("workspace");
-        let project_key = project_root.display().to_string();
+        // The project key is interpolated into a JSON string literal,
+        // so any backslashes the host's path uses (Windows tempdirs
+        // resolve to `C:\Users\...`) must be JSON-escaped or the
+        // parser rejects the doc with "invalid escape". Going through
+        // `serde_json` produces the correctly-quoted-and-escaped form
+        // for any platform.
+        let project_key = serde_json::to_string(&project_root.display().to_string())
+            .expect("serialize project key");
         let body = format!(
             r#"{{
               "mcpServers": {{
                 "user-scoped": {{ "command": "u" }}
               }},
               "projects": {{
-                "{}": {{
+                {}: {{
                   "mcpServers": {{
                     "local-scoped": {{ "command": "l" }}
                   }}
@@ -424,14 +431,18 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path().join(".claude.json");
         let project_root = tmp.path().join("active");
-        let project_key = project_root.display().to_string();
-        let other_key = "/some/other/project";
+        // Same reason as `wrapped_config_extracts_project_local_scope`:
+        // serialize through serde_json so Windows path backslashes
+        // become valid JSON escapes.
+        let project_key = serde_json::to_string(&project_root.display().to_string())
+            .expect("serialize project key");
+        let other_key = serde_json::to_string("/some/other/project").unwrap();
         let body = format!(
             r#"{{
               "mcpServers": {{}},
               "projects": {{
-                "{}": {{ "mcpServers": {{ "active-only": {{ "command": "a" }} }} }},
-                "{}": {{ "mcpServers": {{ "other-only":  {{ "command": "o" }} }} }}
+                {}: {{ "mcpServers": {{ "active-only": {{ "command": "a" }} }} }},
+                {}: {{ "mcpServers": {{ "other-only":  {{ "command": "o" }} }} }}
               }}
             }}"#,
             project_key, other_key
