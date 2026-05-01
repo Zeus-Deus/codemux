@@ -59,19 +59,60 @@ vi.mock("@/lib/toast", () => ({
 
 // Provider capabilities — minimal stub. Selectors pull null when the
 // store has no entry, which renders a disabled "unavailable" state on
-// the pickers; that's fine for these tests.
+// the pickers; that's fine for these tests. The hook is invoked two
+// ways: with a selector function (legacy callers) and bare (the new
+// `MultiProviderModelPicker` reads the full state). Handle both.
+const STUB_CAP_STATE = {
+  claude: null,
+  codex: null,
+  opencode: null,
+  claudeError: null,
+  codexError: null,
+  opencodeError: null,
+  loaded: false,
+  refresh: vi.fn(),
+  refreshAll: vi.fn(),
+};
 vi.mock("@/stores/provider-capabilities-store", () => ({
   useProviderCapabilities: Object.assign(
-    vi.fn((selector: (s: unknown) => unknown) =>
-      selector({ claude: null, codex: null }),
+    vi.fn((selector?: (s: unknown) => unknown) =>
+      typeof selector === "function" ? selector(STUB_CAP_STATE) : STUB_CAP_STATE,
     ),
     // `capability-defaults` reads the store synchronously via
     // `.getState()`. Return the same null-capability shape the hook
     // selector returns, so downstream fallbacks kick in.
-    { getState: () => ({ claude: null, codex: null }) },
+    { getState: () => STUB_CAP_STATE },
   ),
   selectCapabilities: () => null,
+  selectError: () => null,
   selectModel: () => null,
+}));
+
+// Picker favorites store — drafts now use the multi-provider picker
+// which subscribes to the favorites list. Empty array keeps the
+// picker's sort path on the fallback branch.
+vi.mock("@/stores/picker-favorites-store", () => ({
+  pickerFavoriteKey: (provider: string, modelId: string) =>
+    `${provider}::${modelId}`,
+  usePickerFavorites: Object.assign(
+    vi.fn((selector?: (s: unknown) => unknown) => {
+      const state = {
+        favorites: [],
+        toggle: vi.fn(),
+        isFavorite: () => false,
+        getKey: (p: string, m: string) => `${p}::${m}`,
+      };
+      return typeof selector === "function" ? selector(state) : state;
+    }),
+    {
+      getState: () => ({
+        favorites: [],
+        toggle: vi.fn(),
+        isFavorite: () => false,
+        getKey: (p: string, m: string) => `${p}::${m}`,
+      }),
+    },
+  ),
 }));
 
 // Stub the ProjectPicker: the real one subscribes to useAppStore via

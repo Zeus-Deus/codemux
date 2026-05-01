@@ -847,7 +847,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       // Drafts do not need a backend session to be considered ready —
       // Enter-to-send is always available as long as text is present.
       sessionReady={true}
-      showProviderPicker={false}
+      showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
       zone1Override={zone1Override}
