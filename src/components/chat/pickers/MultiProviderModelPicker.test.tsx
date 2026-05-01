@@ -225,6 +225,43 @@ describe("MultiProviderModelPicker — provider rail", () => {
     });
   });
 
+  it("rail icon is dimmed and tooltip flags 'Not installed' when OpenCode is missing", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: CODEX_CAPS,
+      opencode: null,
+      opencodeError: "opencode_not_installed",
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+
+    const opencodeBtn = screen.getByTestId("provider-rail-opencode");
+    // Visual cue: `data-unavailable="true"` is the test-stable hook
+    // for the dimmed-icon styling. The Tailwind opacity-40 class is
+    // applied via the same gate.
+    expect(opencodeBtn).toHaveAttribute("data-unavailable", "true");
+
+    // Sanity: Claude & Codex rail icons stay un-dimmed.
+    expect(
+      screen
+        .getByTestId("provider-rail-claude")
+        .getAttribute("data-unavailable"),
+    ).toBeNull();
+    expect(
+      screen
+        .getByTestId("provider-rail-codex")
+        .getAttribute("data-unavailable"),
+    ).toBeNull();
+
+    // The rail entry is still clickable so the user can see the
+    // empty-state install hint.
+    await user.click(opencodeBtn);
+    expect(
+      await screen.findByText("OpenCode not detected on your system"),
+    ).toBeInTheDocument();
+  });
+
   it("OpenCode rail shows federated rows with sub_provider subtitles", async () => {
     const user = userEvent.setup();
     renderPicker();

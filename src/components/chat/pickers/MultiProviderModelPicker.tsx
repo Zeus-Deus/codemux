@@ -247,6 +247,7 @@ export function MultiProviderModelPicker({
             selected={railKey}
             favoritesCount={favoritesArray.length}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
+            getError={(kind) => selectError(allCaps, kind)}
             onSelect={(next) => {
               setRailKey(next);
               setQuery("");
@@ -337,12 +338,14 @@ function ProviderRail({
   selected,
   favoritesCount,
   getCount,
+  getError,
   onSelect,
 }: {
   providers: ReadonlyArray<{ kind: AgentChatProviderKind; label: string }>;
   selected: RailKey;
   favoritesCount: number;
   getCount: (kind: AgentChatProviderKind) => number;
+  getError: (kind: AgentChatProviderKind) => string | null;
   onSelect: (next: RailKey) => void;
 }) {
   return (
@@ -401,6 +404,14 @@ function ProviderRail({
         {providers.map((p) => {
           const isSelected = selected === p.kind;
           const count = getCount(p.kind);
+          const error = getError(p.kind);
+          // A driver is "unavailable" when its capabilities harvest
+          // failed (today, only OpenCode can hit this — Claude / Codex
+          // ship hand-maintained fallback bundles that never error).
+          // The icon stays clickable so the empty state in the right
+          // column can render the install hint + opencode.ai link;
+          // the dim opacity is just a heads-up at the rail level.
+          const isUnavailable = !!error;
           return (
             <div key={p.kind} className="relative">
               {isSelected && (
@@ -416,12 +427,16 @@ function ProviderRail({
                     onClick={() => onSelect(p.kind)}
                     data-testid={`provider-rail-${p.kind}`}
                     data-selected={isSelected || undefined}
+                    data-unavailable={isUnavailable || undefined}
                     aria-label={p.label}
                     aria-pressed={isSelected}
                     className={cn(
                       "relative flex aspect-square w-full items-center justify-center rounded transition-colors",
                       "hover:bg-muted",
                       isSelected && "bg-background text-foreground shadow-sm",
+                      isUnavailable &&
+                        !isSelected &&
+                        "opacity-40 hover:opacity-70",
                     )}
                   >
                     <ProviderLogo
@@ -431,11 +446,18 @@ function ProviderRail({
                   </button>
                 </TooltipTrigger>
                 <TooltipContent side="right" sideOffset={8}>
-                  {p.label}
-                  {count > 0 ? (
-                    <span className="ml-2 text-muted-foreground">
-                      {count}
-                    </span>
+                  <div className="flex items-center gap-2">
+                    <span>{p.label}</span>
+                    {!isUnavailable && count > 0 ? (
+                      <span className="text-muted-foreground">{count}</span>
+                    ) : null}
+                  </div>
+                  {isUnavailable ? (
+                    <div className="mt-0.5 text-muted-foreground">
+                      {error === "opencode_not_installed"
+                        ? "Not installed"
+                        : "Unavailable"}
+                    </div>
                   ) : null}
                 </TooltipContent>
               </Tooltip>
