@@ -4761,6 +4761,42 @@ mod tests {
         }
     }
 
+    /// Step 12 Stage 4 — chat panes must round-trip through serde for
+    /// all three provider variants, not just Claude. The picker UI now
+    /// emits `Some(Codex)` and `Some(OpenCode)` from the rail click
+    /// handler, so persisting and rehydrating those values must keep
+    /// the variant intact.
+    #[test]
+    fn agent_chat_pane_serde_round_trips_for_every_provider_variant() {
+        use crate::agent_provider::ProviderKind;
+        for kind in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::OpenCode,
+        ] {
+            let node = PaneNodeSnapshot::AgentChat {
+                pane_id: PaneId("pane-1".into()),
+                title: "Agent Chat".into(),
+                thread_id: None,
+                provider: Some(kind),
+                cwd: None,
+            };
+            let json = serde_json::to_string(&node).expect("serialize");
+            let round: PaneNodeSnapshot =
+                serde_json::from_str(&json).expect("deserialize");
+            match round {
+                PaneNodeSnapshot::AgentChat { provider, .. } => {
+                    assert_eq!(
+                        provider,
+                        Some(kind),
+                        "provider variant {kind:?} must survive serde round-trip"
+                    );
+                }
+                other => panic!("expected AgentChat variant, got {other:?}"),
+            }
+        }
+    }
+
     /// Unset optional fields must survive the round-trip without being
     /// re-populated. `thread_id`, `provider`, and `cwd` are all
     /// `#[serde(default)]` so `None` serializes to `null`.

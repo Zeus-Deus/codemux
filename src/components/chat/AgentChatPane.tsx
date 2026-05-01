@@ -93,9 +93,14 @@ import { useUIStore } from "@/stores/ui-store";
 // passes the pane snapshot verbatim; nothing else imports this type.
 type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
-// Codex's set_permission_mode currently rejects unknown strings. Hide
-// the provider picker until the backend exposes a capability probe.
-const ENABLE_PROVIDER_PICKER = false;
+// Step 12 Stage 4 — flipped on. The picker is now the unified
+// `MultiProviderModelPicker` (provider rail + searchable model list)
+// that replaces the side-by-side `ProviderPicker + ModelPicker` pair.
+// Codex now ships proper `permission_modes` so the original
+// `set_permission_mode` concern is moot; OpenCode is federated through
+// `sub_provider`. The picker is the only entry point for provider
+// switching from inside an existing pane.
+const ENABLE_PROVIDER_PICKER = true;
 
 /** Step 8 Stage 7 — hard cap on staged attachments. Above this we
  *  toast and reject the next attach so prompts can't silently grow

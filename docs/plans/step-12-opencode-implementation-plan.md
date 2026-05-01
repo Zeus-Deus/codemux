@@ -2,15 +2,49 @@
 
 - Purpose: Concrete scoping deliverable answering nine GO/MODIFY/DEFER questions for adding OpenCode as a third chat provider in Codemux's GUI.
 - Audience: Decision-maker reviewing whether to commit to Step 12 now, modify the scope, or defer.
-- Authority: Pre-build planning checkpoint. No code in this stage.
-- Update when: A scoping fact below is wrong, or once a stage closes (move that stage's notes to a follow-up plan).
-- Read next: `docs/plans/step-12-opencode-research.md` for the reference-impl research backing this plan.
+- Authority: Pre-build planning checkpoint + post-shipping summary. The body below was the original scoping doc; the **Final State** header at the top reflects what actually shipped.
+- Update when: A scoping fact below is wrong, a deferred follow-up gets reactivated, or the multi-provider feature needs a re-scoping pass.
+- Read next: `docs/features/multi-provider-chat.md` for the current behaviour, `docs/plans/step-12-opencode-research.md` for the reference-impl research backing this plan, `docs/plans/step-12-ui-smoke-checklist.md` for the operator smoke.
 
-## TL;DR — recommendation
+## Final State (2026-05-02)
+
+**Status: SHIPPED. Stages 1-7 complete; Stage 5 (multi-instance) explicitly deferred to v2.**
+
+Multi-provider chat (Claude + Codex + OpenCode) is live. The original scoping body below remains as a historical record of what was considered and what was decided pre-build — the actual delivery diverged from the TL;DR's "defer" recommendation. Per the "Stages 1-3 only" alt path was rejected mid-build; instead the full Stages 1-4 + 6 + 7 path landed (Stage 5 multi-instance explicitly skipped).
+
+### What shipped
+
+| Stage | Status | Highlights |
+|---|---|---|
+| 1 | ✅ Stages 1-3 in commit `0dcf05b` | `ProviderKind::OpenCode` enum + match-arm exhaustiveness across registry/dispatcher/DB; `agent_provider/opencode/{discovery,client,capabilities}` modules; `ProviderInstanceId` shim; Tauri commands `opencode_check_availability` + `opencode_ping`. |
+| 2 | ✅ same commit | `OpenCodeServer` (`kill_on_drop`, generated 32-char `OPENCODE_SERVER_PASSWORD`, stdout-line ready detection) + singleton `OpenCodeServerManager` + `list_models()` against `GET /provider`. Live-verified against OpenCode 1.14.31 — 116 providers / 4,354 models harvested. |
+| 3 | ✅ same commit | `ChatModelInfo.sub_provider: Option<String>`; `harvest_opencode_capabilities` flattens upstream wire shape into chat-side `ChatModelInfo` with namespaced `${provider_id}/${model_id}` slugs and connected-only filter. `provider-capabilities-store` now has 3 slots + parallel `refreshAll` + exhaustive `selectCapabilities`. |
+| 4 | ✅ uncommitted at time of writing | `MultiProviderModelPicker` — 2-column popover (48px provider rail + searchable model list), search collapses provider grouping, federated subtitle line `OpenCode · {sub_provider}`, three empty states (no-match / OpenCode-not-installed / no-connected-providers). `ENABLE_PROVIDER_PICKER` flipped to `true`; Codex finally selectable in the GUI. |
+| 5 | ⏭️ DEFERRED to v2 | Multi-instance per provider (multiple Codex accounts, multiple OpenCode connections). `ProviderInstanceId` shim from Stage 1 keeps the lift small when v2 lands. |
+| 6 | ✅ uncommitted at time of writing | Favorites — zustand `persist` store (`codemux:picker-favorites:v1`), `${provider}::${modelId}` keys, hover-reveal star button with triple-stop click isolation, favorites bubble to the top of both rail-only and cross-provider search lists. |
+| 7 | ✅ this stage | Docs (this file + feature doc + UI smoke checklist), STATUS/PLAN updates, dead-code audit, OpenCode install-hint copy in the empty state. |
+
+### Cumulative test deltas across Step 12
+
+- Rust lib: **+29 tests** vs. pre-Step-12 (1093 → 1122). New tests are concentrated under `agent_provider::opencode::*` (server lifecycle, manager idempotency, client + flatten, capabilities harvest), `agent_provider::instance::*` (forward-compat shim), and one `state::state_impl` test pinning the all-three-providers serde round-trip.
+- Frontend Vitest: **+44 tests across 3 new files** vs. pre-Step-12 (1456 → 1500). Stage 3 added 8 (`provider-capabilities-store.test.ts`); Stage 4 added 20 (`MultiProviderModelPicker.test.tsx`); Stage 6 added 9 + 7 (`picker-favorites-store.test.ts` + `MultiProviderModelPicker.test.tsx` favorites suite).
+- Pre-existing flakes: two integration tests in `tests/codex_adapter.rs` continue to flake under cargo's parallel scheduler (`fake_codex_app_server` helper-binary build race); both pass cleanly in isolation or with `--test-threads=1`. Unrelated to Step 12.
+
+### Deferred follow-ups
+
+1. **v2 — Multi-instance per provider.** Multiple Codex accounts or multiple OpenCode connections collapsed under one rail entry today. `ProviderInstanceId` already exists; the wire format already serialises as a bare slug (`"claude"` / `"codex"` / `"opencode"`).
+2. **v2 — Picker keyboard shortcuts.** `Ctrl+1..9` collides with workspace switching. Slot-based jumps + a non-colliding namespace (`Cmd+Shift+1..N` or in-popover-only) need a deliberate keybinding decision.
+3. **Future cleanup — OpenFlow capabilities convergence.** OpenFlow's `list_models_for_tool` Tauri command keeps a hardcoded model registry separate from the chat-side capabilities harvest; tracked by a parity-by-comment dependency at `src-tauri/src/agent_provider/codex/capabilities.rs:33`. Convergence would let us drop the duplication, but it touches OpenFlow's CLI-launcher invariants and is not blocking anything today.
+
+---
+
+## TL;DR — original recommendation (pre-build, kept for history)
 
 **Defer Step 12 behind Step 11 (Codex MCP HTTP gateway) and Step 10.5 (project-scoped skills sync).** OpenCode integration is real engineering — three weeks-to-month elapsed, two new transport surfaces, a picker rewrite, plus credential UX — and the audience wanting "OpenCode in Codemux's chat GUI" overlaps heavily with users already comfortable in a terminal. Step 11 unblocks an existing user surface (Codex MCP); Step 10.5 unblocks paying-customer behavior (project-scoped sync). Step 12 broadens the funnel but doesn't unblock anyone today. Build it, but not next.
 
 If the scope is reduced to "Stages 1-3 only" (backend driver + live model harvest + sub_provider field, no picker rewrite, no per-instance config), this becomes a ~1-week feature that ships value much sooner — see §6 Stage 3.5 alt path.
+
+The recommendation above was overridden — the full picker rebuild landed alongside the backend work. See "Final State" at the top of this doc.
 
 ---
 

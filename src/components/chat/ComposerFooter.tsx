@@ -9,8 +9,8 @@ import type {
 } from "@/tauri/types";
 
 import { ModelPicker } from "./pickers/ModelPicker";
+import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
-import { ProviderPicker } from "./pickers/ProviderPicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
 
 interface Props {
@@ -108,19 +108,34 @@ export function ComposerFooter({
           </button>
         )}
 
-        {showProviderPicker && (
-          <ProviderPicker
-            value={provider}
-            onChange={onProviderChange}
+        {/* Step 12 Stage 4 — when the unified provider+model picker is
+            enabled (chat panes with `ENABLE_PROVIDER_PICKER`), render
+            the new `MultiProviderModelPicker` and skip the legacy
+            single-provider `ModelPicker`. The draft surface
+            (`DraftChatSurface`) still renders with `showProviderPicker
+            === false`, in which case we keep the legacy picker so a
+            user-without-an-active-session can pick a Claude model
+            without seeing a 3-provider rail they can't fully use yet. */}
+        {showProviderPicker ? (
+          <MultiProviderModelPicker
+            provider={provider}
+            model={model}
+            onProviderModelChange={(nextProvider, nextModel) => {
+              if (nextProvider !== provider) {
+                onProviderChange(nextProvider);
+              }
+              onModelChange(nextModel);
+            }}
+            disabled={controlsDisabled}
+          />
+        ) : (
+          <ModelPicker
+            provider={provider}
+            value={model}
+            onChange={onModelChange}
             disabled={controlsDisabled}
           />
         )}
-        <ModelPicker
-          provider={provider}
-          value={model}
-          onChange={onModelChange}
-          disabled={controlsDisabled}
-        />
         <ReasoningPicker
           model={activeModel}
           effortValue={effort}
