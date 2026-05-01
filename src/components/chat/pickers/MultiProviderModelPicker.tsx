@@ -93,6 +93,12 @@ interface ResolvedRow {
   provider: AgentChatProviderKind;
 }
 
+/** Pseudo-provider for the "favorites" rail entry. Renders all
+ *  favorited rows across drivers in one list. Kept as a string union
+ *  with `AgentChatProviderKind` so the rest of the rail logic stays
+ *  uniform. */
+type RailKey = AgentChatProviderKind | "favorites";
+
 export function MultiProviderModelPicker({
   provider,
   model,
@@ -100,8 +106,7 @@ export function MultiProviderModelPicker({
   disabled,
 }: Props) {
   const [open, setOpen] = useState(false);
-  const [railProvider, setRailProvider] =
-    useState<AgentChatProviderKind>(provider);
+  const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
 
   // Reset the rail + search to the active provider whenever the
@@ -111,7 +116,7 @@ export function MultiProviderModelPicker({
   // open.
   useEffect(() => {
     if (open) {
-      setRailProvider(provider);
+      setRailKey(provider);
       setQuery("");
     }
   }, [open, provider]);
@@ -146,19 +151,27 @@ export function MultiProviderModelPicker({
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
-    const base = !trimmed
-      ? rowsByProvider[railProvider] ?? []
-      : // Search collapses provider grouping — flatten all rows then
-        // filter. Order: claude, codex, opencode (rail order).
-        ALL_PROVIDERS.flatMap((p) => rowsByProvider[p.kind] ?? []).filter(
-          (row) => matchesQuery(row, trimmed),
-        );
+    const allRows = ALL_PROVIDERS.flatMap(
+      (p) => rowsByProvider[p.kind] ?? [],
+    );
+    const base = trimmed
+      ? // Search collapses both rail entries and provider grouping —
+        // flatten all rows then filter. Order: claude, codex, opencode
+        // (rail order). Favorites filter is implicit (favorited rows
+        // still appear if they match the query).
+        allRows.filter((row) => matchesQuery(row, trimmed))
+      : railKey === "favorites"
+        ? // Favorites tab: every starred row across drivers, in
+          // rail-order (claude → codex → opencode) so the layout
+          // stays predictable as the user adds/removes stars.
+          allRows.filter((row) =>
+            favoritesSet.has(pickerFavoriteKey(row.provider, row.model.id)),
+          )
+        : rowsByProvider[railKey] ?? [];
 
-    // Stage 6 — favorites bubble up to the top of the visible list
-    // (across all surfaces: rail-only AND search-collapsed). Within
-    // each group (favorited / not), preserve insertion order so the
-    // capability harvest's row order isn't reshuffled. `slice()`
-    // because `Array.sort` mutates and `rowsByProvider` is memoised.
+    // Favorites bubble to the top of provider-rail and search lists.
+    // On the favorites rail itself every row is already starred, so
+    // the partition is a no-op there — the sort still runs cheaply.
     return base.slice().sort((a, b) => {
       const aFav = favoritesSet.has(pickerFavoriteKey(a.provider, a.model.id));
       const bFav = favoritesSet.has(pickerFavoriteKey(b.provider, b.model.id));
@@ -166,7 +179,7 @@ export function MultiProviderModelPicker({
       if (!aFav && bFav) return 1;
       return 0;
     });
-  }, [query, railProvider, rowsByProvider, favoritesSet]);
+  }, [query, railKey, rowsByProvider, favoritesSet]);
 
   const selectedKey = `${provider}::${model ?? ""}`;
   const triggerLabel = useMemo(() => {
@@ -231,10 +244,11 @@ export function MultiProviderModelPicker({
         <div className="grid grid-cols-[48px_1fr] h-[400px] overflow-hidden">
           <ProviderRail
             providers={ALL_PROVIDERS}
-            selected={railProvider}
+            selected={railKey}
+            favoritesCount={favoritesArray.length}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
-            onSelect={(kind) => {
-              setRailProvider(kind);
+            onSelect={(next) => {
+              setRailKey(next);
               setQuery("");
             }}
           />
@@ -246,32 +260,36 @@ export function MultiProviderModelPicker({
                 onValueChange={setQuery}
                 className="h-9 text-xs"
               />
-              <CommandList className="max-h-none flex-1 overflow-y-auto">
+              {/* Override cmdk's default `no-scrollbar max-h-72` so the
+                  list fills the popover and shows a real scrollbar
+                  when models overflow (Claude has 5, Codex 4, but
+                  OpenCode federates ~150 connected-upstream models on
+                  a fully-configured machine — without a scrollbar
+                  half the list is unreachable). */}
+              <CommandList className="max-h-none flex-1 overflow-y-auto [&]:[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-muted-foreground/30 hover:[&::-webkit-scrollbar-thumb]:bg-muted-foreground/50">
                 <CommandEmpty>
                   <ModelListEmptyState
-                    railProvider={railProvider}
+                    railKey={railKey}
                     query={query}
-                    caps={
-                      railProvider === "claude"
-                        ? claudeCaps
-                        : railProvider === "codex"
-                        ? codexCaps
-                        : opencodeCaps
-                    }
-                    error={selectError(allCaps, railProvider)}
+                    caps={capsForRail(
+                      railKey,
+                      claudeCaps,
+                      codexCaps,
+                      opencodeCaps,
+                    )}
+                    error={errorForRail(railKey, allCaps)}
                   />
                 </CommandEmpty>
                 {visibleRows.length === 0 ? (
                   <LoadingFallback
-                    railProvider={railProvider}
-                    caps={
-                      railProvider === "claude"
-                        ? claudeCaps
-                        : railProvider === "codex"
-                        ? codexCaps
-                        : opencodeCaps
-                    }
-                    error={selectError(allCaps, railProvider)}
+                    railKey={railKey}
+                    caps={capsForRail(
+                      railKey,
+                      claudeCaps,
+                      codexCaps,
+                      opencodeCaps,
+                    )}
+                    error={errorForRail(railKey, allCaps)}
                     query={query}
                   />
                 ) : (
@@ -317,13 +335,15 @@ export function MultiProviderModelPicker({
 function ProviderRail({
   providers,
   selected,
+  favoritesCount,
   getCount,
   onSelect,
 }: {
   providers: ReadonlyArray<{ kind: AgentChatProviderKind; label: string }>;
-  selected: AgentChatProviderKind;
+  selected: RailKey;
+  favoritesCount: number;
   getCount: (kind: AgentChatProviderKind) => number;
-  onSelect: (kind: AgentChatProviderKind) => void;
+  onSelect: (next: RailKey) => void;
 }) {
   return (
     <TooltipProvider delayDuration={200}>
@@ -331,6 +351,53 @@ function ProviderRail({
         className="flex flex-col gap-1 border-r bg-muted/30 p-1"
         data-testid="multi-provider-rail"
       >
+        {/* Favorites pseudo-tab — sits above the driver entries with
+            a hairline separator. Click filters the right column to
+            every starred row across drivers. Hidden when the user has
+            zero favorites so we don't surface an empty tab on a
+            fresh install. */}
+        {favoritesCount > 0 ? (
+          <>
+            <div className="relative">
+              {selected === "favorites" && (
+                <span
+                  className="pointer-events-none absolute -right-1 top-1/2 z-10 h-5 w-0.5 -translate-y-1/2 rounded-l-full bg-primary"
+                  aria-hidden
+                />
+              )}
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() => onSelect("favorites")}
+                    data-testid="provider-rail-favorites"
+                    data-selected={selected === "favorites" || undefined}
+                    aria-label="Favorites"
+                    aria-pressed={selected === "favorites"}
+                    className={cn(
+                      "relative flex aspect-square w-full items-center justify-center rounded transition-colors",
+                      "hover:bg-muted",
+                      selected === "favorites" &&
+                        "bg-background text-foreground shadow-sm",
+                    )}
+                  >
+                    <Star
+                      className="h-5 w-5 shrink-0 text-amber-500"
+                      fill="currentColor"
+                    />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="right" sideOffset={8}>
+                  Favorites
+                  <span className="ml-2 text-muted-foreground">
+                    {favoritesCount}
+                  </span>
+                </TooltipContent>
+              </Tooltip>
+            </div>
+            <div className="my-1 border-t border-border/60" aria-hidden />
+          </>
+        ) : null}
         {providers.map((p) => {
           const isSelected = selected === p.kind;
           const count = getCount(p.kind);
@@ -380,6 +447,36 @@ function ProviderRail({
   );
 }
 
+/** Resolve the right-column caps bundle for a rail key. The
+ *  `favorites` rail is cross-driver, so it has no single
+ *  capabilities source — return `null` and let the empty-state path
+ *  short-circuit when there are zero favorites. */
+function capsForRail(
+  rail: RailKey,
+  claudeCaps: ProviderChatCapabilities | null,
+  codexCaps: ProviderChatCapabilities | null,
+  opencodeCaps: ProviderChatCapabilities | null,
+): ProviderChatCapabilities | null {
+  switch (rail) {
+    case "claude":
+      return claudeCaps;
+    case "codex":
+      return codexCaps;
+    case "opencode":
+      return opencodeCaps;
+    case "favorites":
+      return null;
+  }
+}
+
+function errorForRail(
+  rail: RailKey,
+  state: Parameters<typeof selectError>[0],
+): string | null {
+  if (rail === "favorites") return null;
+  return selectError(state, rail);
+}
+
 function ModelRow({
   row,
   isActive,
@@ -422,11 +519,6 @@ function ModelRow({
           <span className="truncate">{subtitle}</span>
         </div>
       </div>
-      {model.context_window_options[0]?.label ? (
-        <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
-          {model.context_window_options[0].label}
-        </span>
-      ) : null}
       <button
         type="button"
         onClick={(e) => {
@@ -463,12 +555,12 @@ function ModelRow({
 }
 
 function ModelListEmptyState({
-  railProvider,
+  railKey,
   query,
   caps,
   error,
 }: {
-  railProvider: AgentChatProviderKind;
+  railKey: RailKey;
   query: string;
   caps: ProviderChatCapabilities | null;
   error: string | null;
@@ -482,7 +574,20 @@ function ModelListEmptyState({
       </div>
     );
   }
-  if (railProvider === "opencode") {
+  if (railKey === "favorites") {
+    // The favorites rail is only rendered when `favoritesCount > 0`,
+    // so an empty state here means the user just removed their last
+    // favorite while the popover was open. Show a friendly cue.
+    return (
+      <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+        <p className="font-medium text-foreground">No favorites yet</p>
+        <p className="mt-1">
+          Click the star on any model row to favorite it.
+        </p>
+      </div>
+    );
+  }
+  if (railKey === "opencode") {
     if (error === "opencode_not_installed") {
       return (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
@@ -538,12 +643,12 @@ function ModelListEmptyState({
 }
 
 function LoadingFallback({
-  railProvider,
+  railKey,
   caps,
   error,
   query,
 }: {
-  railProvider: AgentChatProviderKind;
+  railKey: RailKey;
   caps: ProviderChatCapabilities | null;
   error: string | null;
   query: string;
@@ -553,6 +658,12 @@ function LoadingFallback({
   // that by deferring to `ModelListEmptyState` for those cases and
   // only render skeletons for the genuine "still loading" branch.
   const trimmed = query.trim();
+  // The favorites pseudo-rail has no caps to load — defer to the
+  // empty-state path entirely (which renders "No favorites yet" or
+  // the search-no-match message above).
+  if (railKey === "favorites") {
+    return null;
+  }
   const hasEmptyState =
     trimmed.length > 0 ||
     error !== null ||
@@ -564,7 +675,7 @@ function LoadingFallback({
   return (
     <div
       className="space-y-2 px-3 py-2"
-      data-testid={`multi-provider-loading-${railProvider}`}
+      data-testid={`multi-provider-loading-${railKey}`}
     >
       {Array.from({ length: 4 }).map((_, i) => (
         <div key={i} className="flex items-center gap-2">

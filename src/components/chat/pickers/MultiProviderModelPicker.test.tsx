@@ -582,6 +582,46 @@ describe("MultiProviderModelPicker — favorites", () => {
     ).toBe(false);
   });
 
+  it("favorites tab is hidden when no favorites are set", async () => {
+    const user = userEvent.setup();
+    expect(usePickerFavorites.getState().favorites).toEqual([]);
+    renderPicker();
+    await openPicker(user);
+    expect(
+      screen.queryByTestId("provider-rail-favorites"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("favorites tab appears once a favorite exists and shows cross-driver favorited rows", async () => {
+    const user = userEvent.setup();
+    // Cross-driver: one Claude favorite + one OpenCode favorite. The
+    // favorites tab should bundle both regardless of which rail is
+    // active.
+    usePickerFavorites
+      .getState()
+      .toggle("claude", "claude-haiku-4-5");
+    usePickerFavorites
+      .getState()
+      .toggle("opencode", "openrouter/x-ai/grok-2");
+    renderPicker({ provider: "codex", model: "gpt-5.4" });
+    await openPicker(user);
+
+    // Tab is now rendered.
+    const favTab = screen.getByTestId("provider-rail-favorites");
+    expect(favTab).toBeInTheDocument();
+
+    await user.click(favTab);
+    await waitFor(() => {
+      const rows = screen.getAllByTestId("multi-provider-model-row");
+      const labels = rows.map((r) => r.textContent ?? "");
+      // Both favorited rows surface; non-favorited rows do not.
+      expect(labels.some((l) => l.includes("Claude Haiku 4.5"))).toBe(true);
+      expect(labels.some((l) => l.includes("Grok 2"))).toBe(true);
+      expect(labels.some((l) => l.includes("GPT-5.4 (Codex)"))).toBe(false);
+      expect(labels.some((l) => l.includes("Claude Opus 4.7"))).toBe(false);
+    });
+  });
+
   it("empty-favorites default does not break rendering", async () => {
     const user = userEvent.setup();
     // Confidence check: with zero favorites in the store, every
