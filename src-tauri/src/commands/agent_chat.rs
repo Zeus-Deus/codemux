@@ -66,10 +66,17 @@ pub fn feature_flag_on(store: &ObservabilityStore) -> Result<(), String> {
 /// whichever providers are reachable at startup and skip the rest.
 /// Absence of an entry is a recoverable error rather than a crash —
 /// the Tauri commands surface it as a provider-not-configured string.
+///
+/// The OpenCode slot is reserved for Step 12 — Stage 1 lands the
+/// schema seam and discovery surface but does not inject a runtime
+/// adapter, so `get(OpenCode)` always returns `None` and commands
+/// routing to it surface `provider_not_configured` exactly like the
+/// existing Claude/Codex paths do when their setup fails.
 #[derive(Default)]
 pub struct ProviderRegistry {
     claude: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
     codex: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
+    opencode: tokio::sync::RwLock<Option<Arc<dyn AgentProvider>>>,
 }
 
 impl ProviderRegistry {
@@ -92,6 +99,13 @@ impl ProviderRegistry {
         *self.codex.write().await = Some(provider);
     }
 
+    /// Inject the OpenCode provider. Reserved for a later stage; the
+    /// Stage 1 scaffold never calls this so the slot stays `None`
+    /// in production.
+    pub async fn set_opencode(&self, provider: Arc<dyn AgentProvider>) {
+        *self.opencode.write().await = Some(provider);
+    }
+
     /// Look up the provider for a given kind. Returns `None` when no
     /// provider has been registered — commands must return a clean
     /// error in that case instead of panicking.
@@ -99,6 +113,7 @@ impl ProviderRegistry {
         match kind {
             ProviderKind::Claude => self.claude.read().await.clone(),
             ProviderKind::Codex => self.codex.read().await.clone(),
+            ProviderKind::OpenCode => self.opencode.read().await.clone(),
         }
     }
 
@@ -111,6 +126,9 @@ impl ProviderRegistry {
         }
         if let Some(p) = self.codex.read().await.clone() {
             out.push((ProviderKind::Codex, p));
+        }
+        if let Some(p) = self.opencode.read().await.clone() {
+            out.push((ProviderKind::OpenCode, p));
         }
         out
     }
@@ -309,6 +327,7 @@ pub async fn agent_chat_start_session(
         let provider_str = match provider {
             ProviderKind::Claude => "claude",
             ProviderKind::Codex => "codex",
+            ProviderKind::OpenCode => "opencode",
         };
         if let Err(error) = db.upsert_agent_chat_session(
             &session.thread_id.0,
@@ -470,11 +489,18 @@ pub async fn agent_chat_set_permission_mode(
 
 /// Return the chat-side capabilities bundle for a provider.
 ///
-/// MVP ships fallback (hand-maintained) data only. Live harvesting from
-/// the Claude SDK's `initializationResult()` and from Codex's
-/// `model/list` RPC is deferred — once wired the returned snapshot will
-/// be a merge of live models + hand-maintained extras (see
+/// Claude and Codex ship hand-maintained fallback data — live SDK /
+/// `model/list` harvest is a follow-up that would merge live models
+/// with the hand-maintained extras (see
 /// `agent_provider/claude/capabilities.rs`).
+///
+/// OpenCode is the live arm: Stage 3 wires
+/// [`harvest_opencode_capabilities`](crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities)
+/// through `OpenCodeServerManager::ensure_running` (lazy spawn,
+/// idempotent) + `OpenCodeClient::list_models`. Failures fall back
+/// to the empty placeholder bundle and the error rides on the
+/// frontend store's `opencodeError` slot — Stage 6 surfaces it as a
+/// "configure OpenCode" hint.
 ///
 /// Not gated on the `enable_agent_chat` flag: the frontend's
 /// capabilities store refreshes at app boot regardless, so the picker
@@ -483,6 +509,10 @@ pub async fn agent_chat_set_permission_mode(
 #[tauri::command]
 pub async fn list_chat_provider_capabilities(
     provider: ProviderKind,
+    opencode_manager: tauri::State<
+        '_,
+        crate::agent_provider::opencode::OpenCodeServerManager,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     match provider {
         ProviderKind::Claude => Ok(
@@ -491,6 +521,12 @@ pub async fn list_chat_provider_capabilities(
         ProviderKind::Codex => Ok(
             crate::agent_provider::codex::capabilities::codex_fallback_capabilities(),
         ),
+        ProviderKind::OpenCode => {
+            crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
+                opencode_manager.inner(),
+            )
+            .await
+        }
     }
 }
 

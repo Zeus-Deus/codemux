@@ -25,6 +25,7 @@ function makeModel(overrides: Partial<ChatModelInfo>): ChatModelInfo {
     supports_thinking_toggle: false,
     supports_fast_mode: false,
     supports_images: false,
+    sub_provider: null,
     ...overrides,
   };
 }

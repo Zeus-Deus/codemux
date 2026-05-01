@@ -147,6 +147,12 @@ pub fn run() {
         .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        // Step 12 Stage 2 — singleton supervisor for the lazily
+        // spawned `opencode serve` child. `ensure_running()` is the
+        // entry point used by `opencode_list_models`; the server is
+        // not spawned until the first call. Shutting Codemux down
+        // drops this state, which `kill_on_drop`-kills the child.
+        .manage(crate::agent_provider::opencode::OpenCodeServerManager::new())
         // MCP runtime registry. `agent_chat_start_session` reads this
         // via `app.state::<McpRegistry>()` to lazily prime servers
         // before launching a chat, and the `commands::mcp::*` Tauri
@@ -825,6 +831,9 @@ pub fn run() {
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::opencode_check_availability,
+            commands::opencode_ping,
+            commands::opencode_list_models,
             commands::update_permission_policy,
             commands::list_tool_permissions,
             commands::remove_tool_permission,

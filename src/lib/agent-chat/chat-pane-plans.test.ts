@@ -89,6 +89,7 @@ const OPUS_4_7: ChatModelInfo = {
   supports_thinking_toggle: false,
   supports_fast_mode: false,
   supports_images: true,
+  sub_provider: null,
 };
 
 const HAIKU: ChatModelInfo = {
@@ -112,6 +113,7 @@ const GPT_54: ChatModelInfo = {
   supports_thinking_toggle: false,
   supports_fast_mode: false,
   supports_images: true,
+  sub_provider: null,
 };
 
 // ─── planEffortChange ───

@@ -557,7 +557,56 @@ export interface TabSnapshot {
   icon: string | null;
 }
 
-export type AgentChatProviderKind = "claude" | "codex";
+export type AgentChatProviderKind = "claude" | "codex" | "opencode";
+
+/** Step 12 Stage 1 — driver-equals-instance shim (`"claude"` /
+ *  `"codex"` / `"opencode"`). v2 lifts this to a richer
+ *  `(driver, instance)` map; today it round-trips with
+ *  `AgentChatProviderKind` so any payload carrying either field
+ *  decodes interchangeably. */
+export type ProviderInstanceId = AgentChatProviderKind;
+
+/** Step 12 Stage 1 — diagnostic snapshot returned by
+ *  `opencode_check_availability`. Mirrors the Rust struct in
+ *  `src-tauri/src/agent_provider/opencode/discovery.rs` field for
+ *  field. The picker surface in later stages reads this verbatim;
+ *  Stage 1 only wires the wrapper so consumers can land without
+ *  schema churn when the live integration ships. */
+export interface OpenCodeAvailability {
+  installed: boolean;
+  binary_path: string | null;
+  version: string | null;
+  server_running: boolean;
+  server_url: string | null;
+}
+
+/** Step 12 Stage 2 — one model entry as returned by
+ *  `opencode_list_models`. Mirrors the Rust `OpenCodeModel`
+ *  struct in `src-tauri/src/agent_provider/opencode/client.rs`
+ *  and is itself a flattened view over OpenCode's `/provider`
+ *  envelope (the wire-format `Model` carries far more — cost,
+ *  capabilities, release date — that Codemux does not need
+ *  yet). Stage 3 maps each entry into `ChatModelInfo`. */
+export interface OpenCodeModel {
+  id: string;
+  name: string;
+  description: string | null;
+  variants: string[];
+  context_window: number | null;
+}
+
+/** Step 12 Stage 2 — one provider entry from
+ *  `opencode_list_models`. Each entry is a flattened view over
+ *  one `Provider` block from the `GET /provider` response, with
+ *  `connected` derived from the top-level `connected: string[]`
+ *  array. The picker rebuild (Stage 4) treats this list as the
+ *  source of truth for the OpenCode model menu. */
+export interface OpenCodeProviderEntry {
+  id: string;
+  name: string;
+  connected: boolean;
+  models: Record<string, OpenCodeModel>;
+}
 
 // ── Chat-side provider capabilities ───────────────────────────────────
 
@@ -584,6 +633,13 @@ export interface ChatModelInfo {
    *  Drives the `+ → Image…` enable state and whether the composer's
    *  paste/drop handlers stage attachments at all. */
   supports_images: boolean;
+  /** Step 12 Stage 3 — for federated providers (OpenCode), the
+   *  upstream provider id this model belongs to (e.g. `"openai"`,
+   *  `"anthropic"`, `"openrouter"`). `null` for direct providers
+   *  (Claude, Codex) where the driver IS the provider. Drives the
+   *  picker's grouping rail and the secondary label rendered below
+   *  the model name. */
+  sub_provider: string | null;
 }
 
 export interface PermissionModeOption {

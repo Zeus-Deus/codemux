@@ -6,8 +6,8 @@
 //! keep a hand-maintained per-model map and, when live data arrives,
 //! merge the SDK's model list with our hand-maintained extras by id.
 //!
-//! Mirrors T3Code's `BUILT_IN_MODELS` table
-//! (`apps/server/src/provider/Layers/ClaudeProvider.ts:48-141`).
+//! Mirrors a reference multi-provider client's `BUILT_IN_MODELS`
+//! table (`apps/server/src/provider/Layers/ClaudeProvider.ts:48-141`).
 
 use std::collections::HashMap;
 
@@ -74,6 +74,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: false,
             supports_images: true,
+            sub_provider: None,
         },
         // Opus 4.6 — default effort is high, supports fast mode + ultrathink + 1M.
         ChatModelInfo {
@@ -93,6 +94,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: true,
             supports_images: true,
+            sub_provider: None,
         },
         // Opus 4.5 — no ultrathink, no 1M context.
         ChatModelInfo {
@@ -112,6 +114,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: true,
             supports_images: true,
+            sub_provider: None,
         },
         // Sonnet 4.6 — narrower effort range, supports ultrathink + 1M.
         ChatModelInfo {
@@ -126,6 +129,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: false,
             supports_images: true,
+            sub_provider: None,
         },
         // Haiku 4.5 — no effort, no context-window picker. Has a thinking
         // toggle we don't render in MVP.
@@ -141,6 +145,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: true,
             supports_fast_mode: false,
             supports_images: true,
+            sub_provider: None,
         },
     ]
 }
@@ -183,9 +188,10 @@ pub fn claude_fallback_capabilities() -> ProviderChatCapabilities {
     }
 }
 
-/// Apply T3Code's `resolveClaudeApiModelId` trick: when context window is
-/// `"1m"`, the Anthropic API expects the model id to carry a `[1m]`
-/// bracket suffix. Any other value (or `None`) returns the id unchanged.
+/// Apply the reference impl's `resolveClaudeApiModelId` trick: when
+/// the context window is `"1m"`, the Anthropic API expects the model
+/// id to carry a `[1m]` bracket suffix. Any other value (or `None`)
+/// returns the id unchanged.
 pub fn resolve_claude_api_model_id(
     model_id: &str,
     context_window: Option<&str>,

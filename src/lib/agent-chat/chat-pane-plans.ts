@@ -78,7 +78,7 @@ export function planEffortChange(
     );
     // `applyClaudePromptEffortPrefix` returns empty for an empty
     // input. For an empty composer we want to seed the prefix so the
-    // user sees immediate feedback (T3Code does this too).
+    // user sees immediate feedback.
     const nextDraft = prepended.length > 0 ? prepended : ULTRATHINK_PROMPT_PREFIX;
     return {
       updateDraft: { kind: "prepend", nextDraft },

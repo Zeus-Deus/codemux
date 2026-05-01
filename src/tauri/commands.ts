@@ -1,7 +1,12 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 
 export { Channel };
-import type { AgentChatProviderKind, ProviderChatCapabilities } from "./types";
+import type {
+  AgentChatProviderKind,
+  OpenCodeAvailability,
+  OpenCodeProviderEntry,
+  ProviderChatCapabilities,
+} from "./types";
 import type { ApprovalDecision } from "./events";
 import type {
   UserSettings,
@@ -1229,6 +1234,65 @@ export const agentChatDeleteSession = (threadId: string) =>
  */
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
+
+// ── OpenCode (Step 12 Stage 1) ──
+//
+// Wrappers for the discovery + ping commands that land alongside the
+// `ProviderKind::OpenCode` enum variant. Stage 1 has no UI consumers
+// yet — the picker rebuild lives in Stage 4 — but the typed surface
+// is locked here so future callers don't depend on stringly-typed
+// `invoke()`s spread across the codebase. Stage 2 adds a sibling
+// `opencodeListModels` wrapper here without changing this section's
+// shape.
+
+/** Probe whether OpenCode is usable on this machine.
+ *
+ *  Pass `serverUrl` only when there is an actual URL worth probing —
+ *  app boot should pass `null`/omit so the discovery layer skips the
+ *  HTTP round-trip. The settings panel (later stage) will pass a
+ *  candidate URL so the user can validate "is this endpoint
+ *  reachable" before saving the change. */
+export const opencodeCheckAvailability = (
+  serverUrl: string | null = null,
+) =>
+  invoke<OpenCodeAvailability>("opencode_check_availability", {
+    serverUrl,
+  });
+
+/** Round-trip a `GET /` against `baseUrl` and report success.
+ *
+ *  Resolves on any HTTP response (including 401/403 — the goal is
+ *  reachability, not auth). Rejects with a stable string code:
+ *  `"connect_failed"`, `"request_timed_out"`, `"http_status_<code>"`,
+ *  or `"request_error: ..."` for everything else. `serverPassword`
+ *  is forwarded as the HTTP Basic password (username is always
+ *  `"opencode"` — see `opencodeRuntime.ts:499` in the reference
+ *  clone). Pass `null` for the no-password local-loopback case. */
+export const opencodePing = (
+  baseUrl: string,
+  serverPassword: string | null = null,
+) =>
+  invoke<void>("opencode_ping", { baseUrl, serverPassword });
+
+/** Step 12 Stage 2 — fetch the running OpenCode server's full
+ *  provider catalogue. The Rust side spawns `opencode serve`
+ *  lazily on the first call; the resulting child stays alive
+ *  for the rest of the Codemux session.
+ *
+ *  Resolves to a flat list of providers; each entry's `models`
+ *  map is the per-provider `Record<modelId, OpenCodeModel>`
+ *  view. On a fully-populated dev box this returns ~116
+ *  providers / ~4,354 models — Stage 4's picker is responsible
+ *  for filtering down to the connected subset.
+ *
+ *  Rejects with the same stable string vocabulary as
+ *  `opencodePing`, plus `"opencode_not_installed"` when the
+ *  binary can't be located, `"spawn_failed: …"` /
+ *  `"ready_banner_missing"` / `"ready_timeout_after_…"` when
+ *  the server fails to come up, and `"parse_error: …"` when
+ *  the response payload doesn't decode. */
+export const opencodeListModels = () =>
+  invoke<OpenCodeProviderEntry[]>("opencode_list_models");
 
 // ── Tool permissions ──
 

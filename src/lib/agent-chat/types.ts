@@ -9,8 +9,9 @@ export type ChatItemId = string;
 /**
  * Every ChatViewItem carries a monotonic `seq`. The render layer sorts
  * by `seq` so message order is a property of the data, not of React
- * reconciliation or store-update timing. Mimics T3Code's pattern where
- * each activity has a `sequence: number` (apps/web/src/store.ts:838).
+ * reconciliation or store-update timing. Mirrors a reference
+ * multi-provider client where each activity has a `sequence: number`
+ * (apps/web/src/store.ts:838).
  *
  * Assigned at insert time from the thread's `nextSeq` counter. Mutating
  * an existing item (appending delta text, attaching tool result,

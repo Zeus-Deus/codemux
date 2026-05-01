@@ -147,17 +147,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
   const [starting, setStarting] = useState(false);
   const [restarting, setRestarting] = useState(false);
-  // Optimistic in-flight flag mirroring T3Code's `isSendBusy`
-  // (ChatView.tsx:406). Set synchronously on submit so the button
-  // disables BEFORE the backend's Running event round-trips.
+  // Optimistic in-flight flag mirroring the reference impl's
+  // `isSendBusy` (ChatView.tsx:406). Set synchronously on submit so
+  // the button disables BEFORE the backend's Running event
+  // round-trips.
   //
   // NOTE: `isSending` is useState (drives the render), but rapid-fire
   // Enter presses in the SAME JS tick don't see the updated state —
-  // the `useCallback` closure captured the pre-set snapshot. T3Code
-  // pairs the state with a `sendInFlightRef.current` synchronous
-  // guard (ChatView.tsx:2458) for exactly this reason: refs mutate
-  // synchronously, so the second call within the same tick sees the
-  // flag the first one just set. We do the same.
+  // the `useCallback` closure captured the pre-set snapshot. The
+  // reference impl pairs the state with a `sendInFlightRef.current`
+  // synchronous guard (ChatView.tsx:2458) for exactly this reason:
+  // refs mutate synchronously, so the second call within the same
+  // tick sees the flag the first one just set. We do the same.
   const [isSending, setIsSending] = useState(false);
   const sendInFlightRef = useRef(false);
 
@@ -1181,12 +1182,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [isSending, streaming, activeTurnId]);
 
-  // T3Code-aligned interrupt: the SDK's `query.interrupt()` causes its
+  // Interrupt mechanic: the SDK's `query.interrupt()` causes its
   // async iterator to exit. The session is functionally dead after
   // that (ClaudeAdapter.ts:2363 calls `stopSessionInternal`
-  // unconditionally). T3Code's next `sendTurn` creates a brand-new
-  // SDK query transparently via `ensureSessionForThread`. Our Rust
-  // adapter has no equivalent auto-recreate, so we do it proactively:
+  // unconditionally). The reference impl's next `sendTurn` creates
+  // a brand-new SDK query transparently via
+  // `ensureSessionForThread`. Our Rust adapter has no equivalent
+  // auto-recreate, so we do it proactively:
   // interrupt for the immediate turn abort, then stop + start the
   // session so subsequent turns land on a live SDK query. Transcript
   // and picker state persist via `migrateThreadId`.
@@ -1784,8 +1786,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   })();
 
   // AskUserQuestion prompts render as a composer-attached panel
-  // (t3code / Claude.ai pattern) rather than inline in the transcript.
-  // Only the first pending user-input request surfaces; MessageList
+  // (one-question-per-card pattern, similar to Claude.ai) rather
+  // than inline in the transcript. Only the first pending
+  // user-input request surfaces; MessageList
   // reduces user-input items to a tiny marker so the transcript
   // doesn't duplicate the prompt.
   const pendingUserInput = useMemo<ChatViewItem | null>(() => {

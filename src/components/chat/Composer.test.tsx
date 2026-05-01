@@ -356,6 +356,7 @@ describe("Composer", () => {
       supports_thinking_toggle: false,
       supports_fast_mode: false,
       supports_images: true,
+      sub_provider: null,
     };
 
     it("renders ReasoningPicker when activeModel is populated (not null)", () => {

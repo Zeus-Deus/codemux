@@ -31,6 +31,7 @@ const OPUS_4_7: ChatModelInfo = {
   supports_thinking_toggle: false,
   supports_fast_mode: false,
   supports_images: true,
+  sub_provider: null,
 };
 
 // Haiku — neither axis. Picker should hide entirely.

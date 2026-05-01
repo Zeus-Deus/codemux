@@ -15,7 +15,7 @@ import type {
 } from "@/tauri/events";
 
 /**
- * T3Code-aligned default: new threads launch in `bypassPermissions`
+ * Default for new threads: launch in `bypassPermissions`
  * (Full access). Users who want stricter prompting pick it in the
  * footer picker; a mode change triggers a silent session restart.
  */

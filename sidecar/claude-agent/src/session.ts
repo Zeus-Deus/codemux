@@ -127,7 +127,8 @@ export function resetQueryFactoryForTests(): void {
 // ---------------------------------------------------------------------------
 
 /** Prepend "Ultrathink:\n" to `text` when `effort === "ultrathink"`,
- *  idempotently. Port of T3Code's `applyClaudePromptEffortPrefix`
+ *  idempotently. Port of `applyClaudePromptEffortPrefix` from a
+ *  reference multi-provider client
  *  (packages/shared/src/model.ts:285). The canonical prepend lives
  *  client-side; this copy exists as a defensive belt-and-braces layer
  *  in case a caller bypasses the client and writes the effort field
@@ -234,8 +235,9 @@ export class ClaudeSession {
   /** SDK-assigned session id, observed from the first incoming SDK
    *  message that carries `session_id`. Forwarded to the Rust side
    *  as a `sdk-session-id` notification so restarts can resume from
-   *  this session. See T3Code's `context.resumeSessionId = message
-   *  .session_id` pattern (ClaudeAdapter.ts:1255). */
+   *  this session. The reference impl uses the same
+   *  `context.resumeSessionId = message.session_id` pattern
+   *  (ClaudeAdapter.ts:1255). */
   private sdkSessionId: string | null = null;
   /** Session-level effort, captured at start. Used by `sendTurn` to
    *  apply the ultrathink prompt-prepend defensively. The canonical

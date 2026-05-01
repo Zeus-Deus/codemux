@@ -1,8 +1,9 @@
 import type { ChatModelInfo } from "@/tauri/types";
 
 /**
- * Resolvers that mirror T3Code's `shared/src/model.ts` — keep a raw
- * effort / context-window value only when the active model supports it,
+ * Resolvers that mirror a reference multi-provider client's
+ * `shared/src/model.ts` — keep a raw effort / context-window value
+ * only when the active model supports it,
  * otherwise fall back to the model default.
  *
  * These are the primitives that enforce the compatibility rule: the UI
@@ -96,8 +97,9 @@ export function resolveContextWindow(
 }
 
 /**
- * Apply T3Code's `resolveClaudeApiModelId` trick client-side: when the
- * user picked `"1m"`, Anthropic expects the model id to carry the
+ * Apply the reference impl's `resolveClaudeApiModelId` trick
+ * client-side: when the user picked `"1m"`, Anthropic expects the
+ * model id to carry the
  * `[1m]` bracket suffix. Used by the frontend when constructing
  * `StartSessionInput` payloads for Claude — the Rust adapter also
  * applies the same mutation as a defense in depth.

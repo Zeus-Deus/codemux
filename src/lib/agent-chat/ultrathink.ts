@@ -1,7 +1,8 @@
 /**
  * Ultrathink is a Claude-only "6th effort level" implemented as a
- * prompt prefix rather than an SDK parameter. T3Code's mechanism,
- * ported verbatim — see their `shared/src/model.ts:173-300`.
+ * prompt prefix rather than an SDK parameter. Mechanism ported
+ * verbatim from a reference multi-provider client — see
+ * `shared/src/model.ts:173-300`.
  *
  * Three layers of defense (client picker, client send-path, sidecar
  * on-turn) all call `applyClaudePromptEffortPrefix`. Idempotency makes
@@ -47,7 +48,7 @@ export function stripClaudeUltrathinkPrefix(text: string): string {
 /**
  * Detect the "ultrathink in body text" state: the user typed the word
  * ultrathink outside the prefix itself. While in this state the effort
- * picker locks — T3Code shows a "Remove it to change effort" hint.
+ * picker locks and surfaces a "Remove it to change effort" hint.
  */
 export function hasUltrathinkInBodyText(
   text: string | null | undefined,

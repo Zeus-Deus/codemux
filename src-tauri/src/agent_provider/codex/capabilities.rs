@@ -2,9 +2,10 @@
 //!
 //! MVP ships fallback data only. Codex's `codex app-server` exposes a
 //! `model/list` RPC that reports each model's `supportedReasoningEfforts`
-//! (T3Code calls it at startup per their `CodexProvider.ts:183-199`) —
-//! wiring that up is deferred to a follow-up and would replace the
-//! fallback at runtime via the same command surface.
+//! (a reference multi-provider client calls it at startup per its
+//! `CodexProvider.ts:183-199`) — wiring that up is deferred to a
+//! follow-up and would replace the fallback at runtime via the same
+//! command surface.
 
 use std::collections::HashMap;
 
@@ -29,9 +30,9 @@ fn codex_effort_label_map() -> HashMap<String, String> {
 }
 
 /// Hardcoded Codex model list. Keep in rough parity with
-/// `src-tauri/src/commands/openflow.rs::codex_default_models` and
-/// T3Code's `packages/contracts/src/model.ts` roster — the canonical
-/// GPT-5 family plus `codex-mini-latest`.
+/// `src-tauri/src/commands/openflow.rs::codex_default_models` and the
+/// reference impl's `packages/contracts/src/model.ts` roster — the
+/// canonical GPT-5 family plus `codex-mini-latest`.
 fn models() -> Vec<ChatModelInfo> {
     vec![
         ChatModelInfo {
@@ -52,6 +53,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: true,
             supports_images: true,
+            sub_provider: None,
         },
         ChatModelInfo {
             id: "gpt-5.4-mini".into(),
@@ -65,6 +67,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: true,
             supports_images: true,
+            sub_provider: None,
         },
         ChatModelInfo {
             id: "gpt-5.3-codex".into(),
@@ -78,6 +81,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_thinking_toggle: false,
             supports_fast_mode: false,
             supports_images: true,
+            sub_provider: None,
         },
         ChatModelInfo {
             id: "codex-mini-latest".into(),
@@ -94,6 +98,7 @@ fn models() -> Vec<ChatModelInfo> {
             // user accidentally enabling images sees a disabled chip
             // rather than a 400 from the API.
             supports_images: false,
+            sub_provider: None,
         },
     ]
 }
@@ -101,8 +106,9 @@ fn models() -> Vec<ChatModelInfo> {
 /// Codex sandbox-policy names used as `permission_mode` values. The
 /// Codex CLI / RPC expose three sandbox policies (`read-only`,
 /// `workspace-write`, `danger-full-access`) paired with approval
-/// policies (`untrusted`, `on-request`, `never`). T3Code treats the
-/// pair as a single logical "runtime mode"
+/// policies (`untrusted`, `on-request`, `never`). A reference
+/// multi-provider client treats the pair as a single logical
+/// "runtime mode"
 /// (`apps/server/src/provider/Layers/CodexSessionRuntime.ts:237-258`);
 /// we follow the same approach. The Rust Codex adapter translates the
 /// mode to both `approvalPolicy` + `sandbox` / `sandboxPolicy` on the

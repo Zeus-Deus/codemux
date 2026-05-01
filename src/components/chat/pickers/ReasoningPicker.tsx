@@ -64,7 +64,7 @@ function effortDescription(id: string): string {
  * Combined Effort + Context Window picker.
  *
  * Replaces the separate `EffortPicker` and `ContextWindowPicker` that
- * used to render as two adjacent pills. T3Code-style merge: one pill
+ * used to render as two adjacent pills. Merged surface: one pill
  * shows "Effort · Context", one dropdown has both sections.
  *
  * Null-slice fallback (Option C of the Stage C follow-up): when the

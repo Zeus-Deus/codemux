@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 /// The set of CLI-backed coding agents the chat runtime can drive.
 ///
-/// Serialized as lowercase strings (`"claude"`, `"codex"`) so values round-trip
-/// cleanly through JSON settings and IPC surfaces.
+/// Serialized as lowercase strings (`"claude"`, `"codex"`, `"opencode"`) so
+/// values round-trip cleanly through JSON settings and IPC surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
@@ -21,6 +21,10 @@ pub enum ProviderKind {
     Claude,
     /// Codex via the `codex app-server` JSON-RPC binary.
     Codex,
+    /// OpenCode via the `opencode` HTTP server. Step 12 Stage 1 scaffold —
+    /// the runtime adapter is not implemented yet and command dispatch
+    /// returns a placeholder error.
+    OpenCode,
 }
 
 /// Capabilities a provider declares statically so the UI can enable or hide
@@ -235,6 +239,14 @@ pub struct ChatModelInfo {
     /// to a 400-from-the-API.
     #[serde(default)]
     pub supports_images: bool,
+    /// Step 12 Stage 3 — for federated providers (OpenCode), the
+    /// upstream provider id this model belongs to (e.g. `"openai"`,
+    /// `"anthropic"`, `"openrouter"`). `None` for direct providers
+    /// (Claude, Codex) where the driver IS the provider. Drives the
+    /// picker's grouping rail and the secondary label rendered
+    /// below the model name.
+    #[serde(default)]
+    pub sub_provider: Option<String>,
 }
 
 /// Bundle of chat-side capability data for a single provider. Returned by

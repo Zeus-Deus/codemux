@@ -503,7 +503,8 @@ impl Drop for CodexSession {
 
 /// Translate Codemux's logical Codex permission-mode string into the
 /// `(approval_policy, sandbox)` pair the Codex RPC expects on
-/// `thread/start` / `thread/resume`. Mirrors T3Code's table
+/// `thread/start` / `thread/resume`. Mirrors a reference
+/// multi-provider client's table
 /// (`apps/server/src/provider/Layers/CodexSessionRuntime.ts:237-258`).
 ///
 /// Returns `None` when no mode is set — callers skip the RPC fields

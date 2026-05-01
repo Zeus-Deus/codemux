@@ -42,11 +42,11 @@ interface Props {
 const OTHER_LABEL = "Other";
 
 /**
- * Composer-attached panel for `request_kind: "user-input"`. Matches the
- * t3code architecture (panel lives with the composer, not inline in
- * the transcript) and the Claude.ai interaction pattern (one question
- * per page, prev/next arrows, numbered options, always-visible
- * "Something else" free-text row as the last option, keyboard-driven).
+ * Composer-attached panel for `request_kind: "user-input"`. The
+ * panel lives with the composer (not inline in the transcript) and
+ * follows the Claude.ai interaction pattern (one question per page,
+ * prev/next arrows, numbered options, always-visible "Something
+ * else" free-text row as the last option, keyboard-driven).
  *
  * Layout: outer wrapper matches the Composer's own centering/width so
  * the two visually belong together. The panel does NOT alter the
@@ -185,10 +185,9 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
 
   // ------- Keyboard shortcuts (global, with input-focus guard) --------
   //
-  // Pattern copied from t3code's ComposerPendingUserInputPanel: listen
-  // on the document, but only fire when focus is outside an input /
-  // textarea / contenteditable so the composer textarea and our own
-  // "Something else" input keep normal typing semantics.
+  // Listen on the document, but only fire when focus is outside an
+  // input / textarea / contenteditable so the composer textarea and
+  // our own "Something else" input keep normal typing semantics.
 
   const advanceOrSubmitRef = useRef(advanceOrSubmit);
   advanceOrSubmitRef.current = advanceOrSubmit;
@@ -418,7 +417,7 @@ interface OptionRowProps {
  * A selectable option row. Native `<input>` stays in the DOM (hidden
  * via `sr-only`) so `role="radio" | "checkbox"` and keyboard a11y keep
  * working for assistive tech; the visible surface is a full-width
- * button-card inspired by t3code.
+ * button-card.
  */
 function OptionRow({
   questionIndex,
