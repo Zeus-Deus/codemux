@@ -640,6 +640,13 @@ export interface ChatModelInfo {
    *  picker's grouping rail and the secondary label rendered below
    *  the model name. */
   sub_provider: string | null;
+  /** True when the model is free-tier on the upstream provider's
+   *  configured plan (both input and output token costs are 0).
+   *  Drives a "FREE" pill in the picker and a soft sort boost so
+   *  free models bubble to the top of their provider's list, after
+   *  favorites. Today only OpenCode federated entries can ever set
+   *  this — Claude / Codex always emit `false`. */
+  is_free: boolean;
 }
 
 export interface PermissionModeOption {

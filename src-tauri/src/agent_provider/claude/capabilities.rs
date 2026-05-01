@@ -75,6 +75,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         // Opus 4.6 — default effort is high, supports fast mode + ultrathink + 1M.
         ChatModelInfo {
@@ -95,6 +96,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: true,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         // Opus 4.5 — no ultrathink, no 1M context.
         ChatModelInfo {
@@ -115,6 +117,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: true,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         // Sonnet 4.6 — narrower effort range, supports ultrathink + 1M.
         ChatModelInfo {
@@ -130,6 +133,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         // Haiku 4.5 — no effort, no context-window picker. Has a thinking
         // toggle we don't render in MVP.
@@ -146,6 +150,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
     ]
 }

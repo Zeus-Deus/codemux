@@ -52,6 +52,7 @@ function makeCaps(modelId: string): ProviderChatCapabilities {
         supports_fast_mode: false,
         supports_images: false,
         sub_provider: null,
+        is_free: false,
       },
     ],
     effort_granularity: "per_session",
@@ -222,5 +223,6 @@ function makeOpenCodeModel(id: string, subProvider: string): ChatModelInfo {
     supports_fast_mode: false,
     supports_images: false,
     sub_provider: subProvider,
+    is_free: false,
   };
 }

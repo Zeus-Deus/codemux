@@ -28,6 +28,7 @@ function makeModel(overrides: Partial<ChatModelInfo>): ChatModelInfo {
     supports_fast_mode: false,
     supports_images: false,
     sub_provider: null,
+    is_free: false,
     ...overrides,
   };
 }
@@ -657,6 +658,105 @@ describe("MultiProviderModelPicker — favorites", () => {
       expect(labels.some((l) => l.includes("GPT-5.4 (Codex)"))).toBe(false);
       expect(labels.some((l) => l.includes("Claude Opus 4.7"))).toBe(false);
     });
+  });
+
+  it("renders a FREE badge on free-tier rows and sorts them above paid ones", async () => {
+    // Reseed the OpenCode caps so two of three rows are free-tier.
+    // Sort behaviour:
+    //   1. favorites first (none here)
+    //   2. free models bubble above paid
+    //   3. insertion order preserved within each tier
+    const FREE_OPENCODE_CAPS: ProviderChatCapabilities = {
+      ...OPENCODE_CAPS,
+      models: [
+        // Insertion order: paid, free, paid, free. After sort the
+        // two free rows must precede the two paid rows.
+        makeModel({
+          id: "openai/gpt-5",
+          label: "GPT-5",
+          sub_provider: "openai",
+          is_free: false,
+        }),
+        makeModel({
+          id: "openrouter/x-ai/grok-2",
+          label: "Grok 2",
+          sub_provider: "openrouter",
+          is_free: true,
+        }),
+        makeModel({
+          id: "anthropic/claude-sonnet-4-6",
+          label: "Claude Sonnet 4.6",
+          sub_provider: "anthropic",
+          is_free: false,
+        }),
+        makeModel({
+          id: "venice/llama-3.3",
+          label: "Llama 3.3",
+          sub_provider: "venice",
+          is_free: true,
+        }),
+      ],
+    };
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: CODEX_CAPS,
+      opencode: FREE_OPENCODE_CAPS,
+    });
+
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-opencode"));
+
+    const rows = await screen.findAllByTestId("multi-provider-model-row");
+    const labels = rows.map((r) => r.textContent ?? "");
+    // Free rows occupy the top two slots regardless of insertion
+    // order.
+    expect(labels[0]).toMatch(/Grok 2|Llama 3\.3/);
+    expect(labels[1]).toMatch(/Grok 2|Llama 3\.3/);
+    // Paid rows follow.
+    expect(labels[2]).not.toMatch(/Grok 2|Llama 3\.3/);
+
+    // FREE badges render only on the two free rows.
+    const badges = screen.getAllByTestId("model-row-free-badge");
+    expect(badges).toHaveLength(2);
+  });
+
+  it("favorites still beat free-tier in sort order", async () => {
+    // A favorited paid model must outrank a non-favorited free
+    // model — the favorites tier is the strongest sort signal.
+    const MIXED_OPENCODE_CAPS: ProviderChatCapabilities = {
+      ...OPENCODE_CAPS,
+      models: [
+        makeModel({
+          id: "openai/gpt-5",
+          label: "GPT-5",
+          sub_provider: "openai",
+          is_free: false,
+        }),
+        makeModel({
+          id: "venice/llama-3.3",
+          label: "Llama 3.3",
+          sub_provider: "venice",
+          is_free: true,
+        }),
+      ],
+    };
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: CODEX_CAPS,
+      opencode: MIXED_OPENCODE_CAPS,
+    });
+    usePickerFavorites.getState().toggle("opencode", "openai/gpt-5");
+
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-opencode"));
+
+    const rows = await screen.findAllByTestId("multi-provider-model-row");
+    expect(rows[0]?.textContent).toContain("GPT-5"); // favorited paid
+    expect(rows[1]?.textContent).toContain("Llama 3.3"); // free, no favorite
   });
 
   it("empty-favorites default does not break rendering", async () => {

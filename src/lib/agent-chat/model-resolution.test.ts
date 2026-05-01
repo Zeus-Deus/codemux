@@ -27,6 +27,7 @@ const OPUS_4_7: ChatModelInfo = {
   supports_fast_mode: false,
   supports_images: true,
   sub_provider: null,
+  is_free: false,
 };
 
 const HAIKU: ChatModelInfo = {
@@ -42,6 +43,7 @@ const HAIKU: ChatModelInfo = {
   supports_fast_mode: false,
   supports_images: true,
   sub_provider: null,
+  is_free: false,
 };
 
 describe("resolveEffort", () => {

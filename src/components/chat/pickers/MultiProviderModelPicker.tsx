@@ -169,14 +169,24 @@ export function MultiProviderModelPicker({
           )
         : rowsByProvider[railKey] ?? [];
 
-    // Favorites bubble to the top of provider-rail and search lists.
-    // On the favorites rail itself every row is already starred, so
-    // the partition is a no-op there — the sort still runs cheaply.
+    // Two-level sort:
+    //   1. Favorites bubble to the very top of every list (rail-only,
+    //      cross-provider search, and the favorites tab itself —
+    //      where it's a no-op since every row is starred).
+    //   2. Within the non-favorites group, free-tier OpenCode models
+    //      bubble above paid ones. Some upstreams (OpenRouter, Venice,
+    //      Vercel, …) rotate which models are free month-to-month, so
+    //      surfacing them up top makes the rotation discoverable
+    //      without forcing the user to scroll the long federated list.
+    // Within each tier we preserve the upstream insertion order so the
+    // capability harvest's order isn't reshuffled.
     return base.slice().sort((a, b) => {
       const aFav = favoritesSet.has(pickerFavoriteKey(a.provider, a.model.id));
       const bFav = favoritesSet.has(pickerFavoriteKey(b.provider, b.model.id));
       if (aFav && !bFav) return -1;
       if (!aFav && bFav) return 1;
+      if (a.model.is_free && !b.model.is_free) return -1;
+      if (!a.model.is_free && b.model.is_free) return 1;
       return 0;
     });
   }, [query, railKey, rowsByProvider, favoritesSet]);
@@ -532,6 +542,15 @@ function ModelRow({
       <div className="min-w-0 flex-1 text-left">
         <div className="flex items-center gap-2 text-xs font-medium leading-snug">
           <span className="truncate">{model.label}</span>
+          {model.is_free ? (
+            <span
+              data-testid="model-row-free-badge"
+              className="shrink-0 rounded border border-emerald-500/35 bg-emerald-500/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+              aria-label="Free model"
+            >
+              Free
+            </span>
+          ) : null}
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground/70">
           <ProviderLogo

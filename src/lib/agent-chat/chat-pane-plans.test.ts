@@ -90,6 +90,7 @@ const OPUS_4_7: ChatModelInfo = {
   supports_fast_mode: false,
   supports_images: true,
   sub_provider: null,
+  is_free: false,
 };
 
 const HAIKU: ChatModelInfo = {
@@ -114,6 +115,7 @@ const GPT_54: ChatModelInfo = {
   supports_fast_mode: false,
   supports_images: true,
   sub_provider: null,
+  is_free: false,
 };
 
 // ─── planEffortChange ───

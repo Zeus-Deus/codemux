@@ -247,6 +247,16 @@ pub struct ChatModelInfo {
     /// below the model name.
     #[serde(default)]
     pub sub_provider: Option<String>,
+    /// True when the model is free-tier on the upstream provider's
+    /// configured plan (both input and output token costs are 0 in
+    /// the harvest response). Today only OpenCode federated entries
+    /// can ever set this — Claude and Codex are paid plans across
+    /// the board, so their fallback bundles always set this `false`.
+    /// Drives a "FREE" pill in the picker and a soft sort boost so
+    /// the free-tier models float to the top of their provider's
+    /// list (after favorites).
+    #[serde(default)]
+    pub is_free: bool,
 }
 
 /// Bundle of chat-side capability data for a single provider. Returned by

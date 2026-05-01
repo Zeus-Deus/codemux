@@ -156,6 +156,7 @@ fn flatten_model(
         supports_fast_mode: false,
         supports_images: false,
         sub_provider: Some(provider.id.clone()),
+        is_free: model.is_free,
     }
 }
 
@@ -193,6 +194,7 @@ mod tests {
             description: Some("test-family".into()),
             variants: variants.iter().map(|s| (*s).to_string()).collect(),
             context_window,
+            is_free: false,
         }
     }
 
@@ -301,6 +303,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    is_free: false,
                 },
             )],
         );

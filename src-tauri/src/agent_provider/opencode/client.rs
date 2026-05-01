@@ -192,6 +192,12 @@ pub struct OpenCodeProviderEntry {
 ///   model. Stage 3 maps these into `ChatModelInfo.effort_levels`.
 /// * `context_window` — upstream `limit.context`. Wired verbatim;
 ///   the frontend already knows how to format token counts.
+/// * `is_free` — `true` when both the input and output token costs
+///   the upstream reports are exactly 0 (free-tier models that the
+///   upstream provider exposes at no cost). Some OpenCode upstreams
+///   rotate which models are free month-to-month, so the picker
+///   surfaces this dynamically rather than hardcoding any model
+///   list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenCodeModel {
     pub id: String,
@@ -202,6 +208,8 @@ pub struct OpenCodeModel {
     pub variants: Vec<String>,
     #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub is_free: bool,
 }
 
 // ── Wire-format decoders for the OpenCode HTTP API ──────────────────
@@ -247,12 +255,30 @@ struct RawModel {
     limit: Option<RawModelLimit>,
     #[serde(default)]
     variants: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    #[serde(default)]
+    cost: Option<RawModelCost>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct RawModelLimit {
     #[serde(default)]
     context: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawModelCost {
+    /// USD-per-million-tokens for input (the upstream's billing unit).
+    /// `0.0` means the upstream offers this model at no cost on the
+    /// configured plan; we surface that as a "FREE" badge in the
+    /// picker.
+    #[serde(default)]
+    input: f64,
+    /// USD-per-million-tokens for output. A free model has
+    /// `input == 0 && output == 0`; we don't infer free from input
+    /// alone because some weird tiers list `input: 0, output: $X`
+    /// (input cached, output billed).
+    #[serde(default)]
+    output: f64,
 }
 
 /// Convert the raw `GET /provider` envelope into the public
@@ -286,12 +312,22 @@ fn flatten_model(raw: RawModel) -> OpenCodeModel {
         .map(|map| map.into_keys().collect())
         .unwrap_or_default();
     let context_window = raw.limit.and_then(|l| l.context);
+    // Strict zero-cost test (no float epsilon). The upstream emits
+    // `0` as an integer literal in JSON for free models, which
+    // deserialises as `0.0` exactly; any non-free model has at
+    // least one positive value.
+    let is_free = raw
+        .cost
+        .as_ref()
+        .map(|c| c.input == 0.0 && c.output == 0.0)
+        .unwrap_or(false);
     OpenCodeModel {
         id: raw.id,
         name: raw.name,
         description: raw.family,
         variants,
         context_window,
+        is_free,
     }
 }
 
@@ -568,6 +604,80 @@ mod tests {
 
         mock.assert_async().await;
         assert!(providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_models_decodes_is_free_when_cost_is_zero() {
+        // Free models have cost.input == 0 AND cost.output == 0.
+        // Anything else (including the weird "input free, output
+        // billed" tier) is paid. Pin both branches against a single
+        // fixture so a future API revision that drops the cost
+        // object entirely doesn't silently flip every paid model
+        // to "free".
+        let fixture = serde_json::json!({
+            "all": [
+                {
+                    "id": "openrouter",
+                    "name": "OpenRouter",
+                    "models": {
+                        "free-llama": {
+                            "id": "free-llama",
+                            "name": "Llama 3.3 (Free)",
+                            "cost": { "input": 0, "output": 0, "cache": { "read": 0, "write": 0 } }
+                        },
+                        "paid-grok": {
+                            "id": "paid-grok",
+                            "name": "Grok 2",
+                            "cost": { "input": 2.0, "output": 8.0, "cache": { "read": 0, "write": 0 } }
+                        },
+                        "weird-tier": {
+                            "id": "weird-tier",
+                            "name": "Free Input Only",
+                            "cost": { "input": 0, "output": 5.0, "cache": { "read": 0, "write": 0 } }
+                        },
+                        "no-cost-block": {
+                            "id": "no-cost-block",
+                            "name": "Cost Missing"
+                        }
+                    }
+                }
+            ],
+            "connected": ["openrouter"]
+        });
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/provider")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&fixture).unwrap())
+            .create_async()
+            .await;
+        let cfg = OpenCodeClientConfig::new(server.url());
+        let client = OpenCodeClient::new(cfg).expect("client builds");
+        let providers = client.list_models().await.expect("decode");
+        mock.assert_async().await;
+        let openrouter = providers.iter().find(|p| p.id == "openrouter").unwrap();
+
+        assert_eq!(
+            openrouter.models.get("free-llama").unwrap().is_free,
+            true,
+            "input=0 + output=0 → is_free=true"
+        );
+        assert_eq!(
+            openrouter.models.get("paid-grok").unwrap().is_free,
+            false,
+            "any positive cost → is_free=false"
+        );
+        assert_eq!(
+            openrouter.models.get("weird-tier").unwrap().is_free,
+            false,
+            "input=0 with output>0 is NOT free (paid output)"
+        );
+        assert_eq!(
+            openrouter.models.get("no-cost-block").unwrap().is_free,
+            false,
+            "missing cost block defaults to NOT free (conservative)"
+        );
     }
 
     #[test]

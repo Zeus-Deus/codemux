@@ -54,6 +54,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: true,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         ChatModelInfo {
             id: "gpt-5.4-mini".into(),
@@ -68,6 +69,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: true,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         ChatModelInfo {
             id: "gpt-5.3-codex".into(),
@@ -82,6 +84,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
+            is_free: false,
         },
         ChatModelInfo {
             id: "codex-mini-latest".into(),
@@ -99,6 +102,7 @@ fn models() -> Vec<ChatModelInfo> {
             // rather than a 400 from the API.
             supports_images: false,
             sub_provider: None,
+            is_free: false,
         },
     ]
 }
