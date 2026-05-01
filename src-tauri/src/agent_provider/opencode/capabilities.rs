@@ -122,6 +122,26 @@ pub fn flatten_into_chat_models(
     out
 }
 
+/// Upstream provider id whose `cost: {input: 0, output: 0}` reliably
+/// means "free to the user." Restricted because the cost field is
+/// unreliable for every other upstream:
+///
+/// * User-supplied API-key providers (OpenAI / Anthropic / Google /
+///   most of the long tail) — OpenCode doesn't track the user's
+///   billing tier, so it reports cost as 0 even when the user pays
+///   per-token to the upstream directly.
+/// * Subscription-based providers (GitHub Copilot, ChatGPT
+///   subscriptions) — flat billing, so per-token cost is always 0
+///   even though the user pays a monthly fee.
+/// * OpenRouter free models — the upstream already suffixes the
+///   model name with `(free)`, so a redundant badge would just add
+///   noise.
+///
+/// `opencode` upstream specifically maps to OpenCode Zen, OpenCode's
+/// own hosted free-tier service. Cost-zero from that upstream IS
+/// reliable.
+const FREE_BADGE_PROVIDER_ID: &str = "opencode";
+
 fn flatten_model(
     provider: &OpenCodeProviderEntry,
     slug_tail: &str,
@@ -156,7 +176,13 @@ fn flatten_model(
         supports_fast_mode: false,
         supports_images: false,
         sub_provider: Some(provider.id.clone()),
-        is_free: model.is_free,
+        // Only OpenCode Zen's own free-tier signal makes it onto the
+        // chat-side `is_free` flag. Every other provider's
+        // cost-zero data is too noisy to act on (see
+        // `FREE_BADGE_PROVIDER_ID` for the full list of false
+        // positives — user creds, subscriptions, OpenRouter's
+        // already-named `(free)` variants).
+        is_free: model.is_free && provider.id == FREE_BADGE_PROVIDER_ID,
     }
 }
 
@@ -351,6 +377,115 @@ mod tests {
         );
         let caps = build_capabilities(vec![p]);
         assert!(caps.models.is_empty());
+    }
+
+    #[test]
+    fn is_free_only_propagates_for_opencode_provider() {
+        // The cost-zero signal is unreliable for every upstream
+        // EXCEPT OpenCode Zen (`provider.id == "opencode"`). Pin
+        // both the positive case (opencode + cost-zero → is_free
+        // true) and three negative cases (other providers with
+        // cost-zero → is_free false), so a future relaxation of
+        // the gate has to delete this test on purpose.
+        let opencode_zen = make_provider(
+            "opencode",
+            "OpenCode",
+            true,
+            &[(
+                "free-thinker",
+                OpenCodeModel {
+                    id: "free-thinker".into(),
+                    name: "Free Thinker".into(),
+                    description: None,
+                    variants: Vec::new(),
+                    context_window: None,
+                    is_free: true,
+                },
+            )],
+        );
+        let openrouter = make_provider(
+            "openrouter",
+            "OpenRouter",
+            true,
+            &[(
+                "x-ai/grok-2:free",
+                OpenCodeModel {
+                    id: "x-ai/grok-2:free".into(),
+                    name: "Grok 2 (free)".into(),
+                    description: None,
+                    variants: Vec::new(),
+                    context_window: None,
+                    is_free: true,
+                },
+            )],
+        );
+        let copilot = make_provider(
+            "github-copilot",
+            "GitHub Copilot",
+            true,
+            &[(
+                "claude-haiku-4-5",
+                OpenCodeModel {
+                    id: "claude-haiku-4-5".into(),
+                    name: "Claude Haiku 4.5".into(),
+                    description: None,
+                    variants: Vec::new(),
+                    context_window: None,
+                    // Copilot is subscription-billed; cost-zero is a
+                    // false positive at the wire layer.
+                    is_free: true,
+                },
+            )],
+        );
+        let openai_user_creds = make_provider(
+            "openai",
+            "OpenAI",
+            true,
+            &[(
+                "gpt-5",
+                OpenCodeModel {
+                    id: "gpt-5".into(),
+                    name: "GPT-5".into(),
+                    description: None,
+                    variants: Vec::new(),
+                    context_window: None,
+                    // User-supplied creds: OpenCode reports cost-zero
+                    // because it doesn't track the user's billing
+                    // tier. False positive.
+                    is_free: true,
+                },
+            )],
+        );
+
+        let models = flatten_into_chat_models(&[
+            opencode_zen,
+            openrouter,
+            copilot,
+            openai_user_creds,
+        ]);
+
+        let by_id: std::collections::HashMap<_, _> =
+            models.iter().map(|m| (m.id.as_str(), m)).collect();
+
+        assert!(
+            by_id["opencode/free-thinker"].is_free,
+            "opencode upstream + cost-zero → is_free true"
+        );
+        assert!(
+            !by_id["openrouter/x-ai/grok-2:free"].is_free,
+            "openrouter cost-zero → is_free false (model name already \
+             carries '(free)' suffix; badge would be redundant)"
+        );
+        assert!(
+            !by_id["github-copilot/claude-haiku-4-5"].is_free,
+            "github-copilot cost-zero → is_free false (subscription \
+             billing makes cost-zero meaningless)"
+        );
+        assert!(
+            !by_id["openai/gpt-5"].is_free,
+            "openai cost-zero → is_free false (user-supplied creds \
+             billed directly to user, OpenCode doesn't track tier)"
+        );
     }
 
     #[test]
