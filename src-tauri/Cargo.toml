@@ -1,7 +1,7 @@
 [package]
 name = "codemux"
 default-run = "codemux"
-version = "0.1.26"
+version = "0.1.33"
 description = "The Agentic Development Environment for Builders"
 authors = ["Zeus-Deus"]
 license = "Elastic-2.0"
@@ -29,7 +29,7 @@ serde_json = "1"
 notify = "8.2.0"
 toml = "1.0.3"
 dirs = "6.0.0"
-portable-pty = { git = "https://github.com/Zeus-Deus/portable-pty", branch = "codemux-0.8.1-no-window" }
+portable-pty = "0.8.1"
 tokio = { version = "1.0", features = ["full"] }
 chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
@@ -68,6 +68,15 @@ tauri-plugin-dialog = { version = "2", default-features = false, features = ["xd
 
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-dialog = { version = "2" }
+# Used only by os_input.rs Tier-3 input injection — EnumWindows,
+# QueryFullProcessImageNameW, SetCursorPos, SendInput. Already in the
+# transitive tree; the explicit dep just lets us call the functions.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 mockito = "1"
@@ -77,6 +86,14 @@ serial_test = "3"
 # means this flag activates at every build, but the `test` feature
 # is additive and doesn't change runtime behavior.
 tauri = { version = "2", features = ["test"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# Used by auth/api.rs tests to dup2 stderr for the log-leak
+# regression guard. Unix-only because the underlying capture mechanism
+# relies on POSIX fd dup2. On Windows the equivalent guarantee is
+# provided statically by the typed AuthSecret boundary + Debug-redact
+# test.
+gag = "1"
 
 # Test helper binary used by `tests/json_rpc_child.rs` — simulates a JSON-RPC
 # peer over stdio. Compiled with the crate; not shipped in distributions

@@ -1,6 +1,6 @@
 use crate::agent_browser::BrowserAutomationResult;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
 pub async fn handle_os_action(
     _action: &str,
     _params: serde_json::Value,
@@ -11,6 +11,9 @@ pub async fn handle_os_action(
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::handle_os_action;
+
+#[cfg(target_os = "windows")]
+pub use windows_impl::handle_os_action;
 
 #[cfg(target_os = "linux")]
 mod linux_impl {
@@ -327,3 +330,346 @@ pub async fn handle_os_action(action: &str, params: Value, browser_id: &str) -> 
 }
 
 } // mod linux_impl
+
+#[cfg(target_os = "windows")]
+mod windows_impl {
+    //! Tier-3 OS-level input injection on Windows.
+    //!
+    //! Mirrors the Linux Tier-3 implementation but driven by Win32 APIs
+    //! instead of ydotool + hyprctl. The protocol is identical: receive a
+    //! viewport-relative coordinate, locate the headed Chromium window via
+    //! `EnumWindows` filtered by process image name, translate to screen
+    //! coordinates accounting for the toolbar offset, run a randomized
+    //! Bezier-path mouse approach, click via `SendInput`, optionally
+    //! follow with synthesized keyboard input.
+    //!
+    //! No daemon dependency (`SendInput` is in user32 directly), no UAC
+    //! elevation required for non-elevated targets — Windows lets a normal
+    //! GUI process inject into other normal GUI processes by default.
+    //! Inputs targeting an elevated window will silently no-op (UIPI),
+    //! same trade-off ydotool has on Linux.
+    use super::BrowserAutomationResult;
+    use serde_json::{json, Value};
+    use tokio::time::{sleep, Duration};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, BOOL, HANDLE, HWND, LPARAM, RECT, TRUE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+        MOUSEINPUT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetCursorPos,
+    };
+
+    /// Browser chrome offset (toolbar height) for viewport→screen.
+    /// Headless = 0; headed Chromium ≈ 88px on Windows (~13px more than
+    /// the Linux number because Windows' default DPI + thicker title bar).
+    /// Matches the Linux file's tunable; refine later if needed.
+    const HEADED_CHROME_OFFSET_Y: f64 = 88.0;
+
+    /// Window we found via EnumWindows.
+    struct WindowGeometry {
+        x: i32,
+        y: i32,
+    }
+
+    /// Process names that count as a Chromium-based browser. Lowercase
+    /// for case-insensitive matching against the basename of the process
+    /// image path returned by `QueryFullProcessImageNameW`.
+    const BROWSER_EXE_NAMES: &[&str] = &[
+        "chrome.exe",
+        "msedge.exe",
+        "brave.exe",
+        "vivaldi.exe",
+        "opera.exe",
+        "chromium.exe",
+    ];
+
+    /// EnumWindows callback context: we accumulate all candidate HWNDs
+    /// then pick the topmost visible one outside the callback (the
+    /// callback runs in a tight loop; we keep it cheap).
+    struct EnumCtx {
+        hwnds: Vec<HWND>,
+    }
+
+    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = &mut *(lparam as *mut EnumCtx);
+        ctx.hwnds.push(hwnd);
+        TRUE
+    }
+
+    /// Returns the lowercased basename of the EXE backing the process
+    /// that owns `hwnd`, or None on lookup failure.
+    fn process_image_name(hwnd: HWND) -> Option<String> {
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid == 0 {
+            return None;
+        }
+        let handle: HANDLE =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut buf: [u16; 1024] = [0; 1024];
+        let mut size: u32 = buf.len() as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size)
+        };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..size as usize]);
+        path.rsplit('\\').next().map(|s| s.to_lowercase())
+    }
+
+    /// Find a visible top-level window whose owning process is one of
+    /// our known Chromium-based browsers. Equivalent to the Linux side's
+    /// `find_browser_window` via `hyprctl clients -j`.
+    fn find_browser_window() -> Result<(HWND, WindowGeometry), String> {
+        let mut ctx = EnumCtx { hwnds: Vec::new() };
+        let ok = unsafe {
+            EnumWindows(
+                Some(enum_windows_proc),
+                &mut ctx as *mut EnumCtx as LPARAM,
+            )
+        };
+        if ok == 0 && ctx.hwnds.is_empty() {
+            return Err("EnumWindows returned no windows".into());
+        }
+
+        for hwnd in ctx.hwnds {
+            if unsafe { IsWindowVisible(hwnd) } == 0 {
+                continue;
+            }
+            let exe = match process_image_name(hwnd) {
+                Some(name) => name,
+                None => continue,
+            };
+            if !BROWSER_EXE_NAMES.iter().any(|n| *n == exe) {
+                continue;
+            }
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+                continue;
+            }
+            // Skip zero-size windows (some hidden / system).
+            if rect.right - rect.left <= 1 || rect.bottom - rect.top <= 1 {
+                continue;
+            }
+            return Ok((
+                hwnd,
+                WindowGeometry {
+                    x: rect.left,
+                    y: rect.top,
+                },
+            ));
+        }
+        Err(
+            "No Chromium-based browser window found. Open the browser in headed mode (not \
+             headless) before requesting OS-level input."
+                .to_string(),
+        )
+    }
+
+    /// Move the system cursor to absolute screen coordinates. SetCursorPos
+    /// is sufficient — no SendInput/MOUSEEVENTF_MOVE needed because
+    /// Windows treats SetCursorPos as a real cursor move event for input
+    /// purposes (Chromium's mouse-event handling sees it).
+    fn cursor_move(x: i32, y: i32) -> Result<(), String> {
+        if unsafe { SetCursorPos(x, y) } == 0 {
+            return Err(format!("SetCursorPos({x}, {y}) failed"));
+        }
+        Ok(())
+    }
+
+    /// Synthesize a left-button click via SendInput (down + up).
+    fn click_left() -> Result<(), String> {
+        let mut inputs: [INPUT; 2] = unsafe { std::mem::zeroed() };
+        inputs[0].r#type = INPUT_MOUSE;
+        inputs[0].Anonymous = INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_LEFTDOWN,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        };
+        inputs[1].r#type = INPUT_MOUSE;
+        inputs[1].Anonymous = INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_LEFTUP,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        };
+        let sent = unsafe {
+            SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            )
+        };
+        if sent != inputs.len() as u32 {
+            return Err(format!(
+                "SendInput sent {sent}/{} mouse events (likely UIPI block)",
+                inputs.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Type a string via SendInput with KEYEVENTF_UNICODE so we don't have
+    /// to map code points to virtual-key codes ourselves. Each char is a
+    /// single 16-bit code unit (codepoints above the BMP are emitted as a
+    /// surrogate pair, which Windows handles natively for KEYEVENTF_UNICODE).
+    async fn type_text(text: &str, key_delay_ms: u64) -> Result<(), String> {
+        for ch in text.encode_utf16() {
+            let mut inputs: [INPUT; 2] = unsafe { std::mem::zeroed() };
+            // KEYDOWN (Unicode)
+            inputs[0].r#type = INPUT_KEYBOARD;
+            inputs[0].Anonymous = INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: ch,
+                    dwFlags: KEYEVENTF_UNICODE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            };
+            // KEYUP (Unicode)
+            inputs[1].r#type = INPUT_KEYBOARD;
+            inputs[1].Anonymous = INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: ch,
+                    dwFlags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            };
+            let sent = unsafe {
+                SendInput(
+                    inputs.len() as u32,
+                    inputs.as_ptr(),
+                    std::mem::size_of::<INPUT>() as i32,
+                )
+            };
+            if sent != inputs.len() as u32 {
+                return Err(format!(
+                    "SendInput sent {sent}/2 key events (likely UIPI block)"
+                ));
+            }
+            if key_delay_ms > 0 {
+                sleep(Duration::from_millis(key_delay_ms)).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Higher-level click: viewport→screen coord conversion + Bezier mouse
+    /// path with randomized delays. Mirrors `linux_impl::os_click`.
+    async fn os_click(viewport_x: f64, viewport_y: f64) -> Result<String, String> {
+        let (_hwnd, geom) = find_browser_window()?;
+
+        let screen_x = geom.x as f64 + viewport_x;
+        let screen_y = geom.y as f64 + HEADED_CHROME_OFFSET_Y + viewport_y;
+
+        // Pre-compute random values before .await (thread_rng is !Send).
+        let (points, delays, pause) = {
+            let rx = rand::random::<f64>();
+            let ry = rand::random::<f64>();
+            let start_x = (screen_x - 120.0 + rx * 60.0).max(0.0);
+            let start_y = (screen_y - 90.0 + ry * 40.0).max(0.0);
+            let pts = crate::stream_input::generate_bezier_points(
+                (start_x, start_y),
+                (screen_x, screen_y),
+                5,
+            );
+            let dls: Vec<u64> = (0..pts.len())
+                .map(|_| 15 + rand::random::<u64>() % 20)
+                .collect();
+            let p = 50 + rand::random::<u64>() % 100;
+            (pts, dls, p)
+        };
+
+        for (i, (px, py)) in points.iter().enumerate() {
+            cursor_move(*px as i32, *py as i32)?;
+            sleep(Duration::from_millis(delays[i])).await;
+        }
+
+        cursor_move(screen_x as i32, screen_y as i32)?;
+        sleep(Duration::from_millis(pause)).await;
+
+        click_left()?;
+
+        Ok(format!(
+            "OS click at viewport ({viewport_x}, {viewport_y}) → screen ({}, {})",
+            screen_x as i32, screen_y as i32
+        ))
+    }
+
+    async fn os_type(text: &str, x: Option<f64>, y: Option<f64>) -> Result<String, String> {
+        if let (Some(vx), Some(vy)) = (x, y) {
+            os_click(vx, vy).await?;
+            sleep(Duration::from_millis(150)).await;
+        }
+        type_text(text, 50).await?;
+        Ok(format!("OS typed {} characters", text.len()))
+    }
+
+    fn make_request_id() -> String {
+        format!(
+            "req-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        )
+    }
+
+    pub async fn handle_os_action(
+        action: &str,
+        params: Value,
+        browser_id: &str,
+    ) -> Result<BrowserAutomationResult, String> {
+        let text = match action {
+            "click_os" => {
+                let x = params.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                let y = params.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                os_click(x, y).await?
+            }
+            "type_os" => {
+                let t = params.get("text").and_then(Value::as_str).unwrap_or("");
+                let x = params.get("x").and_then(Value::as_f64);
+                let y = params.get("y").and_then(Value::as_f64);
+                os_type(t, x, y).await?
+            }
+            _ => return Err(format!("Unknown OS action: {}", action)),
+        };
+
+        Ok(BrowserAutomationResult {
+            request_id: make_request_id(),
+            browser_id: browser_id.to_string(),
+            data: json!({ "result": text, "success": true }),
+            message: Some(text),
+        })
+    }
+} // mod windows_impl

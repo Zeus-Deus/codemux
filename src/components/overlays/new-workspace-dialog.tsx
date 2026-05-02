@@ -276,6 +276,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return map;
   }, [appState, projectDir]);
 
+  // Worktree paths already owned by a Codemux workspace. Used to filter
+  // `git worktree list` so "Open ↵ <branch>" doesn't try to re-import a
+  // worktree that's already attached to another workspace row.
+  const existingWorktreePaths = useMemo(() => {
+    const set = new Set<string>();
+    for (const ws of appState?.workspaces ?? []) {
+      if (ws.worktree_path) set.add(ws.worktree_path);
+    }
+    return set;
+  }, [appState]);
+
   // All branches merged and deduplicated
   const allBranches = useMemo(() => {
     const set = new Set([...localBranches, ...remoteBranches]);
@@ -381,16 +392,26 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         let wsId: string;
         let agentHandled = false;
+        // A real orphan is a worktree on disk whose branch we want, that isn't the
+        // main repo itself and isn't already owned by an existing Codemux workspace.
+        // Both filters are required: the first excludes the primary repo (which appears
+        // in `git worktree list --porcelain`), the second excludes worktrees we already
+        // manage as a workspace.
         const orphan = worktrees.find(
           (wt) =>
-            wt.branch === openExistingBranch ||
-            wt.branch === `refs/heads/${openExistingBranch}`,
+            (wt.branch === openExistingBranch ||
+              wt.branch === `refs/heads/${openExistingBranch}`) &&
+            wt.path !== projectDir &&
+            !existingWorktreePaths.has(wt.path),
         );
 
         const isDefaultOpen = openExistingBranch === "main" || openExistingBranch === "master";
         if (orphan) {
           wsId = await importWorktreeWorkspace(orphan.path, openExistingBranch, "single");
-        } else if (openExistingBranch === currentBranch && isDefaultOpen) {
+        } else if (isDefaultOpen) {
+          // Open on the default branch always attaches to the real repo root.
+          // The sidebar label will reflect actual HEAD via the live refresh loop,
+          // so the user sees reality. No phantom worktree is created.
           wsId = await createWorkspace(projectDir);
         } else {
           wsId = await createWorktreeWorkspace(
@@ -455,18 +476,25 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       let wsId: string;
       let agentHandled = false;
 
-      // Default branch (main/master): open as workspace directly.
-      // Feature branches always get a proper worktree — even if currently
-      // checked out (git_create_worktree will switch the main repo away).
+      // Existing default branch (main/master): always attach to the real repo
+      // root regardless of what the main repo currently has checked out. The
+      // sidebar branch label reflects actual HEAD via the live refresh loop,
+      // so the user sees reality instead of a phantom worktree at
+      // ~/.codemux/worktrees/<project>/main. Feature branches always get a
+      // proper worktree.
       const isDefault = resolvedBranch === "main" || resolvedBranch === "master";
-      if (resolvedBranch === currentBranch && !isNewBranch && isDefault) {
+      if (isDefault && !isNewBranch) {
         wsId = await createWorkspace(projectDir);
       } else {
-        // Check for orphan worktree
+        // Same orphan filter as the open-existing flow above: skip the main
+        // repo entry (which `git worktree list` includes) and any worktree
+        // already owned by another workspace.
         const orphan = worktrees.find(
           (wt) =>
-            wt.branch === resolvedBranch ||
-            wt.branch === `refs/heads/${resolvedBranch}`,
+            (wt.branch === resolvedBranch ||
+              wt.branch === `refs/heads/${resolvedBranch}`) &&
+            wt.path !== projectDir &&
+            !existingWorktreePaths.has(wt.path),
         );
 
         if (orphan) {
@@ -530,6 +558,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     openExistingBranch,
     branchWorkspaceMap,
     worktrees,
+    existingWorktreePaths,
     currentBranch,
     linkedIssue,
     onOpenChange,

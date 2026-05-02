@@ -4,7 +4,7 @@
 - Audience: Anyone working on GitHub integration or workspace-issue workflows.
 - Authority: Canonical feature doc for GitHub issue support.
 - Update when: Issue linking behavior, UI surfaces, or CLI commands change.
-- Read next: `docs/features/pr-integration.md`, `docs/reference/CONTROL.md`
+- Read next: `docs/features/review-integration.md`, `docs/reference/CONTROL.md`
 
 ## What This Feature Is
 

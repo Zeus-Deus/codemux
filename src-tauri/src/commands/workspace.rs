@@ -23,7 +23,13 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, State};
 
-fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
+/// Read fresh git branch / ahead-behind / diff-stat / changed-file counts for
+/// `repo_path` and write them into the workspace snapshot. Crash-proof:
+/// `git_branch_info` and friends return defaults for non-git directories,
+/// detached HEAD, and corrupted `.git` directories. `pub(crate)` so the
+/// periodic refresh loop in `lib.rs` can reuse this instead of duplicating
+/// the extraction logic.
+pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
     let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
@@ -579,6 +585,33 @@ pub fn activate_workspace(
     workspace_id: String,
 ) -> Result<(), String> {
     if state.activate_workspace(&workspace_id) {
+        // Kick off git refresh in a background thread — don't block the
+        // activate click. `populate_git_info` runs 5-8 git subprocesses
+        // (branch + upstream + ahead/behind + two diff-stat calls + status
+        // with duplicated `diff --numstat`), which can hit 100-300ms on a
+        // cold filesystem cache or a large repo. The 5s polling loop
+        // reconciles, so worst case the sidebar shows slightly stale branch
+        // info for one tick. `git_branch_info` handles non-git / detached /
+        // corrupted repos without panicking, and the spawned thread emits
+        // app state when done so the sidebar picks up the refresh.
+        let cwd = {
+            let snapshot = state.snapshot();
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+                .map(|w| w.cwd.clone())
+        };
+        if let Some(cwd) = cwd {
+            let refresh_app = app.clone();
+            let refresh_ws = workspace_id.clone();
+            std::thread::spawn(move || {
+                let state: tauri::State<'_, AppStateStore> = refresh_app.state();
+                populate_git_info(&state, &refresh_ws, Path::new(&cwd));
+                crate::state::emit_app_state(&refresh_app);
+            });
+        }
+
         // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
         // sessions for the workspace that was active at last close. Sessions
         // for any other workspace stay on disk-only until the user activates
@@ -1052,6 +1085,45 @@ pub fn refresh_workspace_git_info(
     populate_git_info(&state, &workspace_id, Path::new(&cwd));
     crate::state::emit_app_state(&app);
     Ok(())
+}
+
+/// Switch a workspace's repo to its default branch (main / master / origin
+/// HEAD). On success, refresh git info synchronously so the sidebar label
+/// updates without waiting for the 5s polling loop. On failure, return the
+/// git stderr verbatim for the frontend to surface as a toast.
+///
+/// Used by the sidebar's right-click "Checkout default branch" action to
+/// close the intent gap where `Open ↵ main` attaches to a repo currently on
+/// a different branch (attach-only by design — no HEAD mutation).
+#[tauri::command]
+pub fn checkout_default_branch_in_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+) -> Result<String, String> {
+    let cwd = {
+        let snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.cwd.clone())
+            .ok_or_else(|| "Workspace not found".to_string())?
+    };
+    let repo_path = Path::new(&cwd);
+
+    match crate::git::checkout_default_branch(repo_path) {
+        Ok(Some(branch)) => {
+            // Sync refresh: closes the 0–5s sidebar-label lag from the
+            // background polling loop by writing fresh branch info before
+            // we emit.
+            populate_git_info(&state, &workspace_id, repo_path);
+            crate::state::emit_app_state(&app);
+            Ok(branch)
+        }
+        Ok(None) => Err("No default branch could be determined for this repo.".to_string()),
+        Err(stderr) => Err(stderr),
+    }
 }
 
 // ---- Editor integration ----

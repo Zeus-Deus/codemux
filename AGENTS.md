@@ -12,12 +12,6 @@ When working on the Codemux repository itself:
 - Treat `docs/` as the maintained project docs system
 - If docs feel stale, use `docs/reference/DOCS_REINDEX.md`
 
-## Rust Backend: Child Process Hygiene
-
-- Before `.output()` / `.spawn()` / `.status()` on any `std::process::Command` or `tokio::process::Command`, call `crate::execution::sanitize_gui_env_std(&mut cmd)` (or `sanitize_gui_env_tokio`).
-- Exceptions: commands that need display access (`hyprctl`, `ydotool`, `systemctl`, `loginctl`).
-- New display/DBus/compositor env vars go in `gui_env_keys()` in `src-tauri/src/execution/mod.rs`; keep `build_linux_bwrap_args` in sync.
-
 ## Browser Control
 
 **Never** use `xdg-open`, `open`, or system browsers. Use these instead:
@@ -112,7 +106,7 @@ The hooks are safe when Codemux isn't running — the notification script checks
 ## Rules
 
 1. **Never** open system browsers — use `codemux browser`
-2. **Never** launch GUI apps — use Codemux built-in tools. As of April 2026, both agent sessions and regular worktree shells default to `allow_desktop_gui: false`, so `DISPLAY` / `WAYLAND_DISPLAY` / DBus / compositor env vars are stripped and neutralizer overrides (`BROWSER=true`, `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=disabled:`, `XDG_CURRENT_DESKTOP=X-Generic`) are injected. GUI launches fail cleanly instead of popping on the host display. Users opt in via `CODEMUX_ALLOW_DESKTOP_GUI=1` or per-workspace `.codemux/config.json` `sandbox.allow_desktop_gui: true`.
+2. **Never** launch GUI apps — use Codemux built-in tools
 3. The user can see everything you do in real-time
 4. When asked to "test in browser" or "check the website", use `codemux browser open <url>`
 5. Get a snapshot before interacting so you know what elements exist

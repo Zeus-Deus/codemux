@@ -12,13 +12,23 @@ import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 
-/** True when the user opted into the chat-agent + lazy-workspace-
- *  creation flow, in which case the first-project legacy onboarding
- *  wizard must not fire — `useEnsureDraftWhenEmpty` will auto-spawn an
- *  agent_chat pane on the freshly created empty project workspace
- *  instead, giving the user the chat UI directly. Read synchronously
- *  from `getState()` so action callbacks don't need to subscribe. */
+/** True when the first-project legacy onboarding wizard should be
+ *  suppressed. Two reasons fire it:
+ *
+ *  1. The user already saw and dismissed onboarding (`hasSeenOnboarding`
+ *     is sticky on `useUIStore`). Closing every workspace or opening a
+ *     second project must NOT re-arm the wizard — that's the re-trap
+ *     fix from main.
+ *  2. The user opted into the chat-agent + lazy-workspace-creation
+ *     flow, in which case `useEnsureDraftWhenEmpty` auto-spawns an
+ *     agent_chat pane on the freshly created empty project workspace
+ *     instead, giving the user the chat UI directly.
+ *
+ *  Both reads are synchronous via `getState()` so action callbacks
+ *  don't need to subscribe.
+ */
 function shouldSkipOnboarding(): boolean {
+  if (useUIStore.getState().hasSeenOnboarding) return true;
   const flags = useFeatureFlags.getState();
   return flags.enableAgentChat && flags.enableLazyWorkspaceCreation;
 }
@@ -49,8 +59,10 @@ export function useProjectActions() {
 
     await dbAddRecentProject(folder, name);
 
-    // Only show the onboarding wizard if there are no existing workspaces
-    // across any project. If workspaces already exist, just create and activate.
+    // Only show the onboarding wizard for truly first-time users — no existing
+    // workspaces AND they have never seen/dismissed onboarding before. The
+    // `hasSeenOnboarding` flag persists so that closing all workspaces or
+    // opening a second project doesn't re-arm the wizard.
     const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
     const wsId = await createEmptyWorkspace(folder);
     await activateWorkspace(wsId);

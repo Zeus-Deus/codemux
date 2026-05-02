@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { PendingWorkspace } from "@/tauri/types";
 
-export type RightPanelTab = "changes" | "files" | "pr";
+export type RightPanelTab = "changes" | "files" | "review";
 
 interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;
@@ -19,6 +19,7 @@ interface UIStore {
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
   onboardingProjectDir: string | null;
+  hasSeenOnboarding: boolean;
   /** Callback ref set by AppShell after SidebarProvider mounts */
   sidebarToggleFn: (() => void) | null;
 
@@ -59,6 +60,7 @@ export const useUIStore = create<UIStore>()(
       showCloneDialog: false,
       showNewProjectScreen: false,
       onboardingProjectDir: null,
+      hasSeenOnboarding: false,
       sidebarToggleFn: null,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
@@ -113,17 +115,40 @@ export const useUIStore = create<UIStore>()(
 
       setShowNewProjectScreen: (show) => set({ showNewProjectScreen: show }),
 
-      setOnboardingProjectDir: (dir) => set({ onboardingProjectDir: dir }),
+      setOnboardingProjectDir: (dir) =>
+        set((s) =>
+          dir === null
+            ? { onboardingProjectDir: null, hasSeenOnboarding: true }
+            : { onboardingProjectDir: dir, hasSeenOnboarding: s.hasSeenOnboarding },
+        ),
 
       setSidebarToggleFn: (fn) => set({ sidebarToggleFn: fn }),
     }),
     {
       name: "codemux-ui",
+      version: 1,
       partialize: (state) => ({
         rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
+        hasSeenOnboarding: state.hasSeenOnboarding,
       }),
+      // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`
+      // when the panel itself was renamed (Phase 3). Rewrite any persisted
+      // values so users keep their active tab on upgrade instead of having
+      // it silently fall back to the default.
+      migrate: (persistedState, version) => {
+        if (version >= 1) return persistedState;
+        const state = persistedState as { rightPanelTabs?: Record<string, string | null> };
+        if (state?.rightPanelTabs) {
+          const migrated: Record<string, string | null> = {};
+          for (const [wsId, tab] of Object.entries(state.rightPanelTabs)) {
+            migrated[wsId] = tab === "pr" ? "review" : tab;
+          }
+          state.rightPanelTabs = migrated;
+        }
+        return state;
+      },
     },
   ),
 );

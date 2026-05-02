@@ -18,7 +18,7 @@ The repo structure is clean and domain-split:
 ## Solid — Daily-Drivable Features
 
 - Workspace shell, sidebar, workspace sections with color coding and drag-drop
-- Multi-session terminals with xterm.js, WebGL rendering, kitty protocol
+- Multi-session terminals with xterm.js, DOM rendering, kitty protocol
 - Tab bar with terminal, browser, editor, and diff tab types
 - Pane splits, resize, drag-swap, close
 - Git worktree-based workspaces (create from new/existing branch, import orphans)
@@ -49,7 +49,11 @@ The repo structure is clean and domain-split:
 - MCP server exposing 29 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
 - Cross-provider MCP server runtime (Claude-side): Codemux hosts user-installed MCP servers, discovers configs across Codemux / Claude / Cursor paths, spawns each child once, dedupes identical configs, exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh. Settings panel and `+` popup both surface enable/disable + status badges + tool list modal + 50-tool cap warning. Codex MCP support planned for Step 11 via HTTP gateway (see `docs/plans/step-9-codex-mcp-spike.md`).
 - Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
-- Multi-provider chat (Step 12, Stages 1-7 shipped): the chat composer's model picker drives session creation across Claude + Codex + OpenCode in one unified popover (provider rail + searchable model list). OpenCode federates 100+ upstream providers behind a single rail entry; only the connected upstreams surface (filtered at the data layer). New OpenCode adapter is Rust-direct-HTTP against a managed `opencode serve` child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo.sub_provider` threads upstream provider id through the harvest so federated models render with `OpenCode · {sub_provider}` subtitles + namespaced `${provider_id}/${model_id}` slugs. Codex finally selectable in the GUI (was hidden behind a stale `ENABLE_PROVIDER_PICKER` flag pre-Step-12). Favorites persist via zustand + `localStorage` and bubble to the top of search results across all surfaces. Live-tested against OpenCode 1.14.31 (116 providers / 4,354 models). Multi-instance per provider + picker keyboard shortcuts deferred to v2; OpenFlow capabilities convergence tracked as future cleanup. See `docs/features/multi-provider-chat.md`.
+- Multi-provider chat (Step 12, Stages 1-9 shipped): the chat composer's model picker drives session creation across Claude + Codex + OpenCode in one unified popover (provider rail + searchable model list). OpenCode federates 100+ upstream providers behind a single rail entry; only the connected upstreams surface (filtered at the data layer). New OpenCode adapter is Rust-direct-HTTP against a managed `opencode serve` child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo.sub_provider` threads upstream provider id through the harvest so federated models render with `OpenCode · {sub_provider}` subtitles + namespaced `${provider_id}/${model_id}` slugs. Codex finally selectable in the GUI (was hidden behind a stale `ENABLE_PROVIDER_PICKER` flag pre-Step-12). Favorites persist via zustand + `localStorage` and bubble to the top of search results across all surfaces. Live-tested against OpenCode 1.14.31 (116 providers / 4,354 models). Multi-instance per provider + picker keyboard shortcuts deferred to v2; OpenFlow capabilities convergence tracked as future cleanup. See `docs/features/multi-provider-chat.md`.
+- Terminal pane persistence across workspace switch: xterm.js Terminal instance + PTY-output channel survive component unmount via the module-level cache in `src/components/terminal/terminal-cache.ts`. Workspace switches reparent the wrapper into a hidden parking node instead of disposing, so alt-screen TUIs (Claude Code, lazygit, btop, vim) keep rendering correctly on return. Disposal is driven by AppState diffs in `useTerminalCacheGc` so close-pane / close-tab / close-workspace / PTY-exit all reach `disposeTerminal`.
+- Auth-derivation module split: `auth.rs` lives at `auth/{mod,api,derivation}.rs` with the `AuthSecret` typed boundary on the API helpers (compile-time guard against raw-password leaks). Step 10's `EncryptionKey` + `derive_login_credentials` and the cross-product `auth_secret_matches_vexis_*` and `encryption_key_matches_vexis_for_known_input` hex pin tests now live alongside the algorithm in `auth/derivation.rs`.
+- Sidebar PR icon (per workspace, with stale-clearing on branch switch and a "DRAFT" collapse), "Checkout default branch" workspace action, Review tab (renamed from PR tab) with React Query refactor, "Open PR" button on the changes-panel toolbar, terminal Unicode-11 widths + WebGL renderer, hidden-pane terminal pause to remove cross-workspace typing lag, desktop notification toast + chime when an off-screen agent finishes, onboarding skip affordance + re-trap fix.
+- Windows portability: portable-pty repinned to upstream + hidden parent console, agent-browser Edge auto-detect + argv fix + ERROR_PIPE_BUSY retry, Tier-3 Win32 SendInput input injection, Claude Code hooks register on Windows, `resolve_binary` Windows discovery branch.
 
 ## Partial / Being Hardened
 
@@ -109,7 +113,7 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - App shell: shadcn Sidebar with collapsible workspace sections, tab bar, right panel
 - Workspace list from real Tauri backend data (zustand + app-state-changed events)
-- Terminal panes with xterm.js + WebGL renderer + PTY via Tauri Channel
+- Terminal panes with xterm.js DOM renderer + PTY via Tauri Channel
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
 - Right panel with Changes panel, File tree, and PR panel tabs
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph
@@ -136,5 +140,5 @@ The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust b
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, diff-viewer, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, pr-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
+- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, diff-viewer, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, review-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
 - `docs/plans/windows-support.md` for the active Windows cross-platform work

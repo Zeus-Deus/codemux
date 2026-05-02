@@ -18,10 +18,18 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { PrStatusIcon, humanizePrState, prStatusToneClass } from "@/components/github/pr-status-icon";
 import {
   activateWorkspace,
+  checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
   renameWorkspace,
@@ -35,6 +43,8 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
+import { toast } from "@/lib/toast";
+import { useDefaultBranch } from "./default-branch-cache";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -88,12 +98,14 @@ function RemoveWorkspaceDialog({
       <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
           <DialogTitle className="text-sm">
-            Remove workspace &ldquo;{workspace.title}&rdquo;?
+            {isWorktree
+              ? <>Remove workspace &ldquo;{workspace.title}&rdquo;?</>
+              : <>Close workspace &ldquo;{workspace.title}&rdquo;?</>}
           </DialogTitle>
           <DialogDescription>
             {isWorktree
               ? "Deleting will permanently remove the worktree. You can hide instead to keep files on disk."
-              : "This will close the workspace."}
+              : "Removes this workspace from the sidebar. Project files on disk are untouched."}
           </DialogDescription>
         </DialogHeader>
 
@@ -129,23 +141,55 @@ function RemoveWorkspaceDialog({
           >
             Cancel
           </Button>
-          <Button
-            variant="secondary"
-            size="sm"
-            className="h-7 px-3 text-xs"
-            onClick={handleHide}
-          >
-            Hide
-          </Button>
-          {isWorktree && (
-            <Button
-              variant="destructive"
-              size="sm"
-              className="h-7 px-3 text-xs"
-              onClick={handleDelete}
-            >
-              Delete
-            </Button>
+          {isWorktree ? (
+            <>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    className="h-7 px-3 text-xs"
+                    onClick={handleHide}
+                  >
+                    Hide
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                  Remove from sidebar. Worktree files stay on disk.
+                </TooltipContent>
+              </Tooltip>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    className="h-7 px-3 text-xs"
+                    onClick={handleDelete}
+                  >
+                    Delete
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                  Permanently remove worktree directory from disk.
+                </TooltipContent>
+              </Tooltip>
+            </>
+          ) : (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="h-7 px-3 text-xs"
+                  onClick={handleHide}
+                >
+                  Close
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                Remove from sidebar. Project files on disk are untouched.
+              </TooltipContent>
+            </Tooltip>
           )}
         </div>
       </DialogContent>
@@ -153,7 +197,7 @@ function RemoveWorkspaceDialog({
   );
 }
 
-function WorkspaceContextMenuItems({
+export function WorkspaceContextMenuItems({
   workspace,
   onRemoveRequest,
 }: {
@@ -161,6 +205,13 @@ function WorkspaceContextMenuItems({
   onRemoveRequest: () => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
+  const isWorktree = !!workspace.worktree_path;
+  // Default-branch lookup is scoped to the project_root (the real repo root
+  // shared by all workspaces pointing at the same repo). Falls back to cwd
+  // for primary workspaces that haven't had project_root stamped yet.
+  const defaultBranch = useDefaultBranch(
+    workspace.project_root ?? (isWorktree ? null : workspace.cwd),
+  );
 
   useEffect(() => {
     detectEditors().then(setEditors).catch(console.error);
@@ -182,6 +233,26 @@ function WorkspaceContextMenuItems({
   const handleOpenInEditor = (editorId: string) => {
     openInEditor(editorId, workspace.cwd).catch(console.error);
   };
+
+  const handleCheckoutDefault = async () => {
+    try {
+      const branch = await checkoutDefaultBranchInWorkspace(workspace.workspace_id);
+      toast.success(`Switched to ${branch}`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error(`Couldn't switch: ${message}`);
+    }
+  };
+
+  // Show the "Checkout default branch" action only for primary workspaces
+  // (worktree workspaces live on a fixed branch by design — swapping their
+  // HEAD would break the Codemux worktree model). Disable when we already
+  // know we're on the default branch — gated on `defaultBranch` being
+  // resolved so the action stays clickable while the fetch is pending, and
+  // the backend's `Ok(None)` guard handles the "actually on default" edge.
+  const showCheckoutDefault = !isWorktree;
+  const isOnDefault =
+    defaultBranch !== null && workspace.git_branch === defaultBranch;
 
   return (
     <ContextMenuContent>
@@ -210,6 +281,14 @@ function WorkspaceContextMenuItems({
       >
         Copy branch name
       </ContextMenuItem>
+      {showCheckoutDefault && (
+        <ContextMenuItem
+          onClick={handleCheckoutDefault}
+          disabled={isOnDefault}
+        >
+          Checkout default branch
+        </ContextMenuItem>
+      )}
       <ContextMenuItem
         onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
       >
@@ -277,6 +356,16 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     ) : (
       <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
     );
+
+  const showPrIcon = !!workspace.pr_state && workspaceStatus !== "working";
+  const prHumanState = humanizePrState(workspace.pr_state);
+  const prToneCls = prStatusToneClass(workspace.pr_state);
+  const handlePrClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (workspace.pr_url) {
+      openUrl(workspace.pr_url).catch(console.error);
+    }
+  };
 
   return (
     <>
@@ -375,20 +464,47 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 )}
               </div>
 
-              {/* Branch name row */}
+              {/* Branch name row. Issue + PR badges are grouped into a
+                  single right-aligned cluster so they sit next to each
+                  other at the bottom-right when both are present (no dead
+                  gap), and the branch text is the only element that
+                  truncates when space is tight. */}
               {workspace.git_branch && (
                 <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   <span className="truncate">{workspace.git_branch}</span>
-                  {workspace.pr_number && (
-                    <Badge variant="outline" className="h-3.5 px-1 text-[9px] leading-none">
-                      #{workspace.pr_number}
-                    </Badge>
-                  )}
-                  {workspace.linked_issue && (
-                    <IssueDetailPopover
-                      workspaceId={workspace.workspace_id}
-                      issue={workspace.linked_issue}
-                    />
+                  {(workspace.linked_issue || showPrIcon) && (
+                    <div className="flex items-center gap-1 ml-auto shrink-0">
+                      {workspace.linked_issue && (
+                        <IssueDetailPopover
+                          workspaceId={workspace.workspace_id}
+                          issue={workspace.linked_issue}
+                        />
+                      )}
+                      {showPrIcon && (
+                        <button
+                          type="button"
+                          onClick={handlePrClick}
+                          disabled={!workspace.pr_url}
+                          aria-label={
+                            workspace.pr_number
+                              ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
+                              : `Open pull request on GitHub — ${prHumanState ?? ""}`
+                          }
+                          className={cn(
+                            "inline-flex items-center gap-0.5 rounded-full px-1.5 py-px transition-opacity",
+                            prToneCls,
+                            workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
+                          )}
+                        >
+                          <PrStatusIcon state={workspace.pr_state} size={3} />
+                          {workspace.pr_number && (
+                            <span className="text-[10px] tabular-nums text-muted-foreground/60">
+                              #{workspace.pr_number}
+                            </span>
+                          )}
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
               )}

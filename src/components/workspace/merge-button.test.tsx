@@ -44,6 +44,13 @@ const mockAbortMergeIntoBase = vi.fn().mockResolvedValue(undefined);
 const mockActivateWorkspace = vi.fn().mockResolvedValue(undefined);
 const mockCloseWorkspace = vi.fn().mockResolvedValue("ws-1");
 const mockCreateWorkspace = vi.fn().mockResolvedValue("ws-new");
+const mockMergePullRequest = vi.fn().mockResolvedValue(undefined);
+const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
+const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
+
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mockOpenUrl(...args),
+}));
 
 vi.mock("@/tauri/commands", () => ({
   getGitStatus: (...args: unknown[]) => mockGetGitStatus(...args),
@@ -79,6 +86,8 @@ vi.mock("@/tauri/commands", () => ({
   gitStashPush: vi.fn().mockResolvedValue(undefined),
   gitStashPop: vi.fn().mockResolvedValue(undefined),
   getCommitFiles: vi.fn().mockResolvedValue([]),
+  mergePullRequest: (...args: unknown[]) => mockMergePullRequest(...args),
+  refreshWorkspacePr: (...args: unknown[]) => mockRefreshWorkspacePr(...args),
 }));
 
 vi.mock("@/stores/diff-store", () => ({
@@ -134,6 +143,7 @@ vi.mock("@/stores/ai-merge-store", () => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ChangesPanel } from "./changes-panel";
 import { toast as mockToast } from "@/lib/toast";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -167,11 +177,25 @@ const mockWorkspace: WorkspaceSnapshot = {
   surfaces: [],
 };
 
+// Each test gets a fresh QueryClient — required since ChangesPanel
+// now calls `useQueryClient` (Phase 3.3) to invalidate Review-tab
+// queries on commit / push / pull / merge. Disable retries + auto
+// refetch so query state doesn't leak between tests.
+function makeTestQueryClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+    },
+  });
+}
+
 function renderPanel() {
   return render(
-    <TooltipProvider>
-      <ChangesPanel workspace={mockWorkspace} />
-    </TooltipProvider>,
+    <QueryClientProvider client={makeTestQueryClient()}>
+      <TooltipProvider>
+        <ChangesPanel workspace={mockWorkspace} />
+      </TooltipProvider>
+    </QueryClientProvider>,
   );
 }
 
@@ -202,6 +226,9 @@ beforeEach(() => {
   mockGetDefaultBranch.mockResolvedValue("main");
   mockListBranches.mockResolvedValue(["main", "develop"]);
   mockCheckClaudeAvailable.mockResolvedValue(false);
+  mockMergePullRequest.mockResolvedValue(undefined);
+  mockRefreshWorkspacePr.mockResolvedValue(undefined);
+  mockOpenUrl.mockResolvedValue(undefined);
   mockAppStoreState = {
     appState: {
       config: { ai_commit_message_enabled: false },
@@ -754,5 +781,101 @@ describe("Post-merge workspace cleanup", () => {
 
     // Project A's workspace must NOT have been activated
     expect(mockActivateWorkspace).not.toHaveBeenCalledWith("ws-projectA-main");
+  });
+});
+
+// ── Phase 2: PR split-button (open-on-GitHub + merge dropdown) ──
+
+describe("Changes panel PR split-button", () => {
+  function renderWithPr(
+    overrides: Partial<WorkspaceSnapshot> = { pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" },
+  ) {
+    return render(
+      <QueryClientProvider client={makeTestQueryClient()}>
+        <TooltipProvider>
+          <ChangesPanel workspace={{ ...mockWorkspace, ...overrides }} />
+        </TooltipProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("renders only the open-on-GitHub button (no merge chevron) for a MERGED PR", async () => {
+    renderWithPr({ pr_number: 7, pr_state: "MERGED", pr_url: "https://github.com/o/r/pull/7" });
+    await flushPromises();
+
+    expect(screen.getByText("#7")).toBeInTheDocument();
+    // The merge-PR chevron only renders for OPEN PRs.
+    expect(screen.queryByLabelText("Merge PR")).not.toBeInTheDocument();
+  });
+
+  it("renders chevron and dispatches mergePullRequest with the right method per item", async () => {
+    const user = userEvent.setup();
+    renderWithPr({ pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" });
+    await flushPromises();
+
+    const chevron = screen.getByLabelText("Merge PR");
+    expect(chevron).toBeInTheDocument();
+
+    // Squash
+    await user.click(chevron);
+    await user.click(await screen.findByText("Squash and merge"));
+    await waitFor(() => {
+      expect(mockMergePullRequest).toHaveBeenLastCalledWith("/home/user/project", 42, "squash");
+    });
+
+    // Merge commit
+    await user.click(screen.getByLabelText("Merge PR"));
+    await user.click(await screen.findByText("Create merge commit"));
+    await waitFor(() => {
+      expect(mockMergePullRequest).toHaveBeenLastCalledWith("/home/user/project", 42, "merge");
+    });
+
+    // Rebase
+    await user.click(screen.getByLabelText("Merge PR"));
+    await user.click(await screen.findByText("Rebase and merge"));
+    await waitFor(() => {
+      expect(mockMergePullRequest).toHaveBeenLastCalledWith("/home/user/project", 42, "rebase");
+    });
+  });
+
+  it("clicking the main button area opens GitHub and does NOT trigger mergePullRequest", async () => {
+    const user = userEvent.setup();
+    renderWithPr({ pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" });
+    await flushPromises();
+
+    await user.click(screen.getByText("#42"));
+
+    expect(mockOpenUrl).toHaveBeenCalledWith("https://github.com/o/r/pull/42");
+    expect(mockMergePullRequest).not.toHaveBeenCalled();
+  });
+
+  it("on success: fires success toast and triggers refreshWorkspacePr", async () => {
+    const user = userEvent.setup();
+    mockMergePullRequest.mockResolvedValueOnce(undefined);
+    renderWithPr({ pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" });
+    await flushPromises();
+
+    await user.click(screen.getByLabelText("Merge PR"));
+    await user.click(await screen.findByText("Squash and merge"));
+
+    await waitFor(() => {
+      expect(mockToast.success).toHaveBeenCalledWith("PR #42 squashed");
+    });
+    expect(mockRefreshWorkspacePr).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("on failure: fires error toast and does NOT trigger refreshWorkspacePr", async () => {
+    const user = userEvent.setup();
+    mockMergePullRequest.mockRejectedValueOnce(new Error("merge conflict"));
+    renderWithPr({ pr_number: 42, pr_state: "OPEN", pr_url: "https://github.com/o/r/pull/42" });
+    await flushPromises();
+
+    await user.click(screen.getByLabelText("Merge PR"));
+    await user.click(await screen.findByText("Squash and merge"));
+
+    await waitFor(() => {
+      expect(mockToast.error).toHaveBeenCalledWith("Couldn't merge PR: merge conflict");
+    });
+    expect(mockRefreshWorkspacePr).not.toHaveBeenCalled();
   });
 });

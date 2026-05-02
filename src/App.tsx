@@ -4,6 +4,8 @@ import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useAuthEvents } from "@/hooks/use-auth-events";
 import { useSkillsSync } from "@/hooks/use-skills-sync";
 import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
+import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
+import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { AppShell } from "@/components/layout/app-shell";
 import { Toaster } from "@/components/ui/sonner";
 import { UpdateToast } from "@/components/update/update-toast";
@@ -59,6 +61,8 @@ function App() {
   useFeatureFlagsInit();
   useProviderCapabilitiesInit();
   useEnsureDraftWhenEmpty();
+  useTerminalCacheGc();
+  useTerminalThemeSync();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

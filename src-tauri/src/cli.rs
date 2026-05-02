@@ -337,12 +337,33 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
         }
         Some(CommandSet::Browser { command }) => {
             let ws_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
+
+            // Helper: surface the handler's error message instead of silently
+            // returning `null` when `response.ok == false`. Without this, every
+            // failed browser command in the running app showed up to the user
+            // (and any agent reading stdout) as the literal string "null" with
+            // no diagnostic — which is exactly what the Windows debug session
+            // surfaced when the control-pipe layer started working.
+            fn unwrap_response(response: crate::control::ControlResponse) -> Result<Value, String> {
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+                }
+                Ok(response.data.unwrap_or(json!(null)))
+            }
+
             let result = match command {
                 BrowserCommand::Create => {
                     let response = send_control_request(ControlRequest {
                         command: "create_browser_pane".to_string(),
                         params: json!({"pane_id": ""}),
                     }).await?;
+                    if !response.ok {
+                        return Err(response
+                            .error
+                            .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+                    }
                     Ok::<_, String>(json!({ "ok": true, "data": response.data.unwrap_or(json!(null)) }))
                 }
                 BrowserCommand::Open { url } => {
@@ -350,7 +371,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "open", "url": url } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::Snapshot { browser_id: _, dom } => {
                     let action = if dom {
@@ -362,42 +383,42 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::Click { selector, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "click", "selector": selector } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::Fill { selector, value, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "fill", "selector": selector, "value": value } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::Screenshot { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "screenshot" } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::ConsoleLogs { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "console" } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::ClickAt { x, y, click_type, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_at", "x": x, "y": y, "click_type": click_type } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::TypeAt { text, x, y, browser_id: _ } => {
                     let mut action = json!({ "kind": "type_at", "text": text });
@@ -407,35 +428,35 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::ScrollAt { x, y, direction, amount, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::KeyPress { key, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "key_press", "key": key } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::Drag { start_x, start_y, end_x, end_y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::ClickOs { x, y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_os", "x": x, "y": y } }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
                 BrowserCommand::TypeOs { text, x, y, browser_id: _ } => {
                     let mut action = json!({ "kind": "type_os", "text": text });
@@ -445,7 +466,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                         command: "browser_automation".into(),
                         params: json!({ "workspace_id": &ws_id, "action": action }),
                     }).await?;
-                    Ok(response.data.unwrap_or(json!(null)))
+                    unwrap_response(response)
                 }
             }?;
             println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);

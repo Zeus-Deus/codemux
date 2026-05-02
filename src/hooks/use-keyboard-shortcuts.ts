@@ -68,12 +68,18 @@ export function useKeyboardShortcuts() {
   return null;
 }
 
-function dispatch(actionId: string, _e: KeyboardEvent): boolean {
+export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
   // ── Close overlay (Escape) — conditional ──
   if (actionId === "closeOverlay") {
+    // Onboarding is a full-view replacement, not a modal — prioritize it over
+    // dismissible overlays so Escape always provides an escape hatch.
+    if (ui.onboardingProjectDir) {
+      ui.setOnboardingProjectDir(null);
+      return true;
+    }
     if (ui.showSettings) {
       ui.setShowSettings(false);
       return true;

@@ -1,4 +1,3 @@
-use crate::execution::sanitize_gui_env_std;
 use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
@@ -117,14 +116,12 @@ fn git_ignored_set(
         .collect();
     let stdin_data = paths.join("\n");
 
-    let mut cmd = Command::new("git");
-    cmd.args(["check-ignore", "--stdin"])
+    let output = Command::new("git")
+        .args(["check-ignore", "--stdin"])
         .current_dir(dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd
+        .stderr(std::process::Stdio::null())
         .spawn()
         .and_then(|mut child| {
             use std::io::Write;
@@ -169,21 +166,21 @@ pub fn search_in_files(
 }
 
 fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
-    let mut cmd = Command::new("rg");
-    cmd.args([
-        "--json",
-        "--max-count",
-        "5",
-        "--max-columns",
-        "200",
-        "--smart-case",
-        query,
-        path,
-    ])
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("rg not found: {e}"))?;
+    let output = Command::new("rg")
+        .args([
+            "--json",
+            "--max-count",
+            "5",
+            "--max-columns",
+            "200",
+            "--smart-case",
+            query,
+            path,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("rg not found: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
@@ -245,12 +242,12 @@ fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResul
 }
 
 fn search_with_grep(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
-    let mut cmd = Command::new("grep");
-    cmd.args(["-rn", "--include=*", "-i", query, path])
+    let output = Command::new("grep")
+        .args(["-rn", "--include=*", "-i", query, path])
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("grep failed: {e}"))?;
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("grep failed: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut results = Vec::new();
@@ -315,19 +312,19 @@ pub fn search_file_names(
 }
 
 fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, String> {
-    let mut cmd = Command::new("fd");
-    cmd.args([
-        "--type",
-        "f",
-        "--max-results",
-        &limit.to_string(),
-        query,
-        path,
-    ])
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("fd not found: {e}"))?;
+    let output = Command::new("fd")
+        .args([
+            "--type",
+            "f",
+            "--max-results",
+            &limit.to_string(),
+            query,
+            path,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("fd not found: {e}"))?;
 
     if !output.status.success() && output.stdout.is_empty() {
         return Err("fd returned no results".to_string());
@@ -343,13 +340,10 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
 
 #[tauri::command]
 pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
-    let mut which_cmd = Command::new("which");
-    which_cmd
+    if Command::new("which")
         .arg("xdg-open")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut which_cmd);
-    if which_cmd
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -357,10 +351,8 @@ pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
     {
         return Err("xdg-open not found — cannot open file manager. Install xdg-utils.".to_string());
     }
-    let mut open_cmd = Command::new("xdg-open");
-    open_cmd.arg(&path);
-    sanitize_gui_env_std(&mut open_cmd);
-    open_cmd
+    Command::new("xdg-open")
+        .arg(&path)
         .spawn()
         .map_err(|e| format!("Failed to open file manager: {e}"))?;
     Ok(())
@@ -372,33 +364,33 @@ fn search_with_find(
     limit: u32,
     base: &Path,
 ) -> Result<Vec<String>, String> {
-    let mut cmd = Command::new("find");
-    cmd.args([
-        path,
-        "-type",
-        "f",
-        "-iname",
-        &format!("*{query}*"),
-        "-not",
-        "-path",
-        "*/node_modules/*",
-        "-not",
-        "-path",
-        "*/.git/*",
-        "-not",
-        "-path",
-        "*/target/*",
-        "-not",
-        "-path",
-        "*/dist/*",
-        "-not",
-        "-path",
-        "*/__pycache__/*",
-    ])
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::null());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd.output().map_err(|e| format!("find failed: {e}"))?;
+    let output = Command::new("find")
+        .args([
+            path,
+            "-type",
+            "f",
+            "-iname",
+            &format!("*{query}*"),
+            "-not",
+            "-path",
+            "*/node_modules/*",
+            "-not",
+            "-path",
+            "*/.git/*",
+            "-not",
+            "-path",
+            "*/target/*",
+            "-not",
+            "-path",
+            "*/dist/*",
+            "-not",
+            "-path",
+            "*/__pycache__/*",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("find failed: {e}"))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout

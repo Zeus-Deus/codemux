@@ -1,7 +1,8 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, act, cleanup, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ReactNode } from "react";
 
 // Polyfill ResizeObserver for ScrollArea (not available in jsdom)
 globalThis.ResizeObserver = class {
@@ -19,7 +20,6 @@ const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
 const mockGetPullRequestChecks = vi.fn().mockResolvedValue([]);
 const mockGetPrReviewComments = vi.fn().mockResolvedValue([]);
 const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
-const mockGetPrDeployments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
 const mockCreatePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockGetDefaultBranch = vi.fn().mockResolvedValue("main");
@@ -32,22 +32,18 @@ vi.mock("@/tauri/commands", () => ({
   getPullRequestChecks: (...args: unknown[]) => mockGetPullRequestChecks(...args),
   getPrReviewComments: (...args: unknown[]) => mockGetPrReviewComments(...args),
   getPrInlineComments: (...args: unknown[]) => mockGetPrInlineComments(...args),
-  getPrDeployments: (...args: unknown[]) => mockGetPrDeployments(...args),
   listBranches: (...args: unknown[]) => mockListBranches(...args),
   createPullRequest: (...args: unknown[]) => mockCreatePullRequest(...args),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
 }));
 
-// Mock sub-components to keep tests focused on PrPanel logic
-vi.mock("./pr/pr-header", () => ({ PrHeader: () => <div data-testid="pr-header" /> }));
-vi.mock("./pr/pr-checks", () => ({ PrChecks: () => <div data-testid="pr-checks" /> }));
-vi.mock("./pr/pr-reviews", () => ({ PrReviews: () => <div data-testid="pr-reviews" /> }));
-vi.mock("./pr/pr-review-actions", () => ({ PrReviewActions: () => <div data-testid="pr-review-actions" /> }));
-vi.mock("./pr/pr-deployments", () => ({ PrDeployments: () => <div data-testid="pr-deployments" /> }));
-vi.mock("./pr/pr-merge-controls", () => ({ PrMergeControls: () => <div data-testid="pr-merge-controls" /> }));
-vi.mock("./pr/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
+// Mock sub-components to keep tests focused on ReviewPanel logic
+vi.mock("./review/review-header", () => ({ ReviewHeader: () => <div data-testid="pr-header" /> }));
+vi.mock("./review/review-checks", () => ({ ReviewChecks: () => <div data-testid="pr-checks" /> }));
+vi.mock("./review/review-threads", () => ({ ReviewThreads: () => <div data-testid="pr-reviews" /> }));
+vi.mock("./review/incoming-prs-view", () => ({ IncomingPrsView: () => <div data-testid="incoming-prs-view" /> }));
 
-import { PrPanel } from "./pr-panel";
+import { ReviewPanel } from "./review-panel";
 import type { WorkspaceSnapshot, PullRequestInfo } from "@/tauri/types";
 // Access the cache helpers exported at module level for cache TTL tests
 import {
@@ -58,10 +54,21 @@ import {
   CACHE_TTL_MS,
   // For direct mutation in tests:
   _resetCaches,
-} from "./pr-panel";
+} from "./review-panel";
 
 function flushPromises() {
   return act(() => new Promise((r) => setTimeout(r, 0)));
+}
+
+// Each test gets a fresh QueryClient so cached data + retries don't
+// leak between cases. Retries off so query errors surface immediately.
+function renderPanel(node: ReactNode) {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, staleTime: Infinity, refetchInterval: false },
+    },
+  });
+  return render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
 }
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
@@ -123,7 +130,6 @@ beforeEach(() => {
   mockGetPullRequestChecks.mockResolvedValue([]);
   mockGetPrReviewComments.mockResolvedValue([]);
   mockGetPrInlineComments.mockResolvedValue([]);
-  mockGetPrDeployments.mockResolvedValue([]);
   mockGetDefaultBranch.mockResolvedValue("main");
 });
 
@@ -131,36 +137,20 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-// ── Bug 1: Refresh triggers PR discovery when no PR ──
+// The refresh button was removed in the visual-match PR — auto-poll
+// (2.5s for PR detail + checks, 30s for comments) handles freshness
+// now. The discovery / fetch behaviors these tests covered are still
+// exercised indirectly through the React Query hooks that fire on
+// mount and on workspace switch.
 
-describe("refresh button", () => {
-  it("calls refreshWorkspacePr when no PR exists", async () => {
-    const user = userEvent.setup();
-    render(<PrPanel workspace={makeWorkspace()} />);
-    await flushPromises();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-
-    expect(mockRefreshWorkspacePr).toHaveBeenCalledWith("ws-1");
-  });
-
-  it("calls getBranchPullRequest (fetchDetails) when PR exists", async () => {
-    const user = userEvent.setup();
+describe("auto-fetch on mount", () => {
+  it("calls getBranchPullRequest when PR exists on mount", async () => {
     mockGetBranchPullRequest.mockResolvedValue(mockPr);
 
-    render(<PrPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
-    await flushPromises();
-
-    // fetchDetails is called on mount; clear to isolate the refresh click
-    mockGetBranchPullRequest.mockClear();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
     await flushPromises();
 
     expect(mockGetBranchPullRequest).toHaveBeenCalledWith("/home/user/project");
-    expect(mockRefreshWorkspacePr).not.toHaveBeenCalled();
   });
 });
 
@@ -181,10 +171,10 @@ describe("cache TTL", () => {
 
   it("ghStatusCache returns value before TTL", () => {
     vi.useFakeTimers();
-    setCachedGhStatus({ status: "NotAuthenticated" });
+    setCachedGhStatus({ status: "Authenticated", username: "alice" });
 
     vi.advanceTimersByTime(CACHE_TTL_MS - 1000);
-    expect(getCachedGhStatus()).toEqual({ status: "NotAuthenticated" });
+    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "alice" });
   });
 
   it("repoCheckCache expires after TTL", () => {
@@ -202,62 +192,67 @@ describe("cache TTL", () => {
     setCachedRepoCheck("/path/a", true);
 
     vi.advanceTimersByTime(CACHE_TTL_MS / 2);
-    setCachedRepoCheck("/path/b", false);
+    setCachedRepoCheck("/path/b", true);
 
-    // Expire first entry
+    // Expire only the first entry
     vi.advanceTimersByTime(CACHE_TTL_MS / 2 + 1);
     expect(getCachedRepoCheck("/path/a")).toBeUndefined();
-    expect(getCachedRepoCheck("/path/b")).toBe(false);
+    expect(getCachedRepoCheck("/path/b")).toBe(true);
   });
 
-  it("manual refresh bypasses caches", async () => {
-    const user = userEvent.setup();
-
+  it("warm caches skip the auth + repo init calls", async () => {
     // Pre-populate caches so auth init won't call checkGhStatus/checkGithubRepo
     setCachedGhStatus({ status: "Authenticated", username: "test" });
     setCachedRepoCheck("/home/user/project", true);
 
-    render(<PrPanel workspace={makeWorkspace()} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
     // Auth init should NOT have called these (cache was warm)
     expect(mockCheckGhStatus).not.toHaveBeenCalled();
     expect(mockCheckGithubRepo).not.toHaveBeenCalled();
-
-    // Click refresh — should bust caches
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    // Caches were busted; verify they're empty
-    expect(getCachedGhStatus()).toBeNull();
-    expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
   });
 
-  it("stale failure recovers after TTL", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-
-    // First render: checkGithubRepo fails (cached as false)
+  it("failures are not cached — recovery is immediate, no TTL wait", async () => {
+    // First render: checkGithubRepo returns false. The buggy old behavior
+    // cached this for 60s; the fix drops failure caching entirely so the
+    // user sees the recovery on the very next render.
     mockCheckGithubRepo.mockResolvedValue(false);
 
-    const { unmount } = render(<PrPanel workspace={makeWorkspace()} />);
+    const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
     expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
+    expect(getCachedRepoCheck("/home/user/project")).toBeUndefined();
 
     unmount();
 
-    // Advance past TTL so cache expires
-    vi.advanceTimersByTime(CACHE_TTL_MS + 1);
-
-    // Now mock success
+    // No TTL advance — fix the underlying issue and re-render immediately.
     mockCheckGithubRepo.mockResolvedValue(true);
 
-    render(<PrPanel workspace={makeWorkspace()} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    // Should re-check (cache expired) and now see the PR panel content
     expect(screen.queryByText("Not a GitHub repository")).not.toBeInTheDocument();
+  });
+
+  it("setCachedGhStatus drops non-Authenticated values", () => {
+    setCachedGhStatus({ status: "NotAuthenticated" });
+    expect(getCachedGhStatus()).toBeNull();
+
+    setCachedGhStatus({ status: "NotInstalled" });
+    expect(getCachedGhStatus()).toBeNull();
+
+    setCachedGhStatus({ status: "Authenticated", username: "test" });
+    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "test" });
+  });
+
+  it("setCachedRepoCheck drops false values", () => {
+    setCachedRepoCheck("/path/x", false);
+    expect(getCachedRepoCheck("/path/x")).toBeUndefined();
+
+    setCachedRepoCheck("/path/x", true);
+    expect(getCachedRepoCheck("/path/x")).toBe(true);
   });
 });
 
@@ -267,7 +262,7 @@ describe("error state", () => {
   it("shows error when fetchDetails fails", async () => {
     mockGetBranchPullRequest.mockRejectedValue(new Error("gh CLI error"));
 
-    render(<PrPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
     await flushPromises();
 
     await waitFor(() => {
@@ -275,54 +270,14 @@ describe("error state", () => {
     });
   });
 
-  it("clears error on successful retry", async () => {
-    const user = userEvent.setup();
-    // First: fail
-    mockGetBranchPullRequest.mockRejectedValue(new Error("network error"));
-
-    render(<PrPanel workspace={makeWorkspace({ pr_number: 42, pr_state: "OPEN" })} />);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.getByText(/network error/)).toBeInTheDocument();
-    });
-
-    // Now succeed
-    mockGetBranchPullRequest.mockResolvedValue(mockPr);
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.queryByText(/network error/)).not.toBeInTheDocument();
-    });
-  });
-
   it("shows NoPrView (not error) when genuinely no PR", async () => {
-    render(<PrPanel workspace={makeWorkspace()} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
     expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
     // No error banner should be present
     expect(screen.queryByText(/Failed/)).not.toBeInTheDocument();
     expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
-  });
-
-  it("shows error when refresh discovery fails", async () => {
-    const user = userEvent.setup();
-    mockRefreshWorkspacePr.mockRejectedValue(new Error("gh pr view failed"));
-
-    render(<PrPanel workspace={makeWorkspace()} />);
-    await flushPromises();
-
-    const refreshBtn = screen.getByTitle("Refresh");
-    await user.click(refreshBtn);
-    await flushPromises();
-
-    await waitFor(() => {
-      expect(screen.getByText(/gh pr view failed/)).toBeInTheDocument();
-    });
   });
 });
 
@@ -331,7 +286,7 @@ describe("error state", () => {
 describe("incoming PRs on base branch", () => {
   it("renders IncomingPrsView when on default branch with no PR", async () => {
     mockGetDefaultBranch.mockResolvedValue("main");
-    render(<PrPanel workspace={makeWorkspace({ git_branch: "main" })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ git_branch: "main" })} />);
     await flushPromises();
 
     await waitFor(() => {
@@ -342,7 +297,7 @@ describe("incoming PRs on base branch", () => {
 
   it("renders NoPrView when on feature branch (not default)", async () => {
     mockGetDefaultBranch.mockResolvedValue("main");
-    render(<PrPanel workspace={makeWorkspace({ git_branch: "feat/my-feature" })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ git_branch: "feat/my-feature" })} />);
     await flushPromises();
 
     await waitFor(() => {
@@ -353,7 +308,7 @@ describe("incoming PRs on base branch", () => {
 
   it("renders NoPrView when git_branch is null (detached HEAD)", async () => {
     mockGetDefaultBranch.mockResolvedValue("main");
-    render(<PrPanel workspace={makeWorkspace({ git_branch: null })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ git_branch: null })} />);
     await flushPromises();
 
     await waitFor(() => {
@@ -364,7 +319,7 @@ describe("incoming PRs on base branch", () => {
 
   it("renders NoPrView when getDefaultBranch fails", async () => {
     mockGetDefaultBranch.mockRejectedValue(new Error("git error"));
-    render(<PrPanel workspace={makeWorkspace({ git_branch: "main" })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ git_branch: "main" })} />);
     await flushPromises();
 
     await waitFor(() => {
@@ -375,7 +330,7 @@ describe("incoming PRs on base branch", () => {
   it("still renders PrView when on default branch with existing PR", async () => {
     mockGetDefaultBranch.mockResolvedValue("main");
     mockGetBranchPullRequest.mockResolvedValue(mockPr);
-    render(<PrPanel workspace={makeWorkspace({ git_branch: "main", pr_number: 42, pr_state: "OPEN" })} />);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ git_branch: "main", pr_number: 42, pr_state: "OPEN" })} />);
     await flushPromises();
 
     await waitFor(() => {

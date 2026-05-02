@@ -277,36 +277,6 @@ fn parse_inline_comment_thread_reply() {
     assert_eq!(comment.pull_request_review_id, Some(500));
 }
 
-#[test]
-fn parse_deployment_with_url() {
-    let json = r#"{
-        "id": 1000,
-        "environment": "preview",
-        "state": "success",
-        "url": "https://preview-42.example.com",
-        "created_at": "2026-03-20T12:00:00Z"
-    }"#;
-    let dep: DeploymentInfo = serde_json::from_str(json).unwrap();
-    assert_eq!(dep.id, 1000);
-    assert_eq!(dep.environment, "preview");
-    assert_eq!(dep.state, "success");
-    assert_eq!(dep.url.as_deref(), Some("https://preview-42.example.com"));
-}
-
-#[test]
-fn parse_deployment_without_url() {
-    let json = r#"{
-        "id": 2000,
-        "environment": "staging",
-        "state": "pending",
-        "created_at": "2026-03-20T13:00:00Z"
-    }"#;
-    let dep: DeploymentInfo = serde_json::from_str(json).unwrap();
-    assert_eq!(dep.id, 2000);
-    assert_eq!(dep.environment, "staging");
-    assert!(dep.url.is_none());
-}
-
 // ═══════════════════════════════════════
 // Integration tests (need real gh CLI)
 // These are #[ignore] by default — run with:
@@ -414,22 +384,3 @@ fn get_pr_inline_comments_returns_vec() {
     }
 }
 
-#[test]
-#[ignore]
-fn get_pr_deployments_returns_vec() {
-    let repo_root = std::env::current_dir().expect("cwd");
-    if let Ok(Some(pr)) = get_branch_pr(&repo_root) {
-        let result = get_pr_deployments(&repo_root, pr.number);
-        match result {
-            Ok(deployments) => {
-                println!("{} deployments found", deployments.len());
-                for d in &deployments {
-                    println!("  {} - {} - {:?}", d.environment, d.state, d.url);
-                }
-            }
-            Err(e) => println!("Error (acceptable): {}", e),
-        }
-    } else {
-        println!("No PR for current branch, skipping");
-    }
-}

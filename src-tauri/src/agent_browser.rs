@@ -3,8 +3,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use tokio::sync::Mutex;
 
-use crate::execution::sanitize_gui_env_std;
-
 /// Stealth Chromium flags that reduce bot detection fingerprinting.
 /// Passed via the AGENT_BROWSER_ARGS env var (comma-separated).
 const STEALTH_CHROMIUM_ARGS: &str = "\
@@ -26,10 +24,7 @@ const STEALTH_CHROMIUM_ARGS: &str = "\
 fn stealth_user_agent() -> String {
     let candidates = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
     for bin in candidates {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("--version");
-        sanitize_gui_env_std(&mut cmd);
-        if let Ok(output) = cmd.output() {
+        if let Ok(output) = std::process::Command::new(bin).arg("--version").output() {
             if output.status.success() {
                 let version_str = String::from_utf8_lossy(&output.stdout);
                 // Parse version like "Chromium 131.0.6778.204" or "Google Chrome 131.0.6778.204"
@@ -97,18 +92,57 @@ pub fn kill_stream_daemons() {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let mut cmd = std::process::Command::new("taskkill");
-        cmd.args(["/IM", "agent-browser.exe", "/F"])
-            .creation_flags(CREATE_NO_WINDOW);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        // The Tauri-bundled sidecar is renamed to `agent-browser.exe`, but
+        // the dev-mode binary at `node_modules/agent-browser/bin/...` keeps
+        // its full name `agent-browser-win32-x64.exe`. Kill both forms so
+        // restarts don't leak daemons in either deployment mode.
+        for image in ["agent-browser.exe", "agent-browser-win32-x64.exe"] {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/IM", image])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
+        }
+
+        // After killing the processes, sweep the per-session lock files
+        // agent-browser leaves under `%USERPROFILE%\.agent-browser\`. The
+        // CLI trusts those `.pid`/`.port`/`.engine`/`.stream` files as
+        // proof that a daemon is alive — when they outlive the process
+        // (e.g. previous codemux exited without cleanup), every new
+        // `agent-browser open` for that session prints
+        // "daemon already running" and times out trying to connect to a
+        // ghost. We just killed every agent-browser, so any lock file
+        // here is by definition stale.
+        cleanup_agent_browser_lock_files();
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
+            .output();
+    }
+}
+
+/// Remove all lock/session files in `%USERPROFILE%\.agent-browser\`.
+/// Windows-only because Linux daemons clean up properly on SIGTERM via
+/// the `pkill -f` path above; this gap only exists on Windows where
+/// `kill_session_tree` is a no-op (no Job Object support yet).
+#[cfg(windows)]
+fn cleanup_agent_browser_lock_files() {
+    let Ok(home) = std::env::var("USERPROFILE") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".agent-browser");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if matches!(ext, "pid" | "port" | "engine" | "stream") {
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -162,10 +196,10 @@ fn kill_process_on_port(port: u16) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let mut netstat_cmd = std::process::Command::new("netstat");
-        netstat_cmd.args(["-ano"]).creation_flags(CREATE_NO_WINDOW);
-        sanitize_gui_env_std(&mut netstat_cmd);
-        let Ok(netstat) = netstat_cmd.output()
+        let Ok(netstat) = std::process::Command::new("netstat")
+            .args(["-ano"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
         else {
             eprintln!(
                 "[codemux::browser] kill_process_on_port({}): failed to spawn netstat",
@@ -181,19 +215,17 @@ fn kill_process_on_port(port: u16) {
         let pids = pids_listening_on_port(&stdout, port);
 
         for pid in pids {
-            let mut cmd = std::process::Command::new("taskkill");
-            cmd.args(["/PID", &pid.to_string(), "/F"])
-                .creation_flags(CREATE_NO_WINDOW);
-            sanitize_gui_env_std(&mut cmd);
-            let _ = cmd.output();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output();
         }
     }
     #[cfg(not(windows))]
     {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
+            .output();
     }
 }
 
@@ -217,6 +249,7 @@ fn session_name(browser_id: &str) -> &str {
     if browser_id.is_empty() { "default" } else { browser_id }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -299,6 +332,7 @@ fn extract_eval_result(stdout: &str) -> String {
 /// 2. Tauri sidecar — bundled next to the executable in AppImage/deb/rpm
 /// 3. node_modules — dev mode (`npm run tauri dev`)
 /// 4. npx fallback — always works if Node.js + npm are present
+#[cfg_attr(target_os = "windows", allow(unreachable_code))]
 fn resolve_binary() -> String {
     // 1. System PATH (AUR/system package, cargo install, manual install).
     //
@@ -311,19 +345,76 @@ fn resolve_binary() -> String {
     // now, Windows falls through to the Tauri sidecar lookup and then
     // the `npx agent-browser` fallback.
     #[cfg(unix)]
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("agent-browser")
+        .output()
     {
-        let mut which_cmd = std::process::Command::new("which");
-        which_cmd.arg("agent-browser");
-        sanitize_gui_env_std(&mut which_cmd);
-        if let Ok(output) = which_cmd.output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                // Skip the node_modules/.bin shim — we want the native binary directly
-                if !path.is_empty() && !path.contains("node_modules/.bin") {
-                    return path;
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // Skip the node_modules/.bin shim — we want the native binary directly
+            if !path.is_empty() && !path.contains("node_modules/.bin") {
+                return path;
+            }
+        }
+    }
+
+    // Windows takes a different discovery path because the rest of this
+    // function is shaped around the Linux/macOS sidecar naming convention
+    // (`agent-browser-{triple}` next to the main exe) and the bash `which`
+    // probe at the top. Specifically:
+    //   1. Tauri's Windows bundler copies the staged sidecar
+    //      `src-tauri/binaries/agent-browser-x86_64-pc-windows-msvc.exe` to
+    //      `target/{debug,release}/agent-browser.exe` (drops the triple,
+    //      keeps `.exe`) — so the runtime lookup must match THAT name.
+    //   2. The original target_triple match below has no Windows branch and
+    //      hard-returns `"npx agent-browser"`, which `Command::new("npx")`
+    //      can't actually spawn because Windows only auto-appends `.exe` and
+    //      `npx` ships as `npx.cmd` (per microsoft/CreateProcessW docs).
+    //   3. The `which` crate (already a dep) honors PATHEXT and is the
+    //      canonical Windows-safe way to probe for an executable on PATH.
+    #[cfg(target_os = "windows")]
+    {
+        // (a) Tauri runtime convention — sidecar copied next to main exe.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let candidate = dir.join("agent-browser.exe");
+                if candidate.exists() {
+                    return candidate.to_string_lossy().to_string();
                 }
             }
         }
+        // (b) Dev mode — npm-installed binary in node_modules.
+        let npm_binary = "agent-browser-win32-x64.exe";
+        let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(cwd) = std::env::current_dir() {
+            search_dirs.push(cwd.clone());
+            if let Some(parent) = cwd.parent() {
+                search_dirs.push(parent.to_path_buf());
+            }
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                search_dirs.push(dir.to_path_buf());
+            }
+        }
+        for base in &search_dirs {
+            let candidate = base.join("node_modules/agent-browser/bin").join(npm_binary);
+            if candidate.exists() {
+                return candidate.to_string_lossy().to_string();
+            }
+        }
+        // (c) Native install on PATH — `which` honors PATHEXT so this finds
+        //     `agent-browser.exe`/`.cmd` without explicit suffix probing.
+        if let Ok(path) = which::which("agent-browser") {
+            return path.to_string_lossy().to_string();
+        }
+        // (d) Last-resort npx fallback. Use `npx.cmd` (not `npx`) because
+        //     CreateProcessW won't auto-append `.cmd`. `which::which("npx")`
+        //     resolves to the right shim with PATHEXT, so prefer it.
+        if let Ok(npx_path) = which::which("npx") {
+            return format!("{} agent-browser", npx_path.to_string_lossy());
+        }
+        return "npx.cmd agent-browser".to_string();
     }
 
     // Determine the platform-specific sidecar name
@@ -392,6 +483,311 @@ fn resolve_binary() -> String {
     "npx agent-browser".to_string()
 }
 
+/// Split `resolve_binary()`'s return value into `(program, prefix_args)` so it
+/// can drive `Command::new(...).args(...)` directly on Windows. The function
+/// either returns a single binary path (most installs / dev) or the literal
+/// `"npx agent-browser"` fallback (no bundled sidecar AND no node_modules).
+/// In the npx case we want the spawn to be `npx -> agent-browser <action> ...`,
+/// not `Command::new("npx agent-browser")` which Windows treats as a single
+/// (nonexistent) executable name.
+#[cfg(target_os = "windows")]
+fn split_resolved_binary(bin: &str) -> (String, Vec<String>) {
+    let trimmed = bin.trim();
+    if let Some(idx) = trimmed.find(' ') {
+        let (program, rest) = trimmed.split_at(idx);
+        let prefix = rest
+            .split_whitespace()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>();
+        (program.to_string(), prefix)
+    } else {
+        (trimmed.to_string(), Vec::new())
+    }
+}
+
+/// Locate a Chromium-based browser executable on Windows. agent-browser
+/// auto-detects "system Chrome" but doesn't probe Brave / Edge / per-user
+/// Chrome installs — and codemux on Windows can't ship its own Chromium
+/// without a 150 MB download per machine. This helper makes the common
+/// case (user has Brave/Chrome/Edge already installed) Just Work without
+/// `agent-browser install` being a setup gotcha.
+///
+/// Order: Brave, Chrome (system + per-user), Edge. Edge always exists on
+/// Windows 10+, so it's the safety net — if everything else is missing
+/// the user still gets a working browser pane out of the box.
+///
+/// Override: respects `CODEMUX_BROWSER_EXECUTABLE` env var if set, so
+/// power users can point at a custom build (Vivaldi, Chromium nightly,
+/// portable installs, etc.) without editing settings.
+#[cfg(target_os = "windows")]
+fn find_chromium_browser_path() -> Option<String> {
+    use std::path::PathBuf;
+
+    if let Ok(custom) = std::env::var("CODEMUX_BROWSER_EXECUTABLE") {
+        let path = PathBuf::from(&custom);
+        if path.exists() {
+            return Some(custom);
+        }
+    }
+
+    let local_appdata = std::env::var("LOCALAPPDATA").ok();
+    let program_files =
+        std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".into());
+    let program_files_x86 = std::env::var("ProgramFiles(x86)")
+        .unwrap_or_else(|_| "C:\\Program Files (x86)".into());
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Brave (per-user first — that's where the .exe Installer puts it for
+    // a single-user install; Brave's own default).
+    if let Some(ref local) = local_appdata {
+        candidates.push(
+            format!("{local}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe").into(),
+        );
+    }
+    candidates.push(
+        format!("{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe").into(),
+    );
+
+    // Google Chrome.
+    candidates.push(format!("{program_files}\\Google\\Chrome\\Application\\chrome.exe").into());
+    candidates
+        .push(format!("{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe").into());
+    if let Some(ref local) = local_appdata {
+        candidates.push(format!("{local}\\Google\\Chrome\\Application\\chrome.exe").into());
+    }
+
+    // Microsoft Edge — preinstalled on every Windows 10+ install. Last
+    // resort but guaranteed to exist if all else fails.
+    candidates
+        .push(format!("{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe").into());
+    candidates.push(format!("{program_files}\\Microsoft\\Edge\\Application\\msedge.exe").into());
+
+    candidates
+        .into_iter()
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Build the `--executable-path <path>` arg pair to splice into an
+/// agent-browser argv when launching a session, or an empty Vec if
+/// auto-detection found nothing (in which case agent-browser will run
+/// its own probe and emit the "Chrome not found" error to surface the
+/// gap to the user). Windows-only because the override is only needed
+/// where agent-browser's own probe misses common installs.
+#[cfg(target_os = "windows")]
+fn windows_executable_path_args() -> Vec<String> {
+    match find_chromium_browser_path() {
+        Some(path) => vec!["--executable-path".into(), path],
+        None => Vec::new(),
+    }
+}
+
+/// Argv-form sibling of `build_agent_browser_command`. Returns a list of
+/// argument vectors, one per agent-browser invocation: most actions are
+/// single-shot, but the historical `open_url` shell form was
+/// `<bin> open <url> --session <sid> && <bin> wait --load load --session <sid>`,
+/// which becomes two sequential argv groups. Used only on Windows so we can
+/// spawn `agent-browser.exe` directly without going through `sh -c` (and
+/// therefore without depending on Git Bash being installed).
+#[cfg(target_os = "windows")]
+fn build_agent_browser_argv_groups(
+    session: &str,
+    action: &str,
+    params: &serde_json::Value,
+) -> Result<Vec<Vec<String>>, String> {
+    let s = session.to_string();
+    let groups: Vec<Vec<String>> = match action {
+        "open_url" | "open" => {
+            let url = params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("about:blank")
+                .to_string();
+            // `--executable-path` is a TOP-LEVEL agent-browser flag, so it
+            // must precede the subcommand (`open`). Putting it after
+            // `open` makes clap reject the argv as an unknown flag for
+            // the `open` subcommand and the binary exits silently —
+            // exactly the "no log activity, browser never loads" mode
+            // the user hit.
+            let mut open_argv: Vec<String> = windows_executable_path_args();
+            open_argv.extend(["open".into(), url, "--session".into(), s.clone()]);
+            // The follow-up `wait --load load` doesn't need
+            // --executable-path; it talks to the already-running daemon.
+            vec![
+                open_argv,
+                vec![
+                    "wait".into(),
+                    "--load".into(),
+                    "load".into(),
+                    "--session".into(),
+                    s,
+                ],
+            ]
+        }
+        "screenshot" => vec![vec!["screenshot".into(), "--session".into(), s]],
+        "snapshot" | "accessibility_snapshot" => vec![vec![
+            "snapshot".into(),
+            "-i".into(),
+            "--session".into(),
+            s,
+        ]],
+        "click" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec!["click".into(), selector, "--session".into(), s]]
+        }
+        "fill" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            let value = params
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec!["fill".into(), selector, value, "--session".into(), s]]
+        }
+        "type_text" => {
+            let text = params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec![
+                "type".into(),
+                "body".into(),
+                text,
+                "--session".into(),
+                s,
+            ]]
+        }
+        "console_logs" | "console" => vec![vec!["console".into(), "--session".into(), s]],
+        "evaluate" | "eval" => {
+            let script = params
+                .get("script")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            vec![vec!["eval".into(), script, "--session".into(), s]]
+        }
+        "back" => vec![vec!["back".into(), "--session".into(), s]],
+        "forward" => vec![vec!["forward".into(), "--session".into(), s]],
+        "reload" => vec![vec!["reload".into(), "--session".into(), s]],
+        "viewport" => {
+            let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
+            let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
+            vec![vec![
+                "set".into(),
+                "viewport".into(),
+                w.to_string(),
+                h.to_string(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        "get_styles" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "styles".into(),
+                selector,
+                "--json".into(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        "wait" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = params.get("text").and_then(|v| v.as_str()).map(String::from);
+            if let Some(text) = text {
+                vec![vec![
+                    "wait".into(),
+                    "--text".into(),
+                    text,
+                    "--session".into(),
+                    s,
+                ]]
+            } else {
+                vec![vec!["wait".into(), selector, "--session".into(), s]]
+            }
+        }
+        "get_text" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "text".into(),
+                selector,
+                "--session".into(),
+                s,
+            ]]
+        }
+        "get_box" => {
+            let selector = params
+                .get("selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or("body")
+                .to_string();
+            vec![vec![
+                "get".into(),
+                "box".into(),
+                selector,
+                "--json".into(),
+                "--session".into(),
+                s,
+            ]]
+        }
+        _ => return Err(format!("Unknown action: {}", action)),
+    };
+    Ok(groups)
+}
+
+/// Spawn agent-browser directly (no shell) on Windows with the standard
+/// stream-port + stealth env vars wired up. Used by the cfg-gated Windows
+/// branches at every shell-out site so we don't depend on Git Bash being
+/// installed for runtime browser control.
+#[cfg(target_os = "windows")]
+fn run_agent_browser_native(
+    bin: &str,
+    argv: &[String],
+    stream_port: u16,
+    discard_stderr: bool,
+) -> std::io::Result<std::process::Output> {
+    let (program, prefix_args) = split_resolved_binary(bin);
+    let mut cmd = std::process::Command::new(&program);
+    for a in &prefix_args {
+        cmd.arg(a);
+    }
+    for a in argv {
+        cmd.arg(a);
+    }
+    cmd.env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    if discard_stderr {
+        cmd.stderr(std::process::Stdio::null());
+    }
+    cmd.output()
+}
+
+#[cfg(not(target_os = "windows"))]
 fn build_agent_browser_command(session: &str, action: &str, params: &serde_json::Value) -> Result<String, String> {
     let bin = resolve_binary();
     let command = match action {
@@ -480,19 +876,43 @@ fn make_request_id() -> String {
 
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
-    let shell_cmd = build_agent_browser_command(session, action, &params)?;
-    let mut cmd = std::process::Command::new("sh");
-    cmd.args(["-c", &shell_cmd])
-        .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
-        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-    sanitize_gui_env_std(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    #[cfg(target_os = "windows")]
+    let (stdout, stderr, status_success) = {
+        let bin = resolve_binary();
+        let groups = build_agent_browser_argv_groups(session, action, &params)?;
+        let mut combined_stdout = String::new();
+        let mut combined_stderr = String::new();
+        let mut all_ok = true;
+        for argv in &groups {
+            let out = run_agent_browser_native(&bin, argv, stream_port, false)
+                .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
+            combined_stdout.push_str(&String::from_utf8_lossy(&out.stdout));
+            combined_stderr.push_str(&String::from_utf8_lossy(&out.stderr));
+            if !out.status.success() {
+                all_ok = false;
+                break; // matches `cmd1 && cmd2` short-circuit semantics
+            }
+        }
+        (combined_stdout, combined_stderr, all_ok)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let (stdout, stderr, status_success) = {
+        let shell_cmd = build_agent_browser_command(session, action, &params)?;
+        let output = std::process::Command::new("sh")
+            .args(["-c", &shell_cmd])
+            .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
+            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+            .output()
+            .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
+        (
+            String::from_utf8_lossy(&output.stdout).to_string(),
+            String::from_utf8_lossy(&output.stderr).to_string(),
+            output.status.success(),
+        )
+    };
 
     // Debug logging for snapshot commands
     if action == "snapshot" || action == "accessibility_snapshot" {
@@ -502,7 +922,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         }
     }
 
-    if !output.status.success() && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
+    if !status_success && !stdout.contains("✓") && !stdout.contains("{") && !stdout.contains("- ") {
         return Err(format!("agent-browser failed: {} {}", stdout, stderr));
     }
 
@@ -513,11 +933,27 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     if (action == "snapshot" || action == "accessibility_snapshot") && needs_dom_fallback(&stdout) {
         eprintln!("[codemux::browser] ARIA snapshot empty, falling back to DOM query");
         let dom_params = serde_json::json!({ "script": DOM_SNAPSHOT_SCRIPT });
-        let dom_cmd = build_agent_browser_command(session, "eval", &dom_params)?;
-        let mut dom_cmd_builder = std::process::Command::new("sh");
-        dom_cmd_builder.args(["-c", &dom_cmd]);
-        sanitize_gui_env_std(&mut dom_cmd_builder);
-        if let Ok(dom_output) = dom_cmd_builder.output() {
+
+        #[cfg(target_os = "windows")]
+        let dom_output_opt = {
+            let bin = resolve_binary();
+            match build_agent_browser_argv_groups(session, "eval", &dom_params) {
+                Ok(groups) if !groups.is_empty() => {
+                    run_agent_browser_native(&bin, &groups[0], stream_port, false).ok()
+                }
+                _ => None,
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let dom_output_opt = match build_agent_browser_command(session, "eval", &dom_params) {
+            Ok(dom_cmd) => std::process::Command::new("sh")
+                .args(["-c", &dom_cmd])
+                .output()
+                .ok(),
+            Err(_) => None,
+        };
+
+        if let Some(dom_output) = dom_output_opt {
             let dom_stdout = String::from_utf8_lossy(&dom_output.stdout).to_string();
             let dom_tree = extract_eval_result(&dom_stdout);
             if !dom_tree.is_empty() && dom_tree != "(no elements found)" {
@@ -553,7 +989,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         } else {
             stdout.clone()
         };
-        serde_json::json!({ "result": result_str, "success": output.status.success() })
+        serde_json::json!({ "result": result_str, "success": status_success })
     };
 
     Ok(BrowserAutomationResult {
@@ -600,10 +1036,17 @@ impl AgentBrowserManager {
     /// Returns the existing port if already allocated, or assigns the next
     /// available port in the range [DEFAULT_STREAM_PORT, MAX_STREAM_PORT].
     ///
-    /// Does NOT check if the port is free — start_stream uses fuser -k to
-    /// reclaim ports occupied by stale daemons. A try-bind check here would
-    /// skip our own stale daemon's port, causing the agent-browser CLI to
-    /// reuse the stale daemon while BrowserPane connects to the wrong port.
+    /// On Unix the loop only checks our in-memory session map and relies on
+    /// `start_stream`'s `fuser -k` to reclaim ports occupied by stale
+    /// daemons that the kernel/process table will let us kill.
+    ///
+    /// On Windows ghost ports are real: `kill_session_tree` is a no-op (no
+    /// Job Object support yet — see TODO in `terminal/mod.rs`), so when the
+    /// codemux app exits its agent-browser daemons leak. The OS keeps the
+    /// ports listening on dead PIDs and `kill_process_on_port` can't kill
+    /// what's already gone. So on Windows we additionally try-bind each
+    /// candidate port and skip ones that fail — that way the stuck ports
+    /// just get skipped and the next free one (9225+, 9226+, etc.) is used.
     pub async fn allocate_port(&self, session_key: &str) -> Result<u16, String> {
         let mut sessions = self.sessions.lock().await;
         if let Some(s) = sessions.get(session_key) {
@@ -622,6 +1065,16 @@ impl AgentBrowserManager {
             }
             // Check no other session already owns this port
             if sessions.values().any(|s| s.port == port) {
+                continue;
+            }
+
+            // Windows-only: try-bind to filter out ghost-occupied ports.
+            // We bind a TcpListener to 127.0.0.1:<port> and immediately
+            // drop it; if the bind fails, some other process (often a
+            // dead-PID-owned leak from a previous codemux run) is on it
+            // and we should skip to the next.
+            #[cfg(target_os = "windows")]
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
                 continue;
             }
 
@@ -662,13 +1115,27 @@ impl AgentBrowserManager {
             }
         }
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
+        #[cfg(target_os = "windows")]
+        let output = {
+            // `--executable-path` is a top-level flag — must come before
+            // the `open` subcommand or clap rejects it.
+            let mut argv: Vec<String> = windows_executable_path_args();
+            argv.extend([
+                "open".into(),
+                "about:blank".into(),
+                "--headless".into(),
+                "--session".into(),
+                session.to_string(),
+            ]);
+            run_agent_browser_native(&bin, &argv, port, false)
+                .map_err(|e| format!("Failed to start agent-browser: {}", e))?
+        };
+        #[cfg(not(target_os = "windows"))]
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut cmd);
-        let output = cmd
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
 
@@ -696,13 +1163,24 @@ impl AgentBrowserManager {
         let bin = resolve_binary();
         let port = self.allocate_port(browser_id).await?;
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} screenshot --session {}", bin, session)])
+        #[cfg(target_os = "windows")]
+        let output = run_agent_browser_native(
+            &bin,
+            &[
+                "screenshot".into(),
+                "--session".into(),
+                session.to_string(),
+            ],
+            port,
+            false,
+        )
+        .map_err(|e| format!("Failed to get screenshot: {}", e))?;
+        #[cfg(not(target_os = "windows"))]
+        let output = std::process::Command::new("sh")
+            .args(["-c", &format!("{} screenshot --session {}", bin, session)])
             .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut cmd);
-        let output = cmd
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
             .output()
             .map_err(|e| format!("Failed to get screenshot: {}", e))?;
 
@@ -744,10 +1222,22 @@ impl AgentBrowserManager {
             kill_process_on_port(s.port);
         }
 
-        let mut cmd = std::process::Command::new("sh");
-        cmd.args(["-c", &format!("{} close --session {}", bin, session)]);
-        sanitize_gui_env_std(&mut cmd);
-        let _ = cmd.output();
+        #[cfg(target_os = "windows")]
+        {
+            // Port not strictly needed for `close` (no streaming), but the
+            // helper requires one — pass 0 since the daemon being closed
+            // already owns whatever port it was streaming on.
+            let _ = run_agent_browser_native(
+                &bin,
+                &["close".into(), "--session".into(), session.to_string()],
+                0,
+                false,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("{} close --session {}", bin, session)])
+            .output();
         Ok(())
     }
 
@@ -784,10 +1274,21 @@ impl AgentBrowserManager {
         // The agent-browser CLI would then reuse the stale daemon (by session name)
         // while BrowserPane connects to the newly allocated (empty) port.
 
-        let mut close_cmd = std::process::Command::new("sh");
-        close_cmd.args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)]);
-        sanitize_gui_env_std(&mut close_cmd);
-        let _ = close_cmd.output();
+        #[cfg(target_os = "windows")]
+        {
+            // discard_stderr=true mirrors the `2>/dev/null` redirect on the
+            // Unix shell form below — stale-close errors are noise.
+            let _ = run_agent_browser_native(
+                &bin,
+                &["close".into(), "--session".into(), session.to_string()],
+                0,
+                true,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("{} close --session {} 2>/dev/null", bin, session)])
+            .output();
 
         let port = self.allocate_port(browser_id).await?;
 
@@ -798,17 +1299,40 @@ impl AgentBrowserManager {
         // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and
         // streaming is enabled by default when AGENT_BROWSER_STREAM_PORT is set.
         eprintln!("[codemux::browser] Starting browser session={} port={}", session, port);
-        let launch_cmd = format!(
-            "{} open about:blank --headless --session {}",
-            bin, session
-        );
-        let mut launch = std::process::Command::new("sh");
-        launch.args(["-c", &launch_cmd])
-            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-        sanitize_gui_env_std(&mut launch);
-        let _ = launch.output();
+        #[cfg(target_os = "windows")]
+        {
+            let _ = run_agent_browser_native(
+                &bin,
+                &{
+                    // Top-level flag before subcommand; see commit
+                    // history note in build_agent_browser_argv_groups.
+                    let mut argv: Vec<String> = windows_executable_path_args();
+                    argv.extend([
+                        "open".into(),
+                        "about:blank".into(),
+                        "--headless".into(),
+                        "--session".into(),
+                        session.to_string(),
+                    ]);
+                    argv
+                },
+                port,
+                false,
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let launch_cmd = format!(
+                "{} open about:blank --headless --session {}",
+                bin, session
+            );
+            let _ = std::process::Command::new("sh")
+                .args(["-c", &launch_cmd])
+                .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+                .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+                .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+                .output();
+        }
 
         // Give the daemon a moment to start the WebSocket stream server.
         std::thread::sleep(std::time::Duration::from_millis(1000));
@@ -854,10 +1378,9 @@ mod tests {
                 result
             );
             // Verify it's executable
-            let mut cmd = std::process::Command::new(&result);
-            cmd.arg("--version");
-            sanitize_gui_env_std(&mut cmd);
-            let output = cmd.output();
+            let output = std::process::Command::new(&result)
+                .arg("--version")
+                .output();
             assert!(output.is_ok(), "Binary at {} is not executable", result);
             let out = output.unwrap();
             let version = String::from_utf8_lossy(&out.stdout);
@@ -869,6 +1392,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_open_chains_wait_load() {
         let cmd = build_agent_browser_command("test-session", "open", &serde_json::json!({"url": "https://example.com"})).unwrap();
@@ -880,17 +1404,106 @@ mod tests {
         assert!(!cmd.contains("stream disable"), "Should NOT restart stream: {}", cmd);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_viewport_uses_set_viewport() {
         let cmd = build_agent_browser_command("s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
         assert!(cmd.contains("set viewport 800 600"), "v0.24.0 uses 'set viewport', got: {}", cmd);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn build_command_unknown_action_returns_error() {
         let result = build_agent_browser_command("s", "nonexistent_action", &serde_json::json!({}));
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown action"));
+    }
+
+    /// Windows-only sibling test that exercises the argv builder. The Linux
+    /// tests above assert shell-string shape; the argv form has different
+    /// semantics (no shell quoting, separate args), so this test asserts the
+    /// argv shape directly instead of trying to share assertions.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_open_chains_wait_load() {
+        let groups = build_agent_browser_argv_groups(
+            "test-session",
+            "open",
+            &serde_json::json!({"url": "https://example.com"}),
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 2, "open should produce open + wait groups");
+
+        // `windows_executable_path_args()` may prepend a global
+        // `--executable-path <path>` pair when Chrome / Brave / Edge is
+        // detected. The GitHub `windows-latest` runner ships Edge, so on
+        // CI this is always the case; on a developer box without any
+        // supported browser installed it's empty. The contract is: any
+        // global flags must precede the `open` subcommand, otherwise clap
+        // rejects them and agent-browser exits silently (the runtime bug
+        // the argv-position fix originally addressed). Assert both that
+        // `open` is present and that any `--executable-path` precedes it.
+        let argv = &groups[0];
+        let open_pos = argv
+            .iter()
+            .position(|a| a == "open")
+            .expect("open subcommand must appear in argv");
+        if let Some(exec_pos) = argv.iter().position(|a| a == "--executable-path") {
+            assert!(
+                exec_pos < open_pos,
+                "--executable-path must precede the `open` subcommand (clap requires global flags first); argv: {:?}",
+                argv
+            );
+        }
+        assert!(argv.contains(&"https://example.com".to_string()));
+        assert!(argv.contains(&"--session".to_string()));
+        assert!(argv.contains(&"test-session".to_string()));
+        assert_eq!(groups[1][0], "wait");
+        assert!(groups[1].contains(&"--load".to_string()));
+        assert!(groups[1].contains(&"load".to_string()));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_viewport_uses_set_viewport() {
+        let groups = build_agent_browser_argv_groups(
+            "s",
+            "viewport",
+            &serde_json::json!({"width": 800, "height": 600}),
+        )
+        .unwrap();
+        assert_eq!(groups.len(), 1);
+        let argv = &groups[0];
+        assert_eq!(argv[0], "set");
+        assert_eq!(argv[1], "viewport");
+        assert_eq!(argv[2], "800");
+        assert_eq!(argv[3], "600");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn build_argv_unknown_action_returns_error() {
+        let result =
+            build_agent_browser_argv_groups("s", "nonexistent_action", &serde_json::json!({}));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown action"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn split_resolved_binary_handles_npx_fallback() {
+        let (program, prefix) = split_resolved_binary("npx agent-browser");
+        assert_eq!(program, "npx");
+        assert_eq!(prefix, vec!["agent-browser".to_string()]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn split_resolved_binary_handles_plain_path() {
+        let (program, prefix) =
+            split_resolved_binary(r"C:\Users\u\node_modules\agent-browser\bin\agent-browser-win32-x64.exe");
+        assert!(program.ends_with("agent-browser-win32-x64.exe"));
+        assert!(prefix.is_empty());
     }
 
     #[tokio::test]

@@ -114,7 +114,18 @@ pub struct SessionRuntime {
     pub writer: Option<Box<dyn Write + Send>>,
     pub master: Option<Box<dyn MasterPty + Send>>,
     pub output_channel: Option<Channel<Vec<u8>>>,
+    /// Monotonic generation for the currently installed output channel.
+    /// Incremented on attach/detach so a failed send from an old cloned
+    /// channel cannot clear a newer channel that attached concurrently.
+    pub output_channel_generation: u64,
     pub pending_output: VecDeque<Vec<u8>>,
+    /// Cumulative count of chunks evicted from `pending_output` because the
+    /// buffer hit `OUTPUT_BUFFER_LIMIT` while no consumer was attached. With
+    /// the frontend cache (terminal-cache.ts) the channel stays attached for
+    /// the entire session lifetime, so this should stay at 0 in the steady
+    /// state. A non-zero value indicates either a long startup window or a
+    /// regression where the channel was detached on workspace switch.
+    pub dropped_chunks: u64,
     pub last_status: TerminalStatusPayload,
     pub child_pid: Option<u32>,
     pub skip_preset_launch: bool,
@@ -137,7 +148,9 @@ impl SessionRuntime {
             writer: None,
             master: None,
             output_channel: None,
+            output_channel_generation: 0,
             pending_output: VecDeque::new(),
+            dropped_chunks: 0,
             last_status: TerminalStatusPayload {
                 session_id: session_id.to_string(),
                 state: TerminalLifecycleState::Starting,
@@ -377,7 +390,7 @@ fn queue_or_send_output(
     session_id: &str,
     chunk: Vec<u8>,
 ) {
-    with_session_runtime(
+    let channel_to_send = with_session_runtime(
         sessions,
         session_id,
         || SessionRuntime::new(session_id),
@@ -385,16 +398,48 @@ fn queue_or_send_output(
             runtime.pending_output.push_back(chunk.clone());
             while runtime.pending_output.len() > OUTPUT_BUFFER_LIMIT {
                 runtime.pending_output.pop_front();
-            }
-
-            if let Some(channel) = runtime.output_channel.clone() {
-                if let Err(error) = channel.send(chunk) {
-                    eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
-                    runtime.output_channel = None;
+                if runtime.output_channel.is_none() {
+                    let dropped = runtime.dropped_chunks.saturating_add(1);
+                    runtime.dropped_chunks = dropped;
+                    // Log on the first drop and then on each power-of-two boundary
+                    // so a chatty regression doesn't spam stderr but is still
+                    // discoverable. A single line is enough — the count is the
+                    // signal; the rest is in the bug.
+                    if dropped == 1 || dropped.is_power_of_two() {
+                        eprintln!(
+                            "[codemux::terminal] session={session_id} dropped pending_output \
+                             chunk (cumulative={dropped}). Indicates the frontend was \
+                             detached when the buffer overflowed."
+                        );
+                    }
                 }
             }
+
+            runtime
+                .output_channel
+                .clone()
+                .map(|channel| (channel, runtime.output_channel_generation))
         },
     );
+
+    let Some((channel, generation)) = channel_to_send else {
+        return;
+    };
+
+    // Tauri IPC delivery can be slower than the in-memory bookkeeping above,
+    // especially when the WebView is busy parsing terminal output. Never hold
+    // the global sessions mutex while sending, otherwise active keystrokes
+    // (`write_to_pty`) block behind unrelated PTY output from other sessions.
+    if let Err(error) = channel.send(chunk) {
+        eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
+        with_existing_session_runtime(sessions, session_id, |runtime| {
+            if runtime.output_channel_generation == generation {
+                runtime.output_channel = None;
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+            }
+        });
+    }
 }
 
 /// Flush accumulated PTY output as a single batched chunk.
@@ -878,63 +923,6 @@ fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, Strin
     vars
 }
 
-/// Extras derived from `.codemux/config.json` `sandbox` section that don't
-/// fit inside `ExecutionPolicy` — currently just the VNC-watch opt-in.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WorkspaceSandboxExtras {
-    watch_vnc: bool,
-}
-
-/// Pure core of `apply_workspace_sandbox_overrides`: given a workspace cwd
-/// and a starting policy, read `.codemux/config.json` there and merge the
-/// `sandbox` section into both the policy and the extras tuple. This is the
-/// side-effect-free half that unit tests drive directly with a tempdir.
-///
-/// Returns the updated policy + extras. Missing config file or absent fields
-/// leave the caller's defaults intact — this is the expected path for
-/// workspaces that opt out of per-workspace sandbox config.
-fn apply_sandbox_config_at(
-    cwd: &std::path::Path,
-    mut policy: crate::execution::ExecutionPolicy,
-) -> (crate::execution::ExecutionPolicy, WorkspaceSandboxExtras) {
-    let mut extras = WorkspaceSandboxExtras::default();
-    let Some(config) = crate::config::workspace_config::read_workspace_config(cwd) else {
-        return (policy, extras);
-    };
-    if let Some(v) = config.sandbox.allow_desktop_gui {
-        policy.allow_desktop_gui = v;
-    }
-    if let Some(v) = config.sandbox.virtual_display {
-        policy.virtual_display = v;
-    }
-    if let Some(v) = config.sandbox.watch_vnc {
-        extras.watch_vnc = v;
-    }
-    (policy, extras)
-}
-
-/// Read `.codemux/config.json` for the workspace and override the caller's
-/// execution policy with any per-workspace `sandbox.*` fields that are set.
-/// Missing config file or absent fields leave the policy untouched.
-///
-/// Silent no-op failure: if the config can't be read for any reason we fall
-/// back to the caller's defaults rather than blocking workspace creation.
-fn apply_workspace_sandbox_overrides(
-    app_state: &AppStateStore,
-    workspace_id: &str,
-    policy: crate::execution::ExecutionPolicy,
-) -> (crate::execution::ExecutionPolicy, WorkspaceSandboxExtras) {
-    let snapshot = app_state.snapshot();
-    let Some(ws) = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)
-    else {
-        return (policy, WorkspaceSandboxExtras::default());
-    };
-    apply_sandbox_config_at(std::path::Path::new(&ws.cwd), policy)
-}
-
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
@@ -993,27 +981,7 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
     app_state.update_terminal_session_shell(&session_id, shell.clone());
 
     let cwd = session_working_dir(&app_state, &session_id);
-
-    // Phase 1 display-isolation wiring: route regular worktree shells through
-    // `prepare_agent_command` so the `allow_desktop_gui` policy is honored here
-    // too. With the default `worktree_session_default` policy
-    // (HostPassthrough + gui allowed) this is a no-op — the shell is spawned
-    // exactly as before. If a future per-workspace config flips
-    // `allow_desktop_gui` to `false`, `prepared.env_unset` will be populated
-    // with GUI env keys and stripped below, without wrapping the shell in
-    // bwrap (which would surprise users by breaking `systemctl --user`, etc.).
-    let session_policy = crate::execution::ExecutionPolicy::worktree_session_default();
-    let prepared_shell = crate::execution::prepare_agent_command(
-        shell.clone(),
-        Vec::new(),
-        &cwd,
-        &session_policy,
-    );
-
-    let mut cmd = CommandBuilder::new(&prepared_shell.executable);
-    for arg in &prepared_shell.args {
-        cmd.arg(arg);
-    }
+    let mut cmd = CommandBuilder::new(shell.clone());
     cmd.cwd(cwd);
 
     // Declare terminal capabilities — Codemux is the terminal emulator, so it
@@ -1116,19 +1084,6 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
-    }
-
-    // Phase 1 display-isolation: strip GUI env keys the policy marked for
-    // removal. With `worktree_session_default` (GUI allowed) this list is
-    // empty. If a user flips `allow_desktop_gui` off later, this is the line
-    // that actually prevents `DISPLAY`/`WAYLAND_DISPLAY`/etc. from reaching
-    // the child shell. Runs AFTER every `cmd.env(...)` above so nothing can
-    // silently re-set a stripped key.
-    for key in &prepared_shell.env_unset {
-        cmd.env_remove(key);
-    }
-    for (key, val) in &prepared_shell.env_set {
-        cmd.env(key, val);
     }
 
     let child = match pty_pair.slave.spawn_command(cmd) {
@@ -1631,6 +1586,8 @@ pub fn attach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = Some(channel.clone());
+            runtime.output_channel_generation =
+                runtime.output_channel_generation.saturating_add(1);
             if skip_pending.unwrap_or(false) {
                 vec![]
             } else {
@@ -1668,6 +1625,8 @@ pub fn detach_pty_output(
         || SessionRuntime::new(&session_id),
         |runtime| {
             runtime.output_channel = None;
+            runtime.output_channel_generation =
+                runtime.output_channel_generation.saturating_add(1);
         },
     );
 
@@ -1837,14 +1796,6 @@ pub fn spawn_pty_for_agent(
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let agent_store: State<'_, crate::openflow::AgentSessionStore> = app.state();
-
-    // Phase 2 display-isolation: per-workspace sandbox config wins over the
-    // adapter-provided policy defaults. Users toggle via `.codemux/config.json`:
-    //   {"sandbox": {"virtual_display": true, "watch_vnc": true}}
-    // If the file doesn't exist or the keys are absent, the adapter default
-    // (which itself reads the CODEMUX_VIRTUAL_DISPLAY env var) is preserved.
-    let (execution_policy, sandbox_extras) =
-        apply_workspace_sandbox_overrides(&app_state, &workspace_id, execution_policy);
     let sessions = terminal_state.sessions.clone();
     let agent_store_inner = agent_store.clone_inner();
 
@@ -1975,23 +1926,8 @@ pub fn spawn_pty_for_agent(
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
 
-    // Agent-specific env vars from the adapter. Adapter env is pre-filtered
-    // against `env_unset` so it can't silently re-set a policy-stripped key
-    // (e.g. an adapter propagating `DISPLAY` from the host env would otherwise
-    // un-do the `allow_desktop_gui=false` strip we're about to apply below).
-    // We still apply `env_unset` at the very end as the authoritative strip.
+    // Agent-specific env vars from the adapter.
     for (key, val) in &extra_env {
-        if prepared
-            .env_unset
-            .iter()
-            .any(|k| k.eq_ignore_ascii_case(key))
-            || prepared
-                .env_set
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case(key))
-        {
-            continue;
-        }
         cmd.env(key, val);
     }
 
@@ -2045,40 +1981,6 @@ pub fn spawn_pty_for_agent(
     }
     for (key, val) in &prepared.env_set {
         cmd.env(key, val);
-    }
-
-    // Phase 2 display-isolation: if the policy asks for a virtual display,
-    // acquire one for this workspace and inject `DISPLAY=:N` AFTER the strip
-    // above. Graceful degrade — if Xvfb isn't installed or the manager can't
-    // allocate a slot, we log, leave `DISPLAY` stripped, and the agent runs
-    // without a display (Phase 1 behavior). Agent code should be prepared for
-    // either outcome.
-    if execution_policy.virtual_display {
-        let manager: State<'_, crate::execution::virtual_display::VirtualDisplayManager> =
-            app.state();
-        let opts = crate::execution::virtual_display::AcquireOptions {
-            watch_vnc: sandbox_extras.watch_vnc,
-        };
-        match manager.acquire_with_options(&workspace_id, opts) {
-            Ok(vd_env) => {
-                for (k, v) in vd_env.env_pairs() {
-                    cmd.env(&k, &v);
-                }
-                let vnc_suffix = vd_env
-                    .vnc_port
-                    .map(|p| format!(" (VNC on 127.0.0.1:{p})"))
-                    .unwrap_or_default();
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::execution] Virtual display {} acquired for workspace {workspace_id}{vnc_suffix}",
-                    vd_env.display
-                ));
-            }
-            Err(e) => {
-                crate::diagnostics::stderr_line(&format!(
-                    "[codemux::execution] Virtual display requested but unavailable for workspace {workspace_id}: {e}"
-                ));
-            }
-        }
     }
 
     let child = match pty_pair.slave.spawn_command(cmd) {
@@ -2808,6 +2710,272 @@ mod tests {
         let runtime = guard.get("sess").unwrap();
         assert_eq!(runtime.pending_output.len(), 1);
         assert_eq!(runtime.pending_output[0], vec![1, 2, 3, 4, 5]);
+    }
+
+    /// dropped_chunks is per-session, not global — eviction in session A
+    /// must not increment session B's counter.
+    #[test]
+    fn test_dropped_chunks_isolated_per_session() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "a", || SessionRuntime::new("a"), |_| {});
+        with_session_runtime(&sessions, "b", || SessionRuntime::new("b"), |_| {});
+
+        for i in 0..OUTPUT_BUFFER_LIMIT + 3 {
+            queue_or_send_output(&sessions, "a", vec![i as u8]);
+        }
+        for i in 0..5 {
+            queue_or_send_output(&sessions, "b", vec![i]);
+        }
+
+        let guard = sessions.lock().unwrap();
+        assert_eq!(guard.get("a").unwrap().dropped_chunks, 3);
+        assert_eq!(guard.get("b").unwrap().dropped_chunks, 0);
+    }
+
+    /// dropped_chunks does not reset across attach/detach cycles. A counter
+    /// reset would obscure the cumulative regression signal.
+    #[test]
+    fn test_dropped_chunks_persists_across_attach_detach() {
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "persist",
+            || SessionRuntime::new("persist"),
+            |_| {},
+        );
+
+        for i in 0..OUTPUT_BUFFER_LIMIT + 7 {
+            queue_or_send_output(&sessions, "persist", vec![i as u8]);
+        }
+        let after_first_overflow = {
+            let guard = sessions.lock().unwrap();
+            guard.get("persist").unwrap().dropped_chunks
+        };
+        assert_eq!(after_first_overflow, 7);
+
+        // Simulate attach (mirrors attach_pty_output body): install a
+        // channel, drain pending_output, then detach again.
+        let channel: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        with_session_runtime(
+            &sessions,
+            "persist",
+            || SessionRuntime::new("persist"),
+            |runtime| {
+                runtime.output_channel = Some(channel);
+                runtime.pending_output.clear();
+            },
+        );
+        with_session_runtime(
+            &sessions,
+            "persist",
+            || SessionRuntime::new("persist"),
+            |runtime| {
+                runtime.output_channel = None;
+            },
+        );
+
+        // Counter should still reflect the prior overflow.
+        let guard = sessions.lock().unwrap();
+        assert_eq!(
+            guard.get("persist").unwrap().dropped_chunks,
+            7,
+            "dropped_chunks must NOT reset on attach/detach"
+        );
+    }
+
+    /// `dropped_chunks` increments exactly once per evicted chunk when the
+    /// buffer overflows with no channel attached. This is the observability
+    /// hook the cache architecture uses to detect a regression that would
+    /// silently lose PTY data.
+    #[test]
+    fn test_dropped_chunks_counter_increments_on_overflow() {
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "drop", || SessionRuntime::new("drop"), |_| {});
+
+        let extra = 5usize;
+        for i in 0..OUTPUT_BUFFER_LIMIT + extra {
+            queue_or_send_output(&sessions, "drop", vec![i as u8]);
+        }
+
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("drop").unwrap();
+        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_LIMIT);
+        assert_eq!(
+            runtime.dropped_chunks, extra as u64,
+            "dropped_chunks should record every eviction, not just the first"
+        );
+    }
+
+    /// The flush-on-attach mechanism is the load-bearing claim from the
+    /// terminal-rendering analysis §6 step 2. With the cache architecture the
+    /// channel stays attached for the session lifetime so this path is
+    /// effectively cold-start-only — but the invariant must still hold,
+    /// because cold start IS the only time the channel attaches and the
+    /// pending_output between PTY spawn and first attach must reach the
+    /// frontend in order, with no loss.
+    ///
+    /// Constructs a real `tauri::ipc::Channel` whose handler captures the
+    /// payload bytes, mirrors the body of `attach_pty_output` directly
+    /// (collecting `pending_output` then forwarding through the channel),
+    /// and asserts the consumer received the full stream in order.
+    #[test]
+    fn test_pending_output_replays_on_attach() {
+        use std::sync::Mutex as StdMutex;
+
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "replay",
+            || SessionRuntime::new("replay"),
+            |_| {},
+        );
+
+        // Queue bytes BEFORE any consumer exists — this is the "PTY ran
+        // ahead of the frontend attach" window.
+        for i in 0..10u8 {
+            queue_or_send_output(&sessions, "replay", vec![i, i + 100]);
+        }
+
+        let captured: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_handler = captured.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |body| {
+            let bytes = body.deserialize::<Vec<u8>>().expect("decode body");
+            captured_handler.lock().unwrap().push(bytes);
+            Ok(())
+        });
+
+        // Mirror the attach_pty_output Tauri command body directly: install
+        // the channel, snapshot pending_output, then forward each chunk.
+        let pending_chunks = with_session_runtime(
+            &sessions,
+            "replay",
+            || SessionRuntime::new("replay"),
+            |runtime| {
+                runtime.output_channel = Some(channel.clone());
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+                runtime.pending_output.iter().cloned().collect::<Vec<_>>()
+            },
+        );
+        for chunk in pending_chunks {
+            channel.send(chunk).expect("channel send");
+        }
+
+        let received = captured.lock().unwrap().clone();
+        assert_eq!(received.len(), 10, "consumer should see every chunk");
+        for (i, chunk) in received.iter().enumerate() {
+            assert_eq!(
+                chunk,
+                &vec![i as u8, i as u8 + 100],
+                "chunk {i} payload preserved end-to-end"
+            );
+        }
+    }
+
+    /// With the cache architecture, the channel stays attached for the full
+    /// session lifetime. Once attached, every subsequent chunk produced by
+    /// the reader thread (modeled here as direct `queue_or_send_output`
+    /// calls) is forwarded to the consumer immediately. The pending_output
+    /// buffer remains a bounded replay window; live delivery is separate and
+    /// must not count normal ring-buffer eviction as dropped frontend output.
+    #[test]
+    fn test_attached_channel_receives_live_writes() {
+        use std::sync::Mutex as StdMutex;
+
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "live",
+            || SessionRuntime::new("live"),
+            |_| {},
+        );
+
+        let captured: Arc<StdMutex<Vec<Vec<u8>>>> = Arc::new(StdMutex::new(Vec::new()));
+        let captured_handler = captured.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |body| {
+            let bytes = body.deserialize::<Vec<u8>>().expect("decode body");
+            captured_handler.lock().unwrap().push(bytes);
+            Ok(())
+        });
+        with_session_runtime(
+            &sessions,
+            "live",
+            || SessionRuntime::new("live"),
+            |runtime| {
+                runtime.output_channel = Some(channel);
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+            },
+        );
+
+        // Drive the same path the reader thread uses for each batched flush.
+        for i in 0..OUTPUT_BUFFER_LIMIT + 5 {
+            queue_or_send_output(&sessions, "live", vec![i as u8]);
+        }
+
+        let received = captured.lock().unwrap().clone();
+        assert_eq!(
+            received.len(),
+            OUTPUT_BUFFER_LIMIT + 5,
+            "channel should receive every chunk synchronously when attached"
+        );
+        for (i, chunk) in received.iter().enumerate() {
+            assert_eq!(chunk, &vec![i as u8]);
+        }
+
+        // pending_output is still appended to (the buffer is the source for
+        // cold-start replay if the consumer ever reattaches), but the
+        // channel-side delivery is the live path and never lossy. Verify
+        // chunks are bounded by OUTPUT_BUFFER_LIMIT and that no drops have
+        // occurred — drops are the regression signal added in 2.6.
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("live").unwrap();
+        assert!(runtime.pending_output.len() <= OUTPUT_BUFFER_LIMIT);
+        assert_eq!(
+            runtime.dropped_chunks, 0,
+            "bounded replay eviction is not dropped live output while channel is attached"
+        );
+    }
+
+    #[test]
+    fn test_attached_channel_send_happens_outside_sessions_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "live-lock",
+            || SessionRuntime::new("live-lock"),
+            |_| {},
+        );
+
+        let send_observed_unlocked_mutex = Arc::new(AtomicBool::new(false));
+        let observed = send_observed_unlocked_mutex.clone();
+        let sessions_for_handler = sessions.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |_| {
+            if sessions_for_handler.try_lock().is_ok() {
+                observed.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        });
+
+        with_session_runtime(
+            &sessions,
+            "live-lock",
+            || SessionRuntime::new("live-lock"),
+            |runtime| {
+                runtime.output_channel = Some(channel);
+                runtime.output_channel_generation =
+                    runtime.output_channel_generation.saturating_add(1);
+            },
+        );
+
+        queue_or_send_output(&sessions, "live-lock", vec![42]);
+
+        assert!(
+            send_observed_unlocked_mutex.load(Ordering::SeqCst),
+            "channel.send must not run while the global sessions mutex is held"
+        );
     }
 
     #[test]
@@ -4166,124 +4334,6 @@ mod tests {
             // Cannot simulate portable_pty::Child::process_id() returning
             // None without mocking the crate. The spawn path now fails
             // loudly (Fix 2). Documented as untested.
-        }
-    }
-
-    // ── Phase 2 sandbox-override helper tests ────────────────────────
-    //
-    // `apply_sandbox_config_at` is the pure core of
-    // `apply_workspace_sandbox_overrides` — takes a workspace cwd + starting
-    // policy, reads `.codemux/config.json`, merges the `sandbox` section.
-    // These tests drive it with real config files in tempdirs so the
-    // merge-precedence contract is tested end-to-end.
-
-    mod sandbox_overrides {
-        use super::*;
-        use std::fs;
-
-        fn default_policy() -> crate::execution::ExecutionPolicy {
-            crate::execution::ExecutionPolicy {
-                backend_preference: crate::execution::ExecutionBackendKind::HostPassthrough,
-                allow_network: true,
-                allow_browser_automation: true,
-                allow_desktop_gui: false,
-                virtual_display: false,
-            }
-        }
-
-        fn write_config(dir: &std::path::Path, body: &str) {
-            let cfg_dir = dir.join(".codemux");
-            fs::create_dir_all(&cfg_dir).unwrap();
-            fs::write(cfg_dir.join("config.json"), body).unwrap();
-        }
-
-        #[test]
-        fn no_config_file_leaves_policy_and_extras_untouched() {
-            let tmp = tempfile::tempdir().unwrap();
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn empty_sandbox_section_is_noop() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn virtual_display_override_flips_policy_field() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"virtual_display": true}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(policy.virtual_display);
-            // Other fields untouched.
-            assert!(!policy.allow_desktop_gui);
-            // watch_vnc wasn't in the config — extras default.
-            assert!(!extras.watch_vnc);
-        }
-
-        #[test]
-        fn allow_desktop_gui_override_flips_policy_field() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"allow_desktop_gui": true}}"#);
-            let (policy, _) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(policy.allow_desktop_gui);
-            // virtual_display unchanged.
-            assert!(!policy.virtual_display);
-        }
-
-        #[test]
-        fn watch_vnc_lands_in_extras_not_policy() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), r#"{"sandbox": {"watch_vnc": true}}"#);
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert!(extras.watch_vnc);
-            // Policy untouched — watch_vnc is a display-manager concern,
-            // not an execution policy concern.
-            assert_eq!(policy, default_policy());
-        }
-
-        #[test]
-        fn all_three_fields_together() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(
-                tmp.path(),
-                r#"{"sandbox": {"allow_desktop_gui": false, "virtual_display": true, "watch_vnc": true}}"#,
-            );
-            let starting = crate::execution::ExecutionPolicy::worktree_session_default();
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), starting);
-            assert!(!policy.allow_desktop_gui, "config should override to false");
-            assert!(policy.virtual_display);
-            assert!(extras.watch_vnc);
-        }
-
-        #[test]
-        fn malformed_json_is_noop_not_panic() {
-            let tmp = tempfile::tempdir().unwrap();
-            write_config(tmp.path(), "{not: valid json");
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            // read_workspace_config returns None on parse error → fall
-            // through to caller defaults. MUST NOT panic.
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
-        }
-
-        #[test]
-        fn config_without_sandbox_section_is_back_compat() {
-            let tmp = tempfile::tempdir().unwrap();
-            // Mimics an existing .codemux/config.json written before Phase 2
-            // landed — must not panic and must preserve caller defaults.
-            write_config(
-                tmp.path(),
-                r#"{"setup": ["npm install"], "teardown": []}"#,
-            );
-            let (policy, extras) = apply_sandbox_config_at(tmp.path(), default_policy());
-            assert_eq!(policy, default_policy());
-            assert_eq!(extras, WorkspaceSandboxExtras::default());
         }
     }
 }

@@ -1,6 +1,6 @@
 {
   "name": "codemux",
-  "version": "0.1.26",
+  "version": "0.1.33",
   "description": "The Agentic Development Environment for Builders",
   "type": "module",
   "scripts": {
@@ -40,6 +40,7 @@
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@lezer/highlight": "^1.2.3",
     "@radix-ui/react-collapsible": "^1.1.12",
+    "@tanstack/react-query": "^5.100.5",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.7.0",
     "@tauri-apps/plugin-opener": "^2",
@@ -47,6 +48,7 @@
     "@tauri-apps/plugin-updater": "^2.10.0",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/addon-unicode11": "^0.9.0",
     "@xterm/addon-webgl": "^0.19.0",
     "@xterm/xterm": "^6.0.0",
     "agent-browser": "^0.24.0",

@@ -48,6 +48,20 @@ pub struct PullRequestInfo {
     pub author: Option<String>,
 }
 
+impl PullRequestInfo {
+    /// State string that feeds the workspace `pr_state` field (and the
+    /// sidebar PR-status icon). Collapses `is_draft: true` into a "DRAFT"
+    /// label so the sidebar can pick the muted draft icon without needing
+    /// a separate `is_draft` column on the workspace.
+    pub fn display_state(&self) -> String {
+        if self.is_draft {
+            "DRAFT".to_string()
+        } else {
+            self.state.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IncomingPrItem {
     pub number: u32,
@@ -777,6 +791,13 @@ pub fn list_incoming_prs(
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
 
+// NOTE: As of 2026-04-26 the Review tab UI no longer exposes its own
+// merge controls — that section was removed in the visual-match PR
+// (`feature/review-tab-visual-match`). The Changes panel toolbar's
+// split-button merge dropdown still uses this command, so this is not
+// dead code; it's the active merge surface for Codemux. Comment kept
+// for future archeology in case someone wonders why the Review tab
+// doesn't have its own merge UI.
 pub fn merge_pull_request(
     repo_path: &Path,
     pr_number: u32,
@@ -796,15 +817,42 @@ pub fn merge_pull_request(
 }
 
 pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
-    let output = run_gh_optional(
-        repo_path,
-        &["pr", "checks", "--json", "name,state,conclusion,elapsedTime,detailUrl,startedAt,completedAt"],
-    );
+    // `gh pr checks --json` only accepts a specific field set:
+    // bucket / completedAt / description / event / link / name /
+    // startedAt / state / workflow. The previous version asked for
+    // `conclusion,elapsedTime,detailUrl` — none of which exist on
+    // gh's side, so gh wrote "Unknown JSON field" to stderr and
+    // stdout was empty for every PR. That's why the Checks section
+    // showed "No checks reported." even when CI was actively running.
+    //
+    // Mapping to our CheckInfo struct:
+    //   gh `bucket` ("pass" / "fail" / "pending" / "skipping" /
+    //                "cancel") → conclusion (matches the strings the
+    //                frontend's CheckIcon already understands).
+    //   gh `link`            → detail_url
+    //   gh `state`           → status (raw "IN_PROGRESS" / "COMPLETED"
+    //                                   / "QUEUED" — fallback when
+    //                                   bucket is empty).
+    //   elapsed_time         → None for now (gh doesn't expose it on
+    //                                  this command; could be derived
+    //                                  later from started/completed).
+    //
+    // Also: `gh pr checks` exits non-zero when checks are pending
+    // (exit 1) or any have failed (exit 8) but still writes valid
+    // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
+    // on non-zero exit) and capture stdout regardless.
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "checks",
+            "--json",
+            "name,state,bucket,link,startedAt,completedAt",
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run gh: {e}"))?;
 
-    let Some(json_str) = output else {
-        return Ok(Vec::new());
-    };
-
+    let json_str = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
     if json_str.is_empty() {
         return Ok(Vec::new());
     }
@@ -818,9 +866,9 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
         .map(|c| CheckInfo {
             name: c["name"].as_str().unwrap_or("").to_string(),
             status: c["state"].as_str().unwrap_or("pending").to_string(),
-            conclusion: c["conclusion"].as_str().map(|s| s.to_string()),
-            elapsed_time: c["elapsedTime"].as_str().map(|s| s.to_string()),
-            detail_url: c["detailUrl"].as_str().map(|s| s.to_string()),
+            conclusion: c["bucket"].as_str().map(|s| s.to_string()),
+            elapsed_time: None,
+            detail_url: c["link"].as_str().map(|s| s.to_string()),
             started_at: c["startedAt"].as_str().map(|s| s.to_string()),
             completed_at: c["completedAt"].as_str().map(|s| s.to_string()),
         })
@@ -902,6 +950,12 @@ pub fn get_pr_inline_comments(
         .collect())
 }
 
+// NOTE: As of 2026-04-26 the Review tab UI no longer exposes review
+// submission — the composer was removed in the visual-match PR
+// (`feature/review-tab-visual-match`) to mirror Superset's resting
+// layout. This command is retained intact in case the UI is restored
+// later (e.g. command palette action, modal, or context menu). Don't
+// delete without confirming with the maintainer.
 pub fn submit_pr_review(
     repo_path: &Path,
     pr_number: u32,
@@ -1239,21 +1293,6 @@ mod tests {
         assert_eq!(comment.path, "src/main.rs");
         assert_eq!(comment.line, Some(42));
         assert_eq!(comment.pull_request_review_id, Some(200));
-    }
-
-    #[test]
-    fn test_parse_deployment_info() {
-        let json = r#"{
-            "id": 500,
-            "environment": "preview",
-            "state": "success",
-            "url": "https://preview.example.com",
-            "created_at": "2026-01-20T12:00:00Z"
-        }"#;
-        let dep: DeploymentInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(dep.id, 500);
-        assert_eq!(dep.environment, "preview");
-        assert_eq!(dep.url.as_deref(), Some("https://preview.example.com"));
     }
 
     #[test]

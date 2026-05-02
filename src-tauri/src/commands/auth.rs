@@ -1,10 +1,11 @@
 use tauri::{Emitter, State};
 
 use crate::auth::{
-    api_base_url, clear_token, delete_encryption_key, derive_login_credentials,
-    is_token_expired, load_cached_user, load_encryption_key, load_stored_auth_method,
-    load_token, save_auth, save_encryption_key, save_stored_auth_method, AuthResponse,
-    AuthState, AuthStatePayload, AuthUser,
+    api_base_url, clear_token, delete_encryption_key, derive_auth_secret,
+    derive_login_credentials, is_token_expired, load_cached_user, load_encryption_key,
+    load_stored_auth_method, load_token, login_email_api, save_auth, save_encryption_key,
+    save_stored_auth_method, signup_email_api, AuthResponse, AuthState, AuthStatePayload,
+    AuthUser,
 };
 use crate::database::DatabaseStore;
 use crate::encryption::EncryptionManager;
@@ -73,29 +74,23 @@ pub async fn signin_email(
         return Err("Email and password are required".into());
     }
 
-    let base = api_base_url();
-    let url = format!("{base}/api/auth/desktop/signin");
+    // Bitwarden-style zero-knowledge derivation: stretch
+    // (password, email) locally into a high-entropy AuthSecret and
+    // a per-user EncryptionKey. The AuthSecret goes to Better Auth
+    // in place of the raw password; the EncryptionKey stays
+    // on-device for Step 10 skills sync. Must produce byte-identical
+    // output to Vexis's derivation or cross-product login + sync
+    // break — pinned by `auth_secret_matches_vexis_for_known_input`
+    // and `encryption_key_matches_vexis_for_known_input` in
+    // auth/derivation.rs.
+    //
+    // `login_email_api` takes `&AuthSecret`, not `&str` — the
+    // compiler refuses to let us pass the raw password past this
+    // point.
+    let (auth_secret, encryption_key) = derive_login_credentials(&password, &email)?;
+    drop(password); // raw password falls out of scope; only the derived secrets proceed.
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "email": email, "password": password }))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Authentication failed");
-        return Err(msg.to_string());
-    }
-
-    let api_resp: ApiAuthResp = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse response: {e}"))?;
+    let api_resp = login_email_api(&email, &auth_secret).await?;
 
     let user = AuthUser {
         id: api_resp.user.id.clone(),
@@ -115,28 +110,20 @@ pub async fn signin_email(
     }
 
     // Email/password users get sync set up automatically on signin.
-    // The same password they typed produces both the AuthSecret
-    // (already accepted by the server, otherwise we'd have failed
-    // above) and the EncryptionKey we need locally. Derive both
-    // here, persist the key machine-bound, and load it into memory
-    // so Stage 3's sync layer finds `is_available()=true` on first
-    // call. A failure here is logged but does NOT fail signin —
-    // the user is signed in regardless; they can repair via the
-    // Settings → Sync "re-enter password" form if persistence
-    // failed (rare: read-only filesystem, full disk).
+    // The EncryptionKey was derived alongside the AuthSecret above
+    // (single Argon2id stretch — paying the cost twice would be
+    // wasteful), so we just persist + load it now. A failure here is
+    // logged but does NOT fail signin — the user is signed in
+    // regardless; they can repair via the Settings → Sync "re-enter
+    // password" form if persistence failed (rare: read-only
+    // filesystem, full disk).
     auth_state.set_auth_method(Some("email"));
-    match derive_login_credentials(&password, &user.email) {
-        Ok((_auth_secret, key)) => {
-            let key_bytes = *key.expose_for_smoke_test();
-            if let Err(err) = save_encryption_key(&key_bytes) {
-                eprintln!("[signin_email] save sync-key.enc failed: {err}");
-            } else if let Err(err) = encryption.set_key(key_bytes) {
-                eprintln!("[signin_email] EncryptionManager.set_key failed: {err}");
-            }
-        }
-        Err(err) => {
-            eprintln!("[signin_email] derive_login_credentials failed: {err}");
-        }
+    let key_bytes = *encryption_key.expose_for_smoke_test();
+    drop(encryption_key); // raw key bytes out of scope after this.
+    if let Err(err) = save_encryption_key(&key_bytes) {
+        eprintln!("[signin_email] save sync-key.enc failed: {err}");
+    } else if let Err(err) = encryption.set_key(key_bytes) {
+        eprintln!("[signin_email] EncryptionManager.set_key failed: {err}");
     }
 
     let auth_response = AuthResponse {
@@ -171,28 +158,18 @@ pub async fn signup_email(
         return Err("Email and password are required".into());
     }
 
-    let base = api_base_url();
-    let url = format!("{base}/api/auth/desktop/signup");
+    // Bitwarden-style zero-knowledge derivation: the server only
+    // ever sees the stretched AuthSecret, never the raw password.
+    // Must match Vexis's derivation byte-for-byte or a user who
+    // signs up in Codemux can't later sign in from Vexis (and vice
+    // versa). See auth/derivation.rs.
+    //
+    // `signup_email_api` takes `&AuthSecret` — the compiler refuses
+    // to let the raw password reach the network.
+    let auth_secret = derive_auth_secret(&password, &email)?;
+    drop(password); // raw password falls out of scope; only the derived secret proceeds.
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({
-            "email": email,
-            "password": password,
-            "name": name,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        let msg = body["error"]
-            .as_str()
-            .unwrap_or("Sign-up failed");
-        return Err(msg.to_string());
-    }
+    signup_email_api(&email, &auth_secret, &name).await?;
 
     // Don't save token — user must verify email first, then sign in
     Ok(())
@@ -582,14 +559,11 @@ async fn set_password_api(token: &str, auth_secret: &str) -> Result<(), String> 
 }
 
 // ── Internal types for API deserialization ────────────────────────
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiAuthResp {
-    token: String,
-    #[serde(rename = "expiresAt")]
-    expires_at: String,
-    user: ApiUserResp,
-}
+//
+// `check_auth` still hand-rolls its `/desktop/verify` HTTP call
+// here (no password involved, so it doesn't need the typed
+// AuthSecret boundary). The signin/signup response types live in
+// `auth/api.rs` alongside the typed helpers that return them.
 
 #[derive(Debug, serde::Deserialize)]
 struct ApiUserResp {

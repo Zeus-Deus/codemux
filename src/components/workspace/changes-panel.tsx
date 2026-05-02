@@ -99,6 +99,8 @@ import {
   gitStashPush,
   gitStashPop,
   getCommitFiles,
+  mergePullRequest,
+  refreshWorkspacePr,
   activateWorkspace,
   closeWorkspace,
   createWorkspace,
@@ -117,6 +119,10 @@ import {
   VscDiffRenamed,
   VscCopy,
 } from "react-icons/vsc";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { useQueryClient } from "@tanstack/react-query";
+import { PrStatusIcon } from "@/components/github/pr-status-icon";
+import { cn } from "@/lib/utils";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
@@ -1007,6 +1013,16 @@ function FileSection({
 
 export function ChangesPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
+  const queryClient = useQueryClient();
+  // Invalidates every Review-tab query for this workspace so the
+  // panel refetches the moment a commit / push / pull / merge lands.
+  // Mirrors Superset's onRefresh wiring at CommitInput.tsx:57-101.
+  const invalidateReviewQueries = useCallback(() => {
+    queryClient.invalidateQueries({
+      predicate: (q) =>
+        q.queryKey[0] === "pr" && q.queryKey[2] === workspace.workspace_id,
+    });
+  }, [queryClient, workspace.workspace_id]);
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
   const [commits, setCommits] = useState<GitLogEntry[]>([]);
@@ -1020,6 +1036,10 @@ export function ChangesPanel({ workspace }: Props) {
   const [commitsExpanded, setCommitsExpanded] = useState(false);
   const [expandedCommits, setExpandedCommits] = useState<Set<string>>(new Set());
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
+  // Tracks an in-flight `gh pr merge`. While set, the merge dropdown
+  // items are disabled and the chevron shows a spinner so the user
+  // doesn't double-fire the command.
+  const [mergingPr, setMergingPr] = useState<null | "squash" | "merge" | "rebase">(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Against-base state
@@ -1187,6 +1207,7 @@ export function ChangesPanel({ workspace }: Props) {
       setExpandedFile(null);
       refresh();
       refreshBaseDiff();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1203,6 +1224,7 @@ export function ChangesPanel({ workspace }: Props) {
       await gitPushChanges(cwd, !!needsPublish);
       refresh();
       refreshBaseDiff();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1217,6 +1239,7 @@ export function ChangesPanel({ workspace }: Props) {
     try {
       await gitPullChanges(cwd);
       refresh();
+      invalidateReviewQueries();
     } catch (err) {
       setGitError(String(err));
     } finally {
@@ -1235,6 +1258,33 @@ export function ChangesPanel({ workspace }: Props) {
       setGitError(String(err));
     } finally {
       setBusyAction(null);
+    }
+  };
+
+  // Merge the open PR via `gh pr merge`. Method maps to GitHub's three
+  // merge strategies. After success, kick refreshWorkspacePr so the
+  // sidebar pill flips to MERGED (purple) without waiting for the 60s
+  // background poll, plus refresh the changes panel itself so deleted
+  // branch / fetch state catches up. On failure, surface the raw error
+  // via toast — no two-tap confirmation since the dropdown click itself
+  // is the deliberate action.
+  const handleMergePr = async (method: "squash" | "merge" | "rebase") => {
+    if (workspace.pr_number == null || mergingPr !== null) return;
+    setMergingPr(method);
+    try {
+      await mergePullRequest(cwd, workspace.pr_number, method);
+      const verb =
+        method === "squash" ? "squashed" : method === "rebase" ? "rebased" : "merged";
+      toast.success(`PR #${workspace.pr_number} ${verb}`);
+      refreshWorkspacePr(workspace.workspace_id).catch(console.error);
+      refresh();
+      refreshBaseDiff();
+      invalidateReviewQueries();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      toast.error(`Couldn't merge PR: ${msg}`);
+    } finally {
+      setMergingPr(null);
     }
   };
 
@@ -1782,6 +1832,82 @@ export function ChangesPanel({ workspace }: Props) {
               Refresh
             </TooltipContent>
           </Tooltip>
+
+          {/* PR button — right-aligned (Superset's ChangesHeader pattern).
+              Renders only when a PR URL is known. For OPEN PRs it's a
+              split button: main half opens GitHub, chevron half opens a
+              merge dropdown (squash / merge commit / rebase). For
+              MERGED/CLOSED/DRAFT PRs only the GitHub-link half renders
+              since merge methods don't apply to them. */}
+          {workspace.pr_url && (
+            <div className="ml-auto flex items-center">
+              <Button
+                variant="outline"
+                size="xs"
+                className={cn(
+                  workspace.pr_state === "OPEN" &&
+                    workspace.pr_number != null &&
+                    "rounded-r-none border-r-0",
+                )}
+                onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
+                aria-label={
+                  workspace.pr_number != null
+                    ? `Open PR #${workspace.pr_number} on GitHub`
+                    : "Open PR on GitHub"
+                }
+              >
+                <PrStatusIcon state={workspace.pr_state} size={3} />
+                {workspace.pr_number != null && (
+                  <span className="tabular-nums">#{workspace.pr_number}</span>
+                )}
+              </Button>
+              {workspace.pr_state === "OPEN" && workspace.pr_number != null && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="outline"
+                      size="icon-xs"
+                      className="size-6 p-0 rounded-l-none"
+                      disabled={mergingPr !== null}
+                      aria-label="Merge PR"
+                    >
+                      {mergingPr !== null ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <ChevronDown className="h-3 w-3" />
+                      )}
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-fit">
+                    <DropdownMenuItem
+                      onClick={() => handleMergePr("squash")}
+                      disabled={mergingPr !== null}
+                      className="text-xs"
+                    >
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
+                      Squash and merge
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => handleMergePr("merge")}
+                      disabled={mergingPr !== null}
+                      className="text-xs"
+                    >
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
+                      Create merge commit
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => handleMergePr("rebase")}
+                      disabled={mergingPr !== null}
+                      className="text-xs"
+                    >
+                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
+                      Rebase and merge
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Commit area */}

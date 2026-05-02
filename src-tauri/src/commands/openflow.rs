@@ -67,10 +67,9 @@ pub struct OrchestratorTriggerResult {
 }
 
 fn which_tool(name: &str) -> Option<String> {
-    let mut cmd = std::process::Command::new("which");
-    cmd.arg(name);
-    crate::execution::sanitize_gui_env_std(&mut cmd);
-    cmd.output()
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
@@ -436,10 +435,9 @@ pub fn list_available_cli_tools() -> Result<Vec<CliToolInfo>, String> {
 pub fn list_models_for_tool(tool_id: String) -> Result<Vec<ModelInfo>, String> {
     match tool_id.as_str() {
         "opencode" => {
-            let mut cmd = std::process::Command::new("opencode");
-            cmd.arg("models");
-            crate::execution::sanitize_gui_env_std(&mut cmd);
-            let output = cmd.output();
+            let output = std::process::Command::new("opencode")
+                .arg("models")
+                .output();
             match output {
                 Ok(output) if output.status.success() => {
                     let text = String::from_utf8_lossy(&output.stdout);
