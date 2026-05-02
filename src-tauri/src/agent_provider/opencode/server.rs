@@ -340,6 +340,10 @@ mod tests {
         );
     }
 
+    // Unix-only: relies on `/bin/true` which doesn't exist on Windows.
+    // The spawn_failed path on Windows is already covered by
+    // `spawn_against_missing_binary_returns_spawn_failed` above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn spawn_against_non_opencode_binary_times_out_or_reports_missing_banner() {
         // `/bin/true` exits 0 with no stdout — should surface as
