@@ -511,7 +511,7 @@ pub async fn list_chat_provider_capabilities(
     provider: ProviderKind,
     opencode_manager: tauri::State<
         '_,
-        crate::agent_provider::opencode::OpenCodeServerManager,
+        std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
     >,
 ) -> Result<ProviderChatCapabilities, String> {
     match provider {
@@ -523,7 +523,7 @@ pub async fn list_chat_provider_capabilities(
         ),
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
-                opencode_manager.inner(),
+                opencode_manager.inner().as_ref(),
             )
             .await
         }

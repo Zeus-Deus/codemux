@@ -152,7 +152,7 @@ pub fn run() {
         // entry point used by `opencode_list_models`; the server is
         // not spawned until the first call. Shutting Codemux down
         // drops this state, which `kill_on_drop`-kills the child.
-        .manage(crate::agent_provider::opencode::OpenCodeServerManager::new())
+        .manage(std::sync::Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new()))
         // MCP runtime registry. `agent_chat_start_session` reads this
         // via `app.state::<McpRegistry>()` to lazily prime servers
         // before launching a chat, and the `commands::mcp::*` Tauri
@@ -557,6 +557,30 @@ pub fn run() {
                         );
                         registry
                             .set_codex(std::sync::Arc::new(codex) as _)
+                            .await;
+
+                        // OpenCode provider — Step 12 Stage 8. Shares
+                        // the singleton OpenCodeServerManager held in
+                        // Tauri-managed state (registered as
+                        // `Arc<OpenCodeServerManager>` at lib.rs:155)
+                        // so a single `opencode serve` child backs
+                        // both the model-list discovery flow and the
+                        // chat runtime. The server is spawned lazily
+                        // on the first start_session call — a missing
+                        // `opencode` binary surfaces as
+                        // `NotInstalled` per session start, never as
+                        // a startup failure.
+                        let opencode_manager: tauri::State<
+                            '_,
+                            std::sync::Arc<agent_provider::opencode::OpenCodeServerManager>,
+                        > = registry_handle.state();
+                        let opencode_provider =
+                            agent_provider::opencode::OpenCodeAgentProvider::new(
+                                opencode_manager.inner().clone(),
+                                agent_provider::opencode::OpenCodeProviderConfig::default(),
+                            );
+                        registry
+                            .set_opencode(std::sync::Arc::new(opencode_provider) as _)
                             .await;
 
                         // Bridge provider events to the frontend

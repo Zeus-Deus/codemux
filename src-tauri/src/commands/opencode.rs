@@ -91,7 +91,7 @@ pub async fn opencode_ping(
 ///   [`OpenCodeClient::list_models`].
 #[tauri::command]
 pub async fn opencode_list_models(
-    manager: State<'_, OpenCodeServerManager>,
+    manager: State<'_, std::sync::Arc<OpenCodeServerManager>>,
 ) -> Result<Vec<OpenCodeProviderEntry>, String> {
     let handle = manager.ensure_running().await?;
     let mut config = OpenCodeClientConfig::new(handle.base_url);

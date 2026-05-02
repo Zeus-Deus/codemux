@@ -35,7 +35,7 @@ chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 notify-rust = "4"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 base64 = "0.22"
 tempfile = "3"
 tokio-tungstenite = "0.26"

@@ -45,15 +45,31 @@
 //! seam (`ProviderKind::OpenCode`) and stand up the discovery surface so
 //! later stages can build the live integration without rewriting prior
 //! work.
+//!
+//! # Stage 8 additions
+//!
+//! Stage 8 lands the runtime [`AgentProvider`](crate::agent_provider::AgentProvider)
+//! impl ([`OpenCodeAgentProvider`]) plus the per-thread session
+//! ([`OpenCodeSession`]), HTTP/SSE protocol types, and the SSE
+//! listener that bridges OpenCode's global event channel onto
+//! Codemux's canonical [`crate::agent_provider::ProviderRuntimeEvent`]
+//! stream.
 
+pub mod agent;
 pub mod capabilities;
 pub mod client;
 pub mod discovery;
 pub mod manager;
+pub mod protocol;
 pub mod server;
+pub mod session;
+pub mod sse;
+pub mod translate;
 
+pub use agent::{OpenCodeAgentProvider, OpenCodeProviderConfig};
 pub use capabilities::opencode_stage1_placeholder;
 pub use client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeModel, OpenCodeProviderEntry};
 pub use discovery::{check_opencode_availability, OpenCodeAvailability, MINIMUM_OPENCODE_VERSION};
 pub use manager::{OpenCodeServerHandle, OpenCodeServerManager};
 pub use server::OpenCodeServer;
+pub use session::OpenCodeSession;
