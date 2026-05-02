@@ -540,17 +540,8 @@ function ModelRow({
       )}
     >
       <div className="min-w-0 flex-1 text-left">
-        <div className="flex items-center gap-2 text-xs font-medium leading-snug">
+        <div className="text-xs font-medium leading-snug">
           <span className="truncate">{model.label}</span>
-          {model.is_free ? (
-            <span
-              data-testid="model-row-free-badge"
-              className="shrink-0 rounded border border-emerald-500/35 bg-emerald-500/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
-              aria-label="Free model"
-            >
-              Free
-            </span>
-          ) : null}
         </div>
         <div className="mt-0.5 flex items-center gap-1 text-[11px] text-muted-foreground/70">
           <ProviderLogo
@@ -560,6 +551,15 @@ function ModelRow({
           <span className="truncate">{subtitle}</span>
         </div>
       </div>
+      {model.is_free ? (
+        <span
+          data-testid="model-row-free-badge"
+          className="mt-0.5 shrink-0 self-start rounded border border-emerald-500/35 bg-emerald-500/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+          aria-label="Free model"
+        >
+          Free
+        </span>
+      ) : null}
       <button
         type="button"
         onClick={(e) => {
