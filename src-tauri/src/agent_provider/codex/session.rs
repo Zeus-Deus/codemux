@@ -23,9 +23,9 @@ use crate::agent_provider::{
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::protocol::{
-    ApprovalResponse, Capabilities, ClientInfo, InitializeParams, NotificationMessage,
-    ServerRequestMessage, ThreadResumeParams, ThreadStartParams, ThreadStartResponse,
-    TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
+    AccountReadResponse, ApprovalResponse, Capabilities, ClientInfo, InitializeParams,
+    NotificationMessage, ServerRequestMessage, ThreadResumeParams, ThreadStartParams,
+    ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
     RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
 use super::translate::{translate_notification, translate_server_request};
@@ -73,6 +73,11 @@ pub(crate) struct CodexSessionState {
     pub status: SessionStatus,
     /// Current model override (session-wide default).
     pub model: Option<String>,
+    /// Per-session reasoning-effort default. Applied to every
+    /// `turn/start` whose caller does not provide an `effort_override`
+    /// — mirrors the reference's `collaborationMode.settings.reasoning_effort`
+    /// session default.
+    pub default_effort: Option<String>,
 }
 
 /// Handle for a live Codex session.
@@ -108,6 +113,7 @@ impl CodexSession {
         cwd: PathBuf,
         model: Option<String>,
         permission_mode: Option<String>,
+        effort: Option<String>,
         resume_cursor: Option<Value>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
@@ -176,8 +182,30 @@ impl CodexSession {
                 });
             }
         }
+        // account/read is the canonical "are you logged in?" check. If
+        // `requires_openai_auth: true` the user has no credentials —
+        // surface as `NotAuthenticated` upfront instead of letting
+        // `thread/start` fail later with a cryptic message. RPC failure
+        // (binary error, not auth) is logged but tolerated; the session
+        // proceeds and turns will fail with the underlying error.
         match child.request("account/read", json!({})).await {
-            Ok(_) => {}
+            Ok(resp) => match serde_json::from_value::<AccountReadResponse>(resp) {
+                Ok(info) if info.requires_openai_auth => {
+                    let _ = child.shutdown().await;
+                    return Err(ProviderError::NotAuthenticated {
+                        provider: crate::agent_provider::ProviderKind::Codex,
+                        hint: "Run `codex login` and try again.".into(),
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(thread_id.clone()),
+                        message: format!("account/read decode failed: {e}"),
+                        original_payload: None,
+                    });
+                }
+            },
             Err(e) => {
                 let _ = event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
                     thread_id: Some(thread_id.clone()),
@@ -256,6 +284,7 @@ impl CodexSession {
             pending_approvals: HashMap::new(),
             status: SessionStatus::Ready,
             model,
+            default_effort: effort,
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -319,11 +348,12 @@ impl CodexSession {
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
-        let (codex_thread_id, model_default, already_active) = {
+        let (codex_thread_id, model_default, effort_default, already_active) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
+                state.default_effort.clone(),
                 state.active_turn.clone(),
             )
         };
@@ -343,6 +373,12 @@ impl CodexSession {
         // Bytes are encoded as `data:` URIs inline — Codex's
         // app-server doesn't expose a separate file-upload API, so
         // base64-in-URL is the canonical local-bytes path.
+        //
+        // Image-only turn handling: when `text` is empty AND there's at
+        // least one image, skip the trailing empty text item entirely.
+        // The pre-Stage-9 adapter pushed an empty `TurnInputItem::Text`
+        // alongside images, which Codex rejects with a 400 on the
+        // image-only path.
         use base64::Engine;
         let mut input_items: Vec<TurnInputItem> = Vec::with_capacity(images.len() + 1);
         for img in images {
@@ -352,17 +388,20 @@ impl CodexSession {
                 url: format!("data:{};base64,{}", img.media_type, encoded),
             });
         }
-        input_items.push(TurnInputItem::Text {
-            text,
-            text_elements: vec![],
-        });
+        let trimmed_text = text.trim();
+        if !trimmed_text.is_empty() || input_items.is_empty() {
+            input_items.push(TurnInputItem::Text {
+                text,
+                text_elements: vec![],
+            });
+        }
 
         let params = TurnStartParams {
             thread_id: codex_thread_id,
             input: input_items,
             model: model_override.or(model_default),
             service_tier: None,
-            effort: effort_override,
+            effort: effort_override.or(effort_default),
             collaboration_mode: None,
         };
         let params_value = serde_json::to_value(&params).unwrap();

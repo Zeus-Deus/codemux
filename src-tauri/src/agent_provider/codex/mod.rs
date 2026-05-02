@@ -189,6 +189,7 @@ impl AgentProvider for CodexAgentProvider {
             input.cwd,
             input.model,
             input.permission_mode,
+            input.effort,
             input.resume_cursor.clone(),
             self.spawn_config(),
             self.event_tx.clone(),

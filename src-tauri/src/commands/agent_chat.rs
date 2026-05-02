@@ -513,14 +513,31 @@ pub async fn list_chat_provider_capabilities(
         '_,
         std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
     >,
+    codex_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     match provider {
         ProviderKind::Claude => Ok(
             crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),
         ),
-        ProviderKind::Codex => Ok(
-            crate::agent_provider::codex::capabilities::codex_fallback_capabilities(),
-        ),
+        ProviderKind::Codex => {
+            // Live harvest from `codex app-server` via `model/list`,
+            // memoised in the Tauri-managed cache. The fallback static
+            // catalog is gone — drift between the picker and the real
+            // SDK is exactly the bug Stage 9 is paying down.
+            let binary_path = which::which("codex").map_err(|_| {
+                crate::agent_provider::codex::capabilities::HarvestError::NotInstalled {
+                    hint: "Install Codex CLI from https://github.com/openai/codex and ensure `codex` is on PATH.".into(),
+                }
+                .to_command_string()
+            })?;
+            codex_cache
+                .get_or_harvest(&binary_path, None)
+                .await
+                .map_err(|err| err.to_command_string())
+        }
         ProviderKind::OpenCode => {
             crate::agent_provider::opencode::capabilities::harvest_opencode_capabilities(
                 opencode_manager.inner().as_ref(),

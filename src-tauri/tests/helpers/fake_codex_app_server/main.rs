@@ -13,7 +13,7 @@
 //!     "params": { "threadId":"c1","turnId":"t1" } },
 //!   { "after": "turn/start", "delay_ms": 10, "emit": "notification",
 //!     "method": "item/agentMessage/delta",
-//!     "params": { "threadId":"c1","turnId":"t1","textDelta": "Hi" } },
+//!     "params": { "threadId":"c1","turnId":"t1","itemId":"i1","delta": "Hi" } },
 //!   { "after": "turn/start", "delay_ms": 20, "emit": "server_request",
 //!     "method": "item/commandExecution/requestApproval",
 //!     "params": { "cmd":"ls","turnId":"t1" } },

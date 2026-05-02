@@ -298,17 +298,120 @@ pub struct ThreadRollbackParams {
 
 /// Response to `account/read`.
 ///
-/// Mirrors the subset the upstream reference actually consumes.
+/// Mirrors the canonical SDK shape (`V2GetAccountResponse`): account is
+/// optional, and `requires_openai_auth` is the unauthenticated signal.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountReadResponse {
-    /// Account type tag (e.g. `"personal"`, `"enterprise"`).
-    #[serde(rename = "type")]
-    pub account_type: String,
-    /// Optional subscription plan name.
+    /// Account info — `None` when no user is logged in.
+    #[serde(default)]
+    pub account: Option<AccountInfo>,
+    /// `true` when Codex needs the user to log in before it can serve
+    /// requests. Surface as `ProviderError::NotAuthenticated` upstream.
+    #[serde(default)]
+    pub requires_openai_auth: bool,
+}
+
+/// Subset of the account info we care about. The SDK exposes much more
+/// (rate limits, plan types, etc.); we only need the auth-mode tag.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountInfo {
+    /// Tag string — typically `"chatgpt"`, `"apiKey"`, or
+    /// `"chatgptDeviceCode"`. Drives picker hints later.
+    #[serde(default, rename = "type")]
+    pub account_type: Option<String>,
+    /// Subscription plan label when known (e.g. `"plus"`, `"pro"`).
+    #[serde(default)]
     pub plan_type: Option<String>,
-    /// Whether spark mode is enabled for this account.
-    pub spark_enabled: Option<bool>,
+}
+
+// ---------------------------------------------------------------------------
+// model/list
+// ---------------------------------------------------------------------------
+
+/// Params for `model/list`. All fields optional — calling with `{}` is the
+/// canonical "give me everything" form.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListParams {
+    /// Pagination cursor returned by a previous call. `None` for the
+    /// first page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Whether to include hidden / preview models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_hidden: Option<bool>,
+    /// Page size cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Response to `model/list`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelListResponse {
+    /// One entry per model the account has access to.
+    pub data: Vec<ModelEntry>,
+    /// Opaque continuation token. `None` when the response is complete.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+}
+
+/// One model the SDK reports.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEntry {
+    /// Stable identifier — e.g. `"gpt-5.4"`, `"gpt-5.4-mini"`. This is
+    /// what gets passed back as the `model` field on `thread/start` /
+    /// `turn/start`.
+    pub id: String,
+    /// Underlying model string (often duplicates `id` but kept distinct
+    /// in the SDK so we mirror the field).
+    #[serde(default)]
+    pub model: String,
+    /// Human-readable label rendered by the picker.
+    #[serde(default)]
+    pub display_name: String,
+    /// One-line description — surfaced as the picker subtitle.
+    #[serde(default)]
+    pub description: String,
+    /// True when the model is hidden from default UIs (still selectable
+    /// when explicitly requested, but the picker leaves it out).
+    #[serde(default)]
+    pub hidden: bool,
+    /// True for the SDK's recommended default model. Used to seed the
+    /// picker selection on first open.
+    #[serde(default)]
+    pub is_default: bool,
+    /// Default reasoning effort for this model — `"none"`, `"minimal"`,
+    /// `"low"`, `"medium"`, `"high"`, `"xhigh"`.
+    #[serde(default)]
+    pub default_reasoning_effort: String,
+    /// Reasoning effort options the model honours, with the per-effort
+    /// description the SDK ships.
+    #[serde(default)]
+    pub supported_reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// Input modalities — `["text"]`, `["text", "image"]`, etc.
+    /// Determines the picker's image-attachment chip.
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    /// Extra speed tiers (`"fast"`, `"flex"`, ...) the model supports.
+    /// Maps to the picker's fast-mode toggle when `"fast"` is present.
+    #[serde(default)]
+    pub additional_speed_tiers: Vec<String>,
+}
+
+/// One element of [`ModelEntry::supported_reasoning_efforts`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningEffortOption {
+    /// Effort level identifier — one of `"none" | "minimal" | "low" |
+    /// "medium" | "high" | "xhigh"`.
+    pub reasoning_effort: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,18 +437,34 @@ pub enum NotificationMessage {
     /// `error` — transient / persistent error with optional retry hint.
     Error(ErrorParams),
     /// `item/agentMessage/delta` — streaming assistant text fragment.
-    AgentMessageDelta(AgentMessageDeltaParams),
-    /// `item/agentMessage` — finalised assistant message.
-    AgentMessage(AgentMessageParams),
-    /// `item/toolCall*` — the family of tool-lifecycle notifications.
-    /// Carried as raw JSON because the exact shape of each subtype is
-    /// provider-internal and evolves more quickly than this adapter.
-    ToolCall {
-        /// Original method string (e.g. `"item/toolCall/started"`).
-        method: String,
-        /// Raw payload.
-        params: Value,
-    },
+    AgentMessageDelta(DeltaParams),
+    /// `item/reasoning/textDelta` — streaming reasoning text.
+    ReasoningTextDelta(ReasoningTextDeltaParams),
+    /// `item/reasoning/summaryTextDelta` — streaming reasoning summary.
+    ReasoningSummaryTextDelta(ReasoningSummaryTextDeltaParams),
+    /// `item/reasoning/summaryPartAdded` — new summary segment marker.
+    ReasoningSummaryPartAdded(ReasoningSummaryPartAddedParams),
+    /// `item/commandExecution/outputDelta` — bash stdout/stderr chunk.
+    CommandExecutionOutputDelta(DeltaParams),
+    /// `item/commandExecution/terminalInteraction` — terminal IO event
+    /// (typically stdin echo for an interactive command). Surfaced as a
+    /// runtime warning since the chat UI doesn't render an interactive
+    /// terminal yet.
+    TerminalInteraction(TerminalInteractionParams),
+    /// `item/fileChange/outputDelta` — file edit text chunk.
+    FileChangeOutputDelta(DeltaParams),
+    /// `item/fileChange/patchUpdated` — full updated patch payload.
+    FileChangePatchUpdated(FileChangePatchUpdatedParams),
+    /// `item/mcpToolCall/progress` — MCP tool call status text.
+    McpToolCallProgress(McpToolCallProgressParams),
+    /// `item/plan/delta` — plan content streaming chunk.
+    PlanDelta(DeltaParams),
+    /// `item/started` — an item has just been created. The `item.type`
+    /// tag indicates whether it's a tool call, reasoning block, etc.
+    ItemStarted(ItemEnvelope),
+    /// `item/completed` — an item has finalised; payload carries the
+    /// full final-form data (text, tool result, file change, etc.).
+    ItemCompleted(ItemEnvelope),
     /// Any other method is surfaced as an unknown fallback so the adapter
     /// can emit a runtime warning.
     Unknown {
@@ -357,57 +476,42 @@ pub enum NotificationMessage {
 }
 
 impl NotificationMessage {
-    /// Build a typed notification from the raw method + params pair. Never
-    /// returns an error — unrecognised or malformed messages fall through
-    /// to [`NotificationMessage::Unknown`].
+    /// Build a typed notification from the raw method + params pair.
+    /// Never returns an error — unrecognised methods OR malformed payloads
+    /// fall through to [`NotificationMessage::Unknown`].
     pub fn from_raw(method: &str, params: Value) -> Self {
+        // Helper to keep the match arms tight: try to decode `params` into
+        // the variant's params struct; if the decode fails, fall through
+        // to `Unknown` so a payload-shape drift never panics the adapter.
+        macro_rules! decode {
+            ($variant:ident) => {{
+                match serde_json::from_value(params.clone()) {
+                    Ok(p) => Self::$variant(p),
+                    Err(_) => Self::Unknown {
+                        method: method.to_string(),
+                        params,
+                    },
+                }
+            }};
+        }
+
         match method {
-            "thread/started" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::ThreadStarted(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            "turn/started" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::TurnStarted(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            "turn/completed" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::TurnCompleted(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            "error" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::Error(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            "item/agentMessage/delta" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::AgentMessageDelta(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            "item/agentMessage" => match serde_json::from_value(params.clone()) {
-                Ok(p) => Self::AgentMessage(p),
-                Err(_) => Self::Unknown {
-                    method: method.to_string(),
-                    params,
-                },
-            },
-            m if m.starts_with("item/toolCall") => Self::ToolCall {
-                method: method.to_string(),
-                params,
-            },
+            "thread/started" => decode!(ThreadStarted),
+            "turn/started" => decode!(TurnStarted),
+            "turn/completed" => decode!(TurnCompleted),
+            "error" => decode!(Error),
+            "item/agentMessage/delta" => decode!(AgentMessageDelta),
+            "item/reasoning/textDelta" => decode!(ReasoningTextDelta),
+            "item/reasoning/summaryTextDelta" => decode!(ReasoningSummaryTextDelta),
+            "item/reasoning/summaryPartAdded" => decode!(ReasoningSummaryPartAdded),
+            "item/commandExecution/outputDelta" => decode!(CommandExecutionOutputDelta),
+            "item/commandExecution/terminalInteraction" => decode!(TerminalInteraction),
+            "item/fileChange/outputDelta" => decode!(FileChangeOutputDelta),
+            "item/fileChange/patchUpdated" => decode!(FileChangePatchUpdated),
+            "item/mcpToolCall/progress" => decode!(McpToolCallProgress),
+            "item/plan/delta" => decode!(PlanDelta),
+            "item/started" => decode!(ItemStarted),
+            "item/completed" => decode!(ItemCompleted),
             _ => Self::Unknown {
                 method: method.to_string(),
                 params,
@@ -461,28 +565,136 @@ pub struct ErrorParams {
     pub thread_id: Option<String>,
 }
 
-/// Params for `item/agentMessage/delta`.
+/// Shared shape for every "delta" notification in the SDK
+/// (`agentMessage`, `commandExecution`, `fileChange`, `plan`). All four
+/// carry exactly `{ delta, itemId, threadId, turnId }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentMessageDeltaParams {
+pub struct DeltaParams {
+    /// Text fragment that was just emitted.
+    pub delta: String,
+    /// Identifier of the item the delta belongs to (a single message,
+    /// command execution, file change, or plan item). Used by the UI to
+    /// thread deltas onto the right card.
+    pub item_id: String,
     /// Codex thread identifier.
     pub thread_id: String,
     /// Turn identifier.
     pub turn_id: String,
-    /// Appended text fragment.
-    pub text_delta: String,
 }
 
-/// Params for a completed `item/agentMessage`.
+/// Params for `item/reasoning/textDelta`. Same as [`DeltaParams`] but
+/// with an extra `content_index` for ordering inside multi-segment
+/// reasoning streams.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentMessageParams {
+pub struct ReasoningTextDeltaParams {
+    /// Text fragment.
+    pub delta: String,
+    /// Stable index of this content segment within the reasoning item.
+    pub content_index: i64,
+    /// Identifier of the reasoning item.
+    pub item_id: String,
     /// Codex thread identifier.
     pub thread_id: String,
     /// Turn identifier.
     pub turn_id: String,
-    /// Full assistant message text.
-    pub text: String,
+}
+
+/// Params for `item/reasoning/summaryTextDelta` — like
+/// [`ReasoningTextDeltaParams`] but indexes summary parts instead of
+/// content parts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSummaryTextDeltaParams {
+    /// Text fragment.
+    pub delta: String,
+    /// Stable index of this summary segment.
+    pub summary_index: i64,
+    /// Identifier of the reasoning item.
+    pub item_id: String,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
+}
+
+/// Params for `item/reasoning/summaryPartAdded` — emitted when the model
+/// starts a new reasoning-summary segment. No text payload; the
+/// segment's content streams in via subsequent
+/// `summaryTextDelta` events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningSummaryPartAddedParams {
+    /// Identifier of the reasoning item.
+    pub item_id: String,
+    /// Stable index of the new summary segment.
+    pub summary_index: i64,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
+}
+
+/// Params for `item/commandExecution/terminalInteraction`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInteractionParams {
+    /// Item identifier.
+    pub item_id: String,
+    /// PTY process identifier.
+    pub process_id: String,
+    /// Stdin chunk that was just delivered to the process.
+    pub stdin: String,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
+}
+
+/// Params for `item/fileChange/patchUpdated`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileChangePatchUpdatedParams {
+    /// File-change list. Surfaced verbatim into the runtime event so the
+    /// UI can render the patch preview without re-parsing.
+    pub changes: Value,
+    /// Item identifier.
+    pub item_id: String,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
+}
+
+/// Params for `item/mcpToolCall/progress`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpToolCallProgressParams {
+    /// Item identifier.
+    pub item_id: String,
+    /// Status text (typically a short human-readable progress note like
+    /// `"connecting"` / `"running"`).
+    pub message: String,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
+}
+
+/// Shared envelope for `item/started` and `item/completed`. The `item`
+/// payload is left as raw JSON — the union has 14 variants and the chat
+/// UI only needs the type tag plus a few common fields, so we let the
+/// translate layer cherry-pick what it cares about per-type.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ItemEnvelope {
+    /// Full item payload — `{ type, id, ...type-specific fields }`.
+    pub item: Value,
+    /// Codex thread identifier.
+    pub thread_id: String,
+    /// Turn identifier.
+    pub turn_id: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -502,6 +714,15 @@ pub enum ServerRequestMessage {
     FileReadApproval(Value),
     /// `item/tool/requestUserInput`.
     UserInputRequest(Value),
+    /// `item/permissions/requestApproval` — newer SDK permission flow
+    /// that carries a structured permission profile (file system, network,
+    /// etc.) instead of a single command. Forwarded verbatim to the UI.
+    PermissionsApproval(Value),
+    /// `item/tool/call` — server-initiated dynamic tool invocation. The
+    /// caller is expected to execute the tool and reply with the result.
+    /// We don't synthesize tool execution today; surface as a request and
+    /// let the user/UI decide.
+    ToolCall(Value),
     /// Unknown method — treated as an approval-shaped request so the
     /// runtime can still resolve it with a `cancel` decision if needed.
     Unknown {
@@ -520,6 +741,8 @@ impl ServerRequestMessage {
             "item/fileChange/requestApproval" => Self::FileChangeApproval(params),
             "item/fileRead/requestApproval" => Self::FileReadApproval(params),
             "item/tool/requestUserInput" => Self::UserInputRequest(params),
+            "item/permissions/requestApproval" => Self::PermissionsApproval(params),
+            "item/tool/call" => Self::ToolCall(params),
             _ => Self::Unknown {
                 method: method.to_string(),
                 params,
@@ -535,6 +758,8 @@ impl ServerRequestMessage {
             Self::FileChangeApproval(_) => "file-change",
             Self::FileReadApproval(_) => "file-read",
             Self::UserInputRequest(_) => "user-input",
+            Self::PermissionsApproval(_) => "permissions",
+            Self::ToolCall(_) => "tool-call",
             Self::Unknown { .. } => "unknown",
         }
     }
@@ -545,7 +770,9 @@ impl ServerRequestMessage {
             Self::CommandExecutionApproval(v)
             | Self::FileChangeApproval(v)
             | Self::FileReadApproval(v)
-            | Self::UserInputRequest(v) => v,
+            | Self::UserInputRequest(v)
+            | Self::PermissionsApproval(v)
+            | Self::ToolCall(v) => v,
             Self::Unknown { params, .. } => params,
         }
     }
@@ -754,16 +981,60 @@ mod tests {
     }
 
     #[test]
-    fn notification_from_raw_tool_call_keeps_method() {
+    fn notification_from_raw_legacy_tool_call_falls_through_to_unknown() {
+        // The pre-Stage-9 adapter pattern-matched on `item/toolCall/*`,
+        // a method namespace that does not exist in the SDK manifest.
+        // Real Codex emits `item/started` + `item/completed` plus the
+        // typed delta methods. Anything still using the legacy name is
+        // surfaced as Unknown so it stays diagnosable.
         let m = NotificationMessage::from_raw(
             "item/toolCall/started",
             json!({"anything": true}),
         );
         match m {
-            NotificationMessage::ToolCall { method, .. } => {
+            NotificationMessage::Unknown { method, .. } => {
                 assert_eq!(method, "item/toolCall/started")
             }
-            _ => panic!("expected ToolCall"),
+            _ => panic!("expected Unknown"),
+        }
+    }
+
+    #[test]
+    fn notification_from_raw_agent_message_delta_decodes_real_sdk_fields() {
+        let m = NotificationMessage::from_raw(
+            "item/agentMessage/delta",
+            json!({
+                "delta": "hi",
+                "itemId": "i-1",
+                "threadId": "c1",
+                "turnId": "t1"
+            }),
+        );
+        match m {
+            NotificationMessage::AgentMessageDelta(p) => {
+                assert_eq!(p.delta, "hi");
+                assert_eq!(p.item_id, "i-1");
+            }
+            _ => panic!("expected AgentMessageDelta"),
+        }
+    }
+
+    #[test]
+    fn notification_from_raw_item_completed_carries_item_payload() {
+        let m = NotificationMessage::from_raw(
+            "item/completed",
+            json!({
+                "threadId": "c1",
+                "turnId": "t1",
+                "item": { "type": "agentMessage", "id": "am-1", "text": "done" }
+            }),
+        );
+        match m {
+            NotificationMessage::ItemCompleted(env) => {
+                assert_eq!(env.thread_id, "c1");
+                assert_eq!(env.item.get("type").and_then(|v| v.as_str()), Some("agentMessage"));
+            }
+            _ => panic!("expected ItemCompleted"),
         }
     }
 

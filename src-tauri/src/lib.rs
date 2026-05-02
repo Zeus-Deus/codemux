@@ -153,6 +153,14 @@ pub fn run() {
         // not spawned until the first call. Shutting Codemux down
         // drops this state, which `kill_on_drop`-kills the child.
         .manage(std::sync::Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new()))
+        // Step 12 Stage 9 — Codex capability cache. Holds the
+        // memoised `model/list` harvest so the picker doesn't
+        // re-spawn `codex app-server` on every render. Empty on app
+        // boot; populated on first `list_chat_provider_capabilities`
+        // call for the Codex provider.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::codex::capabilities::CodexCapabilityCache::new(),
+        ))
         // MCP runtime registry. `agent_chat_start_session` reads this
         // via `app.state::<McpRegistry>()` to lazily prime servers
         // before launching a chat, and the `commands::mcp::*` Tauri

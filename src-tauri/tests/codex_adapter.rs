@@ -224,7 +224,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
          "params":{"threadId":"c-1","turnId":"t-scripted"}},
         {"after":"turn/start","delay_ms":10,"emit":"notification",
          "method":"item/agentMessage/delta",
-         "params":{"threadId":"c-1","turnId":"t-scripted","textDelta":"Hi"}},
+         "params":{"threadId":"c-1","turnId":"t-scripted","itemId":"i-1","delta":"Hi"}},
         {"after":"turn/start","delay_ms":20,"emit":"notification",
          "method":"turn/completed",
          "params":{"threadId":"c-1","turnId":"t-scripted","status":"succeeded"}}
@@ -893,7 +893,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
          "params":{"threadId":"c-1","turnId":"t-race"}},
         {"after":"turn/start","delay_ms":20,"emit":"notification",
          "method":"item/agentMessage/delta",
-         "params":{"threadId":"c-1","turnId":"t-race","textDelta":"."}}
+         "params":{"threadId":"c-1","turnId":"t-race","itemId":"i-r","delta":"."}}
     ]));
     let wrapper = wrapper_with_env(&[
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
