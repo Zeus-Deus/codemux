@@ -57,11 +57,41 @@ Verifies the toggle wires through correctly.
 
 1. From the OFF state above, toggle the Switch ON.
 2. **Verify**:
-   - A success toast: "Agent Chat enabled — refreshing to apply…".
-   - The page reloads automatically after ~300ms.
-   - After reload, the empty-state is replaced by the chat-home
-     landing (or the workspace draft surface depending on whether
-     workspaces exist).
+   - A success toast: "Agent Chat enabled — Codemux will close.
+     Reopen to apply."
+   - After ~600ms the Codemux window closes (the toast is visible
+     long enough for the user to read it before the window goes).
+   - The flag IS persisted to `~/.codemux/observability.json` —
+     check the file: `enable_agent_chat: true`,
+     `enable_lazy_workspace_creation: true`. (Even if the user kills
+     the process before the scheduled close fires, the flag is safe
+     on disk.)
+3. Reopen Codemux (double-click the launcher / re-run
+   `npm run tauri dev` / re-run the AppImage / etc.).
+4. **Verify** on the next boot:
+   - The empty-state is replaced by the chat-home landing (or the
+     workspace draft surface depending on whether workspaces exist).
+   - Sidebar `+` button on the workspace creates a chat draft instead
+     of opening the legacy dialog.
+   - Settings sidebar shows **Permissions, Skills, MCP Servers** under
+     Editor & Workflow.
+   - Account section shows the "Skills sync" subsection.
+   - The chat-agent preset row is back in the preset bar.
+5. Open a chat pane and send a turn — streaming UI and approvals
+   should work as on the branch's flag-on path.
+
+### Why a manual reopen instead of auto-restart?
+
+We tried auto-restart (detached spawn via setsid + DETACHED_PROCESS
++ /dev/null stdio + control-socket teardown). It works in production
+builds, but the dev-server WebView path can't survive the cargo
+runner exiting (the new child loads into a dead Vite server and gets
+a black screen). A "dev: warn / prod: auto-restart" split worked
+mechanically but produced inconsistent UX between dev and prod, so
+both modes ship the same plain-quit flow. The honest UX wins: every
+user — dogfooder and shipping user — sees the same toast and
+manually reopens the app, guaranteeing a clean fresh boot under the
+new flag state with no edge cases.
    - Sidebar `+` button on the workspace now creates a chat draft
      instead of opening the legacy dialog (Shift+click still falls
      back to the dialog).
@@ -81,15 +111,16 @@ Verifies data preservation + pane placeholder.
 1. From the ON state above, with at least one open chat pane, toggle
    the Switch OFF in Settings → Beta Features.
 2. **Verify**:
-   - Toast: "Agent Chat disabled — refreshing…".
-   - Page reloads.
+   - Toast: "Agent Chat disabled — Codemux will close. Reopen to apply."
+   - App closes after ~600ms.
+3. Reopen Codemux. After the boot:
    - The previously-open chat pane is replaced by a centered
      placeholder card: Sparkles icon, "Agent Chat is disabled" title,
      "Your data is preserved" copy, and an "Open Settings → Beta
      Features" button.
    - Clicking the placeholder's CTA opens Settings on the
      BetaFeaturesSection page directly.
-3. Re-enable via the Switch. After reload:
+4. Re-enable via the Switch, manually reopen. After the boot:
    - The chat pane re-mounts at the same `pane_id` with its prior
      `thread_id` intact. Session history (if any) is still in the
      SessionSelector dropdown.

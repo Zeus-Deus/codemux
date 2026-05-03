@@ -1030,6 +1030,7 @@ pub fn run() {
             commands::update_feature_flags,
             commands::get_feature_flags,
             commands::set_agent_chat_beta,
+            commands::quit_app,
             commands::get_home_dir,
             commands::agent_chat_create_pane,
             commands::agent_chat_close_pane,

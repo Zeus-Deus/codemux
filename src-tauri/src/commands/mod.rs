@@ -203,6 +203,32 @@ pub fn get_feature_flags(
     Ok(store.feature_flags())
 }
 
+/// Quit the Codemux app cleanly. Used by Settings → Beta Features →
+/// Agent Chat toggle: flipping the master Beta flag requires the
+/// process to come up fresh under the new flag state (backend
+/// singletons — MCP runtime, OpenCode supervisor, capability caches,
+/// ProviderRegistry — only initialise on app boot), and the simplest
+/// way to guarantee that is to close the app and let the user reopen
+/// it manually.
+///
+/// Auto-restart was attempted earlier (detached spawn + setsid +
+/// /dev/null stdio + control-socket teardown) but the dev-server
+/// WebView path can't survive the original cargo runner exiting,
+/// and adding a "we're in dev mode, please rerun manually" branch
+/// undermined the whole point. A plain quit is honest: the user
+/// reopens the app, sees the new state, and there's no "half-broken"
+/// surface area to worry about. See git history for the abandoned
+/// auto-restart machinery.
+///
+/// Uses `app.exit(0)` (not `std::process::exit`) so Tauri runs its
+/// graceful-shutdown hooks (window-close events, plugin teardown)
+/// before the process actually dies.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
 /// Atomic flip of the Agent Chat Beta master toggle. Sets
 /// `enable_agent_chat` and `enable_lazy_workspace_creation` to the
 /// same value in one mutex-held write so the two flags can never end

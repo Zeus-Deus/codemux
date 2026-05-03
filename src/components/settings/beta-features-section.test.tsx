@@ -35,33 +35,15 @@ function resetStore(enabled: boolean) {
 }
 
 describe("BetaFeaturesSection", () => {
-  let reloadSpy: ReturnType<typeof vi.fn>;
-  let originalLocation: Location;
-
   beforeEach(() => {
     invokeMock.mockReset();
+    // Default: every invoke resolves cleanly (each test that needs a
+    // specific sequence overrides via `mockResolvedValueOnce` etc.).
+    invokeMock.mockResolvedValue(undefined);
     vi.mocked(toast.success).mockReset();
     vi.mocked(toast.error).mockReset();
+    vi.mocked(toast.warning).mockReset();
     resetStore(false);
-
-    // Stub window.location.reload so the test doesn't actually
-    // trigger a navigation.
-    originalLocation = window.location;
-    reloadSpy = vi.fn();
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: {
-        ...originalLocation,
-        reload: reloadSpy,
-      },
-    });
-  });
-
-  afterEach(() => {
-    Object.defineProperty(window, "location", {
-      configurable: true,
-      value: originalLocation,
-    });
   });
 
   it("renders headline + Beta badge + description in OFF state", () => {
@@ -107,9 +89,8 @@ describe("BetaFeaturesSection", () => {
     expect(screen.queryByText(/MCP server runtime and management/i)).toBeNull();
   });
 
-  it("flipping the toggle invokes set_agent_chat_beta and schedules a reload", async () => {
+  it("flipping the toggle persists the flag and quits the app", async () => {
     const user = userEvent.setup();
-    invokeMock.mockResolvedValueOnce(undefined);
 
     render(<BetaFeaturesSection />);
 
@@ -121,19 +102,25 @@ describe("BetaFeaturesSection", () => {
       }),
     );
     expect(toast.success).toHaveBeenCalledWith(
-      expect.stringMatching(/enabled/i),
+      expect.stringMatching(/Codemux will close. Reopen to apply/i),
+      expect.objectContaining({ duration: expect.any(Number) }),
     );
 
-    // Reload is scheduled via setTimeout(300). Wait for it instead of
-    // mucking with fake timers (which interact poorly with userEvent's
-    // own deferred scheduling).
-    await waitFor(() => expect(reloadSpy).toHaveBeenCalledTimes(1), {
-      timeout: 1500,
-    });
+    // The quit fires via setTimeout(600). We picked a plain quit
+    // over an auto-restart because the auto-restart machinery
+    // (detached spawn, setsid, /dev/null stdio, control-socket
+    // teardown) doesn't survive the dev-server WebView path, and a
+    // "dev: warn / prod: auto-restart" split confused the smoke
+    // pass. Manual reopen is the honest UX in both modes.
+    await waitFor(
+      () => expect(invokeMock).toHaveBeenCalledWith("quit_app"),
+      { timeout: 1500 },
+    );
   });
 
-  it("surfaces a toast.error and does not reload when the backend fails", async () => {
+  it("surfaces a toast.error and does NOT quit when set_agent_chat_beta fails", async () => {
     const user = userEvent.setup();
+    invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("disk full"));
 
     render(<BetaFeaturesSection />);
@@ -145,8 +132,36 @@ describe("BetaFeaturesSection", () => {
         expect.stringMatching(/Failed to update Agent Chat/i),
       ),
     );
-    // No reload should fire even after the 300ms window passes.
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(reloadSpy).not.toHaveBeenCalled();
+    // No quit_app call should fire even after the 600ms window
+    // passes — only the failed set_agent_chat_beta is in the log.
+    // (Quitting after a failed persist would lose the user's intent
+    // without persisting it.)
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    expect(invokeMock).not.toHaveBeenCalledWith("quit_app");
+  });
+
+  it("surfaces a fallback toast if quit_app itself fails", async () => {
+    const user = userEvent.setup();
+    invokeMock.mockReset();
+    // First call (set_agent_chat_beta) succeeds; second call
+    // (quit_app) rejects.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "quit_app") {
+        return Promise.reject(new Error("app handle gone"));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    render(<BetaFeaturesSection />);
+
+    await user.click(screen.getByRole("switch"));
+
+    await waitFor(
+      () =>
+        expect(toast.error).toHaveBeenCalledWith(
+          expect.stringMatching(/please quit and reopen manually/i),
+        ),
+      { timeout: 1500 },
+    );
   });
 });

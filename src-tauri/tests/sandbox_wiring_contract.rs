@@ -117,6 +117,49 @@ fn lib_registers_get_workspace_virtual_display_command() {
     );
 }
 
+/// Step 13 — the Beta-toggle quit path. If `quit_app` isn't
+/// registered in `invoke_handler!`, flipping Settings → Beta Features
+/// → Agent Chat won't close Codemux: the frontend's
+/// `invoke("quit_app")` would reject with "command not found" and
+/// the user would see the fallback toast asking them to close the
+/// app manually. Pin the registration so a stray refactor can't
+/// silently break the toggle UX.
+#[test]
+fn lib_registers_quit_app_command() {
+    let src = read("src/lib.rs");
+    assert!(
+        src.contains("commands::quit_app"),
+        "lib.rs must register the quit_app command in tauri::generate_handler! \
+         so the Settings → Beta Features toggle can close Codemux cleanly \
+         (the next launch is then a clean boot under the new flag state)"
+    );
+}
+
+/// `quit_app` must use Tauri's `app.exit(0)` (not `std::process::exit`)
+/// so window-close events and plugin teardown hooks fire — that's
+/// what flushes any in-flight scrollback writes, releases the control
+/// socket, and lets the OpenCode/Codex supervisors `kill_on_drop`
+/// their child processes. Skipping the graceful path leaks subprocesses
+/// across the Beta toggle.
+#[test]
+fn quit_app_uses_tauri_graceful_exit() {
+    let src = read("src/commands/mod.rs");
+    let (_, after_fn) = src
+        .split_once("pub fn quit_app(")
+        .expect("quit_app fn must exist in commands/mod.rs");
+    let body = after_fn
+        .split_once("\npub fn ")
+        .map(|(body, _)| body)
+        .unwrap_or(after_fn);
+
+    assert!(
+        body.contains("app.exit"),
+        "quit_app must call app.exit(0) so Tauri runs its graceful-shutdown \
+         hooks before the process dies — std::process::exit would skip them \
+         and leak the OpenCode/Codex supervisor children"
+    );
+}
+
 /// If this fails: someone inverted the env-strip order in
 /// spawn_pty_for_agent, letting `extra_env` silently re-set DISPLAY. This
 /// is a specific regression class we explicitly closed in Phase 1 — guard

@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import { Sparkles } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 
 import { Badge } from "@/components/ui/badge";
 import { Switch } from "@/components/ui/switch";
@@ -14,10 +15,14 @@ import { toast } from "@/lib/toast";
  * the rest of Settings (warning-tinted card, Sparkles icon, BETA
  * badge) so users can see at a glance that this is preview surface.
  *
- * After the flip, the page reloads — several Settings sections (and
- * pane-tree placeholder branches) need to mount/unmount based on the
- * flag, and a hard reload is the simplest way to engage every gate
- * cleanly without a per-component subscription pass.
+ * After the flip the app quits via the `quit_app` Tauri command and
+ * the user reopens it manually. We tried auto-restart (detached
+ * spawn, setsid, /dev/null stdio, control-socket teardown) but the
+ * dev-server WebView path can't survive the cargo runner exiting,
+ * and a "dev: rerun manually / prod: auto-restart" split was a
+ * landmine. Plain quit is the honest UX: every user — dev or
+ * production — sees the same flow, and the next launch is
+ * unambiguously a clean boot under the new flag state.
  */
 export function BetaFeaturesSection() {
   const enabled = useFeatureFlags((s) => s.enableAgentChat);
@@ -32,14 +37,23 @@ export function BetaFeaturesSection() {
       await setAgentChatEnabled(next);
       toast.success(
         next
-          ? "Agent Chat enabled — refreshing to apply…"
-          : "Agent Chat disabled — refreshing…",
+          ? "Agent Chat enabled — Codemux will close. Reopen to apply."
+          : "Agent Chat disabled — Codemux will close. Reopen to apply.",
+        { duration: 4_000 },
       );
-      // Reload after a short delay so the toast is visible. The
-      // backend has already persisted the flip, so this is purely a
-      // UI-cycle tactic to remount Settings nav rows + pane-tree
-      // gates without a per-component subscription chain.
-      window.setTimeout(() => window.location.reload(), 300);
+      // Short delay so the toast is visible before the window goes
+      // away. Backend has already persisted the flip, so even if the
+      // user kills the process before this fires the new state is
+      // safe on disk and takes effect on next launch.
+      window.setTimeout(() => {
+        void invoke<void>("quit_app").catch((err) => {
+          console.error("[beta-features] quit_app failed:", err);
+          toast.error(
+            `Couldn't close Codemux automatically — please quit and reopen manually: ${String(err)}`,
+          );
+          setPending(false);
+        });
+      }, 600);
     } catch (err) {
       console.error("[beta-features] toggle failed:", err);
       toast.error(`Failed to update Agent Chat: ${String(err)}`);
