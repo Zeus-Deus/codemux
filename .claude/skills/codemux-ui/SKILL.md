@@ -13,17 +13,19 @@ Apply these standards to new code and incremental improvements. Do not mass-refa
 
 ## Design Philosophy
 
-Codemux is a Linux-first ADE (Agentic Development Environment). The UI wraps terminal panes where CLI agents do the real work. The shell (sidebar, pane headers, status indicators, notifications) should feel professional, clean, and calm — like a well-designed control room.
+Codemux is a Linux-first ADE (Agentic Development Environment). The main workspace area hosts the working surfaces where CLI agents do the real work — terminal, browser, and chat panes. The shell (sidebar, pane headers, status indicators, notifications) should feel professional, clean, and calm — like a well-designed control room.
 
 Reference products for the visual feel: modern ADE terminals and developer tools. These apps use neutral dark backgrounds with small, intentional color accents.
+
+This skill owns standards for the shell and for terminal + browser panes. Chat-pane specifics live in the separate `codemux-chat-ui` skill, which extends the shared primitives below (tokens, compound picker, hover-reveal, overlay manager) with chat-specific density, typography, and color rules.
 
 Principles:
 - **neutral base, accent pops** — the app shell is always dark neutral; theme colors appear only in small, intentional places
 - **information density without clutter** — show useful data (agent status, git branch, task progress) but keep visual noise low
 - **keyboard-first** — every action reachable by keybind; mouse supported but not required
 - **progressive disclosure** — hide secondary actions behind hover or expand; show primary state at a glance
-- **the terminal is the star** — everything around the terminal serves it, not the other way around
-- **right panel for auxiliary views** — file tree, changes/diff, and other secondary views live in the collapsible right sidebar panel. The main workspace area is reserved for terminals and browser panes. New auxiliary views should be added as tabs in the right panel, not as separate panels.
+- **the working surface is the star** — everything around the active surface (terminal, browser, or chat) serves it, not the other way around
+- **right panel for auxiliary views** — file tree, changes/diff, and other secondary views live in the collapsible right sidebar panel. The main workspace area hosts working surfaces (terminal, browser, chat panes); non-working auxiliary views should be added as tabs in the right panel, not as separate panels.
 
 ---
 
@@ -77,9 +79,11 @@ All colors come from shadcn CSS variables. Never hardcode hex values in componen
 
 ## Component Visual Standards
 
-### Pane Headers
+### Pane Headers (terminal & browser panes)
 
-- Height: 28-34px, compact. The terminal needs the space.
+These rules apply to terminal panes and browser panes. Chat-pane headers are richer (provider + model + effort + permission controls) and their density / typography are governed by `codemux-chat-ui`.
+
+- Height: 28-34px, compact. The terminal / browser content needs the space.
 - Background: `color-mix(in srgb, var(--ui-layer-1) 80%, transparent 20%)` inactive, add ~5% accent tint for active.
 - Prefer showing contextual info (agent name, git branch, working directory) over generic labels when data is available.
 - Action buttons: hidden by default, visible on hover with slide-in transition. Exception: close button on browser panes can stay visible.
@@ -235,7 +239,7 @@ Subtle always. No bounces, springs, or attention-seeking motion. `ease-out` for 
 
 - Shell chrome: system UI font stack, 0.7-0.9rem.
 - Terminal: `--shell-font-family` or monospace fallback, 13px.
-- Nothing larger than 1.1rem in the app shell except OpenFlow config panel headers.
+- Nothing larger than 1.1rem in the app shell except OpenFlow config panel headers, chat-home empty-state headlines, and other intentional marquee moments. Chat-pane typography (prose body, status lines, content blocks) is governed by `codemux-chat-ui`.
 
 ---
 

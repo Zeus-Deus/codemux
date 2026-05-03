@@ -200,7 +200,8 @@ fn find_session_in_node(
         state::PaneNodeSnapshot::Split { children, .. } => {
             children.iter().any(|c| find_session_in_node(c, target_session_id))
         }
-        state::PaneNodeSnapshot::Browser { .. } => false,
+        state::PaneNodeSnapshot::Browser { .. }
+        | state::PaneNodeSnapshot::AgentChat { .. } => false,
     }
 }
 

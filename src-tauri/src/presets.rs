@@ -13,6 +13,32 @@ pub enum LaunchMode {
     NewTab,
 }
 
+/// Kind discriminator on `TerminalPreset`.
+///
+/// - `Cli` — the classic preset: `apply_preset` spawns or routes a
+///   terminal session and runs the preset's shell commands inside it.
+/// - `ChatAgent` — a native agent-chat preset: clicking creates an
+///   `agent_chat` pane in the workspace (rather than spawning a CLI
+///   subprocess). The Rust `apply_preset` rejects `ChatAgent` with an
+///   explicit error; the frontend routes these through
+///   `agentChatCreatePane` + `agentChatStartSession` +
+///   `agentChatSendTurn` via `materializeWithPreset`.
+///
+/// `#[serde(default)]` falls back to `Cli` so presets persisted in
+/// older SQLite rows (without the `kind` field) load cleanly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetKind {
+    Cli,
+    ChatAgent,
+}
+
+impl Default for PresetKind {
+    fn default() -> Self {
+        PresetKind::Cli
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalPreset {
     pub id: String,
@@ -28,6 +54,12 @@ pub struct TerminalPreset {
     pub auto_run_on_workspace: bool,
     #[serde(default)]
     pub auto_run_on_new_tab: bool,
+    /// `Cli` for classic CLI presets, `ChatAgent` for presets that
+    /// spawn an `agent_chat` pane. See [`PresetKind`] for details.
+    /// Defaults to `Cli` so pre-existing persisted presets (which
+    /// lack this field) round-trip correctly.
+    #[serde(default)]
+    pub kind: PresetKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +103,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         },
         TerminalPreset {
             id: "builtin-codex".into(),
@@ -84,6 +117,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         },
         TerminalPreset {
             id: "builtin-opencode".into(),
@@ -97,6 +131,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         },
         TerminalPreset {
             id: "builtin-gemini".into(),
@@ -110,6 +145,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         },
         TerminalPreset {
             id: "builtin-pi".into(),
@@ -123,6 +159,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         },
         TerminalPreset {
             id: "builtin-shell".into(),
@@ -136,6 +173,29 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             is_builtin: true,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        TerminalPreset {
+            id: "builtin-chat-agent".into(),
+            name: "Chat Agent".into(),
+            description: Some(
+                "Launch the native agent-chat pane (Claude by default).".into(),
+            ),
+            // ChatAgent presets carry no shell commands. The frontend
+            // dispatch in `materializeWithPreset` creates an
+            // `agent_chat` pane and starts a provider session; the
+            // Rust `apply_preset` short-circuits this kind with a
+            // guard to keep the terminal path from accidentally
+            // trying to spawn an empty shell.
+            commands: vec![],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("chat-agent".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::ChatAgent,
         },
     ]
 }
@@ -246,9 +306,63 @@ mod tests {
     }
 
     #[test]
+    fn chat_agent_builtin_is_registered_with_chat_agent_kind() {
+        let presets = builtin_presets();
+        let chat = presets
+            .iter()
+            .find(|p| p.id == "builtin-chat-agent")
+            .expect("chat agent builtin must be present");
+        assert_eq!(chat.kind, PresetKind::ChatAgent);
+        assert!(chat.commands.is_empty());
+        assert!(chat.pinned);
+    }
+
+    #[test]
+    fn existing_cli_builtins_preserve_cli_kind() {
+        let presets = builtin_presets();
+        for id in [
+            "builtin-claude",
+            "builtin-codex",
+            "builtin-opencode",
+            "builtin-gemini",
+            "builtin-pi",
+            "builtin-shell",
+        ] {
+            let p = presets
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("missing builtin {id}"));
+            assert_eq!(p.kind, PresetKind::Cli, "builtin {id} must stay CLI");
+        }
+    }
+
+    #[test]
+    fn persisted_preset_without_kind_defaults_to_cli() {
+        // Simulates a SQLite row written before `kind` existed. The
+        // #[serde(default)] attribute on TerminalPreset::kind should
+        // fill in Cli without erroring.
+        let legacy_json = serde_json::json!({
+            "id": "legacy-1",
+            "name": "Legacy",
+            "description": null,
+            "commands": ["echo"],
+            "working_directory": null,
+            "launch_mode": "new_tab",
+            "icon": null,
+            "pinned": true,
+            "is_builtin": false,
+            "auto_run_on_workspace": false,
+            "auto_run_on_new_tab": false,
+        });
+        let preset: TerminalPreset = serde_json::from_value(legacy_json)
+            .expect("legacy preset JSON should deserialise");
+        assert_eq!(preset.kind, PresetKind::Cli);
+    }
+
+    #[test]
     fn default_store_has_all_builtins() {
         let store = default_store();
-        assert_eq!(store.presets.len(), 6);
+        assert_eq!(store.presets.len(), 7);
         assert!(store.bar_visible);
         assert!(store.presets.iter().all(|p| p.is_builtin));
     }
@@ -257,7 +371,7 @@ mod tests {
     fn load_presets_returns_defaults_on_missing_file() {
         let db = DatabaseStore::new_in_memory();
         let store = load_presets(&db);
-        assert_eq!(store.presets.len(), 6);
+        assert_eq!(store.presets.len(), 7);
         assert!(store.bar_visible);
     }
 
@@ -270,7 +384,7 @@ mod tests {
 
         let loaded = load_presets(&db);
         assert!(!loaded.bar_visible);
-        assert_eq!(loaded.presets.len(), 6);
+        assert_eq!(loaded.presets.len(), 7);
     }
 
     #[test]
@@ -283,7 +397,7 @@ mod tests {
 
         // Load should re-add missing builtins
         let loaded = load_presets(&db);
-        assert_eq!(loaded.presets.len(), 6);
+        assert_eq!(loaded.presets.len(), 7);
     }
 
     fn make_custom_preset(id: &str, name: &str) -> TerminalPreset {
@@ -299,6 +413,7 @@ mod tests {
             is_builtin: false,
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
         }
     }
 
@@ -397,14 +512,14 @@ mod tests {
         let mut store = default_store();
         store.presets.push(make_custom_preset("custom-1", "To Delete"));
         save_presets(&db, &store).unwrap();
-        assert_eq!(load_presets(&db).presets.len(), 7);
+        assert_eq!(load_presets(&db).presets.len(), 8);
 
         let mut loaded = load_presets(&db);
         loaded.presets.retain(|p| p.id != "custom-1");
         save_presets(&db, &loaded).unwrap();
 
         let reloaded = load_presets(&db);
-        assert_eq!(reloaded.presets.len(), 6); // only builtins remain
+        assert_eq!(reloaded.presets.len(), 7); // only builtins remain
         assert!(reloaded.presets.iter().all(|p| p.is_builtin));
     }
 

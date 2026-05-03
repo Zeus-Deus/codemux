@@ -1,5 +1,6 @@
 [package]
 name = "codemux"
+default-run = "codemux"
 version = "0.1.33"
 description = "The Agentic Development Environment for Builders"
 authors = ["Zeus-Deus"]
@@ -34,7 +35,7 @@ chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
 notify-rust = "4"
 clap = { version = "4", features = ["derive"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
 base64 = "0.22"
 tempfile = "3"
 tokio-tungstenite = "0.26"
@@ -46,6 +47,7 @@ tauri-plugin-process = "2"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 sha2 = "0.10"
 argon2 = "0.5"
 hkdf = "0.12"
@@ -54,6 +56,12 @@ url = "2"
 urlencoding = "2"
 regex = "1.12.3"
 which = "6"
+async-trait = "0.1"
+futures-core = "0.3"
+serde_yaml = "0.9"
+glob = "0.3"
+ignore = "0.4"
+nucleo-matcher = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
@@ -73,6 +81,11 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 mockito = "1"
 serial_test = "3"
+# Enable tauri's `test` feature so integration tests can build a
+# mock app handle via `tauri::test::mock_app`. Feature unification
+# means this flag activates at every build, but the `test` feature
+# is additive and doesn't change runtime behavior.
+tauri = { version = "2", features = ["test"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Used by auth/api.rs tests to dup2 stderr for the log-leak
@@ -81,3 +94,31 @@ serial_test = "3"
 # provided statically by the typed AuthSecret boundary + Debug-redact
 # test.
 gag = "1"
+
+# Test helper binary used by `tests/json_rpc_child.rs` — simulates a JSON-RPC
+# peer over stdio. Compiled with the crate; not shipped in distributions
+# because tests do not run against release builds.
+[[bin]]
+name = "fake_rpc_child"
+path = "tests/helpers/fake_rpc_child/main.rs"
+test = false
+doctest = false
+bench = false
+
+# Test helper binary used by `tests/codex_adapter.rs` — simulates the
+# `codex app-server` JSON-RPC peer.
+[[bin]]
+name = "fake_codex_app_server"
+path = "tests/helpers/fake_codex_app_server/main.rs"
+test = false
+doctest = false
+bench = false
+
+# Test helper binary used by `tests/claude_adapter.rs` — simulates the
+# claude-agent sidecar without involving the real SDK.
+[[bin]]
+name = "fake_claude_sidecar"
+path = "tests/helpers/fake_claude_sidecar/main.rs"
+test = false
+doctest = false
+bench = false

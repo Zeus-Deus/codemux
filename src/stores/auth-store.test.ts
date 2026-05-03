@@ -7,6 +7,7 @@ vi.mock("@/tauri/commands", () => ({
   signinEmail: vi.fn(),
   signupEmail: vi.fn(),
   signOut: vi.fn(),
+  getSyncStatus: vi.fn(),
 }));
 
 import { useAuthStore } from "./auth-store";
@@ -15,12 +16,14 @@ import {
   signinEmail,
   signupEmail,
   signOut,
+  getSyncStatus,
 } from "@/tauri/commands";
 
 const mockCheckAuth = vi.mocked(checkAuth);
 const mockSigninEmail = vi.mocked(signinEmail);
 const mockSignupEmail = vi.mocked(signupEmail);
 const mockSignOut = vi.mocked(signOut);
+const mockGetSyncStatus = vi.mocked(getSyncStatus);
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -32,6 +35,8 @@ beforeEach(() => {
     isSigningIn: false,
     error: null,
     devBypass: false,
+    syncAvailable: false,
+    authMethod: null,
   });
 });
 
@@ -171,5 +176,98 @@ describe("auth store", () => {
     const state = useAuthStore.getState();
     expect(state.isAuthenticated).toBe(false);
     expect(state.user).toBeNull();
+  });
+
+  // ── Skills sync (Stage 2) ──
+
+  it("syncAvailable defaults to false", () => {
+    expect(useAuthStore.getState().syncAvailable).toBe(false);
+    expect(useAuthStore.getState().authMethod).toBeNull();
+  });
+
+  it("setSyncStatus updates sync state from a backend payload", () => {
+    useAuthStore.getState().setSyncStatus({
+      syncAvailable: true,
+      authMethod: "github",
+    });
+    const state = useAuthStore.getState();
+    expect(state.syncAvailable).toBe(true);
+    expect(state.authMethod).toBe("github");
+  });
+
+  it("checkAuth pulls sync status when authentication succeeds", async () => {
+    mockCheckAuth.mockResolvedValue({
+      id: "u1",
+      email: "a@b.com",
+      name: "T",
+      image: null,
+    });
+    mockGetSyncStatus.mockResolvedValue({
+      syncAvailable: true,
+      authMethod: "email",
+    });
+
+    await useAuthStore.getState().checkAuth();
+
+    expect(mockGetSyncStatus).toHaveBeenCalled();
+    const state = useAuthStore.getState();
+    expect(state.syncAvailable).toBe(true);
+    expect(state.authMethod).toBe("email");
+  });
+
+  it("checkAuth tolerates getSyncStatus failure (Tauri unavailable)", async () => {
+    mockCheckAuth.mockResolvedValue({
+      id: "u1",
+      email: "a@b.com",
+      name: "T",
+      image: null,
+    });
+    mockGetSyncStatus.mockRejectedValue(new Error("not in tauri"));
+
+    await useAuthStore.getState().checkAuth();
+
+    const state = useAuthStore.getState();
+    expect(state.isAuthenticated).toBe(true);
+    expect(state.syncAvailable).toBe(false);
+  });
+
+  it("signOut clears sync state alongside auth state", async () => {
+    mockSignOut.mockResolvedValue(undefined);
+    useAuthStore.setState({
+      user: { id: "u1", email: "a@b.com", name: "T", image: null },
+      isAuthenticated: true,
+      syncAvailable: true,
+      authMethod: "github",
+    });
+
+    await useAuthStore.getState().signOut();
+
+    const state = useAuthStore.getState();
+    expect(state.syncAvailable).toBe(false);
+    expect(state.authMethod).toBeNull();
+  });
+
+  it("checkAuth → null clears sync state", async () => {
+    useAuthStore.setState({ syncAvailable: true, authMethod: "github" });
+    mockCheckAuth.mockResolvedValue(null);
+
+    await useAuthStore.getState().checkAuth();
+
+    const state = useAuthStore.getState();
+    expect(state.syncAvailable).toBe(false);
+    expect(state.authMethod).toBeNull();
+  });
+
+  it("refreshSyncStatus pulls from getSyncStatus", async () => {
+    mockGetSyncStatus.mockResolvedValue({
+      syncAvailable: true,
+      authMethod: "email",
+    });
+
+    await useAuthStore.getState().refreshSyncStatus();
+
+    const state = useAuthStore.getState();
+    expect(state.syncAvailable).toBe(true);
+    expect(state.authMethod).toBe("email");
   });
 });

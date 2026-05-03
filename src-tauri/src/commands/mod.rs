@@ -1,3 +1,4 @@
+pub mod agent_chat;
 pub mod ai;
 pub mod auth;
 pub mod branch_name;
@@ -6,13 +7,21 @@ pub mod database;
 pub mod files;
 pub mod git;
 pub mod github;
+pub mod mcp;
+pub mod opencode;
 pub mod openflow;
 pub mod package_detect;
+pub mod permissions;
 pub mod presets;
+pub mod project_files;
 pub mod settings_sync;
+pub mod skills;
+pub mod skills_sync;
 pub mod update;
+pub mod virtual_display;
 pub mod workspace;
 
+pub use agent_chat::*;
 pub use ai::*;
 pub use auth::*;
 pub use branch_name::*;
@@ -21,11 +30,18 @@ pub use database::*;
 pub use files::*;
 pub use git::*;
 pub use github::*;
+pub use mcp::*;
+pub use opencode::*;
 pub use openflow::*;
 pub use package_detect::*;
+pub use permissions::*;
 pub use presets::*;
+pub use project_files::*;
 pub use settings_sync::*;
+pub use skills::*;
+pub use skills_sync::*;
 pub use update::*;
+pub use virtual_display::*;
 pub use workspace::*;
 
 use crate::indexing::{
@@ -173,6 +189,86 @@ pub fn update_feature_flags(
     Ok(())
 }
 
+/// Read the current feature-flag snapshot.
+///
+/// Thin wrapper around
+/// [`ObservabilityStore::feature_flags`](crate::observability::ObservabilityStore::feature_flags)
+/// so the frontend can check a single gate without pulling the whole
+/// observability snapshot. Used by the agent-chat pane shell to decide
+/// whether to offer the `agent_chat` pane kind.
+#[tauri::command]
+pub fn get_feature_flags(
+    store: State<'_, ObservabilityStore>,
+) -> Result<FeatureFlags, String> {
+    Ok(store.feature_flags())
+}
+
+/// Quit the Codemux app cleanly. Used by Settings → Beta Features →
+/// Agent Chat toggle: flipping the master Beta flag requires the
+/// process to come up fresh under the new flag state (backend
+/// singletons — MCP runtime, OpenCode supervisor, capability caches,
+/// ProviderRegistry — only initialise on app boot), and the simplest
+/// way to guarantee that is to close the app and let the user reopen
+/// it manually.
+///
+/// Auto-restart was attempted earlier (detached spawn + setsid +
+/// /dev/null stdio + control-socket teardown) but the dev-server
+/// WebView path can't survive the original cargo runner exiting,
+/// and adding a "we're in dev mode, please rerun manually" branch
+/// undermined the whole point. A plain quit is honest: the user
+/// reopens the app, sees the new state, and there's no "half-broken"
+/// surface area to worry about. See git history for the abandoned
+/// auto-restart machinery.
+///
+/// Uses `app.exit(0)` (not `std::process::exit`) so Tauri runs its
+/// graceful-shutdown hooks (window-close events, plugin teardown)
+/// before the process actually dies.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+    app.exit(0);
+    Ok(())
+}
+
+/// Atomic flip of the Agent Chat Beta master toggle. Sets
+/// `enable_agent_chat` and `enable_lazy_workspace_creation` to the
+/// same value in one mutex-held write so the two flags can never end
+/// up half-on (the Step 6–12 surface assumes both are true to
+/// function correctly).
+///
+/// The two flags exist as separate fields for wire-compat with
+/// dogfooding observability.json files; every production read-site
+/// pairs them with `&&`, so there's no real toggle matrix to expose.
+/// `update_feature_flags` is the lower-level setter (writes whatever
+/// `FeatureFlags` you hand it); use this command from the Settings
+/// → Beta Features UI to keep the two paired without forcing the
+/// frontend to read-modify-write the whole struct.
+///
+/// Other flags (`unstable_*`) are left untouched.
+#[tauri::command]
+pub fn set_agent_chat_beta(
+    store: State<'_, ObservabilityStore>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut flags = store.feature_flags();
+    flags.enable_agent_chat = enabled;
+    flags.enable_lazy_workspace_creation = enabled;
+    store.set_feature_flags(flags);
+    Ok(())
+}
+
+/// Return the user's home directory as a string.
+///
+/// Used by the sidebar-header "+" chat flow to create a workspace
+/// anchored at `~` when the user wants an ambient chat not tied to
+/// a specific project. Errors if `dirs::home_dir()` returns `None`
+/// (no `HOME` env on Unix, no `USERPROFILE` on Windows).
+#[tauri::command]
+pub fn get_home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .ok_or_else(|| "home_dir_unavailable".to_string())
+}
+
 #[tauri::command]
 pub fn update_permission_policy(
     store: State<'_, ObservabilityStore>,
@@ -261,6 +357,89 @@ pub async fn pick_files_dialog<R: Runtime>(
     rx.await.map_err(|error| error.to_string())
 }
 
+/// Save-as dialog. Used by the skills export flow (Stage 4).
+/// Caller passes a default filename (e.g.
+/// `codemux-skills-export-2026-04-29.json`) and an optional title.
+/// Returns `Some(path)` when the user picks one, `None` if they
+/// cancel.
+#[tauri::command]
+pub async fn pick_save_file_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+    default_filename: Option<String>,
+    filter_name: Option<String>,
+    filter_extensions: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Save as"));
+
+    if let Some(name) = default_filename.as_deref() {
+        builder = builder.set_file_name(name);
+    }
+    if let (Some(name), Some(exts)) = (filter_name.as_deref(), filter_extensions.as_ref()) {
+        let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        builder = builder.add_filter(name, &ext_refs);
+    }
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.save_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+
+    rx.await.map_err(|error| error.to_string())
+}
+
+/// Single-file open-dialog with filter. Used by the skills
+/// import flow (Stage 4) where the user is picking a previously-
+/// saved JSON backup. Returns `Some(path)` on selection, `None`
+/// on cancel.
+#[tauri::command]
+pub async fn pick_open_file_dialog<R: Runtime>(
+    window: tauri::Window<R>,
+    app: tauri::AppHandle<R>,
+    title: Option<String>,
+    filter_name: Option<String>,
+    filter_extensions: Option<Vec<String>>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    use tokio::sync::oneshot;
+
+    let (tx, rx) = oneshot::channel();
+
+    let mut builder = app
+        .dialog()
+        .file()
+        .set_title(title.as_deref().unwrap_or("Open"));
+
+    if let (Some(name), Some(exts)) = (filter_name.as_deref(), filter_extensions.as_ref()) {
+        let ext_refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        builder = builder.add_filter(name, &ext_refs);
+    }
+
+    #[cfg(desktop)]
+    {
+        builder = builder.set_parent(&window);
+    }
+
+    builder.pick_file(move |path| {
+        let _ = tx.send(path.map(|p| p.to_string()));
+    });
+
+    rx.await.map_err(|error| error.to_string())
+}
+
 // ---- Platform info ----
 
 /// Returns the current OS as reported by `std::env::consts::OS`.
@@ -293,14 +472,16 @@ pub fn kill_port(port: u16) -> Result<(), String> {
 
     let pid = target.pid;
     let output = if cfg!(windows) {
-        std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
-            .output()
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/F"]);
+        crate::execution::sanitize_gui_env_std(&mut cmd);
+        cmd.output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     } else {
-        std::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .output()
+        let mut cmd = std::process::Command::new("kill");
+        cmd.args(["-9", &pid.to_string()]);
+        crate::execution::sanitize_gui_env_std(&mut cmd);
+        cmd.output()
             .map_err(|e| format!("Failed to kill PID {pid}: {e}"))?
     };
 

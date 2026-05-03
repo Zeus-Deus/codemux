@@ -13,9 +13,9 @@ vi.mock("@/tauri/commands", () => ({
 const flush = () => act(() => new Promise((r) => setTimeout(r, 10)));
 
 const SAMPLE_ISSUES: GitHubIssue[] = [
-  { number: 92, title: "Backend endpoints voor prospectielijst", state: "Open", labels: ["enhancement"], assignees: ["zeus"], url: "https://github.com/u/r/issues/92", body: null },
-  { number: 85, title: "Fix login page redirect", state: "Open", labels: ["bug"], assignees: [], url: "https://github.com/u/r/issues/85", body: null },
-  { number: 70, title: "Add dark mode toggle", state: "Closed", labels: [], assignees: [], url: "https://github.com/u/r/issues/70", body: null },
+  { number: 92, title: "Backend endpoints voor prospectielijst", state: "Open", labels: ["enhancement"], assignees: ["zeus"], url: "https://github.com/u/r/issues/92", body: null, comments: [], totalComments: 0, updatedAt: null },
+  { number: 85, title: "Fix login page redirect", state: "Open", labels: ["bug"], assignees: [], url: "https://github.com/u/r/issues/85", body: null, comments: [], totalComments: 0, updatedAt: null },
+  { number: 70, title: "Add dark mode toggle", state: "Closed", labels: [], assignees: [], url: "https://github.com/u/r/issues/70", body: null, comments: [], totalComments: 0, updatedAt: null },
 ];
 
 function renderPanel(overrides: Partial<React.ComponentProps<typeof IssuePickerPanel>> = {}) {

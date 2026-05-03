@@ -1968,6 +1968,21 @@ pub fn spawn_pty_for_agent(
         },
     );
 
+    // Phase 1 display-isolation: authoritative env-strip. On the bwrap branch
+    // this list is empty (bwrap handles it via `--unsetenv`). On every other
+    // branch — macOS/Windows stubs, bwrap-missing fallback, HostPassthrough —
+    // when the policy says `allow_desktop_gui=false` the GUI env keys live
+    // here and we remove them AFTER every `cmd.env(...)` call above (including
+    // the `extra_env` merge). This is the guarantee that OpenFlow agents on
+    // macOS/Windows finally get their `allow_desktop_gui: false` respected
+    // instead of being an advisory flag.
+    for key in &prepared.env_unset {
+        cmd.env_remove(key);
+    }
+    for (key, val) in &prepared.env_set {
+        cmd.env(key, val);
+    }
+
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
         Err(error) => {

@@ -43,11 +43,21 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            file
+            file \
+            ripgrep
         # This matches the package list installed in release.yml so the CI
         # toolchain is a strict subset of what the release pipeline uses.
         # libfuse2 is excluded — it is only needed by `tauri build`'s
         # AppImage packager, not by `cargo check` or `cargo test`.
+        # ripgrep is required by `commands::files::tests::grep_count_pattern_*`,
+        # which shells out to `rg` to count CODEMUX_DEBUG markers.
+
+      - name: Install Windows system dependencies
+        if: matrix.os == 'windows-latest'
+        # Chocolatey is pre-installed on windows-latest runners. ripgrep
+        # is needed for the same `grep_count_pattern_*` tests as Linux.
+        run: choco install ripgrep -y --no-progress
+        shell: pwsh
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -70,6 +80,41 @@ jobs:
 
       - name: Install npm dependencies
         run: npm ci
+
+      - name: Setup Bun
+        # Needed to build the claude-agent sidecar below. Installed here
+        # so the stage step can produce the per-target binary before
+        # `cargo check` fails tauri-build's externalBin validation.
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Stage claude-agent sidecar binary
+        shell: bash
+        run: |
+          # Like the agent-browser step below, tauri-build validates
+          # `externalBin` at compile time, so the sidecar binary has to
+          # be present before `cargo check` / `cargo test`. Full build
+          # via Bun; fall back to a zero-byte placeholder if Bun fails
+          # (e.g. transient registry hiccup) — CI is checking types and
+          # running tests, not producing distributables.
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          mkdir -p src-tauri/binaries
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET" ;;
+          esac
+          if bash scripts/build-claude-sidecar.sh; then
+            if [ ! -s "$DEST" ]; then
+              echo "[ci] build-claude-sidecar.sh reported success but $DEST is missing — placeholder"
+              touch "$DEST"
+              chmod +x "$DEST" 2>/dev/null || true
+            fi
+          else
+            echo "[ci] sidecar build failed — creating placeholder at $DEST"
+            touch "$DEST"
+            chmod +x "$DEST" 2>/dev/null || true
+          fi
 
       - name: Stage agent-browser sidecar binary
         shell: bash
@@ -101,6 +146,19 @@ jobs:
             touch "$DEST"
             chmod +x "$DEST" 2>/dev/null || true
           fi
+
+      - name: Sidecar ToS boundary check
+        # Static check that forbids the sidecar from reading Claude
+        # credential files, hitting Anthropic URLs directly, spawning
+        # the `claude` binary outside the auth-probe allowlist, or
+        # peeking at ANTHROPIC_* / CLAUDE_CODE_OAUTH_TOKEN env vars.
+        # This is a hard CI gate so a violation can never slip in.
+        shell: bash
+        run: cd sidecar/claude-agent && bun run check-tos
+
+      - name: Sidecar unit tests
+        shell: bash
+        run: cd sidecar/claude-agent && bun install --frozen-lockfile && bun test
 
       - name: Build frontend
         # `frontendDist: "../dist"` in tauri.conf.json means tauri-build

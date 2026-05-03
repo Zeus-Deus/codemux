@@ -1,5 +1,5 @@
 use crate::github::{
-    CheckInfo, GhStatus, GitHubIssue, InlineReviewComment, LinkedIssue,
+    CheckInfo, DeploymentInfo, GhStatus, GitHubIssue, InlineReviewComment, LinkedIssue,
     PullRequestInfo,
 };
 use crate::state::AppStateStore;
@@ -39,7 +39,31 @@ pub fn create_pull_request(
 
 #[tauri::command]
 pub fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequestInfo>, String> {
-    crate::github::list_pull_requests(Path::new(&path), &state)
+    crate::github_cache::cached_list_pull_requests(Path::new(&path), &state)
+}
+
+/// Stage 5 — single PR detail (body + comments) by number, by repo
+/// path. Path-based so the chat composer can call without a
+/// workspace handle (mirrors `get_github_issue_by_path`).
+#[tauri::command]
+pub fn get_github_pr_by_path(
+    path: String,
+    pr_number: u32,
+) -> Result<PullRequestInfo, String> {
+    crate::github_cache::cached_get_pull_request(Path::new(&path), pr_number)
+}
+
+/// Stage 5 — PR diff. `full=false` → `--name-only`; `full=true` →
+/// unified diff truncated at 100 KB. Cached separately per (number,
+/// full) so flipping the toggle doesn't blow the other variant out
+/// of the cache.
+#[tauri::command]
+pub fn get_github_pr_diff_by_path(
+    path: String,
+    pr_number: u32,
+    full: bool,
+) -> Result<String, String> {
+    crate::github_cache::cached_get_pr_diff(Path::new(&path), pr_number, full)
 }
 
 #[tauri::command]
@@ -75,6 +99,11 @@ pub fn submit_pr_review(path: String, pr_number: u32, event: String, body: Strin
     crate::github::submit_pr_review(Path::new(&path), pr_number, &event, &body)
 }
 
+#[tauri::command]
+pub fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
+    crate::github::get_pr_deployments(Path::new(&path), pr_number)
+}
+
 // ── GitHub Issues ──
 
 #[tauri::command]
@@ -84,7 +113,7 @@ pub fn list_github_issues(
     search: Option<String>,
 ) -> Result<Vec<GitHubIssue>, String> {
     let cwd = resolve_workspace_cwd(&state, &workspace_id)?;
-    crate::github::list_github_issues(Path::new(&cwd), search.as_deref())
+    crate::github_cache::cached_list_issues(Path::new(&cwd), search.as_deref())
 }
 
 #[tauri::command]
@@ -94,7 +123,7 @@ pub fn get_github_issue(
     issue_number: u64,
 ) -> Result<GitHubIssue, String> {
     let cwd = resolve_workspace_cwd(&state, &workspace_id)?;
-    crate::github::get_github_issue(Path::new(&cwd), issue_number)
+    crate::github_cache::cached_get_issue(Path::new(&cwd), issue_number)
 }
 
 #[tauri::command]
@@ -197,7 +226,7 @@ pub fn list_github_issues_by_path(
     path: String,
     search: Option<String>,
 ) -> Result<Vec<GitHubIssue>, String> {
-    crate::github::list_github_issues(Path::new(&path), search.as_deref())
+    crate::github_cache::cached_list_issues(Path::new(&path), search.as_deref())
 }
 
 /// Get a single issue by repo path directly (no workspace needed).
@@ -206,7 +235,7 @@ pub fn get_github_issue_by_path(
     path: String,
     issue_number: u64,
 ) -> Result<GitHubIssue, String> {
-    crate::github::get_github_issue(Path::new(&path), issue_number)
+    crate::github_cache::cached_get_issue(Path::new(&path), issue_number)
 }
 
 #[tauri::command]

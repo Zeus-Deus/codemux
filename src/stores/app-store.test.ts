@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { resolveProjectRoot } from "./app-store";
+import {
+  groupWorkspacesByProject,
+  resolveProjectRoot,
+  useAppStore,
+} from "./app-store";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // Minimal workspace factory for testing
@@ -180,5 +184,117 @@ describe("project grouping", () => {
     const names = result.map((g) => g.name);
     expect(names).toContain("frontend");
     expect(names).toContain("backend");
+  });
+});
+
+describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
+  it("falls back to path-basename grouping when homeDir is null", () => {
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-home",
+        cwd: "/home/zeus",
+        project_root: "/home/zeus",
+      }),
+      makeWs({
+        workspace_id: "ws-proj",
+        cwd: "/home/zeus/projects/myapp",
+        project_root: "/home/zeus/projects/myapp",
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, null);
+    const names = groups.map((g) => g.projectName).sort();
+    expect(names).toEqual(["myapp", "zeus"]);
+    // No "Home" group is produced when homeDir is unknown.
+    expect(names).not.toContain("Home");
+  });
+
+  it("labels the $HOME-rooted group 'Home' when homeDir matches", () => {
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-home",
+        cwd: "/home/zeus",
+        project_root: "/home/zeus",
+      }),
+      makeWs({
+        workspace_id: "ws-proj",
+        cwd: "/home/zeus/projects/myapp",
+        project_root: "/home/zeus/projects/myapp",
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, "/home/zeus");
+    const byName = new Map(groups.map((g) => [g.projectName, g]));
+    expect(byName.has("Home")).toBe(true);
+    expect(byName.get("Home")!.projectPath).toBe("/home/zeus");
+    expect(byName.get("Home")!.workspaces.map((w) => w.workspace_id)).toEqual([
+      "ws-home",
+    ]);
+    expect(byName.has("myapp")).toBe(true);
+    expect(byName.get("myapp")!.workspaces.map((w) => w.workspace_id)).toEqual([
+      "ws-proj",
+    ]);
+  });
+
+  it("returns an empty array for no workspaces, regardless of homeDir", () => {
+    expect(groupWorkspacesByProject([], "/home/zeus")).toEqual([]);
+    expect(groupWorkspacesByProject([], null)).toEqual([]);
+  });
+
+  it("collects multiple $HOME-rooted workspaces into a single Home group", () => {
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-home-1",
+        cwd: "/home/zeus",
+        project_root: "/home/zeus",
+        title: "Identity inquiry",
+      }),
+      makeWs({
+        workspace_id: "ws-home-2",
+        cwd: "/home/zeus",
+        project_root: "/home/zeus",
+        title: "Friendship inquiry",
+      }),
+      makeWs({
+        workspace_id: "ws-home-3",
+        cwd: "/home/zeus",
+        project_root: "/home/zeus",
+        title: "Dev env setup",
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, "/home/zeus");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].projectName).toBe("Home");
+    expect(groups[0].workspaces.map((w) => w.workspace_id)).toEqual([
+      "ws-home-1",
+      "ws-home-2",
+      "ws-home-3",
+    ]);
+  });
+
+  it("groups a legacy WorkspaceType::Home workspace under 'Home' by path, ignoring the variant tag", () => {
+    const legacyHome = makeWs({
+      workspace_id: "ws-legacy-home",
+      workspace_type: "home",
+      cwd: "/home/zeus",
+      project_root: "/home/zeus",
+    });
+
+    const groups = groupWorkspacesByProject([legacyHome], "/home/zeus");
+    expect(groups).toHaveLength(1);
+    expect(groups[0].projectName).toBe("Home");
+    expect(groups[0].projectPath).toBe("/home/zeus");
+  });
+});
+
+describe("useAppStore.setHomeDir", () => {
+  it("writes and reads back the home dir", () => {
+    useAppStore.setState({ homeDir: null });
+    expect(useAppStore.getState().homeDir).toBeNull();
+    useAppStore.getState().setHomeDir("/home/zeus");
+    expect(useAppStore.getState().homeDir).toBe("/home/zeus");
+    // Reset so later test files don't inherit the value.
+    useAppStore.setState({ homeDir: null });
   });
 });

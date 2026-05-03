@@ -35,6 +35,26 @@ pub struct FeatureFlags {
     pub unstable_openflow: bool,
     pub unstable_browser_automation: bool,
     pub unstable_indexing: bool,
+    /// Gates the agent-chat pane kind, its Tauri command surface, and
+    /// the runtime provider registry.
+    ///
+    /// Defaults to `false`: the chat pane is not selectable in the UI,
+    /// lifecycle commands return `FeatureDisabled`, and the provider
+    /// registry is not initialised at startup. Flip to `true` via
+    /// `update_feature_flags` or by editing
+    /// `.codemux/observability.json` to dogfood the scaffolding.
+    #[serde(default)]
+    pub enable_agent_chat: bool,
+    /// Gates the lazy-workspace-creation path: sidebar-plus and
+    /// boot-into-Home open a client-side chat draft instead of
+    /// eagerly materialising a workspace. The draft is promoted to a
+    /// real workspace on first message send.
+    ///
+    /// Defaults to `false`: today's eager flow is preserved. Flip to
+    /// `true` via `update_feature_flags` or by editing
+    /// `.codemux/observability.json`.
+    #[serde(default)]
+    pub enable_lazy_workspace_creation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,12 +81,34 @@ pub struct SafetyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilitySnapshot {
+    #[serde(default)]
     pub logs: Vec<StructuredLogEntry>,
+    #[serde(default = "default_metrics_snapshot")]
     pub metrics: MetricsSnapshot,
+    #[serde(default = "default_feature_flags")]
     pub feature_flags: FeatureFlags,
+    #[serde(default = "default_permission_policy")]
     pub permission_policy: PermissionPolicy,
+    #[serde(default)]
     pub replay_records: Vec<ReplayRecord>,
+    #[serde(default = "default_safety_config")]
     pub safety_config: SafetyConfig,
+}
+
+fn default_metrics_snapshot() -> MetricsSnapshot {
+    default_snapshot().metrics
+}
+
+fn default_feature_flags() -> FeatureFlags {
+    default_snapshot().feature_flags
+}
+
+fn default_permission_policy() -> PermissionPolicy {
+    default_snapshot().permission_policy
+}
+
+fn default_safety_config() -> SafetyConfig {
+    default_snapshot().safety_config
 }
 
 pub struct ObservabilityStore {
@@ -119,6 +161,24 @@ impl ObservabilityStore {
         let _ = save_snapshot(&snapshot);
     }
 
+    /// Read the current feature-flag snapshot.
+    ///
+    /// Callers that only need one flag should use the explicit
+    /// accessor (e.g. [`agent_chat_enabled`](Self::agent_chat_enabled))
+    /// so the call site documents which flag it depends on.
+    pub fn feature_flags(&self) -> FeatureFlags {
+        self.inner.lock().unwrap().feature_flags.clone()
+    }
+
+    /// Whether the agent-chat pane and provider registry are enabled.
+    ///
+    /// This is a plain boolean read, cheap to call from command
+    /// entry-points. The gate defaults to `false`; see
+    /// [`FeatureFlags::enable_agent_chat`] for how to flip it.
+    pub fn agent_chat_enabled(&self) -> bool {
+        self.inner.lock().unwrap().feature_flags.enable_agent_chat
+    }
+
     pub fn set_feature_flags(&self, flags: FeatureFlags) {
         let mut snapshot = self.inner.lock().unwrap();
         snapshot.feature_flags = flags;
@@ -153,11 +213,30 @@ impl ObservabilityStore {
 
 pub fn load_observability_store() -> ObservabilityStore {
     let path = snapshot_path();
-    if let Ok(contents) = fs::read_to_string(&path) {
-        if let Ok(snapshot) = serde_json::from_str::<ObservabilitySnapshot>(&contents) {
-            return ObservabilityStore {
-                inner: Arc::new(Mutex::new(snapshot)),
-            };
+    match fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<ObservabilitySnapshot>(&contents) {
+            Ok(snapshot) => {
+                return ObservabilityStore {
+                    inner: Arc::new(Mutex::new(snapshot)),
+                };
+            }
+            Err(error) => {
+                // Don't swallow: partial/corrupt JSON silently defaulting to
+                // `enable_agent_chat: false` cost us hours. Log and continue.
+                eprintln!(
+                    "[codemux::observability] Failed to parse {}: {error}. Falling back to defaults.",
+                    path.display()
+                );
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // First run on this machine — nothing to log.
+        }
+        Err(error) => {
+            eprintln!(
+                "[codemux::observability] Failed to read {}: {error}. Falling back to defaults.",
+                path.display()
+            );
         }
     }
 
@@ -177,6 +256,15 @@ fn default_snapshot() -> ObservabilitySnapshot {
             unstable_openflow: true,
             unstable_browser_automation: true,
             unstable_indexing: true,
+            // Step 13 — Agent Chat Beta is OFF by default. Existing users
+            // with a persisted observability.json that has these keys set
+            // to `true` keep their state (the persisted file wins over
+            // these literals). The `Settings → Beta Features → Agent Chat`
+            // toggle flips both flags atomically — they're paired in every
+            // production read site, so the user-facing decision is one
+            // switch. See docs/plans/step-13-beta-toggle-research.md §1.
+            enable_agent_chat: false,
+            enable_lazy_workspace_creation: false,
         },
         permission_policy: PermissionPolicy {
             require_risky_action_approval: true,
@@ -213,7 +301,14 @@ fn save_snapshot(snapshot: &ObservabilitySnapshot) -> Result<(), String> {
 }
 
 fn snapshot_path() -> PathBuf {
-    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    // Anchor to $HOME, not CWD. CWD drifts between build modes (`cargo
+    // tauri dev` launches from `src-tauri/`, the installed binary from
+    // wherever the user invoked it), so a CWD-relative path produces a
+    // different file per launch — feature flags and safety config
+    // appear to "not stick" across restarts. See feature/agent-chat
+    // debugging for the incident.
+    let root = dirs::home_dir()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     root.join(".codemux").join("observability.json")
 }
 
@@ -236,4 +331,135 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regresses the dev-vs-release drift bug: the old CWD-relative
+    // `snapshot_path` resolved to `src-tauri/.codemux/observability.json`
+    // under `cargo tauri dev` and `$HOME/.codemux/observability.json`
+    // under the installed binary — so edits in one file never affected
+    // the other launch mode. Pinning to `$HOME` keeps both in sync.
+    #[test]
+    #[serial_test::serial]
+    fn snapshot_path_is_home_anchored_regardless_of_cwd() {
+        let home = dirs::home_dir().expect("HOME must be set for this test");
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let prev_cwd = std::env::current_dir().expect("current_dir");
+        std::env::set_current_dir(tmp.path()).expect("set_current_dir to tempdir");
+
+        let path = snapshot_path();
+
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+
+        assert!(
+            path.starts_with(&home),
+            "snapshot_path() = {} should live under HOME = {}",
+            path.display(),
+            home.display()
+        );
+    }
+
+    /// Step 13 — Agent Chat is OFF by default for new users. The
+    /// `default_snapshot()` literals and `#[serde(default)]` for the
+    /// flag fields must agree, otherwise a fresh-install user sees
+    /// the Beta surface without opting in.
+    #[test]
+    fn default_snapshot_disables_agent_chat_beta() {
+        let snap = default_snapshot();
+        assert!(
+            !snap.feature_flags.enable_agent_chat,
+            "default_snapshot must have enable_agent_chat = false; new users opt in via Settings → Beta Features"
+        );
+        assert!(
+            !snap.feature_flags.enable_lazy_workspace_creation,
+            "default_snapshot must have enable_lazy_workspace_creation = false; paired with enable_agent_chat as the unified Beta toggle"
+        );
+    }
+
+    /// `#[serde(default)]` on the flag fields must produce the same
+    /// off-default as `default_snapshot()`. Drift between the two
+    /// produces "fresh install OFF, partial-config user ON" surprises
+    /// — the bug Step 13 was scoped to fix.
+    #[test]
+    fn serde_default_for_agent_chat_flags_is_false() {
+        // FeatureFlags requires the unstable_* fields, but the agent-
+        // chat fields are `#[serde(default)]`. A partial JSON missing
+        // those fields must default them to false, matching
+        // `default_snapshot()`'s off-state.
+        let json = r#"{
+            "unstable_openflow": true,
+            "unstable_browser_automation": true,
+            "unstable_indexing": true
+        }"#;
+        let parsed: FeatureFlags = serde_json::from_str(json)
+            .expect("FeatureFlags missing only the agent-chat keys parses with serde defaults");
+        assert!(
+            !parsed.enable_agent_chat,
+            "serde(default) for enable_agent_chat must be false to match default_snapshot()"
+        );
+        assert!(
+            !parsed.enable_lazy_workspace_creation,
+            "serde(default) for enable_lazy_workspace_creation must be false to match default_snapshot()"
+        );
+    }
+
+    /// An existing user with a persisted observability.json that opted
+    /// into the Beta during dogfooding should keep their state — the
+    /// persisted file wins over the off-default. Pins the merge
+    /// promise made in docs/plans/step-13-beta-toggle-research.md §6.
+    #[test]
+    fn persisted_agent_chat_true_survives_default_flip() {
+        let json = r#"{
+            "unstable_openflow": true,
+            "unstable_browser_automation": true,
+            "unstable_indexing": true,
+            "enable_agent_chat": true,
+            "enable_lazy_workspace_creation": true
+        }"#;
+        let parsed: FeatureFlags = serde_json::from_str(json).expect("full flags parse");
+        assert!(parsed.enable_agent_chat);
+        assert!(parsed.enable_lazy_workspace_creation);
+    }
+
+    /// `set_agent_chat_beta` must flip both fields together. The Step
+    /// 6–12 surface assumes both flags are true to function — leaving
+    /// one of them flipped without the other lights up half the
+    /// surface and breaks composer routing. Pin the contract at the
+    /// store level so any future setter that bypasses the command
+    /// still gets caught.
+    #[test]
+    fn agent_chat_flags_can_be_flipped_atomically_via_store() {
+        let store = ObservabilityStore::default();
+        let starting = store.feature_flags();
+        assert!(!starting.enable_agent_chat, "default is off");
+        assert!(!starting.enable_lazy_workspace_creation, "default is off");
+
+        // Mirror what `commands::set_agent_chat_beta(enabled=true)` does.
+        let mut next = store.feature_flags();
+        next.enable_agent_chat = true;
+        next.enable_lazy_workspace_creation = true;
+        store.set_feature_flags(next);
+
+        let after_on = store.feature_flags();
+        assert!(after_on.enable_agent_chat);
+        assert!(after_on.enable_lazy_workspace_creation);
+
+        // And the symmetric off flip.
+        let mut next = store.feature_flags();
+        next.enable_agent_chat = false;
+        next.enable_lazy_workspace_creation = false;
+        store.set_feature_flags(next);
+
+        let after_off = store.feature_flags();
+        assert!(!after_off.enable_agent_chat);
+        assert!(!after_off.enable_lazy_workspace_creation);
+
+        // Other flags untouched by the toggle.
+        assert!(after_off.unstable_openflow);
+        assert!(after_off.unstable_browser_automation);
+        assert!(after_off.unstable_indexing);
+    }
 }

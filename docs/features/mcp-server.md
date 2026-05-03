@@ -1,123 +1,353 @@
 # MCP Server
 
-- Purpose: Describe the built-in MCP (Model Context Protocol) server and the tools it exposes.
-- Audience: Anyone working on agent integration, MCP tooling, or control surface expansion.
-- Authority: Canonical MCP server feature doc.
-- Update when: Tools are added/removed, transport changes, or auto-config behavior changes.
-- Read next: `docs/reference/CONTROL.md`, `AGENTS.md`
+- Purpose: Describe Codemux's two-sided MCP integration — Codemux as an
+  MCP **server** (exposing 29 control-plane tools to external agents)
+  AND as an MCP **host** (running user-installed MCP servers and
+  forwarding their tools into agent-chat sessions).
+- Audience: Anyone working on agent integration, MCP tooling, or
+  control-surface expansion.
+- Authority: Canonical MCP feature doc.
+- Update when: Tools are added/removed, transport changes, host runtime
+  semantics change, or a new agent provider gains MCP support.
+- Read next: `docs/reference/CONTROL.md`, `docs/features/agent-chat.md`,
+  `AGENTS.md`
 
 ## What This Feature Is
 
-A JSON-RPC 2.0 MCP server that runs over stdio, exposing Codemux workspace, browser, pane, notification, and git tools to AI agents. Agents like Claude Code can connect to it as an MCP server and use the tools to control Codemux programmatically.
+Codemux occupies both sides of the Model Context Protocol:
 
-## Current Model
+1. **MCP server** (original role) — Codemux runs `codemux mcp`, a
+   JSON-RPC 2.0 server over stdio that exposes 29 tools (browser,
+   workspace, pane, git, notification) so external agents can drive
+   Codemux programmatically.
+2. **MCP host / client** (Step 9) — Codemux's agent-chat runtime
+   discovers user-installed MCP servers from every supported
+   provider's config files, spawns them as child processes, manages
+   their lifecycle, and forwards their tools into agent sessions
+   through an in-process facade.
+
+The two sides share the same wire framing (JSON-RPC 2.0 over
+newline-delimited stdio per the
+[2024-11-05 spec](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports))
+but live in separate modules: `src-tauri/src/mcp_server.rs` for the
+server, `src-tauri/src/mcp/` plus `sidecar/claude-agent/src/mcp-bridge.ts`
+for the host runtime.
+
+## Server side: `codemux mcp`
 
 ### Transport
 
 - **Protocol**: JSON-RPC 2.0 over stdio (one JSON object per line)
 - **Protocol version**: `2024-11-05`
-- **Launch**: `codemux mcp` starts the server; agents connect via their MCP client config
+- **Launch**: `codemux mcp` starts the server; agents connect via their
+  MCP client config
 
 ### Auto-Configuration
 
-On startup, Codemux can automatically write its MCP server config into `~/.claude/claude_desktop_config.json` and Claude Code's MCP settings so agents discover it without manual setup. This is controlled by the `auto_mcp_config` setting (default: enabled). Users can toggle it in Settings > Editor & Workflow > Agent.
+On startup, Codemux can automatically write its MCP server config into
+`~/.claude/claude_desktop_config.json` and Claude Code's MCP settings so
+agents discover it without manual setup. This is controlled by the
+`auto_mcp_config` setting (default: enabled). Users can toggle it in
+Settings → Editor & Workflow → Agent.
 
 ### Tool Routing
 
-Most tools delegate to the Codemux control transport (Unix socket at `$XDG_RUNTIME_DIR/codemux.sock` on Linux/macOS, named pipe at `\\.\pipe\codemux-{username}` on Windows), reusing the same Rust helper implementations as the Tauri command layer and CLI. Git tools shell out to `git` in the workspace directory. The workspace is resolved from `CODEMUX_WORKSPACE_ID` env var.
+Most tools delegate to the Codemux control transport (Unix socket at
+`$XDG_RUNTIME_DIR/codemux.sock` on Linux/macOS, named pipe at
+`\\.\pipe\codemux-{username}` on Windows), reusing the same Rust helper
+implementations as the Tauri command layer and CLI. Git tools shell out
+to `git` in the workspace directory. The workspace is resolved from
+`CODEMUX_WORKSPACE_ID` env var.
 
-## Tools (29)
+### Tools (29)
 
-### Browser — Tier 1: DOM-based (7)
+| Category | Count | Tools |
+|---|---|---|
+| Browser — Tier 1: DOM-based | 7 | `browser_navigate`, `browser_snapshot`, `browser_accessibility_snapshot`, `browser_click`, `browser_fill`, `browser_screenshot`, `browser_console_logs` |
+| Browser — Tier 2: CDP/Vision-based | 5 | `browser_click_at`, `browser_type_at`, `browser_scroll_at`, `browser_key_press`, `browser_drag` |
+| Browser — Tier 3: OS-level Input | 2 | `browser_click_os`, `browser_type_os` |
+| Browser — Info & Evaluation | 3 | `browser_get_styles`, `browser_wait`, `browser_evaluate` |
+| Workspace | 3 | `workspace_list`, `workspace_info`, `workspace_create` |
+| Pane | 3 | `pane_list`, `pane_split_right`, `pane_split_down` |
+| Notification | 1 | `notify` |
+| Git | 5 | `git_status`, `git_diff`, `git_stage`, `git_commit`, `git_push` |
 
-| Tool | Description |
-|------|-------------|
-| `browser_navigate` | Navigate browser pane to a URL |
-| `browser_snapshot` | Get interactive DOM elements with CSS selectors and bounding boxes |
-| `browser_accessibility_snapshot` | Get the accessibility tree |
-| `browser_click` | Click element by CSS selector |
-| `browser_fill` | Fill input by CSS selector |
-| `browser_screenshot` | Capture page as base64 PNG (includes viewport dimensions) |
-| `browser_console_logs` | Get JavaScript console output |
+## Host side: cross-provider MCP runtime (Step 9)
 
-### Browser — Tier 2: CDP/Vision-based (5)
+### Architecture
 
-| Tool | Description |
-|------|-------------|
-| `browser_click_at` | Click at x,y coordinates (left/right/double) |
-| `browser_type_at` | Type text at optional x,y coordinates |
-| `browser_scroll_at` | Scroll at x,y in a direction |
-| `browser_key_press` | Send a key press (Enter, Tab, Escape, etc.) |
-| `browser_drag` | Drag from start to end coordinates |
+Per the locked decisions in `docs/plans/step-9-mcp-servers.md` and the
+implementation across Stages 1–6:
 
-### Browser — Tier 3: OS-level Input (2)
+```
+┌─────────────────────────────────────────────────┐
+│ Codemux (Rust)                                   │
+│                                                  │
+│  ┌────────────────────────┐                      │
+│  │ McpRegistry            │                      │
+│  │  - codemux-self (stdio)│                      │
+│  │  - omarchy-kb (stdio)  │ ← user config files  │
+│  │  - other user MCPs…    │                      │
+│  └─────────┬──────────────┘                      │
+│            │ tools/list, tools/call              │
+│            ▼                                     │
+│  ┌──────────────────────────────────┐            │
+│  │ Sidecar facade (TS, in-process)  │ ─────→ Claude SDK
+│  │  Options.mcpServers["codemux"]   │            │
+│  │  type: "sdk"                     │            │
+│  └──────────────────────────────────┘            │
+│                                                  │
+│  ┌──────────────────────────────────┐            │
+│  │ HTTP gateway (planned, Step 11)  │ ─────→ Codex CLI
+│  │  127.0.0.1:RANDOM/mcp            │            │
+│  └──────────────────────────────────┘            │
+└─────────────────────────────────────────────────┘
+```
 
-| Tool | Description |
-|------|-------------|
-| `browser_click_os` | Click via ydotool (bypasses anti-bot) |
-| `browser_type_os` | Type via ydotool (bypasses anti-bot) |
+Codemux runs each user-installed MCP server **once** (process-singleton
+inside Codemux) and exposes their tools through a unified registry. The
+Claude SDK consumes them via an in-process MCP server (the "facade").
+Tool calls round-trip back to Codemux's runtime so all Stage 3 plumbing
+— permission flow, logging, error wrapping — applies uniformly.
 
-### Browser — Info & Evaluation (3)
+### Discovery
 
-| Tool | Description |
-|------|-------------|
-| `browser_get_styles` | Get computed CSS styles for an element by selector |
-| `browser_wait` | Wait for an element (by selector) or text to appear on the page |
-| `browser_evaluate` | Execute arbitrary JavaScript in the browser and return the result |
+`McpRegistry::prime_for_chat` walks every supported config path and
+parses the union, discovering servers users have configured anywhere.
 
-### Workspace (3)
+| Path | Source enum | Notes |
+|---|---|---|
+| `~/.codemux/mcp.json` | `CodemuxUser` | Codemux's canonical user config — written by Stage 4 polish (file-based today; UI add/edit deferred) |
+| `<project>/.codemux/mcp.json` | `CodemuxProject` | Project-scoped Codemux MCPs |
+| `~/.claude.json` (top-level `mcpServers`) | `ClaudeUser` | The file Claude Code updates when running `claude mcp add --scope user` |
+| `~/.claude.json` `projects.<path>.mcpServers` | `ClaudeLocal` | Per-user-per-project local scope |
+| `<project>/.mcp.json` | `ClaudeProject` | Project-checked-in scope (also where Codemux's auto-write lives) |
+| `~/.cursor/mcp.json` | `CursorUser` | Cursor's format = Anthropic's |
+| `<project>/.cursor/mcp.json` | `CursorProject` |  |
 
-| Tool | Description |
-|------|-------------|
-| `workspace_list` | List all open workspaces |
-| `workspace_info` | Get active workspace details |
-| `workspace_create` | Create a new workspace (optional path) |
+Codemux's own MCP server (the 29-tool one above) is **always-on**: a
+hardcoded entry in `codemux_self_config()` that's pinned to the top of
+the registry and not user-toggleable.
 
-### Pane (3)
+### Dedupe + conflicts
 
-| Tool | Description |
-|------|-------------|
-| `pane_list` | List panes in active workspace |
-| `pane_split_right` | Split pane vertically |
-| `pane_split_down` | Split pane horizontally |
+Identical configs across multiple sources collapse to one row with a
+merged `sources: Vec<McpConfigSource>`. Same name with different
+configs (e.g. two versions of `omarchy-kb`) stay as two separate rows
+with an inline source disambiguator. The Codemux entry never merges
+with anything — it always stays its own row to preserve the always-on
+badge.
 
-### Notification (1)
+Tool prefix is `mcp__<server>__<tool>` for every tool, matching the
+Anthropic SDK convention so persisted approval rules in
+`~/.claude/settings.json` work without a separate code path. The prefix
+also prevents collisions between user-installed MCPs and Claude Code's
+native MCPs (e.g., `mcp__claude_ai_Google_Drive_*` from claude.ai
+managed connectors vs. `mcp__codemux__*` from our facade).
 
-| Tool | Description |
-|------|-------------|
-| `notify` | Send a notification (info or attention level) |
+### Lifecycle
 
-### Git (5)
+- **Lazy spawn.** Children are NOT started at app boot. They start when
+  the user opens Settings → MCP Servers (which calls `primeMcpRuntime`)
+  or when the first agent-chat session is started — whichever happens
+  first. Stage 3's bug fix in `agent_chat_start_session` waits up to
+  8 s for the prime to complete before snapshotting the tool list, so
+  no tools-list races even on a fresh Codemux launch.
+- **App-shutdown kill.** `tauri::RunEvent::Exit` calls
+  `McpRegistry::shutdown_all`, which fans out parallel
+  `JsonRpcChild::shutdown` calls (graceful EOF then SIGKILL with a 2 s
+  budget per child).
+- **No auto-restart.** A crashed server stays in `Errored` with the
+  stderr tail captured for the Settings tooltip. The user restarts
+  manually via the Restart button on errored rows.
+- **Hot toggle.** Disabling a server in Settings or the `+` popup stops
+  the child immediately and emits `update-mcp-tools` to live Claude
+  sessions so the agent loses access without a chat restart.
 
-| Tool | Description |
-|------|-------------|
-| `git_status` | Run `git status --porcelain` |
-| `git_diff` | Run `git diff` (optional file path) |
-| `git_stage` | Stage a file (or all with ".") |
-| `git_commit` | Commit with a message |
-| `git_push` | Push to remote |
+### Tool registration with Claude SDK
+
+`sidecar/claude-agent/src/mcp-bridge.ts` builds an in-process
+`McpServer` instance via the Claude Agent SDK's `createSdkMcpServer`
+helper. Each tool's handler issues a `mcp-tool-call` JSON-RPC request
+back to the Rust side via the bidirectional protocol added in Stage 3
+(`src/upstream-rpc.ts`). Rust's `spawn_incoming_requests_task` in
+`agent_provider/claude/session.rs` routes `mcp-tool-call` requests to
+`McpRegistry::dispatch_tool_call`, which forwards `tools/call` to the
+backing child and pipes the result back.
+
+JSON-Schema → Zod conversion is handled by `jsonSchemaToZodShape` in
+the bridge (object/string/number/boolean/array/enum/nested object;
+unknown shapes fall back to `z.unknown()`). This is good enough for
+Anthropic's first-party MCPs; pathological schemas degrade to permissive
+input validation.
+
+### Dynamic refresh (Stage 4)
+
+`spawn_mcp_refresh_task` per Claude session subscribes to the
+registry's `broadcast::Sender<McpServerRuntime>` and pushes
+`update-mcp-tools` to the sidecar whenever a server transitions state.
+Debounced 250 ms so toggling several servers in quick succession
+collapses to one refresh. The sidecar calls `query.setMcpServers({
+codemux: ... })` to swap the in-process facade in place — no chat
+restart needed.
+
+### 50-tool cap
+
+`apply_tool_cap` in `mcp/runtime.rs` caps the agent-visible tool list
+at 50 total. Codemux's tools are protected (always survive the cap);
+user MCP tools fill the remaining slots. The Settings UI shows a
+yellow banner above the server list when the cap engages, plus a
+`capped` badge on rows whose tools were dropped.
+
+### Permission flow
+
+MCP tool calls flow through Step 6's existing `canUseTool` bridge in
+the sidecar's `permissions.ts`. The `mcp__` prefix carries through
+unchanged, so persisted approval rules (Allow Once / For This Project /
+For All Projects) match what Anthropic's SDK writes natively. No new
+approval-store code; the prefix IS the discriminator.
+
+## Settings UI
+
+Settings → Editor & Workflow → MCP Servers.
+
+- **Codemux row**: pinned to top, "always on" badge, no toggle, shows
+  "Running, 29 tools" once primed.
+- **User MCP rows**: grouped by source (`Claude · User`, `Cursor · User`,
+  `Codemux · User`, etc.) with inline `Switch` toggles, live status
+  badges, and "View tools" hover-reveal that opens
+  `McpToolModal`.
+- **Status badges**: `discovered` / `starting…` / running tool count /
+  `errored` (red dot, hover for stderr tail) / `stopped`. Slow start
+  (`> 3 s` in starting state) surfaces "slow start — taking longer than
+  usual."
+- **Cap banner**: appears when `dropped_count > 0`; shows "X of N tools
+  registered" and recommends disabling servers to reclaim slots.
+- **Conflict UI**: deduped multi-source rows show "also: Cursor · User"
+  inline; same-name-different-config rows show a disambiguator with
+  hover tooltip.
+- **Restart button**: appears on errored rows.
+
+## `+` popup integration (Stage 4)
+
+Composer's `+` (attach) popup gained an `MCP Servers…` entry that
+pivots to a submenu listing every discovered server with inline
+`Switch` toggles. The submenu shares the same zustand store as
+Settings, so toggling from either place is consistent. A bottom row
+"Open MCP Settings" jumps to the Settings page via a
+`codemux:open-settings` window event.
 
 ## What Works Today
 
-- Full MCP server with 29 tools over stdio transport
-- Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
-- Workspace and pane control for agent self-orchestration
-- Git operations scoped to the agent's workspace directory
-- Auto-configuration for Claude Code and Claude Desktop MCP settings
-- Workspace resolution via `CODEMUX_WORKSPACE_ID` environment variable
+- Cross-provider MCP server runtime (Claude-side) — Stage 1–6 of Step 9.
+- Codemux's own MCP server with 29 tools (the original role, unchanged).
+- Discovery from Codemux / Claude / Cursor config paths with dedupe.
+- Lazy spawn on first chat session start (or Settings panel mount,
+  whichever first), bounded await so chat-start isn't slowed by a
+  cold prime.
+- Dynamic tool refresh — toggling a server mid-session updates the
+  agent's tool list within ~250 ms via SDK `setMcpServers`.
+- 50-tool cap with Codemux protection + UI banner.
+- Permission system integration — MCP tool calls flow through the same
+  Allow Once / For Project / For All Projects approval UI as native
+  tools.
+- Settings panel with status badges, toggles, restart, tool-list modal,
+  cap banner, conflict UI.
+- `+` popup MCP Servers submenu with inline toggles.
+- Auto-config writer for Codemux's own server (the original role) into
+  Claude Code's `.mcp.json` (controlled by `auto_mcp_config` setting).
 
 ## Current Constraints
 
-- Stdio transport only (no HTTP or SSE transport)
-- No streaming results (each tool call returns a single response)
-- Git tools shell out to `git` rather than using the Rust git library
-- OS-level input tools require `ydotool` to be available on the system
-- Auto-config writes to Claude-specific config files; other agent platforms need manual setup
+- **Claude only.** The Claude SDK's `Options.mcpServers["codemux"]` /
+  `type: "sdk"` mechanism is the path; Codex doesn't expose a runtime
+  tool-injection API in `codex app-server`. Codex MCP is planned for
+  Step 11 via an HTTP gateway approach — see
+  `docs/plans/step-9-codex-mcp-spike.md`.
+- **Stdio transport only** for spawning user-installed MCPs. HTTP /
+  SSE transports are parsed and surfaced in Settings (so users see
+  their HTTP MCPs listed) but `start_mcp_server` rejects them with
+  `"HTTP transport not supported in v1"` until Step 11 motivates
+  building an HTTP MCP client.
+- **No add/edit from UI.** Users add servers by editing
+  `~/.codemux/mcp.json` (or any other supported config path) directly.
+  In-app add/edit is deferred to Step 10+.
+- **Auto-config writes to Claude-specific config files.** Other agent
+  platforms need manual setup; this is the original-role behavior and
+  unchanged by Step 9.
+- **JSON-Schema → Zod converter is lossy.** Pathological schemas
+  (`oneOf` discriminated unions, recursive `$ref`, exotic keywords)
+  fall back to `z.unknown()`. The MCP server itself still validates
+  upstream, so this is permissive sidecar-side validation, not a
+  safety hole.
 
 ## Important Touch Points
 
-- `src-tauri/src/mcp_server.rs` — MCP server implementation, tool registry, dispatch, socket bridge
-- `src-tauri/src/cli.rs` — `codemux mcp` CLI entrypoint
-- `src-tauri/src/agent_browser.rs` — DOM snapshot script used by `browser_snapshot`
-- `src-tauri/src/control.rs` — Socket control server that MCP tools delegate to
+### Server side (original role)
+
+- `src-tauri/src/mcp_server.rs` — JSON-RPC server, 29-tool registry,
+  `upsert_mcp_config` config writer
+- `src-tauri/src/cli.rs` — `codemux mcp` CLI entry point
+- `src-tauri/src/agent_browser.rs` — DOM snapshot script used by
+  `browser_snapshot`
+- `src-tauri/src/control.rs` — Socket control server that MCP tools
+  delegate to
 - `src/stores/settings-store.ts` — `auto_mcp_config` setting
+
+### Host side (Step 9)
+
+- `src-tauri/src/mcp/mod.rs` — `McpServerConfig`, `McpConfigSource`,
+  `McpTransport`, `dedupe_servers`, `source_rank`
+- `src-tauri/src/mcp/paths.rs` — Config-path enumeration across
+  providers
+- `src-tauri/src/mcp/parser.rs` — `parse_mcp_config_file` +
+  `parse_claude_wrapped_config` (handles `~/.claude.json` multi-section
+  format)
+- `src-tauri/src/mcp/codemux_self.rs` — Hardcoded always-on entry
+- `src-tauri/src/mcp/runtime.rs` — `start_mcp_server` (handshake),
+  `apply_tool_cap`, `McpServerHandle`, `McpServerStatus`, `McpTool`
+- `src-tauri/src/mcp/registry.rs` — `McpRegistry`, lazy spawn,
+  shutdown_all, dispatch_tool_call, status broadcast
+- `src-tauri/src/commands/mcp.rs` — Tauri commands:
+  `list_mcp_servers`, `get_mcp_runtime_status`, `set_mcp_disabled_ids`,
+  `prime_mcp_runtime`, `start_mcp_server_cmd`, `stop_mcp_server_cmd`,
+  `restart_mcp_server_cmd`, `list_mcp_tools`,
+  `list_mcp_tools_with_cap_info`, `list_mcp_tools_for_server`
+- `src-tauri/src/agent_provider/claude/protocol.rs` —
+  `METHOD_UPDATE_MCP_TOOLS`, `UpdateMcpToolsParams`, `McpToolEntry`
+- `src-tauri/src/agent_provider/claude/session.rs` —
+  `spawn_incoming_requests_task` (handles `mcp-tool-call` from
+  sidecar), `spawn_mcp_refresh_task` (debounced dynamic refresh),
+  `collect_mcp_tools` (snapshot at session start)
+- `sidecar/claude-agent/src/rpc.ts` — `parseLine` discriminated union
+  (incoming vs response)
+- `sidecar/claude-agent/src/upstream-rpc.ts` — Outbound JSON-RPC for
+  sidecar → Rust callbacks
+- `sidecar/claude-agent/src/mcp-bridge.ts` — `buildCodemuxMcpServer`,
+  `jsonSchemaToZodShape`, in-process facade
+- `sidecar/claude-agent/src/methods/index.ts` — `start-session`
+  validates `mcpTools[]`, `update-mcp-tools` dynamic refresh handler
+- `sidecar/claude-agent/src/session.ts` — `buildQueryOptions` populates
+  `Options.mcpServers["codemux"]`, `updateMcpTools` calls
+  `query.setMcpServers`
+- `src/stores/mcp-store.ts` — Zustand `disabledIds` with localStorage
+  persist + backend sync
+- `src/hooks/use-mcp-runtime.ts` — Tauri-event-driven runtime status
+- `src/components/settings/mcp-section.tsx` — Settings UI: groups,
+  rows, status badges, cap banner, conflict UI, slow-start indicator
+- `src/components/settings/mcp-tool-modal.tsx` — Tool-list modal
+- `src/components/chat/Composer.tsx` — `+` popup MCP submenu
+  (`attachSubmode === "mcp"`) with inline `Switch` toggles
+- `src/components/chat/SlashCommandPopup.tsx` — `rightAdornment`
+  support for inline trailing controls
+
+## Roadmap
+
+- **Step 10 — Skills sync** (planned). Mirrors the Step 9 cross-provider
+  pattern for skills. See `docs/features/agent-chat.md` follow-ups.
+- **Step 11 — Codex MCP via HTTP gateway** (planned). Codemux exposes
+  one localhost HTTP MCP server, writes `[mcp_servers.codemux] url =
+  "..."` to `~/.codex/config.toml`, hot-reloads via
+  `config/mcpServer/reload`. Reuses the entire Step 9 registry +
+  dispatcher. See `docs/plans/step-9-codex-mcp-spike.md` for the spike
+  research and staging proposal.

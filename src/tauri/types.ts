@@ -1,3 +1,13 @@
+// ── Feature flags ──
+
+export interface FeatureFlags {
+  unstable_openflow: boolean;
+  unstable_browser_automation: boolean;
+  unstable_indexing: boolean;
+  enable_agent_chat: boolean;
+  enable_lazy_workspace_creation: boolean;
+}
+
 // ── Synced Settings ──
 
 export interface AppearanceSettings {
@@ -432,6 +442,18 @@ export interface PullRequestInfo {
   review_decision: string | null;
   checks_passing: boolean | null;
   updated_at: string | null;
+  /** Stage 5 — populated by `get_github_pr_by_path` only. List paths
+   *  leave it null so list queries stay cheap. Body is truncated at
+   *  50 KB on a char boundary, mirroring the issue path. */
+  body: string | null;
+  /** First 20 conversation comments. Empty for list rows. */
+  comments: IssueComment[];
+  /** Total conversation count — equals `comments.length` when under
+   *  the cap, exceeds it when truncated. */
+  totalComments: number;
+  /** PR author login. Null when gh JSON didn't carry the field
+   *  (e.g. ghost users / list rows that didn't request author). */
+  author: string | null;
 }
 
 export interface IncomingPrItem {
@@ -479,6 +501,12 @@ export interface InlineReviewComment {
 
 export type IssueState = "Open" | "Closed";
 
+export interface IssueComment {
+  author: string;
+  body: string;
+  createdAt: string;
+}
+
 export interface GitHubIssue {
   number: number;
   title: string;
@@ -487,6 +515,15 @@ export interface GitHubIssue {
   assignees: string[];
   url: string;
   body: string | null;
+  /** Stage 4 — populated by the detail fetch only. List queries return
+   *  an empty array. Capped at 20 by the backend. */
+  comments: IssueComment[];
+  /** Total comment count (may exceed `comments.length` when the
+   *  backend truncated the visible slice). */
+  totalComments: number;
+  /** ISO8601 last-update timestamp. Used to sort the issue popup by
+   *  recency. Null when `gh` didn't include the field. */
+  updatedAt: string | null;
 }
 
 export interface LinkedIssue {
@@ -512,9 +549,125 @@ export interface TabSnapshot {
   icon: string | null;
 }
 
+export type AgentChatProviderKind = "claude" | "codex" | "opencode";
+
+/** Step 12 Stage 1 — driver-equals-instance shim (`"claude"` /
+ *  `"codex"` / `"opencode"`). v2 lifts this to a richer
+ *  `(driver, instance)` map; today it round-trips with
+ *  `AgentChatProviderKind` so any payload carrying either field
+ *  decodes interchangeably. */
+export type ProviderInstanceId = AgentChatProviderKind;
+
+/** Step 12 Stage 1 — diagnostic snapshot returned by
+ *  `opencode_check_availability`. Mirrors the Rust struct in
+ *  `src-tauri/src/agent_provider/opencode/discovery.rs` field for
+ *  field. The picker surface in later stages reads this verbatim;
+ *  Stage 1 only wires the wrapper so consumers can land without
+ *  schema churn when the live integration ships. */
+export interface OpenCodeAvailability {
+  installed: boolean;
+  binary_path: string | null;
+  version: string | null;
+  server_running: boolean;
+  server_url: string | null;
+}
+
+/** Step 12 Stage 2 — one model entry as returned by
+ *  `opencode_list_models`. Mirrors the Rust `OpenCodeModel`
+ *  struct in `src-tauri/src/agent_provider/opencode/client.rs`
+ *  and is itself a flattened view over OpenCode's `/provider`
+ *  envelope (the wire-format `Model` carries far more — cost,
+ *  capabilities, release date — that Codemux does not need
+ *  yet). Stage 3 maps each entry into `ChatModelInfo`. */
+export interface OpenCodeModel {
+  id: string;
+  name: string;
+  description: string | null;
+  variants: string[];
+  context_window: number | null;
+}
+
+/** Step 12 Stage 2 — one provider entry from
+ *  `opencode_list_models`. Each entry is a flattened view over
+ *  one `Provider` block from the `GET /provider` response, with
+ *  `connected` derived from the top-level `connected: string[]`
+ *  array. The picker rebuild (Stage 4) treats this list as the
+ *  source of truth for the OpenCode model menu. */
+export interface OpenCodeProviderEntry {
+  id: string;
+  name: string;
+  connected: boolean;
+  models: Record<string, OpenCodeModel>;
+}
+
+// ── Chat-side provider capabilities ───────────────────────────────────
+
+export type EffortGranularity = "per_session" | "per_turn";
+
+export interface ContextWindowOption {
+  value: string;
+  label: string;
+  is_default: boolean;
+}
+
+export interface ChatModelInfo {
+  id: string;
+  label: string;
+  description: string | null;
+  effort_levels: string[];
+  default_effort: string | null;
+  prompt_injected_effort_levels: string[];
+  context_window_options: ContextWindowOption[];
+  supports_adaptive_thinking: boolean;
+  supports_thinking_toggle: boolean;
+  supports_fast_mode: boolean;
+  /** Step 8 Stage 6 — true when the model accepts image attachments.
+   *  Drives the `+ → Image…` enable state and whether the composer's
+   *  paste/drop handlers stage attachments at all. */
+  supports_images: boolean;
+  /** Step 12 Stage 3 — for federated providers (OpenCode), the
+   *  upstream provider id this model belongs to (e.g. `"openai"`,
+   *  `"anthropic"`, `"openrouter"`). `null` for direct providers
+   *  (Claude, Codex) where the driver IS the provider. Drives the
+   *  picker's grouping rail and the secondary label rendered below
+   *  the model name. */
+  sub_provider: string | null;
+  /** True when the model is free-tier on the upstream provider's
+   *  configured plan (both input and output token costs are 0).
+   *  Drives a "FREE" pill in the picker and a soft sort boost so
+   *  free models bubble to the top of their provider's list, after
+   *  favorites. Today only OpenCode federated entries can ever set
+   *  this — Claude / Codex always emit `false`. */
+  is_free: boolean;
+}
+
+export interface PermissionModeOption {
+  value: string;
+  label: string;
+  description: string;
+  is_default: boolean;
+}
+
+export interface ProviderChatCapabilities {
+  models: ChatModelInfo[];
+  effort_granularity: EffortGranularity;
+  effort_label_map: Record<string, string>;
+  permission_modes: PermissionModeOption[];
+  default_permission_mode: string | null;
+  permission_granularity: EffortGranularity;
+}
+
 export type PaneNodeSnapshot =
   | { kind: "terminal"; pane_id: string; session_id: string; title: string }
   | { kind: "browser"; pane_id: string; browser_id: string; title: string }
+  | {
+      kind: "agent_chat";
+      pane_id: string;
+      title: string;
+      thread_id: string | null;
+      provider: AgentChatProviderKind | null;
+      cwd: string | null;
+    }
   | {
       kind: "split";
       pane_id: string;
@@ -530,7 +683,7 @@ export interface SurfaceSnapshot {
   active_pane_id: string;
 }
 
-export type WorkspaceType = "standard" | "open_flow";
+export type WorkspaceType = "standard" | "open_flow" | "home";
 
 export interface WorkspaceSnapshot {
   workspace_id: string;
@@ -669,6 +822,12 @@ export interface OrchestratorTriggerResult {
 
 export type LaunchMode = "split_pane" | "new_tab";
 
+/** Mirror of the Rust `PresetKind` enum. `cli` is the classic
+ *  terminal-launch preset; `chat_agent` is a native agent-chat preset
+ *  that spawns an `agent_chat` pane instead of a CLI subprocess. The
+ *  frontend `materializeWithPreset` dispatches on this field. */
+export type PresetKind = "cli" | "chat_agent";
+
 export interface TerminalPreset {
   id: string;
   name: string;
@@ -681,6 +840,9 @@ export interface TerminalPreset {
   is_builtin: boolean;
   auto_run_on_workspace: boolean;
   auto_run_on_new_tab: boolean;
+  /** Defaults to `"cli"` on the Rust side for presets persisted
+   *  before this field existed. */
+  kind: PresetKind;
 }
 
 export interface PresetStoreSnapshot {
@@ -757,4 +919,83 @@ export interface FileEntry {
   is_dir: boolean;
   size: number | null;
   is_gitignored: boolean;
+}
+
+/** Result row from `list_project_files` (Step 8 Stage 1). Used for the
+ *  `@` mention popup and `+ → File…` picker in the chat composer. */
+export interface FileMatch {
+  /** Path relative to cwd. */
+  path: string;
+  /** Absolute, canonicalized path. */
+  absolute_path: string;
+  /** Fuzzy-match score; higher is better. `0` for empty-query / alphabetical. */
+  score: number;
+}
+
+/** Top-level outline entry surfaced when a large file is truncated.
+ *  Step 8 Stage 2: regex-extracted declarations per language; Stage 7
+ *  promotes to tree-sitter for richer extraction. */
+export interface OutlineEntry {
+  /** Coarse declaration kind: "function", "class", "type", "trait",
+   *  "impl", "mod", "enum", "struct", "interface", "heading", etc.
+   *  Free-form by design — UI just displays as-is. */
+  kind: string;
+  /** Symbol name (the captured identifier or, for headings, the
+   *  heading text). */
+  name: string;
+  /** 1-indexed line number where the declaration was found. */
+  line: number;
+}
+
+/** Result row from `list_project_folders` (Step 8 Stage 3). Used for
+ *  the `+ → Folder…` picker. Derives directory prefixes from the
+ *  same file-walk cache as `FileMatch`. */
+export interface FolderMatch {
+  /** Path relative to cwd, no trailing slash. */
+  path: string;
+  /** Absolute, canonicalized path. */
+  absolute_path: string;
+  /** Fuzzy-match score; `0` for empty-query / alphabetical. */
+  score: number;
+  /** Immediate-children count (files + dirs at depth 1). */
+  item_count: number;
+}
+
+/** Backend response for `read_folder_for_attachment` (Step 8 Stage 3).
+ *  Carries a pre-rendered unicode tree (depth-bounded) plus the true
+ *  pre-truncation item count. */
+export interface FolderAttachmentInfo {
+  absolutePath: string;
+  relativePath: string | null;
+  /** Pre-rendered unicode tree, depth-bounded by the caller's
+   *  `max_depth`. Truncated at 100 entries with a trailing
+   *  "… N more entries" marker. */
+  tree: string;
+  itemCount: number;
+}
+
+/** Backend response for `read_file_for_attachment` (Step 8 Stage 2).
+ *  Reports text/binary, full-vs-truncated content, and an outline
+ *  when truncated. The frontend's chip preview + injection block both
+ *  derive from this struct. */
+export interface FileAttachmentInfo {
+  /** Echo of the input absolute path — agent uses this for Read/Grep. */
+  absolutePath: string;
+  /** Path relative to `cwd` if the file is under it; else null. */
+  relativePath: string | null;
+  /** Total line count of the file (not of the truncated preview). */
+  lineCount: number;
+  /** File size in bytes. */
+  bytes: number;
+  /** File extension as a hint for code fences. `null` for extension-less files. */
+  language: string | null;
+  /** False for binary files (null-byte sniff in first 8KB). */
+  isText: boolean;
+  /** Full text for ≤200KB / ≤1500-line files; first-50-lines preview for
+   *  larger files; empty for binaries. */
+  content: string;
+  /** True when `content` is a preview, not the full file. */
+  truncated: boolean;
+  /** Top-level declarations extracted when truncated. Null otherwise. */
+  outline: OutlineEntry[] | null;
 }

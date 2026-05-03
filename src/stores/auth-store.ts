@@ -2,11 +2,15 @@ import { create } from "zustand";
 import type { AuthUser } from "@/tauri/types";
 import {
   checkAuth as checkAuthCmd,
+  getSyncStatus as getSyncStatusCmd,
   startOauthFlow as startOauthFlowCmd,
   signinEmail as signinEmailCmd,
   signupEmail as signupEmailCmd,
   signOut as signOutCmd,
+  type SyncStatus,
 } from "@/tauri/commands";
+
+export type AuthMethod = "email" | "github" | null;
 
 interface AuthStore {
   user: AuthUser | null;
@@ -15,6 +19,15 @@ interface AuthStore {
   isSigningIn: boolean;
   error: string | null;
   devBypass: boolean;
+
+  // Skills sync (Stage 2). Backend keeps the encryption key bytes;
+  // the frontend only sees a boolean + the auth method that picked
+  // the user's session. The pair drives the Settings → Sync UI fork:
+  //   - syncAvailable=true                        → "Sync ready"
+  //   - syncAvailable=false, authMethod=github    → SetupSyncPasswordForm
+  //   - syncAvailable=false, authMethod=email|nil → ProvidePasswordForm
+  syncAvailable: boolean;
+  authMethod: AuthMethod;
 
   checkAuth: () => Promise<void>;
   startOAuthFlow: () => Promise<void>;
@@ -26,6 +39,8 @@ interface AuthStore {
   ) => Promise<void>;
   signOut: () => Promise<void>;
   setUser: (user: AuthUser | null) => void;
+  setSyncStatus: (status: SyncStatus) => void;
+  refreshSyncStatus: () => Promise<void>;
   clearError: () => void;
 }
 
@@ -36,13 +51,15 @@ const DEV_USER: AuthUser = {
   image: null,
 };
 
-export const useAuthStore = create<AuthStore>((set) => ({
+export const useAuthStore = create<AuthStore>((set, get) => ({
   user: null,
   isAuthenticated: false,
   isLoading: true,
   isSigningIn: false,
   error: null,
   devBypass: false,
+  syncAvailable: false,
+  authMethod: null,
 
   checkAuth: async () => {
     set({ isLoading: true, error: null });
@@ -55,8 +72,28 @@ export const useAuthStore = create<AuthStore>((set) => ({
         const user = await checkAuthCmd();
         if (user) {
           set({ user, isAuthenticated: true, isLoading: false });
+          // Pull the cold-start sync state. Backend may have loaded
+          // the persisted sync-key.enc, in which case we want to
+          // mark the session as sync-ready immediately rather than
+          // waiting for the `sync-state-changed` event.
+          try {
+            const status = await getSyncStatusCmd();
+            set({
+              syncAvailable: status.syncAvailable,
+              authMethod: status.authMethod,
+            });
+          } catch {
+            // Tauri command unavailable in dev/test harness — leave
+            // syncAvailable=false (already the default).
+          }
         } else {
-          set({ user: null, isAuthenticated: false, isLoading: false });
+          set({
+            user: null,
+            isAuthenticated: false,
+            isLoading: false,
+            syncAvailable: false,
+            authMethod: null,
+          });
         }
         return;
       } catch (err) {
@@ -129,6 +166,8 @@ export const useAuthStore = create<AuthStore>((set) => ({
       isAuthenticated: false,
       isSigningIn: false,
       devBypass: false,
+      syncAvailable: false,
+      authMethod: null,
     });
   },
 
@@ -137,6 +176,22 @@ export const useAuthStore = create<AuthStore>((set) => ({
       set({ user, isAuthenticated: true, isSigningIn: false });
     } else {
       set({ user: null, isAuthenticated: false });
+    }
+  },
+
+  setSyncStatus: (status) =>
+    set({ syncAvailable: status.syncAvailable, authMethod: status.authMethod }),
+
+  refreshSyncStatus: async () => {
+    try {
+      const status = await getSyncStatusCmd();
+      set({
+        syncAvailable: status.syncAvailable,
+        authMethod: status.authMethod,
+      });
+    } catch {
+      // Tauri unavailable — leave whatever we had before.
+      void get();
     }
   },
 

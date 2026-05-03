@@ -23,10 +23,22 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard } from "lucide-react";
+import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard, Home } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { dbGetUiState, dbSetUiState, closeWorkspace, closeWorkspaceWithWorktree, revealInFileManager } from "@/tauri/commands";
+import {
+  dbGetUiState,
+  dbSetUiState,
+  closeWorkspace,
+  closeWorkspaceWithWorktree,
+  revealInFileManager,
+  createEmptyWorkspace,
+  activateWorkspace,
+  agentChatCreatePane,
+} from "@/tauri/commands";
 import { useUIStore } from "@/stores/ui-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useAppStore, useHomeDir } from "@/stores/app-store";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
 const PROJECT_COLORS = [
@@ -75,6 +87,10 @@ export function SidebarProjectGroup({
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const enableLazyWorkspaceCreation = useFeatureFlags(
+    (s) => s.enableLazyWorkspaceCreation,
+  );
 
   useEffect(() => {
     dbGetUiState(`collapsed:project:${projectPath}`).then((val) => {
@@ -110,7 +126,41 @@ export function SidebarProjectGroup({
     navigator.clipboard.writeText(projectPath).catch(console.error);
   };
 
+  const handlePlusClick = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+
+    if (e.shiftKey || !enableAgentChat) {
+      setShowNewWorkspaceDialog(true, projectPath);
+      return;
+    }
+
+    // Lazy-creation path: open (or reuse) the single-slot project
+    // draft without materialising a workspace.
+    if (enableLazyWorkspaceCreation) {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateProjectDraft(projectPath);
+      store.setActiveDraft(draft.draftId);
+      return;
+    }
+
+    try {
+      const wsId = await createEmptyWorkspace(projectPath);
+      await activateWorkspace(wsId);
+      await agentChatCreatePane(wsId, null, projectPath);
+    } catch (err) {
+      console.error("[sidebar] failed to open chat pane:", err);
+      setShowNewWorkspaceDialog(true, projectPath);
+    }
+  };
+
   const handleCloseProject = () => {
+    // Drop any client-side drafts targeting this project before
+    // tearing down its workspaces. Keeps the draft store from holding
+    // references to a project that is about to disappear from the
+    // sidebar. When the project being closed IS the Home group
+    // (projectPath === homeDir), home-target drafts are swept too.
+    const homeDir = useAppStore.getState().homeDir;
+    useChatDraftStore.getState().clearDraftsForProject(projectPath, homeDir);
     for (const ws of workspaces) {
       if (ws.worktree_path) {
         closeWorkspaceWithWorktree(ws.workspace_id, false, false, true).catch(console.error);
@@ -123,6 +173,14 @@ export function SidebarProjectGroup({
 
   const hasColor = !!customColor;
   const letter = projectName.charAt(0).toUpperCase();
+  // The Home group is the project-group that `groupWorkspacesByProject`
+  // labels "Home" when `project_root === homeDir`. Render a Home
+  // lucide icon in the avatar slot instead of the "H" letter so users
+  // don't mistake it for an actual project named "Home". Matching
+  // both fields (name and path) is defence against a user project
+  // literally called "Home" living outside $HOME.
+  const homeDir = useHomeDir();
+  const isHomeGroup = projectName === "Home" && projectPath === homeDir;
 
   return (
     <div className="py-1.5">
@@ -135,7 +193,8 @@ export function SidebarProjectGroup({
             onDragStart={onProjectDragStart}
             data-project-header-path={projectPath}
           >
-            {/* Letter avatar — neutral by default, colored only if user picks one */}
+            {/* Letter avatar — neutral by default, colored only if user picks one.
+                The Home group renders a Home lucide icon instead of "H". */}
             <div
               className={cn(
                 "size-6 rounded flex items-center justify-center shrink-0 mr-2.5 text-xs font-medium border-[1.5px]",
@@ -147,7 +206,7 @@ export function SidebarProjectGroup({
                 color: customColor!,
               } : undefined}
             >
-              {letter}
+              {isHomeGroup ? <Home className="h-3.5 w-3.5" /> : letter}
             </div>
 
             <Button
@@ -168,13 +227,13 @@ export function SidebarProjectGroup({
                   size="icon-xs"
                   className="shrink-0 ml-1"
                   aria-label="New workspace"
-                  onClick={(e) => { e.stopPropagation(); setShowNewWorkspaceDialog(true, projectPath); }}
+                  onClick={handlePlusClick}
                 >
                   <Plus className="h-4 w-4 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4}>
-                New workspace
+              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
               </TooltipContent>
             </Tooltip>
 

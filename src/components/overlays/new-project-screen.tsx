@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   pickFolderDialog,
   createEmptyRepo,
@@ -110,7 +111,15 @@ export function NewProjectScreen() {
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(projectPath);
       await activateWorkspace(wsId);
-      if (!hasWorkspaces && !useUIStore.getState().hasSeenOnboarding) {
+      // Skip the legacy onboarding wizard when EITHER the user has
+      // already seen and dismissed it (sticky `hasSeenOnboarding` —
+      // re-trap fix from main) OR the user opted into the chat-agent +
+      // lazy-workspace flow (in which case `useEnsureDraftWhenEmpty`
+      // auto-spawns an agent_chat pane on the empty workspace).
+      const flags = useFeatureFlags.getState();
+      const chatFlow = flags.enableAgentChat && flags.enableLazyWorkspaceCreation;
+      const seenOnboarding = useUIStore.getState().hasSeenOnboarding;
+      if (!hasWorkspaces && !chatFlow && !seenOnboarding) {
         useUIStore.getState().setOnboardingProjectDir(projectPath);
       }
       setShowNewProjectScreen(false);

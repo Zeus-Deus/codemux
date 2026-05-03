@@ -1,0 +1,228 @@
+/// <reference types="@testing-library/jest-dom/vitest" />
+//
+// Step 12 Stage 3 — pin the multi-provider capabilities store
+// behaviour. Two surfaces matter:
+//
+// 1. Each provider has its own `caps` slot + `error` slot, refreshed
+//    independently. A failure on one provider must NOT clobber the
+//    other slots — that's the regression class the Stage 3 refactor
+//    introduced (the previous codebase's `selectCapabilities`
+//    ternary silently misrouted OpenCode → Codex).
+// 2. `selectCapabilities` / `selectError` are exhaustive switches
+//    over `AgentChatProviderKind`; adding a fourth provider in the
+//    future has to fail at compile time rather than fall through to
+//    a stale slot.
+//
+// The store talks to the Tauri layer via `listChatProviderCapabilities`
+// — mocked here so jsdom never reaches a real `invoke`.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockList = vi.fn();
+
+vi.mock("@/tauri/commands", () => ({
+  listChatProviderCapabilities: (...args: unknown[]) => mockList(...args),
+}));
+
+import {
+  selectCapabilities,
+  selectError,
+  selectModel,
+  useProviderCapabilities,
+} from "./provider-capabilities-store";
+import type {
+  AgentChatProviderKind,
+  ChatModelInfo,
+  ProviderChatCapabilities,
+} from "@/tauri/types";
+
+function makeCaps(modelId: string): ProviderChatCapabilities {
+  return {
+    models: [
+      {
+        id: modelId,
+        label: modelId,
+        description: null,
+        effort_levels: [],
+        default_effort: null,
+        prompt_injected_effort_levels: [],
+        context_window_options: [],
+        supports_adaptive_thinking: false,
+        supports_thinking_toggle: false,
+        supports_fast_mode: false,
+        supports_images: false,
+        sub_provider: null,
+        is_free: false,
+      },
+    ],
+    effort_granularity: "per_session",
+    effort_label_map: {},
+    permission_modes: [],
+    default_permission_mode: null,
+    permission_granularity: "per_session",
+  };
+}
+
+function resetStore() {
+  useProviderCapabilities.setState({
+    claude: null,
+    codex: null,
+    opencode: null,
+    claudeError: null,
+    codexError: null,
+    opencodeError: null,
+    loaded: false,
+  });
+  mockList.mockReset();
+}
+
+beforeEach(resetStore);
+afterEach(resetStore);
+
+describe("provider-capabilities-store", () => {
+  it("refresh writes to the right slot", async () => {
+    mockList.mockImplementation(async (provider: AgentChatProviderKind) =>
+      makeCaps(`model-${provider}`),
+    );
+
+    await useProviderCapabilities.getState().refresh("opencode");
+    const state = useProviderCapabilities.getState();
+    expect(state.opencode?.models[0]?.id).toBe("model-opencode");
+    // Cross-slot isolation — claude / codex stay null.
+    expect(state.claude).toBeNull();
+    expect(state.codex).toBeNull();
+    expect(state.opencodeError).toBeNull();
+  });
+
+  it("refresh on failure populates the right error slot only", async () => {
+    mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
+      if (provider === "opencode") throw new Error("opencode_not_installed");
+      return makeCaps(`model-${provider}`);
+    });
+
+    await useProviderCapabilities.getState().refresh("opencode");
+    const state = useProviderCapabilities.getState();
+    expect(state.opencode).toBeNull();
+    expect(state.opencodeError).toBe("opencode_not_installed");
+    // Other providers untouched.
+    expect(state.claudeError).toBeNull();
+    expect(state.codexError).toBeNull();
+  });
+
+  it("refreshAll fires all three providers in parallel", async () => {
+    const calls: AgentChatProviderKind[] = [];
+    mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
+      calls.push(provider);
+      return makeCaps(`model-${provider}`);
+    });
+
+    await useProviderCapabilities.getState().refreshAll();
+    // Order is not guaranteed, but every provider must have been
+    // called exactly once.
+    expect(calls.sort()).toEqual(["claude", "codex", "opencode"]);
+    const state = useProviderCapabilities.getState();
+    expect(state.loaded).toBe(true);
+    expect(state.claude).not.toBeNull();
+    expect(state.codex).not.toBeNull();
+    expect(state.opencode).not.toBeNull();
+  });
+
+  it("refreshAll continues when one provider fails", async () => {
+    // Critical Stage 3 invariant: an OpenCode-not-installed failure
+    // must not block Claude/Codex from loading. `Promise.all` is
+    // safe here because each `refresh()` swallows its own error.
+    mockList.mockImplementation(async (provider: AgentChatProviderKind) => {
+      if (provider === "opencode") throw new Error("opencode_not_installed");
+      return makeCaps(`model-${provider}`);
+    });
+
+    await useProviderCapabilities.getState().refreshAll();
+    const state = useProviderCapabilities.getState();
+    expect(state.loaded).toBe(true);
+    expect(state.claude?.models[0]?.id).toBe("model-claude");
+    expect(state.codex?.models[0]?.id).toBe("model-codex");
+    expect(state.opencode).toBeNull();
+    expect(state.opencodeError).toBe("opencode_not_installed");
+  });
+
+  it("selectCapabilities returns the matching provider's slot", () => {
+    const caps = useProviderCapabilities.getState();
+    const claudeCaps = makeCaps("claude-opus-4-7");
+    const codexCaps = makeCaps("gpt-5.4");
+    const opencodeCaps = makeCaps("openai/gpt-5");
+    useProviderCapabilities.setState({
+      claude: claudeCaps,
+      codex: codexCaps,
+      opencode: opencodeCaps,
+    });
+
+    const updated = useProviderCapabilities.getState();
+    expect(selectCapabilities(updated, "claude")).toBe(claudeCaps);
+    expect(selectCapabilities(updated, "codex")).toBe(codexCaps);
+    // The Stage 2 bug: a non-exhaustive ternary returned `state.codex`
+    // for any non-claude provider. Pin the fix here so a regression
+    // can't reintroduce it silently.
+    expect(selectCapabilities(updated, "opencode")).toBe(opencodeCaps);
+    expect(selectCapabilities(updated, "opencode")).not.toBe(codexCaps);
+
+    // Smoke: caps.opencode used (not unused-import warning material).
+    expect(caps).toBeDefined();
+  });
+
+  it("selectError routes to the matching provider's error slot", () => {
+    useProviderCapabilities.setState({
+      claudeError: "claude broke",
+      codexError: "codex broke",
+      opencodeError: "opencode_not_installed",
+    });
+    const state = useProviderCapabilities.getState();
+    expect(selectError(state, "claude")).toBe("claude broke");
+    expect(selectError(state, "codex")).toBe("codex broke");
+    expect(selectError(state, "opencode")).toBe("opencode_not_installed");
+  });
+
+  it("selectModel finds models by id within capabilities", () => {
+    const caps = makeCaps("openai/gpt-5");
+    expect(selectModel(caps, "openai/gpt-5")?.id).toBe("openai/gpt-5");
+    expect(selectModel(caps, "missing")).toBeNull();
+    expect(selectModel(null, "openai/gpt-5")).toBeNull();
+    expect(selectModel(caps, null)).toBeNull();
+  });
+
+  it("OpenCode model has sub_provider populated when injected", () => {
+    // Pin the wire-shape contract: OpenCode entries must round-trip
+    // `sub_provider` through the store untouched. The store doesn't
+    // transform the field, but the contract is shared with the
+    // picker's grouping logic.
+    const opencodeCaps: ProviderChatCapabilities = {
+      ...makeCaps("openai/gpt-5"),
+      models: [
+        {
+          ...makeOpenCodeModel("openai/gpt-5", "openai"),
+        },
+      ],
+    };
+    useProviderCapabilities.setState({ opencode: opencodeCaps });
+    const state = useProviderCapabilities.getState();
+    const caps = selectCapabilities(state, "opencode");
+    expect(caps?.models[0]?.sub_provider).toBe("openai");
+  });
+});
+
+function makeOpenCodeModel(id: string, subProvider: string): ChatModelInfo {
+  return {
+    id,
+    label: id,
+    description: null,
+    effort_levels: [],
+    default_effort: null,
+    prompt_injected_effort_levels: [],
+    context_window_options: [],
+    supports_adaptive_thinking: false,
+    supports_thinking_toggle: false,
+    supports_fast_mode: false,
+    supports_images: false,
+    sub_provider: subProvider,
+    is_free: false,
+  };
+}

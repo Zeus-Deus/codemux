@@ -10,6 +10,16 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["./vitest.setup.ts"],
+    // The sidecar has its own test suite that runs under `bun test` (it
+    // imports from "bun:test"). Without this exclude, Vitest crawls into
+    // sidecar/ and tries to load those files, then fails because Vite
+    // externalizes "bun:test" for the browser environment.
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/src-tauri/**",
+      "sidecar/**",
+    ],
   },
   resolve: {
     alias: {

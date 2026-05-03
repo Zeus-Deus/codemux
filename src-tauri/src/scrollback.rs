@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 // ── Types ──────────────────────────────────────────────────────
@@ -269,8 +269,19 @@ pub fn remove_pane_scrollback(workspace_id: &str, pane_id: &str) {
 /// Remove scrollback directories that don't correspond to any known workspace.
 /// Returns the list of removed workspace IDs.
 pub fn cleanup_orphan_scrollbacks(active_workspace_ids: &[String]) -> Vec<String> {
-    let base = scrollback_base();
-    let Ok(entries) = fs::read_dir(&base) else {
+    cleanup_orphan_scrollbacks_in(&scrollback_base(), active_workspace_ids)
+}
+
+/// Same as `cleanup_orphan_scrollbacks` but reads from a caller-supplied
+/// base. Split out so the test can exercise the wiping logic in a
+/// private tempdir; without this, the test had to call the shared
+/// `scrollback_base()` and races against any peer test mid-write
+/// inside `save_scrollback`.
+pub(crate) fn cleanup_orphan_scrollbacks_in(
+    base: &Path,
+    active_workspace_ids: &[String],
+) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(base) else {
         return vec![];
     };
 
@@ -651,18 +662,29 @@ mod tests {
 
     #[test]
     fn cleanup_orphan_scrollbacks_works() {
-        let ws_keep = format!("test-ws-keep-{}", std::process::id());
-        let ws_orphan = format!("test-ws-orphan-{}", std::process::id());
-        save_scrollback(&test_payload(&ws_keep, "pane-1")).unwrap();
-        save_scrollback(&test_payload(&ws_orphan, "pane-1")).unwrap();
+        // Drive the wiping logic against a private tempdir, NOT the
+        // shared `scrollback_base()`. The previous version called
+        // `save_scrollback` (writes to the shared base) followed by
+        // `cleanup_orphan_scrollbacks` (wipes everything in the
+        // shared base not in the keep list). When tests ran in
+        // parallel, the wipe could fire between another test's
+        // data-write and meta-write, corrupting that peer mid-flight.
+        // Using a tempdir + the `_in` core function isolates the
+        // wipe and exercises the same logic.
+        let base = tempfile::tempdir().unwrap();
+        let ws_keep = "ws-keep-isolated";
+        let ws_orphan = "ws-orphan-isolated";
+        fs::create_dir_all(base.path().join(ws_keep)).unwrap();
+        fs::write(base.path().join(ws_keep).join("pane-1.dat"), b"keep").unwrap();
+        fs::create_dir_all(base.path().join(ws_orphan)).unwrap();
+        fs::write(base.path().join(ws_orphan).join("pane-1.dat"), b"orphan").unwrap();
 
-        let removed = cleanup_orphan_scrollbacks(&[ws_keep.clone()]);
-        assert!(removed.contains(&ws_orphan));
+        let removed =
+            cleanup_orphan_scrollbacks_in(base.path(), &[ws_keep.to_string()]);
+        assert!(removed.contains(&ws_orphan.to_string()));
 
-        assert!(load_scrollback(&ws_keep, "pane-1").is_some());
-        assert!(load_scrollback(&ws_orphan, "pane-1").is_none());
-
-        remove_workspace_scrollback(&ws_keep);
+        assert!(base.path().join(ws_keep).exists());
+        assert!(!base.path().join(ws_orphan).exists());
     }
 
     #[test]

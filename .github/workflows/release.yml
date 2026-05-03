@@ -71,6 +71,35 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Setup Bun
+        # The claude-agent sidecar (sidecar/claude-agent/) is a small
+        # TypeScript project compiled to a standalone binary with `bun
+        # build --compile`. Installed here so the stage step below can
+        # produce the per-target sidecar binary before tauri-action
+        # picks it up via `externalBin`.
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Stage claude-agent sidecar binary
+        # Mirrors the agent-browser stage below: explicit pre-stage
+        # rather than relying on tauri's beforeBuildCommand, so
+        # failures show up in a dedicated log step.
+        shell: bash
+        run: |
+          bash scripts/build-claude-sidecar.sh
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET" ;;
+          esac
+          if [ ! -s "$DEST" ]; then
+            echo "::error::build-claude-sidecar.sh did not produce a non-empty binary at $DEST"
+            echo "::error::Target: $TARGET"
+            ls -la src-tauri/binaries/ || true
+            exit 1
+          fi
+
       - name: Stage agent-browser sidecar binary
         # `shell: bash` works on both Linux and windows-latest because Git
         # for Windows (which ships bash.exe) is preinstalled in the runner
