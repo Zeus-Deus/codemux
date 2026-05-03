@@ -203,6 +203,33 @@ pub fn get_feature_flags(
     Ok(store.feature_flags())
 }
 
+/// Atomic flip of the Agent Chat Beta master toggle. Sets
+/// `enable_agent_chat` and `enable_lazy_workspace_creation` to the
+/// same value in one mutex-held write so the two flags can never end
+/// up half-on (the Step 6–12 surface assumes both are true to
+/// function correctly).
+///
+/// The two flags exist as separate fields for wire-compat with
+/// dogfooding observability.json files; every production read-site
+/// pairs them with `&&`, so there's no real toggle matrix to expose.
+/// `update_feature_flags` is the lower-level setter (writes whatever
+/// `FeatureFlags` you hand it); use this command from the Settings
+/// → Beta Features UI to keep the two paired without forcing the
+/// frontend to read-modify-write the whole struct.
+///
+/// Other flags (`unstable_*`) are left untouched.
+#[tauri::command]
+pub fn set_agent_chat_beta(
+    store: State<'_, ObservabilityStore>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut flags = store.feature_flags();
+    flags.enable_agent_chat = enabled;
+    flags.enable_lazy_workspace_creation = enabled;
+    store.set_feature_flags(flags);
+    Ok(())
+}
+
 /// Return the user's home directory as a string.
 ///
 /// Used by the sidebar-header "+" chat flow to create a workspace

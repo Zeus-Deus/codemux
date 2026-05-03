@@ -68,6 +68,7 @@ import {
   useChatDraftStore,
   type DraftId,
 } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 
 function flushPromises() {
   return act(() => new Promise((r) => setTimeout(r, 0)));
@@ -110,6 +111,14 @@ function renderPresetBar(workspaceId = "ws-1") {
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
+  // Step 13 — preset bar hides chat_agent presets when the master
+  // Beta toggle is off. These tests assert behavior of the chat_agent
+  // affordances directly, so set the flag on for the suite.
+  useFeatureFlags.setState({
+    enableAgentChat: true,
+    enableLazyWorkspaceCreation: true,
+    loaded: true,
+  });
 });
 
 describe("PresetBar — preset failure feedback", () => {
@@ -470,5 +479,51 @@ describe("PresetBar — ChatAgent on a real workspace", () => {
     );
     // The CLI dispatch path must not fire for a ChatAgent preset.
     expect(mockApplyPreset).not.toHaveBeenCalled();
+  });
+});
+
+describe("PresetBar — Step 13 Beta toggle gating", () => {
+  it("hides chat_agent presets when enableAgentChat is off", async () => {
+    useFeatureFlags.setState({
+      enableAgentChat: false,
+      enableLazyWorkspaceCreation: false,
+      loaded: true,
+    });
+
+    const cliPreset = makePreset({ id: "cli", name: "Claude Code", kind: "cli" });
+    const chatAgent = makePreset({
+      id: "ca",
+      name: "Chat Agent",
+      kind: "chat_agent",
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([cliPreset, chatAgent]));
+
+    renderPresetBar();
+    await flushPromises();
+
+    expect(screen.getByRole("button", { name: /Claude Code/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /chat agent/i })).toBeNull();
+  });
+
+  it("shows chat_agent presets when enableAgentChat is on", async () => {
+    useFeatureFlags.setState({
+      enableAgentChat: true,
+      enableLazyWorkspaceCreation: true,
+      loaded: true,
+    });
+
+    const chatAgent = makePreset({
+      id: "ca",
+      name: "Chat Agent",
+      kind: "chat_agent",
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
+
+    renderPresetBar();
+    await flushPromises();
+
+    expect(
+      screen.getByRole("button", { name: /chat agent/i }),
+    ).toBeInTheDocument();
   });
 });

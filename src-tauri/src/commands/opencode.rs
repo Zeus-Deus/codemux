@@ -20,17 +20,22 @@
 //!   it through `ChatModelInfo`); the command exists so the model
 //!   harvest is independently testable from devtools / e2e probes.
 //!
-//! All three are intentionally feature-flag-agnostic: the OpenCode
-//! integration is gated by the `enable_agent_chat` flag at the picker
-//! level, but discovery + harvest are pure reads that the picker needs
-//! even when it's about to render an empty/disabled state.
+//! Step 13 — all three are gated on `enable_agent_chat`. When the
+//! master Beta toggle is off they return the standard
+//! `feature_disabled` error so a stale caller can't spawn
+//! `opencode serve`, hit the network, or burn CPU on a no-op probe.
+//! The frontend short-circuits at the picker layer too; this gate is
+//! defence-in-depth against future call sites that miss the picker
+//! check.
 
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use crate::agent_provider::opencode::{
     check_opencode_availability, OpenCodeAvailability, OpenCodeClient, OpenCodeClientConfig,
     OpenCodeProviderEntry, OpenCodeServerManager,
 };
+use crate::commands::agent_chat::feature_flag_on;
+use crate::observability::ObservabilityStore;
 
 /// Probe whether OpenCode is usable on this machine. See
 /// [`OpenCodeAvailability`] for the field-by-field semantics.
@@ -41,8 +46,11 @@ use crate::agent_provider::opencode::{
 /// (future) settings panel.
 #[tauri::command]
 pub async fn opencode_check_availability(
+    app: AppHandle,
     server_url: Option<String>,
 ) -> Result<OpenCodeAvailability, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
     Ok(check_opencode_availability(server_url).await)
 }
 
@@ -61,9 +69,12 @@ pub async fn opencode_check_availability(
 /// fine for the no-password local-loopback case.
 #[tauri::command]
 pub async fn opencode_ping(
+    app: AppHandle,
     base_url: String,
     server_password: Option<String>,
 ) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
     let mut config = OpenCodeClientConfig::new(base_url);
     config.server_password = server_password;
     let client = OpenCodeClient::new(config)?;
@@ -91,8 +102,11 @@ pub async fn opencode_ping(
 ///   [`OpenCodeClient::list_models`].
 #[tauri::command]
 pub async fn opencode_list_models(
+    app: AppHandle,
     manager: State<'_, std::sync::Arc<OpenCodeServerManager>>,
 ) -> Result<Vec<OpenCodeProviderEntry>, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
     let handle = manager.ensure_running().await?;
     let mut config = OpenCodeClientConfig::new(handle.base_url);
     config.server_password = Some(handle.server_password);

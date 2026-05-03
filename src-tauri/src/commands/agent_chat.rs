@@ -502,12 +502,16 @@ pub async fn agent_chat_set_permission_mode(
 /// frontend store's `opencodeError` slot — Stage 6 surfaces it as a
 /// "configure OpenCode" hint.
 ///
-/// Not gated on the `enable_agent_chat` flag: the frontend's
-/// capabilities store refreshes at app boot regardless, so the picker
-/// UI can render a disabled "unavailable" pill rather than crash when
-/// the flag is off.
+/// Step 13 — gated on `enable_agent_chat`. When the master Beta toggle
+/// is off this returns the standard `feature_disabled` error so the
+/// frontend's capabilities store can short-circuit without spawning
+/// `opencode serve` or harvesting `codex app-server`. The matching
+/// frontend hook (`useProviderCapabilitiesInit`) also early-returns
+/// when the flag is off so the call is never made in the steady
+/// state — this gate is the defence-in-depth against a stale caller.
 #[tauri::command]
 pub async fn list_chat_provider_capabilities(
+    app: AppHandle,
     provider: ProviderKind,
     opencode_manager: tauri::State<
         '_,
@@ -518,6 +522,8 @@ pub async fn list_chat_provider_capabilities(
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
     >,
 ) -> Result<ProviderChatCapabilities, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
     match provider {
         ProviderKind::Claude => Ok(
             crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),

@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { create } from "zustand";
 
 import { listChatProviderCapabilities } from "@/tauri/commands";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import type {
   AgentChatProviderKind,
   ProviderChatCapabilities,
@@ -66,12 +67,21 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
  * the Rust side emits `provider_capabilities_updated` (live harvest
  * path, deferred — MVP ships fallback-only for Claude/Codex; OpenCode
  * already does a live harvest at refresh time, see Stage 3).
+ *
+ * Step 13 — gates on `enableAgentChat`. When the master Beta toggle
+ * is off this hook no-ops, so the picker never spawns
+ * `opencode serve` or harvests `codex app-server` for a user who
+ * hasn't opted in. The hook re-engages live (no remount required) the
+ * moment the toggle flips on, because the flag is read from the
+ * zustand store via the selector pattern.
  */
 export function useProviderCapabilitiesInit(): void {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const refreshAll = useProviderCapabilities((s) => s.refreshAll);
   useEffect(() => {
+    if (!enableAgentChat) return;
     void refreshAll();
-  }, [refreshAll]);
+  }, [enableAgentChat, refreshAll]);
 }
 
 /** Convenience selector: capabilities for the given provider, or null.

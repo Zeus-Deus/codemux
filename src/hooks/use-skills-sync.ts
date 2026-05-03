@@ -31,6 +31,7 @@ import {
   type SyncStateChangedPayload,
 } from "@/tauri/events";
 import { useAuthStore } from "@/stores/auth-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { skillsSyncNow } from "@/tauri/commands";
 
 /// Wait window after a `skills-changed` event before triggering
@@ -66,6 +67,14 @@ function fireSyncIfReady() {
 
 export function useSkillsSync() {
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Step 13 — gate on the master Beta toggle. When off, the auth
+  // event listener and the file-watcher listener still mount (cheap),
+  // but the inner sync trigger early-returns. The 5-min interval
+  // (effect below) skips registration entirely. Files keep persisting
+  // on disk; syncs just don't fire until the user opts back in. When
+  // they do, the next `sync-state-changed` event or file change
+  // catches the engine up.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   // (1) Trigger on sync-availability transitions. The Stage 2
   // event payload tells us whether sync is now ready; we only
@@ -74,11 +83,12 @@ export function useSkillsSync() {
   // we double-check before firing.
   const handleSyncStateChanged = useCallback(
     (payload: SyncStateChangedPayload) => {
+      if (!enableAgentChat) return;
       if (payload.syncAvailable) {
         fireSyncIfReady();
       }
     },
-    [],
+    [enableAgentChat],
   );
   useTauriEvent(onSyncStateChanged, handleSyncStateChanged, [
     handleSyncStateChanged,
@@ -87,6 +97,7 @@ export function useSkillsSync() {
   // (2) Trigger on filesystem changes, debounced. The same hook
   // mounts both listeners so unmount tears them down together.
   const handleSkillsChanged = useCallback(() => {
+    if (!enableAgentChat) return;
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);
     }
@@ -94,7 +105,7 @@ export function useSkillsSync() {
       debounceTimerRef.current = null;
       fireSyncIfReady();
     }, SKILLS_CHANGED_DEBOUNCE_MS);
-  }, []);
+  }, [enableAgentChat]);
   useTauriEvent(onSkillsChanged, handleSkillsChanged, [handleSkillsChanged]);
 
   useEffect(() => {
@@ -127,6 +138,7 @@ export function useSkillsSync() {
   // ensures convergence for users editing skills on another
   // device.
   useEffect(() => {
+    if (!enableAgentChat) return;
     const intervalId = window.setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") {
         return;
@@ -134,7 +146,7 @@ export function useSkillsSync() {
       fireSyncIfReady();
     }, PERIODIC_SYNC_INTERVAL_MS);
     return () => window.clearInterval(intervalId);
-  }, []);
+  }, [enableAgentChat]);
 }
 
 /// 5 minutes — the standard "we're not in a hurry" cadence used

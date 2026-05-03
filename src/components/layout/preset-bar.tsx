@@ -43,6 +43,7 @@ import {
   useChatDraftStore,
   type DraftId,
 } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import {
   agentChatCreatePane,
@@ -132,6 +133,7 @@ export function PresetBar({
   disabled = false,
 }: PresetBarProps) {
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   useEffect(() => {
     getPresets().then((s) => setPresetStore(s)).catch(console.error);
@@ -195,7 +197,15 @@ export function PresetBar({
   // Resolve the pinned presets in local order, then append any
   // server-pinned items not yet in local (newly-pinned via settings)
   // so they show up immediately without waiting for the next render.
-  const presetById = new Map(presetStore.presets.map((p) => [p.id, p]));
+  // Step 13 — drop chat_agent presets when the master Beta toggle is
+  // off so a user who never opted in never sees the affordance. The
+  // preset still exists in the store; we just hide it at the UI layer
+  // (data preservation, see docs/plans/step-13-beta-toggle-research.md
+  // §5).
+  const allPresets = enableAgentChat
+    ? presetStore.presets
+    : presetStore.presets.filter((p) => p.kind !== "chat_agent");
+  const presetById = new Map(allPresets.map((p) => [p.id, p]));
   const pinnedPresets: TerminalPreset[] = [];
   const seen = new Set<string>();
   for (const id of localPinnedOrder) {
@@ -205,7 +215,7 @@ export function PresetBar({
       seen.add(id);
     }
   }
-  for (const p of presetStore.presets) {
+  for (const p of allPresets) {
     if (p.pinned && !seen.has(p.id)) {
       pinnedPresets.push(p);
     }

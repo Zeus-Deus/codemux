@@ -3,6 +3,7 @@ import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { BrowserPane } from "@/components/browser/BrowserPane";
 import { AgentChatPane } from "@/components/chat/AgentChatPane";
 import { AgentChatPaneHeader } from "@/components/chat/AgentChatPaneHeader";
+import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature-placeholder";
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
@@ -10,6 +11,7 @@ import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/ta
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot, PaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 
 // Map known preset names to their icon identifiers
@@ -222,6 +224,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   const paneStatus: PaneStatus | undefined = useAppStore(
     (s) => s.appState?.pane_statuses[node.pane_id],
   );
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
@@ -282,6 +285,22 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   }
 
   if (node.kind === "agent_chat") {
+    // Step 13 — render a placeholder when the master Beta toggle is
+    // off and the persisted layout still references this pane. The
+    // pane node stays in the tree (data preservation) — the user can
+    // re-enable the Beta toggle and the pane remounts with its
+    // session intact.
+    if (!enableAgentChat) {
+      return (
+        <div
+          className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+          data-pane-drop-id={node.pane_id}
+          onPointerDown={handleActivate}
+        >
+          <DisabledFeaturePlaceholder feature="Agent Chat" />
+        </div>
+      );
+    }
     return (
       <div
         className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"

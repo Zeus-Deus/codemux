@@ -46,6 +46,7 @@ import {
   ShieldCheck,
   BookOpen,
   Server,
+  Sparkles,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -109,46 +110,82 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical } from "lucide-react";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
 
-const NAV_GROUPS: NavGroup[] = [
-  {
-    label: "PERSONAL",
-    items: [
-      { id: "account", label: "Account", icon: UserCircle },
-      { id: "appearance", label: "Appearance", icon: Palette },
-      { id: "notifications", label: "Notifications", icon: Bell },
-      { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
-    ],
-  },
-  {
-    label: "EDITOR & WORKFLOW",
-    items: [
-      { id: "editor", label: "Editor", icon: Code2 },
-      { id: "terminal", label: "Terminal", icon: TerminalSquare },
-      { id: "presets", label: "Presets", icon: Zap },
-      { id: "projects", label: "Projects", icon: FolderCog },
-      { id: "git", label: "Git", icon: GitBranch },
-      { id: "agent", label: "Agent", icon: Bot },
-      { id: "permissions", label: "Permissions", icon: ShieldCheck },
-      { id: "skills", label: "Skills", icon: BookOpen },
-      { id: "mcp", label: "MCP Servers", icon: Server },
-      { id: "browser", label: "Browser", icon: Globe },
-      { id: "session_restore", label: "Session Restore", icon: RotateCcw },
-    ],
-  },
+/** Build the Settings nav groups for the current flag state.
+ *  - The "BETA FEATURES" group is always present at the top so users
+ *    can discover the toggle. Its single row stays visible regardless
+ *    of the flag.
+ *  - The Step 6–12 rows (Permissions, Skills, MCP Servers) are only
+ *    surfaced when the toggle is on; they reach into chat-only data.
+ *    Hiding them when off matches the "feature absent, no work
+ *    performed" promise of the master toggle.
+ *  - The pre-existing rows (Account, Appearance, …, Agent) stay
+ *    visible regardless. The Account section's Skills-sync subsection
+ *    is conditionally rendered separately below.
+ */
+function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
+  const editorWorkflowItems: NavItem[] = [
+    { id: "editor", label: "Editor", icon: Code2 },
+    { id: "terminal", label: "Terminal", icon: TerminalSquare },
+    { id: "presets", label: "Presets", icon: Zap },
+    { id: "projects", label: "Projects", icon: FolderCog },
+    { id: "git", label: "Git", icon: GitBranch },
+    { id: "agent", label: "Agent", icon: Bot },
+    ...(agentChatEnabled
+      ? ([
+          { id: "permissions", label: "Permissions", icon: ShieldCheck },
+          { id: "skills", label: "Skills", icon: BookOpen },
+          { id: "mcp", label: "MCP Servers", icon: Server },
+        ] as NavItem[])
+      : []),
+    { id: "browser", label: "Browser", icon: Globe },
+    { id: "session_restore", label: "Session Restore", icon: RotateCcw },
+  ];
+
+  return [
+    {
+      label: "BETA FEATURES",
+      items: [{ id: "beta_features", label: "Agent Chat", icon: Sparkles }],
+    },
+    {
+      label: "PERSONAL",
+      items: [
+        { id: "account", label: "Account", icon: UserCircle },
+        { id: "appearance", label: "Appearance", icon: Palette },
+        { id: "notifications", label: "Notifications", icon: Bell },
+        { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
+      ],
+    },
+    {
+      label: "EDITOR & WORKFLOW",
+      items: editorWorkflowItems,
+    },
+  ];
+}
+
+/** All sections that exist regardless of flag — used to validate the
+ *  initial-section URL hash. The Step 6–12-only sections are
+ *  intentionally included here too: a stale URL hash to `?settings=skills`
+ *  from a flag-on session falls back to "account" via the validity
+ *  check (see `initialSection` below) when the flag is off. */
+const ALL_SECTION_IDS: Section[] = [
+  "beta_features",
+  "account", "appearance", "editor", "terminal", "presets", "projects",
+  "git", "agent", "permissions", "skills", "mcp", "browser",
+  "shortcuts", "notifications", "session_restore",
 ];
 
-const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
-
 import { KeybindEditor } from "./keybind-editor";
+import { BetaFeaturesSection } from "./beta-features-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
 import { SyncSection } from "./sync-section";
+import { useFeatureFlags } from "@/stores/feature-flags";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -599,7 +636,18 @@ export function SettingsView() {
   const projectRoot = activeWorkspace?.project_root ?? null;
   const projectName = projectRoot ? projectRoot.split("/").pop() ?? "Project" : "Project";
 
-  const initialSection = (settingsSection && ALL_SECTIONS.some((n) => n.id === settingsSection) ? settingsSection : "account") as Section;
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const navGroups = buildNavGroups(enableAgentChat);
+  const visibleSectionIds = new Set(navGroups.flatMap((g) => g.items.map((i) => i.id)));
+  // The hash from a previous flag-on session might point at a section
+  // that's now hidden — fall back to "account" so the user lands on a
+  // visible page instead of a blank panel. ALL_SECTION_IDS is used for
+  // type-narrowing the URL parameter; visibleSectionIds enforces the
+  // current-flag visibility.
+  const initialSection: Section =
+    settingsSection && (ALL_SECTION_IDS as string[]).includes(settingsSection) && visibleSectionIds.has(settingsSection as Section)
+      ? (settingsSection as Section)
+      : "account";
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
@@ -744,13 +792,17 @@ export function SettingsView() {
                       </SettingRow>
                     </>
                   )}
-                  <Separator />
-                  <div className="pt-4 pb-2">
-                    <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                      Skills sync
-                    </div>
-                    <SyncSection />
-                  </div>
+                  {enableAgentChat && (
+                    <>
+                      <Separator />
+                      <div className="pt-4 pb-2">
+                        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          Skills sync
+                        </div>
+                        <SyncSection />
+                      </div>
+                    </>
+                  )}
                   <Separator />
                   <div className="pt-4">
                     <Button
@@ -1115,14 +1167,33 @@ export function SettingsView() {
           </div>
         );
 
+      case "beta_features":
+        return <BetaFeaturesSection />;
+
       case "permissions":
-        return <PermissionsSection projectRoot={projectRoot} />;
+        // Defensive guard: the nav row is hidden when the Beta toggle
+        // is off, but a stale URL hash can still route here. Render
+        // the Beta toggle instead so the user lands somewhere useful
+        // and learns how to enable the feature.
+        return enableAgentChat ? (
+          <PermissionsSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
+        );
 
       case "skills":
-        return <SkillsSection projectRoot={projectRoot} />;
+        return enableAgentChat ? (
+          <SkillsSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
+        );
 
       case "mcp":
-        return <McpSection projectRoot={projectRoot} />;
+        return enableAgentChat ? (
+          <McpSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
+        );
 
       case "browser":
         return <BrowserSection />;
@@ -1334,7 +1405,7 @@ export function SettingsView() {
       <div className="flex flex-1 min-h-0">
         {/* Left nav */}
         <nav className="w-52 shrink-0 border-r border-border p-3 space-y-4">
-          {NAV_GROUPS.map((group) => (
+          {navGroups.map((group) => (
             <div key={group.label}>
               <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
                 {group.label}
