@@ -76,6 +76,58 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "opencode", label: "OpenCode" },
 ];
 
+/** Discriminated shape for the prefixed error strings the capability
+ *  harvest emits. The OpenCode adapter ships bare tokens
+ *  (`opencode_not_installed`); the Codex adapter ships
+ *  `codex_<kind>: <hint>` so each failure mode can render distinct UX
+ *  without re-querying the backend. Anything we can't classify lands
+ *  in `unknown` and falls through to the generic "Unavailable" copy. */
+type ProviderErrorKind =
+  | "not_installed"
+  | "not_authenticated"
+  | "harvest_failed"
+  | "unknown";
+
+interface ParsedProviderError {
+  kind: ProviderErrorKind;
+  /** Backend-supplied hint (the bit after the colon). Null for the
+   *  bare-token OpenCode case where no hint was attached. */
+  detail: string | null;
+}
+
+function parseProviderError(error: string | null): ParsedProviderError | null {
+  if (!error) return null;
+  const colonIdx = error.indexOf(":");
+  const head = colonIdx >= 0 ? error.slice(0, colonIdx) : error;
+  const detail =
+    colonIdx >= 0 ? error.slice(colonIdx + 1).trim() || null : null;
+  switch (head) {
+    case "codex_not_installed":
+    case "opencode_not_installed":
+      return { kind: "not_installed", detail };
+    case "codex_not_authenticated":
+    case "opencode_not_authenticated":
+      return { kind: "not_authenticated", detail };
+    case "codex_harvest_failed":
+    case "opencode_harvest_failed":
+      return { kind: "harvest_failed", detail };
+    default:
+      return { kind: "unknown", detail: error };
+  }
+}
+
+function providerErrorTooltipLabel(parsed: ParsedProviderError): string {
+  switch (parsed.kind) {
+    case "not_installed":
+      return "Not installed";
+    case "not_authenticated":
+      return "Not signed in";
+    case "harvest_failed":
+    case "unknown":
+      return "Unavailable";
+  }
+}
+
 interface Props {
   provider: AgentChatProviderKind;
   model: string | null;
@@ -416,12 +468,14 @@ function ProviderRail({
           const count = getCount(p.kind);
           const error = getError(p.kind);
           // A driver is "unavailable" when its capabilities harvest
-          // failed (today, only OpenCode can hit this — Claude / Codex
-          // ship hand-maintained fallback bundles that never error).
-          // The icon stays clickable so the empty state in the right
-          // column can render the install hint + opencode.ai link;
-          // the dim opacity is just a heads-up at the rail level.
-          const isUnavailable = !!error;
+          // failed. Both OpenCode (bare token) and Codex (prefixed
+          // string with hint) can hit this; Claude ships a static
+          // fallback bundle that never errors. The icon stays
+          // clickable so the empty state in the right column can
+          // render the install / sign-in hint; the dim opacity is
+          // just a rail-level heads-up.
+          const parsedError = parseProviderError(error);
+          const isUnavailable = parsedError !== null;
           return (
             <div key={p.kind} className="relative">
               {isSelected && (
@@ -462,11 +516,9 @@ function ProviderRail({
                       <span className="text-muted-foreground">{count}</span>
                     ) : null}
                   </div>
-                  {isUnavailable ? (
+                  {parsedError ? (
                     <div className="mt-0.5 text-muted-foreground">
-                      {error === "opencode_not_installed"
-                        ? "Not installed"
-                        : "Unavailable"}
+                      {providerErrorTooltipLabel(parsedError)}
                     </div>
                   ) : null}
                 </TooltipContent>
@@ -629,7 +681,8 @@ function ModelListEmptyState({
     );
   }
   if (railKey === "opencode") {
-    if (error === "opencode_not_installed") {
+    const parsed = parseProviderError(error);
+    if (parsed?.kind === "not_installed") {
       return (
         <div className="px-4 py-6 text-center text-xs text-muted-foreground">
           <p className="font-medium text-foreground">
@@ -669,6 +722,56 @@ function ModelListEmptyState({
             <code className="rounded bg-muted px-1">opencode auth login</code>{" "}
             to configure upstream credentials.
           </p>
+        </div>
+      );
+    }
+  }
+  if (railKey === "codex") {
+    const parsed = parseProviderError(error);
+    if (parsed?.kind === "not_installed") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Codex not detected on your system
+          </p>
+          <p className="mt-1">
+            Install the <code className="rounded bg-muted px-1">codex</code>{" "}
+            CLI and ensure it is on your PATH.
+          </p>
+          <p className="mt-2">
+            <a
+              href="https://github.com/openai/codex"
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-foreground underline-offset-4 hover:underline"
+            >
+              github.com/openai/codex
+            </a>
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "not_authenticated") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          <p className="font-medium text-foreground">
+            Codex is not signed in
+          </p>
+          <p className="mt-1">
+            Run{" "}
+            <code className="rounded bg-muted px-1">codex login</code>{" "}
+            in a terminal and try again.
+          </p>
+        </div>
+      );
+    }
+    if (parsed?.kind === "harvest_failed" || parsed?.kind === "unknown") {
+      return (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          Codex harvest failed:{" "}
+          <span className="text-foreground">
+            {parsed.detail ?? error ?? ""}
+          </span>
         </div>
       );
     }

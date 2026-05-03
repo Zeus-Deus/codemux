@@ -263,6 +263,25 @@ describe("MultiProviderModelPicker — provider rail", () => {
     ).toBeInTheDocument();
   });
 
+  it("rail icon is dimmed when Codex returns a prefixed not_authenticated error", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: null,
+      opencode: OPENCODE_CAPS,
+      codexError: "codex_not_authenticated: Run `codex login` and try again.",
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+
+    const codexBtn = screen.getByTestId("provider-rail-codex");
+    // The harvest returns a prefixed string with a colon + hint; the
+    // rail must still recognise the prefix and dim the icon (the old
+    // implementation only special-cased the bare `opencode_not_installed`
+    // token and let Codex fall through to a no-op).
+    expect(codexBtn).toHaveAttribute("data-unavailable", "true");
+  });
+
   it("OpenCode rail shows federated rows with sub_provider subtitles", async () => {
     const user = userEvent.setup();
     renderPicker();
@@ -410,6 +429,64 @@ describe("MultiProviderModelPicker — empty + error states", () => {
 
     expect(
       screen.getByTestId("multi-provider-loading-claude"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows 'Codex not detected' when codex_not_installed", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: null,
+      opencode: OPENCODE_CAPS,
+      codexError:
+        "codex_not_installed: Install Codex CLI from https://github.com/openai/codex and ensure `codex` is on PATH.",
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-codex"));
+
+    expect(
+      await screen.findByText("Codex not detected on your system"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows 'Codex is not signed in' when codex_not_authenticated", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: null,
+      opencode: OPENCODE_CAPS,
+      codexError:
+        "codex_not_authenticated: Run `codex login` and try again.",
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-codex"));
+
+    expect(
+      await screen.findByText("Codex is not signed in"),
+    ).toBeInTheDocument();
+    // Hint surfaces the actual command the user has to run.
+    expect(screen.getByText("codex login")).toBeInTheDocument();
+  });
+
+  it("shows generic 'Codex harvest failed' for codex_harvest_failed", async () => {
+    seedStore({
+      claude: CLAUDE_CAPS,
+      codex: null,
+      opencode: OPENCODE_CAPS,
+      codexError: "codex_harvest_failed: spawn failed: ENOENT",
+    });
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+    await user.click(screen.getByTestId("provider-rail-codex"));
+
+    expect(
+      await screen.findByText(/Codex harvest failed/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("spawn failed: ENOENT"),
     ).toBeInTheDocument();
   });
 });
