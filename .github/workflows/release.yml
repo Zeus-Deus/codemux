@@ -186,6 +186,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # linuxdeploy invokes `strip` on every bundled .so. webkit2gtk 2.50.4
+          # (jammy-updates, 2026-04-29) ships libraries with .relr.dyn ELF
+          # relocation sections that linuxdeploy's bundled strip cannot parse,
+          # producing `unknown type [0x13] section .relr.dyn` and exiting non-zero
+          # — surfaced by tauri as the opaque "failed to run linuxdeploy".
+          # NO_STRIP=true tells linuxdeploy to skip the strip step entirely.
+          # Confirmed fix per tauri-apps/tauri#14796 (FabianLars). The unstripped
+          # AppImage is ~10-15 MB larger but functionally identical; deb/rpm
+          # are unaffected because they do not call linuxdeploy.
+          NO_STRIP: "true"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Codemux ${{ github.ref_name }}"
