@@ -179,6 +179,31 @@ jobs:
       # This is DISTINCT from Windows Authenticode code signing, which
       # is not yet configured (see Windows step TODO below).
 
+      - name: Pre-cache stable linuxdeploy + plugin-appimage
+        if: matrix.os == 'ubuntu-22.04'
+        # Tauri's bundler downloads `linuxdeploy-plugin-appimage` fresh from
+        # the `:continuous` tag on every build. That tag is mutable and was
+        # rebuilt on 2026-05-01 with breaking changes that crash on startup
+        # against tauri's vendored 2022-era linuxdeploy — surfaced as the
+        # opaque "failed to run linuxdeploy" because tauri-bundler captures
+        # but discards linuxdeploy's stderr on non-zero exit.
+        #
+        # Workaround: pre-place a known-good version in ~/.cache/tauri/ so
+        # tauri's "download if missing" check finds the file and skips the
+        # broken `:continuous` fetch. We pin to `1-alpha-20250213-1`, the
+        # most recent immutable tag (Feb 2025), which matches the version
+        # active during the v0.1.33 release on 2026-04-26.
+        #
+        # Linuxdeploy itself is downloaded from tauri-apps/binary-releases
+        # (vendored, frozen since 2022) so we leave that alone — only the
+        # plugin needs pinning.
+        run: |
+          mkdir -p ~/.cache/tauri
+          curl -fsSL -o ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
+          ls -la ~/.cache/tauri/
+
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2
@@ -186,15 +211,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # linuxdeploy invokes `strip` on every bundled .so. webkit2gtk 2.50.4
-          # (jammy-updates, 2026-04-29) ships libraries with .relr.dyn ELF
-          # relocation sections that linuxdeploy's bundled strip cannot parse,
-          # producing `unknown type [0x13] section .relr.dyn` and exiting non-zero
-          # — surfaced by tauri as the opaque "failed to run linuxdeploy".
-          # NO_STRIP=true tells linuxdeploy to skip the strip step entirely.
-          # Confirmed fix per tauri-apps/tauri#14796 (FabianLars). The unstripped
-          # AppImage is ~10-15 MB larger but functionally identical; deb/rpm
-          # are unaffected because they do not call linuxdeploy.
+          # Defensive: skip linuxdeploy's strip step. webkit2gtk 2.50.4 ships
+          # libs with .relr.dyn ELF sections that older binutils strip can
+          # mangle. Not the root cause of the v0.2.0 failure (that was the
+          # plugin-appimage `:continuous` rebuild — see pre-cache step above)
+          # but cheap insurance against a future similar incident.
           NO_STRIP: "true"
         with:
           tagName: ${{ github.ref_name }}
