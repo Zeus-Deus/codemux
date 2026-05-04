@@ -223,6 +223,12 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # Diagnostic: tauri build's bundler captures linuxdeploy's stderr
+          # but only prints it when verbose. Without this flag, linuxdeploy
+          # failures appear as the opaque "failed to run linuxdeploy" with
+          # no clue as to the underlying cause. Worth the ~50 KB of extra
+          # log noise — keeps future incidents debuggable.
+          args: --verbose
 
       - name: Build and release (Windows)
         if: matrix.os == 'windows-latest'
