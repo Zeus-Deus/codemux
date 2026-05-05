@@ -518,6 +518,38 @@ pub fn run() {
 
             control::spawn_control_server(app.handle().clone());
 
+            // Resolve the bundled claude-agent sidecar from Tauri's resource
+            // dir and pin the path via env var so the adapter (which has no
+            // AppHandle access at construction time) can find it. Only one
+            // file matches the `codemux-claude-sidecar-*` glob in resources/
+            // — the per-target binary staged by scripts/build-claude-sidecar.sh
+            // for whichever triple this build was compiled against.
+            //
+            // The bun --compile binary is huge (~100 MB) with the dynamic
+            // section at offset 96 MB, which patchelf corrupts when run by
+            // linuxdeploy during AppImage bundling. Shipping it as a resource
+            // (usr/share/...) instead of an externalBin (usr/bin/) keeps it
+            // out of linuxdeploy's scan path. See `tauri.conf.json` for the
+            // mirror change.
+            if let Ok(resource_dir) = app.handle().path().resource_dir() {
+                let triple = agent_provider::claude::sidecar_path::target_triple();
+                let ext = if cfg!(windows) { ".exe" } else { "" };
+                let sidecar = resource_dir
+                    .join("binaries")
+                    .join(format!("codemux-claude-sidecar-{triple}{ext}"));
+                if sidecar.exists()
+                    && std::env::var(
+                        agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+                    )
+                    .is_err()
+                {
+                    std::env::set_var(
+                        agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+                        sidecar,
+                    );
+                }
+            }
+
             // Agent-chat provider registry initialisation.
             //
             // When `enable_agent_chat` is on, spawn concrete Claude /

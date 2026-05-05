@@ -30,8 +30,10 @@
     "createUpdaterArtifacts": true,
     "targets": "all",
     "externalBin": [
-      "binaries/agent-browser",
-      "binaries/codemux-claude-sidecar"
+      "binaries/agent-browser"
+    ],
+    "resources": [
+      "binaries/codemux-claude-sidecar-*"
     ],
     "linux": {
       "deb": {
