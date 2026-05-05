@@ -60,7 +60,7 @@ pub struct ProjectScripts {
 
 fn database_path() -> Option<PathBuf> {
     let config = dirs::config_dir()?;
-    Some(config.join("codemux").join("codemux.db"))
+    Some(config.join(crate::APP_DIR_NAME).join("codemux.db"))
 }
 
 fn create_schema(conn: &Connection) -> Result<(), String> {

@@ -486,7 +486,7 @@ fn spawn_xvfb(_display: u32, _xauth: Option<&Path>) -> Result<Child, Error> {
 /// failed" errors. `$XDG_RUNTIME_DIR` has no such ageing.
 fn display_secrets_dir(display: u32) -> PathBuf {
     if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let p = PathBuf::from(xdg).join("codemux").join(format!("vd-{display}"));
+        let p = PathBuf::from(xdg).join(crate::APP_DIR_NAME).join(format!("vd-{display}"));
         return p;
     }
     tmp_secrets_dir(display)

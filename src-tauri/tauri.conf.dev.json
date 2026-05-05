@@ -1,0 +1,21 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "codemux-dev",
+  "identifier": "com.codemux.app.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "Codemux (dev)",
+        "label": "main",
+        "width": 800,
+        "height": 600,
+        "backgroundColor": "#09090b",
+        "decorations": false,
+        "windowClassname": "com.codemux.app.dev"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  }
+}

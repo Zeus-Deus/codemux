@@ -41,7 +41,7 @@ fn show_desktop_notification(app: &AppHandle, summary: &str, body: &str) {
     {
         notification
             .hint(notify_rust::Hint::DesktopEntry(
-                "com.codemux.app".to_string(),
+                app.config().identifier.clone(),
             ))
             .hint(notify_rust::Hint::Transient(true))
             .urgency(notify_rust::Urgency::Critical)
@@ -92,8 +92,9 @@ fn focus_app(app: &AppHandle) {
 
     #[cfg(target_os = "linux")]
     {
+        let class = format!("class:{}", app.config().identifier);
         let _ = Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+            .args(["dispatch", "focuswindow", &class])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .output();

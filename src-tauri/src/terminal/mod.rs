@@ -704,7 +704,7 @@ where
 fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     let current_exe = std::env::current_exe().ok()?;
     let current_exe = current_exe.display().to_string();
-    let shim_dir = std::env::temp_dir().join("codemux-openflow-shims");
+    let shim_dir = std::env::temp_dir().join(format!("{}-openflow-shims", crate::APP_DIR_NAME));
     std::fs::create_dir_all(&shim_dir).ok()?;
 
     let shim_path = shim_dir.join("codemux");
@@ -734,7 +734,7 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
 fn ensure_openflow_cli_shims() -> Option<(String, String)> {
     let current_exe = std::env::current_exe().ok()?;
     let current_exe = current_exe.display().to_string();
-    let shim_dir = std::env::temp_dir().join("codemux-openflow-shims");
+    let shim_dir = std::env::temp_dir().join(format!("{}-openflow-shims", crate::APP_DIR_NAME));
     std::fs::create_dir_all(&shim_dir).ok()?;
 
     let shim_path = shim_dir.join("codemux.bat");

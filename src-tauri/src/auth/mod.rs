@@ -196,7 +196,7 @@ const NONCE_LEN: usize = 12;
 pub(crate) fn token_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join("codemux").join("auth-token.enc")
+    data_dir.join(crate::APP_DIR_NAME).join("auth-token.enc")
 }
 
 fn machine_id() -> Vec<u8> {
@@ -383,7 +383,7 @@ pub fn is_token_expired(expires_at: &str) -> bool {
 pub(crate) fn sync_key_file_path() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join("codemux").join("sync-key.enc")
+    data_dir.join(crate::APP_DIR_NAME).join("sync-key.enc")
 }
 
 /// Encrypt `key` with the machine-bound wrap and write to

@@ -251,7 +251,7 @@ fn sync_builtins(store: &mut PresetStore) {
 /// Try to load from the legacy ~/.config/codemux/presets.json file.
 /// If successful, deletes the JSON file after loading.
 fn migrate_from_json_file() -> Option<PresetStore> {
-    let path = dirs::config_dir()?.join("codemux").join("presets.json");
+    let path = dirs::config_dir()?.join(crate::APP_DIR_NAME).join("presets.json");
     let data = std::fs::read_to_string(&path).ok()?;
     let mut store: PresetStore = serde_json::from_str(&data).ok()?;
     sync_builtins(&mut store);

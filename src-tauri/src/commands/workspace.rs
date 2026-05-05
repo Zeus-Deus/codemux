@@ -891,7 +891,7 @@ pub fn notify_attention(
         #[cfg(unix)]
         {
             notification
-                .hint(notify_rust::Hint::DesktopEntry("com.codemux.app".to_string()))
+                .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
                 .hint(notify_rust::Hint::Transient(true))
                 .urgency(notify_rust::Urgency::Critical);
         }
@@ -906,8 +906,9 @@ pub fn notify_attention(
 
         #[cfg(target_os = "linux")]
         {
+            let class = format!("class:{}", app.config().identifier);
             let _ = std::process::Command::new("hyprctl")
-                .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+                .args(["dispatch", "focuswindow", &class])
                 .output();
         }
     }

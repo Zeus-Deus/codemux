@@ -3147,7 +3147,7 @@ fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
 
 fn persisted_layout_path() -> Option<PathBuf> {
     let base = dirs::config_dir()?;
-    Some(base.join("codemux").join("layout.json"))
+    Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
 }
 
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {

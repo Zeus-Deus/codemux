@@ -193,10 +193,19 @@ pub struct ControlResponse {
     pub error: Option<String>,
 }
 
+/// Basename for the control socket / named pipe. Debug builds use a
+/// distinct name so a locally-running dev build doesn't collide with the
+/// installed release build (and vice versa).
+#[cfg(debug_assertions)]
+const SOCKET_BASENAME: &str = "codemux-dev";
+#[cfg(not(debug_assertions))]
+const SOCKET_BASENAME: &str = "codemux";
+
 #[cfg(unix)]
 pub fn control_socket_path() -> Option<PathBuf> {
+    let socket_file = format!("{SOCKET_BASENAME}.sock");
     if let Some(runtime_dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
-        return Some(runtime_dir.join("codemux.sock"));
+        return Some(runtime_dir.join(&socket_file));
     }
 
     // Fallback for systems without XDG_RUNTIME_DIR (e.g. minimal distros, some AppImage environments).
@@ -244,7 +253,7 @@ pub fn control_socket_path() -> Option<PathBuf> {
         "[codemux::control] XDG_RUNTIME_DIR unset, using fallback: {}",
         fallback_dir.display()
     ));
-    Some(fallback_dir.join("codemux.sock"))
+    Some(fallback_dir.join(&socket_file))
 }
 
 /// Build the Windows named-pipe path for the given username.
@@ -278,7 +287,7 @@ fn build_pipe_path(username: &str) -> PathBuf {
         .chars()
         .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
         .collect();
-    PathBuf::from(format!(r"\\.\pipe\codemux-{sanitized}"))
+    PathBuf::from(format!(r"\\.\pipe\{SOCKET_BASENAME}-{sanitized}"))
 }
 
 #[cfg(windows)]
@@ -1007,19 +1016,22 @@ mod tests {
         let path = control_socket_path().expect("control_socket_path should return a value");
         let display = path.to_string_lossy().into_owned();
 
+        let expected_suffix = format!("{SOCKET_BASENAME}.sock");
+
         #[cfg(unix)]
         {
             assert!(
-                display.ends_with("codemux.sock"),
-                "unix control path must end with codemux.sock, got {display:?}"
+                display.ends_with(&expected_suffix),
+                "unix control path must end with {expected_suffix}, got {display:?}"
             );
         }
 
         #[cfg(windows)]
         {
+            let expected_prefix = format!(r"\\.\pipe\{SOCKET_BASENAME}-");
             assert!(
-                display.starts_with(r"\\.\pipe\codemux-"),
-                "windows control path must live under \\\\.\\pipe\\codemux-, got {display:?}"
+                display.starts_with(&expected_prefix),
+                "windows control path must start with {expected_prefix}, got {display:?}"
             );
         }
     }
@@ -1037,7 +1049,7 @@ mod tests {
         // Typical Windows username — already pipe-name-safe.
         let path = build_pipe_path("alice");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-alice");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-alice"));
     }
 
     #[test]
@@ -1047,7 +1059,7 @@ mod tests {
         // must be replaced with underscores.
         let path = build_pipe_path("John Smith");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-John_Smith");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-John_Smith"));
     }
 
     #[test]
@@ -1057,11 +1069,11 @@ mod tests {
         // Every non-[A-Za-z0-9_-] char gets replaced with underscore.
         let path = build_pipe_path(r"DOMAIN\john.smith");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-DOMAIN_john_smith");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-DOMAIN_john_smith"));
 
         let path = build_pipe_path("user@host");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-user_host");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-user_host"));
     }
 
     #[test]
@@ -1071,15 +1083,15 @@ mod tests {
         // non-empty user segment.
         let path = build_pipe_path("");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-default");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-default"));
 
         let path = build_pipe_path("   ");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-default");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-default"));
 
         let path = build_pipe_path("\t\n");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-default");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-default"));
     }
 
     #[test]
@@ -1088,7 +1100,7 @@ mod tests {
         // by the sanitization rule — they should pass through unchanged.
         let path = build_pipe_path("test-user_42");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-test-user_42");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-test-user_42"));
     }
 
     #[test]
@@ -1099,11 +1111,11 @@ mod tests {
         // to ASCII, this test will fail and flag the break.
         let path = build_pipe_path("用户");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-用户");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-用户"));
 
         let path = build_pipe_path("müller");
         let display = path.to_string_lossy().into_owned();
-        assert_eq!(display, r"\\.\pipe\codemux-müller");
+        assert_eq!(display, format!(r"\\.\pipe\{SOCKET_BASENAME}-müller"));
     }
 
     #[test]
@@ -1119,12 +1131,13 @@ mod tests {
             "\\\\\\\\",
             long_input.as_str(),
         ];
+        let expected_prefix = format!(r"\\.\pipe\{SOCKET_BASENAME}-");
         for input in pathological {
             let path = build_pipe_path(input);
             let display = path.to_string_lossy().into_owned();
             assert!(
-                display.starts_with(r"\\.\pipe\codemux-"),
-                "pipe path from pathological input {input:?} must still have the codemux- prefix, got {display:?}"
+                display.starts_with(&expected_prefix),
+                "pipe path from pathological input {input:?} must start with {expected_prefix}, got {display:?}"
             );
         }
     }

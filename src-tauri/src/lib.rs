@@ -1,5 +1,14 @@
 use tauri::{Emitter, Listener, Manager};
 
+/// Subdirectory name used under XDG config/data dirs for all Codemux state
+/// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
+/// distinct name so a locally-running dev build keeps its sessions, auth,
+/// and synced state fully isolated from the installed release build.
+#[cfg(debug_assertions)]
+pub const APP_DIR_NAME: &str = "codemux-dev";
+#[cfg(not(debug_assertions))]
+pub const APP_DIR_NAME: &str = "codemux";
+
 pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;

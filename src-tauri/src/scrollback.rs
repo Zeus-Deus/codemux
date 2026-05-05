@@ -110,7 +110,7 @@ impl ScrollbackCache {
 fn scrollback_base() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join("codemux").join("scrollback")
+    data_dir.join(crate::APP_DIR_NAME).join("scrollback")
 }
 
 fn workspace_dir(workspace_id: &str) -> PathBuf {
