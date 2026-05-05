@@ -1,7 +1,10 @@
 #!/bin/bash
 # Build the claude-agent sidecar for the current target and stage the
 # compiled binary at src-tauri/binaries/codemux-claude-sidecar-<triple>
-# so Tauri's `externalBin` can bundle it into the installer / AppImage.
+# so Tauri's `resources` glob can bundle it into the installer / AppImage.
+# (The sidecar used to ship as an externalBin; it moved to resources
+# because linuxdeploy's patchelf corrupts the bun-compiled binary —
+# see commit 025fa19.)
 #
 # Called by scripts/copy-sidecars.sh (which wraps every sidecar we
 # bundle), by the release workflow, and optionally during `cargo test`

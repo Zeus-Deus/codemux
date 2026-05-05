@@ -138,18 +138,33 @@ bun run build:all
 
 The per-target binary is staged at
 `src-tauri/binaries/codemux-claude-sidecar-<target-triple>`, which is
-where Tauri's `externalBin` bundling picks it up. The Rust integration
+where Tauri's `resources` glob picks it up. The Rust integration
 tests (`src-tauri/tests/sidecar_ping.rs`) look for the same path and
 skip cleanly (with a build hint) if the binary is missing.
 
-**How it's shipped.** `tauri.conf.json`'s `bundle.externalBin` array
-includes `binaries/codemux-claude-sidecar`. Tauri's packager picks up
-`binaries/codemux-claude-sidecar-<triple>` per target and embeds it
-into the AppImage / deb / rpm / NSIS installer. The release workflow
-(`.github/workflows/release.yml`) installs Bun and pre-stages the
-binary so tauri-action finds it before bundling. CI
+**How it's shipped.** `tauri.conf.json`'s `bundle.resources` array
+includes `binaries/codemux-claude-sidecar-*`. Tauri's packager picks
+up the per-triple variant and embeds it into the AppImage / deb / rpm
+/ NSIS installer under `usr/lib/codemux/binaries/` on Linux and next
+to `codemux.exe` under `binaries/` on Windows. (It originally shipped
+as an `externalBin` under `usr/bin/`; moved to a resource because
+linuxdeploy's patchelf step corrupts the ~100 MB bun-compiled binary
+during AppImage bundling — see commit 025fa19.) At runtime, the
+`setup()` hook in `src-tauri/src/lib.rs` resolves the resource via
+`AppHandle::path().resource_dir()` and pins the resolved path into
+the `CODEMUX_CLAUDE_SIDECAR_PATH` env var so the adapter (which has
+no `AppHandle` access at construction time) can find it. The release
+workflow (`.github/workflows/release.yml`) installs Bun and
+pre-stages the binary so tauri-action finds it before bundling. CI
 (`.github/workflows/ci.yml`) does the same, with a zero-byte
 placeholder fallback for constrained runners.
+
+**Packagers note.** Downstream packagers (AUR, custom distros) MUST
+copy the sidecar from the Tauri resource layout (`usr/lib/codemux/
+binaries/codemux-claude-sidecar-<triple>` on Linux) into their own
+package — repackaging only `usr/bin/codemux` will leave the agent-
+chat Claude provider unable to find its sidecar and the first send
+fails with `provider_not_configured: Claude`.
 
 **Protocol.** Newline-delimited JSON-RPC 2.0 over stdin/stdout. The
 Rust side spawns the sidecar through

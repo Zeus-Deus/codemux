@@ -2,9 +2,11 @@
 //!
 //! The sidecar is a Bun-compiled TypeScript binary staged under
 //! `src-tauri/binaries/codemux-claude-sidecar-<triple>[.exe]` in dev
-//! builds and bundled into the installer via Tauri's `externalBin`
-//! mechanism in release builds. This module finds whichever copy is
-//! reachable from the current process.
+//! builds and bundled into the installer via Tauri's `resources`
+//! mechanism in release builds. (Originally shipped via `externalBin`,
+//! moved to `resources` because linuxdeploy's patchelf step corrupts
+//! the ~100 MB bun-compiled binary — see commit 025fa19.) This module
+//! finds whichever copy is reachable from the current process.
 //!
 //! Search order:
 //!   1. `CODEMUX_CLAUDE_SIDECAR_PATH` env var (tests and manual
