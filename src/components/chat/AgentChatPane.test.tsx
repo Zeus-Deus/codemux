@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -46,6 +46,11 @@ const setPermissionModeMock = vi.fn();
 const markRequestResolvedMock = vi.fn();
 const setHasDebugActivityMock = vi.fn();
 const setDebugActivityResolvedMock = vi.fn();
+// Hoisted mock for the bug/chat-agent-empty regression test (an
+// unmount/remount that lands on an existing thread should pull the
+// persisted transcript and overlay it onto the in-memory slice when
+// disk has more rendered messages than memory).
+const hydrateThreadMock = vi.fn();
 
 vi.mock("./ChatHomeLanding", () => ({
   ChatHomeLanding: ({ composer }: { composer: React.ReactNode }) => (
@@ -224,6 +229,10 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatInterruptTurn: vi.fn().mockResolvedValue(undefined),
+  // The pane's mount-time hydrate effect calls this whenever it lands
+  // with a truthy threadId — return an empty transcript so the effect
+  // short-circuits without exercising the resume path in unit tests.
+  agentChatListMessages: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
@@ -374,6 +383,9 @@ vi.mock("@/stores/agent-chat-store", () => {
         ensureThread: vi.fn(),
         setPermissionMode: vi.fn(),
         setSessionLaunchMode: vi.fn(),
+        // Exposed on getState so the mount-time hydrate effect can
+        // imperatively replace the slice when disk leads memory.
+        hydrateThread: hydrateThreadMock,
       }),
     },
   );
@@ -385,6 +397,7 @@ vi.mock("@/stores/agent-chat-store", () => {
 
 import { AgentChatPane } from "./AgentChatPane";
 import {
+  agentChatListMessages,
   agentChatSendTurn,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -433,6 +446,101 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+});
+
+describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
+  // Regression test for the bug where: the user submits a turn, switches
+  // workspaces (the inactive workspace's pane tree unmounts entirely per
+  // workspace-main.tsx), the live event broadcaster drops events with
+  // no listener attached, and the user comes back to a chat that shows
+  // only the optimistic user message — even though the agent ran (file
+  // changes prove it) and the backend persisted the full transcript to
+  // SQLite. The fix pulls `agent_chat_list_messages` on every mount that
+  // lands with a truthy thread id and overlays disk onto memory whenever
+  // disk has more rendered messages.
+  beforeEach(() => {
+    currentMessages = [];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatListMessages).mockReset();
+    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    hydrateThreadMock.mockClear();
+  });
+
+  it("reads persisted messages on mount when the pane has an existing thread id", async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalledWith("thread-x");
+    });
+  });
+
+  it("hydrates the slice when disk has strictly more rendered messages than memory", async () => {
+    // In-memory slice carries only the optimistic user message — the
+    // exact snapshot the user sees after returning from another workspace.
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const userPayload = JSON.stringify({
+      type: "user_message",
+      thread_id: "thread-x",
+      text: "hello",
+    });
+    // Persisted assistant reply, shaped per the reducer's
+    // `item_completed` / `assistant_text` arms (see reducer.ts:254).
+    // The crucial bit for this test is that this payload, when
+    // replayed, ADDS a message to the rebuilt state — driving disk
+    // count strictly above the in-memory count.
+    const assistantPayload = JSON.stringify({
+      type: "item_completed",
+      thread_id: "thread-x",
+      turn_id: "turn-1",
+      item: { kind: "assistant_text", text: "hi back" },
+    });
+    vi.mocked(agentChatListMessages).mockResolvedValue([
+      userPayload,
+      assistantPayload,
+    ]);
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", [
+        userPayload,
+        assistantPayload,
+      ]);
+    });
+  });
+
+  it("does NOT hydrate when memory already has at least as many messages as disk", async () => {
+    // Steady-state path: the live stream kept up, so memory is at least
+    // as fresh as disk. Hydrating would clobber events that are queued
+    // for persistence but not yet on disk.
+    currentMessages = [
+      { kind: "user_message", id: "m1" },
+      { kind: "assistant_message", id: "m2", turn_id: "t-1" },
+    ];
+    const userPayload = JSON.stringify({
+      type: "user_message",
+      thread_id: "thread-x",
+      text: "hello",
+    });
+    vi.mocked(agentChatListMessages).mockResolvedValue([userPayload]);
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalled();
+    });
+    expect(hydrateThreadMock).not.toHaveBeenCalled();
+  });
+
+  it("swallows hydrate failures so a flaky list_messages call cannot blank the pane", async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    vi.mocked(agentChatListMessages).mockRejectedValue(
+      new Error("simulated SQLite read failure"),
+    );
+    expect(() => render(<AgentChatPane pane={pane} />)).not.toThrow();
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalled();
+    });
+    expect(hydrateThreadMock).not.toHaveBeenCalled();
   });
 });
 

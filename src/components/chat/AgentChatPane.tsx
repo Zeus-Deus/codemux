@@ -47,6 +47,7 @@ import {
 import {
   activateWorkspace,
   agentChatInterruptTurn,
+  agentChatListMessages,
   agentChatRespondToRequest,
   agentChatSendTurn,
   agentChatSetModel,
@@ -62,6 +63,7 @@ import {
   readFileForAttachment,
   readFolderForAttachment,
 } from "@/tauri/commands";
+import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
@@ -485,6 +487,64 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     useAgentChatStore.getState().applyEvent(payload.thread_id, payload.event);
   }, []);
   useAgentChatEvents(threadId, handleEvent);
+
+  // Hydrate on (re)mount when the pane attaches to a thread that
+  // already has a server-side transcript.
+  //
+  // The provider event broadcaster is live-only (bounded channel, no
+  // replay — see docs/features/agent-chat.md). When the user switches
+  // workspaces the entire inactive workspace's pane tree unmounts
+  // (workspace-main.tsx returns null for non-active workspaces), so
+  // the `useAgentChatEvents` listener detaches and any provider events
+  // emitted while the pane is gone are dropped on the frontend side.
+  // The backend still persists transcript-affecting events to SQLite
+  // via `forward_event` in `commands/agent_chat.rs`, but nothing pulled
+  // that history back into the in-memory Zustand slice on remount —
+  // so the user came back to a chat showing only their optimistic
+  // user message with no agent reply, even though the agent had run
+  // (file changes proved it).
+  //
+  // We pull the persisted transcript on every mount that lands with a
+  // truthy `threadId`, replay it through the same pure reducer the
+  // live stream uses, and only call `hydrateThread` if the replayed
+  // transcript is longer than the in-memory slice — otherwise the
+  // local state is at least as fresh as disk and a hydrate would
+  // clobber events that haven't been persisted yet (the persistence
+  // path is async, so live state can briefly lead disk).
+  //
+  // `hydrateAttemptedRef` is keyed by thread id so a thread switch
+  // (resume → new thread id, recovery → adopted orphan thread id)
+  // re-triggers hydrate, but a stable thread id within one mount only
+  // hydrates once.
+  const hydrateAttemptedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!threadId) return;
+    if (hydrateAttemptedRef.current === threadId) return;
+    hydrateAttemptedRef.current = threadId;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const payloads = await agentChatListMessages(threadId);
+        if (cancelled) return;
+        if (payloads.length === 0) return;
+        const replayed = replayPayloads(payloads);
+        const slice = useAgentChatStore.getState().threads[threadId];
+        const localCount = slice?.messages.length ?? 0;
+        // Guard against clobbering live state: only hydrate when disk
+        // has strictly more rendered messages than memory. Equal /
+        // shorter means the live stream kept up.
+        if (replayed.messages.length <= localCount) return;
+        useAgentChatStore.getState().hydrateThread(threadId, payloads);
+      } catch (err) {
+        // Soft-fail: if hydrate fails, the user still sees whatever
+        // the live stream brings in. Log so it's debuggable.
+        console.warn("[agent-chat] hydrate-on-mount failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [threadId]);
 
   // Start a session on mount if the pane doesn't already have one.
   const startAttempted = useRef(false);
