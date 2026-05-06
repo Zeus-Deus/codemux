@@ -220,4 +220,28 @@ describe("Composer Stage 7 polish", () => {
       expect(queryByTestId("attachment-chip-expand")).toBeNull();
     });
   });
+
+  // Long-prompt scroll bug (bug/chat-agent-empty companion fix).
+  // The composer paints a transparent textarea on top of a colored
+  // "mirror" div that owns the visible glyphs. Without the scroll-sync
+  // wired up, the textarea would scroll its own (invisible) content
+  // while the mirror stayed clipped at scrollTop=0 — the user saw a
+  // working scrollbar that revealed nothing. The fix: textarea's
+  // `onScroll` mirrors `scrollTop` onto the mirror so both layers
+  // move together.
+  describe("long-prompt scroll sync", () => {
+    it("mirrors textarea scrollTop onto the highlight overlay on scroll", () => {
+      const { getByTestId, container } = renderControlled({
+        draft: "long\n".repeat(40),
+      });
+      const textarea = container.querySelector("textarea");
+      const mirror = getByTestId("composer-highlight-mirror");
+      if (!textarea) throw new Error("textarea missing from composer");
+      // jsdom doesn't compute layout, so we set scrollTop manually and
+      // dispatch the scroll event the browser would fire.
+      textarea.scrollTop = 87;
+      fireEvent.scroll(textarea);
+      expect(mirror.scrollTop).toBe(87);
+    });
+  });
 });

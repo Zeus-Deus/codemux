@@ -243,11 +243,13 @@ export function Composer({
   onModeRemove,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
-  // Mirror overlay ref — used to sync scrollTop with the textarea so
-  // the highlighted text follows the user's scroll once content
-  // exceeds MAX_ROWS_APPROX_PX. Without this, the textarea's
-  // transparent text scrolls but the mirror stays pinned, making the
-  // scrollbar look broken.
+  // Mirror layer that paints the colored highlights behind the
+  // transparent textarea. The textarea owns scroll position; the
+  // mirror's `scrollTop` is slaved to it on every textarea scroll so
+  // both layers stay aligned when the user types past `MAX_ROWS_APPROX_PX`.
+  // Without this sync, long prompts surface a textarea scrollbar that
+  // does nothing visible (textarea text is `text-transparent`; only the
+  // mirror is painted, and a stale mirror clips the overflow).
   const mirrorRef = useRef<HTMLDivElement | null>(null);
   // Step 8 Stage 6 — hidden file input used by the `+ → Image…`
   // picker. We trigger `.click()` from the popup's onSelect; the
@@ -262,7 +264,25 @@ export function Composer({
     el.style.height = "auto";
     const desired = Math.min(el.scrollHeight, MAX_ROWS_APPROX_PX);
     el.style.height = `${desired}px`;
+    // Keep the mirror's scroll offset in step with the textarea after
+    // any auto-grow recalculation. When the textarea shrinks (delete
+    // a line near the bottom) its `scrollTop` snaps; the mirror needs
+    // to follow so the painted text doesn't desync.
+    const mirror = mirrorRef.current;
+    if (mirror) mirror.scrollTop = el.scrollTop;
   }, [draft]);
+
+  // Forward the textarea's scroll position to the mirror layer. We can't
+  // attach `onScroll` declaratively in JSX inside the existing handlers
+  // because the textarea is the scrolling element; the React event still
+  // fires but we keep this in a stable callback so the JSX edit stays
+  // small.
+  const handleTextareaScroll = useCallback(() => {
+    const ta = textareaRef.current;
+    const mirror = mirrorRef.current;
+    if (!ta || !mirror) return;
+    mirror.scrollTop = ta.scrollTop;
+  }, []);
 
   // ─── Slash command popup state ────────────────────────────────────
   // The popup is purely a discoverability surface: when the user types
@@ -1907,7 +1927,15 @@ export function Composer({
                 "pointer-events-none absolute inset-0 px-3 py-2.5",
                 "whitespace-pre-wrap break-words",
                 "text-sm text-foreground",
-                "overflow-hidden",
+                // `overflow-y-auto` (rather than `overflow-hidden`) is
+                // required so we can imperatively assign `scrollTop` —
+                // setting `scrollTop` on a clipped element is a no-op in
+                // some browsers. The mirror's own scrollbar is hidden
+                // (next two utilities) so only the textarea's scrollbar
+                // is ever visible to the user.
+                "overflow-y-auto",
+                "[scrollbar-width:none]",
+                "[&::-webkit-scrollbar]:hidden",
               )}
             >
               {highlightSegments.map((seg, i) => {
@@ -2016,18 +2044,9 @@ export function Composer({
               value={draft}
               onChange={handleTextareaChange}
               onSelect={handleSelect}
+              onScroll={handleTextareaScroll}
               onKeyDown={handleKeyDown}
               onPaste={handlePasteImage}
-              onScroll={(e) => {
-                // Keep the highlight mirror glued to the textarea's
-                // scroll position. Once the draft exceeds ~8 rows, the
-                // textarea scrolls internally; without this sync the
-                // mirror (which is what the user actually sees) would
-                // stay pinned at the top, making the scrollbar appear
-                // dead.
-                const mirror = mirrorRef.current;
-                if (mirror) mirror.scrollTop = e.currentTarget.scrollTop;
-              }}
               onCompositionStart={() => {
                 composingRef.current = true;
               }}
