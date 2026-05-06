@@ -243,6 +243,12 @@ export function Composer({
   onModeRemove,
 }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Mirror overlay ref — used to sync scrollTop with the textarea so
+  // the highlighted text follows the user's scroll once content
+  // exceeds MAX_ROWS_APPROX_PX. Without this, the textarea's
+  // transparent text scrolls but the mirror stays pinned, making the
+  // scrollbar look broken.
+  const mirrorRef = useRef<HTMLDivElement | null>(null);
   // Step 8 Stage 6 — hidden file input used by the `+ → Image…`
   // picker. We trigger `.click()` from the popup's onSelect; the
   // input's onChange forwards each picked File to onAttachImage.
@@ -1894,6 +1900,7 @@ export function Composer({
               stay glued together at every position.
             */}
             <div
+              ref={mirrorRef}
               aria-hidden
               data-testid="composer-highlight-mirror"
               className={cn(
@@ -2011,6 +2018,16 @@ export function Composer({
               onSelect={handleSelect}
               onKeyDown={handleKeyDown}
               onPaste={handlePasteImage}
+              onScroll={(e) => {
+                // Keep the highlight mirror glued to the textarea's
+                // scroll position. Once the draft exceeds ~8 rows, the
+                // textarea scrolls internally; without this sync the
+                // mirror (which is what the user actually sees) would
+                // stay pinned at the top, making the scrollbar appear
+                // dead.
+                const mirror = mirrorRef.current;
+                if (mirror) mirror.scrollTop = e.currentTarget.scrollTop;
+              }}
               onCompositionStart={() => {
                 composingRef.current = true;
               }}
