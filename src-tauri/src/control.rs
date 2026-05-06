@@ -768,9 +768,10 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             };
 
             // Get the port for this session (already allocated above or in start_stream).
-            // Try cli_session_name first (key used by start_stream/close), then workspace_id.
+            // P2 from docs/plans/browser-stream-fix.md removed the
+            // `workspace_id` alias the manager used to register, so
+            // `cli_session_name` is the only key the manager knows.
             let vision_port = agent_browser.get_port(&cli_session_name).await
-                .or(agent_browser.get_port(&workspace_id).await)
                 .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
 
             let result = match action_kind.as_str() {

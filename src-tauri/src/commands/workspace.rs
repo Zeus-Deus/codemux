@@ -704,11 +704,13 @@ pub fn close_workspace(
     }
 
     // Close agent browser CLI session for this workspace.
-    // Release port entries for both cli_session_name and workspace_id keys.
+    // P2 from docs/plans/browser-stream-fix.md removed the workspace_id
+    // alias the manager used to register, so closing under
+    // cli_session_name is sufficient — there is no longer a second key
+    // to reap.
     {
         let cli_name = state.find_detached_agent_browser(&workspace_id)
             .map(|s| s.cli_session_name.clone());
-        let ws_id = workspace_id.clone();
         let app_handle = app.clone();
         tauri::async_runtime::spawn(async move {
             let manager: State<'_, AgentBrowserManager> = app_handle.state();
@@ -717,8 +719,6 @@ pub fn close_workspace(
                     eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
                 }
             }
-            // Also remove the workspace_id port entry (may be a separate HashMap key).
-            let _ = manager.close(&ws_id).await;
         });
     }
 
