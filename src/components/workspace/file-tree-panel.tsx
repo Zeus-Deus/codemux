@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { memo, useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -17,7 +17,14 @@ interface Props {
   workspace: WorkspaceSnapshot;
 }
 
-function TreeNode({
+// `TreeNode` is recursive and the file-tree panel sits in the always-
+// visible right sidebar — every app-state-changed event would otherwise
+// re-render every node in every expanded subtree. The expansion sets
+// and child caches are passed through Sets/Maps that we update via
+// `new Set(prev).add(...)` so reference equality on those props is a
+// reliable changed-vs-unchanged signal. `entry` itself is a stable ref
+// inside `dirContents`, so the default comparator is enough.
+const TreeNode = memo(function TreeNode({
   entry,
   depth,
   expandedDirs,
@@ -101,7 +108,7 @@ function TreeNode({
       )}
     </Button>
   );
-}
+});
 
 export function FileTreePanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;

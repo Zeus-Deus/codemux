@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
@@ -36,7 +36,11 @@ interface Props {
  * SDK shape), the block renders the raw payload via ToolCallBlock so
  * nothing is silently dropped.
  */
-export function PlanProposalBlock({ item, onAccept, onReject }: Props) {
+export const PlanProposalBlock = memo(function PlanProposalBlock({
+  item,
+  onAccept,
+  onReject,
+}: Props) {
   const [submitted, setSubmitted] = useState(false);
 
   if (item.resolution.state !== "pending") {
@@ -133,7 +137,7 @@ export function PlanProposalBlock({ item, onAccept, onReject }: Props) {
       </div>
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // Helpers

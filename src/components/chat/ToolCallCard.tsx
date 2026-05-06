@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { memo, useRef, useState } from "react";
 import {
   BookOpen,
   Check,
@@ -66,7 +66,11 @@ interface Props {
  *   success           status=done                → header + check, body collapsed, expandable
  *   error             status=error               → header with muted-red target + X, body expanded
  */
-export function ToolCallCard({ item, approval, onDecide }: Props) {
+export const ToolCallCard = memo(function ToolCallCard({
+  item,
+  approval,
+  onDecide,
+}: Props) {
   const resolution = approval?.resolution;
   const isPendingApproval = resolution?.state === "pending";
   const isResponding = resolution?.state === "responding";
@@ -179,7 +183,7 @@ export function ToolCallCard({ item, approval, onDecide }: Props) {
       )}
     </div>
   );
-}
+});
 
 // ---------------------------------------------------------------------------
 // Approval footer

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
@@ -17,7 +17,10 @@ interface Props {
  * reason textarea before confirming. Once resolved the block collapses
  * to a one-line status.
  */
-export function PermissionRequestBlock({ item, onDecide }: Props) {
+export const PermissionRequestBlock = memo(function PermissionRequestBlock({
+  item,
+  onDecide,
+}: Props) {
   const [denying, setDenying] = useState(false);
   const [reason, setReason] = useState("");
 
@@ -120,7 +123,7 @@ export function PermissionRequestBlock({ item, onDecide }: Props) {
       )}
     </div>
   );
-}
+});
 
 function resolvedLabel(decision: ApprovalDecision): string {
   switch (decision.decision) {

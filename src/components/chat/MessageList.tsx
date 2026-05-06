@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronUp } from "lucide-react";
-import { type ReactNode, useMemo, useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 
 import type {
   ChatViewItem,
@@ -110,22 +110,28 @@ export function MessageList({
     return out;
   }, [ordered]);
 
-  const renderItem = (item: ChatViewItem): ReactNode => (
-    <MessageRow
-      key={item.id}
-      item={item}
-      requestsById={requestsById}
-      mergedRequestIds={mergedRequestIds}
-      onRespondToRequest={onRespondToRequest}
-      onAcceptPlan={onAcceptPlan}
-      onRejectPlan={onRejectPlan}
-    />
-  );
-
+  // Pre-resolve the approval lookup at the parent so MessageRow gets
+  // a stable `approval` reference instead of the requestsById map
+  // (which is a fresh Map ref on every parent render). Without this
+  // the React.memo on MessageRow can never skip a re-render — the
+  // map identity churn alone would force a re-mount of every row on
+  // every streaming token.
   return (
     <div className="flex flex-col gap-3">
       {slots.map((slot) => {
-        if (slot.kind === "item") return renderItem(slot.item);
+        if (slot.kind === "item") {
+          return (
+            <MessageRowMemo
+              key={slot.item.id}
+              item={slot.item}
+              approval={lookupApproval(slot.item, requestsById)}
+              isMerged={isMerged(slot.item, mergedRequestIds)}
+              onRespondToRequest={onRespondToRequest}
+              onAcceptPlan={onAcceptPlan}
+              onRejectPlan={onRejectPlan}
+            />
+          );
+        }
         return (
           <ToolRunCollapse
             // Key on the first item's id so React preserves expand
@@ -133,7 +139,10 @@ export function MessageList({
             // at the tail of a streaming run.
             key={`run:${slot.items[0].id}`}
             items={slot.items}
-            renderItem={renderItem}
+            requestsById={requestsById}
+            onRespondToRequest={onRespondToRequest}
+            onAcceptPlan={onAcceptPlan}
+            onRejectPlan={onRejectPlan}
           />
         );
       })}
@@ -144,6 +153,26 @@ export function MessageList({
 type RenderSlot =
   | { kind: "item"; item: ChatViewItem }
   | { kind: "toolRun"; items: ToolCallItem[] };
+
+function lookupApproval(
+  item: ChatViewItem,
+  requestsById: Map<string, PermissionRequestItem>,
+): PermissionRequestItem | null {
+  if (item.kind === "tool_call" && item.approval_request_id != null) {
+    return requestsById.get(item.approval_request_id) ?? null;
+  }
+  return null;
+}
+
+function isMerged(
+  item: ChatViewItem,
+  mergedRequestIds: Set<string>,
+): boolean {
+  return (
+    item.kind === "permission_request" &&
+    mergedRequestIds.has(item.request_id)
+  );
+}
 
 /**
  * Collapses a stretch of ≥ RUN_COLLAPSE_THRESHOLD consecutive tool
@@ -156,10 +185,16 @@ type RenderSlot =
  */
 function ToolRunCollapse({
   items,
-  renderItem,
+  requestsById,
+  onRespondToRequest,
+  onAcceptPlan,
+  onRejectPlan,
 }: {
   items: ToolCallItem[];
-  renderItem: (item: ChatViewItem) => ReactNode;
+  requestsById: Map<string, PermissionRequestItem>;
+  onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
+  onAcceptPlan: (requestId: string) => void | Promise<void>;
+  onRejectPlan: (requestId: string) => void | Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const hiddenCount = items.length - RUN_TAIL_VISIBLE;
@@ -184,51 +219,79 @@ function ToolRunCollapse({
             : `Show ${hiddenCount} earlier tool call${pluralSuffix}`}
         </span>
       </button>
-      {visible.map((item) => renderItem(item))}
+      {visible.map((item) => (
+        <MessageRowMemo
+          key={item.id}
+          item={item}
+          approval={lookupApproval(item, requestsById)}
+          isMerged={false}
+          onRespondToRequest={onRespondToRequest}
+          onAcceptPlan={onAcceptPlan}
+          onRejectPlan={onRejectPlan}
+        />
+      ))}
     </div>
   );
 }
 
 function MessageRow({
   item,
-  requestsById,
-  mergedRequestIds,
+  approval,
+  isMerged,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
 }: {
   item: ChatViewItem;
-  requestsById: Map<string, PermissionRequestItem>;
-  mergedRequestIds: Set<string>;
+  approval: PermissionRequestItem | null;
+  isMerged: boolean;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
 }) {
+  // Stable per-row decision callback. Without useCallback, ToolCallCard
+  // and PermissionRequestBlock receive a fresh function on every render
+  // and their own React.memo wrappers can't skip work.
+  const requestId =
+    item.kind === "tool_call"
+      ? item.approval_request_id
+      : item.kind === "permission_request"
+        ? item.request_id
+        : null;
+  const handleDecide = useCallback(
+    (decision: ApprovalDecision) => {
+      if (requestId) onRespondToRequest(requestId, decision);
+    },
+    [requestId, onRespondToRequest],
+  );
+  const handleAcceptPlan = useCallback(() => {
+    if (item.kind === "permission_request") {
+      return onAcceptPlan(item.request_id);
+    }
+  }, [item, onAcceptPlan]);
+  const handleRejectPlan = useCallback(() => {
+    if (item.kind === "permission_request") {
+      return onRejectPlan(item.request_id);
+    }
+  }, [item, onRejectPlan]);
+
   switch (item.kind) {
     case "user_message":
       return <UserMessage item={item} />;
     case "assistant_message":
       return <AssistantMessage item={item} />;
     case "tool_call": {
-      const approval =
-        item.approval_request_id != null
-          ? requestsById.get(item.approval_request_id) ?? null
-          : null;
       return (
         <ToolCallCard
           item={item}
           approval={approval}
-          onDecide={(decision) => {
-            if (item.approval_request_id) {
-              onRespondToRequest(item.approval_request_id, decision);
-            }
-          }}
+          onDecide={handleDecide}
         />
       );
     }
     case "permission_request": {
       // Requests already consumed by a ToolCallCard render there.
-      if (mergedRequestIds.has(item.request_id)) return null;
+      if (isMerged) return null;
       // Stage 2 dispatch by request_kind: plan / user-input get
       // specialized renderers; everything else stays on the generic
       // PermissionRequestBlock fallback so future kinds (MCP server,
@@ -238,8 +301,8 @@ function MessageRow({
           return (
             <PlanProposalBlock
               item={item}
-              onAccept={() => onAcceptPlan(item.request_id)}
-              onReject={() => onRejectPlan(item.request_id)}
+              onAccept={handleAcceptPlan}
+              onReject={handleRejectPlan}
             />
           );
         case "user-input": {
@@ -262,9 +325,7 @@ function MessageRow({
           return (
             <PermissionRequestBlock
               item={item}
-              onDecide={(decision) =>
-                onRespondToRequest(item.request_id, decision)
-              }
+              onDecide={handleDecide}
             />
           );
       }
@@ -279,3 +340,9 @@ function MessageRow({
       );
   }
 }
+
+// Default reference comparator is enough now that the parent passes the
+// resolved `approval` ref (not the whole map). The reducer mutates one
+// item at a time via `replaceItem`, so non-changing rows keep their
+// identity and skip the entire MessageRow → leaf-component chain.
+const MessageRowMemo = memo(MessageRow);

@@ -1,3 +1,5 @@
+import { memo } from "react";
+
 import type { AssistantMessageItem } from "@/lib/agent-chat/types";
 
 import { ChatMarkdown } from "./ChatMarkdown";
@@ -16,7 +18,11 @@ import { StreamingIndicator } from "./streaming-indicator";
  * (Stage 2) and future mode-pill renderers share the exact same prose
  * without drift.
  */
-export function AssistantMessage({ item }: { item: AssistantMessageItem }) {
+export const AssistantMessage = memo(function AssistantMessage({
+  item,
+}: {
+  item: AssistantMessageItem;
+}) {
   const showIndicator = item.streaming && item.text.length === 0;
 
   return (
@@ -28,4 +34,4 @@ export function AssistantMessage({ item }: { item: AssistantMessageItem }) {
       {showIndicator && <StreamingIndicator />}
     </div>
   );
-}
+});
