@@ -152,6 +152,21 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
     setSelectedElement(null);
   }, []);
 
+  // P6 from docs/plans/browser-stream-fix.md — reactive stream URL.
+  //
+  // The agent browser session in app state owns the canonical
+  // `stream_url`. When the Rust manager re-allocates a port (after a
+  // teardown/respawn or after the bind-test rejects a stale port), the
+  // backend writes the new port into `agent_browser_sessions` and the
+  // store re-emits.  We read that value directly here so the WebSocket
+  // reconnect is driven by state changes, not by a one-shot
+  // `startBrowserStream` return value cached in a closure.
+  //
+  // Falling back to the value returned by `startBrowserStream` keeps
+  // the legacy non-agent path (no `agentSession`) working unchanged —
+  // there is no reactive source there, so the one-shot URL is fine.
+  const reactiveStreamUrl = agentSession?.stream_url;
+
   // Start stream and connect WebSocket
   useEffect(() => {
     if (!visible) return;
@@ -168,7 +183,11 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
       let streamUrl: string;
       try {
-        streamUrl = await startBrowserStream(streamSessionId);
+        const startResult = await startBrowserStream(streamSessionId);
+        // Prefer the reactive value when present so port re-allocations
+        // don't strand the WebSocket on an old URL.  The Tauri command
+        // call still happens for its side effect (spawning the daemon).
+        streamUrl = reactiveStreamUrl ?? startResult;
       } catch (err) {
         if (!active) return;
         console.error("[browser] startBrowserStream FAILED", err);
@@ -346,7 +365,11 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         wsRef.current = null;
       }
     };
-  }, [browserId, visible, browserSession?.agent_session_name]);
+    // `reactiveStreamUrl` is included so a port re-allocation in the
+    // backend (after a teardown/respawn cycle) tears down this WS and
+    // reconnects against the fresh URL — the bug the old deps array
+    // missed (P6 in docs/plans/browser-stream-fix.md).
+  }, [browserId, visible, browserSession?.agent_session_name, reactiveStreamUrl]);
 
   // Mouse handlers
   const handleMouseDown = (e: React.MouseEvent) => {

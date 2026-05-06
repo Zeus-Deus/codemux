@@ -638,21 +638,50 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
 
             // Resolve the CLI session name to use for agent-browser commands.
             let cli_session_name = if !workspace_id.is_empty() {
-                // Allocate a unique stream port for this workspace.
-                let stream_port = agent_browser.allocate_port(&workspace_id).await
+                // P2 from docs/plans/browser-stream-fix.md: allocate the
+                // stream port keyed by `cli_session_name` directly, not
+                // by `workspace_id` plus an `ensure_port` alias.
+                //
+                // The old flow allocated against `workspace_id`, then
+                // mirrored the port into the manager under
+                // `cli_session_name` via `ensure_port`. That left two
+                // HashMap entries pinning the same port, which `close()`
+                // could not fully reap (it only removed the key it was
+                // passed) — every workspace churn leaked a phantom slot
+                // and eventually exhausted or aliased the 9223–9299
+                // range. Allocating against `cli_session_name` from the
+                // start removes the alias entirely.
+                //
+                // We resolve the agent session once with a placeholder
+                // port (the previously-stored value, or
+                // `DEFAULT_STREAM_PORT` for the very first call) so we
+                // know the canonical `cli_session_name`, then allocate
+                // for real and write the actual port back into state so
+                // the frontend's reactive `stream_url` reflects reality
+                // (P6).
+                let placeholder_port = state
+                    .agent_browser_stream_port_for_workspace(&workspace_id)
+                    .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
+                let session_for_naming = state.resolve_agent_browser_session(
+                    &workspace_id,
+                    placeholder_port,
+                );
+                let stream_port = agent_browser
+                    .allocate_port(&session_for_naming.cli_session_name)
+                    .await
                     .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
 
-
-                // Workspace-scoped path: find or create agent session for this workspace.
+                // Persist the real port back into the agent session so
+                // the frontend's `stream_url` is reactive when the port
+                // gets re-allocated after a teardown/respawn.
+                let _ = state.update_agent_browser_stream_port(
+                    &workspace_id,
+                    stream_port,
+                );
                 let agent_session = state.resolve_agent_browser_session(
                     &workspace_id,
                     stream_port,
                 );
-
-                // Register the same port under cli_session_name so that
-                // start_stream(cli_session_name) and close(cli_session_name) find it.
-
-                agent_browser.ensure_port(&agent_session.cli_session_name, stream_port).await;
 
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
                 let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;

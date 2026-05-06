@@ -1910,6 +1910,49 @@ impl AppStateStore {
             .cloned()
     }
 
+    /// Return the stream port currently recorded for a workspace's agent
+    /// browser session, parsed from `stream_url`. Used by `control.rs`
+    /// to resolve the canonical `cli_session_name` before allocating a
+    /// new port — see P2 in `docs/plans/browser-stream-fix.md`. Returns
+    /// `None` when the workspace has no session yet (first call).
+    pub fn agent_browser_stream_port_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Option<u16> {
+        let snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter()
+            .find(|s| s.workspace_id.0 == workspace_id)?;
+        session
+            .stream_url
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+    }
+
+    /// Update the stream port recorded on an agent browser session so
+    /// the frontend's `stream_url` becomes reactive on re-allocation
+    /// (P6 in `docs/plans/browser-stream-fix.md`). Returns Err when no
+    /// session exists for the workspace yet — callers should
+    /// `resolve_agent_browser_session` first if that matters.
+    pub fn update_agent_browser_stream_port(
+        &self,
+        workspace_id: &str,
+        stream_port: u16,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+            .ok_or_else(|| {
+                format!("No agent browser session for workspace {workspace_id}")
+            })?;
+        session.stream_url = format!("ws://localhost:{stream_port}");
+        Ok(())
+    }
+
     /// Update the current URL on the agent browser session for a workspace.
     pub fn update_agent_browser_url(
         &self,
