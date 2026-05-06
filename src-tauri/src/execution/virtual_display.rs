@@ -1062,7 +1062,10 @@ mod tests {
         let dir = display_secrets_dir(1042);
         assert_eq!(
             dir,
-            std::path::PathBuf::from("/run/user/1234/codemux/vd-1042")
+            std::path::PathBuf::from(format!(
+                "/run/user/1234/{}/vd-1042",
+                crate::APP_DIR_NAME
+            ))
         );
         unsafe {
             match orig {
