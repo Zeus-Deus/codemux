@@ -85,7 +85,35 @@ fn strip_ansi_codes(s: &str) -> String {
 
 const DEFAULT_ROWS: u16 = 24;
 const DEFAULT_COLS: u16 = 80;
-const OUTPUT_BUFFER_LIMIT: usize = 1024;
+/// Maximum bytes of PTY output retained in a session's `pending_output` ring
+/// buffer between when the frontend channel detaches (e.g. workspace switched
+/// away from a parked agent pane — see `terminal-cache.ts::detachPtyChannel`)
+/// and when it reattaches. Bounds per-session memory; once exceeded, oldest
+/// chunks are evicted FIFO so memory stays bounded but any scrollback prior to
+/// the eviction is permanently lost when the user returns to the workspace.
+///
+/// Sized for sustained verbose-agent runs (Claude Code / Codex / OpenCode)
+/// streaming behind a switched-away workspace. 256 MiB holds ~1.5M typical
+/// 150-byte token-delta chunks or ~8K max-size 32 KiB tool-output bursts —
+/// enough headroom for a long thinking + tool-call sequence while the user
+/// works in another workspace, without bounding away real RAM on idle sessions
+/// (the cap is an upper bound, not a reservation).
+///
+/// Prior implementation capped at a fixed 1024 chunks regardless of chunk
+/// size, which was a fuzzy proxy for memory: tiny token chunks evicted in a
+/// few minutes of agent activity even though they used barely any RAM,
+/// silently truncating the scrollback the user expected to see on return.
+/// The chunk-count cap was originally chosen under the assumption that the
+/// channel would stay attached for the session lifetime (per a now-stale
+/// design note); the cache-architecture rework added park-time channel
+/// detach for input-latency reasons, which made eviction routinely fire.
+///
+/// Test builds use a much smaller cap so eviction tests stay fast — tests
+/// push 1-byte chunks so chunk-count and byte-count line up.
+#[cfg(not(test))]
+const OUTPUT_BUFFER_BYTE_LIMIT: usize = 256 * 1024 * 1024;
+#[cfg(test)]
+const OUTPUT_BUFFER_BYTE_LIMIT: usize = 1024;
 /// PTY output batching: flush after this many accumulated bytes.
 const PTY_BATCH_SIZE: usize = 32_768;
 /// PTY output batching: flush after this much time since last flush (~1 frame at 60 Hz).
@@ -119,12 +147,27 @@ pub struct SessionRuntime {
     /// channel cannot clear a newer channel that attached concurrently.
     pub output_channel_generation: u64,
     pub pending_output: VecDeque<Vec<u8>>,
+    /// Running total of `chunk.len()` across every entry in `pending_output`.
+    /// Maintained alongside the deque so the eviction loop can cap by bytes
+    /// (`OUTPUT_BUFFER_BYTE_LIMIT`) without paying an O(n) sum per push. Must
+    /// stay in lockstep with the deque: every `push_back` adds the chunk
+    /// length, every `pop_front` subtracts it, every `clear()` resets to 0.
+    /// `saturating_*` arithmetic prevents arithmetic overflow on the rare
+    /// pathological session that exceeds `usize::MAX` cumulative bytes.
+    pub pending_output_bytes: usize,
     /// Cumulative count of chunks evicted from `pending_output` because the
-    /// buffer hit `OUTPUT_BUFFER_LIMIT` while no consumer was attached. With
-    /// the frontend cache (terminal-cache.ts) the channel stays attached for
-    /// the entire session lifetime, so this should stay at 0 in the steady
-    /// state. A non-zero value indicates either a long startup window or a
-    /// regression where the channel was detached on workspace switch.
+    /// buffer hit `OUTPUT_BUFFER_BYTE_LIMIT` while no consumer was attached.
+    ///
+    /// `terminal-cache.ts` deliberately detaches the output channel when a
+    /// workspace is parked (this trade was made to eliminate cross-workspace
+    /// typing lag — hidden panes used to push bytes through Tauri IPC and
+    /// xterm parsing on the renderer main thread, contending with the
+    /// foreground pane). While detached, PTY output accumulates here; if the
+    /// user stays away long enough for the byte cap to overflow, the oldest
+    /// scrollback is dropped. A non-zero value here is the regression signal
+    /// for "scrollback was lost while a workspace was parked." Persisted
+    /// across attach/detach cycles so the cumulative loss across a session
+    /// is observable, not just the most recent overflow.
     pub dropped_chunks: u64,
     pub last_status: TerminalStatusPayload,
     pub child_pid: Option<u32>,
@@ -150,6 +193,7 @@ impl SessionRuntime {
             output_channel: None,
             output_channel_generation: 0,
             pending_output: VecDeque::new(),
+            pending_output_bytes: 0,
             dropped_chunks: 0,
             last_status: TerminalStatusPayload {
                 session_id: session_id.to_string(),
@@ -395,9 +439,28 @@ fn queue_or_send_output(
         session_id,
         || SessionRuntime::new(session_id),
         |runtime| {
+            // Maintain `pending_output_bytes` in lockstep with the deque so
+            // the eviction loop below can cap by total bytes without an O(n)
+            // re-sum. `saturating_add` defends against the pathological case
+            // of cumulative bytes wrapping `usize::MAX` — at the production
+            // 256 MiB cap this is theoretical, but it's free insurance.
+            runtime.pending_output_bytes = runtime
+                .pending_output_bytes
+                .saturating_add(chunk.len());
             runtime.pending_output.push_back(chunk.clone());
-            while runtime.pending_output.len() > OUTPUT_BUFFER_LIMIT {
-                runtime.pending_output.pop_front();
+            while runtime.pending_output_bytes > OUTPUT_BUFFER_BYTE_LIMIT {
+                let Some(evicted) = runtime.pending_output.pop_front() else {
+                    // Defensive: the byte counter and the deque got out of
+                    // sync somehow (would indicate a bug in this function or
+                    // a future caller mutating the deque directly). Clamp to
+                    // zero to break the loop instead of spinning, and let
+                    // the next push restart accounting from a clean slate.
+                    runtime.pending_output_bytes = 0;
+                    break;
+                };
+                runtime.pending_output_bytes = runtime
+                    .pending_output_bytes
+                    .saturating_sub(evicted.len());
                 if runtime.output_channel.is_none() {
                     let dropped = runtime.dropped_chunks.saturating_add(1);
                     runtime.dropped_chunks = dropped;
@@ -1475,6 +1538,7 @@ pub(crate) fn terminate_pty_session(
     let pid = runtime.child_pid.take();
     runtime.output_channel = None;
     runtime.pending_output.clear();
+    runtime.pending_output_bytes = 0;
     if let Some(master) = runtime.master.as_mut() {
         let _ = master.resize(PtySize {
             rows: 1,
@@ -2679,13 +2743,13 @@ mod tests {
         let sessions = make_sessions();
         with_session_runtime(&sessions, "sess", || SessionRuntime::new("sess"), |_| {});
 
-        for i in 0..OUTPUT_BUFFER_LIMIT + 10 {
+        for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + 10 {
             queue_or_send_output(&sessions, "sess", vec![i as u8]);
         }
 
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("sess").unwrap();
-        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_LIMIT);
+        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_BYTE_LIMIT);
         // Oldest 10 evicted; first remaining is chunk #10
         assert_eq!(runtime.pending_output[0], vec![10]);
     }
@@ -2720,7 +2784,7 @@ mod tests {
         with_session_runtime(&sessions, "a", || SessionRuntime::new("a"), |_| {});
         with_session_runtime(&sessions, "b", || SessionRuntime::new("b"), |_| {});
 
-        for i in 0..OUTPUT_BUFFER_LIMIT + 3 {
+        for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + 3 {
             queue_or_send_output(&sessions, "a", vec![i as u8]);
         }
         for i in 0..5 {
@@ -2744,7 +2808,7 @@ mod tests {
             |_| {},
         );
 
-        for i in 0..OUTPUT_BUFFER_LIMIT + 7 {
+        for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + 7 {
             queue_or_send_output(&sessions, "persist", vec![i as u8]);
         }
         let after_first_overflow = {
@@ -2754,7 +2818,10 @@ mod tests {
         assert_eq!(after_first_overflow, 7);
 
         // Simulate attach (mirrors attach_pty_output body): install a
-        // channel, drain pending_output, then detach again.
+        // channel, drain pending_output, then detach again. Reset the
+        // byte counter alongside the deque to keep the invariant —
+        // production code does this in `close_terminal_session`; tests
+        // touching the deque directly must do the same.
         let channel: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
         with_session_runtime(
             &sessions,
@@ -2763,6 +2830,7 @@ mod tests {
             |runtime| {
                 runtime.output_channel = Some(channel);
                 runtime.pending_output.clear();
+                runtime.pending_output_bytes = 0;
             },
         );
         with_session_runtime(
@@ -2793,13 +2861,13 @@ mod tests {
         with_session_runtime(&sessions, "drop", || SessionRuntime::new("drop"), |_| {});
 
         let extra = 5usize;
-        for i in 0..OUTPUT_BUFFER_LIMIT + extra {
+        for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + extra {
             queue_or_send_output(&sessions, "drop", vec![i as u8]);
         }
 
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("drop").unwrap();
-        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_LIMIT);
+        assert_eq!(runtime.pending_output.len(), OUTPUT_BUFFER_BYTE_LIMIT);
         assert_eq!(
             runtime.dropped_chunks, extra as u64,
             "dropped_chunks should record every eviction, not just the first"
@@ -2909,14 +2977,14 @@ mod tests {
         );
 
         // Drive the same path the reader thread uses for each batched flush.
-        for i in 0..OUTPUT_BUFFER_LIMIT + 5 {
+        for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + 5 {
             queue_or_send_output(&sessions, "live", vec![i as u8]);
         }
 
         let received = captured.lock().unwrap().clone();
         assert_eq!(
             received.len(),
-            OUTPUT_BUFFER_LIMIT + 5,
+            OUTPUT_BUFFER_BYTE_LIMIT + 5,
             "channel should receive every chunk synchronously when attached"
         );
         for (i, chunk) in received.iter().enumerate() {
@@ -2926,11 +2994,11 @@ mod tests {
         // pending_output is still appended to (the buffer is the source for
         // cold-start replay if the consumer ever reattaches), but the
         // channel-side delivery is the live path and never lossy. Verify
-        // chunks are bounded by OUTPUT_BUFFER_LIMIT and that no drops have
+        // chunks are bounded by OUTPUT_BUFFER_BYTE_LIMIT and that no drops have
         // occurred — drops are the regression signal added in 2.6.
         let guard = sessions.lock().unwrap();
         let runtime = guard.get("live").unwrap();
-        assert!(runtime.pending_output.len() <= OUTPUT_BUFFER_LIMIT);
+        assert!(runtime.pending_output.len() <= OUTPUT_BUFFER_BYTE_LIMIT);
         assert_eq!(
             runtime.dropped_chunks, 0,
             "bounded replay eviction is not dropped live output while channel is attached"
