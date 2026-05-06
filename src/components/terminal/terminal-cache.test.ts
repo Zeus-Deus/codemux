@@ -432,9 +432,141 @@ describe("terminal-cache", () => {
     await Promise.resolve();
     emitChannelBytes(sid, new TextEncoder().encode("replayed-output"));
 
+    // The channel callback queues bytes; the async pump drains them via
+    // setTimeout(0) yields. Drain fully before asserting.
+    await waitForPumpDrain();
+
     expect(writeSpy).toHaveBeenCalledTimes(1);
 
     writeSpy.mockRestore();
     disposeTerminal(sid);
   });
+
+  // ── Reattach-replay throttle ────────────────────────────────────────
+  // A long park on a chatty agent leaves up to OUTPUT_BUFFER_BYTE_LIMIT
+  // (256 MiB) of bytes in Rust's pending_output. On reattach Rust fires a
+  // channel send per ~32 KiB chunk — thousands of back-to-back callbacks.
+  // Before throttling, each callback synchronously called terminal.write,
+  // so the renderer parsed every chunk in one main-thread task and froze
+  // for several seconds. The pump now yields between chunks; these tests
+  // cover the queue/drain invariants.
+
+  it("rapid burst of channel callbacks is delivered to xterm in order", async () => {
+    const sid = "session-replay-burst-order";
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const { entry } = await getOrCreateTerminal(sid, baseOptions);
+    attachToContainer(sid, container);
+
+    const writeSpy = vi
+      .spyOn(entry.terminal, "write")
+      .mockImplementation(() => true);
+
+    const chunkCount = 200;
+    for (let i = 0; i < chunkCount; i++) {
+      emitChannelBytes(sid, new TextEncoder().encode(`chunk-${i}\n`));
+    }
+
+    await waitForPumpDrain();
+
+    expect(writeSpy).toHaveBeenCalledTimes(chunkCount);
+    for (let i = 0; i < chunkCount; i++) {
+      const arg = writeSpy.mock.calls[i]?.[0];
+      const decoded = arg ? new TextDecoder().decode(arg as Uint8Array) : "";
+      expect(decoded).toBe(`chunk-${i}\n`);
+    }
+
+    writeSpy.mockRestore();
+    disposeTerminal(sid);
+  });
+
+  it("pump yields between writes — main thread is not pegged on a multi-MB replay", async () => {
+    // A burst of channel callbacks must not all be flushed to terminal.write
+    // in one synchronous task. We assert this directly: after queueing a
+    // burst, between the first xterm.write and the next there must be at
+    // least one macrotask boundary — proving setTimeout-scheduled work from
+    // _other_ subsystems (input, paint, React) gets a chance to run.
+    const sid = "session-replay-yield";
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const { entry } = await getOrCreateTerminal(sid, baseOptions);
+    attachToContainer(sid, container);
+
+    let interleaved = false;
+    const writeOrder: string[] = [];
+    const writeSpy = vi
+      .spyOn(entry.terminal, "write")
+      .mockImplementation((data: string | Uint8Array) => {
+        // Schedule a macrotask after every xterm.write. If the pump
+        // yields between writes, this callback runs BEFORE the pump
+        // gets to its next chunk — interleaved goes true.
+        writeOrder.push("write");
+        setTimeout(() => {
+          writeOrder.push("interleaved");
+          interleaved = true;
+        }, 0);
+        void data;
+        return true;
+      });
+
+    const chunks = 50;
+    for (let i = 0; i < chunks; i++) {
+      emitChannelBytes(sid, new TextEncoder().encode("x"));
+    }
+
+    await waitForPumpDrain();
+
+    expect(writeSpy).toHaveBeenCalledTimes(chunks);
+    expect(interleaved).toBe(true);
+    // The "interleaved" macrotask must have been processed at least once
+    // mid-drain, not just after the last write — i.e. an "interleaved"
+    // entry must appear before the final "write" entry in writeOrder.
+    const lastWriteIdx = writeOrder.lastIndexOf("write");
+    const firstInterleavedIdx = writeOrder.indexOf("interleaved");
+    expect(firstInterleavedIdx).toBeGreaterThanOrEqual(0);
+    expect(firstInterleavedIdx).toBeLessThan(lastWriteIdx);
+
+    writeSpy.mockRestore();
+    disposeTerminal(sid);
+  });
+
+  it("dispose mid-pump drops queued chunks and stops the pump", async () => {
+    const sid = "session-replay-dispose";
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const { entry } = await getOrCreateTerminal(sid, baseOptions);
+    attachToContainer(sid, container);
+
+    const writeSpy = vi
+      .spyOn(entry.terminal, "write")
+      .mockImplementation(() => true);
+
+    // Queue a burst, then dispose immediately. No await between — the pump
+    // hasn't drained anything yet (first iteration has not yielded).
+    for (let i = 0; i < 100; i++) {
+      emitChannelBytes(sid, new TextEncoder().encode("y"));
+    }
+    disposeTerminal(sid);
+
+    await waitForPumpDrain();
+
+    // The pump drains at most one chunk before checking entry.disposed
+    // (dispose runs after pumpWrites started), then bails out. We accept
+    // 0..1 writes — the invariant is "no late writes after dispose".
+    expect(writeSpy.mock.calls.length).toBeLessThanOrEqual(1);
+    expect(entry.writeQueue.length).toBe(0);
+    expect(entry.writePumpRunning).toBe(false);
+
+    writeSpy.mockRestore();
+  });
 });
+
+// Wait for any pending pumpWrites cycles to complete. The pump uses
+// setTimeout(0) to yield between writes, so we need to flush macrotasks
+// repeatedly until every queued chunk has drained. The pump processes one
+// chunk per macrotask cycle, so chunk-count + slack is a sufficient bound.
+async function waitForPumpDrain(): Promise<void> {
+  for (let i = 0; i < 300; i++) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+}
