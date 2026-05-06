@@ -93,6 +93,16 @@ pub struct IncludeResult {
     pub source: IncludeSource,
 }
 
+/// Compare two paths for filesystem equality. Prefers canonicalized comparison
+/// (resolves symlinks, `.`, `..`) and falls back to direct path comparison if
+/// canonicalization fails (e.g., a path doesn't exist yet).
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ac), Ok(bc)) => ac == bc,
+        _ => a == b,
+    }
+}
+
 /// Process worktree includes: copy gitignored files matching patterns from the
 /// main worktree into the new worktree.
 ///
@@ -100,11 +110,29 @@ pub struct IncludeResult {
 ///   1. `.codemuxinclude` file in project root
 ///   2. `worktree_includes` from project settings
 ///   3. Hardcoded defaults (`DEFAULT_WORKTREE_INCLUDES`)
+///
+/// If `root_path` and `worktree_path` resolve to the same directory (i.e., the
+/// workspace is the project root itself, not a separate git worktree), this is
+/// a no-op. Without that guard, the copy step would call
+/// `std::fs::copy(src, src)`, which on Linux truncates the file to zero bytes
+/// because Rust opens the destination with `O_TRUNC` *before* reading the
+/// source. See `test_worktree_includes_same_root_does_not_truncate`.
 pub fn process_worktree_includes(
     root_path: &Path,
     worktree_path: &Path,
     setting_patterns: &[String],
 ) -> Result<IncludeResult, String> {
+    if paths_equal(root_path, worktree_path) {
+        eprintln!(
+            "[codemux::scripts] worktree includes skipped: workspace path == project root ({})",
+            root_path.display()
+        );
+        return Ok(IncludeResult {
+            copied: Vec::new(),
+            source: IncludeSource::Defaults,
+        });
+    }
+
     let include_file = root_path.join(".codemuxinclude");
 
     // Determine source and write a temp exclude file for non-file sources
@@ -188,6 +216,20 @@ fn copy_matching_files(
         let dst = worktree_path.join(relative_path);
 
         if !src.exists() || !src.is_file() {
+            continue;
+        }
+
+        // Defense-in-depth: never copy a file onto itself. `std::fs::copy`
+        // opens the destination with O_TRUNC before reading the source, so a
+        // self-copy silently zeroes the file. The outer
+        // `process_worktree_includes` already short-circuits when root and
+        // worktree paths match, but a symlink inside the worktree could still
+        // alias back to the source.
+        if paths_equal(&src, &dst) {
+            eprintln!(
+                "[codemux::scripts] skipping self-copy for {}",
+                src.display()
+            );
             continue;
         }
 
@@ -684,6 +726,147 @@ mod tests {
         // Empty setting patterns should fall through to defaults
         let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
         assert_eq!(result.source, IncludeSource::Defaults);
+    }
+
+    /// Regression test for the bug where opening an existing project's main
+    /// branch as a workspace (workspace path == project root) would silently
+    /// truncate `.env` files to zero bytes. The copy step internally called
+    /// `std::fs::copy(src, src)`, and Rust opens the destination with
+    /// `O_TRUNC` before reading the source, so the file was destroyed.
+    ///
+    /// The fix: `process_worktree_includes` short-circuits when root and
+    /// worktree paths resolve to the same directory.
+    #[test]
+    fn test_worktree_includes_same_root_does_not_truncate() {
+        let root = tempfile::tempdir().unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+
+        fs::write(root.path().join(".gitignore"), ".env\n.env.*\n").unwrap();
+
+        let env_content = "DATABASE_URL=postgres://localhost/prod\nSECRET_KEY=do-not-lose-this\n";
+        fs::write(root.path().join(".env"), env_content).unwrap();
+        fs::write(root.path().join(".env.local"), "LOCAL=keep-me").unwrap();
+
+        // Workspace path == project root (the buggy scenario).
+        let result = process_worktree_includes(root.path(), root.path(), &[]).unwrap();
+
+        // Nothing was copied — there's no separate destination to copy into.
+        assert!(
+            result.copied.is_empty(),
+            "expected no-op when workspace == root, got copied={:?}",
+            result.copied
+        );
+
+        // Crucially, the original files must still have their content.
+        assert_eq!(
+            fs::read_to_string(root.path().join(".env")).unwrap(),
+            env_content,
+            ".env was truncated by self-copy — regression!"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(".env.local")).unwrap(),
+            "LOCAL=keep-me",
+            ".env.local was truncated by self-copy — regression!"
+        );
+    }
+
+    /// Same-root guard must hold even when an explicit `.codemuxinclude` file
+    /// is present (file source, not defaults).
+    #[test]
+    fn test_worktree_includes_same_root_with_codemuxinclude_does_not_truncate() {
+        let root = tempfile::tempdir().unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+
+        fs::write(root.path().join(".gitignore"), ".env\nsecrets/\n").unwrap();
+        fs::write(
+            root.path().join(".codemuxinclude"),
+            ".env\nsecrets/key.pem\n",
+        )
+        .unwrap();
+
+        fs::write(root.path().join(".env"), "ENV=preserved").unwrap();
+        fs::create_dir_all(root.path().join("secrets")).unwrap();
+        fs::write(root.path().join("secrets/key.pem"), "PEM=preserved").unwrap();
+
+        let result = process_worktree_includes(root.path(), root.path(), &[]).unwrap();
+        assert!(result.copied.is_empty());
+
+        assert_eq!(
+            fs::read_to_string(root.path().join(".env")).unwrap(),
+            "ENV=preserved"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("secrets/key.pem")).unwrap(),
+            "PEM=preserved"
+        );
+    }
+
+    /// Same-root detection must work through symlinks. If `worktree_path` is a
+    /// symlink to `root_path` (or vice versa), the canonicalized check should
+    /// catch it and skip the copy.
+    #[cfg(unix)]
+    #[test]
+    fn test_worktree_includes_same_root_via_symlink_does_not_truncate() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("real");
+        let alias = parent.path().join("alias");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+
+        fs::write(root.join(".gitignore"), ".env\n").unwrap();
+        let content = "SYMLINKED=preserved";
+        fs::write(root.join(".env"), content).unwrap();
+
+        // root and alias resolve to the same directory after canonicalization.
+        let result = process_worktree_includes(&root, &alias, &[]).unwrap();
+        assert!(result.copied.is_empty());
+
+        assert_eq!(fs::read_to_string(root.join(".env")).unwrap(), content);
+    }
+
+    /// Sanity check: with distinct directories, the copy still works
+    /// (the fix must not break the legitimate worktree case).
+    #[test]
+    fn test_worktree_includes_distinct_paths_still_copies() {
+        let root = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+
+        fs::write(root.path().join(".gitignore"), ".env\n").unwrap();
+        fs::write(root.path().join(".env"), "FROM_ROOT=ok").unwrap();
+
+        let result = process_worktree_includes(root.path(), worktree.path(), &[]).unwrap();
+        assert!(result.copied.contains(&".env".to_string()));
+        assert_eq!(
+            fs::read_to_string(worktree.path().join(".env")).unwrap(),
+            "FROM_ROOT=ok"
+        );
+        // Source must be untouched too.
+        assert_eq!(
+            fs::read_to_string(root.path().join(".env")).unwrap(),
+            "FROM_ROOT=ok"
+        );
     }
 
     #[test]
