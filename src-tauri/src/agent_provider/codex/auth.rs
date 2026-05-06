@@ -12,6 +12,44 @@ use tokio::process::Command;
 
 use crate::agent_provider::{ProviderError, ProviderKind};
 
+/// Linux `ETXTBSY` (errno 26): "an attempt was made to execute a file that
+/// is currently open for writing." This is a *transient* kernel state, not
+/// a permanent failure — the file is busy because some process in our
+/// process tree still has a writable FD on the inode.
+///
+/// We see this in two places:
+/// 1. **CI / multi-thread tests:** one test thread is between `write()` and
+///    `close()` on a fresh script while another thread `fork()`s. The fork
+///    inherits the writer FD; even with `O_CLOEXEC` it remains open until
+///    the child's `exec()` runs, and during that microseconds-wide window
+///    a sibling thread's `exec()` of the same inode trips ETXTBSY.
+/// 2. **End-user machines:** anti-virus, indexers, or backup agents may
+///    briefly hold a freshly-installed `codex` binary open for scanning.
+///
+/// Both cases resolve in milliseconds, so a short bounded retry loop is the
+/// correct response — far better than surfacing a confusing
+/// `ProcessError { source: "Text file busy (os error 26)" }` to the UI.
+const ETXTBSY: i32 = 26;
+const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+const ETXTBSY_MAX_ATTEMPTS: u32 = 25; // ~500 ms total worst case.
+
+/// Wrap [`Command::output`] with retry-on-ETXTBSY. Any non-ETXTBSY error
+/// (and the success case) is returned immediately on the first attempt.
+async fn output_retrying_etxtbsy(mut cmd: Command) -> std::io::Result<std::process::Output> {
+    for attempt in 0..ETXTBSY_MAX_ATTEMPTS {
+        match cmd.output().await {
+            Err(e) if e.raw_os_error() == Some(ETXTBSY)
+                && attempt + 1 < ETXTBSY_MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(ETXTBSY_RETRY_DELAY).await;
+                continue;
+            }
+            other => return other,
+        }
+    }
+    unreachable!("loop above always returns when attempt+1 == MAX_ATTEMPTS")
+}
+
 /// Patterns that indicate the CLI is installed but the user is not logged
 /// in. Matched case-insensitively against both stdout and stderr.
 const UNAUTHENTICATED_PATTERNS: &[&str] = &[
@@ -52,11 +90,9 @@ pub enum AuthStatus {
 /// is on PATH. `Ok(None)` means the binary was not runnable; `Err` covers
 /// timeouts and other unexpected failures.
 pub async fn probe_installed(codex_binary: &Path) -> Result<Option<String>, ProviderError> {
-    let result = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new(codex_binary).arg("--version").output(),
-    )
-    .await;
+    let mut cmd = Command::new(codex_binary);
+    cmd.arg("--version");
+    let result = tokio::time::timeout(PROBE_TIMEOUT, output_retrying_etxtbsy(cmd)).await;
     let output = match result {
         Ok(Ok(out)) => out,
         Ok(Err(err)) => {
@@ -99,14 +135,9 @@ pub async fn probe_installed(codex_binary: &Path) -> Result<Option<String>, Prov
 
 /// Run `codex auth status` and classify its output.
 pub async fn probe_authenticated(codex_binary: &Path) -> Result<AuthStatus, ProviderError> {
-    let result = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new(codex_binary)
-            .arg("auth")
-            .arg("status")
-            .output(),
-    )
-    .await;
+    let mut cmd = Command::new(codex_binary);
+    cmd.arg("auth").arg("status");
+    let result = tokio::time::timeout(PROBE_TIMEOUT, output_retrying_etxtbsy(cmd)).await;
     let output = match result {
         Ok(Ok(out)) => out,
         Ok(Err(err)) => {
