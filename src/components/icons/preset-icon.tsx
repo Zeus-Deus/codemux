@@ -1,4 +1,4 @@
-import { Terminal, TerminalSquare } from "lucide-react";
+import { BotMessageSquare, Terminal, TerminalSquare } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 import claudeIcon from "@/assets/preset-icons/claude.svg";
@@ -33,6 +33,13 @@ export function PresetIcon({ icon, className }: PresetIconProps) {
 
   if (icon === "terminal") {
     return <Terminal className={cn("shrink-0", className)} />;
+  }
+
+  // The Chat Agent builtin renders a lucide glyph inline so it stays
+  // crisp at any size and picks up the current foreground color (which
+  // raster SVG assets don't always do reliably across themes).
+  if (icon === "chat-agent") {
+    return <BotMessageSquare className={cn("shrink-0", className)} />;
   }
 
   const src = ICON_MAP[icon];

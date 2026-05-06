@@ -438,3 +438,170 @@ pub fn read_file(path: String) -> Result<String, String> {
 pub fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
 }
+
+/// Count occurrences of `pattern` across `cwd` using ripgrep.
+///
+/// `cwd` must be an absolute, existing directory. The pattern is passed
+/// to `rg` verbatim. ripgrep respects `.gitignore` by default, so build
+/// artifacts and `node_modules` are skipped without extra flags.
+///
+/// Returns 0 (not an error) when ripgrep exits with code 1 — that
+/// indicates "no matches", which is a normal outcome for the
+/// debug-marker grep on a clean codebase. Higher exit codes propagate
+/// as `Err`.
+#[tauri::command]
+pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, String> {
+    let path = Path::new(&cwd);
+    if !path.is_absolute() {
+        return Err(format!("cwd must be absolute: {cwd}"));
+    }
+    if !path.is_dir() {
+        return Err(format!("cwd does not exist or is not a directory: {cwd}"));
+    }
+
+    let mut cmd = tokio::process::Command::new("rg");
+    cmd.arg("--count-matches")
+        .arg("--no-messages")
+        .arg(&pattern)
+        .arg(&cwd);
+    crate::execution::sanitize_gui_env_tokio(&mut cmd);
+
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run ripgrep: {e}"))?;
+
+    if !output.status.success() {
+        // rg exits 1 when no matches — that's not an error.
+        if output.status.code() == Some(1) {
+            return Ok(0);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("ripgrep failed: {stderr}"));
+    }
+
+    // --count-matches output: "path:N" per file. Sum the Ns.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let total: usize = stdout
+        .lines()
+        .filter_map(|line| line.rsplit(':').next()?.parse::<usize>().ok())
+        .sum();
+
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::grep_count_pattern;
+    use std::fs;
+
+    #[tokio::test]
+    async fn grep_count_pattern_zero_when_no_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "no markers here\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let count = grep_count_pattern(path, "CODEMUX_DEBUG".to_string())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn grep_count_pattern_counts_correctly() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "// CODEMUX_DEBUG one\n// CODEMUX_DEBUG two\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.py"), "# CODEMUX_DEBUG three\n").unwrap();
+        fs::write(dir.path().join("clean.txt"), "ordinary file\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let count = grep_count_pattern(path, "CODEMUX_DEBUG".to_string())
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn grep_count_pattern_rejects_relative_cwd() {
+        let err = grep_count_pattern("relative/path".to_string(), "X".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("absolute"));
+    }
+
+    #[tokio::test]
+    async fn grep_count_pattern_rejects_missing_dir() {
+        // Build an absolute, definitely-not-existing path that's valid
+        // on any platform — joining a fresh tempdir with a fake subdir
+        // yields an absolute path on Linux (`/tmp/.tmpXXXX/missing`)
+        // and Windows (`C:\Users\...\Temp\.tmpXXXX\missing`). The
+        // hardcoded POSIX `/this/path/...` form failed the early
+        // `is_absolute()` check on Windows and surfaced a different
+        // error string ("cwd must be absolute") that didn't match this
+        // assertion.
+        let dir = tempfile::tempdir().unwrap();
+        let nonexistent = dir.path().join("definitely-not-here");
+        let err = grep_count_pattern(
+            nonexistent.to_string_lossy().to_string(),
+            "X".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("does not exist") || err.contains("not a directory"));
+    }
+
+    /// Regression guard for the Stage 6 cleanup pattern: the
+    /// CODEMUX_DEBUG marker is written by Claude in whatever comment
+    /// syntax the surrounding language uses. A bare-pattern grep
+    /// (no comment-prefix) must catch every form so the cleanup
+    /// turn can later remove them.
+    #[tokio::test]
+    async fn grep_count_pattern_catches_all_comment_syntaxes() {
+        let dir = tempfile::tempdir().unwrap();
+        // JS / TS / Rust / C / C++ / Java / Go / Swift
+        fs::write(dir.path().join("a.rs"), "// CODEMUX_DEBUG slash style\n").unwrap();
+        // Python / Ruby / shell / Make
+        fs::write(dir.path().join("b.py"), "# CODEMUX_DEBUG hash style\n").unwrap();
+        // SQL / Lua / Haskell / Ada
+        fs::write(dir.path().join("c.sql"), "-- CODEMUX_DEBUG dash style\n").unwrap();
+        // HTML / XML / Vue templates / Markdown comments
+        fs::write(
+            dir.path().join("d.html"),
+            "<!-- CODEMUX_DEBUG html style -->\n",
+        )
+        .unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let count = grep_count_pattern(path, "CODEMUX_DEBUG".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 4,
+            "bare CODEMUX_DEBUG pattern must catch //, #, --, <!-- forms"
+        );
+    }
+
+    /// Sanity: the helper survives a missing rg binary by surfacing
+    /// the underlying spawn error. Caller (AgentChatPane) treats this
+    /// as `count = 0` after seeing `Err`.
+    #[tokio::test]
+    async fn grep_count_pattern_surfaces_spawn_error_when_rg_missing() {
+        // We can't unconditionally remove `rg` from PATH inside a unit
+        // test, but we can simulate the same branch by exercising the
+        // error-path code via an absolute path that isn't a directory:
+        // this is the closest deterministic check until we move to a
+        // trait-injected runner. See `grep_count_pattern_rejects_missing_dir`.
+        // The contract is: callers must treat `Err` as recoverable.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("not-a-dir.txt");
+        fs::write(&not_a_dir, "").unwrap();
+        let err = grep_count_pattern(
+            not_a_dir.to_string_lossy().to_string(),
+            "CODEMUX_DEBUG".to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not a directory") || err.contains("does not exist"));
+    }
+}

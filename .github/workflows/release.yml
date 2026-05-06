@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -61,15 +61,56 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          # Node 22 — GitHub is deprecating Node 20 runners starting
-          # June 2026. See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+          # Node 22 for the project's npm scripts. The action itself is on
+          # @v5 (Node 24 runtime) so it won't trip GitHub's Node-20-actions
+          # deprecation that takes effect 2026-06-02.
+          # See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
           node-version: 22
           cache: npm
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Setup Bun
+        # The claude-agent sidecar (sidecar/claude-agent/) is a small
+        # TypeScript project compiled to a standalone binary with `bun
+        # build --compile`. Installed here so the stage step below can
+        # produce the per-target sidecar binary before tauri-action
+        # picks it up via `externalBin`.
+        #
+        # Pinned to 1.2.21 (not `latest`) because Bun 1.3+ compiles its
+        # standalone binaries against glibc 2.36+ symbols. The Linux
+        # release runner is ubuntu-22.04 (glibc 2.35), and linuxdeploy's
+        # AppImage step runs `ldd` on every executable in usr/bin/ — which
+        # invokes the dynamic loader. If the binary needs glibc symbols
+        # the loader can't resolve, ldd exits 1 and linuxdeploy aborts
+        # with `Failed to run ldd: exited with code 1`. Surfaced as the
+        # opaque "failed to run linuxdeploy" without --verbose. Bun 1.2.21
+        # targets glibc 2.31+, which the runner satisfies.
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.2.21"
+
+      - name: Stage claude-agent sidecar binary
+        # Mirrors the agent-browser stage below: explicit pre-stage
+        # rather than relying on tauri's beforeBuildCommand, so
+        # failures show up in a dedicated log step.
+        shell: bash
+        run: |
+          bash scripts/build-claude-sidecar.sh
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET" ;;
+          esac
+          if [ ! -s "$DEST" ]; then
+            echo "::error::build-claude-sidecar.sh did not produce a non-empty binary at $DEST"
+            echo "::error::Target: $TARGET"
+            ls -la src-tauri/binaries/ || true
+            exit 1
+          fi
 
       - name: Stage agent-browser sidecar binary
         # `shell: bash` works on both Linux and windows-latest because Git
@@ -150,6 +191,31 @@ jobs:
       # This is DISTINCT from Windows Authenticode code signing, which
       # is not yet configured (see Windows step TODO below).
 
+      - name: Pre-cache stable linuxdeploy + plugin-appimage
+        if: matrix.os == 'ubuntu-22.04'
+        # Tauri's bundler downloads `linuxdeploy-plugin-appimage` fresh from
+        # the `:continuous` tag on every build. That tag is mutable and was
+        # rebuilt on 2026-05-01 with breaking changes that crash on startup
+        # against tauri's vendored 2022-era linuxdeploy — surfaced as the
+        # opaque "failed to run linuxdeploy" because tauri-bundler captures
+        # but discards linuxdeploy's stderr on non-zero exit.
+        #
+        # Workaround: pre-place a known-good version in ~/.cache/tauri/ so
+        # tauri's "download if missing" check finds the file and skips the
+        # broken `:continuous` fetch. We pin to `1-alpha-20250213-1`, the
+        # most recent immutable tag (Feb 2025), which matches the version
+        # active during the v0.1.33 release on 2026-04-26.
+        #
+        # Linuxdeploy itself is downloaded from tauri-apps/binary-releases
+        # (vendored, frozen since 2022) so we leave that alone — only the
+        # plugin needs pinning.
+        run: |
+          mkdir -p ~/.cache/tauri
+          curl -fsSL -o ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/1-alpha-20250213-1/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x ~/.cache/tauri/linuxdeploy-plugin-appimage.AppImage
+          ls -la ~/.cache/tauri/
+
       - name: Build and release (Linux)
         if: matrix.os == 'ubuntu-22.04'
         uses: tauri-apps/tauri-action@action-v0.6.2
@@ -157,12 +223,24 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Defensive: skip linuxdeploy's strip step. webkit2gtk 2.50.4 ships
+          # libs with .relr.dyn ELF sections that older binutils strip can
+          # mangle. Not the root cause of the v0.2.0 failure (that was the
+          # plugin-appimage `:continuous` rebuild — see pre-cache step above)
+          # but cheap insurance against a future similar incident.
+          NO_STRIP: "true"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Codemux ${{ github.ref_name }}"
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          # Diagnostic: tauri build's bundler captures linuxdeploy's stderr
+          # but only prints it when verbose. Without this flag, linuxdeploy
+          # failures appear as the opaque "failed to run linuxdeploy" with
+          # no clue as to the underlying cause. Worth the ~50 KB of extra
+          # log noise — keeps future incidents debuggable.
+          args: --verbose
 
       - name: Build and release (Windows)
         if: matrix.os == 'windows-latest'

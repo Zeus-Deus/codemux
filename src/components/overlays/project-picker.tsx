@@ -15,7 +15,11 @@ import {
 } from "@/components/ui/command";
 import { Check, ChevronDown, FolderOpen, FolderPlus } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useAppStore, useProjectGroupedWorkspaces } from "@/stores/app-store";
+import {
+  useAppStore,
+  useHomeDir,
+  useProjectGroupedWorkspaces,
+} from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
 import { useProjectActions } from "@/hooks/use-project-actions";
@@ -78,7 +82,8 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
   );
 
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
-  const projectGroups = useProjectGroupedWorkspaces(workspaces);
+  const homeDir = useHomeDir();
+  const projectGroups = useProjectGroupedWorkspaces(workspaces, homeDir);
 
   // Load recent projects and project colors when popover opens
   useEffect(() => {

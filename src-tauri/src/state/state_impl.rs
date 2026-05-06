@@ -10,11 +10,22 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 const MAX_NOTIFICATIONS: usize = 500;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceType {
     Standard,
     OpenFlow,
+    /// The Home singleton is being retired across the Stage A→E
+    /// rework. Stage B keeps the variant intact (code paths like
+    /// `get_or_create_home_workspace` still construct it). Stage E
+    /// deletes it and, in the SAME commit, adds `#[serde(alias =
+    /// "home")]` on `Standard` so legacy SQLite rows continue to
+    /// deserialise. Adding the alias now would collide with this
+    /// variant and trigger a `serde_derive`-emitted
+    /// `unreachable_patterns` warning that neither enum- nor
+    /// variant-level `#[allow]` silences — so the alias work is
+    /// deferred to Stage E.
+    Home,
 }
 
 impl Default for WorkspaceType {
@@ -134,6 +145,14 @@ pub enum WorkspacePresetLayout {
     Six,
     Eight,
     ShellBrowser,
+    /// No surfaces, no tabs, no terminal sessions — an "empty shell"
+    /// workspace whose panes are populated later by the caller
+    /// (e.g. `agent_chat_create_pane` after an inline worktree
+    /// creation). Matches the shape of
+    /// [`create_empty_workspace_at_path`]; differs from it only in
+    /// that the workspace also carries worktree metadata set by the
+    /// bundled `create_worktree_workspace` command.
+    Empty,
 }
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -272,6 +291,27 @@ pub enum PaneNodeSnapshot {
         browser_id: BrowserId,
         title: String,
     },
+    /// Agent-chat pane. Feature-flagged behind
+    /// [`FeatureFlags::enable_agent_chat`](crate::observability::FeatureFlags::enable_agent_chat);
+    /// the stub renderer only shows a placeholder while the chat UI lands
+    /// in a follow-up task.
+    AgentChat {
+        pane_id: PaneId,
+        title: String,
+        /// Thread identifier when a chat session has been started.
+        /// `None` on a freshly-created pane that has not yet been bound
+        /// to a session.
+        #[serde(default)]
+        thread_id: Option<String>,
+        /// Provider family selected for this thread. `None` until the
+        /// user picks one (or a default is applied in Step 3).
+        #[serde(default)]
+        provider: Option<crate::agent_provider::ProviderKind>,
+        /// Working directory the thread should act on. `None` falls back
+        /// to the workspace cwd at render time.
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     Split {
         pane_id: PaneId,
         direction: SplitDirection,
@@ -344,6 +384,8 @@ pub struct CodemuxConfigSnapshot {
     pub notification_sound_enabled: bool,
     #[serde(default = "default_true")]
     pub ai_commit_message_enabled: bool,
+    #[serde(default)]
+    pub ai_commit_message_cli: Option<String>,
     #[serde(default)]
     pub ai_commit_message_model: Option<String>,
     #[serde(default)]
@@ -433,6 +475,10 @@ impl AppStateStore {
 
     pub fn set_ai_commit_message_enabled(&self, enabled: bool) {
         self.inner.lock().unwrap().config.ai_commit_message_enabled = enabled;
+    }
+
+    pub fn set_ai_commit_message_cli(&self, cli: Option<String>) {
+        self.inner.lock().unwrap().config.ai_commit_message_cli = cli;
     }
 
     pub fn set_ai_commit_message_model(&self, model: Option<String>) {
@@ -734,6 +780,15 @@ impl AppStateStore {
         cwd_path: PathBuf,
         layout: WorkspacePresetLayout,
     ) -> WorkspaceId {
+        // Empty layout short-circuits to the same shape
+        // `create_empty_workspace_at_path` produces: no tabs, no
+        // surfaces, no terminal sessions. Callers (e.g. the inline
+        // chat-worktree flow) fill the workspace with their own pane
+        // afterward via `agent_chat_create_pane`.
+        if matches!(layout, WorkspacePresetLayout::Empty) {
+            return self.create_empty_workspace_at_path(cwd_path);
+        }
+
         let mut snapshot = self.inner.lock().unwrap();
         let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
@@ -882,6 +937,156 @@ impl AppStateStore {
         Ok((new_pane_id, browser_id))
     }
 
+    /// Spawn a new agent-chat pane inside the given workspace.
+    ///
+    /// Pane tree behavior mirrors [`create_browser_pane`](Self::create_browser_pane):
+    /// the new pane is inserted by splitting the workspace's currently
+    /// active pane horizontally. Returns the new [`PaneId`] on success.
+    ///
+    /// This method does not consult the `enable_agent_chat` feature
+    /// flag — callers (the Tauri command layer) are responsible for
+    /// gating. Keeping the flag check at the command boundary keeps
+    /// state-level operations reusable from tests that bypass the flag.
+    pub fn create_agent_chat_pane(
+        &self,
+        workspace_id: &str,
+        provider: Option<crate::agent_provider::ProviderKind>,
+        cwd: Option<String>,
+        launch_mode: Option<crate::presets::LaunchMode>,
+    ) -> Result<PaneId, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+
+        let workspace_index = snapshot
+            .workspaces
+            .iter()
+            .position(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        let new_pane_id = PaneId(next_id("pane"));
+        let split_pane_id = PaneId(next_id("pane"));
+        let title = "Agent Chat".to_string();
+        let new_node = PaneNodeSnapshot::AgentChat {
+            pane_id: new_pane_id.clone(),
+            title,
+            thread_id: None,
+            provider,
+            cwd,
+        };
+
+        let workspace = snapshot
+            .workspaces
+            .get_mut(workspace_index)
+            .ok_or_else(|| "Workspace disappeared while creating chat pane".to_string())?;
+
+        // Force a fresh tab+surface when the caller explicitly asks
+        // for `NewTab`. Without this the existing surface check below
+        // would split the active pane on a populated workspace —
+        // which is the right default for materialise / sidebar paths
+        // (the chat IS the workspace) but wrong when a Chat Agent
+        // preset button is clicked on a workspace the user is already
+        // working in: clicking the button should mirror CLI presets
+        // (new tab on plain click, split on shift+click), not always
+        // split.
+        let force_new_tab = matches!(
+            launch_mode,
+            Some(crate::presets::LaunchMode::NewTab)
+        );
+
+        // Find the active surface. If the workspace has no surfaces
+        // (empty workspace state) OR the caller wants a new tab,
+        // create a fresh surface carrying the new chat pane as its
+        // only child. Otherwise split at the active pane, mirroring
+        // browser/terminal pane insertion.
+        if workspace.surfaces.is_empty() || force_new_tab {
+            let surface_id = SurfaceId(next_id("surface"));
+            let tab_id = next_id("tab");
+            workspace.tabs.push(TabSnapshot {
+                tab_id: tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Agent Chat".into(),
+                surface_id: Some(surface_id.clone()),
+                browser_id: None,
+                icon: None,
+            });
+            workspace.active_tab_id = tab_id;
+            workspace.active_surface_id = surface_id.clone();
+            workspace.surfaces.push(SurfaceSnapshot {
+                surface_id,
+                title: "Agent Chat".into(),
+                active_pane_id: new_pane_id.clone(),
+                root: new_node,
+            });
+            let active_workspace_id = workspace.workspace_id.clone();
+            snapshot.active_workspace_id = active_workspace_id;
+            return Ok(new_pane_id);
+        }
+
+        let active_surface_id = workspace.active_surface_id.clone();
+        let surface_index = workspace
+            .surfaces
+            .iter()
+            .position(|s| s.surface_id == active_surface_id)
+            .unwrap_or(0);
+        let surface = workspace
+            .surfaces
+            .get_mut(surface_index)
+            .ok_or_else(|| "Workspace has no usable surface".to_string())?;
+
+        let target_pane_id = surface.active_pane_id.clone();
+        let inserted = insert_split_at_pane(
+            &mut surface.root,
+            &target_pane_id.0,
+            split_pane_id,
+            SplitDirection::Horizontal,
+            new_node,
+        );
+        if !inserted {
+            return Err(format!(
+                "Failed to create agent_chat pane next to {}",
+                target_pane_id.0
+            ));
+        }
+
+        surface.active_pane_id = new_pane_id.clone();
+        let surface_id = surface.surface_id.clone();
+        workspace.active_surface_id = surface_id;
+        let active_workspace_id = workspace.workspace_id.clone();
+        snapshot.active_workspace_id = active_workspace_id;
+
+        Ok(new_pane_id)
+    }
+
+    /// Return the [`ThreadId`] bound to the given chat pane, if any.
+    pub fn agent_chat_thread_id(&self, pane_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        for workspace in &snapshot.workspaces {
+            for surface in &workspace.surfaces {
+                if let Some(tid) = agent_chat_thread_for_pane(&surface.root, pane_id) {
+                    return tid;
+                }
+            }
+        }
+        None
+    }
+
+    /// Store a [`ThreadId`] on an existing chat pane. Returns true on
+    /// success. A no-op on non-chat panes or unknown pane ids.
+    pub fn set_agent_chat_thread_id(
+        &self,
+        pane_id: &str,
+        new_thread_id: Option<String>,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        for workspace in &mut snapshot.workspaces {
+            for surface in &mut workspace.surfaces {
+                if assign_agent_chat_thread(&mut surface.root, pane_id, &new_thread_id) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn rename_workspace(&self, workspace_id: &str, title: String) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -993,6 +1198,30 @@ impl AppStateStore {
         }
     }
 
+    pub fn set_workspace_type(&self, workspace_id: &str, workspace_type: WorkspaceType) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.workspace_type = workspace_type;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// First workspace with `workspace_type == Home`, if any.
+    pub fn find_home_workspace_id(&self) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_type == WorkspaceType::Home)
+            .map(|w| w.workspace_id.0.clone())
+    }
+
     /// Update detected ports. Returns true if the port list actually changed.
     pub fn update_detected_ports(&self, ports: Vec<PortInfoSnapshot>) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
@@ -1059,6 +1288,7 @@ impl AppStateStore {
 
             let removed = snapshot.workspaces.remove(workspace_index);
             let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
+            let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
             snapshot
                 .notifications
                 .retain(|notification| notification.workspace_id != removed.workspace_id);
@@ -1077,6 +1307,7 @@ impl AppStateStore {
                     .into_iter()
                     .map(SessionId)
                     .collect(),
+                removed_agent_chat_threads,
             });
         }
 
@@ -1088,6 +1319,7 @@ impl AppStateStore {
 
         let removed = snapshot.workspaces.remove(workspace_index);
         let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
+        let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != removed.workspace_id);
@@ -1112,6 +1344,7 @@ impl AppStateStore {
                 .into_iter()
                 .map(SessionId)
                 .collect(),
+            removed_agent_chat_threads,
         })
     }
 
@@ -1460,6 +1693,25 @@ impl AppStateStore {
     pub fn workspace_id_for_session(&self, session_id: &str) -> Option<WorkspaceId> {
         let snapshot = self.inner.lock().unwrap();
         find_workspace_id_for_session(&snapshot.workspaces, session_id)
+    }
+
+    /// Look up the `(provider, thread_id)` pair for an `AgentChat` pane.
+    /// Returns `None` when the pane id is unknown, the pane is not an
+    /// agent-chat leaf, or no session has been bound yet. Callers use this
+    /// to capture the session-cleanup target before mutating the tree.
+    pub fn agent_chat_pane_thread(
+        &self,
+        pane_id: &str,
+    ) -> Option<(crate::agent_provider::ProviderKind, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        for workspace in &snapshot.workspaces {
+            for surface in &workspace.surfaces {
+                if let Some(pair) = agent_chat_thread_pair_for_pane(&surface.root, pane_id) {
+                    return Some(pair);
+                }
+            }
+        }
+        None
     }
 
     pub fn close_pane(&self, pane_id: &str) -> Result<Option<SessionId>, String> {
@@ -2169,6 +2421,8 @@ impl AppStateStore {
         // Collect resources to clean up
         let mut removed_sessions: Vec<SessionId> = vec![];
         let mut removed_browser_ids: Vec<BrowserId> = vec![];
+        let mut removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)> =
+            vec![];
 
         // Tab-level browser ID (for dedicated browser tabs)
         if let Some(ref bid) = tab.browser_id {
@@ -2186,6 +2440,10 @@ impl AppStateStore {
                 let surface = workspace.surfaces.remove(surface_index);
                 collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
                 collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
+                collect_agent_chat_threads_from_tree(
+                    &surface.root,
+                    &mut removed_agent_chat_threads,
+                );
             }
         }
 
@@ -2221,6 +2479,7 @@ impl AppStateStore {
         Ok(CloseTabResult {
             removed_sessions,
             removed_browser_ids,
+            removed_agent_chat_threads,
         })
     }
 
@@ -2361,6 +2620,7 @@ impl AppStateStore {
 pub struct CloseTabResult {
     pub removed_sessions: Vec<SessionId>,
     pub removed_browser_ids: Vec<BrowserId>,
+    pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
 }
 
 /// Return value of `AppStateStore::close_workspace`. Carries both the fallback
@@ -2374,12 +2634,13 @@ pub struct CloseTabResult {
 pub struct CloseWorkspaceResult {
     pub fallback: WorkspaceId,
     pub removed_sessions: Vec<SessionId>,
+    pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
     match node {
         PaneNodeSnapshot::Terminal { session_id, .. } => out.push(session_id.clone()),
-        PaneNodeSnapshot::Browser { .. } => {}
+        PaneNodeSnapshot::Browser { .. } | PaneNodeSnapshot::AgentChat { .. } => {}
         PaneNodeSnapshot::Split { children, .. } => {
             for child in children {
                 collect_session_ids_from_tree(child, out);
@@ -2388,10 +2649,31 @@ fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionI
     }
 }
 
+fn collect_agent_chat_threads_from_tree(
+    node: &PaneNodeSnapshot,
+    out: &mut Vec<(crate::agent_provider::ProviderKind, String)>,
+) {
+    match node {
+        PaneNodeSnapshot::AgentChat {
+            thread_id: Some(thread),
+            provider: Some(kind),
+            ..
+        } => out.push((*kind, thread.clone())),
+        PaneNodeSnapshot::AgentChat { .. }
+        | PaneNodeSnapshot::Terminal { .. }
+        | PaneNodeSnapshot::Browser { .. } => {}
+        PaneNodeSnapshot::Split { children, .. } => {
+            for child in children {
+                collect_agent_chat_threads_from_tree(child, out);
+            }
+        }
+    }
+}
+
 fn collect_browser_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<BrowserId>) {
     match node {
         PaneNodeSnapshot::Browser { browser_id, .. } => out.push(browser_id.clone()),
-        PaneNodeSnapshot::Terminal { .. } => {}
+        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::AgentChat { .. } => {}
         PaneNodeSnapshot::Split { children, .. } => {
             for child in children {
                 collect_browser_ids_from_tree(child, out);
@@ -2470,7 +2752,9 @@ pub fn strip_browser_panes_from_snapshot(mut snapshot: AppStateSnapshot) -> AppS
 fn remove_browser_nodes(node: &PaneNodeSnapshot) -> Option<PaneNodeSnapshot> {
     match node {
         PaneNodeSnapshot::Browser { .. } => None,
-        PaneNodeSnapshot::Terminal { .. } => Some(node.clone()),
+        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::AgentChat { .. } => {
+            Some(node.clone())
+        }
         PaneNodeSnapshot::Split {
             pane_id,
             direction,
@@ -2495,10 +2779,75 @@ fn remove_browser_nodes(node: &PaneNodeSnapshot) -> Option<PaneNodeSnapshot> {
     }
 }
 
+/// Locate an `AgentChat` leaf by pane id and return its bound thread
+/// id (inner `Option<String>` is the field itself; the outer `Option`
+/// distinguishes "not found" from "found but unbound").
+fn agent_chat_thread_for_pane(
+    root: &PaneNodeSnapshot,
+    target_pane_id: &str,
+) -> Option<Option<String>> {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id,
+            ..
+        } if pane_id.0 == target_pane_id => Some(thread_id.clone()),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| agent_chat_thread_for_pane(child, target_pane_id)),
+        _ => None,
+    }
+}
+
+/// Locate an `AgentChat` leaf with an active session and return its
+/// `(provider, thread_id)` pair. `None` when the pane id does not match,
+/// is not an agent-chat leaf, or has not yet been bound to a thread —
+/// callers (workspace/tab/pane close) treat that as nothing to tear down.
+fn agent_chat_thread_pair_for_pane(
+    root: &PaneNodeSnapshot,
+    target_pane_id: &str,
+) -> Option<(crate::agent_provider::ProviderKind, String)> {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id: Some(thread),
+            provider: Some(kind),
+            ..
+        } if pane_id.0 == target_pane_id => Some((*kind, thread.clone())),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| agent_chat_thread_pair_for_pane(child, target_pane_id)),
+        _ => None,
+    }
+}
+
+/// Assign (or clear) the `thread_id` on an `AgentChat` leaf.
+fn assign_agent_chat_thread(
+    root: &mut PaneNodeSnapshot,
+    target_pane_id: &str,
+    new_thread_id: &Option<String>,
+) -> bool {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id,
+            ..
+        } if pane_id.0 == target_pane_id => {
+            *thread_id = new_thread_id.clone();
+            true
+        }
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter_mut()
+            .any(|child| assign_agent_chat_thread(child, target_pane_id, new_thread_id)),
+        _ => false,
+    }
+}
+
 fn pane_exists_in_node(node: &PaneNodeSnapshot, pane_id: &str) -> bool {
     match node {
         PaneNodeSnapshot::Terminal { pane_id: pid, .. }
-        | PaneNodeSnapshot::Browser { pane_id: pid, .. } => pid.0 == pane_id,
+        | PaneNodeSnapshot::Browser { pane_id: pid, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id: pid, .. } => pid.0 == pane_id,
         PaneNodeSnapshot::Split { children, .. } => {
             children.iter().any(|c| pane_exists_in_node(c, pane_id))
         }
@@ -2674,6 +3023,7 @@ fn default_app_state() -> AppStateSnapshot {
             linux_first: true,
             notification_sound_enabled: true,
             ai_commit_message_enabled: true,
+            ai_commit_message_cli: None,
             ai_commit_message_model: None,
             ai_resolver_enabled: false,
             ai_resolver_cli: None,
@@ -2717,7 +3067,7 @@ fn pane_tree_contains_session(root: &PaneNodeSnapshot, target_session_id: &str) 
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .any(|child| pane_tree_contains_session(child, target_session_id)),
-        PaneNodeSnapshot::Browser { .. } => false,
+        PaneNodeSnapshot::Browser { .. } | PaneNodeSnapshot::AgentChat { .. } => false,
     }
 }
 
@@ -2727,7 +3077,9 @@ fn remove_terminal_from_tree(
 ) -> Option<PaneNodeSnapshot> {
     match root {
         PaneNodeSnapshot::Terminal { session_id, .. } if session_id.0 == target_session_id => None,
-        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => Some(root.clone()),
+        PaneNodeSnapshot::Terminal { .. }
+        | PaneNodeSnapshot::Browser { .. }
+        | PaneNodeSnapshot::AgentChat { .. } => Some(root.clone()),
         PaneNodeSnapshot::Split {
             pane_id,
             direction,
@@ -2762,7 +3114,9 @@ fn remove_terminals_from_tree(
         PaneNodeSnapshot::Terminal { session_id, .. } if session_ids.contains(session_id.0.as_str()) => {
             None
         }
-        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => Some(root.clone()),
+        PaneNodeSnapshot::Terminal { .. }
+        | PaneNodeSnapshot::Browser { .. }
+        | PaneNodeSnapshot::AgentChat { .. } => Some(root.clone()),
         PaneNodeSnapshot::Split {
             pane_id,
             direction,
@@ -2796,15 +3150,15 @@ fn first_terminal_pane(root: &PaneNodeSnapshot) -> Option<(PaneId, SessionId)> {
             ..
         } => Some((pane_id.clone(), session_id.clone())),
         PaneNodeSnapshot::Split { children, .. } => children.iter().find_map(first_terminal_pane),
-        PaneNodeSnapshot::Browser { .. } => None,
+        PaneNodeSnapshot::Browser { .. } | PaneNodeSnapshot::AgentChat { .. } => None,
     }
 }
 
 fn collect_pane_ids_from_node(node: &PaneNodeSnapshot) -> Vec<String> {
     match node {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            vec![pane_id.0.clone()]
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => vec![pane_id.0.clone()],
         PaneNodeSnapshot::Split { children, .. } => {
             children.iter().flat_map(collect_pane_ids_from_node).collect()
         }
@@ -2832,6 +3186,23 @@ pub fn collect_terminal_sessions(surfaces: &[SurfaceSnapshot]) -> Vec<String> {
         .collect()
 }
 
+/// Walk every surface in a workspace and pull out `(provider, thread_id)`
+/// pairs for `AgentChat` panes that have an active session bound. Used by
+/// the workspace/tab close paths to feed `provider.stop_session` so the
+/// JSON-RPC sidecar process and its background tokio tasks tear down
+/// instead of leaking — the tasks keep `Arc<Session>` alive in a refcycle
+/// with the session's `JoinHandle` vec, so `Drop` never fires unless
+/// `stop_session` aborts them via the shutdown channel.
+pub fn collect_agent_chat_threads(
+    surfaces: &[SurfaceSnapshot],
+) -> Vec<(crate::agent_provider::ProviderKind, String)> {
+    let mut out = Vec::new();
+    for surface in surfaces {
+        collect_agent_chat_threads_from_tree(&surface.root, &mut out);
+    }
+    out
+}
+
 fn collect_terminal_sessions_from_node(root: &PaneNodeSnapshot) -> Vec<String> {
     match root {
         PaneNodeSnapshot::Terminal { session_id, .. } => vec![session_id.0.clone()],
@@ -2839,7 +3210,7 @@ fn collect_terminal_sessions_from_node(root: &PaneNodeSnapshot) -> Vec<String> {
             .iter()
             .flat_map(collect_terminal_sessions_from_node)
             .collect(),
-        PaneNodeSnapshot::Browser { .. } => vec![],
+        PaneNodeSnapshot::Browser { .. } | PaneNodeSnapshot::AgentChat { .. } => vec![],
     }
 }
 
@@ -2875,7 +3246,7 @@ fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
 
 fn persisted_layout_path() -> Option<PathBuf> {
     let base = dirs::config_dir()?;
-    Some(base.join("codemux").join("layout.json"))
+    Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
 }
 
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
@@ -2966,6 +3337,7 @@ fn layout_shell_count(layout: &WorkspacePresetLayout) -> usize {
         WorkspacePresetLayout::Six => 6,
         WorkspacePresetLayout::Eight => 8,
         WorkspacePresetLayout::ShellBrowser => 1,
+        WorkspacePresetLayout::Empty => 0,
     }
 }
 
@@ -3056,6 +3428,16 @@ fn build_workspace_layout(
                 ),
             ],
         ),
+        WorkspacePresetLayout::Empty => {
+            // `create_workspace_with_layout` short-circuits the Empty
+            // variant before reaching this helper; if we ever land
+            // here it means the short-circuit has been bypassed.
+            unreachable!(
+                "build_workspace_layout should not be called with Empty — \
+                 create_workspace_with_layout short-circuits that variant \
+                 to `create_empty_workspace_at_path`"
+            )
+        }
     }
 }
 
@@ -3086,9 +3468,9 @@ fn split_node(direction: SplitDirection, children: Vec<PaneNodeSnapshot>) -> Pan
 
 fn rightmost_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            Some(pane_id.clone())
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => Some(pane_id.clone()),
         PaneNodeSnapshot::Split { children, .. } => {
             children.last().and_then(rightmost_leaf_pane_id)
         }
@@ -3184,9 +3566,9 @@ fn nudge_active_pane_size(
 
 fn pane_contains_leaf(root: &PaneNodeSnapshot, target_pane_id: &PaneId) -> bool {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            pane_id == target_pane_id
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => pane_id == target_pane_id,
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .any(|child| pane_contains_leaf(child, target_pane_id)),
@@ -3195,9 +3577,9 @@ fn pane_contains_leaf(root: &PaneNodeSnapshot, target_pane_id: &PaneId) -> bool 
 
 fn pane_tree_contains_pane(root: &PaneNodeSnapshot, target_pane_id: &str) -> bool {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            pane_id.0 == target_pane_id
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => pane_id.0 == target_pane_id,
         PaneNodeSnapshot::Split {
             pane_id, children, ..
         } => {
@@ -3211,9 +3593,9 @@ fn pane_tree_contains_pane(root: &PaneNodeSnapshot, target_pane_id: &str) -> boo
 
 fn collect_leaf_pane_ids(root: &PaneNodeSnapshot) -> Vec<PaneId> {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            vec![pane_id.clone()]
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => vec![pane_id.clone()],
         PaneNodeSnapshot::Split { children, .. } => {
             children.iter().flat_map(collect_leaf_pane_ids).collect()
         }
@@ -3222,16 +3604,18 @@ fn collect_leaf_pane_ids(root: &PaneNodeSnapshot) -> Vec<PaneId> {
 
 fn first_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            Some(pane_id.clone())
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => Some(pane_id.clone()),
         PaneNodeSnapshot::Split { children, .. } => children.iter().find_map(first_leaf_pane_id),
     }
 }
 
 fn clone_pane_node(root: &PaneNodeSnapshot, target_pane_id: &str) -> Option<PaneNodeSnapshot> {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. }
             if pane_id.0 == target_pane_id =>
         {
             Some(root.clone())
@@ -3259,6 +3643,19 @@ fn with_pane_id(node: PaneNodeSnapshot, pane_id: PaneId) -> PaneNodeSnapshot {
             browser_id,
             title,
         },
+        PaneNodeSnapshot::AgentChat {
+            title,
+            thread_id,
+            provider,
+            cwd,
+            ..
+        } => PaneNodeSnapshot::AgentChat {
+            pane_id,
+            title,
+            thread_id,
+            provider,
+            cwd,
+        },
         PaneNodeSnapshot::Split {
             direction,
             child_sizes,
@@ -3279,7 +3676,9 @@ fn replace_pane_node(
     replacement: PaneNodeSnapshot,
 ) -> bool {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. }
             if pane_id.0 == target_pane_id =>
         {
             *root = replacement;
@@ -3294,9 +3693,9 @@ fn replace_pane_node(
 
 fn pane_id_from_node(node: &PaneNodeSnapshot) -> PaneId {
     match node {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. } => {
-            pane_id.clone()
-        }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. } => pane_id.clone(),
         PaneNodeSnapshot::Split { pane_id, .. } => pane_id.clone(),
     }
 }
@@ -3339,7 +3738,9 @@ fn insert_split_at_pane_with_behavior(
     behavior: WorkspaceInsertBehavior,
 ) -> bool {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. }
             if pane_id.0 == target_pane_id =>
         {
             let previous = root.clone();
@@ -3365,7 +3766,9 @@ fn insert_split_at_pane_with_behavior(
                     .find(|(_, child)| pane_tree_contains_pane(child, target_pane_id))
                 {
                     match target_child {
-                        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => {
+                        PaneNodeSnapshot::Terminal { .. }
+                        | PaneNodeSnapshot::Browser { .. }
+                        | PaneNodeSnapshot::AgentChat { .. } => {
                             let existing_child = target_child.clone();
                             let nested_split_id = PaneId(next_id("pane"));
                             *target_child = PaneNodeSnapshot::Split {
@@ -3430,12 +3833,16 @@ fn remove_pane_from_tree(
     target_pane_id: &str,
 ) -> Option<PaneNodeSnapshot> {
     match root {
-        PaneNodeSnapshot::Terminal { pane_id, .. } | PaneNodeSnapshot::Browser { pane_id, .. }
+        PaneNodeSnapshot::Terminal { pane_id, .. }
+        | PaneNodeSnapshot::Browser { pane_id, .. }
+        | PaneNodeSnapshot::AgentChat { pane_id, .. }
             if pane_id.0 == target_pane_id =>
         {
             None
         }
-        PaneNodeSnapshot::Terminal { .. } | PaneNodeSnapshot::Browser { .. } => Some(root.clone()),
+        PaneNodeSnapshot::Terminal { .. }
+        | PaneNodeSnapshot::Browser { .. }
+        | PaneNodeSnapshot::AgentChat { .. } => Some(root.clone()),
         PaneNodeSnapshot::Split {
             pane_id,
             direction,
@@ -3505,6 +3912,9 @@ fn collect_numeric_ids_from_node(root: &PaneNodeSnapshot) -> Vec<Option<u64>> {
             extract_numeric_suffix(&pane_id.0),
             extract_numeric_suffix(&browser_id.0),
         ],
+        PaneNodeSnapshot::AgentChat { pane_id, .. } => {
+            vec![extract_numeric_suffix(&pane_id.0)]
+        }
         PaneNodeSnapshot::Split {
             pane_id, children, ..
         } => {
@@ -3546,6 +3956,9 @@ mod tests {
             }
             PaneNodeSnapshot::Browser { browser_id, .. } => {
                 vec![format!("browser:{}", browser_id.0)]
+            }
+            PaneNodeSnapshot::AgentChat { pane_id, .. } => {
+                vec![format!("agent_chat:{}", pane_id.0)]
             }
             PaneNodeSnapshot::Split { children, .. } => {
                 children.iter().flat_map(collect_leaf_payload_ids).collect()
@@ -3720,6 +4133,52 @@ mod tests {
             }
             _ => panic!("expected shell+browser preset to be a horizontal split"),
         }
+    }
+
+    #[test]
+    fn workspace_preset_empty_produces_no_surfaces_terminals_or_tabs() {
+        // Empty layout is what the inline "+ New worktree…" chat
+        // flow uses: the backend creates the git worktree + workspace
+        // record, but leaves no surfaces / terminal sessions / tabs
+        // behind — the frontend attaches a chat pane afterward via
+        // `agent_chat_create_pane`. Regressing this to any other
+        // layout reintroduces the split-with-leftover-terminal bug.
+        let store = AppStateStore::default();
+        let terminals_before = store.snapshot().terminal_sessions.len();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-empty"),
+            WorkspacePresetLayout::Empty,
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .expect("workspace must be registered");
+
+        assert!(
+            workspace.surfaces.is_empty(),
+            "Empty layout must produce zero surfaces (got {})",
+            workspace.surfaces.len(),
+        );
+        assert!(
+            workspace.tabs.is_empty(),
+            "Empty layout must produce zero tabs (got {})",
+            workspace.tabs.len(),
+        );
+        assert_eq!(
+            workspace.active_tab_id, "",
+            "Empty layout must leave active_tab_id blank, not a dangling Terminal tab",
+        );
+        assert_eq!(
+            snapshot.terminal_sessions.len(),
+            terminals_before,
+            "Empty layout must NOT allocate any terminal sessions",
+        );
+        assert_eq!(
+            snapshot.active_workspace_id, workspace_id,
+            "Empty layout still activates the new workspace (parity with other variants)",
+        );
     }
 
     #[test]
@@ -4364,5 +4823,311 @@ mod tests {
             new_session.unwrap().0,
             "new tab session must differ from the reused default"
         );
+    }
+
+    /// `PaneNodeSnapshot::AgentChat` must round-trip through serde
+    /// cleanly so persisted layouts restore chat panes after a
+    /// restart.
+    #[test]
+    fn agent_chat_pane_serde_round_trips() {
+        use crate::agent_provider::ProviderKind;
+
+        let node = PaneNodeSnapshot::AgentChat {
+            pane_id: PaneId("pane-42".into()),
+            title: "Agent Chat".into(),
+            thread_id: Some("thread-abc".into()),
+            provider: Some(ProviderKind::Claude),
+            cwd: Some("/tmp/project".into()),
+        };
+        let json = serde_json::to_string(&node).expect("serialize agent_chat pane");
+        let round: PaneNodeSnapshot =
+            serde_json::from_str(&json).expect("deserialize agent_chat pane");
+        match round {
+            PaneNodeSnapshot::AgentChat {
+                pane_id,
+                title,
+                thread_id,
+                provider,
+                cwd,
+            } => {
+                assert_eq!(pane_id.0, "pane-42");
+                assert_eq!(title, "Agent Chat");
+                assert_eq!(thread_id, Some("thread-abc".to_string()));
+                assert_eq!(provider, Some(ProviderKind::Claude));
+                assert_eq!(cwd, Some("/tmp/project".to_string()));
+            }
+            other => panic!("expected AgentChat variant, got {other:?}"),
+        }
+    }
+
+    /// Step 12 Stage 4 — chat panes must round-trip through serde for
+    /// all three provider variants, not just Claude. The picker UI now
+    /// emits `Some(Codex)` and `Some(OpenCode)` from the rail click
+    /// handler, so persisting and rehydrating those values must keep
+    /// the variant intact.
+    #[test]
+    fn agent_chat_pane_serde_round_trips_for_every_provider_variant() {
+        use crate::agent_provider::ProviderKind;
+        for kind in [
+            ProviderKind::Claude,
+            ProviderKind::Codex,
+            ProviderKind::OpenCode,
+        ] {
+            let node = PaneNodeSnapshot::AgentChat {
+                pane_id: PaneId("pane-1".into()),
+                title: "Agent Chat".into(),
+                thread_id: None,
+                provider: Some(kind),
+                cwd: None,
+            };
+            let json = serde_json::to_string(&node).expect("serialize");
+            let round: PaneNodeSnapshot =
+                serde_json::from_str(&json).expect("deserialize");
+            match round {
+                PaneNodeSnapshot::AgentChat { provider, .. } => {
+                    assert_eq!(
+                        provider,
+                        Some(kind),
+                        "provider variant {kind:?} must survive serde round-trip"
+                    );
+                }
+                other => panic!("expected AgentChat variant, got {other:?}"),
+            }
+        }
+    }
+
+    /// Unset optional fields must survive the round-trip without being
+    /// re-populated. `thread_id`, `provider`, and `cwd` are all
+    /// `#[serde(default)]` so `None` serializes to `null`.
+    #[test]
+    fn agent_chat_pane_defaults_round_trip() {
+        let node = PaneNodeSnapshot::AgentChat {
+            pane_id: PaneId("pane-99".into()),
+            title: "Agent Chat".into(),
+            thread_id: None,
+            provider: None,
+            cwd: None,
+        };
+        let json = serde_json::to_string(&node).unwrap();
+        let round: PaneNodeSnapshot = serde_json::from_str(&json).unwrap();
+        match round {
+            PaneNodeSnapshot::AgentChat {
+                thread_id,
+                provider,
+                cwd,
+                ..
+            } => {
+                assert!(thread_id.is_none());
+                assert!(provider.is_none());
+                assert!(cwd.is_none());
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    /// Legacy `AgentChat` payloads without the optional fields (e.g.
+    /// produced by an older binary) should deserialize, with the
+    /// missing fields defaulting to `None`.
+    #[test]
+    fn agent_chat_pane_deserializes_without_optional_fields() {
+        let json = r#"{"kind":"agent_chat","pane_id":"pane-7","title":"Agent Chat"}"#;
+        let round: PaneNodeSnapshot = serde_json::from_str(json).unwrap();
+        match round {
+            PaneNodeSnapshot::AgentChat {
+                pane_id,
+                title,
+                thread_id,
+                provider,
+                cwd,
+            } => {
+                assert_eq!(pane_id.0, "pane-7");
+                assert_eq!(title, "Agent Chat");
+                assert!(thread_id.is_none());
+                assert!(provider.is_none());
+                assert!(cwd.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_agent_chat_pane_inserts_into_active_surface() {
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        let workspace_id = snapshot.active_workspace_id.clone();
+
+        let pane_id = store
+            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .expect("create_agent_chat_pane should succeed");
+
+        let after = store.snapshot();
+        let workspace = workspace_by_id(&after, &workspace_id);
+        let surface = &workspace.surfaces[0];
+        assert_eq!(surface.active_pane_id, pane_id);
+        assert!(pane_tree_contains_pane(&surface.root, &pane_id.0));
+    }
+
+    #[test]
+    fn create_agent_chat_pane_on_missing_workspace_errors() {
+        let store = AppStateStore::default();
+        let err = store
+            .create_agent_chat_pane("does-not-exist", None, None, None)
+            .unwrap_err();
+        assert!(err.contains("does-not-exist"));
+    }
+
+    #[test]
+    fn set_agent_chat_thread_id_binds_chat_pane() {
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        let workspace_id = snapshot.active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .unwrap();
+
+        assert!(store.agent_chat_thread_id(&pane_id.0).is_none());
+        let ok = store.set_agent_chat_thread_id(&pane_id.0, Some("thread-xyz".into()));
+        assert!(ok);
+        assert_eq!(
+            store.agent_chat_thread_id(&pane_id.0),
+            Some("thread-xyz".into())
+        );
+    }
+
+    /// Regression guard for the agent-chat sidecar leak fix.
+    ///
+    /// Closing a workspace must surface every bound `(provider, thread_id)`
+    /// pair so the command layer can call `provider.stop_session` for
+    /// each. Without this list the JSON-RPC sidecar children stayed
+    /// alive and their background tokio tasks held `Arc<Session>` in a
+    /// refcycle with the session's own `JoinHandle` vec, so `Drop`
+    /// never fired and every closed worktree leaked one sidecar plus
+    /// its task graph until the whole app was killed.
+    #[test]
+    fn close_workspace_result_contains_agent_chat_threads() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-agent-chat-close"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Bind two chat panes: one with a live session, one still unbound.
+        // Only the live one should be returned for cleanup.
+        let pane_a = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_a.0, Some("thread-live".into()));
+
+        let _pane_unbound = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Codex), None, None)
+            .unwrap();
+
+        let result = store
+            .close_workspace(&ws_id.0)
+            .expect("close_workspace should succeed");
+
+        assert_eq!(
+            result.removed_agent_chat_threads,
+            vec![(ProviderKind::Claude, "thread-live".to_string())],
+            "close_workspace must surface only chat panes with bound threads",
+        );
+    }
+
+    /// Regression guard mirroring the workspace-close cleanup for `close_pane`.
+    /// Closing a single agent-chat pane must let the command layer reach
+    /// the bound session before the pane disappears from the tree.
+    #[test]
+    fn agent_chat_pane_thread_returns_bound_pair() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .unwrap();
+
+        // Unbound pane returns None — nothing to tear down.
+        assert_eq!(store.agent_chat_pane_thread(&pane_id.0), None);
+
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-zzz".into()));
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Claude, "thread-zzz".to_string()))
+        );
+
+        // Unknown pane id is a clean None, not a panic.
+        assert_eq!(store.agent_chat_pane_thread("does-not-exist"), None);
+    }
+
+    #[test]
+    fn workspace_type_serde_roundtrip_all_variants() {
+        for variant in [
+            WorkspaceType::Standard,
+            WorkspaceType::OpenFlow,
+            WorkspaceType::Home,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let back: WorkspaceType = serde_json::from_str(&json).unwrap();
+            assert_eq!(variant, back, "roundtrip failed for {variant:?} ({json})");
+        }
+        assert_eq!(
+            serde_json::to_string(&WorkspaceType::Home).unwrap(),
+            "\"home\""
+        );
+    }
+
+    #[test]
+    fn find_home_workspace_id_returns_none_when_absent() {
+        let store = AppStateStore::default();
+        assert!(store.find_home_workspace_id().is_none());
+    }
+
+    #[test]
+    fn set_workspace_type_tags_home_and_find_returns_it() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+        assert!(store.set_workspace_type(&ws_id.0, WorkspaceType::Home));
+        assert_eq!(store.find_home_workspace_id(), Some(ws_id.0.clone()));
+    }
+
+    #[test]
+    fn get_or_create_home_workspace_is_idempotent() {
+        // Models the command body's state-level logic: if a Home workspace
+        // exists, return it; otherwise create + tag.
+        let store = AppStateStore::default();
+
+        // First call: none exists → create and tag.
+        let first = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+
+        // Second call: the tagged workspace is returned unchanged.
+        let second = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+        assert_eq!(first, second, "repeat call must return the same Home id");
+
+        // Simulate a hard-delete of the Home workspace.
+        {
+            let mut snap = store.inner.lock().unwrap();
+            snap.workspaces.retain(|w| w.workspace_id.0 != first);
+        }
+        assert!(store.find_home_workspace_id().is_none());
+
+        // Post-delete: next call creates a fresh Home with a new id.
+        let third = store.find_home_workspace_id().unwrap_or_else(|| {
+            let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/home"));
+            store.set_workspace_type(&id.0, WorkspaceType::Home);
+            id.0
+        });
+        assert_ne!(third, first, "post-deletion call must create a fresh id");
+        assert_eq!(store.find_home_workspace_id(), Some(third));
     }
 }

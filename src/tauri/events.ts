@@ -90,3 +90,145 @@ export const onAuthStateChanged = (
   cb: EventCallback<AuthStatePayload>,
 ): Promise<UnlistenFn> =>
   listen<AuthStatePayload>("auth-state-changed", (e) => cb(e.payload));
+
+// Stage 2 sync state changes: emitted by the backend after signin,
+// signout, sync setup, and sync repair.
+export interface SyncStateChangedPayload {
+  syncAvailable: boolean;
+  authMethod: "email" | "github" | null;
+}
+
+export const onSyncStateChanged = (
+  cb: EventCallback<SyncStateChangedPayload>,
+): Promise<UnlistenFn> =>
+  listen<SyncStateChangedPayload>("sync-state-changed", (e) => cb(e.payload));
+
+// ── Agent chat events ──
+//
+// Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload
+// and src-tauri/src/agent_provider/events.rs:ProviderRuntimeEvent.
+// The Rust side emits a single channel name; subscribers filter by
+// thread_id via the useAgentChatEvents hook.
+
+export type ApprovalDecision =
+  | {
+      decision: "allow";
+      updated_input?: unknown;
+      /** Opaque SDK-shaped `PermissionUpdate[]` — populated when the
+       *  user picks an "always allow" scope. Stage 1 never sends it,
+       *  but the field is on the wire now so Stage 5 can fill it in
+       *  without another backend change. */
+      updated_permissions?: unknown[];
+    }
+  | { decision: "allow_for_session" }
+  | { decision: "deny"; message: string }
+  | { decision: "cancel" };
+
+export type SessionStatus =
+  | { status: "starting" }
+  | { status: "ready" }
+  | { status: "running"; active_turn: string }
+  | { status: "waiting_approval"; request_id: string }
+  | { status: "error"; message: string }
+  | { status: "closed" };
+
+export type ContentDelta =
+  | { kind: "text"; text: string }
+  | { kind: "thinking"; text: string }
+  | { kind: "tool_input"; tool_name: string; partial_json: string };
+
+export type CompletedItem =
+  | { kind: "assistant_text"; text: string }
+  | { kind: "assistant_thinking"; text: string }
+  | { kind: "tool_use"; tool_name: string; input: unknown; tool_use_id: string }
+  | {
+      kind: "tool_result";
+      tool_use_id: string;
+      content: unknown;
+      is_error: boolean;
+    };
+
+export type TurnStatus =
+  | { kind: "success" }
+  | { kind: "error"; subtype: string; message: string }
+  | { kind: "max_turns" }
+  | { kind: "max_budget" };
+
+export interface TurnUsage {
+  total_cost_usd: number | null;
+  duration_ms: number;
+  num_turns: number;
+}
+
+export type ProviderRuntimeEvent =
+  | {
+      type: "session_configured";
+      thread_id: string;
+      provider_session_id: string;
+    }
+  | {
+      type: "content_delta";
+      thread_id: string;
+      turn_id: string;
+      delta: ContentDelta;
+    }
+  | {
+      type: "item_completed";
+      thread_id: string;
+      turn_id: string;
+      item: CompletedItem;
+    }
+  | {
+      type: "turn_completed";
+      thread_id: string;
+      turn_id: string;
+      status: TurnStatus;
+      usage: TurnUsage | null;
+    }
+  | {
+      type: "request_opened";
+      thread_id: string;
+      turn_id: string;
+      request_id: string;
+      request_kind: string;
+      payload: unknown;
+      /** Provider tool_use_id when this request maps to an in-flight
+       *  tool invocation. Lets the reducer merge the approval into
+       *  its originating tool_call row. `null` for standalone
+       *  requests (plan, Codex server-initiated, or when the provider
+       *  didn't supply one). */
+      tool_use_id: string | null;
+    }
+  | {
+      type: "request_resolved";
+      thread_id: string;
+      request_id: string;
+      decision: ApprovalDecision;
+    }
+  | {
+      type: "session_state_changed";
+      thread_id: string;
+      status: SessionStatus;
+    }
+  | {
+      type: "runtime_warning";
+      thread_id: string | null;
+      message: string;
+      original_payload: unknown | null;
+    }
+  | {
+      type: "resume_cursor_updated";
+      thread_id: string;
+      resume_cursor: unknown;
+    };
+
+/** Canonical provider event payload as emitted to the frontend. */
+export interface AgentChatEventPayload {
+  thread_id: string;
+  event: ProviderRuntimeEvent;
+}
+
+export const onAgentChatEvent = (
+  cb: EventCallback<AgentChatEventPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));

@@ -14,6 +14,7 @@ Codemux is a Linux-first AI coding workspace that keeps terminal work, browser t
 
 - a daily-driver workspace for terminal-based coding agents
 - a multi-workspace, multi-pane terminal and browser environment
+- a conversational chat surface for CLI coding agents alongside the terminal and browser
 - a local control plane via CLI and socket APIs
 - the flagship host for `OpenFlow`, a multi-agent orchestration system
 
@@ -21,7 +22,7 @@ Codemux is a Linux-first AI coding workspace that keeps terminal work, browser t
 
 - Linux-first, not Linux-only
 - backend state is the source of truth
-- terminal and browser belong in the same workspace
+- terminal, browser, and chat belong in the same workspace
 - automation is a first-class feature
 - memory and indexing stay local-first
 - keep `OpenFlow` modular enough to embed elsewhere later
@@ -41,6 +42,7 @@ The first real Codemux MVP should support:
 - multiple workspaces and pane splits
 - stable terminal sessions
 - one usable browser pane
+- a conversational agent chat pane backed by CLI coding agents
 - notifications and attention signals
 - CLI and socket automation
 - enough reliability to daily-drive with coding agents

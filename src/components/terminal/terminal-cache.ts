@@ -109,6 +109,19 @@ export interface CachedTerminal {
    *  Stays per-session because the agent-side stack is per-PTY. */
   kittyStack: number[];
   kittyLevel: number;
+  /** Pending PTY-output chunks queued from the channel callback. Drained
+   *  by `pumpWrites` which yields to the macrotask queue between writes
+   *  so a multi-MB pending_output replay on workspace reattach can't
+   *  monopolise the main thread. Without throttling, Rust replays the
+   *  entire backlog (capped at 256 MiB by `OUTPUT_BUFFER_BYTE_LIMIT`)
+   *  through thousands of back-to-back channel sends; the renderer then
+   *  parses thousands of IPC payloads + xterm escape sequences in one
+   *  go and freezes hard with input dead until parsing finishes. */
+  writeQueue: Uint8Array[];
+  /** True while `pumpWrites` is iterating. Re-entrant pump kicks become
+   *  no-ops; the running pump picks up newly queued chunks on its next
+   *  iteration. */
+  writePumpRunning: boolean;
   /** Disposers for resources the cache owns (input handler, serialize
    *  registration, query-suppression handlers). Called from disposeTerminal. */
   cleanups: Array<() => void>;
@@ -274,6 +287,8 @@ function createCachedTerminal(
     outputAttachEpoch: 0,
     kittyStack: [],
     kittyLevel: 0,
+    writeQueue: [],
+    writePumpRunning: false,
     cleanups: [],
   };
 
@@ -313,6 +328,40 @@ function createCachedTerminal(
 }
 
 /**
+ * Drain `entry.writeQueue` into `entry.terminal.write`, yielding to the
+ * macrotask queue between chunks so the main thread can interleave input
+ * handling, paint, and xterm's internal parser tick.
+ *
+ * Why this exists: on workspace reattach, Rust replays the session's
+ * `pending_output` ring (capped at `OUTPUT_BUFFER_BYTE_LIMIT` = 256 MiB) by
+ * firing a channel send for each ~32 KiB chunk in the deque. Without
+ * throttling, the channel callback ran `terminal.write` synchronously for
+ * thousands of chunks in succession; the renderer pegged on Tauri IPC
+ * dispatch + xterm parser work for several seconds, input died, and the
+ * webview hit ~1 GB RSS before recovering. setTimeout(0) is the cheapest
+ * yield that crosses a macrotask boundary, which is what the browser uses
+ * to schedule input/paint between long-running JS tasks.
+ *
+ * Re-entry: the pump is single-flight per entry (`writePumpRunning`).
+ * Any callback that queues bytes during an active drain just appends to
+ * `writeQueue`; the running pump picks them up on its next iteration.
+ */
+async function pumpWrites(entry: CachedTerminal): Promise<void> {
+  if (entry.writePumpRunning) return;
+  entry.writePumpRunning = true;
+  try {
+    while (entry.writeQueue.length > 0 && !entry.disposed) {
+      const next = entry.writeQueue.shift();
+      if (!next) continue;
+      entry.terminal.write(next);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+  } finally {
+    entry.writePumpRunning = false;
+  }
+}
+
+/**
  * Wire up the PTY → xterm channel while the terminal is visible. Hidden panes
  * detach the backend channel to preserve v0.1.29 input latency; reattach uses
  * Rust's pending_output replay and writes into the same xterm instance.
@@ -328,12 +377,14 @@ async function attachPtyChannel(entry: CachedTerminal): Promise<void> {
     if (!bytes) return;
     // Kitty stack has to advance at receive time regardless of park state —
     // the input handler reads kittyLevel synchronously on every keystroke and
-    // a stale stack would send the wrong CSI-u sequences.
+    // a stale stack would send the wrong CSI-u sequences. Runs before
+    // queueing so query responses are dispatched in IPC-arrival order, not
+    // delayed behind the throttled xterm-write pump.
     scanKittyProtocol(entry, bytes);
-    // Write straight into xterm regardless of mount state. xterm.js's parser
-    // consumes bytes into its internal buffer and doesn't paint when the
-    // wrapper is detached.
-    entry.terminal.write(bytes);
+    // Queue + pump rather than calling terminal.write synchronously. See
+    // pumpWrites for the rationale (reattach-replay freeze fix).
+    entry.writeQueue.push(bytes);
+    void pumpWrites(entry);
   });
 
   const promise = attachPtyOutput(entry.sessionId, channel)
@@ -515,6 +566,9 @@ export function disposeTerminal(sessionId: string): void {
   entry.disposed = true;
   cache.delete(sessionId);
   detachPtyChannel(entry);
+  // Drop any chunks still queued for the throttled write pump — the
+  // pump's loop guard re-checks `disposed` between iterations and exits.
+  entry.writeQueue.length = 0;
 
   for (const cleanup of entry.cleanups) {
     try {

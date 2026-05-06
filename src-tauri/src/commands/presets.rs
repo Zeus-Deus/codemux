@@ -5,8 +5,8 @@ use tauri::State;
 
 use crate::database::DatabaseStore;
 use crate::presets::{
-    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetStoreSnapshot,
-    PresetStoreState, TerminalPreset,
+    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetKind,
+    PresetStoreSnapshot, PresetStoreState, TerminalPreset,
 };
 use crate::state::AppStateStore;
 use crate::terminal;
@@ -43,6 +43,9 @@ pub fn create_preset(
         is_builtin: false,
         auto_run_on_workspace: false,
         auto_run_on_new_tab: false,
+        // User-created presets default to CLI. If we later add UI
+        // for creating ChatAgent presets, plumb a `kind` arg through.
+        kind: PresetKind::Cli,
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -168,6 +171,51 @@ pub fn set_preset_pinned(
     Ok(())
 }
 
+/// Reorder a preset to a new position in the global preset list.
+///
+/// `target_index` is in the global Vec, not the pinned-only view. The
+/// frontend translates pinned-bar drag indices to global indices before
+/// invoking this (see `getTargetIndexForPinnedReorder` in
+/// `preset-bar.tsx`); the settings list passes the global index
+/// directly. Either way the server's job is the same: splice the
+/// preset to its new position and persist.
+#[tauri::command]
+pub fn reorder_presets(
+    app: tauri::AppHandle,
+    db: State<'_, DatabaseStore>,
+    presets: State<'_, PresetStoreState>,
+    preset_id: String,
+    target_index: usize,
+) -> Result<(), String> {
+    let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+    let current_index = store
+        .presets
+        .iter()
+        .position(|p| p.id == preset_id)
+        .ok_or_else(|| format!("Preset not found: {preset_id}"))?;
+
+    if target_index >= store.presets.len() {
+        return Err(format!(
+            "target_index {target_index} out of bounds (len={})",
+            store.presets.len()
+        ));
+    }
+
+    if current_index == target_index {
+        return Ok(());
+    }
+
+    let preset = store.presets.remove(current_index);
+    store.presets.insert(target_index, preset);
+
+    save_presets(&db, &store)?;
+    drop(store);
+
+    emit_presets_changed(&app);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_preset_bar_visible(
     app: tauri::AppHandle,
@@ -204,6 +252,19 @@ pub fn apply_preset(
         .ok_or_else(|| format!("Preset not found: {preset_id}"))?
         .clone();
     drop(store);
+
+    // ChatAgent presets are dispatched by the frontend via
+    // `agentChatCreatePane` + `agentChatStartSession` + `agentChatSendTurn`
+    // (see `src/lib/agent-chat/materialize.ts::materializeWithPreset`).
+    // Routing one through the terminal path would fall into the empty-
+    // commands Shell branch below and spawn a blank shell, so short-
+    // circuit here with an explicit error.
+    if matches!(preset.kind, PresetKind::ChatAgent) {
+        return Err(format!(
+            "apply_preset cannot launch ChatAgent preset `{}`; dispatch via the agent-chat API instead.",
+            preset.id
+        ));
+    }
 
     // Check that all command binaries exist before creating any tabs/splits.
     for cmd in &preset.commands {

@@ -2,12 +2,20 @@
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/dm-sans";
 @import "@xterm/xterm/css/xterm.css";
+
+/* `@tailwindcss/typography` — drives the `prose` utility used by
+ * `ChatMarkdown` to render assistant messages and plan proposals.
+ * Tailwind v4 registers plugins via the `@plugin` at-rule instead
+ * of a JS config file. */
+@plugin "@tailwindcss/typography";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
     --font-heading: var(--font-mono);
+    --font-sans: 'DM Sans Variable', ui-sans-serif, system-ui, sans-serif;
     --font-mono: 'JetBrains Mono Variable', monospace;
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
@@ -165,9 +173,12 @@ body.pane-resizing iframe {
     }
   body {
     @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
     }
   html {
-    @apply font-mono;
+    @apply font-sans;
     }
 }
 
@@ -251,3 +262,13 @@ body.pane-resizing iframe {
   margin-right: 0.5em;
   accent-color: var(--sidebar-primary);
 }
+
+/* Transcript-tail "thinking" indicator (see ThinkingIndicator.tsx).
+ * Three dots with this same keyframe plus staggered animation-delay
+ * produce a neutral wave. Opacity-only — no color change, no
+ * transform — keeps the affordance quiet per the chat-ui skill. */
+@keyframes cm-thinking-wave {
+  0%, 80%, 100% { opacity: 0.2; }
+  40% { opacity: 0.9; }
+}
+

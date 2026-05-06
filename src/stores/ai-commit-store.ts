@@ -10,7 +10,12 @@ interface GenerationEntry {
 interface AiCommitStore {
   generations: Record<string, GenerationEntry>;
   getGeneration: (workspaceId: string) => GenerationEntry | undefined;
-  requestGeneration: (workspaceId: string, cwd: string, model: string | null) => void;
+  requestGeneration: (
+    workspaceId: string,
+    cwd: string,
+    cli: string | null,
+    model: string | null,
+  ) => void;
   consumeMessage: (workspaceId: string) => string | undefined;
   clearGeneration: (workspaceId: string) => void;
 }
@@ -20,7 +25,7 @@ export const useAiCommitStore = create<AiCommitStore>()((set, get) => ({
 
   getGeneration: (workspaceId) => get().generations[workspaceId],
 
-  requestGeneration: (workspaceId, cwd, model) => {
+  requestGeneration: (workspaceId, cwd, cli, model) => {
     set((s) => ({
       generations: {
         ...s.generations,
@@ -28,7 +33,7 @@ export const useAiCommitStore = create<AiCommitStore>()((set, get) => ({
       },
     }));
 
-    generateAiCommitMessage(cwd, model)
+    generateAiCommitMessage(cwd, cli, model)
       .then((message) => {
         set((s) => ({
           generations: {

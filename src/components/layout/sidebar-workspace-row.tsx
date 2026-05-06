@@ -39,6 +39,7 @@ import {
 } from "@/tauri/commands";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
@@ -331,10 +332,22 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   });
 
   const handleActivate = () => {
+    // Clear any active draft first so `WorkspaceMain`'s lazy branch
+    // (`lazyEnabled && activeDraftId`) doesn't keep the draft surface
+    // on screen after the backend's active_workspace_id flips. The
+    // draft itself stays in the store — clicking "+" again restores
+    // it with composer text intact via the single-slot rule.
+    useChatDraftStore.getState().setActiveDraft(null);
     activateWorkspace(workspace.workspace_id).catch(console.error);
   };
 
   const isPrimary = !workspace.worktree_path;
+  // Default branches (no worktree_path — the primary project checkout,
+  // usually main/master) can't be deleted. We still offer a Hide path
+  // via right-click → Close Worktree, but the inline X is redundant
+  // and the button's Hide-only dialog feels like a ghost click. Match
+  // Cursor 3: hide the X on these rows.
+  const canDelete = !isPrimary;
   const icon =
     workspace.workspace_type === "open_flow" ? (
       <Workflow className="h-4 w-4 shrink-0 text-muted-foreground" />
@@ -413,36 +426,39 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   </span>
                 )}
 
-                {/* Git diff stats + close button overlay */}
-                <div className="ml-auto grid shrink-0 [&>*]:col-start-1 [&>*]:row-start-1 items-center">
-                  {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
-                    <span className={cn(
-                      "flex items-center gap-1.5 text-[10px] font-mono tabular-nums rounded px-1.5 h-5",
-                      isActive ? "bg-foreground/10" : "bg-muted/50",
-                      "transition-opacity group-hover:opacity-0",
-                    )}>
-                      {workspace.git_additions > 0 && (
-                        <span className="text-success">+{workspace.git_additions}</span>
-                      )}
-                      {workspace.git_deletions > 0 && (
-                        <span className="text-danger">−{workspace.git_deletions}</span>
-                      )}
-                    </span>
-                  )}
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    className="opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground justify-end"
-                    onClick={(e) => { e.stopPropagation(); setShowRemoveDialog(true); }}
-                    aria-label="Remove workspace"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
+                {/* Git diff stats — in normal flow; fades on hover
+                    (only when the X is going to appear) so the
+                    absolute-positioned X doesn't overlap numbers. */}
+                {(workspace.git_additions > 0 || workspace.git_deletions > 0) && (
+                  <span className={cn(
+                    "ml-auto flex items-center gap-1.5 text-[10px] font-mono tabular-nums rounded px-1.5 h-5 shrink-0",
+                    isActive ? "bg-foreground/10" : "bg-muted/50",
+                    canDelete && "transition-opacity group-hover:opacity-0",
+                  )}>
+                    {workspace.git_additions > 0 && (
+                      <span className="text-success">+{workspace.git_additions}</span>
+                    )}
+                    {workspace.git_deletions > 0 && (
+                      <span className="text-danger">−{workspace.git_deletions}</span>
+                    )}
+                  </span>
+                )}
 
-                {/* Notification badge */}
+                {/* Notification badge — pinned to the far right in
+                    normal state. Fades on hover when the X will
+                    appear so they don't collide on the same slot. */}
                 {workspace.notification_count > 0 && (
-                  <Badge variant="outline" className="shrink-0 text-[10px] tabular-nums text-warning bg-warning/20 border-transparent px-1.5 py-0.5 leading-none">
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      "shrink-0 text-[10px] tabular-nums text-warning bg-warning/20 border-transparent px-1.5 py-0.5 leading-none",
+                      // `ml-auto` only when the git-diff pill isn't
+                      // holding that slot; otherwise inherit the
+                      // default flex spacing after the git-diff pill.
+                      !(workspace.git_additions > 0 || workspace.git_deletions > 0) && "ml-auto",
+                      canDelete && "transition-opacity group-hover:opacity-0",
+                    )}
+                  >
                     {workspace.notification_count}
                   </Badge>
                 )}
@@ -493,6 +509,27 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 </div>
               )}
             </div>
+
+            {/* Remove button — absolute-positioned at a fixed
+                right offset so the hover-reveal X sits at the same
+                x-coordinate on every row, regardless of what mix of
+                git-diff pill / notification badge / PR badge sits in
+                the normal flow. Sibling badges fade on hover (above)
+                so the overlay is visually exclusive. Only rendered
+                for worktrees with a worktree_path — the primary
+                checkout is Hide-only via right-click → Close
+                Worktree. */}
+            {canDelete && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground"
+                onClick={(e) => { e.stopPropagation(); setShowRemoveDialog(true); }}
+                aria-label="Remove workspace"
+              >
+                <X className="h-3.5 w-3.5" />
+              </Button>
+            )}
           </div>
         </ContextMenuTrigger>
         <WorkspaceContextMenuItems

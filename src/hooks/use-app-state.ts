@@ -7,7 +7,6 @@ import type { AppStateSnapshot } from "@/tauri/types";
 
 export function useAppStateInit(skip = false) {
   const setAppState = useAppStore((s) => s.setAppState);
-  const lastJsonRef = useRef("");
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Fetch initial state on mount (skip if not authenticated yet)
@@ -15,20 +14,23 @@ export function useAppStateInit(skip = false) {
     if (skip) return;
     getAppState()
       .then((snapshot) => {
-        lastJsonRef.current = JSON.stringify(snapshot);
         setAppState(snapshot);
       })
       .catch((err) => console.error("Failed to fetch app state:", err));
   }, [setAppState, skip]);
 
-  // Subscribe to state changes with 16ms debounce + JSON dedup
+  // Subscribe to state changes with a 16ms debounce. The backend already
+  // coalesces app-state mutations, so the previous full-snapshot
+  // JSON.stringify dedup was paying a multi-KB serialize cost on every
+  // tick to catch the rare identical-payload case. Dropping it lets
+  // Zustand's selector-level reference equality at the component layer
+  // handle no-op fan-out — workspace state can grow with each opened
+  // surface/pane/session, so the stringify scaled with usage and was
+  // a real freeze contributor under sustained backend churn.
   const handleStateChanged = useCallback(
     (payload: AppStateSnapshot) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(() => {
-        const json = JSON.stringify(payload);
-        if (json === lastJsonRef.current) return;
-        lastJsonRef.current = json;
         setAppState(payload);
       }, 16);
     },

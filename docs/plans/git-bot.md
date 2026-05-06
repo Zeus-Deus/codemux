@@ -12,9 +12,9 @@ Provide a safe, AI-powered merge conflict resolution workflow that works on temp
 
 ## Active Priorities
 
-1. Deepen test coverage with real multi-file conflict scenarios
-2. Live validation on real merge workflows across different project types
-3. Improve partial resolution UX (some files resolved, some need human input)
+1. Per-file resolver loop with Tauri events for live progress (replaces the current single-shot batch invocation; enables real progress UI in the resolver banner; allows partial resolutions)
+2. Deepen test coverage with real multi-file conflict scenarios
+3. Live validation on real merge workflows across different project types
 
 ## Open Questions
 
@@ -32,6 +32,7 @@ Provide a safe, AI-powered merge conflict resolution workflow that works on temp
 - Frontend state machine with full lifecycle tracking (`ai-merge-store.ts`)
 - Integration points in Changes panel and PR panel
 - Settings for CLI tool and model selection
+- Labeled state-aware merge CTA in the changes panel header (replaces icon-only dropdown); inline strategy override in the resolver banner; removed `ai_resolver_enabled` gating toggle from settings.
 
 ## Notes
 

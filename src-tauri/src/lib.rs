@@ -1,9 +1,20 @@
 use tauri::{Emitter, Listener, Manager};
 
+/// Subdirectory name used under XDG config/data dirs for all Codemux state
+/// (sqlite db, auth tokens, scrollback, presets, etc.). Debug builds use a
+/// distinct name so a locally-running dev build keeps its sessions, auth,
+/// and synced state fully isolated from the installed release build.
+#[cfg(debug_assertions)]
+pub const APP_DIR_NAME: &str = "codemux-dev";
+#[cfg(not(debug_assertions))]
+pub const APP_DIR_NAME: &str = "codemux";
+
 pub mod agent_context;
+pub mod agent_provider;
 pub mod ai;
 pub mod auth;
 pub mod branch_name;
+pub mod json_rpc_child;
 pub mod mcp_server;
 pub mod agent_browser;
 pub mod cli;
@@ -12,10 +23,13 @@ pub mod database;
 pub mod config;
 pub mod git;
 pub mod github;
+pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
+pub mod encryption;
 pub mod execution;
 pub mod indexing;
+pub mod mcp;
 pub mod memory;
 pub mod notifications;
 pub mod openflow;
@@ -26,6 +40,8 @@ pub mod presets;
 pub mod project;
 pub mod scripts;
 pub mod scrollback;
+pub mod skills;
+pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod state;
@@ -138,6 +154,36 @@ pub fn run() {
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
+        .manage(encryption::EncryptionManager::default())
+        .manage(skills_sync::SyncEngine::new())
+        .manage(commands::agent_chat::ProviderRegistry::new())
+        // Step 12 Stage 2 — singleton supervisor for the lazily
+        // spawned `opencode serve` child. `ensure_running()` is the
+        // entry point used by `opencode_list_models`; the server is
+        // not spawned until the first call. Shutting Codemux down
+        // drops this state, which `kill_on_drop`-kills the child.
+        .manage(std::sync::Arc::new(crate::agent_provider::opencode::OpenCodeServerManager::new()))
+        // Step 12 Stage 9 — Codex capability cache. Holds the
+        // memoised `model/list` harvest so the picker doesn't
+        // re-spawn `codex app-server` on every render. Empty on app
+        // boot; populated on first `list_chat_provider_capabilities`
+        // call for the Codex provider.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::codex::capabilities::CodexCapabilityCache::new(),
+        ))
+        // MCP runtime registry. `agent_chat_start_session` reads this
+        // via `app.state::<McpRegistry>()` to lazily prime servers
+        // before launching a chat, and the `commands::mcp::*` Tauri
+        // commands take it via `State<'_, McpRegistry>`. Registering
+        // it here is mandatory — without `.manage()` the first
+        // `state()` call panics with "state() called before manage()".
+        .manage(mcp::registry::McpRegistry::default())
+        .manage(skills::watcher::SkillsWatcherState::new())
+        // Phase 2 display-isolation: per-workspace virtual display manager.
+        // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
+        // prior Codemux crashes. Actual Xvfb spawning is lazy — first agent
+        // that opts in via CODEMUX_VIRTUAL_DISPLAY=1 triggers acquire().
+        .manage(execution::virtual_display::VirtualDisplayManager::new())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()
@@ -481,6 +527,123 @@ pub fn run() {
 
             control::spawn_control_server(app.handle().clone());
 
+            // Resolve the bundled claude-agent sidecar from Tauri's resource
+            // dir and pin the path via env var so the adapter (which has no
+            // AppHandle access at construction time) can find it. Only one
+            // file matches the `codemux-claude-sidecar-*` glob in resources/
+            // — the per-target binary staged by scripts/build-claude-sidecar.sh
+            // for whichever triple this build was compiled against.
+            //
+            // The bun --compile binary is huge (~100 MB) with the dynamic
+            // section at offset 96 MB, which patchelf corrupts when run by
+            // linuxdeploy during AppImage bundling. Shipping it as a resource
+            // (usr/share/...) instead of an externalBin (usr/bin/) keeps it
+            // out of linuxdeploy's scan path. See `tauri.conf.json` for the
+            // mirror change.
+            if let Ok(resource_dir) = app.handle().path().resource_dir() {
+                let triple = agent_provider::claude::sidecar_path::target_triple();
+                let ext = if cfg!(windows) { ".exe" } else { "" };
+                let sidecar = resource_dir
+                    .join("binaries")
+                    .join(format!("codemux-claude-sidecar-{triple}{ext}"));
+                if sidecar.exists()
+                    && std::env::var(
+                        agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+                    )
+                    .is_err()
+                {
+                    std::env::set_var(
+                        agent_provider::claude::sidecar_path::SIDECAR_PATH_ENV,
+                        sidecar,
+                    );
+                }
+            }
+
+            // Agent-chat provider registry initialisation.
+            //
+            // When `enable_agent_chat` is on, spawn concrete Claude /
+            // Codex provider adapters into the
+            // `commands::agent_chat::ProviderRegistry` managed state.
+            // Claude's adapter resolves its sidecar binary eagerly,
+            // which involves filesystem IO — run the whole block on a
+            // background task so startup is not blocked, and treat
+            // per-provider failures as recoverable (leave the slot
+            // empty; commands routing to it return
+            // `provider_not_configured`).
+            //
+            // When the flag is off this whole task is skipped so
+            // memory is not consumed.
+            {
+                let observability: tauri::State<'_, observability::ObservabilityStore> =
+                    app.handle().state();
+                if observability.agent_chat_enabled() {
+                    let registry_handle = app.handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        let registry: tauri::State<
+                            '_,
+                            commands::agent_chat::ProviderRegistry,
+                        > = registry_handle.state();
+
+                        match agent_provider::claude::ClaudeAgentProvider::new(
+                            agent_provider::claude::ClaudeProviderConfig::default(),
+                        )
+                        .await
+                        {
+                            Ok(provider) => {
+                                registry
+                                    .set_claude(std::sync::Arc::new(provider) as _)
+                                    .await;
+                            }
+                            Err(error) => {
+                                eprintln!(
+                                    "[codemux::agent_chat] Claude provider init failed: {error}; \
+                                     commands routing to it will return provider_not_configured"
+                                );
+                            }
+                        }
+
+                        let codex = agent_provider::codex::CodexAgentProvider::new(
+                            agent_provider::codex::CodexProviderConfig::default(),
+                        );
+                        registry
+                            .set_codex(std::sync::Arc::new(codex) as _)
+                            .await;
+
+                        // OpenCode provider — Step 12 Stage 8. Shares
+                        // the singleton OpenCodeServerManager held in
+                        // Tauri-managed state (registered as
+                        // `Arc<OpenCodeServerManager>` at lib.rs:155)
+                        // so a single `opencode serve` child backs
+                        // both the model-list discovery flow and the
+                        // chat runtime. The server is spawned lazily
+                        // on the first start_session call — a missing
+                        // `opencode` binary surfaces as
+                        // `NotInstalled` per session start, never as
+                        // a startup failure.
+                        let opencode_manager: tauri::State<
+                            '_,
+                            std::sync::Arc<agent_provider::opencode::OpenCodeServerManager>,
+                        > = registry_handle.state();
+                        let opencode_provider =
+                            agent_provider::opencode::OpenCodeAgentProvider::new(
+                                opencode_manager.inner().clone(),
+                                agent_provider::opencode::OpenCodeProviderConfig::default(),
+                            );
+                        registry
+                            .set_opencode(std::sync::Arc::new(opencode_provider) as _)
+                            .await;
+
+                        // Bridge provider events to the frontend
+                        // exactly once, after both providers have been
+                        // injected (or attempted). spawn_event_bridge
+                        // subscribes every registered provider in a
+                        // fresh Tokio task each.
+                        commands::agent_chat::spawn_event_bridge(registry_handle.clone())
+                            .await;
+                    });
+                }
+            }
+
             // Periodically refresh git info for EVERY workspace (so non-active
             // sidebar rows stay honest when agents switch branches), plus
             // PR/issue info for the active workspace only (where `gh` CLI
@@ -804,12 +967,29 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_platform,
+            commands::get_workspace_virtual_display,
             commands::get_current_theme,
             commands::get_shell_appearance,
             commands::get_app_state,
             commands::create_workspace,
             commands::create_empty_workspace,
+            commands::get_or_create_home_workspace,
             commands::regenerate_mcp_config,
+            // MCP runtime registry commands. Frontend invokes these via
+            // `src/tauri/commands.ts` and `src/hooks/use-mcp-runtime.ts`.
+            // Defined in `commands/mcp.rs`; missing registration is what
+            // produced the "Command get_mcp_runtime_status not found"
+            // warnings.
+            commands::list_mcp_servers,
+            commands::get_mcp_runtime_status,
+            commands::set_mcp_disabled_ids,
+            commands::prime_mcp_runtime,
+            commands::start_mcp_server_cmd,
+            commands::stop_mcp_server_cmd,
+            commands::restart_mcp_server_cmd,
+            commands::list_mcp_tools,
+            commands::list_mcp_tools_with_cap_info,
+            commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,
             commands::create_openflow_workspace,
             commands::activate_workspace,
@@ -835,6 +1015,7 @@ pub fn run() {
             commands::notify_attention,
             commands::set_notification_sound_enabled,
             commands::set_ai_commit_message_enabled,
+            commands::set_ai_commit_message_cli,
             commands::set_ai_commit_message_model,
             commands::set_ai_resolver_enabled,
             commands::set_ai_resolver_cli,
@@ -876,6 +1057,10 @@ pub fn run() {
             commands::rebuild_project_index,
             commands::get_project_index_status,
             commands::search_project_index,
+            commands::list_project_files,
+            commands::read_file_for_attachment,
+            commands::list_project_folders,
+            commands::read_folder_for_attachment,
             commands::get_openflow_design_spec,
             commands::get_openflow_runtime_snapshot,
             commands::create_openflow_run,
@@ -885,11 +1070,40 @@ pub fn run() {
             commands::get_observability_snapshot,
             commands::add_structured_log,
             commands::update_feature_flags,
+            commands::get_feature_flags,
+            commands::set_agent_chat_beta,
+            commands::quit_app,
+            commands::get_home_dir,
+            commands::agent_chat_create_pane,
+            commands::agent_chat_close_pane,
+            commands::dev_agent_chat_spawn_test_pane,
+            commands::agent_chat_start_session,
+            commands::agent_chat_send_turn,
+            commands::agent_chat_interrupt_turn,
+            commands::agent_chat_respond_to_request,
+            commands::agent_chat_set_model,
+            commands::agent_chat_set_permission_mode,
+            commands::list_chat_provider_capabilities,
+            commands::agent_chat_stop_session,
+            commands::agent_chat_list_sessions,
+            commands::agent_chat_rename_session,
+            commands::agent_chat_delete_session,
+            commands::agent_chat_list_messages,
+            commands::opencode_check_availability,
+            commands::opencode_ping,
+            commands::opencode_list_models,
             commands::update_permission_policy,
+            commands::list_tool_permissions,
+            commands::remove_tool_permission,
+            commands::list_skills,
+            commands::start_skills_watcher,
+            commands::stop_skills_watcher,
             commands::update_safety_config,
             commands::add_replay_record,
             commands::pick_folder_dialog,
             commands::pick_files_dialog,
+            commands::pick_save_file_dialog,
+            commands::pick_open_file_dialog,
             commands::list_available_cli_tools,
             commands::list_models_for_tool,
             commands::list_thinking_modes_for_tool,
@@ -964,12 +1178,15 @@ pub fn run() {
             commands::get_branch_pull_request,
             commands::create_pull_request,
             commands::list_pull_requests,
+            commands::get_github_pr_by_path,
+            commands::get_github_pr_diff_by_path,
             commands::list_incoming_prs,
             commands::merge_pull_request,
             commands::get_pull_request_checks,
             commands::get_pr_review_comments,
             commands::get_pr_inline_comments,
             commands::submit_pr_review,
+            commands::get_pr_deployments,
             commands::list_github_issues,
             commands::list_github_issues_by_path,
             commands::get_github_issue_by_path,
@@ -988,6 +1205,7 @@ pub fn run() {
             commands::delete_preset,
             commands::set_preset_pinned,
             commands::set_preset_bar_visible,
+            commands::reorder_presets,
             commands::apply_preset,
             commands::get_workspace_config,
             commands::has_codemuxinclude,
@@ -998,6 +1216,7 @@ pub fn run() {
             commands::search_file_names,
             commands::read_file,
             commands::write_file,
+            commands::grep_count_pattern,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,
             commands::signin_email,
@@ -1006,6 +1225,15 @@ pub fn run() {
             commands::check_auth,
             commands::sign_out,
             commands::get_auth_token,
+            commands::get_sync_status,
+            commands::setup_sync_password,
+            commands::provide_password_for_sync,
+            commands::skills_sync_now,
+            commands::skills_sync_status,
+            commands::get_export_recommended_filename,
+            commands::export_skills_to_file,
+            commands::import_skills_from_file,
+            commands::wipe_remote_skills_for_reset,
             commands::get_synced_settings,
             commands::update_synced_settings,
             commands::update_setting,

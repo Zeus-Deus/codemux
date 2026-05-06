@@ -47,6 +47,9 @@ const mockCreateWorkspace = vi.fn().mockResolvedValue("ws-new");
 const mockMergePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
 const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
+const mockSetAiResolverStrategy = vi.fn().mockResolvedValue(undefined);
+const mockSetShowSettings = vi.fn();
+const mockStartResolution = vi.fn();
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mockOpenUrl(...args),
@@ -88,6 +91,18 @@ vi.mock("@/tauri/commands", () => ({
   getCommitFiles: vi.fn().mockResolvedValue([]),
   mergePullRequest: (...args: unknown[]) => mockMergePullRequest(...args),
   refreshWorkspacePr: (...args: unknown[]) => mockRefreshWorkspacePr(...args),
+  setAiResolverStrategy: (...args: unknown[]) => mockSetAiResolverStrategy(...args),
+}));
+
+vi.mock("@/stores/ui-store", () => ({
+  useUIStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) => {
+    const state = {
+      setShowSettings: mockSetShowSettings,
+      showSettings: false,
+      settingsSection: null,
+    };
+    return selector(state);
+  }),
 }));
 
 vi.mock("@/stores/diff-store", () => ({
@@ -134,7 +149,7 @@ vi.mock("@/stores/ai-merge-store", () => ({
   useAiMergeStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) => {
     const state = {
       getResolver: () => ({ status: "idle", tempBranch: null, originalBranch: null, targetBranch: null, conflictingFiles: [], agentOutput: null, resolutionDiff: null, error: null }),
-      startResolution: vi.fn(),
+      startResolution: mockStartResolution,
       approveResolution: vi.fn().mockResolvedValue(undefined),
       rejectResolution: vi.fn().mockResolvedValue(undefined),
     };
@@ -877,5 +892,245 @@ describe("Changes panel PR split-button", () => {
       expect(mockToast.error).toHaveBeenCalledWith("Couldn't merge PR: merge conflict");
     });
     expect(mockRefreshWorkspacePr).not.toHaveBeenCalled();
+  });
+});
+
+// ── Labeled "Merge → base" CTA (worktree exit) ──
+//
+// This is the primary affordance for shipping a worktree's work onto the
+// base branch. Before this redesign the same action was a 24px GitMerge
+// icon hidden in a toolbar between refresh and view-mode toggles, which
+// gave new users no signal that "this is where the workflow exits."
+
+describe("Labeled merge-to-base CTA", () => {
+  it("renders the labeled CTA on a feature branch with work vs base", async () => {
+    renderPanel();
+    await flushPromises();
+
+    // The CTA is identified by its accessible name, not a glyph — that's
+    // the whole point of the redesign.
+    expect(
+      screen.getByRole("button", { name: /Merge into main/i }),
+    ).toBeInTheDocument();
+    // Micro-copy that surfaces the AI resolver feature without the user
+    // needing to open settings or hit a conflict first.
+    expect(
+      screen.getByText(/AI resolves conflicts automatically/i),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the CTA when current branch equals base branch", async () => {
+    mockGetGitBranchInfo.mockResolvedValue({
+      branch: "main",
+      ahead: 0,
+      behind: 0,
+      has_upstream: true,
+    });
+
+    renderPanel();
+    await flushPromises();
+
+    expect(
+      screen.queryByRole("button", { name: /Merge into main/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/AI resolves conflicts automatically/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the CTA while a merge is in progress (banner takes over)", async () => {
+    mockGetMergeState.mockResolvedValue({
+      is_merging: true,
+      is_rebasing: false,
+      merge_head: "deadbeef",
+      conflicted_files: [{ path: "src/x.ts", conflict_type: "both_modified" }],
+    });
+    mockGetGitStatus.mockResolvedValue([
+      { path: "src/x.ts", status: "conflicted", is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: "both_modified" },
+    ]);
+
+    renderPanel();
+    await flushPromises();
+
+    // Banner should be visible — the labeled CTA must NOT compete with it.
+    expect(screen.getByText(/Merge in progress/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Merge into main$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the CTA when there are unresolved conflicts (resolver banner owns the moment)", async () => {
+    // Not actively merging, but conflicted files exist (e.g. user resumed
+    // after a partial state). The CTA should defer to the conflict UI.
+    mockGetGitStatus.mockResolvedValue([
+      { path: "src/x.ts", status: "conflicted", is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: "both_modified" },
+    ]);
+
+    renderPanel();
+    await flushPromises();
+
+    expect(
+      screen.queryByRole("button", { name: /^Merge into main$/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("primary click opens the merge-into-base confirmation dialog", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flushPromises();
+
+    await user.click(screen.getByRole("button", { name: /Merge into main/i }));
+
+    // Dialog confirm button appears (the dialog reuses existing
+    // mergeIntoBase flow — we don't re-test the dialog itself here).
+    expect(
+      await screen.findByRole("button", { name: /^Merge into main$/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("caret dropdown exposes 'Merge base into current' as a secondary action", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flushPromises();
+
+    await user.click(screen.getByRole("button", { name: "Merge options" }));
+    await user.click(await screen.findByText("Merge main into current"));
+
+    await waitFor(() => {
+      expect(mockMergeBranch).toHaveBeenCalledWith("/home/user/project", "main");
+    });
+  });
+
+  it("caret dropdown 'Resolver settings' opens settings to the git section", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flushPromises();
+
+    await user.click(screen.getByRole("button", { name: "Merge options" }));
+    await user.click(await screen.findByText("Resolver settings"));
+
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "git");
+  });
+
+  it("file count badge reflects baseBranchFiles length", async () => {
+    mockGetBaseBranchDiff.mockResolvedValue({
+      files: [
+        { path: "a.ts", status: "modified", is_staged: false, is_unstaged: true, additions: 1, deletions: 0 },
+        { path: "b.ts", status: "modified", is_staged: false, is_unstaged: true, additions: 2, deletions: 0 },
+        { path: "c.ts", status: "added", is_staged: false, is_unstaged: true, additions: 5, deletions: 0 },
+      ],
+      merge_base_commit: "abc",
+    });
+
+    renderPanel();
+    await flushPromises();
+
+    const cta = screen.getByRole("button", { name: /Merge into main/i });
+    // Count badge inside the button.
+    expect(cta.textContent).toMatch(/3/);
+  });
+
+  it("renders disabled (no count badge) when on feature branch with nothing to merge yet", async () => {
+    // Fresh feature branch — no committed diff vs base. The CTA must still
+    // RENDER so a new user discovers it; just disabled until they commit.
+    // Regression: an earlier version hid the CTA entirely in this state,
+    // which left a brand-new user staring at a panel that gave them no
+    // signal that a merge action even existed.
+    mockGetBaseBranchDiff.mockResolvedValue({ files: [], merge_base_commit: "abc" });
+
+    renderPanel();
+    await flushPromises();
+
+    const cta = screen.getByRole("button", { name: /Merge into main/i });
+    expect(cta).toBeInTheDocument();
+    expect(cta).toBeDisabled();
+    // No count badge when there's nothing to merge.
+    expect(cta.textContent).not.toMatch(/\d/);
+  });
+});
+
+// ── Resolver strategy override ──
+//
+// Before: the resolver was gated by `ai_resolver_enabled` and the strategy
+// only existed in settings — users had to open settings before their first
+// conflict to make the feature work at all.
+// After: always available, strategy override lives inline next to the
+// "Resolve with AI" button.
+
+describe("Resolver strategy override", () => {
+  beforeEach(() => {
+    mockGetGitStatus.mockResolvedValue([
+      { path: "src/x.ts", status: "conflicted", is_staged: false, is_unstaged: true, additions: 0, deletions: 0, conflict_type: "both_modified" },
+    ]);
+    mockAppStoreState = {
+      appState: {
+        config: {
+          ai_commit_message_enabled: false,
+          ai_resolver_enabled: false, // explicitly off — must NOT gate the resolver
+          ai_resolver_strategy: "smart_merge",
+          ai_resolver_cli: "claude",
+          ai_resolver_model: "",
+        },
+        workspaces: [],
+      },
+    };
+  });
+
+  it("renders the strategy selector and 'Resolve with AI' button when conflicts exist", async () => {
+    renderPanel();
+    await flushPromises();
+
+    expect(screen.getByLabelText("Resolution strategy")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Resolve conflicts with AI" }),
+    ).toBeInTheDocument();
+  });
+
+  it("'Resolve with AI' is enabled even when ai_resolver_enabled is false", async () => {
+    // Regression: previously this button was disabled until the user
+    // toggled `ai_resolver_enabled` in settings. The toggle is gone; the
+    // button must always be clickable.
+    renderPanel();
+    await flushPromises();
+
+    const btn = screen.getByRole("button", { name: "Resolve conflicts with AI" });
+    expect(btn).not.toBeDisabled();
+  });
+
+  it("clicking 'Resolve with AI' invokes startResolution with the current strategy", async () => {
+    const user = userEvent.setup();
+    renderPanel();
+    await flushPromises();
+
+    await user.click(screen.getByRole("button", { name: "Resolve conflicts with AI" }));
+
+    await waitFor(() => {
+      expect(mockStartResolution).toHaveBeenCalled();
+    });
+    // 6th positional arg is the strategy. The handler reads from
+    // config.ai_resolver_strategy, which we seeded as "smart_merge".
+    const [, , , , , strategy] = mockStartResolution.mock.calls[0];
+    expect(strategy).toBe("smart_merge");
+  });
+
+  it("default strategy persists if config.ai_resolver_strategy is missing", async () => {
+    // No strategy set in config — falls back to "smart_merge".
+    mockAppStoreState = {
+      appState: {
+        config: { ai_commit_message_enabled: false, ai_resolver_enabled: false },
+        workspaces: [],
+      },
+    };
+    const user = userEvent.setup();
+    renderPanel();
+    await flushPromises();
+
+    await user.click(screen.getByRole("button", { name: "Resolve conflicts with AI" }));
+
+    await waitFor(() => {
+      expect(mockStartResolution).toHaveBeenCalled();
+    });
+    const [, , , , , strategy] = mockStartResolution.mock.calls[0];
+    expect(strategy).toBe("smart_merge");
   });
 });

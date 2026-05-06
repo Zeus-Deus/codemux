@@ -53,10 +53,12 @@ idle → creating_branch → resolving → review → applying → idle
 
 ### Configuration
 
+The resolver is always available — there is no enable toggle. It only fires when the user explicitly clicks "Resolve with AI" on a real conflict, and even then runs on a temp branch with mandatory user review before apply, so gating it behind a setting was unnecessary friction.
+
 Resolver settings are in Settings > Editor & Workflow > Agent:
 - CLI tool selector (Claude Code, Codex, OpenCode)
 - Model selector
-- Merge strategy preferences
+- Default merge strategy (Smart merge / Keep both / Prefer mine / Prefer theirs) — can also be overridden per-conflict from the resolver banner
 
 ## What Works Today
 
@@ -75,6 +77,7 @@ Resolver settings are in Settings > Editor & Workflow > Agent:
 - No automatic test running after resolution (manual verification required)
 - Agent output is captured but not streamed live to the UI
 - No conflict resolution history or learning from past resolutions
+- Backend still runs single-shot resolution for all files; per-file streaming is the next planned improvement (see `docs/plans/git-bot.md`).
 
 ## Important Touch Points
 

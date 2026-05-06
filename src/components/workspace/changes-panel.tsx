@@ -9,6 +9,19 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "@/components/ui/popover";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from "@/components/ui/command";
+import {
   Tooltip,
   TooltipTrigger,
   TooltipContent,
@@ -54,6 +67,7 @@ import {
   FolderTree,
   ArrowDownUp,
   Download,
+  Settings,
 } from "lucide-react";
 import {
   getGitStatus,
@@ -91,7 +105,16 @@ import {
   activateWorkspace,
   closeWorkspace,
   createWorkspace,
+  setAiResolverStrategy,
 } from "@/tauri/commands";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
 import {
   ContextMenu,
@@ -610,31 +633,33 @@ function ConflictsSection({
   cwd,
   onRefresh,
   onOpenDiff,
-  resolverEnabled,
   resolverStatus,
   resolverError,
   resolverFiles,
   resolverTempBranch,
   resolverCli,
   resolverModel,
+  resolverStrategy,
   onStartResolve,
   onApproveResolve,
   onRejectResolve,
+  onChangeResolverStrategy,
 }: {
   files: GitFileStatus[];
   cwd: string;
   onRefresh: () => void;
   onOpenDiff?: (filePath: string, staged: boolean) => void;
-  resolverEnabled: boolean;
   resolverStatus: string;
   resolverError: string | null;
   resolverFiles: string[];
   resolverTempBranch: string | null;
   resolverCli: string;
   resolverModel: string | null;
+  resolverStrategy: string;
   onStartResolve: () => void;
   onApproveResolve: () => void;
   onRejectResolve: () => void;
+  onChangeResolverStrategy: (strategy: string) => void;
 }) {
   // Show resolver progress UI when active
   if (resolverStatus !== "idle") {
@@ -809,27 +834,49 @@ function ConflictsSection({
               onOpenDiff={onOpenDiff}
             />
           ))}
-          <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="block px-1.5 mt-1">
+          {/* Strategy override + Resolve action. Strategy defaults to whatever
+              the user picked in Settings; per-conflict overrides persist back to
+              the same setting so the next conflict starts from their last choice.
+              No "enable" gate — running the resolver only happens on click and
+              the result still requires explicit approval before any real branch
+              is touched, so gating it added friction without any safety value. */}
+          <div
+            className="px-1.5 mt-1 flex items-stretch gap-1"
+            data-testid="resolver-actions"
+          >
+            <Select value={resolverStrategy} onValueChange={onChangeResolverStrategy}>
+              <SelectTrigger
+                className="h-6 text-[10px] w-28 flex-shrink-0 px-1.5"
+                aria-label="Resolution strategy"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="smart_merge" className="text-xs">
+                  Smart merge
+                </SelectItem>
+                <SelectItem value="keep_both" className="text-xs">
+                  Keep both
+                </SelectItem>
+                <SelectItem value="prefer_ours" className="text-xs">
+                  Prefer mine
+                </SelectItem>
+                <SelectItem value="prefer_theirs" className="text-xs">
+                  Prefer target
+                </SelectItem>
+              </SelectContent>
+            </Select>
             <Button
               size="xs"
               variant="secondary"
-              className="text-[10px] h-6 w-full"
-              disabled={!resolverEnabled}
+              className="text-[10px] h-6 flex-1"
               onClick={onStartResolve}
+              aria-label="Resolve conflicts with AI"
             >
               <Sparkles className="h-3 w-3 mr-1" />
               Resolve with AI
             </Button>
-          </span>
-        </TooltipTrigger>
-        {!resolverEnabled && (
-          <TooltipContent side="bottom" className="text-xs">
-            Configure in Settings &rarr; Git &rarr; AI Tools
-          </TooltipContent>
-        )}
-          </Tooltip>
+          </div>
         </>
       )}
     </div>
@@ -1034,6 +1081,7 @@ export function ChangesPanel({ workspace }: Props) {
   const [baseBranchFiles, setBaseBranchFiles] = useState<GitFileStatus[]>([]);
   const [baseBranchExpanded, setBaseBranchExpanded] = useState(false);
   const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
+  const [baseBranchPickerOpen, setBaseBranchPickerOpen] = useState(false);
 
   const config = useAppStore((s) => s.appState?.config);
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
@@ -1108,6 +1156,16 @@ export function ChangesPanel({ workspace }: Props) {
 
   useEffect(() => { refreshBaseDiff(); }, [refreshBaseDiff]);
 
+  const sortedBaseBranches = useMemo(() => {
+    return [...remoteBranches].sort((a, b) => {
+      const aDefault = a === "main" || a === "master";
+      const bDefault = b === "main" || b === "master";
+      if (aDefault && !bDefault) return -1;
+      if (!aDefault && bDefault) return 1;
+      return a.localeCompare(b);
+    });
+  }, [remoteBranches]);
+
   const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
   const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
   const conflicted = useMemo(() => files.filter((f) => f.status === "conflicted"), [files]);
@@ -1134,13 +1192,33 @@ export function ChangesPanel({ workspace }: Props) {
     rejectResolution(workspace.workspace_id, cwd).then(refresh);
   };
 
+  /** Persist a new resolver strategy. Backend update; the snapshot
+   *  refresh propagates the change back to `config?.ai_resolver_strategy`,
+   *  which the UI re-reads on next render. */
+  const handleSetResolverStrategy = (v: string) => {
+    setAiResolverStrategy(v).catch(console.error);
+  };
+
+  /** Open Settings → Git so the user can change CLI / model / default strategy. */
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
+  const handleOpenResolverSettings = () => {
+    setShowSettings(true, "git");
+  };
+
   const busy = busyAction !== null;
 
   const handleGenerateCommitMsg = () => {
     if (isGenerating || staged.length === 0) return;
     setGitError(null);
+    // The commits backend now supports any of the three CLIs (claude /
+    // codex / opencode), same way the merge resolver does. We forward
+    // both the CLI and the model so they stay paired — the picker in
+    // settings always writes them atomically, but `??` defaults guard
+    // against legacy configs that pre-date the `ai_commit_message_cli`
+    // field.
+    const cli = config?.ai_commit_message_cli ?? "claude";
     const model = config?.ai_commit_message_model ?? null;
-    requestGeneration(workspace.workspace_id, cwd, model);
+    requestGeneration(workspace.workspace_id, cwd, cli, model);
   };
 
   const handleAbortMerge = async () => {
@@ -1634,32 +1712,60 @@ export function ChangesPanel({ workspace }: Props) {
         <div className="flex items-center gap-0.5 px-2 py-1.5">
           {/* Base branch selector */}
           {remoteBranches.length > 1 ? (
-            <DropdownMenu>
+            <Popover open={baseBranchPickerOpen} onOpenChange={setBaseBranchPickerOpen}>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <DropdownMenuTrigger asChild>
+                  <PopoverTrigger asChild>
                     <Button variant="ghost" size="icon-xs" className="size-6 p-0">
                       <GitBranch className="h-3.5 w-3.5" />
                     </Button>
-                  </DropdownMenuTrigger>
+                  </PopoverTrigger>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="text-xs">
                   Base: {baseBranch}
                 </TooltipContent>
               </Tooltip>
-              <DropdownMenuContent align="start" className="max-h-60 overflow-y-auto">
-                {remoteBranches.map((b) => (
-                  <DropdownMenuItem
-                    key={b}
-                    onClick={() => setBaseBranch(b)}
-                    className="text-xs"
+              <PopoverContent align="start" className="w-[260px] p-0">
+                <Command>
+                  <CommandInput placeholder="Search branches..." className="h-8" />
+                  <CommandList
+                    className="max-h-[300px] [scrollbar-width:thin]"
+                    onWheel={(e) => e.stopPropagation()}
                   >
-                    {b === baseBranch && <Check className="h-3 w-3 mr-1.5 shrink-0" />}
-                    <span className={b !== baseBranch ? "pl-[18px]" : ""}>{b}</span>
-                  </DropdownMenuItem>
-                ))}
-              </DropdownMenuContent>
-            </DropdownMenu>
+                    <CommandEmpty>No branches match</CommandEmpty>
+                    <CommandGroup>
+                      {sortedBaseBranches.map((b) => {
+                        const isDefault = b === "main" || b === "master";
+                        const isSelected = b === baseBranch;
+                        return (
+                          <CommandItem
+                            key={b}
+                            value={b}
+                            onSelect={() => {
+                              setBaseBranch(b);
+                              setBaseBranchPickerOpen(false);
+                            }}
+                            className="h-8 text-xs gap-2 px-2"
+                          >
+                            <span className="flex-1 min-w-0 truncate font-mono">
+                              {b}
+                            </span>
+                            {isDefault && (
+                              <span className="text-[10px] text-muted-foreground shrink-0">
+                                default
+                              </span>
+                            )}
+                            {isSelected && (
+                              <Check className="h-3 w-3 shrink-0 text-foreground" />
+                            )}
+                          </CommandItem>
+                        );
+                      })}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
           ) : (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -1704,48 +1810,13 @@ export function ChangesPanel({ workspace }: Props) {
             </DropdownMenuContent>
           </DropdownMenu>
 
-          {/* Merge dropdown */}
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <Button
-                    variant="ghost"
-                    size="icon-xs"
-                    className="size-6 p-0"
-                    disabled={busy || branchInfo?.branch === baseBranch}
-                  >
-                    {busyAction === "merge" ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <GitMerge className="h-3.5 w-3.5" />
-                    )}
-                  </Button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-xs">
-                {branchInfo?.branch === baseBranch ? "Already on base branch" : "Merge"}
-              </TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent align="start" className="w-52">
-              <DropdownMenuItem
-                onClick={handleMergeBranch}
-                disabled={isMerging}
-                className="text-xs"
-              >
-                <GitMerge className="h-3.5 w-3.5" />
-                Merge {baseBranch} into current
-              </DropdownMenuItem>
-              <DropdownMenuItem
-                onClick={() => setShowMergeIntoDialog(true)}
-                disabled={isMerging || !!mergeIntoBaseState}
-                className="text-xs"
-              >
-                <ArrowUpToLine className="h-3.5 w-3.5" />
-                Merge into {baseBranch}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          {/* The icon-only merge dropdown that lived here was the original
+              "buried in a row of glyphs" affordance. It's been replaced by
+              the labeled "Merge → {baseBranch}" CTA in the commit area
+              (see below) which mirrors the Commit ButtonGroup shape and
+              gives the workflow exit a real identity. The same two
+              actions (merge into base, merge base into current) are still
+              available via that CTA's primary click and caret dropdown. */}
 
           {/* View mode toggle */}
           <Tooltip>
@@ -2011,6 +2082,93 @@ export function ChangesPanel({ workspace }: Props) {
             </DropdownMenu>
           </div>
 
+          {/* Worktree exit: labeled "Merge → base" CTA. Visible whenever the
+              user is on a feature branch and not in an in-progress merge or
+              conflict-resolution flow — even if there's nothing to merge yet.
+              Discoverability matters: a new user needs to SEE the button
+              before their first commit so they learn it exists. When there is
+              nothing to merge the button stays disabled with a tooltip
+              explaining what they need to do next. Mirrors the commit
+              ButtonGroup shape so it reads as a peer action, not a hidden
+              tool. */}
+          {branchInfo?.branch !== baseBranch
+            && !isMerging
+            && !mergeIntoBaseState?.active
+            && conflicted.length === 0 && (
+            <div className="flex flex-col gap-0.5">
+              {/* `data-slot="button-group"` is required: the Button
+                  component's `in-data-[slot=button-group]:rounded-lg` rule
+                  swaps the corner radius from the per-size default (10–12px)
+                  to `rounded-lg` so adjacent grouped buttons line up. The
+                  Commit ButtonGroup above uses the same slot — without it
+                  the borders/corners visibly diverge from Commit. */}
+              <div data-slot="button-group" className="flex w-full items-stretch">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="flex-1 gap-1.5 h-7 text-xs rounded-r-none border-r-0"
+                      onClick={() => setShowMergeIntoDialog(true)}
+                      disabled={busy || baseBranchFiles.length === 0}
+                      aria-label={`Merge into ${baseBranch}`}
+                    >
+                      {busyAction === "merge" ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ArrowUpToLine className="h-3.5 w-3.5" />
+                      )}
+                      <span>Merge → {baseBranch}</span>
+                      {baseBranchFiles.length > 0 && (
+                        <span className="text-[10px] opacity-70">{baseBranchFiles.length}</span>
+                      )}
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" className="text-xs">
+                    {baseBranchFiles.length === 0
+                      ? `Nothing to merge yet — commit your changes first`
+                      : `Land this worktree on ${baseBranch}`}
+                  </TooltipContent>
+                </Tooltip>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      className="h-7 px-1.5 rounded-l-none"
+                      disabled={busy}
+                      aria-label="Merge options"
+                    >
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-56 text-xs">
+                    <DropdownMenuItem
+                      onClick={handleMergeBranch}
+                      disabled={isMerging}
+                      className="text-xs"
+                    >
+                      <ArrowDown className="h-3.5 w-3.5" />
+                      Merge {baseBranch} into current
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      onClick={handleOpenResolverSettings}
+                      className="text-xs"
+                    >
+                      <Settings className="h-3.5 w-3.5" />
+                      Resolver settings
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </div>
+              <p className="text-[10px] text-muted-foreground px-0.5 flex items-center gap-1">
+                <Sparkles className="h-2.5 w-2.5" />
+                AI resolves conflicts automatically
+              </p>
+            </div>
+          )}
+
           {gitError && (
             <p className="text-[10px] text-destructive break-words px-0.5">{gitError}</p>
           )}
@@ -2102,16 +2260,17 @@ export function ChangesPanel({ workspace }: Props) {
                 cwd={cwd}
                 onRefresh={refresh}
                 onOpenDiff={handleOpenDiff}
-                resolverEnabled={config?.ai_resolver_enabled ?? false}
                 resolverStatus={resolver.status}
                 resolverError={resolver.error}
                 resolverFiles={resolver.conflictingFiles.map((f) => f.path)}
                 resolverTempBranch={resolver.tempBranch}
                 resolverCli={config?.ai_resolver_cli ?? "claude"}
                 resolverModel={config?.ai_resolver_model ?? null}
+                resolverStrategy={config?.ai_resolver_strategy ?? "smart_merge"}
                 onStartResolve={handleStartResolve}
                 onApproveResolve={handleApproveResolve}
                 onRejectResolve={handleRejectResolve}
+                onChangeResolverStrategy={handleSetResolverStrategy}
               />
             )}
 

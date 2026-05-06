@@ -1,6 +1,6 @@
 {
   "name": "codemux",
-  "version": "0.1.33",
+  "version": "0.2.1",
   "description": "The Agentic Development Environment for Builders",
   "type": "module",
   "scripts": {
@@ -12,8 +12,8 @@
     "verify": "cargo check --manifest-path src-tauri/Cargo.toml && cargo test --manifest-path src-tauri/Cargo.toml && npm run check && npm run test",
     "test:watch": "vitest run --watch",
     "tauri": "tauri",
-    "tauri:dev:x11": "GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
-    "tauri:dev": "WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri dev",
+    "tauri:dev:x11": "GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri -- dev --config src-tauri/tauri.conf.dev.json",
+    "tauri:dev": "WEBKIT_DISABLE_DMABUF_RENDERER=1 npm run tauri -- dev --config src-tauri/tauri.conf.dev.json",
     "cli": "cargo run --manifest-path src-tauri/Cargo.toml --",
     "build:cli": "cargo build --manifest-path src-tauri/Cargo.toml && cp src-tauri/target/debug/codemux ~/.local/bin/codemux"
   },
@@ -33,6 +33,10 @@
     "@codemirror/search": "^6.6.0",
     "@codemirror/state": "^6.6.0",
     "@codemirror/view": "^6.40.0",
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@fontsource-variable/dm-sans": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
     "@lezer/highlight": "^1.2.3",
     "@radix-ui/react-collapsible": "^1.1.12",
@@ -67,6 +71,7 @@
     "zustand": "^5.0.0"
   },
   "devDependencies": {
+    "@tailwindcss/typography": "^0.5.19",
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2",
     "@testing-library/jest-dom": "^6.6.3",

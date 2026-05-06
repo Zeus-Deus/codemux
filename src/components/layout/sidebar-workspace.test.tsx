@@ -1,8 +1,12 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, act, cleanup } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, fireEvent, act, cleanup } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+
+const setShowNewWorkspaceDialogMock = vi.fn();
+let enableAgentChatFlag = false;
+let enableLazyFlag = false;
 
 // Mock Tauri commands
 vi.mock("@/tauri/commands", () => ({
@@ -17,6 +21,9 @@ vi.mock("@/tauri/commands", () => ({
   runWorkspaceSetup: vi.fn().mockResolvedValue(undefined),
   dbGetUiState: vi.fn().mockResolvedValue(null),
   dbSetUiState: vi.fn().mockResolvedValue(undefined),
+  revealInFileManager: vi.fn().mockResolvedValue(undefined),
+  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   getGithubIssue: vi.fn().mockResolvedValue({
     number: 92, title: "Test", state: "Open", labels: [], assignees: [],
     url: "https://github.com/u/r/issues/92", body: null,
@@ -26,7 +33,6 @@ vi.mock("@/tauri/commands", () => ({
 // `useDefaultBranch` uses a module-level cache; reset between suites so a
 // mock return from a prior test doesn't leak in.
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
-import { beforeEach } from "vitest";
 beforeEach(() => __resetDefaultBranchCacheForTests());
 
 // Flush pending microtasks + unmount before the next test so late-resolving
@@ -46,7 +52,18 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector) => {
     const state = {
       showNewWorkspaceDialog: false,
-      setShowNewWorkspaceDialog: vi.fn(),
+      setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
+    };
+    return selector(state);
+  }),
+}));
+
+vi.mock("@/stores/feature-flags", () => ({
+  useFeatureFlags: vi.fn((selector) => {
+    const state = {
+      enableAgentChat: enableAgentChatFlag,
+      enableLazyWorkspaceCreation: enableLazyFlag,
+      loaded: true,
     };
     return selector(state);
   }),
@@ -54,6 +71,12 @@ vi.mock("@/stores/ui-store", () => ({
 
 import { SidebarProjectGroup } from "./sidebar-project-group";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
+import {
+  activateWorkspace,
+  agentChatCreatePane,
+  createEmptyWorkspace,
+} from "@/tauri/commands";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
 
 function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
   return {
@@ -116,6 +139,163 @@ describe("SidebarProjectGroup", () => {
     expect(avatar).toHaveClass("text-muted-foreground");
     expect(avatar?.style.color).toBeFalsy();
   });
+
+  describe("+ button click behavior", () => {
+    const PROJECT_PATH = "/home/user/myproject";
+
+    function renderGroup() {
+      const utils = render(
+        <TooltipProvider>
+          <SidebarProjectGroup
+            projectName="myproject"
+            projectPath={PROJECT_PATH}
+            workspaces={[]}
+            activeWorkspaceId=""
+          />
+        </TooltipProvider>,
+      );
+      const plus = utils.container.querySelector(
+        'button[aria-label="New workspace"]',
+      ) as HTMLElement;
+      return { ...utils, plus };
+    }
+
+    beforeEach(() => {
+      setShowNewWorkspaceDialogMock.mockClear();
+      vi.mocked(createEmptyWorkspace).mockClear();
+      vi.mocked(createEmptyWorkspace).mockResolvedValue("ws-new");
+      vi.mocked(activateWorkspace).mockClear();
+      vi.mocked(agentChatCreatePane).mockClear();
+      enableAgentChatFlag = false;
+      enableLazyFlag = false;
+      useChatDraftStore.setState({
+        draftsById: {},
+        activeHomeDraftId: null,
+        projectDraftIdByPath: {},
+        activeDraftId: null,
+      });
+    });
+
+    it("flag OFF + plain click → opens NewWorkspaceDialog", () => {
+      enableAgentChatFlag = false;
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag OFF + Shift+click → opens NewWorkspaceDialog", () => {
+      enableAgentChatFlag = false;
+      const { plus } = renderGroup();
+      fireEvent.click(plus, { shiftKey: true });
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + plain click → creates empty workspace + activates + opens chat pane (no terminal pane)", async () => {
+      enableAgentChatFlag = true;
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      await vi.waitFor(() => {
+        expect(agentChatCreatePane).toHaveBeenCalled();
+      });
+      // createEmptyWorkspace (not createWorkspace) — the empty variant
+      // doesn't spawn a terminal session, so agent_chat_create_pane
+      // mounts its own fresh surface containing only the chat pane.
+      // No skipSetup arg: projects SHOULD get setup scripts + MCP
+      // config; only the home-chat path opts out.
+      expect(createEmptyWorkspace).toHaveBeenCalledWith(PROJECT_PATH);
+      const call = vi.mocked(createEmptyWorkspace).mock.calls[0];
+      expect(call[1]).toBeUndefined();
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-new");
+      expect(agentChatCreatePane).toHaveBeenCalledWith("ws-new", null, PROJECT_PATH);
+      expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + Shift+click → opens dialog, does NOT call chat commands", () => {
+      enableAgentChatFlag = true;
+      const { plus } = renderGroup();
+      fireEvent.click(plus, { shiftKey: true });
+      expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+    });
+
+    it("flag ON + createEmptyWorkspace rejects → falls back to dialog", async () => {
+      enableAgentChatFlag = true;
+      vi.mocked(createEmptyWorkspace).mockRejectedValueOnce(new Error("boom"));
+      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const { plus } = renderGroup();
+      fireEvent.click(plus);
+      await vi.waitFor(() => {
+        expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(true, PROJECT_PATH);
+      });
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      errSpy.mockRestore();
+    });
+
+    describe("lazy workspace creation (Stage C §10)", () => {
+      it("lazy ON + plain click → creates project draft, no Tauri commands called", () => {
+        enableAgentChatFlag = true;
+        enableLazyFlag = true;
+        const { plus } = renderGroup();
+        fireEvent.click(plus);
+
+        const state = useChatDraftStore.getState();
+        expect(state.projectDraftIdByPath[PROJECT_PATH]).toBeTruthy();
+        expect(state.activeDraftId).toBe(state.projectDraftIdByPath[PROJECT_PATH]);
+        const draft = state.draftsById[state.activeDraftId!];
+        expect(draft.target).toEqual({
+          kind: "project",
+          projectPath: PROJECT_PATH,
+        });
+        expect(createEmptyWorkspace).not.toHaveBeenCalled();
+        expect(agentChatCreatePane).not.toHaveBeenCalled();
+        expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
+      });
+
+      it("lazy ON + plain click reuses the existing project draft on a second click", () => {
+        enableAgentChatFlag = true;
+        enableLazyFlag = true;
+        const { plus } = renderGroup();
+        fireEvent.click(plus);
+        const firstId =
+          useChatDraftStore.getState().projectDraftIdByPath[PROJECT_PATH];
+        fireEvent.click(plus);
+        expect(
+          useChatDraftStore.getState().projectDraftIdByPath[PROJECT_PATH],
+        ).toBe(firstId);
+        expect(
+          Object.keys(useChatDraftStore.getState().draftsById),
+        ).toHaveLength(1);
+      });
+
+      it("lazy ON + Shift+click still opens the dialog (eager path preserved)", () => {
+        enableAgentChatFlag = true;
+        enableLazyFlag = true;
+        const { plus } = renderGroup();
+        fireEvent.click(plus, { shiftKey: true });
+        expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(
+          true,
+          PROJECT_PATH,
+        );
+        expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+      });
+
+      it("lazy OFF + plain click falls through to the legacy eager path", async () => {
+        enableAgentChatFlag = true;
+        enableLazyFlag = false;
+        const { plus } = renderGroup();
+        fireEvent.click(plus);
+        await vi.waitFor(() => {
+          expect(createEmptyWorkspace).toHaveBeenCalled();
+        });
+        expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+      });
+    });
+  });
 });
 
 describe("SidebarWorkspaceRow", () => {
@@ -138,12 +318,12 @@ describe("SidebarWorkspaceRow", () => {
     expect(branchIcon).toBeInTheDocument();
   });
 
-  it("shows remove button for primary checkout", () => {
+  it("hides remove button for primary checkout (Hide-only via right-click)", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
       <SidebarWorkspaceRow workspace={ws} isActive={false} />,
     );
-    expect(container.querySelector("[aria-label='Remove workspace']")).not.toBeNull();
+    expect(container.querySelector("[aria-label='Remove workspace']")).toBeNull();
   });
 
   it("shows remove button for worktree checkout", () => {
@@ -228,5 +408,51 @@ describe("SidebarWorkspaceRow", () => {
     );
     const closedDot = c2.querySelector(".bg-muted-foreground");
     expect(closedDot).toBeInTheDocument();
+  });
+
+  describe("workspace-row click vs. active draft (Bug 2)", () => {
+    beforeEach(() => {
+      vi.mocked(activateWorkspace).mockClear();
+      useChatDraftStore.setState({
+        draftsById: {},
+        activeHomeDraftId: null,
+        projectDraftIdByPath: {},
+        activeDraftId: null,
+      });
+    });
+
+    it("clicking the row clears any active draft AND activates the workspace", () => {
+      // Pre-seed an active draft so WorkspaceMain would otherwise
+      // keep the draft surface on screen after activation.
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      expect(useChatDraftStore.getState().activeDraftId).toBe(draft.draftId);
+
+      const ws = makeWorkspace({ workspace_id: "ws-target" });
+      const { container } = render(
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      );
+      const row = container.querySelector("[role='button']") as HTMLElement;
+      fireEvent.click(row);
+
+      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-target");
+    });
+
+    it("clicking the row is a no-op for draft store when no draft is active", () => {
+      // No draft pre-seeded; the `setActiveDraft(null)` call is safe
+      // (already null) and the click still activates the workspace.
+      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+
+      const ws = makeWorkspace({ workspace_id: "ws-target-2" });
+      const { container } = render(
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      );
+      const row = container.querySelector("[role='button']") as HTMLElement;
+      fireEvent.click(row);
+
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-target-2");
+      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+    });
   });
 });

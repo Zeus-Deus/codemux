@@ -162,7 +162,7 @@ fn default_max_total_mb() -> u32 {
 fn cache_dir() -> PathBuf {
     let data_dir = dirs::data_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join("codemux")
+    data_dir.join(crate::APP_DIR_NAME)
 }
 
 fn cache_file_path() -> PathBuf {

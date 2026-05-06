@@ -105,7 +105,7 @@ const MAX_SCAN_SECONDS: u64 = 60;
 fn config_path() -> PathBuf {
     let config_dir = dirs::config_dir()
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
-    config_dir.join("codemux").join("session-adapters.toml")
+    config_dir.join(crate::APP_DIR_NAME).join("session-adapters.toml")
 }
 
 /// Default adapter config shipped with Codemux.

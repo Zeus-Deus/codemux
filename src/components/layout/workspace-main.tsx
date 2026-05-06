@@ -1,5 +1,7 @@
 import { useCallback, useRef, useEffect } from "react";
 import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { TabBar } from "./tab-bar";
@@ -7,6 +9,7 @@ import { PresetBar } from "./preset-bar";
 import { PaneContainer } from "./pane-container";
 import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
+import { DraftChatSurface } from "@/components/chat/DraftChatSurface";
 import { EditorPane } from "@/components/editor/EditorPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
@@ -99,6 +102,31 @@ export function WorkspaceMain() {
       setOnboardingProjectDir(null);
     }
   }, [onboardingProjectDir, allWorkspaces, setOnboardingProjectDir]);
+
+  // Lazy-workspace-creation: when the flag is on and a client-side
+  // chat draft is active, render the draft surface in place of the
+  // workspace pane tree. PresetBar sits ABOVE the branch so it's
+  // present on both drafts and real workspaces — a preset click on a
+  // draft materialises the workspace via `materializeWithPreset`.
+  const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
+  const activeDraft = useChatDraftStore((s) =>
+    s.activeDraftId ? s.draftsById[s.activeDraftId] ?? null : null,
+  );
+  if (lazyEnabled && activeDraftId && activeDraft) {
+    return (
+      <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
+        <PresetBar
+          workspaceId={null}
+          draftId={activeDraft.draftId}
+          disabled={activeDraft.promoting}
+        />
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <DraftChatSurface />
+        </div>
+      </div>
+    );
+  }
 
   if (!activeWorkspace) return null;
 

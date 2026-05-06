@@ -1,6 +1,9 @@
 import React from "react";
 import { TerminalPane } from "@/components/terminal/TerminalPane";
 import { BrowserPane } from "@/components/browser/BrowserPane";
+import { AgentChatPane } from "@/components/chat/AgentChatPane";
+import { AgentChatPaneHeader } from "@/components/chat/AgentChatPaneHeader";
+import { DisabledFeaturePlaceholder } from "@/components/layout/disabled-feature-placeholder";
 import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { cn } from "@/lib/utils";
@@ -8,6 +11,7 @@ import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/ta
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot, PaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 
 // Map known preset names to their icon identifiers
@@ -220,6 +224,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   const paneStatus: PaneStatus | undefined = useAppStore(
     (s) => s.appState?.pane_statuses[node.pane_id],
   );
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
@@ -274,6 +279,54 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
             visible={visible}
             title={node.title}
           />
+        </div>
+      </div>
+    );
+  }
+
+  if (node.kind === "agent_chat") {
+    // Step 13 — render a placeholder when the master Beta toggle is
+    // off and the persisted layout still references this pane. The
+    // pane node stays in the tree (data preservation) — the user can
+    // re-enable the Beta toggle and the pane remounts with its
+    // session intact.
+    if (!enableAgentChat) {
+      return (
+        <div
+          className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+          data-pane-drop-id={node.pane_id}
+          onPointerDown={handleActivate}
+        >
+          <DisabledFeaturePlaceholder feature="Agent Chat" />
+        </div>
+      );
+    }
+    return (
+      <div
+        className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
+        data-pane-drop-id={node.pane_id}
+        onPointerDown={handleActivate}
+      >
+        <AgentChatPaneHeader
+          pane={node}
+          isActive={isActive}
+          onPointerDown={(e) => handleDragStart(e, node.pane_id)}
+        />
+        <div className="flex-1 min-h-0 overflow-hidden">
+          {/*
+            `key={node.pane_id}` is REQUIRED for per-pane isolation.
+            Without it, React reconciles the existing `AgentChatPane`
+            Fiber across pane swaps (e.g. switching tabs in a workspace
+            with multiple chat panes, or a Chat-Agent preset click that
+            opens a new tab): the JSX shape is the same so the prior
+            pane's `useState<threadId>` value survives onto the new
+            pane, the mount effect's `if (threadId) { ensureThread;
+            return; }` early-exit fires, and the new pane subscribes to
+            the previous pane's Zustand slice — so both panes render
+            the same chat. Keying by pane_id forces a clean unmount/
+            remount and matches CLI panes' per-session_id isolation.
+          */}
+          <AgentChatPane key={node.pane_id} pane={node} />
         </div>
       </div>
     );

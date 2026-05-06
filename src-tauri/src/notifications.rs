@@ -41,10 +41,17 @@ fn show_desktop_notification(app: &AppHandle, summary: &str, body: &str) {
     {
         notification
             .hint(notify_rust::Hint::DesktopEntry(
-                "com.codemux.app".to_string(),
+                app.config().identifier.clone(),
             ))
             .hint(notify_rust::Hint::Transient(true))
-            .urgency(notify_rust::Urgency::Critical)
+            // Use Normal urgency, not Critical. On every common Linux
+            // notification daemon (mako, dunst, GNOME Shell, KDE Plasma,
+            // xfce4-notifyd), Critical is reserved for emergencies and
+            // is intentionally non-expiring — the popup stays on screen
+            // until the user clicks it. "Agent finished" is routine, so
+            // Normal is the correct level and lets the daemon's normal
+            // expire-timeout dismiss the popup automatically.
+            .urgency(notify_rust::Urgency::Normal)
             .action("default", "Open");
     }
 
@@ -92,8 +99,9 @@ fn focus_app(app: &AppHandle) {
 
     #[cfg(target_os = "linux")]
     {
+        let class = format!("class:{}", app.config().identifier);
         let _ = Command::new("hyprctl")
-            .args(["dispatch", "focuswindow", "class:com.codemux.app"])
+            .args(["dispatch", "focuswindow", &class])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .output();

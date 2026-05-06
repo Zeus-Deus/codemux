@@ -43,6 +43,10 @@ import {
   LogOut,
   Globe,
   RotateCcw,
+  ShieldCheck,
+  BookOpen,
+  Server,
+  Sparkles,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -62,8 +66,8 @@ import {
   detectEditors,
   setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
+  setAiCommitMessageCli,
   setAiCommitMessageModel,
-  setAiResolverEnabled,
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
@@ -75,51 +79,114 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind } from "@/tauri/types";
+import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   getPresets,
+  reorderPresets,
   setPresetPinned,
   setPresetBarVisible,
   deletePreset,
   updatePreset,
 } from "@/tauri/commands";
 import { onPresetsChanged } from "@/tauri/events";
+import {
+  DndContext,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { GripVertical } from "lucide-react";
 
-type Section = "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
 
-const NAV_GROUPS: NavGroup[] = [
-  {
-    label: "PERSONAL",
-    items: [
-      { id: "account", label: "Account", icon: UserCircle },
-      { id: "appearance", label: "Appearance", icon: Palette },
-      { id: "notifications", label: "Notifications", icon: Bell },
-      { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
-    ],
-  },
-  {
-    label: "EDITOR & WORKFLOW",
-    items: [
-      { id: "editor", label: "Editor", icon: Code2 },
-      { id: "terminal", label: "Terminal", icon: TerminalSquare },
-      { id: "presets", label: "Presets", icon: Zap },
-      { id: "projects", label: "Projects", icon: FolderCog },
-      { id: "git", label: "Git", icon: GitBranch },
-      { id: "agent", label: "Agent", icon: Bot },
-      { id: "browser", label: "Browser", icon: Globe },
-      { id: "session_restore", label: "Session Restore", icon: RotateCcw },
-    ],
-  },
+/** Build the Settings nav groups for the current flag state.
+ *  - The "BETA FEATURES" group is always present at the top so users
+ *    can discover the toggle. Its single row stays visible regardless
+ *    of the flag.
+ *  - The Step 6–12 rows (Permissions, Skills, MCP Servers) are only
+ *    surfaced when the toggle is on; they reach into chat-only data.
+ *    Hiding them when off matches the "feature absent, no work
+ *    performed" promise of the master toggle.
+ *  - The pre-existing rows (Account, Appearance, …, Agent) stay
+ *    visible regardless. The Account section's Skills-sync subsection
+ *    is conditionally rendered separately below.
+ */
+function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
+  const editorWorkflowItems: NavItem[] = [
+    { id: "editor", label: "Editor", icon: Code2 },
+    { id: "terminal", label: "Terminal", icon: TerminalSquare },
+    { id: "presets", label: "Presets", icon: Zap },
+    { id: "projects", label: "Projects", icon: FolderCog },
+    { id: "git", label: "Git", icon: GitBranch },
+    { id: "agent", label: "Agent", icon: Bot },
+    ...(agentChatEnabled
+      ? ([
+          { id: "permissions", label: "Permissions", icon: ShieldCheck },
+          { id: "skills", label: "Skills", icon: BookOpen },
+          { id: "mcp", label: "MCP Servers", icon: Server },
+        ] as NavItem[])
+      : []),
+    { id: "browser", label: "Browser", icon: Globe },
+    { id: "session_restore", label: "Session Restore", icon: RotateCcw },
+  ];
+
+  return [
+    {
+      label: "BETA FEATURES",
+      items: [{ id: "beta_features", label: "Agent Chat", icon: Sparkles }],
+    },
+    {
+      label: "PERSONAL",
+      items: [
+        { id: "account", label: "Account", icon: UserCircle },
+        { id: "appearance", label: "Appearance", icon: Palette },
+        { id: "notifications", label: "Notifications", icon: Bell },
+        { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
+      ],
+    },
+    {
+      label: "EDITOR & WORKFLOW",
+      items: editorWorkflowItems,
+    },
+  ];
+}
+
+/** All sections that exist regardless of flag — used to validate the
+ *  initial-section URL hash. The Step 6–12-only sections are
+ *  intentionally included here too: a stale URL hash to `?settings=skills`
+ *  from a flag-on session falls back to "account" via the validity
+ *  check (see `initialSection` below) when the flag is off. */
+const ALL_SECTION_IDS: Section[] = [
+  "beta_features",
+  "account", "appearance", "editor", "terminal", "presets", "projects",
+  "git", "agent", "permissions", "skills", "mcp", "browser",
+  "shortcuts", "notifications", "session_restore",
 ];
 
-const ALL_SECTIONS = NAV_GROUPS.flatMap((g) => g.items);
-
 import { KeybindEditor } from "./keybind-editor";
+import { BetaFeaturesSection } from "./beta-features-section";
+import { McpSection } from "./mcp-section";
+import { PermissionsSection } from "./permissions-section";
+import { SkillsSection } from "./skills-section";
+import { SyncSection } from "./sync-section";
+import { useFeatureFlags } from "@/stores/feature-flags";
 
 function SettingRow({ label, description, children }: {
   label: string;
@@ -570,11 +637,62 @@ export function SettingsView() {
   const projectRoot = activeWorkspace?.project_root ?? null;
   const projectName = projectRoot ? projectRoot.split("/").pop() ?? "Project" : "Project";
 
-  const initialSection = (settingsSection && ALL_SECTIONS.some((n) => n.id === settingsSection) ? settingsSection : "account") as Section;
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const navGroups = buildNavGroups(enableAgentChat);
+  const visibleSectionIds = new Set(navGroups.flatMap((g) => g.items.map((i) => i.id)));
+  // The hash from a previous flag-on session might point at a section
+  // that's now hidden — fall back to "account" so the user lands on a
+  // visible page instead of a blank panel. ALL_SECTION_IDS is used for
+  // type-narrowing the URL parameter; visibleSectionIds enforces the
+  // current-flag visibility.
+  const initialSection: Section =
+    settingsSection && (ALL_SECTION_IDS as string[]).includes(settingsSection) && visibleSectionIds.has(settingsSection as Section)
+      ? (settingsSection as Section)
+      : "account";
   const [activeSection, setActiveSection] = useState<Section>(initialSection);
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+
+  // Drag-to-reorder presets list. 5px activation distance keeps a
+  // plain row click from engaging drag, so clicks still open the
+  // editor while drag motion engages sort. The reorder mutation
+  // writes to the global preset list — drag in the bar and drag
+  // here both flow through the same backend command.
+  const presetSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, {
+      coordinateGetter: sortableKeyboardCoordinates,
+    }),
+  );
+
+  const handlePresetDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    if (!presetStore) return;
+
+    const ids = presetStore.presets.map((p) => p.id);
+    const fromIndex = ids.indexOf(String(active.id));
+    const toIndex = ids.indexOf(String(over.id));
+    if (fromIndex < 0 || toIndex < 0) return;
+
+    // Optimistic local update so the row settles into place even
+    // before the server emits the next snapshot.
+    setPresetStore((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        presets: arrayMove(prev.presets, fromIndex, toIndex),
+      };
+    });
+
+    reorderPresets(String(active.id), toIndex).catch((err) => {
+      console.error("[settings] reorderPresets failed:", err);
+      // Resync from server on error — listener will fire if our
+      // optimistic update is stale.
+      getPresets().then((s) => setPresetStore(s)).catch(console.error);
+    });
+  };
 
   // Project scripts state
   const [setupScripts, setSetupScripts] = useState("");
@@ -675,6 +793,17 @@ export function SettingsView() {
                       </SettingRow>
                     </>
                   )}
+                  {enableAgentChat && (
+                    <>
+                      <Separator />
+                      <div className="pt-4 pb-2">
+                        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                          Skills sync
+                        </div>
+                        <SyncSection />
+                      </div>
+                    </>
+                  )}
                   <Separator />
                   <div className="pt-4">
                     <Button
@@ -712,7 +841,7 @@ export function SettingsView() {
               </SettingRow>
               <Separator />
               <SettingRow label="Font family" description="Applied to the entire app shell and terminal.">
-                <span className="text-sm text-muted-foreground">JetBrains Mono Variable</span>
+                <span className="text-sm text-muted-foreground">DM Sans Variable</span>
               </SettingRow>
               <Separator />
               <SettingRow label="Border radius" description="Controls the roundness of all UI elements.">
@@ -844,67 +973,33 @@ export function SettingsView() {
               <Separator />
               {presetStore ? (
                 <div className="space-y-2 pt-2">
-                  <p className="text-xs text-muted-foreground mb-3">Click a preset to edit details.</p>
-                  {presetStore.presets.map((preset) => (
-                    <div
-                      key={preset.id}
-                      className={`flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150 ${
-                        selectedPresetId === preset.id
-                          ? "border-foreground/40 bg-foreground/5"
-                          : "border-border/50 bg-card/50 hover:bg-accent/30"
-                      }`}
-                      onClick={() => setSelectedPresetId(preset.id)}
+                  <p className="text-xs text-muted-foreground mb-3">Drag the grip to reorder. Click a preset to edit.</p>
+                  <DndContext
+                    sensors={presetSensors}
+                    collisionDetection={closestCenter}
+                    onDragEnd={handlePresetDragEnd}
+                  >
+                    <SortableContext
+                      items={presetStore.presets.map((p) => p.id)}
+                      strategy={verticalListSortingStrategy}
                     >
-                      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium truncate">{preset.name}</span>
-                          {preset.is_builtin && (
-                            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
-                              built-in
-                            </Badge>
-                          )}
-                        </div>
-                        {preset.commands.length > 0 && (
-                          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
-                            {preset.commands[0]}
-                          </code>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setPresetPinned(preset.id, !preset.pinned).catch(console.error);
+                      {presetStore.presets.map((preset) => (
+                        <SortablePresetRow
+                          key={preset.id}
+                          preset={preset}
+                          selected={selectedPresetId === preset.id}
+                          onSelect={() => setSelectedPresetId(preset.id)}
+                          onTogglePin={() =>
+                            setPresetPinned(preset.id, !preset.pinned).catch(console.error)
+                          }
+                          onDelete={() => {
+                            deletePreset(preset.id).catch(console.error);
+                            if (selectedPresetId === preset.id) setSelectedPresetId(null);
                           }}
-                        >
-                          {preset.pinned ? (
-                            <Pin className="h-3.5 w-3.5 text-foreground" />
-                          ) : (
-                            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
-                          )}
-                        </Button>
-                        {!preset.is_builtin && (
-                          <Button
-                            variant="ghost"
-                            size="icon-xs"
-                            title="Delete preset"
-                            className="hover:bg-destructive/80"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              deletePreset(preset.id).catch(console.error);
-                              if (selectedPresetId === preset.id) setSelectedPresetId(null);
-                            }}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
-                        )}
-                      </div>
-                    </div>
-                  ))}
+                        />
+                      ))}
+                    </SortableContext>
+                  </DndContext>
                 </div>
               ) : (
                 <p className="text-sm text-muted-foreground">Loading presets...</p>
@@ -960,15 +1055,28 @@ export function SettingsView() {
                     }}
                   />
                 </SettingRow>
-                <SettingRow label="Model override" description="Leave empty to use the Claude CLI default.">
-                  <Input
-                    value={config?.ai_commit_message_model ?? ""}
-                    onChange={(e) => {
-                      setAiCommitMessageModel(e.target.value || null).catch(console.error);
-                      storeSet("ai_commit_message_model", e.target.value || "");
+                {/* Same `MultiProviderModelPicker` the resolver row below
+                    uses (and the agent-chat composer). All three providers
+                    are shown — the commit-message backend in
+                    `src-tauri/src/ai.rs:generate_commit_message` now
+                    dispatches via `build_resolver_argv`, the same builder
+                    the merge resolver uses, so claude / codex / opencode
+                    all work. Picking a model atomically writes both the
+                    CLI and the model so they can never drift out of sync.
+                    Reuse buys us favorites carry-over for free: star a
+                    model anywhere (chat composer, this row, the resolver
+                    row) and it's starred everywhere via the shared
+                    `picker-favorites-store`. */}
+                <SettingRow label="Agent" description="Which AI agent (and model) generates commit messages.">
+                  <MultiProviderModelPicker
+                    provider={(config?.ai_commit_message_cli ?? "claude") as AgentChatProviderKind}
+                    model={config?.ai_commit_message_model ?? null}
+                    onProviderModelChange={(provider, model) => {
+                      setAiCommitMessageCli(provider).catch(console.error);
+                      storeSet("ai_commit_message_cli", provider);
+                      setAiCommitMessageModel(model).catch(console.error);
+                      storeSet("ai_commit_message_model", model);
                     }}
-                    placeholder="Default"
-                    className="w-36 h-9"
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
                 </SettingRow>
@@ -978,47 +1086,33 @@ export function SettingsView() {
             <div className="mt-8">
               <h3 className="text-sm font-medium mb-1">Merge Conflict Resolver</h3>
               <p className="text-xs text-muted-foreground mb-4">
-                AI-powered merge conflict resolution. Creates a safe temp branch, resolves conflicts, then lets you review before applying.
+                AI-powered merge conflict resolution. When conflicts are detected, the AI works on a temp branch and you review the diff before applying.
               </p>
               <div className="space-y-1">
-                <SettingRow label="Enable resolver" description="Show 'Resolve with AI' button in the conflicts section.">
-                  <Switch
-                    checked={config?.ai_resolver_enabled ?? false}
-                    onCheckedChange={(checked) => {
-                      setAiResolverEnabled(checked).catch(console.error);
-                      storeSet("ai_resolver_enabled", String(checked));
+                {/* One picker that sets BOTH `ai_resolver_cli` and
+                    `ai_resolver_model`. Same component the agent-chat
+                    composer uses (provider rail + searchable model list),
+                    populated from the same `provider-capabilities-store` —
+                    so opencode shows the user's actual configured providers,
+                    not a hardcoded list. Replaces the previous "CLI tool"
+                    Select + freeform "Model override" Input pair, which had
+                    two failure modes: (a) typing a model name that didn't
+                    exist for the selected CLI, (b) the CLI selector and
+                    model field drifting out of sync. The picker keeps them
+                    inherently consistent. */}
+                <SettingRow
+                  label="Agent"
+                  description="Which AI agent (and model) resolves conflicts."
+                >
+                  <MultiProviderModelPicker
+                    provider={(config?.ai_resolver_cli ?? "claude") as AgentChatProviderKind}
+                    model={config?.ai_resolver_model ?? null}
+                    onProviderModelChange={(provider, model) => {
+                      setAiResolverCli(provider).catch(console.error);
+                      storeSet("ai_resolver_cli", provider);
+                      setAiResolverModel(model).catch(console.error);
+                      storeSet("ai_resolver_model", model);
                     }}
-                  />
-                </SettingRow>
-                <SettingRow label="CLI tool" description="Which AI CLI to use for resolving conflicts.">
-                  <Select
-                    value={config?.ai_resolver_cli ?? "claude"}
-                    onValueChange={(v) => {
-                      setAiResolverCli(v).catch(console.error);
-                      storeSet("ai_resolver_cli", v);
-                    }}
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
-                  >
-                    <SelectTrigger className="w-36 h-9">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="claude">Claude Code</SelectItem>
-                      <SelectItem value="codex">Codex</SelectItem>
-                      <SelectItem value="opencode">OpenCode</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </SettingRow>
-                <SettingRow label="Model override" description="Leave empty to use the CLI default.">
-                  <Input
-                    value={config?.ai_resolver_model ?? ""}
-                    onChange={(e) => {
-                      setAiResolverModel(e.target.value || null).catch(console.error);
-                      storeSet("ai_resolver_model", e.target.value || "");
-                    }}
-                    placeholder="Default"
-                    className="w-36 h-9"
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
                   />
                 </SettingRow>
                 <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
@@ -1028,7 +1122,6 @@ export function SettingsView() {
                       setAiResolverStrategy(v).catch(console.error);
                       storeSet("ai_resolver_strategy", v);
                     }}
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
                     <SelectTrigger className="w-48 h-9">
                       <SelectValue />
@@ -1071,6 +1164,34 @@ export function SettingsView() {
               </SettingRow>
             </div>
           </div>
+        );
+
+      case "beta_features":
+        return <BetaFeaturesSection />;
+
+      case "permissions":
+        // Defensive guard: the nav row is hidden when the Beta toggle
+        // is off, but a stale URL hash can still route here. Render
+        // the Beta toggle instead so the user lands somewhere useful
+        // and learns how to enable the feature.
+        return enableAgentChat ? (
+          <PermissionsSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
+        );
+
+      case "skills":
+        return enableAgentChat ? (
+          <SkillsSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
+        );
+
+      case "mcp":
+        return enableAgentChat ? (
+          <McpSection projectRoot={projectRoot} />
+        ) : (
+          <BetaFeaturesSection />
         );
 
       case "browser":
@@ -1283,7 +1404,7 @@ export function SettingsView() {
       <div className="flex flex-1 min-h-0">
         {/* Left nav */}
         <nav className="w-52 shrink-0 border-r border-border p-3 space-y-4">
-          {NAV_GROUPS.map((group) => (
+          {navGroups.map((group) => (
             <div key={group.label}>
               <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
                 {group.label}
@@ -1319,6 +1440,111 @@ export function SettingsView() {
             {renderSection()}
           </div>
         </ScrollArea>
+      </div>
+    </div>
+  );
+}
+
+interface SortablePresetRowProps {
+  preset: TerminalPreset;
+  selected: boolean;
+  onSelect: () => void;
+  onTogglePin: () => void;
+  onDelete: () => void;
+}
+
+function SortablePresetRow({
+  preset,
+  selected,
+  onSelect,
+  onTogglePin,
+  onDelete,
+}: SortablePresetRowProps) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: preset.id });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : undefined,
+    zIndex: isDragging ? 1 : undefined,
+  };
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={cn(
+        "group flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150",
+        selected
+          ? "border-foreground/40 bg-foreground/5"
+          : "border-border/50 bg-card/50 hover:bg-accent/30",
+      )}
+      onClick={onSelect}
+    >
+      <button
+        type="button"
+        className="-ml-1 -mr-1 p-1 rounded hover:bg-accent/50 text-muted-foreground/40 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none"
+        aria-label="Drag to reorder"
+        title="Drag to reorder"
+        onClick={(e) => e.stopPropagation()}
+        {...attributes}
+        {...listeners}
+      >
+        <GripVertical className="h-4 w-4" />
+      </button>
+      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-medium truncate">{preset.name}</span>
+          {preset.is_builtin && (
+            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+              built-in
+            </Badge>
+          )}
+        </div>
+        {preset.commands.length > 0 && (
+          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
+            {preset.commands[0]}
+          </code>
+        )}
+      </div>
+      <div className="flex items-center gap-1 shrink-0">
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+          onClick={(e) => {
+            e.stopPropagation();
+            onTogglePin();
+          }}
+        >
+          {preset.pinned ? (
+            <Pin className="h-3.5 w-3.5 text-foreground" />
+          ) : (
+            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
+          )}
+        </Button>
+        {!preset.is_builtin && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Delete preset"
+            className="hover:bg-destructive/80"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        )}
       </div>
     </div>
   );
