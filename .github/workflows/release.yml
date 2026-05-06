@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-22.04'
@@ -61,10 +61,12 @@ jobs:
           key: ${{ matrix.os }}
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          # Node 22 — GitHub is deprecating Node 20 runners starting
-          # June 2026. See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+          # Node 22 for the project's npm scripts. The action itself is on
+          # @v5 (Node 24 runtime) so it won't trip GitHub's Node-20-actions
+          # deprecation that takes effect 2026-06-02.
+          # See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
           node-version: 22
           cache: npm
 
