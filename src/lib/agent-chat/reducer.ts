@@ -15,6 +15,27 @@ function nextId(prefix: string): string {
   return `${prefix}-${idCounter}`;
 }
 
+/**
+ * Hard cap on retained transcript items per thread. The reducer keeps every
+ * message in memory so streaming deltas can mutate the trailing assistant
+ * row in place; nothing prunes it. Long-running threads (10k+ items) push
+ * the spread cost on every event and the React fan-out into territory
+ * that visibly stalls the main thread. The cap only fires when the thread
+ * is between turns and has no pending approvals — dropping head items
+ * mid-turn would orphan `tool_use_id` / `request_id` correlation lookups
+ * (`findToolCallByUseId`, `findPermissionRequest`) that scan the full array.
+ */
+const MAX_MESSAGES_PER_THREAD = 5_000;
+const TRIM_TARGET_MESSAGES = 4_000;
+
+function maybeCapMessages(state: ChatThreadState): ChatThreadState {
+  if (state.messages.length <= MAX_MESSAGES_PER_THREAD) return state;
+  if (state.streaming) return state;
+  if (state.pendingRequestIds.length > 0) return state;
+  const drop = state.messages.length - TRIM_TARGET_MESSAGES;
+  return { ...state, messages: state.messages.slice(drop) };
+}
+
 /** Tools whose UI is owned by a dedicated specialized renderer
  *  (`PlanProposalBlock` inline, `ComposerPendingInputPanel` attached
  *  to the composer) driven by the `permission_request` row. We
@@ -121,7 +142,7 @@ export function appendUserMessage(
   state: ChatThreadState,
   text: string,
 ): ChatThreadState {
-  return appendUserMessageLocal(state, text);
+  return maybeCapMessages(appendUserMessageLocal(state, text));
 }
 
 /**
@@ -170,6 +191,13 @@ export function markRequestResolved(
 }
 
 export function applyEvent(
+  state: ChatThreadState,
+  event: ProviderRuntimeEvent,
+): ChatThreadState {
+  return maybeCapMessages(applyEventInner(state, event));
+}
+
+function applyEventInner(
   state: ChatThreadState,
   event: ProviderRuntimeEvent,
 ): ChatThreadState {

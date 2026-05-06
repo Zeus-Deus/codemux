@@ -774,4 +774,59 @@ describe("agent-chat reducer", () => {
     )!;
     expect(assistants[1].seq).toBeGreaterThan(permReq.seq);
   });
+
+  it("caps message history once the thread quiets between turns", () => {
+    // Long-running threads accumulate transcript items forever. Without
+    // a cap, every reducer event spreads into a growing array and the
+    // React fan-out scales with item count, eventually stalling the
+    // main thread. The cap kicks in only between turns (not streaming,
+    // no pending requests) so mid-turn correlation lookups against
+    // earlier `tool_use_id` / `request_id` rows can't be orphaned.
+    let state = createEmptyThreadState();
+    // 5500 sealed user/assistant pairs — well beyond MAX_MESSAGES_PER_THREAD.
+    for (let i = 0; i < 5500; i += 1) {
+      state = appendUserMessage(state, `msg-${i}`);
+    }
+
+    expect(state.messages.length).toBeLessThanOrEqual(5_000);
+    // Trim should drop the oldest items, not the most recent ones.
+    const lastFive = state.messages.slice(-5).map((m) => {
+      if (m.kind !== "user_message") {
+        throw new Error("expected user_message");
+      }
+      return m.text;
+    });
+    expect(lastFive).toEqual([
+      "msg-5495",
+      "msg-5496",
+      "msg-5497",
+      "msg-5498",
+      "msg-5499",
+    ]);
+  });
+
+  it("does not trim mid-stream or while approvals are pending", () => {
+    // Mid-turn drops would orphan tool_use_id / request_id correlation
+    // (`findToolCallByUseId`, `findPermissionRequest`) that scan the
+    // full array — the guard must hold even when the array is huge.
+    let state: ChatThreadState = {
+      ...createEmptyThreadState(),
+      streaming: true,
+    };
+    for (let i = 0; i < 5500; i += 1) {
+      state = appendUserMessage(state, `msg-${i}`);
+    }
+    expect(state.streaming).toBe(true);
+    expect(state.messages.length).toBe(5_500);
+
+    state = {
+      ...createEmptyThreadState(),
+      pendingRequestIds: ["req-1"],
+    };
+    for (let i = 0; i < 5500; i += 1) {
+      state = appendUserMessage(state, `msg-${i}`);
+    }
+    expect(state.pendingRequestIds).toEqual(["req-1"]);
+    expect(state.messages.length).toBe(5_500);
+  });
 });

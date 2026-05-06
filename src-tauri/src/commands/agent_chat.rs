@@ -192,9 +192,17 @@ pub fn agent_chat_close_pane(
     pane_id: String,
 ) -> Result<(), String> {
     feature_flag_on(&observability)?;
+    // Capture the chat session bound to this pane *before* the tree
+    // mutation so the cleanup path still has provider + thread_id to
+    // hand to `stop_session`. Without this the JSON-RPC sidecar and
+    // its background tokio tasks live on after the pane disappears.
+    let chat_thread = state.agent_chat_pane_thread(&pane_id);
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
     let _ = state.close_pane(&pane_id);
+    if let Some(pair) = chat_thread {
+        shutdown_agent_chat_threads(&app, vec![pair]);
+    }
     crate::state::emit_app_state(&app);
     Ok(())
 }
@@ -565,6 +573,40 @@ pub async fn agent_chat_stop_session(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     impl_.stop_session(thread_id).await.map_err(provider_err)
+}
+
+/// Fire-and-forget cleanup for chat sessions whose owning pane/tab/workspace
+/// just got removed. Without this, `provider.stop_session` is never called
+/// during workspace or tab close — the session keeps its JSON-RPC sidecar
+/// child alive and its background tokio tasks hold `Arc<Session>` in a
+/// refcycle with the session's own `JoinHandle` vec, so `Drop` never
+/// fires. Each closed worktree leaks one sidecar process plus its task
+/// graph until the whole app is killed.
+///
+/// Skips the feature-flag gate intentionally: the gate guards new session
+/// creation, but already-running sessions must be reaped regardless of
+/// whether the flag has since been flipped off.
+pub fn shutdown_agent_chat_threads(
+    app: &AppHandle,
+    threads: Vec<(ProviderKind, String)>,
+) {
+    if threads.is_empty() {
+        return;
+    }
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let registry: State<'_, ProviderRegistry> = app_handle.state();
+        for (kind, thread_id) in threads {
+            let Some(impl_) = registry.get(kind).await else {
+                continue;
+            };
+            if let Err(error) = impl_.stop_session(ThreadId(thread_id.clone())).await {
+                eprintln!(
+                    "[agent_chat] cleanup stop_session failed for {kind:?} {thread_id}: {error:?}"
+                );
+            }
+        }
+    });
 }
 
 // ── Session history (for the pane-header dropdown) ──────────────────

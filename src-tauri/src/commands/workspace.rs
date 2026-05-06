@@ -553,6 +553,11 @@ pub fn close_workspace_with_worktree(
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
 
+    crate::commands::agent_chat::shutdown_agent_chat_threads(
+        &app,
+        close_result.removed_agent_chat_threads,
+    );
+
     // Release virtual display for this workspace (idempotent).
     {
         let vd_manager: State<
@@ -727,6 +732,11 @@ pub fn close_workspace(
     for session_id in result.removed_sessions {
         crate::terminal::terminate_pty_session(&terminal_state.sessions, &session_id.0);
     }
+
+    crate::commands::agent_chat::shutdown_agent_chat_threads(
+        &app,
+        result.removed_agent_chat_threads,
+    );
 
     // Release the virtual display (if any) allocated for this workspace.
     // Idempotent — no-op if no display was ever acquired.
@@ -1040,6 +1050,11 @@ pub fn close_tab(
         // Tab close is cleanup, not explicit dismissal — agent can reopen the pane.
         state.detach_agent_browser_from_pane(&browser_id.0, false);
     }
+
+    crate::commands::agent_chat::shutdown_agent_chat_threads(
+        &app,
+        result.removed_agent_chat_threads,
+    );
 
     crate::state::emit_app_state(&app);
     Ok(())

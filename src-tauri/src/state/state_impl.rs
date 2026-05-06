@@ -1282,6 +1282,7 @@ impl AppStateStore {
 
             let removed = snapshot.workspaces.remove(workspace_index);
             let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
+            let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
             snapshot
                 .notifications
                 .retain(|notification| notification.workspace_id != removed.workspace_id);
@@ -1300,6 +1301,7 @@ impl AppStateStore {
                     .into_iter()
                     .map(SessionId)
                     .collect(),
+                removed_agent_chat_threads,
             });
         }
 
@@ -1311,6 +1313,7 @@ impl AppStateStore {
 
         let removed = snapshot.workspaces.remove(workspace_index);
         let removed_session_id_strings = collect_terminal_sessions(&removed.surfaces);
+        let removed_agent_chat_threads = collect_agent_chat_threads(&removed.surfaces);
         snapshot
             .notifications
             .retain(|notification| notification.workspace_id != removed.workspace_id);
@@ -1335,6 +1338,7 @@ impl AppStateStore {
                 .into_iter()
                 .map(SessionId)
                 .collect(),
+            removed_agent_chat_threads,
         })
     }
 
@@ -1683,6 +1687,25 @@ impl AppStateStore {
     pub fn workspace_id_for_session(&self, session_id: &str) -> Option<WorkspaceId> {
         let snapshot = self.inner.lock().unwrap();
         find_workspace_id_for_session(&snapshot.workspaces, session_id)
+    }
+
+    /// Look up the `(provider, thread_id)` pair for an `AgentChat` pane.
+    /// Returns `None` when the pane id is unknown, the pane is not an
+    /// agent-chat leaf, or no session has been bound yet. Callers use this
+    /// to capture the session-cleanup target before mutating the tree.
+    pub fn agent_chat_pane_thread(
+        &self,
+        pane_id: &str,
+    ) -> Option<(crate::agent_provider::ProviderKind, String)> {
+        let snapshot = self.inner.lock().unwrap();
+        for workspace in &snapshot.workspaces {
+            for surface in &workspace.surfaces {
+                if let Some(pair) = agent_chat_thread_pair_for_pane(&surface.root, pane_id) {
+                    return Some(pair);
+                }
+            }
+        }
+        None
     }
 
     pub fn close_pane(&self, pane_id: &str) -> Result<Option<SessionId>, String> {
@@ -2392,6 +2415,8 @@ impl AppStateStore {
         // Collect resources to clean up
         let mut removed_sessions: Vec<SessionId> = vec![];
         let mut removed_browser_ids: Vec<BrowserId> = vec![];
+        let mut removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)> =
+            vec![];
 
         // Tab-level browser ID (for dedicated browser tabs)
         if let Some(ref bid) = tab.browser_id {
@@ -2409,6 +2434,10 @@ impl AppStateStore {
                 let surface = workspace.surfaces.remove(surface_index);
                 collect_session_ids_from_tree(&surface.root, &mut removed_sessions);
                 collect_browser_ids_from_tree(&surface.root, &mut removed_browser_ids);
+                collect_agent_chat_threads_from_tree(
+                    &surface.root,
+                    &mut removed_agent_chat_threads,
+                );
             }
         }
 
@@ -2444,6 +2473,7 @@ impl AppStateStore {
         Ok(CloseTabResult {
             removed_sessions,
             removed_browser_ids,
+            removed_agent_chat_threads,
         })
     }
 
@@ -2584,6 +2614,7 @@ impl AppStateStore {
 pub struct CloseTabResult {
     pub removed_sessions: Vec<SessionId>,
     pub removed_browser_ids: Vec<BrowserId>,
+    pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
 }
 
 /// Return value of `AppStateStore::close_workspace`. Carries both the fallback
@@ -2597,6 +2628,7 @@ pub struct CloseTabResult {
 pub struct CloseWorkspaceResult {
     pub fallback: WorkspaceId,
     pub removed_sessions: Vec<SessionId>,
+    pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
@@ -2606,6 +2638,27 @@ fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionI
         PaneNodeSnapshot::Split { children, .. } => {
             for child in children {
                 collect_session_ids_from_tree(child, out);
+            }
+        }
+    }
+}
+
+fn collect_agent_chat_threads_from_tree(
+    node: &PaneNodeSnapshot,
+    out: &mut Vec<(crate::agent_provider::ProviderKind, String)>,
+) {
+    match node {
+        PaneNodeSnapshot::AgentChat {
+            thread_id: Some(thread),
+            provider: Some(kind),
+            ..
+        } => out.push((*kind, thread.clone())),
+        PaneNodeSnapshot::AgentChat { .. }
+        | PaneNodeSnapshot::Terminal { .. }
+        | PaneNodeSnapshot::Browser { .. } => {}
+        PaneNodeSnapshot::Split { children, .. } => {
+            for child in children {
+                collect_agent_chat_threads_from_tree(child, out);
             }
         }
     }
@@ -2736,6 +2789,28 @@ fn agent_chat_thread_for_pane(
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .find_map(|child| agent_chat_thread_for_pane(child, target_pane_id)),
+        _ => None,
+    }
+}
+
+/// Locate an `AgentChat` leaf with an active session and return its
+/// `(provider, thread_id)` pair. `None` when the pane id does not match,
+/// is not an agent-chat leaf, or has not yet been bound to a thread —
+/// callers (workspace/tab/pane close) treat that as nothing to tear down.
+fn agent_chat_thread_pair_for_pane(
+    root: &PaneNodeSnapshot,
+    target_pane_id: &str,
+) -> Option<(crate::agent_provider::ProviderKind, String)> {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id: Some(thread),
+            provider: Some(kind),
+            ..
+        } if pane_id.0 == target_pane_id => Some((*kind, thread.clone())),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| agent_chat_thread_pair_for_pane(child, target_pane_id)),
         _ => None,
     }
 }
@@ -3102,6 +3177,23 @@ pub fn collect_terminal_sessions(surfaces: &[SurfaceSnapshot]) -> Vec<String> {
         .iter()
         .flat_map(|surface| collect_terminal_sessions_from_node(&surface.root))
         .collect()
+}
+
+/// Walk every surface in a workspace and pull out `(provider, thread_id)`
+/// pairs for `AgentChat` panes that have an active session bound. Used by
+/// the workspace/tab close paths to feed `provider.stop_session` so the
+/// JSON-RPC sidecar process and its background tokio tasks tear down
+/// instead of leaking — the tasks keep `Arc<Session>` alive in a refcycle
+/// with the session's `JoinHandle` vec, so `Drop` never fires unless
+/// `stop_session` aborts them via the shutdown channel.
+pub fn collect_agent_chat_threads(
+    surfaces: &[SurfaceSnapshot],
+) -> Vec<(crate::agent_provider::ProviderKind, String)> {
+    let mut out = Vec::new();
+    for surface in surfaces {
+        collect_agent_chat_threads_from_tree(&surface.root, &mut out);
+    }
+    out
 }
 
 fn collect_terminal_sessions_from_node(root: &PaneNodeSnapshot) -> Vec<String> {
@@ -4893,6 +4985,74 @@ mod tests {
             store.agent_chat_thread_id(&pane_id.0),
             Some("thread-xyz".into())
         );
+    }
+
+    /// Regression guard for the agent-chat sidecar leak fix.
+    ///
+    /// Closing a workspace must surface every bound `(provider, thread_id)`
+    /// pair so the command layer can call `provider.stop_session` for
+    /// each. Without this list the JSON-RPC sidecar children stayed
+    /// alive and their background tokio tasks held `Arc<Session>` in a
+    /// refcycle with the session's own `JoinHandle` vec, so `Drop`
+    /// never fired and every closed worktree leaked one sidecar plus
+    /// its task graph until the whole app was killed.
+    #[test]
+    fn close_workspace_result_contains_agent_chat_threads() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-agent-chat-close"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Bind two chat panes: one with a live session, one still unbound.
+        // Only the live one should be returned for cleanup.
+        let pane_a = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_a.0, Some("thread-live".into()));
+
+        let _pane_unbound = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Codex), None, None)
+            .unwrap();
+
+        let result = store
+            .close_workspace(&ws_id.0)
+            .expect("close_workspace should succeed");
+
+        assert_eq!(
+            result.removed_agent_chat_threads,
+            vec![(ProviderKind::Claude, "thread-live".to_string())],
+            "close_workspace must surface only chat panes with bound threads",
+        );
+    }
+
+    /// Regression guard mirroring the workspace-close cleanup for `close_pane`.
+    /// Closing a single agent-chat pane must let the command layer reach
+    /// the bound session before the pane disappears from the tree.
+    #[test]
+    fn agent_chat_pane_thread_returns_bound_pair() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&ws_id.0, Some(ProviderKind::Claude), None, None)
+            .unwrap();
+
+        // Unbound pane returns None — nothing to tear down.
+        assert_eq!(store.agent_chat_pane_thread(&pane_id.0), None);
+
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-zzz".into()));
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Claude, "thread-zzz".to_string()))
+        );
+
+        // Unknown pane id is a clean None, not a panic.
+        assert_eq!(store.agent_chat_pane_thread("does-not-exist"), None);
     }
 
     #[test]
