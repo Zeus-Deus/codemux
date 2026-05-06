@@ -903,7 +903,10 @@ pub fn notify_attention(
             notification
                 .hint(notify_rust::Hint::DesktopEntry(app.config().identifier.clone()))
                 .hint(notify_rust::Hint::Transient(true))
-                .urgency(notify_rust::Urgency::Critical);
+                // Normal urgency, not Critical: see notifications.rs for
+                // the reasoning. Critical is non-expiring on mako/dunst/
+                // GNOME/KDE — wrong fit for routine attention requests.
+                .urgency(notify_rust::Urgency::Normal);
         }
         let _ = notification.show();
 

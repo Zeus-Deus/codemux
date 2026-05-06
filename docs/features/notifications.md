@@ -12,7 +12,7 @@ Codemux has a multi-layer notification system: workspace-scoped alert badges in 
 
 ## Current Model
 
-Notifications originate from the Rust backend. Desktop notifications use `notify_rust::Notification` with critical urgency and the `com.codemux.app` desktop entry. Workspace alerts are stored in app state and surfaced in the sidebar with unread badge counts. The frontend subscribes to state change events to update notification UI.
+Notifications originate from the Rust backend. Desktop notifications use `notify_rust::Notification` with normal urgency and the `com.codemux.app` desktop entry. Normal urgency lets every common Linux notification daemon (mako, dunst, GNOME Shell, KDE Plasma, xfce4-notifyd) auto-dismiss popups after their configured timeout — Critical is reserved by those daemons for non-expiring system emergencies and would leave Codemux popups on screen until the user clicked them. Workspace alerts are stored in app state and surfaced in the sidebar with unread badge counts. The frontend subscribes to state change events to update notification UI.
 
 ## What Works Today
 
