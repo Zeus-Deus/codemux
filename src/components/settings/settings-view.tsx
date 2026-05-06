@@ -66,8 +66,8 @@ import {
   detectEditors,
   setNotificationSoundEnabled,
   setAiCommitMessageEnabled,
+  setAiCommitMessageCli,
   setAiCommitMessageModel,
-  setAiResolverEnabled,
   setAiResolverCli,
   setAiResolverModel,
   setAiResolverStrategy,
@@ -79,7 +79,8 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind } from "@/tauri/types";
+import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
@@ -1054,15 +1055,28 @@ export function SettingsView() {
                     }}
                   />
                 </SettingRow>
-                <SettingRow label="Model override" description="Leave empty to use the Claude CLI default.">
-                  <Input
-                    value={config?.ai_commit_message_model ?? ""}
-                    onChange={(e) => {
-                      setAiCommitMessageModel(e.target.value || null).catch(console.error);
-                      storeSet("ai_commit_message_model", e.target.value || "");
+                {/* Same `MultiProviderModelPicker` the resolver row below
+                    uses (and the agent-chat composer). All three providers
+                    are shown — the commit-message backend in
+                    `src-tauri/src/ai.rs:generate_commit_message` now
+                    dispatches via `build_resolver_argv`, the same builder
+                    the merge resolver uses, so claude / codex / opencode
+                    all work. Picking a model atomically writes both the
+                    CLI and the model so they can never drift out of sync.
+                    Reuse buys us favorites carry-over for free: star a
+                    model anywhere (chat composer, this row, the resolver
+                    row) and it's starred everywhere via the shared
+                    `picker-favorites-store`. */}
+                <SettingRow label="Agent" description="Which AI agent (and model) generates commit messages.">
+                  <MultiProviderModelPicker
+                    provider={(config?.ai_commit_message_cli ?? "claude") as AgentChatProviderKind}
+                    model={config?.ai_commit_message_model ?? null}
+                    onProviderModelChange={(provider, model) => {
+                      setAiCommitMessageCli(provider).catch(console.error);
+                      storeSet("ai_commit_message_cli", provider);
+                      setAiCommitMessageModel(model).catch(console.error);
+                      storeSet("ai_commit_message_model", model);
                     }}
-                    placeholder="Default"
-                    className="w-36 h-9"
                     disabled={!(config?.ai_commit_message_enabled ?? true)}
                   />
                 </SettingRow>
@@ -1072,47 +1086,33 @@ export function SettingsView() {
             <div className="mt-8">
               <h3 className="text-sm font-medium mb-1">Merge Conflict Resolver</h3>
               <p className="text-xs text-muted-foreground mb-4">
-                AI-powered merge conflict resolution. Creates a safe temp branch, resolves conflicts, then lets you review before applying.
+                AI-powered merge conflict resolution. When conflicts are detected, the AI works on a temp branch and you review the diff before applying.
               </p>
               <div className="space-y-1">
-                <SettingRow label="Enable resolver" description="Show 'Resolve with AI' button in the conflicts section.">
-                  <Switch
-                    checked={config?.ai_resolver_enabled ?? false}
-                    onCheckedChange={(checked) => {
-                      setAiResolverEnabled(checked).catch(console.error);
-                      storeSet("ai_resolver_enabled", String(checked));
+                {/* One picker that sets BOTH `ai_resolver_cli` and
+                    `ai_resolver_model`. Same component the agent-chat
+                    composer uses (provider rail + searchable model list),
+                    populated from the same `provider-capabilities-store` —
+                    so opencode shows the user's actual configured providers,
+                    not a hardcoded list. Replaces the previous "CLI tool"
+                    Select + freeform "Model override" Input pair, which had
+                    two failure modes: (a) typing a model name that didn't
+                    exist for the selected CLI, (b) the CLI selector and
+                    model field drifting out of sync. The picker keeps them
+                    inherently consistent. */}
+                <SettingRow
+                  label="Agent"
+                  description="Which AI agent (and model) resolves conflicts."
+                >
+                  <MultiProviderModelPicker
+                    provider={(config?.ai_resolver_cli ?? "claude") as AgentChatProviderKind}
+                    model={config?.ai_resolver_model ?? null}
+                    onProviderModelChange={(provider, model) => {
+                      setAiResolverCli(provider).catch(console.error);
+                      storeSet("ai_resolver_cli", provider);
+                      setAiResolverModel(model).catch(console.error);
+                      storeSet("ai_resolver_model", model);
                     }}
-                  />
-                </SettingRow>
-                <SettingRow label="CLI tool" description="Which AI CLI to use for resolving conflicts.">
-                  <Select
-                    value={config?.ai_resolver_cli ?? "claude"}
-                    onValueChange={(v) => {
-                      setAiResolverCli(v).catch(console.error);
-                      storeSet("ai_resolver_cli", v);
-                    }}
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
-                  >
-                    <SelectTrigger className="w-36 h-9">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="claude">Claude Code</SelectItem>
-                      <SelectItem value="codex">Codex</SelectItem>
-                      <SelectItem value="opencode">OpenCode</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </SettingRow>
-                <SettingRow label="Model override" description="Leave empty to use the CLI default.">
-                  <Input
-                    value={config?.ai_resolver_model ?? ""}
-                    onChange={(e) => {
-                      setAiResolverModel(e.target.value || null).catch(console.error);
-                      storeSet("ai_resolver_model", e.target.value || "");
-                    }}
-                    placeholder="Default"
-                    className="w-36 h-9"
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
                   />
                 </SettingRow>
                 <SettingRow label="Strategy" description="How the AI should approach conflict resolution.">
@@ -1122,7 +1122,6 @@ export function SettingsView() {
                       setAiResolverStrategy(v).catch(console.error);
                       storeSet("ai_resolver_strategy", v);
                     }}
-                    disabled={!(config?.ai_resolver_enabled ?? false)}
                   >
                     <SelectTrigger className="w-48 h-9">
                       <SelectValue />

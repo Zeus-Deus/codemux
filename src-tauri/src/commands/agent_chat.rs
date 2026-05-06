@@ -510,13 +510,19 @@ pub async fn agent_chat_set_permission_mode(
 /// frontend store's `opencodeError` slot — Stage 6 surfaces it as a
 /// "configure OpenCode" hint.
 ///
-/// Step 13 — gated on `enable_agent_chat`. When the master Beta toggle
-/// is off this returns the standard `feature_disabled` error so the
-/// frontend's capabilities store can short-circuit without spawning
-/// `opencode serve` or harvesting `codex app-server`. The matching
-/// frontend hook (`useProviderCapabilitiesInit`) also early-returns
-/// when the flag is off so the call is never made in the steady
-/// state — this gate is the defence-in-depth against a stale caller.
+/// Originally gated on `enable_agent_chat` (Step 13) so non-Beta users
+/// couldn't trigger `opencode serve` or `codex app-server` harvest.
+/// That gate was lifted because the same capabilities bundle is now
+/// consumed by the merge-resolver settings panel — a non-Beta surface
+/// that legitimately needs the model list. The harvest is still safe:
+/// Claude returns its static fallback (no spawning); Codex/OpenCode
+/// each shell out only if their binary is on PATH and bubble a typed
+/// "not installed" / "not authenticated" error otherwise, which the
+/// frontend renders as a tooltip in the picker rail.
+///
+/// The chat session machinery (`agent_chat_send`, `agent_chat_resume`,
+/// etc.) remains gated — the gate moved off "data discovery" and onto
+/// "actually using the chat", which is the correct level.
 #[tauri::command]
 pub async fn list_chat_provider_capabilities(
     app: AppHandle,
@@ -530,8 +536,13 @@ pub async fn list_chat_provider_capabilities(
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
     >,
 ) -> Result<ProviderChatCapabilities, String> {
-    let observability: State<'_, ObservabilityStore> = app.state();
-    feature_flag_on(&observability)?;
+    // Note: `feature_flag_on(&observability)?;` was deliberately
+    // removed when settings began consuming capabilities. See the
+    // function-level comment for the rationale. The `app` handle is
+    // still in the signature because removing it would be a public
+    // API break; downstream consumers may add it back if they grow a
+    // need for app-handle-scoped state.
+    let _ = app;
     match provider {
         ProviderKind::Claude => Ok(
             crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),

@@ -76,6 +76,23 @@ const ALL_PROVIDERS: ReadonlyArray<{
   { kind: "opencode", label: "OpenCode" },
 ];
 
+/**
+ * Filter `ALL_PROVIDERS` by an optional allowed-set. When `allowed` is
+ * undefined every provider is returned (chat behavior). When `allowed`
+ * is supplied (settings: commits is claude-only because the commit-
+ * message backend in `src-tauri/src/ai.rs:generate_commit_message`
+ * hardcodes the claude CLI), only those entries appear in the rail and
+ * in the cross-provider search results. Kept as a pure helper so we
+ * don't have to thread the predicate through every internal function.
+ */
+function filterProviders(
+  allowed: ReadonlyArray<AgentChatProviderKind> | undefined,
+): typeof ALL_PROVIDERS {
+  if (!allowed || allowed.length === 0) return ALL_PROVIDERS;
+  const allowedSet = new Set(allowed);
+  return ALL_PROVIDERS.filter((p) => allowedSet.has(p.kind));
+}
+
 /** Discriminated shape for the prefixed error strings the capability
  *  harvest emits. The OpenCode adapter ships bare tokens
  *  (`opencode_not_installed`); the Codex adapter ships
@@ -136,6 +153,17 @@ interface Props {
     model: string,
   ) => void;
   disabled?: boolean;
+  /**
+   * Optional allowlist of providers. When omitted (chat usage), every
+   * provider is shown. When set (settings → commit messages), only
+   * those providers render in the rail and only their models appear in
+   * cross-provider search. Used by surfaces whose backend supports a
+   * subset of the providers — e.g. commit messages is claude-only on
+   * the Rust side, so passing `["claude"]` here keeps the picker
+   * visually consistent with the resolver picker while preventing the
+   * user from choosing a model the backend will reject.
+   */
+  allowedProviders?: ReadonlyArray<AgentChatProviderKind>;
 }
 
 interface ResolvedRow {
@@ -156,10 +184,18 @@ export function MultiProviderModelPicker({
   model,
   onProviderModelChange,
   disabled,
+  allowedProviders,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
+  // Filter the providers list once per render. Memoized via the
+  // identity of `allowedProviders` so consumers passing a stable
+  // array reference (the common case) don't churn the rail.
+  const visibleProviders = useMemo(
+    () => filterProviders(allowedProviders),
+    [allowedProviders],
+  );
 
   // Reset the rail + search to the active provider whenever the
   // popover opens. Lets the picker stay in sync with external
@@ -188,6 +224,25 @@ export function MultiProviderModelPicker({
     [favoritesArray],
   );
 
+  // The favorites pseudo-tab in the rail must be gated on favorites
+  // FOR THE CURRENTLY VISIBLE PROVIDERS, not on the unfiltered total.
+  // Without this filter, a picker with `allowedProviders=["claude"]`
+  // and only Codex/OpenCode favorites would show an empty favorites
+  // tab — which looks like the favorites silently disappeared. Each
+  // favorites key is `${provider}::${id}`, so we filter by the
+  // provider prefix.
+  const visibleFavoritesCount = useMemo(() => {
+    if (!allowedProviders || allowedProviders.length === 0) {
+      return favoritesArray.length;
+    }
+    const allowedSet = new Set(allowedProviders);
+    return favoritesArray.filter((key) => {
+      const sep = key.indexOf("::");
+      if (sep < 0) return false;
+      return allowedSet.has(key.slice(0, sep) as AgentChatProviderKind);
+    }).length;
+  }, [favoritesArray, allowedProviders]);
+
   // Provider model rows, organised so we can switch between
   // "single-provider list" and "all-providers flat list" without
   // re-iterating the whole capabilities store on every keystroke.
@@ -203,7 +258,11 @@ export function MultiProviderModelPicker({
 
   const visibleRows = useMemo<ResolvedRow[]>(() => {
     const trimmed = query.trim().toLowerCase();
-    const allRows = ALL_PROVIDERS.flatMap(
+    // Cross-provider search only ever flattens the providers we've been
+    // allowed to show — passing an `allowedProviders` allowlist must
+    // keep restricted models out of search results too, not just the
+    // rail.
+    const allRows = visibleProviders.flatMap(
       (p) => rowsByProvider[p.kind] ?? [],
     );
     const base = trimmed
@@ -241,7 +300,7 @@ export function MultiProviderModelPicker({
       if (!a.model.is_free && b.model.is_free) return 1;
       return 0;
     });
-  }, [query, railKey, rowsByProvider, favoritesSet]);
+  }, [query, railKey, rowsByProvider, favoritesSet, visibleProviders]);
 
   const selectedKey = `${provider}::${model ?? ""}`;
   const triggerLabel = useMemo(() => {
@@ -305,9 +364,9 @@ export function MultiProviderModelPicker({
       >
         <div className="grid grid-cols-[48px_1fr] h-[400px] overflow-hidden">
           <ProviderRail
-            providers={ALL_PROVIDERS}
+            providers={visibleProviders}
             selected={railKey}
-            favoritesCount={favoritesArray.length}
+            favoritesCount={visibleFavoritesCount}
             getCount={(kind) => rowsByProvider[kind]?.length ?? 0}
             getError={(kind) => selectError(allCaps, kind)}
             onSelect={(next) => {

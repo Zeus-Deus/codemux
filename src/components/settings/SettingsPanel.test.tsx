@@ -29,7 +29,16 @@ vi.mock("@/stores/app-store", () => ({
   useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
       appState: {
-        config: { notification_sound_enabled: true, ai_commit_message_enabled: true, ai_resolver_enabled: false },
+        config: {
+          notification_sound_enabled: true,
+          ai_commit_message_enabled: true,
+          ai_commit_message_cli: "claude",
+          ai_commit_message_model: null,
+          ai_resolver_enabled: false,
+          ai_resolver_cli: "claude",
+          ai_resolver_model: null,
+          ai_resolver_strategy: "smart_merge",
+        },
         active_workspace_id: "ws-1",
         workspaces: [{ workspace_id: "ws-1", project_root: "/tmp/proj" }],
       },
@@ -88,6 +97,7 @@ vi.mock("@/tauri/commands", () => ({
   detectEditors: vi.fn().mockResolvedValue([]),
   setNotificationSoundEnabled: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageEnabled: vi.fn().mockResolvedValue(undefined),
+  setAiCommitMessageCli: vi.fn().mockResolvedValue(undefined),
   setAiCommitMessageModel: vi.fn().mockResolvedValue(undefined),
   setAiResolverEnabled: vi.fn().mockResolvedValue(undefined),
   setAiResolverCli: vi.fn().mockResolvedValue(undefined),
@@ -107,7 +117,68 @@ vi.mock("@/tauri/events", () => ({
   onPresetsChanged: vi.fn().mockReturnValue(Promise.resolve(() => {})),
 }));
 
+// ── Model picker mock ──
+//
+// Both settings rows now use `MultiProviderModelPicker`; the commits
+// row passes `allowedProviders=["claude"]` to keep that backend's
+// claude-only constraint, while the resolver row leaves it open. We
+// mock the picker as a thin shell that:
+//   - surfaces `allowedProviders` as a data attribute so tests can
+//     distinguish the two instances on the page
+//   - fires a sensible change tuple on click. When restricted to a
+//     single provider, the mock fires THAT provider; otherwise it
+//     simulates a cross-provider switch (claude → opencode) so the
+//     resolver test can prove both setters are invoked atomically.
+//
+// The picker's real internals (search, rail, error states, loading
+// skeletons, favorites) are covered by chat-side tests. Reusing the
+// real component in jsdom needs a full Radix Popover + cmdk environment
+// we don't control from this test.
+
+vi.mock("@/components/chat/pickers/MultiProviderModelPicker", () => ({
+  MultiProviderModelPicker: ({
+    provider,
+    model,
+    onProviderModelChange,
+    allowedProviders,
+  }: {
+    provider: string;
+    model: string | null;
+    onProviderModelChange: (provider: string, model: string) => void;
+    allowedProviders?: ReadonlyArray<string>;
+  }) => {
+    const restricted =
+      Array.isArray(allowedProviders) && allowedProviders.length > 0;
+    const allowedKey = restricted ? allowedProviders!.join(",") : "all";
+    return (
+      <button
+        type="button"
+        data-testid="multi-provider-model-picker"
+        data-provider={provider}
+        data-model={model ?? ""}
+        data-allowed={allowedKey}
+        onClick={() => {
+          if (restricted) {
+            // Pinned-provider case (commits): pick a model in the same
+            // provider so the wiring stays type-correct. The first
+            // allowed provider wins.
+            onProviderModelChange(allowedProviders![0]!, "claude-test-model");
+          } else {
+            // Multi-provider case (resolver): simulate flipping to a
+            // different provider so the test can verify BOTH the cli
+            // setter and the model setter fire atomically.
+            onProviderModelChange("opencode", "anthropic/claude-3-5-sonnet");
+          }
+        }}
+      >
+        MultiPicker:{provider}/{model ?? "default"}/{allowedKey}
+      </button>
+    );
+  },
+}));
+
 import { SettingsView } from "./settings-view";
+import * as commands from "@/tauri/commands";
 
 describe("SettingsPanel", () => {
   beforeEach(() => {
@@ -174,5 +245,120 @@ describe("SettingsPanel", () => {
 
     expect(mockSignOut).toHaveBeenCalled();
     expect(mockSetShowSettings).toHaveBeenCalledWith(false);
+  });
+});
+
+// ── Git section: model pickers wiring ──
+//
+// Verifies the freeform "Model override" Inputs were replaced with the
+// shared chat pickers, and that selecting a model writes through the
+// right Tauri setters. The pickers' own behavior (search, rail, error
+// states) is covered by chat tests; here we only verify settings calls
+// the right setters when the picker fires.
+
+describe("SettingsPanel — Git section model pickers", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openGitSection() {
+    render(<SettingsView />);
+    const gitButtons = screen.getAllByRole("button", { name: /Git/i });
+    fireEvent.click(gitButtons[0]);
+  }
+
+  /** Both pickers in the Git section now use the same shared
+   *  `MultiProviderModelPicker` with no `allowedProviders` allowlist —
+   *  the commits row went open after the backend was generalised to
+   *  accept any CLI (claude / codex / opencode) via `build_resolver_argv`.
+   *  Distinguish them by document order: the FIRST live picker is the
+   *  "Used to generate commit messages" row, the SECOND is the merge
+   *  resolver row. ScrollArea duplicates trees for measurement, so we
+   *  filter to the unique instances by stable side-effect (the
+   *  duplicates render the same data-* attributes but are positioned
+   *  off-screen — `getAllByTestId` returns them all; we take 0 and N
+   *  where N is the next live one). For our purposes, since both
+   *  duplicates fire the same wiring, picking either copy of each
+   *  picker works. */
+  function getPickers(): HTMLElement[] {
+    const all = screen.getAllByTestId("multi-provider-model-picker");
+    expect(all.length).toBeGreaterThanOrEqual(2);
+    return all;
+  }
+
+  it("renders MultiProviderModelPicker for both rows, both seeded with the current cli + model", () => {
+    // Both rows use the same picker (same component, same favorites
+    // store, identical visual style) and now both show all providers.
+    // The commits row going open is what closes the visual-consistency
+    // bug the user reported in the screenshots.
+    openGitSection();
+
+    const pickers = getPickers();
+    // Mock app-store seeds both rows with provider="claude", model=null.
+    expect(pickers[0]!.getAttribute("data-provider")).toBe("claude");
+    expect(pickers[1]!.getAttribute("data-provider")).toBe("claude");
+    // Neither picker passes `allowedProviders` anymore — both surfaces
+    // accept all three drivers now. (The chat composer still passes no
+    // allowlist either, so all three pickers in the app are
+    // interchangeable wiring-wise.)
+    expect(pickers[0]!.getAttribute("data-allowed")).toBe("all");
+    expect(pickers[1]!.getAttribute("data-allowed")).toBe("all");
+  });
+
+  it("clicking the commits picker writes BOTH ai_commit_message_cli AND ai_commit_message_model atomically", () => {
+    // Atomicity guarantee for the commits row, mirroring what the
+    // resolver row already had. The Rust side now supports arbitrary
+    // CLIs for commit-message generation (`generate_commit_message`
+    // dispatches via `build_resolver_argv`), so both fields must
+    // travel together — picking an OpenCode model while leaving the
+    // CLI on "claude" would crash the generator.
+    openGitSection();
+    fireEvent.click(getPickers()[0]!);
+
+    expect(vi.mocked(commands.setAiCommitMessageCli)).toHaveBeenCalledWith(
+      "opencode",
+    );
+    expect(vi.mocked(commands.setAiCommitMessageModel)).toHaveBeenCalledWith(
+      "anthropic/claude-3-5-sonnet",
+    );
+    // Side-effect isolation: clicking commits picker must NOT touch
+    // the resolver's settings.
+    expect(vi.mocked(commands.setAiResolverCli)).not.toHaveBeenCalled();
+    expect(vi.mocked(commands.setAiResolverModel)).not.toHaveBeenCalled();
+  });
+
+  it("clicking the resolver picker writes BOTH ai_resolver_cli and ai_resolver_model atomically", () => {
+    // Key wiring guarantee: under the old "CLI Select + freeform model
+    // Input" pair, the two could drift out of sync (user picks opencode
+    // CLI but leaves model as "claude-sonnet-4"). The unified picker
+    // must always update both setters together so they stay consistent.
+    openGitSection();
+    fireEvent.click(getPickers()[1]!);
+
+    expect(vi.mocked(commands.setAiResolverCli)).toHaveBeenCalledWith("opencode");
+    expect(vi.mocked(commands.setAiResolverModel)).toHaveBeenCalledWith(
+      "anthropic/claude-3-5-sonnet",
+    );
+    // Side-effect isolation: clicking resolver picker must NOT touch
+    // the commit-message settings.
+    expect(vi.mocked(commands.setAiCommitMessageCli)).not.toHaveBeenCalled();
+    expect(vi.mocked(commands.setAiCommitMessageModel)).not.toHaveBeenCalled();
+  });
+
+  it("does not render the legacy freeform 'Model override' Input or the standalone CLI Select", () => {
+    // Regression guard: if a future refactor reintroduces the freeform
+    // text input or the redundant CLI Select, this fails. Both UI
+    // shapes were sources of the drift bug we just fixed.
+    openGitSection();
+
+    // The CLI tool Select had a rendered SelectItem text "Claude Code"
+    // (the human label); the new picker doesn't render that string in
+    // the trigger.
+    expect(screen.queryByText("Claude Code")).not.toBeInTheDocument();
+    // The freeform Input had placeholder="Default" — none should remain
+    // on the Git section.
+    expect(
+      screen.queryByPlaceholderText("Default"),
+    ).not.toBeInTheDocument();
   });
 });

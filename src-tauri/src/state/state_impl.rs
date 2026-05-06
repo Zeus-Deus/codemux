@@ -385,6 +385,8 @@ pub struct CodemuxConfigSnapshot {
     #[serde(default = "default_true")]
     pub ai_commit_message_enabled: bool,
     #[serde(default)]
+    pub ai_commit_message_cli: Option<String>,
+    #[serde(default)]
     pub ai_commit_message_model: Option<String>,
     #[serde(default)]
     pub ai_resolver_enabled: bool,
@@ -473,6 +475,10 @@ impl AppStateStore {
 
     pub fn set_ai_commit_message_enabled(&self, enabled: bool) {
         self.inner.lock().unwrap().config.ai_commit_message_enabled = enabled;
+    }
+
+    pub fn set_ai_commit_message_cli(&self, cli: Option<String>) {
+        self.inner.lock().unwrap().config.ai_commit_message_cli = cli;
     }
 
     pub fn set_ai_commit_message_model(&self, model: Option<String>) {
@@ -3017,6 +3023,7 @@ fn default_app_state() -> AppStateSnapshot {
             linux_first: true,
             notification_sound_enabled: true,
             ai_commit_message_enabled: true,
+            ai_commit_message_cli: None,
             ai_commit_message_model: None,
             ai_resolver_enabled: false,
             ai_resolver_cli: None,

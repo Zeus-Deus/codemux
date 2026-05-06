@@ -953,6 +953,17 @@ pub fn set_ai_commit_message_enabled(
 }
 
 #[tauri::command]
+pub fn set_ai_commit_message_cli(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    cli: Option<String>,
+) -> Result<(), String> {
+    state.set_ai_commit_message_cli(cli);
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+#[tauri::command]
 pub fn set_ai_commit_message_model(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,

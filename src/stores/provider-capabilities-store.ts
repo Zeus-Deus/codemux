@@ -2,7 +2,6 @@ import { useEffect } from "react";
 import { create } from "zustand";
 
 import { listChatProviderCapabilities } from "@/tauri/commands";
-import { useFeatureFlags } from "@/stores/feature-flags";
 import type {
   AgentChatProviderKind,
   ProviderChatCapabilities,
@@ -68,20 +67,25 @@ export const useProviderCapabilities = create<ProviderCapabilitiesStore>(
  * path, deferred — MVP ships fallback-only for Claude/Codex; OpenCode
  * already does a live harvest at refresh time, see Stage 3).
  *
- * Step 13 — gates on `enableAgentChat`. When the master Beta toggle
- * is off this hook no-ops, so the picker never spawns
- * `opencode serve` or harvests `codex app-server` for a user who
- * hasn't opted in. The hook re-engages live (no remount required) the
- * moment the toggle flips on, because the flag is read from the
- * zustand store via the selector pattern.
+ * Originally gated on `enableAgentChat` so the harvest only ran for
+ * Beta users. That gate was lifted because the same picker is now
+ * reused by the merge-resolver settings panel — a non-Beta consumer
+ * that legitimately needs the model list. Per-provider failures
+ * (`codex_not_installed`, `opencode_not_installed`) still surface
+ * correctly via the per-provider error slot, so users who don't have
+ * those CLIs installed see "Not installed" tooltips instead of broken
+ * states. The capability call is read-only from the user's perspective:
+ * Claude returns its static fallback, Codex/OpenCode harvest only if
+ * their binaries are present on PATH.
+ *
+ * `enableAgentChat` is kept as a parameter for any future caller that
+ * wants to opt out, but the default behavior is unconditional refresh.
  */
 export function useProviderCapabilitiesInit(): void {
-  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const refreshAll = useProviderCapabilities((s) => s.refreshAll);
   useEffect(() => {
-    if (!enableAgentChat) return;
     void refreshAll();
-  }, [enableAgentChat, refreshAll]);
+  }, [refreshAll]);
 }
 
 /** Convenience selector: capabilities for the given provider, or null.

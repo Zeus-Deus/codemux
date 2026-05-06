@@ -724,6 +724,7 @@ export interface CodemuxConfigSnapshot {
   linux_first: boolean;
   notification_sound_enabled: boolean;
   ai_commit_message_enabled: boolean;
+  ai_commit_message_cli: string | null;
   ai_commit_message_model: string | null;
   ai_resolver_enabled: boolean;
   ai_resolver_cli: string | null;

@@ -1015,6 +1015,7 @@ pub fn run() {
             commands::notify_attention,
             commands::set_notification_sound_enabled,
             commands::set_ai_commit_message_enabled,
+            commands::set_ai_commit_message_cli,
             commands::set_ai_commit_message_model,
             commands::set_ai_resolver_enabled,
             commands::set_ai_resolver_cli,

@@ -7,6 +7,7 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   "terminal.color_theme": "app",
   "terminal.font_family": "'JetBrains Mono Variable', monospace",
   ai_commit_message_enabled: "true",
+  ai_commit_message_cli: "",
   ai_commit_message_model: "",
   ai_resolver_enabled: "false",
   ai_resolver_cli: "",

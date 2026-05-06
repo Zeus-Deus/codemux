@@ -3401,6 +3401,7 @@ mod tests {
                 linux_first: false,
                 notification_sound_enabled: false,
                 ai_commit_message_enabled: false,
+                ai_commit_message_cli: None,
                 ai_commit_message_model: None,
                 ai_resolver_enabled: false,
                 ai_resolver_cli: None,

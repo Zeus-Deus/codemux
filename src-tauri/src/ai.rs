@@ -307,6 +307,7 @@ pub(crate) fn verify_resolution(
 
 pub async fn generate_commit_message(
     repo_path: &Path,
+    cli: &str,
     model: Option<&str>,
 ) -> Result<String, String> {
     let diff = {
@@ -329,40 +330,30 @@ pub async fn generate_commit_message(
         return Err("No staged changes to describe".into());
     }
 
-    let prompt = format!(
-        "Write a concise git commit message for this diff. \
-         Use conventional commit format (feat:, fix:, refactor:, etc.). \
-         One line, max 72 chars. Return ONLY the message, no quotes, no explanation.\n\n{}",
-        diff
-    );
+    // Split the prompt into a system part (instructions) and a user
+    // part (the diff) so `build_resolver_argv` can emit the
+    // provider-correct argv for whichever CLI was selected. The same
+    // builder is used by the merge resolver, so all three CLIs
+    // (claude / codex / opencode) get tested against the same flag
+    // matrix in one place.
+    let system_prompt = "Write a concise git commit message for this diff. \
+        Use conventional commit format (feat:, fix:, refactor:, etc.). \
+        One line, max 72 chars. Return ONLY the message, no quotes, no explanation.";
 
-    // Same headless-claude requirements as the resolver: must include
-    // `--dangerously-skip-permissions` (so a stale permission prompt can't
-    // deadlock the call) and must go through `run_resolver_cli` so stdin is
-    // /dev/null and the child is killed if it hangs past the timeout. Prior
-    // to this, `generate_commit_message` had NO timeout at all — a hung
-    // claude would leave the commit-message UI spinning indefinitely.
-    let mut args = vec![
-        "--print".to_string(),
-        "--dangerously-skip-permissions".to_string(),
-        prompt,
-    ];
-    if let Some(m) = model {
-        args.push("--model".to_string());
-        args.push(m.to_string());
-    }
+    let (program, args) = build_resolver_argv(cli, model, system_prompt, &diff);
 
-    let output = match run_resolver_cli("claude", &args, repo_path, RESOLVER_TIMEOUT).await {
+    // Goes through the same hardened spawn helper as the resolver:
+    // stdin = /dev/null, kill_on_drop, fixed timeout. Prior to this
+    // path, `generate_commit_message` had NO timeout at all — a hung
+    // CLI would leave the commit-message UI spinning indefinitely.
+    let output = match run_resolver_cli(program, &args, repo_path, RESOLVER_TIMEOUT).await {
         Ok(out) => out,
         Err(ResolverRunError::Spawn(e)) | Err(ResolverRunError::Io(e)) => {
-            return Err(format!("Failed to run claude: {e}"));
+            return Err(format!("Failed to run {cli}: {e}"));
         }
         Err(ResolverRunError::Timeout) => {
-            // Keep the message shape aligned with the resolver's timeout
-            // error so the UI (and user mental model) stays consistent
-            // across the two entry points that go through `run_resolver_cli`.
             return Err(format!(
-                "claude did not finish within {}s. The agent may be stuck on an interactive prompt despite skip-permissions flags. Abort and try again, or switch CLI / model.",
+                "{cli} did not finish within {}s. The agent may be stuck on an interactive prompt despite skip-permissions flags. Abort and try again, or switch CLI / model.",
                 RESOLVER_TIMEOUT.as_secs()
             ));
         }
@@ -370,7 +361,7 @@ pub async fn generate_commit_message(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("claude failed: {}", stderr.trim()));
+        return Err(format!("{cli} failed: {}", stderr.trim()));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout)

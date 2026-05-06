@@ -739,11 +739,17 @@ export const resolveConflictsWithAgent = (
 export const checkClaudeAvailable = () =>
   invoke<boolean>("check_claude_available");
 
-export const generateAiCommitMessage = (path: string, model: string | null = null) =>
-  invoke<string>("generate_ai_commit_message", { path, model });
+export const generateAiCommitMessage = (
+  path: string,
+  cli: string | null = null,
+  model: string | null = null,
+) => invoke<string>("generate_ai_commit_message", { path, cli, model });
 
 export const setAiCommitMessageEnabled = (enabled: boolean) =>
   invoke("set_ai_commit_message_enabled", { enabled });
+
+export const setAiCommitMessageCli = (cli: string | null) =>
+  invoke("set_ai_commit_message_cli", { cli });
 
 export const setAiCommitMessageModel = (model: string | null) =>
   invoke("set_ai_commit_message_model", { model });
