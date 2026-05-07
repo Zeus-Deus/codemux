@@ -28,6 +28,12 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
+    /// Head commit SHA of the PR. Used to gate stale historical PRs:
+    /// once a workspace's HEAD has moved past this SHA, a MERGED/CLOSED
+    /// PR for the branch is no longer considered current and the badge
+    /// is cleared. Mirrors Superset's `headRefOid`-based attach rule.
+    #[serde(alias = "headRefOid", default)]
+    pub head_ref_oid: Option<String>,
     /// Stage 5 — populated by `get_pull_request` only; list paths
     /// leave it `None` so a list query stays cheap. Body is truncated
     /// to 50 KB at a char boundary, mirroring the issue path.
@@ -59,6 +65,49 @@ impl PullRequestInfo {
         } else {
             self.state.clone()
         }
+    }
+}
+
+/// True for terminal PR states. `gh pr view` keeps returning a closed/merged
+/// PR for a branch indefinitely, so a long-lived workspace (typically `main`)
+/// would otherwise show the same merged-PR pill forever.
+pub fn is_historical_pr_state(state: &str) -> bool {
+    matches!(state, "CLOSED" | "MERGED")
+}
+
+/// Whether to attach a PR to a workspace's sidebar pill given the workspace's
+/// current HEAD SHA. Open/draft PRs always attach; historical PRs only attach
+/// while the workspace still points at the exact PR head commit. Mirrors
+/// Superset's `shouldAcceptPRMatch` SHA gate.
+pub fn should_show_branch_pr(pr: &PullRequestInfo, head_sha: Option<&str>) -> bool {
+    if !is_historical_pr_state(&pr.state) {
+        return true;
+    }
+    match (pr.head_ref_oid.as_deref(), head_sha) {
+        (Some(pr_sha), Some(ws_sha)) => pr_sha == ws_sha,
+        // Missing either side ⇒ can't prove the PR is still current; hide it
+        // rather than risk a stale pill on a long-lived branch.
+        _ => false,
+    }
+}
+
+/// `git rev-parse HEAD` for a worktree path. Returns `None` on any failure
+/// (detached HEAD edge cases, missing repo, transient errors) — callers
+/// treat None as "can't gate, fall back to permissive behavior".
+pub fn get_head_sha(repo_path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
     }
 }
 
@@ -708,7 +757,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
         repo_path,
         &[
             "pr", "view",
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt",
+            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid",
         ],
     );
 
@@ -1091,6 +1140,10 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
         review_decision: v["reviewDecision"].as_str().map(|s| s.to_string()),
         checks_passing: None, // populated separately via get_pr_checks
         updated_at: v["updatedAt"].as_str().map(|s| s.to_string()),
+        head_ref_oid: v["headRefOid"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
         // Detail-only fields. List paths leave these None / empty so
         // the cheap query stays cheap.
         body: None,
@@ -1170,6 +1223,103 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pr_info_captures_head_ref_oid() {
+        // `headRefOid` powers the SHA-gate that hides stale merged PRs
+        // from long-lived branches. Without it the gate falls open.
+        let json = serde_json::json!({
+            "number": 1,
+            "url": "https://example",
+            "state": "MERGED",
+            "title": "T",
+            "headRefOid": "abc123def456",
+        });
+        let pr = parse_pr_json(&json);
+        assert_eq!(pr.head_ref_oid.as_deref(), Some("abc123def456"));
+    }
+
+    #[test]
+    fn test_parse_pr_info_treats_missing_head_ref_oid_as_none() {
+        // List-shape gh JSON rarely includes headRefOid. Don't synthesize
+        // a placeholder — the gate treats None as "can't prove current"
+        // and hides historical PRs accordingly.
+        let json = serde_json::json!({
+            "number": 1,
+            "url": "https://example",
+            "state": "OPEN",
+            "title": "T",
+        });
+        let pr = parse_pr_json(&json);
+        assert!(pr.head_ref_oid.is_none());
+    }
+
+    fn pr_with(state: &str, head_ref_oid: Option<&str>) -> PullRequestInfo {
+        PullRequestInfo {
+            number: 1,
+            url: "https://example".into(),
+            state: state.into(),
+            title: "T".into(),
+            head_branch: None,
+            base_branch: None,
+            is_draft: false,
+            mergeable: None,
+            additions: None,
+            deletions: None,
+            review_decision: None,
+            checks_passing: None,
+            updated_at: None,
+            head_ref_oid: head_ref_oid.map(|s| s.to_string()),
+            body: None,
+            comments: Vec::new(),
+            total_comments: 0,
+            author: None,
+        }
+    }
+
+    #[test]
+    fn test_should_show_branch_pr_open_always_attaches() {
+        // Open PRs attach regardless of SHA — the user is actively working
+        // on the branch and expects to see the pill.
+        let pr = pr_with("OPEN", Some("aaa"));
+        assert!(should_show_branch_pr(&pr, Some("bbb")));
+        assert!(should_show_branch_pr(&pr, None));
+    }
+
+    #[test]
+    fn test_should_show_branch_pr_merged_attaches_when_sha_matches() {
+        // On the original feature-branch worktree the branch HEAD still
+        // equals the PR head SHA, so the merged-PR pill stays until the
+        // worktree is removed.
+        let pr = pr_with("MERGED", Some("aaa"));
+        assert!(should_show_branch_pr(&pr, Some("aaa")));
+    }
+
+    #[test]
+    fn test_should_show_branch_pr_merged_hides_when_sha_diverges() {
+        // The bug this fix targets: on `main`, after merging PR #138,
+        // main's HEAD has advanced past the PR's head commit and the
+        // pill must disappear.
+        let pr = pr_with("MERGED", Some("aaa"));
+        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    }
+
+    #[test]
+    fn test_should_show_branch_pr_closed_hides_when_sha_diverges() {
+        let pr = pr_with("CLOSED", Some("aaa"));
+        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    }
+
+    #[test]
+    fn test_should_show_branch_pr_historical_with_missing_sha_hides() {
+        // If we can't prove the workspace still points at the PR head,
+        // err on the side of hiding the pill rather than leaving stale
+        // data on the screen forever.
+        let pr_no_oid = pr_with("MERGED", None);
+        assert!(!should_show_branch_pr(&pr_no_oid, Some("aaa")));
+        let pr = pr_with("MERGED", Some("aaa"));
+        assert!(!should_show_branch_pr(&pr, None));
+    }
+
+    #[test]
     fn test_parse_pr_info_carries_author_when_present() {
         // Stage 5 — `gh pr view --json author` emits `author.login`;
         // the parser must thread it through so the chip header /
@@ -1219,6 +1369,7 @@ mod tests {
             review_decision: Some("APPROVED".into()),
             checks_passing: None,
             updated_at: Some("2026-04-27T00:00:00Z".into()),
+            head_ref_oid: Some("deadbeef".into()),
             body: Some("PR body here".into()),
             comments: vec![IssueComment {
                 author: "alice".into(),

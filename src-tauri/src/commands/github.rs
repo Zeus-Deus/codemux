@@ -216,14 +216,46 @@ pub fn refresh_workspace_pr(
         ws.worktree_path.clone().unwrap_or_else(|| ws.cwd.clone())
     };
 
-    let pr_info = crate::github::get_branch_pr(Path::new(&cwd))?;
-    // Only overwrite if we found a PR — don't clear a pr_number that was
-    // explicitly set during PR-checkout (fork branches where gh can't resolve).
-    if pr_info.is_some() {
-        let pr_number = pr_info.as_ref().map(|p| p.number);
-        let pr_state = pr_info.as_ref().map(|p| p.display_state());
-        let pr_url = pr_info.as_ref().map(|p| p.url.clone());
-        state.update_workspace_pr_info(&workspace_id, pr_number, pr_state, pr_url);
+    let path = Path::new(&cwd);
+    let pr_info = crate::github::get_branch_pr(path)?;
+    // Decision matrix (mirrors the background pollers):
+    //   - PR found & passes the historical-SHA gate → write fresh info
+    //   - PR found but gated out (CLOSED/MERGED with diverged SHA) → clear
+    //   - `gh pr view` returned nothing AND persisted state is historical
+    //     → clear stale leftover from when the PR was active
+    //   - `gh pr view` returned nothing AND persisted state is OPEN/DRAFT
+    //     → preserve, protecting the fork-branch `gh pr checkout` case
+    match pr_info.as_ref() {
+        Some(pr) => {
+            let head_sha = crate::github::get_head_sha(path);
+            if crate::github::should_show_branch_pr(pr, head_sha.as_deref()) {
+                state.update_workspace_pr_info(
+                    &workspace_id,
+                    Some(pr.number),
+                    Some(pr.display_state()),
+                    Some(pr.url.clone()),
+                );
+            } else {
+                state.update_workspace_pr_info(&workspace_id, None, None, None);
+            }
+        }
+        None => {
+            let persisted_state = {
+                let snapshot = state.snapshot();
+                snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == workspace_id)
+                    .and_then(|w| w.pr_state.clone())
+            };
+            if persisted_state
+                .as_deref()
+                .map(crate::github::is_historical_pr_state)
+                .unwrap_or(false)
+            {
+                state.update_workspace_pr_info(&workspace_id, None, None, None);
+            }
+        }
     }
     crate::state::emit_app_state(&app);
     Ok(())
