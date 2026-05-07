@@ -777,6 +777,63 @@ pub fn run() {
                 }
             });
 
+            // Periodically `git fetch` every workspace's remote so the 5s
+            // read-only loop above can compare HEAD against fresh upstream
+            // refs. Without this, `git rev-list --left-right HEAD...@{upstream}`
+            // returns stale counts (typically 0/0) until something else
+            // fetches, so the sidebar's ahead/behind arrows never light up
+            // for commits pushed by teammates while Codemux is open.
+            //
+            // Runs at a coarser cadence (60s) than the read loop because
+            // each fetch is a real network call. Each per-workspace fetch
+            // is spawned independently with a 10s timeout so one slow or
+            // offline remote can't stall the others. `GIT_TERMINAL_PROMPT=0`
+            // prevents git from ever blocking on a credential prompt.
+            // Errors are intentionally swallowed: repos without remotes,
+            // transient offline state, and rejected creds are routine and
+            // shouldn't pollute the log on every tick.
+            let fetch_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                const TICK_SECS: u64 = 60;
+                const PER_FETCH_TIMEOUT_SECS: u64 = 10;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
+
+                    // Same window-active gate as the 5s loop — no point
+                    // burning network when the sidebar isn't on screen.
+                    let window_active = fetch_handle
+                        .get_webview_window("main")
+                        .map(|w| {
+                            let visible = w.is_visible().unwrap_or(false);
+                            let minimized = w.is_minimized().unwrap_or(true);
+                            visible && !minimized
+                        })
+                        .unwrap_or(false);
+                    if !window_active {
+                        continue;
+                    }
+
+                    let state: tauri::State<'_, state::AppStateStore> = fetch_handle.state();
+                    let all_workspaces = state.all_workspace_cwds();
+
+                    for (_workspace_id, cwd) in all_workspaces {
+                        tokio::spawn(async move {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
+                                tokio::process::Command::new("git")
+                                    .args(["fetch", "--prune", "--quiet", "--no-tags"])
+                                    .current_dir(&cwd)
+                                    .env("GIT_TERMINAL_PROMPT", "0")
+                                    .output(),
+                            )
+                            .await;
+                            // Result intentionally discarded — see comment
+                            // on the parent loop.
+                        });
+                    }
+                }
+            });
+
             // Background PR polling for the sidebar PR-status icon. The 5s
             // tick above only refreshes the active workspace's PR info; this
             // 60s tick walks every workspace so non-active sidebar rows

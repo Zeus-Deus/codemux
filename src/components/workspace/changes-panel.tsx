@@ -1315,6 +1315,27 @@ export function ChangesPanel({ workspace }: Props) {
     }
   };
 
+  // Refresh button is what users naturally reach for when they want to
+  // know "is my branch up to date with the remote?" Without a fetch
+  // step the answer is computed against stale local refs and the
+  // ahead/behind arrows in the sidebar never update on demand. We fetch
+  // first, then refresh local panel state and the base-branch diff.
+  // Fetch failures (offline, no remote, rejected creds) are logged but
+  // don't block the local refresh — partial freshness still helps.
+  const handleRefresh = async () => {
+    if (busy) return;
+    setBusyAction("fetch");
+    setGitError(null);
+    try {
+      await gitFetchChanges(cwd);
+    } catch (err) {
+      console.warn("[ChangesPanel] fetch failed during refresh:", err);
+    }
+    refresh();
+    refreshBaseDiff();
+    setBusyAction(null);
+  };
+
   // Merge the open PR via `gh pr merge`. Method maps to GitHub's three
   // merge strategies. After success, kick refreshWorkspacePr so the
   // sidebar pill flips to MERGED (purple) without waiting for the 60s
@@ -1842,7 +1863,8 @@ export function ChangesPanel({ workspace }: Props) {
                 variant="ghost"
                 size="icon-xs"
                 className="size-6 p-0"
-                onClick={() => { refresh(); refreshBaseDiff(); }}
+                onClick={handleRefresh}
+                disabled={busy}
               >
                 <RefreshCw className="h-3.5 w-3.5" />
               </Button>
@@ -2074,7 +2096,7 @@ export function ChangesPanel({ workspace }: Props) {
                   Fetch & Pull
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={() => { refresh(); refreshBaseDiff(); }} className="text-xs">
+                <DropdownMenuItem onClick={handleRefresh} disabled={busy} className="text-xs">
                   <RefreshCw className="h-3.5 w-3.5" />
                   Refresh
                 </DropdownMenuItem>
