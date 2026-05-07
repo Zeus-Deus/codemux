@@ -772,21 +772,40 @@ pub fn list_pull_requests(
     Ok(arr.iter().map(parse_pr_json).collect())
 }
 
+/// Timeout for the incoming-PRs list. On a repo with thousands of PRs
+/// `gh pr list` can take several seconds (or hang behind a rate-limit);
+/// without a deadline the synchronous shell-out will sit on the IPC
+/// runtime forever and freeze the UI. 15s is well past the p99 for
+/// healthy repos and short enough that a stuck call surfaces as a
+/// visible error instead of a frozen tab.
+const INCOMING_PRS_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub fn list_incoming_prs(
     repo_path: &Path,
     base_branch: &str,
 ) -> Result<Vec<IncomingPrItem>, String> {
-    let v = run_gh_json(
+    // `statusCheckRollup` is intentionally omitted: it's by far the
+    // most expensive field on `gh pr list` because GitHub has to
+    // compute the aggregate CI state per PR server-side, and on
+    // projects with lots of open PRs that single field can balloon
+    // the call from ~200ms to 10s+. The incoming-list rows render a
+    // small CI dot from `checks_status`; for the overview we accept
+    // null status (no dot) and let the per-PR detail view fetch
+    // checks separately when the user actually opens a PR.
+    let output = run_gh_timed(
         repo_path,
         &[
             "pr", "list",
             "--base", base_branch,
             "--state", "open",
             "--limit", "50",
-            "--json", "number,title,author,headRefName,isDraft,updatedAt,additions,deletions,reviewDecision,statusCheckRollup,url",
+            "--json", "number,title,author,headRefName,isDraft,updatedAt,additions,deletions,reviewDecision,url",
         ],
+        INCOMING_PRS_TIMEOUT,
     )?;
 
+    let v: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse gh JSON: {e}"))?;
     let arr = v.as_array().ok_or("Expected JSON array from gh pr list")?;
     Ok(arr.iter().map(parse_incoming_pr_json).collect())
 }
