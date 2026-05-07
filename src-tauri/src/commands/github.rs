@@ -67,11 +67,20 @@ pub fn get_github_pr_diff_by_path(
 }
 
 #[tauri::command]
-pub fn list_incoming_prs(
+pub async fn list_incoming_prs(
     path: String,
     base_branch: String,
 ) -> Result<Vec<crate::github::IncomingPrItem>, String> {
-    crate::github::list_incoming_prs(Path::new(&path), &base_branch)
+    // Run the blocking `gh pr list` shell-out on the blocking pool so it
+    // never holds up the IPC runtime. On a repo with thousands of PRs
+    // the call can take several seconds; a sync `#[tauri::command]`
+    // would pin a runtime thread for that whole duration and was the
+    // root cause of the Review-tab freeze the user reported.
+    tokio::task::spawn_blocking(move || {
+        crate::github::list_incoming_prs(Path::new(&path), &base_branch)
+    })
+    .await
+    .map_err(|e| format!("list_incoming_prs task join failed: {e}"))?
 }
 
 #[tauri::command]

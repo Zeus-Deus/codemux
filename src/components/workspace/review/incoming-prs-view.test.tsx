@@ -41,7 +41,7 @@ vi.mock("@/stores/app-store", () => ({
     selector({ appState: { workspaces: mockWorkspaces } }),
 }));
 
-import { IncomingPrsView } from "./incoming-prs-view";
+import { IncomingPrsView, _resetIncomingPrsCache } from "./incoming-prs-view";
 import type { IncomingPrItem } from "@/tauri/types";
 
 function flushPromises() {
@@ -95,6 +95,11 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockWorkspaces.length = 0;
   mockListIncomingPrs.mockResolvedValue([]);
+  // The view caches results module-level (so a re-mounted Review tab
+  // paints instantly instead of re-shelling-out to `gh`). Reset
+  // between tests so a previous test's PR list doesn't bleed into
+  // the next render.
+  _resetIncomingPrsCache();
 });
 
 afterEach(() => {

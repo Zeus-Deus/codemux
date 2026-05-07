@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo, memo } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,7 +14,28 @@ import { listIncomingPrs, activateWorkspace, createWorktreeWorkspace } from "@/t
 import { useAppStore } from "@/stores/app-store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
-import type { IncomingPrItem } from "@/tauri/types";
+import type { IncomingPrItem, WorkspaceSnapshot } from "@/tauri/types";
+
+// ── Module-level cache ──
+//
+// On a repo with thousands of PRs the `gh pr list` shell-out is the
+// expensive part — even with the new 15s backend timeout we don't want
+// to re-run it every time the user toggles into the Review tab. A
+// 30-second TTL keyed by (cwd, baseBranch) makes re-mounts feel
+// instant while still picking up new PRs on a normal browse cadence.
+// `refreshKey` (bumped by the parent on commit/push events) bypasses
+// the cache by forcing a fresh fetch.
+const INCOMING_CACHE_TTL_MS = 30_000;
+type CacheKey = string;
+interface CacheEntry { value: IncomingPrItem[]; ts: number; }
+const incomingCache = new Map<CacheKey, CacheEntry>();
+const cacheKey = (cwd: string, base: string): CacheKey => `${cwd}\0${base}`;
+
+/** Reset the module-level cache. For tests only — mirrors the
+ * `_resetCaches` hook used by `review-panel.tsx`. */
+export function _resetIncomingPrsCache(): void {
+  incomingCache.clear();
+}
 
 function formatRelativeTime(dateStr: string): string {
   const date = new Date(dateStr);
@@ -52,14 +73,16 @@ const REVIEW_LABELS: Record<string, { label: string; cls: string }> = {
 interface RowProps {
   pr: IncomingPrItem;
   projectRoot: string;
+  // Resolved at the parent so the row doesn't subscribe to the entire
+  // workspaces array. Without this, every store update (background
+  // git/PR poll, terminal output, etc.) re-runs `workspaces.find` for
+  // each of the 50 rows — a real cost when the user has many open
+  // workspaces. `existingWs` is null when no checked-out worktree
+  // matches this PR's head branch.
+  existingWs: WorkspaceSnapshot | null;
 }
 
-function IncomingPrRow({ pr, projectRoot }: RowProps) {
-  const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
-  const existingWs = workspaces.find(
-    (w) => w.git_branch === pr.head_branch && w.project_root === projectRoot,
-  );
-
+function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
   const handleView = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (pr.url) openUrl(pr.url);
@@ -149,6 +172,12 @@ function IncomingPrRow({ pr, projectRoot }: RowProps) {
   );
 }
 
+// Memoize so a re-render of the parent (e.g. after a polling fetch
+// resolves with the same data) doesn't walk all 50 rows. With the
+// `existingWs` lookup hoisted to the parent, prop equality is now
+// stable across store updates that don't actually change this row.
+const IncomingPrRow = memo(IncomingPrRowImpl);
+
 interface Props {
   cwd: string;
   baseBranch: string;
@@ -157,16 +186,46 @@ interface Props {
 }
 
 export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Props) {
-  const [prs, setPrs] = useState<IncomingPrItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Seed from the cache so a re-mount within the TTL paints instantly
+  // instead of flashing the skeleton while the fetch is in flight.
+  const cached = incomingCache.get(cacheKey(cwd, baseBranch));
+  const cacheFresh = cached != null && Date.now() - cached.ts < INCOMING_CACHE_TTL_MS;
+  const [prs, setPrs] = useState<IncomingPrItem[]>(cacheFresh ? cached!.value : []);
+  const [loading, setLoading] = useState(!cacheFresh);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchPrs = useCallback(async () => {
+  // Resolve PR → existing-workspace once at the parent. Subscribing
+  // here (instead of inside each row) collapses the per-row store
+  // dependency to a single subscription and replaces 50 linear scans
+  // with one Map lookup per row.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const wsByBranch = useMemo(() => {
+    const m = new Map<string, WorkspaceSnapshot>();
+    if (!workspaces) return m;
+    for (const w of workspaces) {
+      if (w.project_root === projectRoot && w.git_branch) {
+        m.set(w.git_branch, w);
+      }
+    }
+    return m;
+  }, [workspaces, projectRoot]);
+
+  const fetchPrs = useCallback(async (force: boolean) => {
+    if (!force) {
+      const hit = incomingCache.get(cacheKey(cwd, baseBranch));
+      if (hit && Date.now() - hit.ts < INCOMING_CACHE_TTL_MS) {
+        setPrs(hit.value);
+        setLoading(false);
+        setError(null);
+        return;
+      }
+    }
     setLoading(true);
     setError(null);
     try {
       const result = await listIncomingPrs(cwd, baseBranch);
       setPrs(result);
+      incomingCache.set(cacheKey(cwd, baseBranch), { value: result, ts: Date.now() });
     } catch (err) {
       console.warn("[incoming-prs] fetch failed:", err);
       setError(String(err));
@@ -177,7 +236,9 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
   }, [cwd, baseBranch]);
 
   useEffect(() => {
-    fetchPrs();
+    // refreshKey > 0 is an explicit invalidation from the parent
+    // (commit/push/etc.) — bypass the cache in that case.
+    fetchPrs(refreshKey > 0);
   }, [fetchPrs, refreshKey]);
 
   return (
@@ -225,7 +286,12 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
       {!loading && prs.length > 0 && (
         <div className="flex flex-col gap-0.5">
           {prs.map((pr) => (
-            <IncomingPrRow key={pr.number} pr={pr} projectRoot={projectRoot} />
+            <IncomingPrRow
+              key={pr.number}
+              pr={pr}
+              projectRoot={projectRoot}
+              existingWs={(pr.head_branch && wsByBranch.get(pr.head_branch)) || null}
+            />
           ))}
           {prs.length >= 50 && (
             <button
