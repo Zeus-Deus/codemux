@@ -8,9 +8,10 @@ import { FileCode } from "lucide-react";
 import { useEditorStore } from "@/stores/editor-store";
 import { readFile, writeFile } from "@/tauri/commands";
 import { buildEditorTheme } from "@/lib/codemirror-theme";
-import { loadLanguage, isBinaryExtension } from "@/lib/editor-languages";
+import { loadLanguage, isBinaryExtension, isImageExtension } from "@/lib/editor-languages";
 import { useThemeColors } from "@/hooks/use-theme-colors";
 import { MarkdownRendered } from "./MarkdownRendered";
+import { ImageViewer } from "./ImageViewer";
 
 interface Props {
   tabId: string;
@@ -44,6 +45,7 @@ export function EditorPane({ tabId }: Props) {
   const [content, setContent] = useState("");
 
   const isMd = filePath != null && isMarkdownFile(filePath);
+  const isImage = filePath != null && isImageExtension(filePath);
   const [viewMode, setViewMode] = useState<ViewMode>("raw");
 
   // Default to rendered for markdown files when filePath changes
@@ -151,6 +153,13 @@ export function EditorPane({ tabId }: Props) {
   useEffect(() => {
     const view = viewRef.current;
     if (!view || !filePath) return;
+
+    // Images render in a dedicated viewer below \u2014 no need to read
+    // bytes into the text editor or show a "binary" error.
+    if (isImageExtension(filePath)) {
+      setErrorMsg(null);
+      return;
+    }
 
     if (isBinaryExtension(filePath)) {
       setErrorMsg("Binary file \u2014 cannot edit");
@@ -267,16 +276,22 @@ export function EditorPane({ tabId }: Props) {
         )}
       </div>
 
+      {/* Image viewer — shown instead of the text editor for image files */}
+      {isImage && <ImageViewer filePath={filePath} />}
+
       {/* Rendered markdown view */}
       {isMd && viewMode === "rendered" && (
-        <MarkdownRendered content={renderedContent} />
+        <MarkdownRendered content={renderedContent} filePath={filePath} />
       )}
 
-      {/* CodeMirror container — hidden when showing rendered view */}
+      {/* CodeMirror container — hidden when showing rendered view or image */}
       <div
         ref={containerRef}
         className="flex-1 min-h-0 overflow-hidden [&_.cm-editor]:h-full [&_.cm-scroller]:overflow-auto"
-        style={{ display: isMd && viewMode === "rendered" ? "none" : undefined }}
+        style={{
+          display:
+            isImage || (isMd && viewMode === "rendered") ? "none" : undefined,
+        }}
       />
     </div>
   );

@@ -39,8 +39,12 @@ export async function loadLanguage(filename: string): Promise<Extension | null> 
   }
 }
 
-const BINARY_EXTENSIONS = new Set([
+const IMAGE_EXTENSIONS = new Set([
   "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "avif", "svg",
+]);
+
+const BINARY_EXTENSIONS = new Set([
+  ...IMAGE_EXTENSIONS,
   "woff", "woff2", "ttf", "eot", "otf",
   "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
   "exe", "dll", "so", "dylib", "o", "a",
@@ -50,4 +54,9 @@ const BINARY_EXTENSIONS = new Set([
 export function isBinaryExtension(filename: string): boolean {
   const ext = filename.split(".").pop()?.toLowerCase();
   return ext != null && BINARY_EXTENSIONS.has(ext);
+}
+
+export function isImageExtension(filename: string): boolean {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  return ext != null && IMAGE_EXTENSIONS.has(ext);
 }
