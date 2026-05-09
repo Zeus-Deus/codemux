@@ -771,8 +771,13 @@ pub fn run() {
                     // Single emit per tick, regardless of how many workspaces
                     // were refreshed or whether PR info was updated. The
                     // frontend dedups on payload equality anyway.
+                    //
+                    // Coalesced because this loop fires every 5 s; if a user
+                    // action emits within 16 ms of this tick, both collapse
+                    // into one snapshot serialise + IPC + frontend render
+                    // pass instead of two.
                     if !all_workspaces.is_empty() {
-                        state::emit_app_state(&git_handle);
+                        state::schedule_emit_app_state(&git_handle);
                     }
                 }
             });
@@ -1011,7 +1016,10 @@ pub fn run() {
                     }
 
                     if refreshed > 0 {
-                        state::emit_app_state(&pr_handle);
+                        // Coalesced: PR poll runs on its own cadence; if
+                        // it lands within 16 ms of the git poll the two
+                        // emits collapse into one frontend render.
+                        state::schedule_emit_app_state(&pr_handle);
                     }
                     eprintln!(
                         "[codemux::pr-poll] tick — refreshed={refreshed} skipped_non_github={skipped_non_github} timed_out={timed_out}"
@@ -1044,7 +1052,9 @@ pub fn run() {
                         .collect();
 
                     if app_state.update_detected_ports(port_snapshots) {
-                        state::emit_app_state(&port_handle);
+                        // Coalesced: port detection is a background
+                        // heartbeat — no need for synchronous emit.
+                        state::schedule_emit_app_state(&port_handle);
                     }
                 }
             });

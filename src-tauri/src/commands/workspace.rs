@@ -613,7 +613,12 @@ pub fn activate_workspace(
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppStateStore> = refresh_app.state();
                 populate_git_info(&state, &refresh_ws, Path::new(&cwd));
-                crate::state::emit_app_state(&refresh_app);
+                // Coalesced: this background refresh fires after the
+                // synchronous activate emit (line 627). Without
+                // coalescing the user sees two back-to-back snapshot
+                // serialise + IPC + render passes for what should be
+                // one logical change ("workspace activated").
+                crate::state::schedule_emit_app_state(&refresh_app);
             });
         }
 
