@@ -65,6 +65,10 @@ vi.mock("@/stores/app-store", () => ({
   useAppStore: {
     getState: () => ({ appState: null }),
   },
+  // Imperative session→workspace lookup used by buildScrollbackPayload /
+  // restoreScrollback. With `appState: null` there is no terminal pane
+  // registered anywhere, so the lookup always returns null.
+  getSessionWorkspaceId: () => null,
 }));
 
 vi.mock("@/stores/synced-settings-store", () => ({

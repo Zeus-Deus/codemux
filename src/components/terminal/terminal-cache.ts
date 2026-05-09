@@ -47,7 +47,7 @@ import {
   applyKittyStack,
   kittyFlags,
 } from "@/lib/kitty-keyboard";
-import { useAppStore } from "@/stores/app-store";
+import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { suppressQueryResponses } from "./query-suppression";
@@ -200,12 +200,9 @@ function buildScrollbackPayload(
   );
   if (!session) return null;
 
-  const workspace = appState.workspaces.find((ws) =>
-    ws.surfaces.some((surf) => {
-      const json = JSON.stringify(surf.root);
-      return json.includes(sid);
-    }),
-  );
+  // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex` in
+  // `app-store.ts`.
+  const workspaceId = getSessionWorkspaceId(sid);
 
   const scrollbackLines =
     useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
@@ -214,7 +211,7 @@ function buildScrollbackPayload(
   return {
     pane_id: entry.paneId ?? sid,
     session_id: sid,
-    workspace_id: workspace?.workspace_id ?? "",
+    workspace_id: workspaceId ?? "",
     working_directory: session.cwd,
     original_command: session.original_command,
     cols: session.cols,
@@ -424,18 +421,14 @@ async function restoreScrollback(entry: CachedTerminal): Promise<void> {
     useSyncedSettingsStore.getState().settings.session_restore.enabled;
   if (!restoreEnabled) return;
 
-  const appState = useAppStore.getState().appState;
-  const workspace = appState?.workspaces.find((ws) =>
-    ws.surfaces.some((surf) => {
-      const json = JSON.stringify(surf.root);
-      return json.includes(entry.sessionId);
-    }),
-  );
-  if (!workspace || !entry.paneId) return;
+  // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex` in
+  // `app-store.ts`.
+  const workspaceId = getSessionWorkspaceId(entry.sessionId);
+  if (!workspaceId || !entry.paneId) return;
 
   try {
     const scrollback = await getTerminalScrollback(
-      workspace.workspace_id,
+      workspaceId,
       entry.paneId,
     );
     if (!scrollback || entry.disposed) return;

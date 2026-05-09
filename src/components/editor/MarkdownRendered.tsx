@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -15,7 +15,21 @@ interface Props {
   filePath?: string | null;
 }
 
-export function MarkdownRendered({ content, filePath }: Props) {
+/**
+ * Internal impl. Wrapped in `React.memo` below so the AST re-parse only
+ * runs when `content` or `filePath` actually change. Without the memo,
+ * every parent re-render of `EditorPane` (which itself re-renders
+ * whenever the global `app-state-changed` snapshot ticks — e.g. on every
+ * agent token, git poll, or hook event) would force `react-markdown` to
+ * walk the entire content string and rebuild the rendered tree. On
+ * multi-KB markdown files that is the dominant cause of choppy scrolling
+ * while an agent is streaming. The internal `useMemo` for plugins and
+ * components is necessary but not sufficient — they're consumed by an
+ * unmemoized wrapper, so they only stabilise refs feeding into the
+ * non-skipped render. Wrapping the wrapper itself is what skips the
+ * `<ReactMarkdown>` call entirely.
+ */
+function MarkdownRenderedImpl({ content, filePath }: Props) {
   const plugins = useMemo(() => [remarkGfm], []);
 
   const components = useMemo<Components>(
@@ -47,3 +61,14 @@ export function MarkdownRendered({ content, filePath }: Props) {
     </div>
   );
 }
+
+/**
+ * Default `React.memo` shallow-compare is sufficient: `content` is a
+ * primitive string and `filePath` is a primitive string-or-null. Both
+ * come from `EditorPane`'s `useEditorStore` slice, which only mutates
+ * on local edit / save — it does not churn during agent streaming or
+ * git polls. So when the parent re-renders due to backend
+ * `app-state-changed` ticks, both props will be reference-equal and the
+ * memo skips the inner `<ReactMarkdown>` call entirely.
+ */
+export const MarkdownRendered = memo(MarkdownRenderedImpl);

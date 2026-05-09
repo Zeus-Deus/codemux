@@ -9,15 +9,18 @@ import { Input } from "@/components/ui/input";
 import { Loader2 } from "lucide-react";
 import { FileTypeIcon } from "@/components/icons/file-type-icon";
 import { useUIStore } from "@/stores/ui-store";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchFileNames } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 
 export function FileSearchDialog() {
   const open = useUIStore((s) => s.showFileSearch);
   const setOpen = useUIStore((s) => s.setShowFileSearch);
-  const workspace = useActiveWorkspace();
-  const cwd = workspace?.cwd ?? "";
+  // Subscribe only to cwd (a primitive string) instead of the whole
+  // workspace object. The dialog used to re-render on every backend
+  // tick because the workspace ref churns; now it only re-renders when
+  // cwd actually changes (i.e. workspace switch).
+  const cwd = useActiveWorkspaceCwd() ?? "";
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<string[]>([]);
@@ -61,16 +64,24 @@ export function FileSearchDialog() {
 
   const openFile = useCallback(
     async (filePath: string) => {
-      if (!workspace) return;
+      // Pull the live workspace at click time via getState so the
+      // dialog doesn't subscribe to the workspace ref (which churns on
+      // every backend tick). On user click, latency from a single
+      // getState read is irrelevant.
+      const appState = useAppStore.getState().appState;
+      const ws = appState?.workspaces.find(
+        (w) => w.workspace_id === appState.active_workspace_id,
+      );
+      if (!ws) return;
       try {
         const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
-        await openEditorTab(workspace.workspace_id, workspace.tabs, fullPath);
+        await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
       } catch (err) {
         console.error("Failed to open file:", err);
       }
       setOpen(false);
     },
-    [workspace, cwd, setOpen],
+    [cwd, setOpen],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

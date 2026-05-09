@@ -9,7 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Loader2, FileCode, CaseSensitive, Regex } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchInFiles } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
 import type { SearchResult } from "@/tauri/types";
@@ -22,8 +22,9 @@ interface GroupedResults {
 export function ContentSearchDialog() {
   const open = useUIStore((s) => s.showContentSearch);
   const setOpen = useUIStore((s) => s.setShowContentSearch);
-  const workspace = useActiveWorkspace();
-  const cwd = workspace?.cwd ?? "";
+  // Subscribe only to cwd (a primitive string). The full-workspace
+  // selector churns its reference on every backend tick.
+  const cwd = useActiveWorkspaceCwd() ?? "";
 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
@@ -87,16 +88,23 @@ export function ContentSearchDialog() {
 
   const openFile = useCallback(
     async (filePath: string) => {
-      if (!workspace) return;
+      // Pull the live workspace at click time via getState so the
+      // dialog doesn't subscribe to the workspace ref (which churns on
+      // every backend tick).
+      const appState = useAppStore.getState().appState;
+      const ws = appState?.workspaces.find(
+        (w) => w.workspace_id === appState.active_workspace_id,
+      );
+      if (!ws) return;
       try {
         const fullPath = filePath.startsWith("/") ? filePath : `${cwd}/${filePath}`;
-        await openEditorTab(workspace.workspace_id, workspace.tabs, fullPath);
+        await openEditorTab(ws.workspace_id, ws.tabs, fullPath);
       } catch (err) {
         console.error("Failed to open file:", err);
       }
       setOpen(false);
     },
-    [workspace, cwd, setOpen],
+    [cwd, setOpen],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

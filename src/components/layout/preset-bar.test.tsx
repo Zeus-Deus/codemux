@@ -54,11 +54,17 @@ vi.mock("@/stores/ui-store", () => ({
 // RunButton pulls its own dependencies (getProjectScripts / getWorkspaceConfig
 // / useActiveWorkspace). Mock the parts that would otherwise hit unmocked
 // modules so we can mount <PresetBar> without dragging in every store.
+//
+// RunButton now subscribes via the focused primitive
+// `useActiveWorkspaceProjectRoot` (perf fix — full-workspace selector
+// churns on every backend tick). Both exports must be mocked so tests
+// that reach for either get a consistent stub.
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => ({
     workspace_id: "ws-1",
     project_root: "/home/user/myapp",
   }),
+  useActiveWorkspaceProjectRoot: () => "/home/user/myapp",
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";

@@ -31,7 +31,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { useUIStore } from "@/stores/ui-store";
-import { useAppStore, useActiveWorkspace } from "@/stores/app-store";
+import {
+  useAppStore,
+  useActiveWorkspaceProjectRoot,
+  useActiveWorkspaceBranch,
+} from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
@@ -43,16 +47,20 @@ import type { EditorInfo } from "@/tauri/types";
 function SearchTrigger() {
   const { getKeysForAction } = useResolvedKeybinds();
   const toggleCombo = getKeysForAction("commandPalette");
-  const workspace = useActiveWorkspace();
+  // Subscribe to the two primitive slices we actually use, not the
+  // full workspace object. The full object's reference churns on every
+  // backend tick (snapshot rebuild) and would re-render this header on
+  // every git poll / agent token / hook event.
+  const projectRoot = useActiveWorkspaceProjectRoot();
+  const branch = useActiveWorkspaceBranch();
 
   const handleClick = useCallback(() => {
     useUIStore.getState().toggleCommandPalette();
   }, []);
 
-  const projectName = workspace?.project_root
-    ? workspace.project_root.split(/[\\/]/).filter(Boolean).pop() ?? null
+  const projectName = projectRoot
+    ? projectRoot.split(/[\\/]/).filter(Boolean).pop() ?? null
     : null;
-  const branch = workspace?.git_branch ?? null;
   const label = projectName
     ? branch
       ? `Search ${projectName} - ${branch}`

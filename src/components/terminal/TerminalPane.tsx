@@ -35,7 +35,7 @@ import {
   type ScrollbackPayload,
 } from "@/tauri/commands";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
-import { useAppStore } from "@/stores/app-store";
+import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
 // import { useThemeColors } from "@/hooks/use-theme-colors";
@@ -438,12 +438,11 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       );
       if (!session) return null;
 
-      const workspace = appState.workspaces.find((ws) =>
-        ws.surfaces.some((surf) => {
-          const json = JSON.stringify(surf.root);
-          return json.includes(sid);
-        }),
-      );
+      // O(1) lookup via the cached session→workspace index. The previous
+      // `JSON.stringify(surf.root).includes(sid)` scan was O(panes^2) and
+      // ran on every scrollback save / mount — measurable cost with many
+      // workspaces. See `buildSessionWorkspaceIndex` in `app-store.ts`.
+      const workspaceId = getSessionWorkspaceId(sid);
 
       // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.)
       const isAlternateBuffer = t.buffer.active.type === "alternate";
@@ -454,7 +453,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       return {
         pane_id: paneId ?? sid,
         session_id: sid,
-        workspace_id: workspace?.workspace_id ?? "",
+        workspace_id: workspaceId ?? "",
         working_directory: session.cwd,
         original_command: session.original_command,
         cols: session.cols,
@@ -482,17 +481,12 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
     (async () => {
       try {
-        const appState = useAppStore.getState().appState;
-        const workspace = appState?.workspaces.find((ws) =>
-          ws.surfaces.some((surf) => {
-            const json = JSON.stringify(surf.root);
-            return json.includes(sid);
-          }),
-        );
+        // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
+        const workspaceId = getSessionWorkspaceId(sid);
         const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
 
-        if (restoreEnabled && workspace && paneId) {
-          const scrollback = await getTerminalScrollback(workspace.workspace_id, paneId);
+        if (restoreEnabled && workspaceId && paneId) {
+          const scrollback = await getTerminalScrollback(workspaceId, paneId);
           if (scrollback && !cancelled) {
             const { meta } = scrollback;
             // Cache captures from scrollback metadata — these survive tab switches

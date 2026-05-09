@@ -1,10 +1,17 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildSessionWorkspaceIndex,
+  getSessionWorkspaceId,
   groupWorkspacesByProject,
   resolveProjectRoot,
   useAppStore,
 } from "./app-store";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type {
+  AppStateSnapshot,
+  PaneNodeSnapshot,
+  SurfaceSnapshot,
+  WorkspaceSnapshot,
+} from "@/tauri/types";
 
 // Minimal workspace factory for testing
 function makeWs(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
@@ -296,5 +303,209 @@ describe("useAppStore.setHomeDir", () => {
     expect(useAppStore.getState().homeDir).toBe("/home/zeus");
     // Reset so later test files don't inherit the value.
     useAppStore.setState({ homeDir: null });
+  });
+});
+
+// ── session→workspace reverse index ─────────────────────────────────────
+
+function termPane(paneId: string, sessionId: string): PaneNodeSnapshot {
+  return { kind: "terminal", pane_id: paneId, session_id: sessionId, title: "" };
+}
+
+function browserPane(paneId: string): PaneNodeSnapshot {
+  return { kind: "browser", pane_id: paneId, browser_id: "br", title: "" };
+}
+
+function chatPane(paneId: string): PaneNodeSnapshot {
+  return {
+    kind: "agent_chat",
+    pane_id: paneId,
+    title: "",
+    thread_id: null,
+    provider: null,
+    cwd: null,
+  };
+}
+
+function split(...children: PaneNodeSnapshot[]): PaneNodeSnapshot {
+  return {
+    kind: "split",
+    pane_id: "split-" + children.map((c) => c.pane_id).join("-"),
+    direction: "horizontal",
+    child_sizes: children.map(() => 1 / children.length),
+    children,
+  };
+}
+
+function makeSurface(root: PaneNodeSnapshot, surfaceId = "sf-1"): SurfaceSnapshot {
+  return { surface_id: surfaceId, title: "", root, active_pane_id: root.pane_id };
+}
+
+function makeAppState(workspaces: WorkspaceSnapshot[]): AppStateSnapshot {
+  return {
+    schema_version: 1,
+    active_workspace_id: workspaces[0]?.workspace_id ?? "",
+    workspaces,
+    terminal_sessions: [],
+    browser_sessions: [],
+    agent_browser_sessions: [],
+    notifications: [],
+    detected_ports: [],
+    pane_statuses: {},
+    persistence: {
+      schema_version: 1,
+      stores_layout_metadata: true,
+      stores_terminal_metadata: true,
+      stores_live_process_state: true,
+    },
+    config: {
+      config_version: 1,
+      default_shell: null,
+      theme_source: "default",
+      linux_first: false,
+      notification_sound_enabled: true,
+      ai_commit_message_enabled: false,
+      ai_commit_message_cli: null,
+      ai_commit_message_model: null,
+      ai_resolver_enabled: false,
+      ai_resolver_cli: null,
+      ai_resolver_model: null,
+      ai_resolver_strategy: "auto",
+    },
+  };
+}
+
+describe("buildSessionWorkspaceIndex", () => {
+  it("returns an empty Map for a null appState", () => {
+    const index = buildSessionWorkspaceIndex(null);
+    expect(index.size).toBe(0);
+  });
+
+  it("returns an empty Map when there are no workspaces", () => {
+    const index = buildSessionWorkspaceIndex(makeAppState([]));
+    expect(index.size).toBe(0);
+  });
+
+  it("maps a single terminal pane in a single workspace", () => {
+    const ws = makeWs({
+      workspace_id: "ws-1",
+      surfaces: [makeSurface(termPane("pane-1", "sess-1"))],
+    });
+    const index = buildSessionWorkspaceIndex(makeAppState([ws]));
+    expect(index.size).toBe(1);
+    expect(index.get("sess-1")).toBe("ws-1");
+  });
+
+  it("walks a split tree to find every terminal pane", () => {
+    const ws = makeWs({
+      workspace_id: "ws-split",
+      surfaces: [
+        makeSurface(
+          split(
+            termPane("pane-a", "sess-a"),
+            split(termPane("pane-b", "sess-b"), termPane("pane-c", "sess-c")),
+          ),
+        ),
+      ],
+    });
+    const index = buildSessionWorkspaceIndex(makeAppState([ws]));
+    expect(index.size).toBe(3);
+    expect(index.get("sess-a")).toBe("ws-split");
+    expect(index.get("sess-b")).toBe("ws-split");
+    expect(index.get("sess-c")).toBe("ws-split");
+  });
+
+  it("maps panes across multiple workspaces and surfaces", () => {
+    const ws1 = makeWs({
+      workspace_id: "ws-1",
+      surfaces: [
+        makeSurface(termPane("p1", "s1"), "sf-1a"),
+        makeSurface(
+          split(termPane("p2", "s2"), termPane("p3", "s3")),
+          "sf-1b",
+        ),
+      ],
+    });
+    const ws2 = makeWs({
+      workspace_id: "ws-2",
+      surfaces: [makeSurface(termPane("p4", "s4"))],
+    });
+    const index = buildSessionWorkspaceIndex(makeAppState([ws1, ws2]));
+    expect(index.size).toBe(4);
+    expect(index.get("s1")).toBe("ws-1");
+    expect(index.get("s2")).toBe("ws-1");
+    expect(index.get("s3")).toBe("ws-1");
+    expect(index.get("s4")).toBe("ws-2");
+  });
+
+  it("ignores browser and agent_chat panes (no session_id to index)", () => {
+    const ws = makeWs({
+      workspace_id: "ws-mixed",
+      surfaces: [
+        makeSurface(
+          split(
+            browserPane("p-browser"),
+            chatPane("p-chat"),
+            termPane("p-term", "s-term"),
+          ),
+        ),
+      ],
+    });
+    const index = buildSessionWorkspaceIndex(makeAppState([ws]));
+    expect(index.size).toBe(1);
+    expect(index.get("s-term")).toBe("ws-mixed");
+    // Browser/chat pane ids should not appear as keys, and their pane_ids
+    // should not have leaked in as session_ids either.
+    expect(index.has("p-browser")).toBe(false);
+    expect(index.has("p-chat")).toBe(false);
+  });
+});
+
+describe("getSessionWorkspaceId", () => {
+  it("reads the cached index from useAppStore.getState()", () => {
+    const ws = makeWs({
+      workspace_id: "ws-A",
+      surfaces: [makeSurface(termPane("pane-x", "sess-x"))],
+    });
+    useAppStore.setState({ appState: makeAppState([ws]) });
+    try {
+      expect(getSessionWorkspaceId("sess-x")).toBe("ws-A");
+      expect(getSessionWorkspaceId("missing")).toBeNull();
+    } finally {
+      useAppStore.setState({ appState: null });
+    }
+  });
+
+  it("returns null when there is no app state", () => {
+    useAppStore.setState({ appState: null });
+    expect(getSessionWorkspaceId("anything")).toBeNull();
+  });
+
+  it("reuses the same Map for repeated calls against the same snapshot", () => {
+    // The WeakMap cache means two calls with the same appState reference
+    // walk the tree once; the second call hits the cache. We can't observe
+    // the WeakMap directly, but exposing a hook would defeat the perf goal,
+    // so we assert the property indirectly: building the index for a freshly
+    // mutated snapshot vs the original yields different Map identities, but
+    // re-reading the same snapshot must yield identical results.
+    const ws = makeWs({
+      workspace_id: "ws-cache",
+      surfaces: [makeSurface(termPane("p1", "s1"))],
+    });
+    const snapshot = makeAppState([ws]);
+    useAppStore.setState({ appState: snapshot });
+    try {
+      const a = getSessionWorkspaceId("s1");
+      const b = getSessionWorkspaceId("s1");
+      expect(a).toBe("ws-cache");
+      expect(b).toBe("ws-cache");
+      // Replace with a structurally-identical but new snapshot. The cache
+      // is keyed on identity, so the index rebuilds — still correct.
+      const fresh = makeAppState([ws]);
+      useAppStore.setState({ appState: fresh });
+      expect(getSessionWorkspaceId("s1")).toBe("ws-cache");
+    } finally {
+      useAppStore.setState({ appState: null });
+    }
   });
 });

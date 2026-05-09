@@ -91,17 +91,33 @@ export function WorkspaceMain() {
   );
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 
-  // Auto-dismiss onboarding when a workspace is created through any path ("+", CLI, etc.)
-  const allWorkspaces = useAppStore((s) => s.appState?.workspaces ?? []);
+  // Auto-dismiss onboarding when a workspace is created through any path ("+", CLI, etc.).
+  //
+  // Subscribe to the COUNT (a primitive number), not the workspaces array.
+  // The Rust backend rebuilds the snapshot on every emit, so the array ref
+  // is fresh on every backend tick — agent tokens, git polls, hook events.
+  // Subscribing to the array would re-run this entire `WorkspaceMain`
+  // tree on every tick. Counting inside the selector returns a primitive
+  // that compares with === and is stable across ticks unless workspaces
+  // were actually added/removed.
+  const onboardingMatchCount = useAppStore((s) => {
+    if (!onboardingProjectDir) return 0;
+    const ws = s.appState?.workspaces;
+    if (!ws) return 0;
+    let count = 0;
+    for (const w of ws) {
+      if (w.project_root === onboardingProjectDir || w.cwd === onboardingProjectDir) {
+        count += 1;
+      }
+    }
+    return count;
+  });
   useEffect(() => {
     if (!onboardingProjectDir) return;
-    const count = allWorkspaces.filter(
-      (ws) => ws.project_root === onboardingProjectDir || ws.cwd === onboardingProjectDir,
-    ).length;
-    if (count > 1) {
+    if (onboardingMatchCount > 1) {
       setOnboardingProjectDir(null);
     }
-  }, [onboardingProjectDir, allWorkspaces, setOnboardingProjectDir]);
+  }, [onboardingProjectDir, onboardingMatchCount, setOnboardingProjectDir]);
 
   // Lazy-workspace-creation: when the flag is on and a client-side
   // chat draft is active, render the draft surface in place of the
