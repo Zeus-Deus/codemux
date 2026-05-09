@@ -19,7 +19,7 @@ export function AgentNode({ node, onClick }: AgentNodeProps) {
   return (
     <button
       className={cn(
-        "absolute rounded-lg border bg-card/80 backdrop-blur-sm p-2 text-left transition-all hover:bg-card cursor-pointer",
+        "absolute rounded-lg border bg-card/80 backdrop-blur-sm p-2 text-left transition-colors hover:bg-card cursor-pointer",
         isActive && "border-primary/40 shadow-[0_0_8px_-2px] shadow-primary/20",
         node.status === "done" && "border-emerald-400/30",
         node.status === "blocked" && "border-red-400/30",

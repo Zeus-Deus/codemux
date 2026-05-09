@@ -1727,7 +1727,14 @@ export function Composer({
           className={cn(
             "relative",
             "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
-            "transition-all",
+            // Composer is mounted for the entire chat session and re-
+            // renders frequently as the draft / attachments change.
+            // `transition-all` would animate every property change;
+            // scope to the two properties that actually transition
+            // here (drag-state ring colour + tinted background, plus
+            // focus-within ring colour shift) so the compositor only
+            // has work to do on those changes.
+            "transition-[box-shadow,background-color]",
             isDragging && "ring-2 ring-primary bg-primary/5",
           )}
         >
