@@ -169,21 +169,24 @@ export function EditorPane({ tabId }: Props) {
     isLoadingRef.current = true;
     setErrorMsg(null);
 
-    readFile(filePath)
+    // Fire the file read IPC and the language-module dynamic import
+    // concurrently. They are independent \u2014 `readFile` does Tauri IPC
+    // for the file bytes, `loadLanguage` does an ESM dynamic import of
+    // the appropriate `@codemirror/lang-*` package by extension.
+    // Previously the language load was sequenced AFTER the read
+    // resolved, which on a workspace switch with an editor tab open
+    // doubled the wall clock (IPC round-trip + module load + parse)
+    // for no reason \u2014 neither call needs the other's result.
+    const readPromise = readFile(filePath);
+    const langPromise = loadLanguage(filePath);
+
+    readPromise
       .then((c) => {
         view.dispatch({
           changes: { from: 0, to: view.state.doc.length, insert: c },
         });
         setBaselineContent(tabId, c);
         setContent(c);
-
-        loadLanguage(filePath).then((lang) => {
-          if (lang) {
-            view.dispatch({
-              effects: languageCompartment.current.reconfigure(lang),
-            });
-          }
-        });
       })
       .catch((err) => {
         setErrorMsg(String(err));
@@ -191,6 +194,20 @@ export function EditorPane({ tabId }: Props) {
       .finally(() => {
         isLoadingRef.current = false;
       });
+
+    // Apply the language as soon as it's ready, independently of the
+    // text content being in the document. CodeMirror's language
+    // compartment can be reconfigured at any time; until it lands the
+    // editor renders the file as plain text, which is fine because
+    // the file is generally not yet visible (the rendered-markdown
+    // path is the dominant view for .md files anyway).
+    langPromise.then((lang) => {
+      if (lang && viewRef.current) {
+        viewRef.current.dispatch({
+          effects: languageCompartment.current.reconfigure(lang),
+        });
+      }
+    });
   }, [filePath, tabId, setBaselineContent]);
 
   // When switching back to raw, sync content from store in case it changed
