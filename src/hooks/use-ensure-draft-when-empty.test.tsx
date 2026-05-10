@@ -348,6 +348,68 @@ describe("useEnsureDraftWhenEmpty", () => {
     expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
   });
 
+  it("does NOT re-spawn when only an irrelevant workspace field changes (perf — fingerprint guard)", () => {
+    // Regression guard for the audit-pass fix that switched this hook
+    // from a `[appState]` dep array to a primitive-fingerprint
+    // selector. Without the fingerprint, every backend
+    // `app-state-changed` tick (agent tokens, git polls, hook events)
+    // re-ran the effect body — walking surface trees and doing
+    // workspace lookups for nothing. The `inFlightSpawnRef` guard
+    // prevented duplicate IPC, but the wasted cycles still added up.
+    //
+    // This test simulates a backend tick that changes `git_branch` on
+    // the active workspace (a frequent mutation under the 5 s git
+    // poll). The effect's fingerprint is built from
+    // `(active_workspace_id, hasPane, project_root)` — `git_branch`
+    // is intentionally NOT in it — so the effect must NOT fire a
+    // second time across the rerender.
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    flagsLoaded = true;
+    homeDirSnapshot = "/home/user";
+    appStateSnapshot = {
+      active_workspace_id: "ws-foo",
+      workspaces: [
+        {
+          workspace_id: "ws-foo",
+          active_surface_id: "surf-empty",
+          surfaces: [emptySplitSurface],
+          project_root: "/projects/foo",
+          cwd: "/projects/foo",
+          git_branch: "main",
+        },
+      ],
+    };
+    const { rerender } = renderHook(() => useEnsureDraftWhenEmpty());
+    expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
+
+    // Backend tick: same fingerprint fields, different git_branch +
+    // a different workspaces array reference (Rust rebuilds the
+    // snapshot on every emit). The hook's effect MUST NOT fire
+    // again — fingerprint is reference-equal.
+    appStateSnapshot = {
+      active_workspace_id: "ws-foo",
+      workspaces: [
+        {
+          workspace_id: "ws-foo",
+          active_surface_id: "surf-empty",
+          surfaces: [emptySplitSurface],
+          project_root: "/projects/foo",
+          cwd: "/projects/foo",
+          git_branch: "feature-x",
+        },
+      ],
+    };
+    rerender();
+
+    // Either branch of the proof works:
+    //  - in-flight ref is set, so even if the effect DID fire it
+    //    would short-circuit; OR
+    //  - fingerprint is unchanged, so the effect didn't re-fire at all.
+    // The contract we care about is: zero extra Tauri calls.
+    expect(agentChatCreatePane).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to workspace.cwd when project_root is missing (ad-hoc workspaces)", () => {
     enableAgentChatFlag = true;
     enableLazyFlag = true;

@@ -589,6 +589,7 @@ pub fn activate_workspace(
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
+    let activate_started = std::time::Instant::now();
     if state.activate_workspace(&workspace_id) {
         // Kick off git refresh in a background thread — don't block the
         // activate click. `populate_git_info` runs 5-8 git subprocesses
@@ -613,19 +614,46 @@ pub fn activate_workspace(
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppStateStore> = refresh_app.state();
                 populate_git_info(&state, &refresh_ws, Path::new(&cwd));
-                crate::state::emit_app_state(&refresh_app);
+                // Coalesced: this background refresh fires after the
+                // synchronous activate emit. Without coalescing the user
+                // sees two back-to-back snapshot serialise + IPC + render
+                // passes for what should be one logical change
+                // ("workspace activated").
+                crate::state::schedule_emit_app_state(&refresh_app);
             });
         }
 
         // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
         // sessions for the workspace that was active at last close. Sessions
         // for any other workspace stay on disk-only until the user activates
-        // them — at which point this branch spawns whatever PTYs aren't
-        // already running. Idempotent thanks to `try_reserve_session_spawn`,
-        // so re-activating the already-active workspace is a no-op.
-        terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id);
+        // them — at which point we spawn whatever PTYs aren't already
+        // running. Idempotent thanks to `try_reserve_session_spawn`, so
+        // re-activating the already-active workspace is a no-op.
+        //
+        // Fire-and-forget on a background thread instead of running on the
+        // IPC thread. `spawn_missing_ptys_for_workspace` issues
+        // synchronous `pty_system.openpty()` + `spawn_command()` calls per
+        // missing session; on Linux those are fast (single-digit ms each)
+        // but a workspace with 3-4 cold terminals + a slow shell rc file
+        // can still tip the IPC thread into a perceptible blocking window
+        // on the click. Spawning gives the UI back the IPC thread
+        // immediately; each terminal's status overlay (`emit_terminal_status`
+        // inside `spawn_pty_for_session`) shows "Starting shell..." until
+        // its child is ready, so the user sees the right state without
+        // the activate click feeling stuck.
+        let spawn_app = app.clone();
+        let spawn_ws = workspace_id.clone();
+        std::thread::spawn(move || {
+            terminal::spawn_missing_ptys_for_workspace(spawn_app, &spawn_ws);
+        });
         crate::state::emit_app_state(&app);
         db.set_ui_state("active_workspace", &workspace_id).ok();
+        let elapsed_ms = activate_started.elapsed().as_millis();
+        if elapsed_ms > 8 {
+            eprintln!(
+                "[codemux::workspace] activate_workspace({workspace_id}) returned in {elapsed_ms}ms"
+            );
+        }
         Ok(())
     } else {
         Err(format!("No workspace found for {workspace_id}"))

@@ -189,7 +189,7 @@ export function NewProjectScreen() {
                     setError(null);
                   }}
                   className={cn(
-                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-all",
+                    "flex flex-col items-center gap-3 rounded-lg border p-4 pt-5 text-center transition-colors",
                     selected
                       ? "border-foreground/50 bg-foreground/5"
                       : "border-border/50 hover:border-border hover:bg-accent/30",

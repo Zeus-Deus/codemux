@@ -6,7 +6,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspaceProjectRoot } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
   getProjectScripts,
@@ -20,10 +20,12 @@ interface RunButtonProps {
 
 export function RunButton({ workspaceId }: RunButtonProps) {
   const [runCommand, setRunCommand] = useState<string | null>(null);
-  const workspace = useActiveWorkspace();
+  // Subscribe to the primitive project_root, not the whole workspace
+  // object — full-snapshot rebuilds on every backend tick churn the
+  // workspace ref and would re-render this button on every tick.
+  const projectRoot = useActiveWorkspaceProjectRoot();
   const showSettings = useUIStore((s) => s.showSettings);
   const prevShowSettings = useRef(showSettings);
-  const projectRoot = workspace?.project_root ?? null;
 
   useEffect(() => {
     // Re-fetch when settings closes (user may have edited the run command)

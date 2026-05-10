@@ -2736,6 +2736,93 @@ pub fn emit_app_state(app: &AppHandle) {
     persist_debouncer().schedule(snapshot);
 }
 
+/// Coalesce many emits into one. The first call schedules a worker
+/// thread that sleeps `EMIT_COALESCE_MS` then invokes
+/// `emit_app_state` with the *current* AppStateStore — so any state
+/// mutations that happen during the window are picked up by the
+/// single eventual emit. Subsequent calls during the window are
+/// no-ops at the emit boundary; the snapshot is read fresh from the
+/// store at flush time, not from any cached value.
+///
+/// Use this for high-frequency background sources (5 s git poll, PR /
+/// port refresh, agent runtime hooks, control protocol bookkeeping)
+/// where multiple emits can pile up within a single frame and the
+/// frontend would otherwise pay the JSON-serialise cost N times for
+/// what coalesces into one re-render anyway (the renderer already
+/// debounces 16 ms in `use-app-state.ts`).
+///
+/// Do NOT use for user-action paths (split, swap, activate, tab
+/// switch, command palette) — those should fire `emit_app_state`
+/// directly so the UI updates without any added latency.
+///
+/// Mirrors the `PersistDebouncer` shape but with a 16 ms quiet
+/// window (one frame) and an emit instead of a disk write. Stores
+/// the latest AppHandle clone so the worker can call back into the
+/// Tauri runtime once the timer elapses.
+pub fn schedule_emit_app_state(app: &AppHandle) {
+    emit_debouncer().schedule(app);
+}
+
+const EMIT_COALESCE_MS: u64 = 16;
+
+struct EmitDebouncer {
+    pending: Arc<AtomicBool>,
+    app: Arc<Mutex<Option<AppHandle>>>,
+}
+
+impl EmitDebouncer {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+            app: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Stash the AppHandle (always overwriting — the latest clone is
+    /// what the worker will use) and, if no worker is in flight,
+    /// spawn one that sleeps then emits.
+    fn schedule(&self, app: &AppHandle) {
+        {
+            let mut guard = self.app.lock().unwrap();
+            *guard = Some(app.clone());
+        }
+
+        // If a worker is already counting down, nothing more to do.
+        // It will pick up the latest `app` reference at flush time.
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let pending = Arc::clone(&self.pending);
+        let app_slot = Arc::clone(&self.app);
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(EMIT_COALESCE_MS));
+
+            // Take the AppHandle and clear the pending flag while
+            // still holding the mutex. This ensures no second worker
+            // can slip through the pending.swap guard between the
+            // flag clear and the emit. Any schedule() arriving AFTER
+            // this point spawns a fresh worker for the next window.
+            let app = {
+                let mut guard = app_slot.lock().unwrap();
+                pending.store(false, Ordering::Release);
+                guard.take()
+            };
+
+            if let Some(app) = app {
+                emit_app_state(&app);
+            }
+        });
+    }
+}
+
+static EMIT_DEBOUNCER: std::sync::OnceLock<EmitDebouncer> = std::sync::OnceLock::new();
+
+fn emit_debouncer() -> &'static EmitDebouncer {
+    EMIT_DEBOUNCER.get_or_init(EmitDebouncer::new)
+}
+
 pub fn load_persisted_state() -> Option<AppStateSnapshot> {
     let path = persisted_layout_path()?;
     let contents = fs::read_to_string(path).ok()?;

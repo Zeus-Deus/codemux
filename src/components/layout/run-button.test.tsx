@@ -35,8 +35,15 @@ vi.mock("@/stores/ui-store", () => ({
 
 let mockActiveWorkspace: Record<string, unknown> | null = null;
 
+// RunButton was refactored to use the focused primitive selector
+// `useActiveWorkspaceProjectRoot` so it doesn't subscribe to the full
+// workspace ref (which churns on every backend tick). The mock has to
+// expose that hook now; we still keep `useActiveWorkspace` exported in
+// case other test paths reach for it.
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => mockActiveWorkspace,
+  useActiveWorkspaceProjectRoot: () =>
+    (mockActiveWorkspace?.project_root as string | undefined) ?? null,
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";

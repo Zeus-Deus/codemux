@@ -133,7 +133,11 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
     let is_active_status =
         matches!(resolved_status, PaneStatus::Working | PaneStatus::Permission);
     state.set_pane_status_by_session(session_id, resolved_status.clone());
-    state::emit_app_state(app);
+    // Coalesced: agent hooks can fire many times per second during a
+    // streaming turn (PreToolUse / PostToolUse / Notification). The
+    // 16 ms window collapses bursts into one frontend render — the
+    // status pill update is not perception-sensitive at that scale.
+    state::schedule_emit_app_state(app);
 
     // Fire desktop notification on agent completion when the user can't already
     // see the pane. Mirrors Superset's "suppress if visible" behavior.
@@ -291,7 +295,10 @@ fn start_agent_exit_monitor(app: AppHandle, session_id: String, shell_pid: u32) 
             // Check if the shell is the foreground process (agent has exited)
             if shell_is_foreground(shell_pid) {
                 state.clear_transient_pane_status_by_session(&session_id);
-                state::emit_app_state(&app);
+                // Coalesced: this fires from a polling loop checking
+                // shell foreground state; not perception-sensitive at
+                // 16 ms.
+                state::schedule_emit_app_state(&app);
                 break;
             }
         }

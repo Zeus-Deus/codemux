@@ -27,7 +27,7 @@ export function EmptyState() {
         <button
           type="button"
           onClick={() => openProject()}
-          className="w-[400px] rounded-xl border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-all hover:border-foreground/30 hover:bg-card"
+          className="w-[400px] rounded-xl border-2 border-dashed border-border/60 bg-card/50 px-6 py-12 text-center transition-colors hover:border-foreground/30 hover:bg-card"
         >
           <FolderOpen className="h-8 w-8 mx-auto mb-3 text-muted-foreground" />
           <div className="text-sm font-medium text-foreground">

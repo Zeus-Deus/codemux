@@ -6,6 +6,34 @@ import { hasAnyPane } from "@/lib/pane-tree";
 import { agentChatCreatePane } from "@/tauri/commands";
 
 /**
+ * Primitive-summary selector for the bits of `appState` this hook
+ * actually depends on. Returning a string fingerprint means the effect
+ * below only re-runs when one of the four relevant fields changes —
+ * not on every backend `app-state-changed` tick (agent tokens, git
+ * polls, hook events). Without this, the effect body would walk the
+ * surface tree on every tick under heavy load.
+ */
+function selectEmptyWorkspaceFingerprint(
+  s: { appState: ReturnType<typeof useAppStore.getState>["appState"] },
+): string {
+  const app = s.appState;
+  if (!app) return "no-app-state";
+  const wsId = app.active_workspace_id;
+  if (!wsId) return "no-active-ws";
+  const ws = app.workspaces.find((w) => w.workspace_id === wsId);
+  if (!ws) return `ws-missing:${wsId}`;
+  // Whether the active surface has any panes — this is the only
+  // structural fact the effect cares about.
+  const activeSurface = ws.surfaces.find(
+    (sf) => sf.surface_id === ws.active_surface_id,
+  );
+  const hasPane = activeSurface ? hasAnyPane(activeSurface.root) : false;
+  // Project_root vs cwd drives the Home-draft-vs-pane branch.
+  const projectRoot = ws.project_root ?? ws.cwd;
+  return `${wsId}|${hasPane ? "1" : "0"}|${projectRoot}`;
+}
+
+/**
  * Ensure something is showing for the active workspace whenever the
  * user has nothing else to look at.
  *
@@ -28,7 +56,13 @@ import { agentChatCreatePane } from "@/tauri/commands";
  *    effect fires while the Tauri call is pending don't double-spawn.
  */
 export function useEnsureDraftWhenEmpty() {
-  const appState = useAppStore((s) => s.appState);
+  // Subscribe to a primitive string fingerprint of the four fields
+  // this effect actually depends on, NOT the whole appState. Without
+  // this, the effect body re-ran on every backend `app-state-changed`
+  // tick (many per second under load) walking surface trees and doing
+  // workspace lookups for nothing. The audit pass found this pattern;
+  // see `selectEmptyWorkspaceFingerprint` above.
+  const fingerprint = useAppStore(selectEmptyWorkspaceFingerprint);
   const homeDir = useHomeDir();
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
@@ -44,9 +78,16 @@ export function useEnsureDraftWhenEmpty() {
   const inFlightSpawnRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!appState || !flagsLoaded) return;
+    if (!flagsLoaded) return;
     if (!enableAgentChat || !enableLazyWorkspaceCreation) return;
     if (activeDraftId) return;
+
+    // Re-read the live snapshot at effect-fire time. The fingerprint
+    // dep above ensures we only get here when the relevant slice
+    // changed, but we still need the full workspace object to read
+    // surfaces / surface ids.
+    const appState = useAppStore.getState().appState;
+    if (!appState) return;
 
     const activeWs = appState.workspaces.find(
       (w) => w.workspace_id === appState.active_workspace_id,
@@ -86,7 +127,7 @@ export function useEnsureDraftWhenEmpty() {
     const draft = store.getOrCreateHomeDraft();
     store.setActiveDraft(draft.draftId);
   }, [
-    appState,
+    fingerprint,
     homeDir,
     enableAgentChat,
     enableLazyWorkspaceCreation,
