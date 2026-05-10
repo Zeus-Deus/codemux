@@ -476,41 +476,75 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
     // ── Attach PTY session ──
     //
-    // Restore scrollback, then attach PTY output and fit the pane.
+    // Mount cost on workspace switch was previously dominated by THREE
+    // sequential awaited IPCs:
+    //
+    //   getTerminalScrollback  →  getTerminalStatus  →  attachPtyOutput
+    //
+    // Each round-trip is on the order of 5–30 ms on Linux WebKitGTK
+    // (Tauri's IPC docs do not publish a number; per-call cost is
+    // dominated by JSON encode/decode plus the WebKit→GTK→Rust hop).
+    // With 2-3 terminals re-mounting on every workspace switch, that
+    // stacks into the user-perceived 1-second hitch.
+    //
+    // Scrollback and status are independent reads — they can run in
+    // parallel. The `attachPtyOutput` step must come AFTER scrollback
+    // is written to xterm, otherwise live PTY output could interleave
+    // with the historical bytes (xterm's parser is stateful, so byte
+    // order across the boundary matters for the alt-screen / cursor
+    // state). Status-overlay update is independent of both.
+    //
+    // Net: 3 sequential round-trips → 1 parallel pair + 1 = effectively
+    // 2 round-trips per terminal on switch.
     let cancelled = false;
+    const attachStarted = performance.now();
 
     (async () => {
-      try {
-        // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
-        const workspaceId = getSessionWorkspaceId(sid);
-        const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
+      // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
+      const workspaceId = getSessionWorkspaceId(sid);
+      const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
+      const wantsScrollback = restoreEnabled && !!workspaceId && !!paneId;
 
-        if (restoreEnabled && workspaceId && paneId) {
-          const scrollback = await getTerminalScrollback(workspaceId, paneId);
-          if (scrollback && !cancelled) {
-            const { meta } = scrollback;
-            // Cache captures from scrollback metadata — these survive tab switches
-            // even when layout.json doesn't persist adapter_captures.
-            if (meta.adapter_captures && Object.keys(meta.adapter_captures).length > 0) {
-              restoredCapturesRef.current = meta.adapter_captures;
-            }
-            if (!meta.alternate_buffer && scrollback.data) {
-              term.write(scrollback.data);
-              term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");
-            }
-          }
+      // Stage 1: parallel reads — scrollback + status. Both are
+      // independent disk/state lookups in Rust; running them in
+      // parallel halves the wall-clock for the read phase. Either
+      // failure is recoverable (we fall back to fresh pane / failed
+      // overlay).
+      const [scrollbackResult, statusResult] = await Promise.allSettled([
+        wantsScrollback
+          ? getTerminalScrollback(workspaceId!, paneId!)
+          : Promise.resolve(null),
+        getTerminalStatus(sid),
+      ]);
+      if (cancelled) return;
+
+      // Apply scrollback first so historical bytes land in the buffer
+      // before the live channel can deliver anything. Errors here are
+      // logged via the catch-all on the IIFE and the pane continues
+      // with a fresh xterm.
+      if (
+        scrollbackResult.status === "fulfilled" &&
+        scrollbackResult.value &&
+        !cancelled
+      ) {
+        const scrollback = scrollbackResult.value;
+        const { meta } = scrollback;
+        // Cache captures from scrollback metadata — these survive tab
+        // switches even when layout.json doesn't persist
+        // adapter_captures.
+        if (meta.adapter_captures && Object.keys(meta.adapter_captures).length > 0) {
+          restoredCapturesRef.current = meta.adapter_captures;
         }
-      } catch {
-        // Scrollback restore failed — continue with fresh pane
+        if (!meta.alternate_buffer && scrollback.data) {
+          term.write(scrollback.data);
+          term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");
+        }
       }
 
-      // Attach PTY — never blocked by adapter checks
-      try {
-        const status = await getTerminalStatus(sid);
-        if (cancelled) return;
-        updateStatusOverlay(status);
-      } catch {
-        if (cancelled) return;
+      // Update overlay from whichever result we got.
+      if (statusResult.status === "fulfilled") {
+        updateStatusOverlay(statusResult.value);
+      } else {
         updateStatusOverlay({
           session_id: sid,
           state: "failed",
@@ -519,6 +553,8 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         });
       }
 
+      // Stage 2: attach the channel. Must come AFTER the scrollback
+      // write so live bytes don't interleave with historical bytes.
       const channel = new Channel<unknown>((payload) => {
         writePtyChunk(payload);
       });
@@ -538,9 +574,22 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         return;
       }
 
+      // Stage 3: fit + resize. resizePty is fire-and-forget so doesn't
+      // block the mount finishing.
       fitAddon.fit();
       if (term.cols > 0 && term.rows > 0) {
         resizePty(sid, term.cols, term.rows).catch(console.error);
+      }
+
+      // Timing log gated to slow mounts so steady-state stays quiet.
+      // The user can grep stderr for `[codemux::terminal-mount]` while
+      // exercising workspace switches to see actual numbers.
+      const elapsed = performance.now() - attachStarted;
+      if (elapsed > 50) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[codemux::terminal-mount] sid=${sid.slice(0, 8)} attach=${elapsed.toFixed(0)}ms`,
+        );
       }
     })();
 

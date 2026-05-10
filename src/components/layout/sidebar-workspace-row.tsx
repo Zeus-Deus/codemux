@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -338,7 +338,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     // draft itself stays in the store — clicking "+" again restores
     // it with composer text intact via the single-slot rule.
     useChatDraftStore.getState().setActiveDraft(null);
-    activateWorkspace(workspace.workspace_id).catch(console.error);
+    // Wrap in `startTransition` so React treats the workspace switch
+    // as a non-urgent update. The expensive commit (unmount the old
+    // workspace's pane tree, mount the new one — including 2-3
+    // TerminalPane mount effects with their xterm setup + IPC
+    // round-trips, possibly an EditorPane CodeMirror rebuild) still
+    // happens, but React keeps yielding to the browser between fiber
+    // units while it's running so the click feedback, hover states,
+    // and any in-flight typing remain responsive instead of feeling
+    // frozen. See react.dev/reference/react/startTransition. Pairs
+    // with the backend `spawn_missing_ptys_for_workspace` move off
+    // the IPC thread and the parallelised mount IPCs.
+    startTransition(() => {
+      activateWorkspace(workspace.workspace_id).catch(console.error);
+    });
   };
 
   const isPrimary = !workspace.worktree_path;
