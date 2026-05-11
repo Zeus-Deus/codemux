@@ -1,68 +1,102 @@
 use crate::git::{BaseBranchDiff, CommitFileEntry, ConflictCheckResult, GitBranchInfo, GitDiffStat, GitFileStatus, GitLogEntry, MergeIntoBaseResult, MergeState, ResolverBranchInfo, WorktreeInfo};
 use std::path::Path;
 
+// Every command here shells out via `crate::git::*` → `Command::new("git")`.
+// They MUST run on Tokio's blocking pool: a sync `#[tauri::command]` runs on
+// the GTK main thread, and any wedged `git` subprocess (slow disk, stuck FS,
+// network credential prompt) freezes the whole UI hard enough that even
+// window-close requests can't be processed. The fix is uniform — async
+// command + `spawn_blocking`. Frontend-side `invoke()` already returns a
+// Promise either way, so no caller changes are needed.
+
 #[tauri::command]
-pub fn check_is_git_repo(path: String) -> bool {
-    crate::git::is_git_repo(Path::new(&path))
+pub async fn check_is_git_repo(path: String) -> bool {
+    tokio::task::spawn_blocking(move || crate::git::is_git_repo(Path::new(&path)))
+        .await
+        .unwrap_or(false)
 }
 
 #[tauri::command]
-pub fn init_git_repo(path: String) -> Result<String, String> {
-    crate::git::git_init_repo(Path::new(&path))
+pub async fn init_git_repo(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_init_repo(Path::new(&path)))
+        .await
+        .map_err(|e| format!("init_git_repo task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
-    let repo_path = Path::new(&parent_dir).join(&name);
-    std::fs::create_dir_all(&repo_path)
-        .map_err(|e| format!("Failed to create directory: {e}"))?;
-    crate::git::git_init_repo(&repo_path)?;
-    Ok(repo_path.display().to_string())
+pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let repo_path = Path::new(&parent_dir).join(&name);
+        std::fs::create_dir_all(&repo_path)
+            .map_err(|e| format!("Failed to create directory: {e}"))?;
+        crate::git::git_init_repo(&repo_path)?;
+        Ok(repo_path.display().to_string())
+    })
+    .await
+    .map_err(|e| format!("create_empty_repo task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
-    crate::git::git_status(Path::new(&path))
+pub async fn get_git_status(path: String) -> Result<Vec<GitFileStatus>, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_status(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_git_status task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
-    crate::git::git_diff(Path::new(&path), &file, staged)
+pub async fn get_git_diff(path: String, file: String, staged: bool) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_diff(Path::new(&path), &file, staged))
+        .await
+        .map_err(|e| format!("get_git_diff task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_git_diff_stat(path: String) -> Result<GitDiffStat, String> {
-    crate::git::git_diff_stat(Path::new(&path))
+pub async fn get_git_diff_stat(path: String) -> Result<GitDiffStat, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_diff_stat(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_git_diff_stat task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_stage_files(path: String, files: Vec<String>) -> Result<(), String> {
-    crate::git::git_stage(Path::new(&path), &files)
+pub async fn git_stage_files(path: String, files: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_stage(Path::new(&path), &files))
+        .await
+        .map_err(|e| format!("git_stage_files task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
-    crate::git::git_unstage(Path::new(&path), &files)
+pub async fn git_unstage_files(path: String, files: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_unstage(Path::new(&path), &files))
+        .await
+        .map_err(|e| format!("git_unstage_files task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_commit_changes(path: String, message: String) -> Result<(), String> {
-    crate::git::git_commit(Path::new(&path), &message)
+pub async fn git_commit_changes(path: String, message: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_commit(Path::new(&path), &message))
+        .await
+        .map_err(|e| format!("git_commit_changes task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_push_changes(path: String, set_upstream: bool) -> Result<(), String> {
-    crate::git::git_push(Path::new(&path), set_upstream)
+pub async fn git_push_changes(path: String, set_upstream: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_push(Path::new(&path), set_upstream))
+        .await
+        .map_err(|e| format!("git_push_changes task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_pull_changes(path: String) -> Result<(), String> {
-    crate::git::git_pull(Path::new(&path))
+pub async fn git_pull_changes(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_pull(Path::new(&path)))
+        .await
+        .map_err(|e| format!("git_pull_changes task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_fetch_changes(path: String) -> Result<(), String> {
-    crate::git::git_fetch(Path::new(&path))
+pub async fn git_fetch_changes(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_fetch(Path::new(&path)))
+        .await
+        .map_err(|e| format!("git_fetch_changes task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -90,78 +124,118 @@ pub async fn git_fetch_prune(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn git_stash_push(path: String, include_untracked: bool) -> Result<(), String> {
-    crate::git::git_stash_push(Path::new(&path), include_untracked)
+pub async fn git_stash_push(path: String, include_untracked: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_stash_push(Path::new(&path), include_untracked)
+    })
+    .await
+    .map_err(|e| format!("git_stash_push task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_stash_pop(path: String) -> Result<(), String> {
-    crate::git::git_stash_pop(Path::new(&path))
+pub async fn git_stash_pop(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_stash_pop(Path::new(&path)))
+        .await
+        .map_err(|e| format!("git_stash_pop task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_discard_file(path: String, file: String) -> Result<(), String> {
-    crate::git::git_discard_file(Path::new(&path), &file)
+pub async fn git_discard_file(path: String, file: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_discard_file(Path::new(&path), &file))
+        .await
+        .map_err(|e| format!("git_discard_file task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn git_log_entries(path: String, count: usize) -> Result<Vec<GitLogEntry>, String> {
-    crate::git::git_log(Path::new(&path), count)
+pub async fn git_log_entries(path: String, count: usize) -> Result<Vec<GitLogEntry>, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_log(Path::new(&path), count))
+        .await
+        .map_err(|e| format!("git_log_entries task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_commit_files(path: String, hash: String) -> Result<Vec<CommitFileEntry>, String> {
-    crate::git::get_commit_files(Path::new(&path), &hash)
+pub async fn get_commit_files(path: String, hash: String) -> Result<Vec<CommitFileEntry>, String> {
+    tokio::task::spawn_blocking(move || crate::git::get_commit_files(Path::new(&path), &hash))
+        .await
+        .map_err(|e| format!("get_commit_files task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_git_branch_info(path: String) -> Result<GitBranchInfo, String> {
-    crate::git::git_branch_info(Path::new(&path))
+pub async fn get_git_branch_info(path: String) -> Result<GitBranchInfo, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_branch_info(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_git_branch_info task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn list_branches(path: String, remote: bool) -> Result<Vec<String>, String> {
-    crate::git::git_list_branches(Path::new(&path), remote)
+pub async fn list_branches(path: String, remote: bool) -> Result<Vec<String>, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_list_branches(Path::new(&path), remote))
+        .await
+        .map_err(|e| format!("list_branches task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn list_branches_detailed(path: String) -> Result<Vec<crate::git::BranchDetail>, String> {
-    crate::git::git_list_branches_detailed(Path::new(&path))
+pub async fn list_branches_detailed(path: String) -> Result<Vec<crate::git::BranchDetail>, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_list_branches_detailed(Path::new(&path)))
+        .await
+        .map_err(|e| format!("list_branches_detailed task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_base_branch_diff(path: String, base_branch: String) -> Result<BaseBranchDiff, String> {
-    crate::git::git_diff_base_branch(Path::new(&path), &base_branch)
+pub async fn get_base_branch_diff(path: String, base_branch: String) -> Result<BaseBranchDiff, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_diff_base_branch(Path::new(&path), &base_branch)
+    })
+    .await
+    .map_err(|e| format!("get_base_branch_diff task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_base_branch_file_diff(path: String, base_branch: String, file: String) -> Result<String, String> {
-    crate::git::git_diff_base_branch_file(Path::new(&path), &base_branch, &file)
+pub async fn get_base_branch_file_diff(path: String, base_branch: String, file: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_diff_base_branch_file(Path::new(&path), &base_branch, &file)
+    })
+    .await
+    .map_err(|e| format!("get_base_branch_file_diff task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_default_branch(path: String) -> Result<String, String> {
-    crate::git::git_default_branch(Path::new(&path))
+pub async fn get_default_branch(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_default_branch(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_default_branch task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn create_worktree(path: String, branch: String, new_branch: bool, base: Option<String>, pr_number: Option<u32>) -> Result<String, String> {
-    crate::git::git_create_worktree(Path::new(&path), &branch, new_branch, base.as_deref(), pr_number)
+pub async fn create_worktree(path: String, branch: String, new_branch: bool, base: Option<String>, pr_number: Option<u32>) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_create_worktree(Path::new(&path), &branch, new_branch, base.as_deref(), pr_number)
+    })
+    .await
+    .map_err(|e| format!("create_worktree task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn remove_worktree(worktree_path: String, branch: Option<String>, force: Option<bool>) -> Result<(), String> {
-    crate::git::git_remove_worktree(Path::new(&worktree_path), branch.as_deref(), force.unwrap_or(false))
+pub async fn remove_worktree(worktree_path: String, branch: Option<String>, force: Option<bool>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_remove_worktree(Path::new(&worktree_path), branch.as_deref(), force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| format!("remove_worktree task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn list_worktrees(path: String) -> Result<Vec<WorktreeInfo>, String> {
-    crate::git::git_list_worktrees(Path::new(&path))
+pub async fn list_worktrees(path: String) -> Result<Vec<WorktreeInfo>, String> {
+    tokio::task::spawn_blocking(move || crate::git::git_list_worktrees(Path::new(&path)))
+        .await
+        .map_err(|e| format!("list_worktrees task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn merge_branch(path: String, source_branch: String) -> Result<String, String> {
-    crate::git::merge_branch(Path::new(&path), &source_branch)
+pub async fn merge_branch(path: String, source_branch: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::git::merge_branch(Path::new(&path), &source_branch))
+        .await
+        .map_err(|e| format!("merge_branch task join failed: {e}"))?
 }
 
 /// Run a fallible blocking operation on Tokio's blocking pool with an outer
@@ -252,58 +326,92 @@ pub async fn abort_merge_into_base(
 }
 
 #[tauri::command]
-pub fn get_merge_state(path: String) -> Result<MergeState, String> {
-    crate::git::get_merge_state(Path::new(&path))
+pub async fn get_merge_state(path: String) -> Result<MergeState, String> {
+    tokio::task::spawn_blocking(move || crate::git::get_merge_state(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_merge_state task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn check_merge_conflicts(path: String, target_branch: String) -> Result<ConflictCheckResult, String> {
-    crate::git::check_merge_conflicts(Path::new(&path), &target_branch)
+pub async fn check_merge_conflicts(path: String, target_branch: String) -> Result<ConflictCheckResult, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::check_merge_conflicts(Path::new(&path), &target_branch)
+    })
+    .await
+    .map_err(|e| format!("check_merge_conflicts task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn resolve_conflict_ours(path: String, file: String) -> Result<(), String> {
-    crate::git::resolve_conflict_ours(Path::new(&path), &file)
+pub async fn resolve_conflict_ours(path: String, file: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::resolve_conflict_ours(Path::new(&path), &file))
+        .await
+        .map_err(|e| format!("resolve_conflict_ours task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn resolve_conflict_theirs(path: String, file: String) -> Result<(), String> {
-    crate::git::resolve_conflict_theirs(Path::new(&path), &file)
+pub async fn resolve_conflict_theirs(path: String, file: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::resolve_conflict_theirs(Path::new(&path), &file)
+    })
+    .await
+    .map_err(|e| format!("resolve_conflict_theirs task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn mark_conflict_resolved(path: String, file: String) -> Result<(), String> {
-    crate::git::mark_conflict_resolved(Path::new(&path), &file)
+pub async fn mark_conflict_resolved(path: String, file: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::mark_conflict_resolved(Path::new(&path), &file)
+    })
+    .await
+    .map_err(|e| format!("mark_conflict_resolved task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn abort_merge(path: String) -> Result<(), String> {
-    crate::git::abort_merge(Path::new(&path))
+pub async fn abort_merge(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::abort_merge(Path::new(&path)))
+        .await
+        .map_err(|e| format!("abort_merge task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn continue_merge(path: String, message: String) -> Result<(), String> {
-    crate::git::continue_merge(Path::new(&path), &message)
+pub async fn continue_merge(path: String, message: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::continue_merge(Path::new(&path), &message))
+        .await
+        .map_err(|e| format!("continue_merge task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn create_resolver_branch(path: String, target_branch: String) -> Result<ResolverBranchInfo, String> {
-    crate::git::create_resolver_branch(Path::new(&path), &target_branch)
+pub async fn create_resolver_branch(path: String, target_branch: String) -> Result<ResolverBranchInfo, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::create_resolver_branch(Path::new(&path), &target_branch)
+    })
+    .await
+    .map_err(|e| format!("create_resolver_branch task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn apply_resolution(path: String, temp_branch: String, original_branch: String, message: String) -> Result<(), String> {
-    crate::git::apply_resolution(Path::new(&path), &temp_branch, &original_branch, &message)
+pub async fn apply_resolution(path: String, temp_branch: String, original_branch: String, message: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::apply_resolution(Path::new(&path), &temp_branch, &original_branch, &message)
+    })
+    .await
+    .map_err(|e| format!("apply_resolution task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn abort_resolution(path: String, temp_branch: String, original_branch: String) -> Result<(), String> {
-    crate::git::abort_resolution(Path::new(&path), &temp_branch, &original_branch)
+pub async fn abort_resolution(path: String, temp_branch: String, original_branch: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::abort_resolution(Path::new(&path), &temp_branch, &original_branch)
+    })
+    .await
+    .map_err(|e| format!("abort_resolution task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_resolution_diff(path: String) -> Result<String, String> {
-    crate::git::get_resolution_diff(Path::new(&path))
+pub async fn get_resolution_diff(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || crate::git::get_resolution_diff(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_resolution_diff task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -358,7 +466,6 @@ mod tests {
 
     #[tokio::test]
     async fn happy_path_returns_inner_ok() {
-        // Closure returns Ok quickly → wrapper returns the same Ok unchanged.
         let res: Result<i32, String> = run_blocking_with_timeout(
             Duration::from_secs(5),
             "happy",
@@ -370,9 +477,6 @@ mod tests {
 
     #[tokio::test]
     async fn inner_error_passes_through_verbatim() {
-        // Closure returns Err → wrapper passes the exact same Err through,
-        // not a "task failed" wrapping. (Critical for surfacing real git
-        // errors like "uncommitted changes" to the UI.)
         let res: Result<(), String> = run_blocking_with_timeout(
             Duration::from_secs(5),
             "inner_err",
@@ -387,17 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_returns_named_error_and_does_not_block_caller() {
-        // This is the test that proves the freeze is fixed: a closure that
-        // would block far longer than the deadline must NOT pin the caller.
-        // We assert (a) the wrapper returns Err with the timeout message
-        // mentioning the operation name and the deadline in seconds, and
-        // (b) the call returns within a small bounded wall-clock window.
-        // Without `tokio::time::timeout` the test would hang for 30s.
         let start = Instant::now();
-        // Inner sleep (1s) > deadline (100ms), so timeout MUST fire. Kept
-        // short on purpose: tokio's runtime waits for blocking threads on
-        // shutdown, so a long inner sleep would inflate the CI suite by
-        // that duration even though the assertion already passed.
         let res: Result<(), String> = run_blocking_with_timeout(
             Duration::from_millis(100),
             "merge_into_base",
@@ -411,20 +505,9 @@ mod tests {
 
         assert!(res.is_err(), "expected timeout Err, got: {res:?}");
         let err = res.unwrap_err();
-        assert!(
-            err.contains("merge_into_base"),
-            "timeout error should name the operation, got: {err}"
-        );
-        assert!(
-            err.contains("timed out"),
-            "timeout error should say 'timed out', got: {err}"
-        );
-        assert!(
-            err.contains("0 seconds"),
-            "timeout error should report the configured deadline (0s for 100ms), got: {err}"
-        );
-        // The wrapper must return promptly after the 100ms deadline; if the
-        // freeze regression came back, this would be ≥1s.
+        assert!(err.contains("merge_into_base"), "got: {err}");
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(err.contains("0 seconds"), "got: {err}");
         assert!(
             elapsed < Duration::from_millis(800),
             "wrapper must return promptly after timeout, took {elapsed:?}"
@@ -433,11 +516,6 @@ mod tests {
 
     #[tokio::test]
     async fn inner_panic_becomes_task_failed_error() {
-        // If the inner closure panics, spawn_blocking yields a JoinError;
-        // the wrapper must convert it into a `<name> task failed: <err>`
-        // string instead of unwinding the runtime task. This matters
-        // because a panicking git helper would otherwise crash the IPC
-        // worker and the user would see an opaque IPC failure.
         let res: Result<(), String> = run_blocking_with_timeout(
             Duration::from_secs(5),
             "panicker",
@@ -447,17 +525,12 @@ mod tests {
         let err = res.unwrap_err();
         assert!(
             err.contains("panicker") && err.contains("task failed"),
-            "panic should surface as '<name> task failed: ...', got: {err}"
+            "got: {err}"
         );
     }
 
     #[tokio::test]
     async fn runtime_remains_responsive_during_long_blocking_call() {
-        // The whole point of moving the work off the IPC thread: while
-        // a long blocking call is in flight, OTHER async tasks can still
-        // make progress. We start a 1s blocking task on the wrapper and
-        // a parallel async sleep of 50ms; the parallel sleep must finish
-        // promptly, well before the blocking task does.
         let blocking = tokio::spawn(run_blocking_with_timeout(
             Duration::from_secs(5),
             "long_blocker",
@@ -473,10 +546,9 @@ mod tests {
 
         assert!(
             parallel_elapsed < Duration::from_millis(500),
-            "parallel async task should not be starved by blocking work, took {parallel_elapsed:?}"
+            "parallel async task should not be starved, took {parallel_elapsed:?}"
         );
 
-        // Drain the blocking task so the test's runtime shuts down cleanly.
         let _ = blocking.await;
     }
 }

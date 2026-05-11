@@ -3,54 +3,99 @@ use crate::github::{
     PullRequestInfo,
 };
 use crate::state::AppStateStore;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
+// Every command here that delegates to `crate::github::*` or
+// `crate::github_cache::*` shells out via `Command::new("gh")` or
+// `Command::new("git")`. They MUST run on Tokio's blocking pool: a sync
+// `#[tauri::command]` runs on the GTK main thread, and any wedged
+// subprocess freezes the whole UI hard enough that even window-close
+// requests can't be processed. The fix is uniform — async command +
+// `spawn_blocking`. Frontend `invoke()` returns a Promise either way.
+
 #[tauri::command]
-pub fn check_gh_available() -> bool {
-    crate::github::gh_available()
+pub async fn check_gh_available() -> bool {
+    tokio::task::spawn_blocking(crate::github::gh_available)
+        .await
+        .unwrap_or(false)
 }
 
 #[tauri::command]
-pub fn check_gh_status() -> GhStatus {
-    crate::github::check_gh_status()
+pub async fn check_gh_status() -> GhStatus {
+    tokio::task::spawn_blocking(crate::github::check_gh_status)
+        .await
+        .unwrap_or(GhStatus::NotInstalled)
 }
 
 #[tauri::command]
-pub fn check_github_repo(path: String) -> bool {
-    crate::github::is_github_repo(Path::new(&path))
+pub async fn check_github_repo(path: String) -> bool {
+    // 10s timeout retained because this is the specific freeze the user hit
+    // (sync `git remote -v` on the GTK main thread, May 2026). On wedged
+    // git, falling back to "not a github repo" is acceptable; the perfect
+    // answer is not worth a permanently pinned IPC.
+    let path_buf = PathBuf::from(path);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::task::spawn_blocking(move || crate::github::is_github_repo(&path_buf)),
+    )
+    .await
+    {
+        Ok(Ok(v)) => v,
+        _ => false,
+    }
 }
 
 #[tauri::command]
-pub fn get_branch_pull_request(path: String) -> Result<Option<PullRequestInfo>, String> {
-    crate::github::get_branch_pr(Path::new(&path))
+pub async fn get_branch_pull_request(path: String) -> Result<Option<PullRequestInfo>, String> {
+    tokio::task::spawn_blocking(move || crate::github::get_branch_pr(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_branch_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn create_pull_request(
+pub async fn create_pull_request(
     path: String,
     title: String,
     body: String,
     base: Option<String>,
     draft: bool,
 ) -> Result<PullRequestInfo, String> {
-    crate::github::create_pull_request(Path::new(&path), &title, &body, base.as_deref(), draft)
+    tokio::task::spawn_blocking(move || {
+        crate::github::create_pull_request(
+            Path::new(&path),
+            &title,
+            &body,
+            base.as_deref(),
+            draft,
+        )
+    })
+    .await
+    .map_err(|e| format!("create_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequestInfo>, String> {
-    crate::github_cache::cached_list_pull_requests(Path::new(&path), &state)
+pub async fn list_pull_requests(path: String, state: String) -> Result<Vec<PullRequestInfo>, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_list_pull_requests(Path::new(&path), &state)
+    })
+    .await
+    .map_err(|e| format!("list_pull_requests task join failed: {e}"))?
 }
 
 /// Stage 5 — single PR detail (body + comments) by number, by repo
 /// path. Path-based so the chat composer can call without a
 /// workspace handle (mirrors `get_github_issue_by_path`).
 #[tauri::command]
-pub fn get_github_pr_by_path(
+pub async fn get_github_pr_by_path(
     path: String,
     pr_number: u32,
 ) -> Result<PullRequestInfo, String> {
-    crate::github_cache::cached_get_pull_request(Path::new(&path), pr_number)
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_get_pull_request(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_github_pr_by_path task join failed: {e}"))?
 }
 
 /// Stage 5 — PR diff. `full=false` → `--name-only`; `full=true` →
@@ -58,12 +103,16 @@ pub fn get_github_pr_by_path(
 /// full) so flipping the toggle doesn't blow the other variant out
 /// of the cache.
 #[tauri::command]
-pub fn get_github_pr_diff_by_path(
+pub async fn get_github_pr_diff_by_path(
     path: String,
     pr_number: u32,
     full: bool,
 ) -> Result<String, String> {
-    crate::github_cache::cached_get_pr_diff(Path::new(&path), pr_number, full)
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_get_pr_diff(Path::new(&path), pr_number, full)
+    })
+    .await
+    .map_err(|e| format!("get_github_pr_diff_by_path task join failed: {e}"))?
 }
 
 #[tauri::command]
@@ -84,66 +133,98 @@ pub async fn list_incoming_prs(
 }
 
 #[tauri::command]
-pub fn merge_pull_request(path: String, pr_number: u32, method: String) -> Result<(), String> {
-    crate::github::merge_pull_request(Path::new(&path), pr_number, &method)
+pub async fn merge_pull_request(path: String, pr_number: u32, method: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::github::merge_pull_request(Path::new(&path), pr_number, &method)
+    })
+    .await
+    .map_err(|e| format!("merge_pull_request task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_pull_request_checks(path: String) -> Result<Vec<CheckInfo>, String> {
-    crate::github::get_pr_checks(Path::new(&path))
+pub async fn get_pull_request_checks(path: String) -> Result<Vec<CheckInfo>, String> {
+    tokio::task::spawn_blocking(move || crate::github::get_pr_checks(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_pull_request_checks task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_pr_review_comments(path: String) -> Result<Vec<crate::github::ReviewComment>, String> {
-    crate::github::get_pr_review_comments(Path::new(&path))
+pub async fn get_pr_review_comments(path: String) -> Result<Vec<crate::github::ReviewComment>, String> {
+    tokio::task::spawn_blocking(move || crate::github::get_pr_review_comments(Path::new(&path)))
+        .await
+        .map_err(|e| format!("get_pr_review_comments task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<InlineReviewComment>, String> {
-    crate::github::get_pr_inline_comments(Path::new(&path), pr_number)
+pub async fn get_pr_inline_comments(path: String, pr_number: u32) -> Result<Vec<InlineReviewComment>, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::github::get_pr_inline_comments(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_pr_inline_comments task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
-    crate::github::submit_pr_review(Path::new(&path), pr_number, &event, &body)
+pub async fn submit_pr_review(path: String, pr_number: u32, event: String, body: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::github::submit_pr_review(Path::new(&path), pr_number, &event, &body)
+    })
+    .await
+    .map_err(|e| format!("submit_pr_review task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
-    crate::github::get_pr_deployments(Path::new(&path), pr_number)
+pub async fn get_pr_deployments(path: String, pr_number: u32) -> Result<Vec<DeploymentInfo>, String> {
+    tokio::task::spawn_blocking(move || {
+        crate::github::get_pr_deployments(Path::new(&path), pr_number)
+    })
+    .await
+    .map_err(|e| format!("get_pr_deployments task join failed: {e}"))?
 }
 
 // ── GitHub Issues ──
 
 #[tauri::command]
-pub fn list_github_issues(
+pub async fn list_github_issues(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     search: Option<String>,
 ) -> Result<Vec<GitHubIssue>, String> {
     let cwd = resolve_workspace_cwd(&state, &workspace_id)?;
-    crate::github_cache::cached_list_issues(Path::new(&cwd), search.as_deref())
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_list_issues(Path::new(&cwd), search.as_deref())
+    })
+    .await
+    .map_err(|e| format!("list_github_issues task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn get_github_issue(
+pub async fn get_github_issue(
     state: State<'_, AppStateStore>,
     workspace_id: String,
     issue_number: u64,
 ) -> Result<GitHubIssue, String> {
     let cwd = resolve_workspace_cwd(&state, &workspace_id)?;
-    crate::github_cache::cached_get_issue(Path::new(&cwd), issue_number)
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_get_issue(Path::new(&cwd), issue_number)
+    })
+    .await
+    .map_err(|e| format!("get_github_issue task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn link_workspace_issue(
+pub async fn link_workspace_issue(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     issue_number: u64,
 ) -> Result<(), String> {
     let cwd = resolve_workspace_cwd(&state, &workspace_id)?;
-    let issue = crate::github::get_github_issue(Path::new(&cwd), issue_number)?;
+    let issue = tokio::task::spawn_blocking(move || {
+        crate::github::get_github_issue(Path::new(&cwd), issue_number)
+    })
+    .await
+    .map_err(|e| format!("link_workspace_issue task join failed: {e}"))??;
     let linked = LinkedIssue {
         number: issue.number,
         title: issue.title,
@@ -167,7 +248,7 @@ pub fn unlink_workspace_issue(
 }
 
 #[tauri::command]
-pub fn refresh_workspace_issue(
+pub async fn refresh_workspace_issue(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
@@ -187,7 +268,11 @@ pub fn refresh_workspace_issue(
         (ws.cwd.clone(), num)
     };
 
-    let issue = crate::github::get_github_issue(Path::new(&cwd), issue_number)?;
+    let issue = tokio::task::spawn_blocking(move || {
+        crate::github::get_github_issue(Path::new(&cwd), issue_number)
+    })
+    .await
+    .map_err(|e| format!("refresh_workspace_issue task join failed: {e}"))??;
     let linked = LinkedIssue {
         number: issue.number,
         title: issue.title,
@@ -200,7 +285,7 @@ pub fn refresh_workspace_issue(
 }
 
 #[tauri::command]
-pub fn refresh_workspace_pr(
+pub async fn refresh_workspace_pr(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
@@ -216,8 +301,12 @@ pub fn refresh_workspace_pr(
         ws.worktree_path.clone().unwrap_or_else(|| ws.cwd.clone())
     };
 
-    let path = Path::new(&cwd);
-    let pr_info = crate::github::get_branch_pr(path)?;
+    let cwd_for_pr = cwd.clone();
+    let pr_info = tokio::task::spawn_blocking(move || {
+        crate::github::get_branch_pr(Path::new(&cwd_for_pr))
+    })
+    .await
+    .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
     // Decision matrix (mirrors the background pollers):
     //   - PR found & passes the historical-SHA gate → write fresh info
     //   - PR found but gated out (CLOSED/MERGED with diverged SHA) → clear
@@ -227,7 +316,13 @@ pub fn refresh_workspace_pr(
     //     → preserve, protecting the fork-branch `gh pr checkout` case
     match pr_info.as_ref() {
         Some(pr) => {
-            let head_sha = crate::github::get_head_sha(path);
+            let cwd_for_head = cwd.clone();
+            let head_sha = tokio::task::spawn_blocking(move || {
+                crate::github::get_head_sha(Path::new(&cwd_for_head))
+            })
+            .await
+            .ok()
+            .flatten();
             if crate::github::should_show_branch_pr(pr, head_sha.as_deref()) {
                 state.update_workspace_pr_info(
                     &workspace_id,
@@ -263,24 +358,33 @@ pub fn refresh_workspace_pr(
 
 /// List issues by repo path directly (no workspace needed — for use before workspace exists).
 #[tauri::command]
-pub fn list_github_issues_by_path(
+pub async fn list_github_issues_by_path(
     path: String,
     search: Option<String>,
 ) -> Result<Vec<GitHubIssue>, String> {
-    crate::github_cache::cached_list_issues(Path::new(&path), search.as_deref())
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_list_issues(Path::new(&path), search.as_deref())
+    })
+    .await
+    .map_err(|e| format!("list_github_issues_by_path task join failed: {e}"))?
 }
 
 /// Get a single issue by repo path directly (no workspace needed).
 #[tauri::command]
-pub fn get_github_issue_by_path(
+pub async fn get_github_issue_by_path(
     path: String,
     issue_number: u64,
 ) -> Result<GitHubIssue, String> {
-    crate::github_cache::cached_get_issue(Path::new(&path), issue_number)
+    tokio::task::spawn_blocking(move || {
+        crate::github_cache::cached_get_issue(Path::new(&path), issue_number)
+    })
+    .await
+    .map_err(|e| format!("get_github_issue_by_path task join failed: {e}"))?
 }
 
 #[tauri::command]
 pub fn suggest_issue_branch_name(issue_number: u64, issue_title: String) -> Result<String, String> {
+    // Pure in-memory string formatting — safe on the main thread.
     Ok(crate::github::suggest_branch_name(issue_number, &issue_title))
 }
 
