@@ -55,6 +55,7 @@ import {
   checkGithubRepo,
   listPullRequests,
   pickFilesDialog,
+  pasteClipboardImageToFile,
   suggestIssueBranchName,
   linkWorkspaceIssue,
   getGithubIssueByPath,
@@ -318,6 +319,46 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     ta.style.height = "auto";
     ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 40), 192)}px`;
   };
+
+  // Accept clipboard images alongside the paperclip-attach flow.
+  //
+  // Linux/WebKit2GTK strips image payloads from the standard `paste`
+  // event for security reasons, so we cannot read clipboard images
+  // from JS at all. We delegate the entire flow to Rust: a single
+  // `paste_clipboard_image_to_file` command reads the OS clipboard,
+  // encodes a real PNG, writes it to the codemux temp dir, and
+  // returns just the file path. The image bytes never cross the IPC
+  // boundary, which keeps Ctrl+V snappy even for large screenshots.
+  //
+  // The downstream attachment pipeline already takes filesystem
+  // paths (the paperclip flow opens a file picker), so the returned
+  // path drops straight into the existing `attachments` array. Chip
+  // rendering, X-to-remove, and prompt inlining at submit stay
+  // identical to a file-picked image.
+  const handlePasteImage = useCallback(
+    async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      let path: string;
+      try {
+        path = await pasteClipboardImageToFile();
+      } catch {
+        // No image on clipboard (or plugin error). Let the textarea
+        // handle the paste the normal way — typing plain text, etc.
+        return;
+      }
+
+      if (!path) return;
+
+      // We DO have an image. Prevent the default paste so the bytes
+      // don't also get rendered as text in the textarea.
+      e.preventDefault();
+
+      setAttachments((prev) => {
+        if (prev.includes(path)) return prev;
+        return [...prev, path];
+      });
+    },
+    [],
+  );
 
   const handleIssueSelect = useCallback(
     async (issue: GitHubIssue) => {
@@ -630,6 +671,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               ref={textareaRef}
               value={prompt}
               onChange={handleTextareaChange}
+              onPaste={handlePasteImage}
               placeholder="What do you want to do?"
               className="min-h-10 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
               rows={1}

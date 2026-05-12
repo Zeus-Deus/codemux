@@ -439,6 +439,160 @@ pub fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
 }
 
+/// Hard ceiling for clipboard image payloads. Mirrors the soft 5 MB
+/// warning the chat composer surfaces — anything larger almost
+/// certainly wasn't intended for a prompt and would just blow up the
+/// agent's context. Reject at the IPC boundary so a runaway paste
+/// can't fill the disk via the temp directory.
+const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024; // 25 MB
+
+/// Resolve a stable extension for a clipboard image MIME type.
+///
+/// We deliberately keep this list short — these are the formats a
+/// browser/OS clipboard realistically hands us. Anything else falls
+/// back to `bin` so the file is still written (the agent can sniff
+/// the bytes) but the filename doesn't lie about the format.
+fn clipboard_image_extension(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
+/// Shared write logic for clipboard image payloads.
+///
+/// Splits out from `save_clipboard_image_bytes` so the
+/// `paste_clipboard_image_to_file` command can reuse the validation
+/// and disk-write path without going through Tauri's IPC. The
+/// clipboard-paste flow reads the OS clipboard server-side, encodes
+/// PNG bytes in Rust, and calls this helper directly — avoiding the
+/// (slow!) round-trip of shipping the image bytes through the JS
+/// boundary just to ship them back.
+fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("Clipboard image payload is empty".into());
+    }
+    if bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "Clipboard image too large ({:.1} MB, limit is {} MB)",
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+    if !mime.to_ascii_lowercase().starts_with("image/") {
+        return Err(format!("Unsupported clipboard MIME type: {mime}"));
+    }
+
+    let dir = std::env::temp_dir().join("codemux-clipboard-images");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create clipboard image dir: {e}"))?;
+
+    let ext = clipboard_image_extension(mime);
+    let filename = format!("paste-{}.{}", uuid::Uuid::new_v4(), ext);
+    let path = dir.join(&filename);
+
+    std::fs::write(&path, bytes)
+        .map_err(|e| format!("Failed to write clipboard image: {e}"))?;
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Persist a caller-supplied clipboard image payload to a temp file.
+///
+/// Kept as a stable IPC entry point for callers that already have
+/// encoded bytes in hand (and as a unit-testable surface for the
+/// validation + write logic). The hot path for the new-workspace
+/// dialog's paste flow is `paste_clipboard_image_to_file`, which
+/// reads the OS clipboard server-side and bypasses the JS round
+/// trip entirely.
+#[tauri::command]
+pub fn save_clipboard_image_bytes(bytes: Vec<u8>, mime: String) -> Result<String, String> {
+    write_clipboard_image_to_disk(&bytes, &mime)
+}
+
+/// Encode a raw RGBA pixel buffer (8 bits per channel) as PNG.
+///
+/// Extracted from `paste_clipboard_image_to_file` so the encoding
+/// logic is unit-testable without an OS clipboard. The `rgba` slice
+/// must be exactly `width * height * 4` bytes; we return an error
+/// rather than panicking on a mismatch so a misbehaving clipboard
+/// source can't crash the app.
+fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| "Image dimensions overflow".to_string())?;
+    if rgba.len() != expected {
+        return Err(format!(
+            "RGBA length {} does not match width*height*4 = {}",
+            rgba.len(),
+            expected,
+        ));
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(rgba.len() / 4);
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("PNG header write failed: {e}"))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|e| format!("PNG body write failed: {e}"))?;
+    drop(writer); // flush
+
+    Ok(out)
+}
+
+/// Read the OS clipboard as an image, encode it as PNG, write it to
+/// the same temp directory `save_clipboard_image_bytes` uses, and
+/// return the absolute path.
+///
+/// Doing this on the Rust side has two motivations:
+///   1. **Speed.** WebKit2GTK serialises `Vec<u8>` across IPC as a
+///      JSON number array. A 1920×1080 RGBA buffer (~8 MB) becomes
+///      a ~25 MB JSON string, and we'd be shipping it across twice
+///      (JS reads from Rust, then Rust writes to disk). Keeping the
+///      bytes resident in Rust collapses that to a single small
+///      response — just the file path.
+///   2. **Correctness.** The plugin's JS surface only exposes raw
+///      RGBA pixels (no encoder). Writing those to a `.png` file
+///      from JS produces a file with a misleading extension that
+///      image viewers and agents cannot decode. Encoding PNG here
+///      means the resulting attachment is a valid PNG.
+#[tauri::command]
+pub fn paste_clipboard_image_to_file<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<String, String> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+
+    // `read_image` resolves with an error when the clipboard does
+    // not hold an image (e.g. text-only). Surface a stable error
+    // string so the frontend can distinguish "no image" from a
+    // genuine failure and let the default paste behaviour run.
+    let img = app
+        .clipboard()
+        .read_image()
+        .map_err(|e| format!("clipboard read_image failed: {e}"))?;
+
+    let width = img.width();
+    let height = img.height();
+    let rgba = img.rgba();
+
+    if width == 0 || height == 0 || rgba.is_empty() {
+        return Err("Clipboard image is empty".into());
+    }
+
+    let png_bytes = encode_rgba_to_png(rgba, width, height)?;
+    write_clipboard_image_to_disk(&png_bytes, "image/png")
+}
+
 /// Count occurrences of `pattern` across `cwd` using ripgrep.
 ///
 /// `cwd` must be an absolute, existing directory. The pattern is passed
@@ -492,7 +646,10 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 
 #[cfg(test)]
 mod tests {
-    use super::grep_count_pattern;
+    use super::{
+        clipboard_image_extension, encode_rgba_to_png, grep_count_pattern,
+        save_clipboard_image_bytes, MAX_CLIPBOARD_IMAGE_BYTES,
+    };
     use std::fs;
 
     #[tokio::test]
@@ -603,5 +760,238 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.contains("not a directory") || err.contains("does not exist"));
+    }
+
+    // ── save_clipboard_image_bytes ──────────────────────────────
+
+    /// Helper: clean up any file save_clipboard_image_bytes might
+    /// leave behind in the shared temp directory. The command writes
+    /// to a stable per-app subdir (so multiple paste-cycles share
+    /// it), which means tests can't rely on tempdir isolation — they
+    /// must clean up their own artifacts.
+    fn cleanup_clipboard_temp(path: &str) {
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn clipboard_image_extension_maps_known_types() {
+        assert_eq!(clipboard_image_extension("image/png"), "png");
+        assert_eq!(clipboard_image_extension("image/jpeg"), "jpg");
+        assert_eq!(clipboard_image_extension("image/jpg"), "jpg");
+        assert_eq!(clipboard_image_extension("image/gif"), "gif");
+        assert_eq!(clipboard_image_extension("image/webp"), "webp");
+        assert_eq!(clipboard_image_extension("image/bmp"), "bmp");
+        assert_eq!(clipboard_image_extension("image/svg+xml"), "svg");
+    }
+
+    #[test]
+    fn clipboard_image_extension_is_case_insensitive() {
+        // Some platforms hand us uppercase MIME types
+        // (e.g. macOS clipboard providers). The mapping must match
+        // regardless of casing.
+        assert_eq!(clipboard_image_extension("IMAGE/PNG"), "png");
+        assert_eq!(clipboard_image_extension("Image/Jpeg"), "jpg");
+    }
+
+    #[test]
+    fn clipboard_image_extension_falls_back_for_unknown() {
+        // Unknown but valid image/* types still get persisted — the
+        // agent can sniff the bytes — but the filename uses `bin` so
+        // it doesn't claim a format we don't recognise.
+        assert_eq!(clipboard_image_extension("image/heic"), "bin");
+        assert_eq!(clipboard_image_extension("image/x-icon"), "bin");
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_writes_png_and_returns_path() {
+        // Minimal PNG signature — enough to verify the bytes round-trip.
+        let payload: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+        let path = save_clipboard_image_bytes(payload.clone(), "image/png".into())
+            .expect("png write should succeed");
+
+        assert!(path.ends_with(".png"), "expected .png extension, got {path}");
+        assert!(
+            std::path::Path::new(&path).is_absolute(),
+            "expected absolute path, got {path}",
+        );
+
+        let on_disk = fs::read(&path).expect("written file should be readable");
+        assert_eq!(on_disk, payload, "bytes on disk must match payload");
+
+        cleanup_clipboard_temp(&path);
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_uses_correct_extension_per_mime() {
+        // Spot-check that the filename extension follows the MIME.
+        // Doesn't re-test every mapping (clipboard_image_extension
+        // covers that) — just verifies the command actually wires
+        // the helper into the path.
+        let cases = [
+            ("image/jpeg", ".jpg"),
+            ("image/gif", ".gif"),
+            ("image/webp", ".webp"),
+        ];
+        for (mime, expected_ext) in cases {
+            let path = save_clipboard_image_bytes(vec![0xff, 0xd8, 0xff], mime.into())
+                .expect("write should succeed");
+            assert!(
+                path.ends_with(expected_ext),
+                "expected {expected_ext} for {mime}, got {path}",
+            );
+            cleanup_clipboard_temp(&path);
+        }
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_generates_unique_filenames() {
+        // Two paste-cycles in a row must not clobber each other —
+        // the UUID in the filename guarantees this. Regression
+        // guard: if someone "simplifies" the naming and a user
+        // pastes twice quickly, the second image would silently
+        // overwrite the first attachment.
+        let bytes = vec![0x89, 0x50, 0x4e, 0x47];
+        let a = save_clipboard_image_bytes(bytes.clone(), "image/png".into()).unwrap();
+        let b = save_clipboard_image_bytes(bytes, "image/png".into()).unwrap();
+        assert_ne!(a, b, "consecutive saves must yield distinct paths");
+        cleanup_clipboard_temp(&a);
+        cleanup_clipboard_temp(&b);
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_rejects_empty_payload() {
+        let err = save_clipboard_image_bytes(vec![], "image/png".into()).unwrap_err();
+        assert!(
+            err.to_lowercase().contains("empty"),
+            "expected empty-payload error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_rejects_non_image_mime() {
+        // The frontend already filters for image/* before invoking
+        // this command, but the IPC boundary must not trust the
+        // caller — a misbehaving (or compromised) frontend mustn't
+        // be able to write arbitrary blobs to the temp directory
+        // via this command.
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "text/plain".into()).unwrap_err();
+        assert!(
+            err.contains("Unsupported"),
+            "expected unsupported-mime error, got: {err}",
+        );
+
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "application/pdf".into()).unwrap_err();
+        assert!(
+            err.contains("Unsupported"),
+            "expected unsupported-mime error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_rejects_oversize_payload() {
+        // Use a payload exactly one byte over the cap. Allocating
+        // 25 MB + 1 in a test is cheap (Vec::with_capacity is a
+        // single allocation) and exercises the exact boundary
+        // condition.
+        let oversize = vec![0u8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
+        let err = save_clipboard_image_bytes(oversize, "image/png".into()).unwrap_err();
+        assert!(
+            err.contains("too large"),
+            "expected oversize error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
+        // The artifacts must land under a clearly-named subdir so
+        // operators can wipe the cache without grepping through
+        // every UUID in /tmp. Lock the directory name as part of
+        // the contract.
+        let path =
+            save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into()).unwrap();
+        assert!(
+            path.contains("codemux-clipboard-images"),
+            "expected path under codemux-clipboard-images/, got {path}",
+        );
+        cleanup_clipboard_temp(&path);
+    }
+
+    // ── encode_rgba_to_png ───────────────────────────────────────
+
+    /// Smallest valid PNG signature — used to assert the encoder
+    /// produced a real PNG (not raw RGBA dumped to bytes). The
+    /// regression we're guarding against: previously the JS side
+    /// wrote raw RGBA into a .png file because the plugin didn't
+    /// expose a PNG encoder.
+    const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+
+    #[test]
+    fn encode_rgba_to_png_produces_valid_png_header() {
+        // 2×2 image, all-opaque red pixels.
+        let rgba: Vec<u8> = vec![
+            255, 0, 0, 255, // (0,0)
+            255, 0, 0, 255, // (1,0)
+            255, 0, 0, 255, // (0,1)
+            255, 0, 0, 255, // (1,1)
+        ];
+        let out = encode_rgba_to_png(&rgba, 2, 2).expect("encode should succeed");
+        assert!(
+            out.len() >= 8 && out[..8] == PNG_MAGIC,
+            "output must start with PNG magic bytes, got first 8: {:?}",
+            &out[..out.len().min(8)],
+        );
+    }
+
+    #[test]
+    fn encode_rgba_to_png_roundtrips_through_decoder() {
+        // 3×1 image with three distinct pixels. Decode the encoder
+        // output with the same `png` crate and verify the pixels
+        // round-trip. This is the strongest correctness assertion:
+        // even a bogus encoder that wrote PNG magic followed by
+        // garbage would fail this.
+        let rgba: Vec<u8> = vec![
+            10, 20, 30, 255, //
+            40, 50, 60, 255, //
+            70, 80, 90, 255, //
+        ];
+        let out = encode_rgba_to_png(&rgba, 3, 1).expect("encode should succeed");
+
+        let decoder = png::Decoder::new(out.as_slice());
+        let mut reader = decoder.read_info().expect("PNG should be parseable");
+        let mut decoded = vec![0u8; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut decoded)
+            .expect("PNG body should decode");
+        assert_eq!(info.width, 3);
+        assert_eq!(info.height, 1);
+        decoded.truncate(info.buffer_size());
+        assert_eq!(
+            decoded, rgba,
+            "decoded pixels must match the input RGBA",
+        );
+    }
+
+    #[test]
+    fn encode_rgba_to_png_rejects_mismatched_length() {
+        // 2×2 needs 16 bytes; supplying 12 must error instead of
+        // panicking on the slice index inside the encoder.
+        let rgba = vec![0u8; 12];
+        let err = encode_rgba_to_png(&rgba, 2, 2).unwrap_err();
+        assert!(
+            err.contains("does not match"),
+            "expected length-mismatch error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn encode_rgba_to_png_rejects_dimension_overflow() {
+        // width * height * 4 must not overflow usize. On a 64-bit
+        // target the largest single u32 dim is enough — pair two
+        // u32::MAX values to force the overflow path.
+        let err = encode_rgba_to_png(&[], u32::MAX, u32::MAX).unwrap_err();
+        assert!(
+            err.contains("overflow") || err.contains("does not match"),
+            "expected overflow or mismatch error, got: {err}",
+        );
     }
 }

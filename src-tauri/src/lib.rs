@@ -192,6 +192,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             #[cfg(debug_assertions)]
             {
@@ -1358,6 +1359,8 @@ pub fn run() {
             commands::search_file_names,
             commands::read_file,
             commands::write_file,
+            commands::save_clipboard_image_bytes,
+            commands::paste_clipboard_image_to_file,
             commands::grep_count_pattern,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,
