@@ -44,6 +44,13 @@ libc = "0.2"
 tauri-plugin-single-instance = "2.4.0"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# WebKit2GTK strips clipboard image payloads from the standard
+# `paste` event for security reasons, so reading clipboard images
+# from JS via `e.clipboardData` always comes back empty on Linux.
+# The clipboard-manager plugin reads the OS clipboard from the Rust
+# side and hands the bytes to the frontend, bypassing the webview
+# filter. Used by the new-workspace dialog's paste-to-attach flow.
+tauri-plugin-clipboard-manager = "2"
 rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 aes-gcm = "0.10"
@@ -62,6 +69,12 @@ serde_yaml = "0.9"
 glob = "0.3"
 ignore = "0.4"
 nucleo-matcher = "0.3"
+# PNG encoder for the clipboard-paste flow. The OS clipboard hands
+# us raw RGBA pixels via tauri-plugin-clipboard-manager; we encode
+# to a real PNG on the Rust side so the resulting attachment file
+# is a valid image (not just RGBA bytes with a .png extension) and
+# so the encoded bytes never have to cross the JS IPC boundary.
+png = "0.17"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

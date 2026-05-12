@@ -49,6 +49,7 @@ vi.mock("@/tauri/commands", () => ({
   checkGithubRepo: vi.fn().mockResolvedValue(false),
   listPullRequests: vi.fn().mockResolvedValue([]),
   pickFilesDialog: vi.fn().mockResolvedValue([]),
+  pasteClipboardImageToFile: vi.fn(),
   suggestIssueBranchName: vi.fn().mockResolvedValue("feature/92-backend-endpoints"),
   linkWorkspaceIssue: vi.fn().mockResolvedValue(undefined),
   listGithubIssues: vi.fn().mockResolvedValue([]),
@@ -75,6 +76,7 @@ import {
   activateWorkspace,
   generateBranchName,
   generateRandomBranchName,
+  pasteClipboardImageToFile,
 } from "@/tauri/commands";
 
 // ── Helpers ──
@@ -566,5 +568,127 @@ describe("Default base branch", () => {
     const branchPicker = within(dialog).getByText("main");
     expect(branchPicker).toBeInTheDocument();
     expect(within(dialog).queryByText("feature-pr-branch")).not.toBeInTheDocument();
+  });
+});
+
+// ── Clipboard image paste ─────────────────────────────────────────
+//
+// The dialog delegates the entire paste flow to a single Rust
+// command (`paste_clipboard_image_to_file`) so the image bytes
+// never cross the JS IPC boundary. These tests verify the wiring:
+// the command returns a path, the path lands as an attachment chip,
+// and a clipboard miss (no image) is silent so plain-text paste
+// still works through the default browser path.
+
+describe("Clipboard image paste", () => {
+  function firePaste(textarea: Element) {
+    // The handler ignores clipboardData entirely — the Rust command
+    // does the read. We still need to dispatch a real `paste` event
+    // so React's synthetic event fires; the payload doesn't matter.
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [],
+        files: [],
+        types: [],
+        getData: () => "",
+      },
+    });
+  }
+
+  it("calls pasteClipboardImageToFile when paste fires", async () => {
+    setAppState("/path/to/project");
+    (pasteClipboardImageToFile as Mock).mockResolvedValue(
+      "/tmp/codemux-clipboard-images/paste-abc.png",
+    );
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    firePaste(textarea);
+
+    await waitFor(() => {
+      expect(pasteClipboardImageToFile).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it("adds the returned path as an attachment chip", async () => {
+    setAppState("/path/to/project");
+    (pasteClipboardImageToFile as Mock).mockResolvedValue(
+      "/tmp/codemux-clipboard-images/paste-xyz.png",
+    );
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    firePaste(textarea);
+
+    // The chip renders the trailing filename component (the existing
+    // attachment-strip logic lifts it via `.split("/").pop()`).
+    await waitFor(() => {
+      const chips = within(dialog).getAllByText("paste-xyz.png");
+      expect(chips.length).toBeGreaterThan(0);
+    });
+  });
+
+  it("stays silent when the OS clipboard has no image", async () => {
+    // The Rust command rejects when the clipboard does not hold an
+    // image. The handler must treat that as "let default paste
+    // behaviour run" — no chip, no error toast, no crash.
+    setAppState("/path/to/project");
+    (pasteClipboardImageToFile as Mock).mockRejectedValue(
+      new Error("clipboard read_image failed"),
+    );
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    firePaste(textarea);
+
+    await waitFor(() => {
+      expect(pasteClipboardImageToFile).toHaveBeenCalled();
+    });
+
+    // No chip should appear. Probe by the paste-* filename pattern
+    // so the test isn't sensitive to other chip text.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(within(dialog).queryByText(/paste-.*\.png/)).toBeNull();
+  });
+
+  it("does not double-add the same path on repeated paste", async () => {
+    // Defensive: if the same image ends up at the same path (e.g.
+    // a deterministic temp filename collision), the chip strip must
+    // de-dupe so the user doesn't see two identical chips for one
+    // pasted image.
+    setAppState("/path/to/project");
+    (pasteClipboardImageToFile as Mock).mockResolvedValue(
+      "/tmp/codemux-clipboard-images/paste-dupe.png",
+    );
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    firePaste(textarea);
+    await waitFor(() => {
+      expect(within(dialog).getAllByText("paste-dupe.png").length).toBe(1);
+    });
+
+    firePaste(textarea);
+    await waitFor(() => {
+      expect(pasteClipboardImageToFile).toHaveBeenCalledTimes(2);
+    });
+    // Still exactly one chip.
+    expect(within(dialog).getAllByText("paste-dupe.png").length).toBe(1);
   });
 });

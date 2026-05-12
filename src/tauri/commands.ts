@@ -1054,6 +1054,33 @@ export const writeFile = (path: string, content: string) =>
 export const grepCountPattern = (cwd: string, pattern: string) =>
   invoke<number>("grep_count_pattern", { cwd, pattern });
 
+/// Persist a caller-supplied clipboard image payload to a temp file
+/// and return the absolute path on disk.
+///
+/// Used by call sites that already have encoded image bytes in hand.
+/// For the paste flow itself, prefer `pasteClipboardImageToFile`
+/// which reads the OS clipboard server-side and avoids shipping the
+/// bytes through JS twice.
+export const saveClipboardImageBytes = (
+  bytes: Uint8Array,
+  mime: string,
+): Promise<string> =>
+  invoke<string>("save_clipboard_image_bytes", {
+    bytes: Array.from(bytes),
+    mime,
+  });
+
+/// Read the OS clipboard as an image, encode it as PNG, write it to
+/// the codemux temp directory, and return the absolute path.
+///
+/// This is the fast path for Ctrl+V on the new-workspace dialog —
+/// the image bytes never cross the IPC boundary, only the resulting
+/// file path comes back. Throws when the clipboard does not hold an
+/// image (e.g. text-only), which the caller should treat as "let
+/// the default paste behaviour run".
+export const pasteClipboardImageToFile = (): Promise<string> =>
+  invoke<string>("paste_clipboard_image_to_file");
+
 // ── Dialogs ──
 
 export const pickFolderDialog = (title: string) =>
