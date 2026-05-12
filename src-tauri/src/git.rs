@@ -137,6 +137,63 @@ fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool
     Ok((stdout, stderr, output.status.success()))
 }
 
+/// Resolve a usable upstream ref for the current branch.
+///
+/// Returns the ref name (e.g. `origin/main`) we should diff against to
+/// compute ahead/behind and "is this commit pushed?" — or `None` if the
+/// branch genuinely hasn't been published yet.
+///
+/// Priority:
+/// 1. Formal upstream tracking via `branch.<name>.{remote,merge}`. This is
+///    what `@{upstream}` resolves to. Set automatically by clone and by
+///    `git push -u`.
+/// 2. Fallback: a same-named remote-tracking ref (`refs/remotes/<remote>/<branch>`).
+///    This catches branches that were pushed without `-u` — for example
+///    via `push.autoSetupRemote=true` or `git push origin <branch>`. Git
+///    accepts those pushes but doesn't write the tracking config, so
+///    `@{upstream}` stays unset even though the branch clearly exists on
+///    the remote. Before this fallback, the UI mistakenly offered to
+///    "Publish Branch" for such branches.
+///
+/// `origin` is preferred when multiple remotes match, since it's the
+/// conventional default and what `git push` targets when no remote is
+/// specified.
+fn resolve_upstream_ref(repo_path: &Path) -> Option<String> {
+    // Preferred path: branch.<name>.{remote,merge} is configured.
+    let upstream = run_git_permissive(
+        repo_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    );
+    if !upstream.is_empty() {
+        return Some(upstream);
+    }
+
+    // Fallback path: look for a same-named remote-tracking ref. Empty branch
+    // name means detached HEAD — nothing to resolve.
+    let branch = run_git_permissive(repo_path, &["branch", "--show-current"]);
+    if branch.is_empty() {
+        return None;
+    }
+
+    let remotes_raw = run_git_permissive(repo_path, &["remote"]);
+    let mut remotes: Vec<&str> = remotes_raw.lines().filter(|r| !r.is_empty()).collect();
+    // Probe origin first; it's the conventional default and avoids
+    // surprising the user when multiple remotes have the same branch.
+    remotes.sort_by_key(|r| if *r == "origin" { 0 } else { 1 });
+
+    for remote in remotes {
+        let ref_name = format!("refs/remotes/{remote}/{branch}");
+        let resolved = run_git_permissive(
+            repo_path,
+            &["rev-parse", "--verify", "--quiet", &ref_name],
+        );
+        if !resolved.is_empty() {
+            return Some(format!("{remote}/{branch}"));
+        }
+    }
+    None
+}
+
 pub fn git_status(repo_path: &Path) -> Result<Vec<GitFileStatus>, String> {
     let output = run_git(repo_path, &["status", "--porcelain=v1"])?;
     let mut files = parse_porcelain_status(&output);
@@ -260,14 +317,16 @@ pub fn git_log(repo_path: &Path, count: usize) -> Result<Vec<GitLogEntry>, Strin
         &["log", "--format=%H%n%h%n%s%n%an%n%ar", "-n", &count_str],
     )?;
 
-    // Get unpushed commit hashes (empty if no upstream)
-    let unpushed_output = run_git_permissive(repo_path, &["rev-list", "@{upstream}..HEAD"]);
+    // Resolve upstream (falls back to remote-tracking ref if @{upstream}
+    // isn't configured — see resolve_upstream_ref).
+    let upstream_ref = resolve_upstream_ref(repo_path);
+    let has_upstream = upstream_ref.is_some();
+    let unpushed_output = if let Some(ref u) = upstream_ref {
+        run_git_permissive(repo_path, &["rev-list", &format!("{u}..HEAD")])
+    } else {
+        String::new()
+    };
     let unpushed: HashSet<&str> = unpushed_output.lines().collect();
-    let has_upstream = !run_git_permissive(
-        repo_path,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-    )
-    .is_empty();
 
     let lines: Vec<&str> = output.lines().collect();
     let mut entries = Vec::new();
@@ -336,16 +395,14 @@ pub fn git_branch_info(repo_path: &Path) -> Result<GitBranchInfo, String> {
         Some(branch_name)
     };
 
-    let upstream = run_git_permissive(
-        repo_path,
-        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-    );
-    let has_upstream = !upstream.is_empty();
+    let upstream_ref = resolve_upstream_ref(repo_path);
+    let has_upstream = upstream_ref.is_some();
 
-    let (ahead, behind) = if has_upstream {
+    let (ahead, behind) = if let Some(ref u) = upstream_ref {
+        let range = format!("HEAD...{u}");
         let rev_list = run_git_permissive(
             repo_path,
-            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            &["rev-list", "--left-right", "--count", &range],
         );
         parse_ahead_behind(&rev_list)
     } else {
@@ -2400,6 +2457,163 @@ C  source.txt -> copy.txt";
         assert_eq!(info.ahead, 0);
         assert_eq!(info.behind, 0);
         assert!(info.branch.is_some(), "should have a branch name");
+    }
+
+    /// Regression: branches that exist on the remote but lack
+    /// `branch.<name>.{remote,merge}` config (e.g. pushed via
+    /// `push.autoSetupRemote=true` or `git push origin <branch>` without
+    /// `-u`) should still report `has_upstream=true`. Before the
+    /// `resolve_upstream_ref` fallback was added, the UI mistakenly offered
+    /// "Publish Branch" for these branches even though the user could push
+    /// fine from the terminal.
+    #[test]
+    fn test_git_branch_info_remote_ref_without_tracking_config() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Sanity: cloned branch starts with proper upstream tracking.
+        let info = git_branch_info(&local).expect("branch info before unset");
+        assert!(info.has_upstream, "cloned branch should have upstream initially");
+
+        let branch = run_git_permissive(&local, &["branch", "--show-current"]);
+        assert!(!branch.is_empty(), "test setup: should have a current branch");
+
+        // Remove tracking config. Leaves refs/remotes/origin/<branch> intact —
+        // this is exactly the state a no-`-u` push leaves behind.
+        let _ = run_git(
+            &local,
+            &["config", "--unset", &format!("branch.{branch}.remote")],
+        );
+        let _ = run_git(
+            &local,
+            &["config", "--unset", &format!("branch.{branch}.merge")],
+        );
+
+        // `@{upstream}` should now fail, confirming the test fixture.
+        let raw = run_git_permissive(
+            &local,
+            &[
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                "@{upstream}",
+            ],
+        );
+        assert!(
+            raw.is_empty(),
+            "test setup: @{{upstream}} should be unset after stripping tracking config",
+        );
+
+        // The fallback should still surface the remote-tracking ref.
+        let info = git_branch_info(&local).expect("branch info after unset");
+        assert!(
+            info.has_upstream,
+            "branch should be considered published via remote-tracking ref fallback"
+        );
+        assert_eq!(info.ahead, 0, "no new commits → 0 ahead");
+        assert_eq!(info.behind, 0, "remote unchanged → 0 behind");
+
+        // Adding a local commit should bump ahead, proving the fallback
+        // actually computes ahead/behind against the remote ref, not just
+        // flips the boolean.
+        std::fs::write(local.join("after-unset.txt"), "after").expect("write");
+        run_git(&local, &["add", "after-unset.txt"]).expect("add");
+        run_git(
+            &local,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "after unset",
+            ],
+        )
+        .expect("commit");
+
+        let info = git_branch_info(&local).expect("branch info after commit");
+        assert!(info.has_upstream, "still published via remote-tracking ref");
+        assert_eq!(info.ahead, 1, "should count the new local commit as ahead");
+        assert_eq!(info.behind, 0);
+    }
+
+    /// Regression: `git_log` powers the sidebar's pushed/unpushed badges on
+    /// each commit. It used to share the same `@{upstream}`-only check as
+    /// `git_branch_info`, so removing tracking config flipped every
+    /// already-pushed commit to "unpushed" in the UI.
+    #[test]
+    fn test_git_log_is_pushed_without_tracking_config() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Initial commit was pushed during setup → should show as pushed.
+        let log_before = git_log(&local, 10).expect("log before unset");
+        let initial_before = log_before
+            .iter()
+            .find(|e| e.message == "initial")
+            .expect("initial commit in log");
+        assert!(
+            initial_before.is_pushed,
+            "initial commit should be pushed before we touch config"
+        );
+
+        // Remove formal upstream tracking.
+        let branch = run_git_permissive(&local, &["branch", "--show-current"]);
+        let _ = run_git(
+            &local,
+            &["config", "--unset", &format!("branch.{branch}.remote")],
+        );
+        let _ = run_git(
+            &local,
+            &["config", "--unset", &format!("branch.{branch}.merge")],
+        );
+
+        // is_pushed should still resolve correctly via the remote-tracking
+        // ref fallback.
+        let log_after = git_log(&local, 10).expect("log after unset");
+        let initial_after = log_after
+            .iter()
+            .find(|e| e.message == "initial")
+            .expect("initial commit still in log");
+        assert!(
+            initial_after.is_pushed,
+            "commit present on remote should still report is_pushed=true after upstream tracking removed"
+        );
+
+        // Make a local commit — it should report as unpushed, while the
+        // initial commit stays pushed.
+        std::fs::write(local.join("local-only.txt"), "x").expect("write");
+        run_git(&local, &["add", "local-only.txt"]).expect("add");
+        run_git(
+            &local,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                "local only",
+            ],
+        )
+        .expect("commit");
+
+        let log = git_log(&local, 10).expect("log after local commit");
+        let local_only = log
+            .iter()
+            .find(|e| e.message == "local only")
+            .expect("local-only commit in log");
+        assert!(
+            !local_only.is_pushed,
+            "new local commit should be reported as unpushed"
+        );
+        let initial = log
+            .iter()
+            .find(|e| e.message == "initial")
+            .expect("initial commit still in log");
+        assert!(
+            initial.is_pushed,
+            "initial commit must remain pushed alongside the new unpushed commit"
+        );
     }
 
     #[test]
