@@ -23,13 +23,27 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tauri::{Emitter, Manager, State};
 
-/// Read fresh git branch / ahead-behind / diff-stat / changed-file counts for
-/// `repo_path` and write them into the workspace snapshot. Crash-proof:
-/// `git_branch_info` and friends return defaults for non-git directories,
-/// detached HEAD, and corrupted `.git` directories. `pub(crate)` so the
-/// periodic refresh loop in `lib.rs` can reuse this instead of duplicating
-/// the extraction logic.
-pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
+/// Snapshot of the git fields written to a workspace by `populate_git_info`.
+/// Carrying these out of the I/O step as a value lets async callers gather
+/// them via `spawn_blocking` and then apply the result synchronously to
+/// state — `AppStateStore` references can't cross the `spawn_blocking`
+/// boundary.
+#[derive(Default)]
+pub(crate) struct WorkspaceGitInfo {
+    pub branch: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub additions: u32,
+    pub deletions: u32,
+    pub changed_files: u32,
+}
+
+/// Run the git subprocesses that produce a workspace's branch / ahead-behind
+/// / diff-stat / changed-file counts. Crash-proof: `git_branch_info` and
+/// friends return defaults for non-git directories, detached HEAD, and
+/// corrupted `.git` directories. Pure I/O — touches no shared state, so it
+/// is safe to call from `spawn_blocking`.
+pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
     let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
@@ -46,7 +60,41 @@ pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_
         .map(|s| s.staged_deletions + s.unstaged_deletions)
         .unwrap_or(0);
 
-    state.update_workspace_git_info(workspace_id, branch, ahead, behind, additions, deletions, changed_files);
+    WorkspaceGitInfo { branch, ahead, behind, additions, deletions, changed_files }
+}
+
+fn apply_workspace_git_info(state: &AppStateStore, workspace_id: &str, info: WorkspaceGitInfo) {
+    state.update_workspace_git_info(
+        workspace_id,
+        info.branch,
+        info.ahead,
+        info.behind,
+        info.additions,
+        info.deletions,
+        info.changed_files,
+    );
+}
+
+/// Read fresh git branch / ahead-behind / diff-stat / changed-file counts for
+/// `repo_path` and write them into the workspace snapshot. `pub(crate)` so the
+/// periodic refresh loop in `lib.rs` can reuse this instead of duplicating
+/// the extraction logic.
+pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
+    apply_workspace_git_info(state, workspace_id, gather_workspace_git_info(repo_path));
+}
+
+/// Async equivalent of `populate_git_info` for use inside `async fn` Tauri
+/// commands. Runs the 5-8 git subprocesses on the blocking pool so they do
+/// not stall a Tokio worker (and through it, every other in-flight IPC call).
+pub(crate) async fn populate_git_info_async(
+    state: &AppStateStore,
+    workspace_id: &str,
+    repo_path: PathBuf,
+) {
+    let info = tokio::task::spawn_blocking(move || gather_workspace_git_info(&repo_path))
+        .await
+        .unwrap_or_default();
+    apply_workspace_git_info(state, workspace_id, info);
 }
 
 pub(crate) fn create_workspace_impl(
@@ -274,8 +322,13 @@ pub fn create_workspace_with_preset(
     Ok(workspace_id.0)
 }
 
+// `async fn` so this command runs on Tokio's worker pool instead of the GTK
+// main thread. `git_create_worktree` shells out to `git worktree add`, which
+// can take many seconds on large repos (fetches refs, checks out files), and
+// `populate_git_info` shells out to 5-8 more git subprocesses for the new
+// workspace. With a sync handler all of that blocks every other IPC call.
 #[tauri::command]
-pub fn create_worktree_workspace(
+pub async fn create_worktree_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -310,15 +363,31 @@ pub fn create_worktree_workspace(
         return Err(format!("Not a git repository: {repo_path}"));
     }
 
-    let worktree_path =
-        crate::git::git_create_worktree(Path::new(&repo_path), &branch, new_branch, base.as_deref(), pr_number)?;
+    // The slow git op (recursive checkout, may fetch). Off-load to the
+    // blocking pool so it doesn't stall a Tokio worker.
+    let worktree_path = {
+        let repo_path = repo_path.clone();
+        let branch = branch.clone();
+        let base = base.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::git::git_create_worktree(
+                Path::new(&repo_path),
+                &branch,
+                new_branch,
+                base.as_deref(),
+                pr_number,
+            )
+        })
+        .await
+        .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
+    };
     let wt_path_buf = PathBuf::from(&worktree_path);
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch.clone());
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
 
-    populate_git_info(&state, &workspace_id.0, &wt_path_buf);
+    populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 
     if let Some(pr_num) = pr_number {
         state.update_workspace_pr_info(&workspace_id.0, Some(pr_num), None, None);
@@ -438,8 +507,11 @@ pub fn create_worktree_workspace(
     Ok(workspace_id.0)
 }
 
+// `async fn` so `populate_git_info_async`'s 5-8 git subprocesses run on the
+// blocking pool. The function itself adopts an already-on-disk worktree
+// (state ops are cheap), so the git-info gather is the only slow step.
 #[tauri::command]
-pub fn import_worktree_workspace(
+pub async fn import_worktree_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -467,7 +539,7 @@ pub fn import_worktree_workspace(
         state.set_workspace_project_root(&workspace_id.0, root.display().to_string());
     }
 
-    populate_git_info(&state, &workspace_id.0, &wt_path_buf);
+    populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 
     let snapshot = state.snapshot();
     let session_ids = snapshot
@@ -716,8 +788,13 @@ pub fn update_workspace_cwd(
     }
 }
 
+// `async fn` so this command runs on Tokio's worker pool instead of the GTK
+// main thread. User-defined teardown scripts shell out to arbitrary commands
+// — typically fast (`docker compose down`) but can stall on a hung process —
+// and we'd rather not freeze the UI while one runs. Mirrors the fix in
+// `close_workspace_with_worktree`.
 #[tauri::command]
-pub fn close_workspace(
+pub async fn close_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -777,6 +854,12 @@ pub fn close_workspace(
     }
 
     let result = state.close_workspace(&workspace_id)?;
+
+    // Optimistic emit: the workspace is gone from in-memory state. Push the
+    // update to the frontend NOW so the sidebar row disappears immediately,
+    // even if a PTY shutdown or agent-chat thread takes a moment to wind
+    // down. A second emit at the end of the command picks up any fan-out.
+    crate::state::emit_app_state(&app);
 
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
@@ -1830,5 +1913,108 @@ mod editor_detection_tests {
         // Either outcome is valid; we only check that the call didn't
         // panic and returned a well-typed `Option<String>`.
         let _: Option<String> = resolved;
+    }
+}
+
+#[cfg(test)]
+mod git_info_tests {
+    //! Lock in the behavior of `gather_workspace_git_info` after the
+    //! gather/apply refactor. The synchronous `populate_git_info` still
+    //! calls the same gather logic, so these tests also cover its data
+    //! shape implicitly.
+
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run_git(repo: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@test.invalid")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@test.invalid")
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn gather_workspace_git_info_returns_defaults_for_non_git_path() {
+        // Crash-proof guarantee from the doc-comment: a directory with no
+        // `.git/` must yield default values, not panic.
+        let tmp = TempDir::new().expect("tempdir");
+        let info = gather_workspace_git_info(tmp.path());
+        assert!(info.branch.is_none(), "no branch in a non-git dir");
+        assert_eq!(info.ahead, 0);
+        assert_eq!(info.behind, 0);
+        assert_eq!(info.additions, 0);
+        assert_eq!(info.deletions, 0);
+        assert_eq!(info.changed_files, 0);
+    }
+
+    #[test]
+    fn gather_workspace_git_info_returns_defaults_for_nonexistent_path() {
+        let info = gather_workspace_git_info(std::path::Path::new(
+            "/nonexistent/codemux/test/path/xyz",
+        ));
+        assert!(info.branch.is_none());
+        assert_eq!(info.changed_files, 0);
+    }
+
+    #[test]
+    fn gather_workspace_git_info_reports_branch_for_real_repo() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(repo, &["commit", "--allow-empty", "-q", "-m", "initial"]);
+
+        let info = gather_workspace_git_info(repo);
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert_eq!(info.changed_files, 0);
+        assert_eq!(info.additions, 0);
+        assert_eq!(info.deletions, 0);
+    }
+
+    #[test]
+    fn gather_workspace_git_info_counts_changed_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(repo, &["commit", "--allow-empty", "-q", "-m", "initial"]);
+        std::fs::write(repo.join("untracked.txt"), "hi").expect("write file");
+
+        let info = gather_workspace_git_info(repo);
+        assert_eq!(info.branch.as_deref(), Some("main"));
+        assert!(
+            info.changed_files >= 1,
+            "untracked file should be counted, got {}",
+            info.changed_files,
+        );
+    }
+
+    // Verifies the new async path: `populate_git_info_async` must write the
+    // same shape of data into the workspace snapshot that the sync path
+    // would. Guards against the refactor accidentally dropping a field.
+    #[tokio::test]
+    async fn populate_git_info_async_writes_branch_into_state() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path();
+        run_git(repo, &["init", "-q", "-b", "main"]);
+        run_git(repo, &["commit", "--allow-empty", "-q", "-m", "initial"]);
+
+        let state = AppStateStore::default();
+        let workspace_id = state.create_workspace_at_path(repo.to_path_buf());
+
+        populate_git_info_async(&state, &workspace_id.0, repo.to_path_buf()).await;
+
+        let snapshot = state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id.0)
+            .expect("workspace exists");
+        assert_eq!(ws.git_branch.as_deref(), Some("main"));
     }
 }
