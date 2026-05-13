@@ -39,6 +39,7 @@ This terminal runs inside Codemux. Check: `test -n "$CODEMUX"`
 - `codemux browser click "<selector>"` — click an element
 - `codemux browser fill "<selector>" "<text>"` — type into input
 - `codemux browser screenshot` — capture screenshot
+- `codemux browser viewport <mobile|tablet|desktop|...|WxH|reset>` — resize viewport for responsive testing (CSS media queries fire at the new width); `codemux browser viewport-presets` lists available presets
 
 Always get a snapshot before interacting so you know what elements exist.
 

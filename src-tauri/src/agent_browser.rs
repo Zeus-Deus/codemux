@@ -796,6 +796,53 @@ fn windows_executable_path_args() -> Vec<String> {
     }
 }
 
+/// Resolve the JSON params passed to a `viewport` action into a concrete
+/// `ViewportSpec`. Accepts (in priority order):
+///
+/// 1. `preset` — a named entry from `browser_viewport::PRESETS` or the
+///    literal `"reset"`. Highest priority because it's what the CLI and
+///    MCP tool send; explicit width/height/scale beneath are only used
+///    as fallbacks for legacy callers (e.g. `BrowserPane.tsx`'s
+///    `ResizeObserver` that auto-syncs the pane size on every resize).
+/// 2. `width` + `height` (+ optional `scale` for DPR). This is the
+///    pre-preset shape the frontend already emits, so it stays a
+///    first-class input. Missing fields fall back to 1280×720×1.0.
+///
+/// An unknown preset name falls through to the (1280, 720, 1.0)
+/// fallback because the calling layer (CLI / MCP) is expected to have
+/// already validated the input via `browser_viewport::parse_spec`. The
+/// fallback prevents a typo from breaking the live browser pane.
+fn resolve_viewport_params(params: &serde_json::Value) -> crate::browser_viewport::ViewportSpec {
+    // Preset path (CLI / MCP path).
+    if let Some(name) = params.get("preset").and_then(|v| v.as_str()) {
+        let dpr_override = params.get("scale").and_then(|v| v.as_f64());
+        if let Ok(spec) = crate::browser_viewport::parse_spec(name, dpr_override) {
+            return spec;
+        }
+        // Fall through to width/height path on unknown preset — see doc
+        // comment for the rationale.
+    }
+
+    let width = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280) as u32;
+    let height = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720) as u32;
+    let dpr = params.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    crate::browser_viewport::ViewportSpec::new(width, height, dpr)
+}
+
+/// Format a device-pixel-ratio float for the `agent-browser set viewport
+/// W H [scale]` CLI argument. Trims trailing zeros so `2.0` becomes
+/// `"2"` (cleaner shell echo, smaller argv) but preserves precision when
+/// users pass odd values like `1.5`.
+fn format_dpr(dpr: f64) -> String {
+    if (dpr - dpr.round()).abs() < f64::EPSILON {
+        format!("{}", dpr as u64)
+    } else {
+        // Two decimal places is more than enough — DPR > 3.0 is
+        // already exotic and nobody cares about the third decimal.
+        format!("{dpr:.2}")
+    }
+}
+
 /// Argv-form sibling of `build_agent_browser_command`. Returns a list of
 /// argument vectors, one per agent-browser invocation: most actions are
 /// single-shot, but the historical `open_url` shell form was
@@ -893,16 +940,24 @@ fn build_agent_browser_argv_groups(
         "forward" => vec![vec!["forward".into(), "--session".into(), s]],
         "reload" => vec![vec!["reload".into(), "--session".into(), s]],
         "viewport" => {
-            let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
-            let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
-            vec![vec![
+            let spec = resolve_viewport_params(params);
+            let mut argv = vec![
                 "set".into(),
                 "viewport".into(),
-                w.to_string(),
-                h.to_string(),
-                "--session".into(),
-                s,
-            ]]
+                spec.width.to_string(),
+                spec.height.to_string(),
+            ];
+            // Only pass the scale argument when it differs from 1.0 so
+            // legacy callers that didn't set DPR keep producing the same
+            // exact `set viewport W H` argv. agent-browser treats a
+            // missing 3rd arg as 1.0 anyway, so this is a pure
+            // backwards-compat preservation.
+            if (spec.dpr - 1.0).abs() > f64::EPSILON {
+                argv.push(format_dpr(spec.dpr));
+            }
+            argv.push("--session".into());
+            argv.push(s);
+            vec![argv]
         }
         "get_styles" => {
             let selector = params
@@ -1045,9 +1100,25 @@ fn build_agent_browser_command(session: &str, action: &str, params: &serde_json:
         "forward" => format!("{} forward --session {}", bin, session),
         "reload" => format!("{} reload --session {}", bin, session),
         "viewport" => {
-            let w = params.get("width").and_then(|v| v.as_u64()).unwrap_or(1280);
-            let h = params.get("height").and_then(|v| v.as_u64()).unwrap_or(720);
-            format!("{} set viewport {} {} --session {}", bin, w, h, session)
+            let spec = resolve_viewport_params(params);
+            // Match the argv builder: only emit the scale arg when it
+            // differs from 1.0 so existing call sites that pass plain
+            // {width, height} produce the same exact shell string.
+            if (spec.dpr - 1.0).abs() > f64::EPSILON {
+                format!(
+                    "{} set viewport {} {} {} --session {}",
+                    bin,
+                    spec.width,
+                    spec.height,
+                    format_dpr(spec.dpr),
+                    session
+                )
+            } else {
+                format!(
+                    "{} set viewport {} {} --session {}",
+                    bin, spec.width, spec.height, session
+                )
+            }
         }
         // New v0.24.0 commands
         "get_styles" => {
@@ -1905,6 +1976,126 @@ mod tests {
     fn build_command_viewport_uses_set_viewport() {
         let cmd = build_agent_browser_command("s", "viewport", &serde_json::json!({"width": 800, "height": 600})).unwrap();
         assert!(cmd.contains("set viewport 800 600"), "v0.24.0 uses 'set viewport', got: {}", cmd);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_command_viewport_omits_dpr_when_one() {
+        // Backwards-compat with the pre-preset call sites (BrowserPane's
+        // ResizeObserver, the old socket clients): a plain {width, height}
+        // payload must produce the same exact `set viewport W H` shell
+        // string with no trailing scale arg.
+        let cmd = build_agent_browser_command(
+            "s",
+            "viewport",
+            &serde_json::json!({"width": 800, "height": 600, "scale": 1.0}),
+        )
+        .unwrap();
+        assert!(
+            cmd.contains("set viewport 800 600 --session"),
+            "scale=1.0 should be omitted to keep argv tight: {}",
+            cmd
+        );
+        assert!(!cmd.contains(" 1 --session"), "no stray '1' DPR arg: {}", cmd);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_command_viewport_emits_dpr_when_retina() {
+        // Mobile presets always pass scale=2 or scale=3 — that must
+        // surface as a 3rd positional arg so agent-browser actually
+        // applies the retina factor (not just resizes the box).
+        let cmd = build_agent_browser_command(
+            "s",
+            "viewport",
+            &serde_json::json!({"width": 390, "height": 844, "scale": 3.0}),
+        )
+        .unwrap();
+        assert!(
+            cmd.contains("set viewport 390 844 3 --session"),
+            "DPR=3 must be 3rd positional arg: {}",
+            cmd
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_command_viewport_resolves_preset_name() {
+        // Preset-name path (CLI / MCP path) must resolve through
+        // browser_viewport::parse_spec and produce the right argv —
+        // catches a regression where someone forgets to wire preset
+        // resolution into the legacy width/height path.
+        let cmd = build_agent_browser_command(
+            "s",
+            "viewport",
+            &serde_json::json!({"preset": "mobile"}),
+        )
+        .unwrap();
+        // mobile = 390x844 @ DPR 3
+        assert!(
+            cmd.contains("set viewport 390 844 3 --session"),
+            "'mobile' preset → 390x844x3: {}",
+            cmd
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_command_viewport_preset_unknown_falls_back() {
+        // An unknown preset must fall back to width/height defaults
+        // (1280×720) rather than fail mid-stream. The CLI / MCP layer is
+        // expected to validate up front; this is the last-line defence.
+        let cmd = build_agent_browser_command(
+            "s",
+            "viewport",
+            &serde_json::json!({"preset": "iphone-99-pro-max-ultra"}),
+        )
+        .unwrap();
+        assert!(
+            cmd.contains("set viewport 1280 720"),
+            "unknown preset should fall back to defaults: {}",
+            cmd
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn build_command_viewport_preset_reset() {
+        // "reset" preset = RESET_SPEC = 1280x800 @ DPR 1.0; DPR 1.0 must
+        // be omitted from argv (same backwards-compat rule).
+        let cmd = build_agent_browser_command(
+            "s",
+            "viewport",
+            &serde_json::json!({"preset": "reset"}),
+        )
+        .unwrap();
+        assert!(
+            cmd.contains("set viewport 1280 800 --session"),
+            "'reset' preset → 1280x800 with no scale: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn format_dpr_integer_round_trips() {
+        // DPRs are floats internally but the CLI argv looks cleaner with
+        // integer DPRs as integers (no trailing ".0").
+        assert_eq!(format_dpr(1.0), "1");
+        assert_eq!(format_dpr(2.0), "2");
+        assert_eq!(format_dpr(3.0), "3");
+    }
+
+    #[test]
+    fn format_dpr_preserves_fractional() {
+        // Odd values (1.5x, 2.75x — yes, some Android phones) must
+        // round-trip to two decimals so we don't silently truncate to 1x.
+        // Note: Rust's `{:.2}` uses banker's rounding (round half to even),
+        // so 2.625 actually rounds to 2.62 — pick values that don't hit
+        // the half-to-even ambiguity to keep this test stable across
+        // platforms and rustc versions.
+        assert_eq!(format_dpr(1.5), "1.50");
+        assert_eq!(format_dpr(2.75), "2.75");
+        assert_eq!(format_dpr(2.626), "2.63");
     }
 
     #[cfg(not(target_os = "windows"))]

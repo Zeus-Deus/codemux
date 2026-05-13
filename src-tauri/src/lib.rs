@@ -17,6 +17,7 @@ pub mod branch_name;
 pub mod json_rpc_child;
 pub mod mcp_server;
 pub mod agent_browser;
+pub mod browser_viewport;
 pub mod cli;
 pub mod commands;
 pub mod database;

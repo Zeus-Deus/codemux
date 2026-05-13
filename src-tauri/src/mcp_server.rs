@@ -270,6 +270,54 @@ fn register_tools() -> Vec<McpTool> {
                 "required": ["script"]
             }),
         },
+        McpTool {
+            name: "browser_viewport",
+            description: "Resize the browser viewport to test mobile, tablet, or desktop layouts. \
+                CSS media queries fire against the new width, `window.devicePixelRatio` reflects the \
+                preset's DPR, and subsequent browser_screenshot calls capture at the new dimensions. \
+                Always use this instead of wrapping the page in an iframe for mobile preview — \
+                viewport resizing gives true CSS / DPR / layout behavior, not just a narrower scroll \
+                region. \
+                \n\nDEFAULT PICKS when the user is vague: \
+                \n- \"test on mobile\" or \"check mobile view\" → use 'mobile' (390x844, the \
+                standard modern phone size). Do NOT pick 'mobile-small' or 'mobile-large' unless the \
+                user explicitly asks for SE-class / Pro Max phones. \
+                \n- \"test on tablet\" → use 'tablet' (768x1024, iPad portrait). Only use \
+                'tablet-large' if the user explicitly asks for iPad Pro / large tablet. \
+                \n- \"test on desktop\" or after mobile testing → use 'desktop' (1280x800, matches \
+                Tailwind 'xl' breakpoint). Only use 'desktop-large' if the user explicitly asks for \
+                Full HD / 1080p. \
+                \n- \"go back to normal\" or \"reset viewport\" → use 'reset'.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "preset": {
+                        "type": "string",
+                        "description": "Preset name (e.g. 'mobile'), 'WxH' like '390x844', or 'reset'.",
+                        "enum": [
+                            "mobile-small", "mobile", "mobile-large",
+                            "tablet", "tablet-large",
+                            "desktop", "desktop-large",
+                            "reset"
+                        ]
+                    },
+                    "dpr": {
+                        "type": "number",
+                        "description": "Optional device-pixel-ratio override (e.g. 2 for retina, 1 for desktop). Defaults to the preset's natural DPR."
+                    }
+                },
+                "required": ["preset"]
+            }),
+        },
+        McpTool {
+            name: "browser_viewport_presets",
+            description: "List the available viewport presets with their CSS dimensions and DPR. \
+                Useful for discovering options before calling browser_viewport.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
         // -- Workspace tools --
         McpTool {
             name: "workspace_list",
@@ -599,6 +647,63 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
                 "workspace_id": &workspace_id,
                 "action": { "kind": "eval", "script": script }
             })).await
+        }
+        "browser_viewport" => {
+            // Validate locally so an agent gets a typed error with the
+            // preset list instead of a generic "Unknown action" bounce
+            // from the agent-browser subprocess.
+            let preset_arg = arguments.get("preset").and_then(Value::as_str).unwrap_or("");
+            let dpr = arguments.get("dpr").and_then(Value::as_f64);
+            match crate::browser_viewport::parse_spec(preset_arg, dpr) {
+                Ok(spec) => {
+                    // Shared socket-action builder — see cli.rs for the
+                    // matching call site. Both surfaces MUST go through
+                    // this helper so the wire payload stays in sync.
+                    let action = crate::browser_viewport::socket_action(spec);
+                    let result = call_socket("browser_automation", json!({
+                        "workspace_id": &workspace_id,
+                        "action": action,
+                    })).await;
+                    result.map(|data| json!({
+                        "applied": {
+                            "preset": preset_arg,
+                            "width": spec.width,
+                            "height": spec.height,
+                            "dpr": spec.dpr,
+                        },
+                        "hint": format!(
+                            "Viewport set to {}x{} @ {}x DPR. Take a browser_screenshot to verify the layout.",
+                            spec.width, spec.height, spec.dpr
+                        ),
+                        "result": data,
+                    }))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        "browser_viewport_presets" => {
+            let presets = crate::browser_viewport::list_presets();
+            let json_presets: Vec<Value> = presets
+                .iter()
+                .map(|p| {
+                    json!({
+                        "name": p.name,
+                        "width": p.spec.width,
+                        "height": p.spec.height,
+                        "dpr": p.spec.dpr,
+                        "description": p.description,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "presets": json_presets,
+                "reset": {
+                    "width": crate::browser_viewport::RESET_SPEC.width,
+                    "height": crate::browser_viewport::RESET_SPEC.height,
+                    "dpr": crate::browser_viewport::RESET_SPEC.dpr,
+                },
+                "custom": "Pass a 'WxH' string like '390x844' to browser_viewport for custom dimensions.",
+            }))
         }
 
         // -- Workspace tools --
@@ -971,7 +1076,11 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        assert_eq!(tools.len(), 29);
+        // Tool count bumped from 29 → 31 when the mobile/desktop
+        // viewport tools (browser_viewport, browser_viewport_presets)
+        // were added. Keep this number in sync with register_tools()
+        // when adding new entries.
+        assert_eq!(tools.len(), 31);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -990,6 +1099,10 @@ mod tests {
         assert!(names.contains(&"browser_wait"));
         assert!(names.contains(&"browser_evaluate"));
         assert!(names.contains(&"git_push"));
+        // Viewport tools — guards the mobile/desktop test surface so a
+        // future refactor that accidentally drops them gets caught here.
+        assert!(names.contains(&"browser_viewport"));
+        assert!(names.contains(&"browser_viewport_presets"));
     }
 
     #[test]
@@ -1088,7 +1201,10 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 29);
+        // Bumped from 29 → 31 with the addition of browser_viewport +
+        // browser_viewport_presets. See tool_registry_has_all_tools for
+        // the canonical count.
+        assert_eq!(tools.len(), 31);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

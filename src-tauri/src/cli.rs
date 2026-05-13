@@ -81,6 +81,21 @@ pub enum BrowserCommand {
     ClickOs { x: f64, y: f64, browser_id: Option<String> },
     /// Type text using OS-level input (ydotool)
     TypeOs { text: String, #[arg(long)] x: Option<f64>, #[arg(long)] y: Option<f64>, browser_id: Option<String> },
+    /// Set the browser viewport to a preset (mobile / tablet / desktop / ...),
+    /// a custom WxH like `390x844`, or `reset` to return to the default.
+    /// Use `codemux browser viewport-presets` to list every preset.
+    Viewport {
+        /// Preset name, `WxH` dimensions, or `reset`.
+        spec: String,
+        /// Override device-pixel-ratio (e.g. `2` for retina). Defaults to
+        /// the preset's natural DPR (3.0 for phones, 2.0 for tablets,
+        /// 1.0 for desktop / custom dimensions).
+        #[arg(long)]
+        dpr: Option<f64>,
+        browser_id: Option<String>,
+    },
+    /// List the available viewport presets and their CSS dimensions.
+    ViewportPresets,
 }
 
 #[derive(Subcommand)]
@@ -468,6 +483,59 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     }).await?;
                     unwrap_response(response)
                 }
+                BrowserCommand::Viewport { spec, dpr, browser_id: _ } => {
+                    // Resolve preset / WxH locally first so we can surface
+                    // a friendly error (with the full preset list) instead
+                    // of letting the socket call return a generic "Unknown
+                    // action" message.
+                    let resolved = crate::browser_viewport::parse_spec(&spec, dpr)
+                        .map_err(|e| e.to_string())?;
+                    // Shared socket-action builder — keeps CLI and MCP
+                    // payloads byte-identical so a future field bump
+                    // can't ship to one surface and not the other.
+                    let action = crate::browser_viewport::socket_action(resolved);
+                    let response = send_control_request(ControlRequest {
+                        command: "browser_automation".into(),
+                        params: json!({
+                            "workspace_id": &ws_id,
+                            "action": action,
+                        }),
+                    }).await?;
+                    let data = unwrap_response(response)?;
+                    // Echo back what we applied — useful for agents
+                    // chaining `viewport` → `screenshot`.
+                    Ok::<_, String>(json!({
+                        "applied": {
+                            "width": resolved.width,
+                            "height": resolved.height,
+                            "dpr": resolved.dpr,
+                            "spec": spec,
+                        },
+                        "result": data,
+                    }))
+                }
+                BrowserCommand::ViewportPresets => {
+                    let presets = crate::browser_viewport::list_presets();
+                    let json_presets: Vec<_> = presets
+                        .iter()
+                        .map(|p| json!({
+                            "name": p.name,
+                            "width": p.spec.width,
+                            "height": p.spec.height,
+                            "dpr": p.spec.dpr,
+                            "description": p.description,
+                        }))
+                        .collect();
+                    Ok::<_, String>(json!({
+                        "presets": json_presets,
+                        "reset": {
+                            "width": crate::browser_viewport::RESET_SPEC.width,
+                            "height": crate::browser_viewport::RESET_SPEC.height,
+                            "dpr": crate::browser_viewport::RESET_SPEC.dpr,
+                        },
+                        "custom": "Use `WxH` like `390x844` for a custom viewport, plus `--dpr N` for retina.",
+                    }))
+                }
             }?;
             println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
             Ok(true)
@@ -508,7 +576,12 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                             "fill": { "args": "<selector> <value>", "description": "Type into an input" },
                             "screenshot": { "description": "Capture screenshot (base64 PNG)" },
                             "console-logs": { "description": "Get browser console output" },
-                            "create": { "description": "Create a new browser pane" }
+                            "create": { "description": "Create a new browser pane" },
+                            "viewport": {
+                                "args": "<preset|WxH|reset> [--dpr N]",
+                                "description": "Set viewport for mobile/tablet/desktop testing"
+                            },
+                            "viewport-presets": { "description": "List available viewport presets" }
                         }
                     },
                     "memory": {

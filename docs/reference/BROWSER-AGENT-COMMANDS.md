@@ -90,6 +90,44 @@ codemux browser console-logs [browser_id]
 
 Returns JavaScript console output from the page. Useful for debugging errors.
 
+### Set Viewport (Mobile / Tablet / Desktop Testing)
+
+```bash
+codemux browser viewport <preset>           # mobile / tablet / desktop etc.
+codemux browser viewport 390x844            # custom dimensions
+codemux browser viewport mobile --dpr 2     # preset with DPR override
+codemux browser viewport reset              # restore default
+codemux browser viewport-presets            # list available presets
+```
+
+Resizes the actual browser viewport so CSS media queries fire, `window.devicePixelRatio` reflects the simulated device, and subsequent screenshots capture at the new dimensions. Use this instead of wrapping the page in a 375px iframe — viewport resizing gives true mobile rendering (responsive layout, retina assets, real touch-target sizes) and produces clean screenshots without surrounding desktop chrome.
+
+Available presets (use `viewport-presets` to see the live list):
+
+| Preset | W × H | DPR | Matches |
+|---|---|---|---|
+| `mobile-small` | 320 × 568 | 2 | iPhone SE class, smaller Androids |
+| `mobile` | 390 × 844 | 3 | iPhone 13/14/15, Pixel 7 |
+| `mobile-large` | 430 × 932 | 3 | Pro Max, Pixel Pro |
+| `tablet` | 768 × 1024 | 2 | iPad portrait |
+| `tablet-large` | 1024 × 1366 | 2 | iPad Pro 12.9" |
+| `desktop` | 1280 × 800 | 1 | Standard laptop, Tailwind `xl:` breakpoint |
+| `desktop-large` | 1920 × 1080 | 1 | Full HD |
+| `reset` | 1280 × 800 | 1 | Restore default |
+
+Preset names are deliberately size-bucket labels (not "iPhone 15") so they stay accurate across future hardware refreshes.
+
+Typical workflow:
+
+```bash
+codemux browser open https://mysite.local
+codemux browser viewport mobile
+codemux browser screenshot      # mobile screenshot
+codemux browser viewport tablet
+codemux browser screenshot      # tablet screenshot
+codemux browser viewport reset
+```
+
 ## Socket API Commands
 
 These actions are available via the Codemux control socket. They cover additional functionality not exposed as CLI subcommands.
@@ -191,11 +229,17 @@ Reload the current page.
 
 #### viewport
 
-Set the browser viewport size.
+Set the browser viewport size. Accepts either a preset name or explicit dimensions.
 
 ```json
-{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"viewport","width":1024,"height":768}}}
+// Preset (recommended)
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"viewport","preset":"mobile"}}}
+
+// Explicit dimensions, optional `scale` for DPR
+{"command":"browser_automation","params":{"browser_id":"default","action":{"kind":"viewport","width":390,"height":844,"scale":3.0}}}
 ```
+
+When both `preset` and `width`/`height` are present, `preset` wins. When neither is set, dimensions default to 1280×720×1.0 (backwards-compat with the pre-preset shape that `BrowserPane.tsx`'s ResizeObserver emits when the user manually resizes the pane).
 
 #### console / console_logs
 
