@@ -492,8 +492,14 @@ pub fn import_worktree_workspace(
     Ok(workspace_id.0)
 }
 
+// `async fn` so this command runs on Tokio's worker pool instead of the GTK
+// main thread. With a synchronous handler, `git worktree remove --force` on a
+// large worktree (recursive filesystem delete) blocks every subsequent IPC
+// call, freezing the UI hard enough that even window-close requests don't
+// process. Same pattern as `commands/git.rs` — see the note at the top of that
+// file.
 #[tauri::command]
-pub fn close_workspace_with_worktree(
+pub async fn close_workspace_with_worktree(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -543,10 +549,17 @@ pub fn close_workspace_with_worktree(
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
 
+    // Optimistic emit: the workspace is gone from in-memory state. Push the
+    // update to the frontend NOW so the sidebar row disappears immediately,
+    // even when the filesystem cleanup below takes seconds (large worktrees,
+    // slow disk). A second emit at the end of the command picks up any
+    // session/agent-chat fan-out the cleanup triggers.
+    crate::state::emit_app_state(&app);
+
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
-    // acquisition that removed the workspace — no TOCTOU race with newly
-    // created panes. Idempotent on the waiter thread (double-remove is a
+    // acquisition that removed the workspace — no TOCTOU race with concurrent
+    // pane creation. Idempotent on the waiter thread (double-remove is a
     // no-op) so per-session errors cannot bubble.
     let terminal_state: State<'_, crate::terminal::PtyState> = app.state();
     for session_id in close_result.removed_sessions {
@@ -570,11 +583,24 @@ pub fn close_workspace_with_worktree(
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
             let branch_to_delete = if delete_branch.unwrap_or(false) {
-                branch.as_deref()
+                branch
             } else {
                 None
             };
-            crate::git::git_remove_worktree(Path::new(&wt_path), branch_to_delete, true)?;
+            // The slow part: `git worktree remove --force` recursively deletes
+            // the working tree directory. On a project with thousands of
+            // commits / a heavy `node_modules` this can take many seconds.
+            // Offload to the blocking pool so the Tokio worker stays free for
+            // other commands.
+            tokio::task::spawn_blocking(move || {
+                crate::git::git_remove_worktree(
+                    Path::new(&wt_path),
+                    branch_to_delete.as_deref(),
+                    true,
+                )
+            })
+            .await
+            .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
         }
     }
 
