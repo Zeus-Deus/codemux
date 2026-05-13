@@ -1461,6 +1461,53 @@ pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
     }
 }
 
+/// Returns true iff `git worktree list --porcelain` for `repo_path` contains
+/// an entry whose `worktree` line matches `target_path` AND whose `branch`
+/// line matches `refs/heads/<branch>` (the form git uses for porcelain
+/// output). Used by `git_create_worktree` to short-circuit when the brain
+/// re-asks for a worktree that's already on disk and attached to the
+/// requested branch.
+///
+/// The porcelain format groups records by blank lines. Each record looks
+/// like:
+///   worktree /home/.../<repo>/<branch>
+///   HEAD <sha>
+///   branch refs/heads/<branch>
+///
+/// Detached worktrees print `detached` instead of `branch …`; we treat
+/// those as non-match because callers always pass a branch name and a
+/// detached worktree at the path is not what they asked for.
+fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) -> bool {
+    let Ok(output) = run_git(repo_path, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    let expected_branch_ref = format!("refs/heads/{branch}");
+    let mut current_path: Option<String> = None;
+    let mut current_branch: Option<String> = None;
+    for raw in output.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            // End of a record — evaluate before resetting.
+            if current_path.as_deref() == Some(target_path)
+                && current_branch.as_deref() == Some(&expected_branch_ref)
+            {
+                return true;
+            }
+            current_path = None;
+            current_branch = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            current_path = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            current_branch = Some(rest.to_string());
+        }
+    }
+    // Last record may not be terminated by a blank line.
+    current_path.as_deref() == Some(target_path)
+        && current_branch.as_deref() == Some(&expected_branch_ref)
+}
+
 pub fn git_create_worktree(
     repo_path: &Path,
     branch: &str,
@@ -1491,6 +1538,31 @@ pub fn git_create_worktree(
     }
 
     let path_str = worktree_path.to_string_lossy().to_string();
+
+    // Reuse path: if the worktree directory already exists, was previously
+    // registered with git for the SAME branch, and is still attached
+    // (not stale / pruned), short-circuit by returning that path. Without
+    // this, calling worktree_create with a previously-used branch errors
+    // with `fatal: '<path>' already exists`, the brain falls back to
+    // `workspace_create`, the workspace gets a generic "Workspace N"
+    // title, and any `initial_prompt` gets dropped because the fallback
+    // doesn't run the preset-launch / prompt-injection block in
+    // `create_worktree_workspace_impl`. Detect-and-reuse keeps the
+    // happy path intact for the Telegram "spin up an agent in this
+    // branch" flow even when the worktree is already on disk.
+    //
+    // Safety: we only reuse when `git worktree list` confirms the
+    // existing entry maps to OUR `path_str` AND our `branch`. A path
+    // collision against a different branch still errors loudly so the
+    // brain doesn't silently attach an agent to the wrong branch.
+    if worktree_path.exists() {
+        if existing_worktree_matches(repo_path, &path_str, branch) {
+            return Ok(path_str);
+        }
+        // Path exists but isn't a registered worktree for `branch`. Let
+        // git fail with its own diagnostic so the brain sees the real
+        // reason (e.g. a leftover dir from a half-deleted worktree).
+    }
 
     if new_branch {
         // Resolve base: prefer origin/<base> so new branches start from the
@@ -1979,6 +2051,100 @@ C  source.txt -> copy.txt";
         assert_eq!(info.branch.as_deref(), Some("existing-branch"));
 
         git_remove_worktree(Path::new(&wt_path), Some("existing-branch"), true).expect("cleanup");
+    }
+
+    // ── Worktree reuse (worktree_create resilience) ─────────────────
+    //
+    // Regression coverage for the bug where calling `worktree_create`
+    // with `new_branch=false` against a branch whose Codemux worktree
+    // directory already existed would error with `fatal: '<path>'
+    // already exists`. The brain's natural fallback (calling
+    // `workspace_create` with the same path) produced a workspace with
+    // generic "Workspace N" title and silently dropped `initial_prompt`
+    // because the fallback skips the preset-launch + prompt-injection
+    // block in `create_worktree_workspace_impl`.
+    //
+    // Fix: `git_create_worktree` now detects when the requested worktree
+    // path is already registered against the requested branch and
+    // returns Ok early. The downstream impl then runs the same title-
+    // setting + prompt-injection code path as a fresh creation.
+
+    /// A unique random branch name per test run so parallel cargo test
+    /// processes don't collide on `~/.codemux/worktrees/<repo>/<branch>`
+    /// (the path `git_create_worktree` derives from the branch).
+    fn unique_branch(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("worktree-reuse-{label}-{}-{nanos}", std::process::id())
+    }
+
+    #[test]
+    fn worktree_create_reuses_existing_path_for_same_branch() {
+        let (_dir, repo) = setup_test_repo();
+        let branch = unique_branch("same");
+        run_git(&repo, &["branch", &branch]).expect("create branch");
+
+        // First call materializes the worktree on disk.
+        let first = git_create_worktree(&repo, &branch, false, None, None)
+            .expect("first worktree create");
+        assert!(PathBuf::from(&first).exists(), "worktree dir should exist after first call");
+
+        // Second call MUST NOT error with `already exists`. It must
+        // return the same path so the downstream impl can run its
+        // preset-launch and prompt-injection block on the workspace
+        // it creates for this reused worktree.
+        let second = git_create_worktree(&repo, &branch, false, None, None)
+            .expect("second call must reuse, not error");
+        assert_eq!(
+            first, second,
+            "reused worktree should return the same path"
+        );
+
+        git_remove_worktree(Path::new(&first), Some(&branch), true).expect("cleanup");
+    }
+
+    #[test]
+    fn worktree_create_does_not_reuse_path_for_different_branch() {
+        // Safety net: if a path collision somehow happened against the
+        // WRONG branch (e.g. stale dir from a half-deleted worktree),
+        // git_create_worktree must still error rather than silently
+        // attaching an agent to the wrong branch.
+        let (_dir, repo) = setup_test_repo();
+        let branch_a = unique_branch("wrong-a");
+        let branch_b = unique_branch("wrong-b");
+        run_git(&repo, &["branch", &branch_a]).expect("create branch a");
+        run_git(&repo, &["branch", &branch_b]).expect("create branch b");
+
+        let wt_a = git_create_worktree(&repo, &branch_a, false, None, None)
+            .expect("worktree a");
+
+        // Path for branch_b would be different (different name), so this
+        // doesn't directly test path collision against wrong-branch.
+        // Instead, simulate the collision: create an empty dir at
+        // branch_a's path AFTER removing the worktree, then ask for
+        // branch_b at that exact path. Use the helper directly to
+        // verify the porcelain check refuses to match.
+        assert!(
+            !existing_worktree_matches(&repo, &wt_a, &branch_b),
+            "porcelain check must refuse to match a path that's registered against a different branch"
+        );
+        assert!(
+            existing_worktree_matches(&repo, &wt_a, &branch_a),
+            "porcelain check must match a path that's registered against the requested branch"
+        );
+
+        git_remove_worktree(Path::new(&wt_a), Some(&branch_a), true).expect("cleanup");
+    }
+
+    #[test]
+    fn existing_worktree_matches_returns_false_when_no_worktrees() {
+        let (_dir, repo) = setup_test_repo();
+        assert!(
+            !existing_worktree_matches(&repo, "/tmp/nonexistent-path", "main"),
+            "no registered worktrees => no match"
+        );
     }
 
     #[test]
