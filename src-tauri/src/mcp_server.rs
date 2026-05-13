@@ -510,6 +510,89 @@ fn register_tools() -> Vec<McpTool> {
                 }
             }),
         },
+        // -- Delegation primitives (Phase 1.5 vexis-agent integration) --
+        McpTool {
+            name: "worktree_create",
+            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, `.mcp.json` autoconfig, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to a git repository (or any subdirectory of one — the git root is resolved automatically)."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If `new_branch` is true, this branch is created from `base`; otherwise it must already exist."
+                    },
+                    "new_branch": {
+                        "type": "boolean",
+                        "description": "Create the branch (true) or check out an existing branch (false). Defaults to true — the common case for the brain is starting fresh work.",
+                        "default": true
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Base branch to fork from when `new_branch` is true. Defaults to \"main\".",
+                        "default": "main"
+                    },
+                    "layout": {
+                        "type": "string",
+                        "enum": ["single", "pair", "quad", "six", "eight", "shell_browser", "empty"],
+                        "description": "Pane layout for the workspace. \"single\" is one terminal (the right choice for almost every delegated task); \"empty\" creates no pane (chat-only). Defaults to \"single\".",
+                        "default": "single"
+                    },
+                    "initial_prompt": {
+                        "type": "string",
+                        "description": "Optional starting prompt to feed the agent. For Claude/Codex presets it's appended as a positional ANSI-C-quoted argument; for other CLIs (Gemini, OpenCode, custom) it's typed into the terminal after a ~1500ms TUI settle. Ignored unless `agent_preset_id` is set."
+                    },
+                    "agent_preset_id": {
+                        "type": "string",
+                        "description": "Optional preset id (from `preset_list`) to launch after the workspace is hydrated. Without this, the workspace is created but no agent runs — leaving the brain to drive via `preset_apply` or `terminal_write` later."
+                    },
+                    "pr_number": {
+                        "type": "integer",
+                        "description": "Optional GitHub PR number to associate with the new workspace (shows in the workspace's PR badge).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["repo_path", "branch"]
+            }),
+        },
+        McpTool {
+            name: "preset_apply",
+            description: "Apply an existing preset to an already-open workspace. Use this when you have a workspace from `workspace_list` and want to launch an agent in it (or run a shell preset's commands). For starting from scratch — new branch, new worktree, agent attached — use `worktree_create` instead, which combines all of that into one call. Returns `{ok: true}` on success.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Target workspace (from `workspace_list` / `workspace_info` / `app_status`)."
+                    },
+                    "preset_id": {
+                        "type": "string",
+                        "description": "Preset to apply (from `preset_list`)."
+                    },
+                    "override_mode": {
+                        "type": "string",
+                        "enum": ["new_tab", "split_pane", "current_terminal", "existing_panes"],
+                        "description": "Override the preset's default launch mode. `current_terminal` writes commands to the workspace's active terminal; `new_tab` creates a fresh tab; `split_pane` splits the active pane; `existing_panes` chains the commands into every terminal session in the workspace."
+                    },
+                    "initial_prompt": {
+                        "type": "string",
+                        "description": "Optional prompt to feed the agent after launch. Same injection rules as `worktree_create`: positional arg for Claude/Codex, PTY-typed for others."
+                    }
+                },
+                "required": ["workspace_id", "preset_id"]
+            }),
+        },
+        McpTool {
+            name: "preset_list",
+            description: "List the agent presets Codemux knows about. Each entry has `preset_id`, `name`, `description`, `kind` (\"terminal\" or \"chat\"), `is_default`, and `commands_available` — a boolean that's true only when every command binary the preset launches resolves on the current PATH. Filter to `commands_available: true` before calling `worktree_create` or `preset_apply` so the brain doesn't ask for a CLI that isn't installed on this host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
     ]
 }
 
@@ -914,6 +997,80 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             call_socket("port_list", params).await
         }
 
+        // -- Delegation primitives (Phase 1.5) --
+        "worktree_create" => {
+            let repo_path = arguments
+                .get("repo_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let branch = arguments
+                .get("branch")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if repo_path.is_empty() {
+                Err("worktree_create: missing required argument 'repo_path'".to_string())
+            } else if branch.is_empty() {
+                Err("worktree_create: missing required argument 'branch'".to_string())
+            } else {
+                // Build params lazily so the socket arm's defaults
+                // (new_branch=true, base="main", layout="single") fire
+                // when the brain omits them. Passing them explicitly
+                // here would freeze the defaults on the MCP side and
+                // make future changes harder to coordinate.
+                let mut params = json!({
+                    "repo_path": repo_path,
+                    "branch": branch,
+                });
+                if let Some(nb) = arguments.get("new_branch").and_then(Value::as_bool) {
+                    params["new_branch"] = json!(nb);
+                }
+                if let Some(base) = arguments.get("base").and_then(Value::as_str) {
+                    params["base"] = json!(base);
+                }
+                if let Some(layout) = arguments.get("layout").and_then(Value::as_str) {
+                    params["layout"] = json!(layout);
+                }
+                if let Some(prompt) = arguments.get("initial_prompt").and_then(Value::as_str) {
+                    params["initial_prompt"] = json!(prompt);
+                }
+                if let Some(pid) = arguments.get("agent_preset_id").and_then(Value::as_str) {
+                    params["agent_preset_id"] = json!(pid);
+                }
+                if let Some(prn) = arguments.get("pr_number").and_then(Value::as_u64) {
+                    params["pr_number"] = json!(prn);
+                }
+                call_socket("create_worktree_workspace", params).await
+            }
+        }
+        "preset_apply" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let preset_id = arguments
+                .get("preset_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("preset_apply: missing required argument 'workspace_id'".to_string())
+            } else if preset_id.is_empty() {
+                Err("preset_apply: missing required argument 'preset_id'".to_string())
+            } else {
+                let mut params = json!({
+                    "workspace_id": workspace_id,
+                    "preset_id": preset_id,
+                });
+                if let Some(m) = arguments.get("override_mode").and_then(Value::as_str) {
+                    params["override_mode"] = json!(m);
+                }
+                if let Some(p) = arguments.get("initial_prompt").and_then(Value::as_str) {
+                    params["initial_prompt"] = json!(p);
+                }
+                call_socket("apply_preset", params).await
+            }
+        }
+        "preset_list" => call_socket("get_presets", json!({})).await,
+
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -1274,11 +1431,12 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        // Tool count bumped from 31 → 36 with the Phase 1 vexis-agent
-        // integration tools: terminal_write, terminal_read, workspace_open,
-        // app_status, port_list. Keep this number in sync with
-        // register_tools() when adding new entries.
-        assert_eq!(tools.len(), 36);
+        // Tool count bumped from 36 → 39 with the Phase 1.5 delegation
+        // primitives: worktree_create, preset_apply, preset_list. The
+        // workspace_create path-bug fix is a socket-arm patch, not a new
+        // tool. Keep this number in sync with register_tools() when
+        // adding new entries.
+        assert_eq!(tools.len(), 39);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -1309,6 +1467,13 @@ mod tests {
         assert!(names.contains(&"workspace_open"));
         assert!(names.contains(&"app_status"));
         assert!(names.contains(&"port_list"));
+        // Phase 1.5 delegation primitives — pinning the contract so the
+        // brain can rely on these names existing. `workspace_create`
+        // (the path-bug fix) is one of the original 31 — already
+        // covered by the count assertion above.
+        assert!(names.contains(&"worktree_create"));
+        assert!(names.contains(&"preset_apply"));
+        assert!(names.contains(&"preset_list"));
     }
 
     #[test]
@@ -1407,11 +1572,10 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        // Bumped from 31 → 36 with the Phase 1 vexis-agent integration
-        // tools (terminal_write, terminal_read, workspace_open,
-        // app_status, port_list). See tool_registry_has_all_tools for
-        // the canonical count.
-        assert_eq!(tools.len(), 36);
+        // Bumped from 36 → 39 with the Phase 1.5 delegation primitives
+        // (worktree_create, preset_apply, preset_list). See
+        // tool_registry_has_all_tools for the canonical count.
+        assert_eq!(tools.len(), 39);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

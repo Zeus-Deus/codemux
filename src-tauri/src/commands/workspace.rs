@@ -290,6 +290,41 @@ pub fn create_worktree_workspace(
     agent_preset_id: Option<String>,
     pr_number: Option<u32>,
 ) -> Result<String, String> {
+    create_worktree_workspace_impl(
+        app, &state, &db, &pty_state, &presets,
+        repo_path, branch, new_branch, base, layout,
+        initial_prompt, agent_preset_id, pr_number,
+    )
+}
+
+/// Shared implementation behind both the Tauri command (frontend "+
+/// New worktree" / branch-picker "Fork" flow) and the
+/// `create_worktree_workspace` control-socket command exposed via the
+/// Phase 1.5 `worktree_create` MCP tool.
+///
+/// Takes refs instead of `State<>` wrappers so the socket dispatcher
+/// (which already pulls each state via `app.state()`) and any future
+/// non-Tauri caller can drive it. The body is byte-identical to the
+/// pre-extraction Tauri command — moving it preserves git worktree
+/// creation, workspace+layout hydration, PTY spawn, setup scripts,
+/// `.mcp.json` autoconfig, and the preset-launch-with-prompt-injection
+/// branch as one atomic operation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_worktree_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    pty_state: &crate::terminal::PtyState,
+    presets: &crate::presets::PresetStoreState,
+    repo_path: String,
+    branch: String,
+    new_branch: bool,
+    base: Option<String>,
+    layout: String,
+    initial_prompt: Option<String>,
+    agent_preset_id: Option<String>,
+    pr_number: Option<u32>,
+) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -1650,6 +1685,66 @@ mod empty_workspace_skip_setup_tests {
         assert_eq!(
             after, sentinel,
             "pre-existing .mcp.json must be byte-identical when skip_setup=true"
+        );
+    }
+}
+
+#[cfg(test)]
+mod phase_1_5_workspace_create_path_tests {
+    //! Phase 1.5 regression coverage for the `workspace_create` MCP tool's
+    //! `path` argument. The bug pre-fix was at `control.rs:573`: the
+    //! socket arm hardcoded `None` as the fourth argument to
+    //! `create_workspace_impl`, dropping the path the brain asked for.
+    //! These tests pin the state-layer contract the fix relies on —
+    //! `create_workspace_at_path(path)` must produce a workspace whose
+    //! `cwd` matches the path the caller supplied. If the underlying
+    //! state method ever stops honoring the path, the regression test
+    //! at this layer fails immediately and the fix at the socket arm
+    //! becomes meaningless. End-to-end socket-arm coverage requires an
+    //! `AppHandle` (deferred — see Phase 1 notes on dispatch tests).
+    use super::*;
+    use crate::state::AppStateStore;
+
+    #[test]
+    fn create_workspace_at_path_uses_supplied_cwd() {
+        let store = AppStateStore::default();
+        // Use a path that's unambiguously not the test process's CWD so
+        // a regression that silently substitutes `current_project_root()`
+        // (the pre-fix behavior) fails this assertion cleanly.
+        let target = PathBuf::from("/tmp/codemux-phase-1-5-cwd-test");
+        let ws_id = store.create_workspace_at_path(target.clone());
+
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .expect("newly created workspace must appear in snapshot");
+        assert_eq!(
+            ws.cwd,
+            target.display().to_string(),
+            "create_workspace_at_path must store the supplied path verbatim — \
+             the workspace_create path-bug fix depends on this contract"
+        );
+    }
+
+    #[test]
+    fn create_workspace_without_path_falls_back_to_current_root() {
+        // The None path of `create_workspace_impl` calls
+        // `state.create_workspace()` (no path), which falls back to
+        // `current_project_root()` resolution downstream. Here we just
+        // pin that the no-path constructor produces a workspace at all.
+        let store = AppStateStore::default();
+        let snap_before = store.snapshot();
+        let ws_id = store.create_workspace();
+        let snap_after = store.snapshot();
+        assert!(
+            snap_after.workspaces.len() > snap_before.workspaces.len(),
+            "create_workspace() must add exactly one workspace"
+        );
+        assert!(
+            snap_after.workspaces.iter().any(|w| w.workspace_id == ws_id),
+            "the returned workspace_id must be present in the new snapshot"
         );
     }
 }

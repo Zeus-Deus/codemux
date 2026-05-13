@@ -59,7 +59,29 @@ servers:
 
 LOC budget: ~200 LOC in `mcp_server.rs` (5 new tools) + ~80 LOC in `control.rs` (2–3 new socket commands: `terminal_read`, `workspace_open`, possibly `app_status` depending on whether the existing `status` shape suffices) + ~20 LOC for the atomic-write fix.
 
-**Phase 2 (deferred until agent-chat surface stabilizes).** Four agent-chat tools: `agent_chat_list_sessions`, `agent_chat_send_turn`, `agent_chat_list_messages`, `agent_chat_start_session`. Deferred because 12 substantive commits have landed since the feature shipped (recon §6) — OpenCode provider, capability harvest, Step 13 master toggle — and wrapping a moving target wastes effort. Compounding cost: agent-chat has no socket equivalent today, so MCP-wrapping means adding 4–5 new socket commands first. Revisit once the Tauri-command surface settles.
+**Phase 1.5 (delegation primitives — required before merge).** Phase 1 proved inspection works end-to-end via Telegram, but real-world testing (`docs/research/codemux-phase-1-5-research.md`) found the brain cannot *delegate actual work*: no MCP tool starts an agent in a workspace, no atomic worktree+workspace+agent+prompt flow exists, and `workspace_create` silently drops its `path` argument. Phase 1.5 closes that gap so the target use case ("spin up a worktree in openclaw and start a Claude Code agent there to research computer use") materializes in two MCP calls.
+
+1. **`workspace_create` path-bug fix.** `control.rs:573` hardcodes `None` as `cwd` for `create_workspace_impl`, dropping the `path` the MCP schema advertises. Read `request.params.get("path")` and pass it through. ~3 LOC. Socket patch, not a new tool.
+2. **`worktree_create` MCP tool.** Wraps `commands/workspace.rs:277-439::create_worktree_workspace` (Tauri-only today) via a new socket command. Inputs: `repo_path`, `branch`, `new_branch` (default `true`), `base` (default `"main"`), `layout` (`single`/`pair`/`quad`/`six`/`eight`/`shell_browser`/`empty`, default `"single"`), `initial_prompt`, `agent_preset_id`, `pr_number`. One atomic call does git worktree, workspace+layout, PTY spawn, setup scripts, `.mcp.json`, and preset launch with prompt injection via `branch_name::prepare_agent_command`. ~80 LOC.
+3. **`preset_apply` MCP tool.** Thin wrap of `apply_preset` (`control.rs:591-610`). Inputs: `workspace_id`, `preset_id`, `override_mode` (`new_tab`/`split_pane`/`current_terminal`/`existing_panes`), `initial_prompt`. Attaches an agent to an existing workspace. ~25 LOC.
+4. **`preset_list` MCP tool.** Wraps `get_presets` via a new socket command. Returns `[{preset_id, name, description, kind, is_default, commands_available}]` — `commands_available` reflects `command_binary_exists` (`commands/presets.rs:270-275`) so the brain knows which agents work on this host. ~30 LOC.
+
+Acceptance criterion: the target prompt resolves in two MCP calls.
+
+```
+preset_list() → [{preset_id: "builtin-claude", commands_available: true}, ...]
+worktree_create(repo_path: ".../openclaw", branch: "computer-use-research",
+  new_branch: true, base: "main", layout: "single",
+  agent_preset_id: "builtin-claude",
+  initial_prompt: "research how they do computer use")
+  → "workspace-NN"
+```
+
+The worktree lands on disk, the workspace hydrates, Claude Code launches with the prompt as a positional arg, the sidebar emits. Progress via `app_status` / `terminal_read`.
+
+Tool count: **36 → 39**. LOC: ~140.
+
+**Phase 2 (deferred until agent-chat surface stabilizes — independent of Phase 1.5).** Four agent-chat tools: `agent_chat_list_sessions`, `agent_chat_send_turn`, `agent_chat_list_messages`, `agent_chat_start_session`. Deferred because 12 substantive commits have landed since the feature shipped (recon §6) and wrapping a moving target wastes effort; MCP-wrapping also means adding 4–5 new socket commands first. Phase 1.5 does not depend on Phase 2 — `worktree_create` + `preset_apply` + `terminal_read` drive Claude Code without touching the agent-chat pane.
 
 ## 6. Patterns to adopt or avoid
 

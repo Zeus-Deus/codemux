@@ -573,7 +573,18 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "create_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
             let db: State<'_, crate::database::DatabaseStore> = app.state();
-            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, None)
+            // Phase 1.5 fix: the MCP `workspace_create` tool advertises an
+            // optional `path` argument in its schema and the MCP dispatcher
+            // (mcp_server.rs::workspace_create) packs it into params, but
+            // this arm previously hardcoded `None` — so every call landed
+            // at `current_project_root()` regardless of what the brain
+            // asked for. Reading the param closes the silent-drop.
+            let path = request
+                .params
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, path)
                 .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
         }
         "split_pane" => {
@@ -607,6 +618,95 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 initial_prompt,
             )
             .map(|()| serde_json::json!({ "ok": true }))
+        }
+        "create_worktree_workspace" => {
+            // Phase 1.5: backs the `worktree_create` MCP tool. The
+            // underlying impl already handles git worktree + workspace
+            // hydration + PTY spawn + setup scripts + .mcp.json autoconfig
+            // + preset launch with prompt injection in one atomic call —
+            // we only parse params and pass through.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let pty_state: State<'_, PtyState> = app.state();
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let repo_path = request
+                .params
+                .get("repo_path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: repo_path".to_string());
+            let branch = request
+                .params
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: branch".to_string());
+            // Defaults match Phase 1.5 plan §5: new_branch=true so the
+            // brain's natural "spin up a new feature branch" flow doesn't
+            // need an extra arg, base="main" since that's where almost
+            // every project forks from, layout="single" because the brain
+            // typically wants one terminal pane to attach a CLI agent to.
+            let new_branch = request
+                .params
+                .get("new_branch")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let base = request
+                .params
+                .get("base")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("main".to_string()));
+            let layout = request
+                .params
+                .get("layout")
+                .and_then(Value::as_str)
+                .unwrap_or("single")
+                .to_string();
+            let initial_prompt = request
+                .params
+                .get("initial_prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let agent_preset_id = request
+                .params
+                .get("agent_preset_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let pr_number = request
+                .params
+                .get("pr_number")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32);
+            repo_path.and_then(|rp| {
+                branch.and_then(|br| {
+                    crate::commands::workspace::create_worktree_workspace_impl(
+                        app.clone(),
+                        &state,
+                        &db,
+                        &pty_state,
+                        &presets,
+                        rp,
+                        br,
+                        new_branch,
+                        base,
+                        layout,
+                        initial_prompt,
+                        agent_preset_id,
+                        pr_number,
+                    )
+                    .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
+                })
+            })
+        }
+        "get_presets" => {
+            // Phase 1.5: backs the `preset_list` MCP tool. Returns the
+            // preset registry enriched with `commands_available` so the
+            // brain can pre-filter to agents whose CLI is actually on
+            // PATH before calling `preset_apply` or `worktree_create`.
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let entries = crate::commands::presets::list_presets_with_availability(&presets);
+            Ok(serde_json::json!({ "presets": entries }))
         }
         "create_browser_pane" => {
             let state: State<'_, AppStateStore> = app.state();
