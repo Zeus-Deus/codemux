@@ -490,7 +490,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "app_status",
-            description: "Return basic Codemux app status — control socket path and control-protocol version. Useful for confirming the agent is talking to a live Codemux instance.",
+            description: "Return Codemux app status: app version, control protocol version, control socket path, the active workspace id, the focused pane id, and a one-line summary (id/title/cwd) of every open workspace. Use this for a quick orientation snapshot before deciding which `workspace_list` / `workspace_info` / `pane_list` calls to make.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -498,7 +498,8 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "port_list",
-            description: "List dev-server ports Codemux has detected as listening on the local machine. Each entry includes port, pid, process_name, optional workspace_id (which workspace owns the listener) and optional label (e.g. \"vite\", \"next\"). Filter by `workspace_id` to only see ports owned by one workspace.",
+            description: "List dev-server ports Codemux has detected as listening on the local machine. Each entry includes port, pid, process_name, optional workspace_id (which workspace owns the listener) and optional label (e.g. \"vite\", \"next\"). \
+                Filter semantics: omit `workspace_id` to get EVERY port, including unscoped (system) listeners. Pass `workspace_id` to get ONLY ports the detector tagged with that workspace — unscoped ports are excluded. To see workspace + unscoped together, call without a filter and partition client-side on the `workspace_id` field.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

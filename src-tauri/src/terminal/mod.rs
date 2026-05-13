@@ -4663,6 +4663,77 @@ mod tests {
     }
 
     #[test]
+    fn read_terminal_output_default_when_lines_none() {
+        // The `read_terminal` socket-command arm passes `lines` straight
+        // through as `Option<usize>`. When the MCP caller omits the
+        // argument entirely, this must use `READ_TERMINAL_DEFAULT_LINES`
+        // (200) — not 0, not the cap. Builds 250 lines of buffered
+        // output and asks for the default; expect 200 returned with
+        // `truncated=true` and 250 total.
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-default",
+            || SessionRuntime::new("sess-default"),
+            |runtime| {
+                let bulk = (1..=250)
+                    .map(|i| format!("ln-{i}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                runtime.pending_output.push_back(bulk.into_bytes());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, None, Some("sess-default".to_string())).unwrap();
+        assert_eq!(
+            out.lines_returned, READ_TERMINAL_DEFAULT_LINES,
+            "default line count must be {READ_TERMINAL_DEFAULT_LINES}"
+        );
+        assert!(out.truncated, "older lines beyond the default must be dropped");
+        // 250 lines of "ln-N\n" + the trailing empty split = 251 total.
+        assert_eq!(out.total_lines, 251);
+    }
+
+    #[test]
+    fn read_terminal_output_clamps_to_max() {
+        // Even if the dispatcher passes `Some(usize::MAX)` (a brain
+        // ignoring the schema cap), the helper must clamp to
+        // `READ_TERMINAL_MAX_LINES` (5000). Asks for 1_000_000 lines
+        // against a tiny buffer; expect the full buffer back (since
+        // it's under the cap) but also assert the cap path was taken
+        // by checking the helper accepted a value larger than the cap
+        // without panicking and without returning more than the cap.
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-clamp",
+            || SessionRuntime::new("sess-clamp"),
+            |runtime| {
+                // 6000 lines so we can prove the cap fires.
+                let bulk = (1..=6000)
+                    .map(|i| format!("ln-{i}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                runtime.pending_output.push_back(bulk.into_bytes());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, Some(1_000_000), Some("sess-clamp".to_string()))
+                .unwrap();
+        assert_eq!(
+            out.lines_returned, READ_TERMINAL_MAX_LINES,
+            "must clamp to READ_TERMINAL_MAX_LINES ({READ_TERMINAL_MAX_LINES})"
+        );
+        assert!(out.truncated);
+    }
+
+    #[test]
     fn read_terminal_output_applies_line_cap() {
         let pty = PtyState::default();
         let app = crate::state::AppStateStore::default();

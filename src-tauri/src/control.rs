@@ -527,10 +527,45 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
 
 async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
-        "status" => Ok(serde_json::json!({
-            "socket_path": control_socket_path().map(|path| path.display().to_string()),
-            "protocol_version": CONTROL_PROTOCOL_VERSION
-        })),
+        "status" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let snap = state.snapshot();
+            // Workspace summary: id + title + cwd for every open workspace.
+            // Kept tight on purpose — a brain doing `app_status` wants a
+            // one-line description per workspace, not the full git/tab
+            // shape. Use `workspace_list` / `workspace_info` for the rest.
+            let workspaces: Vec<Value> = snap
+                .workspaces
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "workspace_id": w.workspace_id.0,
+                        "title": w.title,
+                        "cwd": w.cwd,
+                    })
+                })
+                .collect();
+            // Focused pane: the active workspace's active surface's active
+            // pane id. None when there's no open workspace.
+            let focused_pane = snap
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == snap.active_workspace_id)
+                .and_then(|w| {
+                    w.surfaces
+                        .iter()
+                        .find(|s| s.surface_id == w.active_surface_id)
+                        .map(|s| s.active_pane_id.0.clone())
+                });
+            Ok(serde_json::json!({
+                "socket_path": control_socket_path().map(|path| path.display().to_string()),
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "active_workspace_id": snap.active_workspace_id.0,
+                "focused_pane_id": focused_pane,
+                "workspaces": workspaces,
+            }))
+        }
         "get_app_state" => {
             let state: State<'_, AppStateStore> = app.state();
             serde_json::to_value(state.snapshot()).map_err(|error| error.to_string())
