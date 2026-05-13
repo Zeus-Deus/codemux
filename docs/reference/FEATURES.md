@@ -11,10 +11,14 @@
 - Create workspaces with preset pane layouts (1, 2, 4, 6, or 8 terminal slots, or shell+browser)
 - Create workspaces at a specific directory path
 - Create OpenFlow workspaces for multi-agent orchestration runs
+- Lazy workspace creation (Beta-gated): sidebar `+` and boot-into-Home open a client-side chat draft; the draft is promoted on first message send
 - Switch workspaces via sidebar click or Ctrl+]/[
 - Rename workspaces by double-clicking the active workspace name in the sidebar
 - Close workspaces with all child sessions
-- Workspace rows show title, git branch, and compact working directory path
+- Auto-transition to main workspace after merge+delete
+- Workspace rows show title, git branch, compact working directory path, and PR status icon
+- "Checkout default branch" workspace action
+- Derivative-branch picker with icons, recency, and worktree tab
 - Notification count badges per workspace in the sidebar
 - Window focus indicator (green dot) in sidebar header
 
@@ -62,6 +66,29 @@
 - Click-to-interact on rendered viewport (coordinates mapped from display to actual viewport)
 - Loading spinner and error banner display
 - Agent-driven browser mode for automated testing
+- Viewport presets via `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` — real CDP-driven viewport resize so CSS media queries fire and screenshots capture at the simulated dimensions
+- Per-workspace browser sessions stable across concurrent worktrees (PID-tracked daemons, single canonical key, atomic teardown)
+- Browser inspector / DevTools panel
+
+## Agent Chat (Beta — opt-in via Settings → Beta Features)
+
+- In-app chat pane that talks to CLI coding agents (Claude, Codex, OpenCode) through a conversational UX instead of a raw terminal
+- Three providers behind one unified picker:
+  - Claude via Claude Agent SDK (Bun-compiled sidecar)
+  - Codex via `codex app-server` JSON-RPC
+  - OpenCode via Rust-direct HTTP against a managed `opencode serve` child (federates 100+ upstream providers behind one rail entry)
+- Streaming transcript with messages, tool approvals (per-tool body rendering), plan proposals (ExitPlanMode), AskUserQuestion panels, thinking indicator
+- Mode pills: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
+- Attachments via `+` and `@`: files, folders, GitHub issues + PRs, images via paste / drop / picker
+- Slash command popup with cross-provider parsing
+- Cross-provider skill system (watcher, conflicts, disable, refined compat)
+- End-to-end encrypted skills sync across devices
+- Permission settings page with per-tool body rendering and AllowAlways rule persistence
+- Session history selector + transcript persistence + replay on session resume
+- Permission-mode mid-session restart
+- Favorites on the model picker with `localStorage` persistence
+- Debug-mode banner with explicit exit dialog
+- Plain-quit on Beta toggle off (no auto-restart) to keep user data intact
 
 ## OpenFlow Orchestration
 
@@ -167,13 +194,34 @@
 - Entry points in Changes panel and PR panel
 - Full state machine: idle → creating_branch → resolving → review → applying
 
-## MCP Server
+## MCP Server (Codemux as server)
 
-- JSON-RPC 2.0 MCP server over stdio transport (29 tools)
+- JSON-RPC 2.0 MCP server over stdio transport (31 tools)
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace, pane, notification, and git tools for agent self-orchestration
+- Browser viewport presets (`browser_viewport`, `browser_viewport_presets`)
 - Auto-configuration for Claude Code and Claude Desktop
 - Launched via `codemux mcp`
+
+## MCP Host (Codemux as host)
+
+- Runs user-installed MCP servers as first-class infrastructure
+- Discovers configs across Codemux / Claude / Cursor paths
+- Spawns each server once, dedupes identical configs
+- Exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh
+- Settings panel and composer `+` popup surface enable/disable + status badges + tool list modal + 50-tool cap warning
+- Codex MCP support planned via HTTP gateway (Step 11)
+
+## Auth & Sync
+
+- GitHub OAuth, email/password with email verification
+- AES-256-GCM encrypted token storage with machine-bound key
+- Zero-knowledge auth derivation: Argon2id → HKDF-SHA256 → split `AuthSecret` (server) + `EncryptionKey` (client-only)
+- Cross-product byte-identical with Vexis (pinned in CI)
+- End-to-end encrypted skills sync across devices (XChaCha20-Poly1305, machine-bound key persistence)
+- Settings → Account → Sync surface with live status + relative-time + Export/Import/Forgot-password controls
+- Per-user synced settings with server sync, offline cache, and dirty flag
+- Multi-step reset flow that enforces export-or-explicit-skip before the destructive wipe
 
 ## Command Palette
 
@@ -228,10 +276,11 @@
 ## Settings Panel
 
 - Centralized configuration overlay (Ctrl+,)
-- 12 sections: Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore
+- 15+ sections including Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore, Sync, Skills, MCP, Permissions, Beta Features
 - Keyboard shortcut editor with conflict detection and search
 - Server-synced settings with offline cache
 - Workspace-level project config (setup/teardown scripts, worktree includes)
+- Beta Features section that flips the Step 13 agent-chat toggle (controls `enable_agent_chat` and `enable_lazy_workspace_creation` together)
 
 ## CLI / Socket Control
 

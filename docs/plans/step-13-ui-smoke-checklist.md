@@ -5,8 +5,8 @@
 - Audience: The operator booting the dev build to verify the toggle.
 - Authority: Follow this list verbatim before push to `main`.
 - Read next: `docs/plans/step-13-beta-toggle-research.md` for the
-  scoping rationale, `docs/plans/main-merge-plan.md` for the merge
-  context this gate sits behind.
+  scoping rationale, `docs/archive/main-merge-plan.md` for the merge
+  context this gate sat behind (now landed in commit `a58c3d9`).
 
 ## Setup
 

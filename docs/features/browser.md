@@ -24,6 +24,7 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 - browser data management in Settings (clear cookies, clear all data, view data size)
 - inspector panel for debugging web content
 - viewport presets for mobile / tablet / desktop responsive testing via `codemux browser viewport <preset>` (e.g. `mobile`, `tablet`, `desktop-large`, `reset`) or custom `WxH` dimensions — applies real viewport resize + DPR through CDP, so CSS media queries fire and screenshots capture at the simulated dimensions (replaces the older iframe trick)
+- stream stability across concurrent worktrees: daemons are PID-tracked (not port-tracked), the workspace-id map is the single canonical key, `close()` is atomic (remove entry → kill PID → await exit → verify port free), `allocate_port()` runs a symmetric `TcpListener::bind` probe on every OS, and `BrowserPane.tsx` reactively reconnects when `stream_url` changes. Replaces the older flow where the manager could lose track of which port belonged to which workspace, leak daemons, and leave panes stuck at the right URL with no frames. See `docs/archive/browser-stream-fix.md` for the full landed plan.
 
 ## Expected Operating Model
 
@@ -46,11 +47,12 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 
 ## Important Touch Points
 
-- `src-tauri/src/agent_browser.rs` — `AgentBrowserManager`, stealth flags, stream port allocation, spawning, viewport argv builder (`resolve_viewport_params`, `format_dpr`)
+- `src-tauri/src/agent_browser.rs` — `AgentBrowserManager`, stealth flags, stream port allocation (PID-tracked daemons keyed by `workspace_id`, symmetric bind probe on every OS, atomic teardown), viewport argv builder (`resolve_viewport_params`, `format_dpr`)
 - `src-tauri/src/browser_viewport.rs` — preset table (`PRESETS`, `RESET_SPEC`) and `parse_spec` for preset / `WxH` / `reset` parsing
 - `src-tauri/src/commands/browser.rs` — Tauri commands for pane creation, URL navigation, automation
 - `src-tauri/src/cli.rs` — `BrowserCommand::Viewport` and `BrowserCommand::ViewportPresets` CLI subcommands
 - `src-tauri/src/mcp_server.rs` — `browser_viewport` and `browser_viewport_presets` MCP tools
-- `src/components/browser/BrowserPane.tsx` — screenshot rendering, toolbar, address bar, auto-syncs viewport on pane resize via legacy `width`/`height` payload (which the new socket handler accepts unchanged)
+- `src/components/browser/BrowserPane.tsx` — screenshot rendering, toolbar, address bar, reactive `stream_url` reconnect on URL change, auto-syncs viewport on pane resize via legacy `width`/`height` payload (which the new socket handler accepts unchanged)
 - `src/components/browser/InspectorPanel.tsx` — browser inspector/DevTools panel
 - `docs/reference/BROWSER-AGENT-COMMANDS.md` — CLI and socket command reference
+- `docs/archive/browser-stream-fix.md` — landed cross-platform stream-stability plan (PID tracking, single canonical key, atomic teardown, symmetric bind probe, reactive frontend reconnect)

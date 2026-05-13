@@ -6,67 +6,132 @@
 - Authority: Canonical feature-level reality doc.
 - Update when: Behavior, constraints, expectations, or major touch points
   change.
-- Read next: `docs/plans/agent-chat.md` (when it lands), related reference
-  docs.
+- Read next: `docs/features/multi-provider-chat.md`,
+  `docs/features/skills-sync.md`, `docs/features/mcp-server.md`,
+  `docs/plans/step-8-attachments.md`,
+  `docs/plans/step-13-beta-toggle-research.md`.
 
 ## What This Feature Is
 
-Agent Chat is the planned GUI surface that will let users talk to CLI coding
-agents (Claude Code, Codex) through a conversational pane instead of a raw
-terminal. When complete it will share orchestration with the existing
-openflow system but surface a streaming chat UX — messages, tool approvals,
-file-diff previews — over the existing subprocess-backed runners.
+Agent Chat is the in-app GUI surface that lets users talk to CLI coding
+agents (Claude Code, Codex, OpenCode) through a conversational pane instead
+of a raw terminal. It surfaces a streaming chat UX — messages, tool
+approvals, plan proposals, AskUserQuestion panels, image and file
+attachments, slash commands, mode pills — over subprocess-backed runners.
+
+## Beta Gate (Step 13)
+
+The feature is **OFF by default**. Two persisted feature flags gate the
+entire Step 6–12 surface:
+
+- `enable_agent_chat` — gates the chat pane kind, its Tauri command surface,
+  the provider registry (Claude + Codex + OpenCode), and the MCP host
+  runtime.
+- `enable_lazy_workspace_creation` — gates the lazy-workspace path: sidebar
+  `+` and boot-into-Home open a client-side chat draft instead of eagerly
+  materialising a workspace; the draft is promoted on first message send.
+
+Both flags default to `false`. The Settings → Beta Features section flips
+them together (see `src/components/settings/beta-features-section.tsx`).
+Turning Beta off triggers a plain-quit (no auto-restart) to keep user data
+intact across the legacy/Beta UI swap. The legacy main-branch experience
+(preset bar, terminal panes, empty-state splash) is byte-identical when
+both flags are off.
+
+See `docs/plans/step-13-beta-toggle-research.md` for the toggle scoping and
+`docs/plans/step-13-ui-smoke-checklist.md` for the operator-verified gate.
 
 ## Current Model
 
-**Scaffolding only.** No user-visible behaviour is wired up yet. The work
-landed in this checkpoint is purely backend plumbing so future chunks can
-stand on a stable contract:
+The chat pane stack:
 
-- `src-tauri/src/agent_provider/` defines the `AgentProvider` trait plus the
-  shared type vocabulary (`ProviderKind`, `ProviderSession`,
-  `ProviderRuntimeEvent`, `ApprovalDecision`, `ProviderError`, ...) that
-  every concrete provider adapter must speak.
-- `src-tauri/src/json_rpc_child/` implements a reusable
-  `JsonRpcChildProcess` helper for long-lived subprocesses that speak
-  newline-delimited JSON-RPC 2.0 over stdio.
-- `src-tauri/src/agent_provider/codex/` implements the first concrete
-  provider — a `CodexAgentProvider` that drives the `codex app-server`
-  subprocess through the shared JSON-RPC helper and translates its
-  notifications into the canonical event stream.
-
-None of this is reachable from Tauri commands or UI today. It sits dormant
-until later tasks wire a chat pane and feature flag on top.
+- **`src-tauri/src/agent_provider/`** — `AgentProvider` trait + shared types
+  (`ProviderKind`, `ProviderSession`, `ProviderRuntimeEvent`,
+  `ApprovalDecision`, `ProviderError`, …). Three concrete adapters:
+  `claude/`, `codex/`, `opencode/`.
+- **`src-tauri/src/json_rpc_child/`** — reusable `JsonRpcChildProcess`
+  helper for long-lived subprocesses that speak newline-delimited
+  JSON-RPC 2.0 over stdio. Used by both Claude (against the bundled
+  Bun-compiled sidecar) and Codex (against `codex app-server`).
+- **`sidecar/claude-agent/`** — Bun-compiled TypeScript subprocess that
+  hosts Anthropic's Claude Agent SDK. Codemux never talks to Anthropic
+  directly; the sidecar is a transport-only bridge that runs SDK
+  `query()` in-process and forwards messages.
+- **`src/components/chat/`** — chat pane UI: `AgentChatPane`, `Composer`
+  (with `+` popup, `@` mention popup, slash command popup, image
+  paste/drop), `ChatTranscript`, `MessageList`, `ToolCallCard` + per-tool
+  bodies, `PlanProposalBlock`, `ComposerPendingInputPanel` for
+  AskUserQuestion, `ThinkingIndicator`, `PermissionRequestBlock`,
+  `ModePill`, `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
+  `DebugCleanupBanner`, `DebugExitDialog`, and the picker family under
+  `src/components/chat/pickers/`.
 
 ## What Works Today
 
-- Stable trait/type surface for provider adapters.
-- Reusable JSON-RPC-over-stdio child-process helper with timeout, graceful
-  shutdown, bidirectional notifications, server-initiated requests, and
-  child-exit cleanup.
-- Codex provider end-to-end: spawn → init handshake → `thread/start` (with
-  `thread/resume` fallback) → turn dispatch → streaming notifications and
-  tool-approval requests → canonical event broadcast.
-- Auth probes (`probe_installed`, `probe_authenticated`) that shell out
-  to `codex --version` / `codex auth status` and classify the output.
-- Integration tests (`src-tauri/tests/json_rpc_child.rs` and
-  `src-tauri/tests/codex_adapter.rs`) covering the helper and the Codex
-  adapter respectively. The Codex adapter tests are backed by a scripted
-  fake fixture at `src-tauri/tests/helpers/fake_codex_app_server/main.rs`
-  so no real `codex` binary is required.
+- **Three end-to-end providers** behind one unified picker:
+  - **Claude** — Claude Agent SDK via the Bun-compiled `claude-agent`
+    sidecar (JSON-RPC over stdio).
+  - **Codex** — `codex app-server` subprocess, JSON-RPC over stdio.
+  - **OpenCode** — Rust-direct HTTP against a managed `opencode serve`
+    child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`).
+  - All three render in a single 2-column picker (provider rail + searchable
+    model list); favorites persist via zustand + `localStorage`.
+- **Streaming chat UX**: messages, tool approvals (per-tool body rendering),
+  plan proposals (`ExitPlanMode`), AskUserQuestion panels, thinking
+  indicator, debug-mode banner + exit dialog.
+- **Mode pills**: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
+  and silent-restart on pill removal.
+- **Attachments** via `+` and `@`: files, folders, GitHub issues + PRs,
+  images via paste / drop / picker. Inline chips, send-time injection,
+  expand, caps, gif guard, chip tooltips. See
+  `docs/plans/step-8-attachments.md`.
+- **Slash command popup** with cross-provider parsing.
+- **Cross-provider skill system**: watcher, conflicts, disable, refined
+  compat. End-to-end encrypted sync (see `docs/features/skills-sync.md`).
+- **MCP host runtime** (Step 9): Codemux discovers user-installed MCP
+  servers across Codemux / Claude / Cursor paths, spawns each child once,
+  exposes tools to the Claude SDK via an in-process facade with dynamic
+  `setMcpServers` refresh. Settings panel + composer `+` popup surface
+  enable/disable + status badges + tool list modal + 50-tool cap warning.
+  See `docs/features/mcp-server.md`.
+- **Permissions settings page** with per-tool body rendering and
+  `AllowAlways` rule persistence.
+- **Session lifecycle**: transcripts persist + replay on session resume;
+  session history selector; permission-mode mid-session restart;
+  pane-scoped chats; new-tab preset launch; base-branch picker; stop-click
+  restarts the session so the next turn works.
+- **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
+  graceful shutdown, bidirectional notifications, server-initiated
+  requests, and child-exit cleanup.
+- **Auth probes** (`probe_installed`, `probe_authenticated`) for each
+  provider.
+- **Integration tests** covering each adapter, the JSON-RPC helper, the
+  Claude sidecar (38 Bun tests + 27 fake-sidecar Rust tests + 43
+  translate/protocol unit tests), and the picker UI (Vitest).
+- **Codex spawn race fix**: probe spawns retry on ETXTBSY (text file busy);
+  `interrupt_turn_sends_turn_interrupt` and
+  `auth_probe_unauthenticated_matches_common_patterns` are gated to Unix
+  in CI to dodge the `fake_codex_app_server` helper-binary build race
+  under cargo's parallel scheduler.
 
 ## Current Constraints
 
-- No user-visible chat panel yet.
-- No Claude adapter yet; Claude integration will live in a sibling
-  submodule once the SDK sidecar piece is designed.
-- No Tauri commands exposed.
-- No persistence, projection pipeline, or event sourcing.
-- No permission / approval UX; approval events flow through the stream
-  but nothing routes them to a human.
+- **Beta-gated.** The chat pane is hidden unless the user opts in via
+  Settings → Beta Features. See "Beta Gate" above.
+- **Single instance per provider.** A user with multiple Codex accounts or
+  multiple OpenCode connections sees them collapsed under one rail entry.
+  Multi-instance lifting is planned for v2 (the `ProviderInstanceId` shim
+  already exists at `src-tauri/src/agent_provider/instance.rs`).
+- **No keyboard shortcuts on the picker.** `Ctrl+1..9` collides with
+  workspace switching; deferred until a non-colliding namespace is decided.
 - The event broadcaster uses a bounded channel (default 1024) — slow
   subscribers lose old events. This is deliberate; downstream UI must
   treat the stream as live-only.
+- **Image attachments in `send-turn`** currently route through the
+  `images` array on user turns; the SDK paths are wired but
+  multi-modal-everywhere is still settling.
+- **OpenCode credential management lives in OpenCode itself.** Codemux
+  never reads or writes upstream API keys.
 
 ## Important Touch Points
 
@@ -386,13 +451,14 @@ active pane horizontally — the same insertion path
 Tauri command layer can write it back after `start_session` without
 another provider round-trip.
 
-The stub renderer in `src/components/chat/AgentChatPane.tsx` shows a
-single centered "Agent chat — coming soon" line using shadcn tokens
-only. It has no pane header, no composer, and no message list. The
-real chat UI (reading column, composer, status lines, content blocks,
-inline approvals) lands in Step 2; the stub container is structured
-so that step can replace the inner body without fighting pre-existing
-chrome.
+The pane renderer at `src/components/chat/AgentChatPane.tsx` is now the
+full chat UI (transcript, composer with `+`/`@`/slash popups, mode pill,
+streaming indicators, content blocks, inline approvals, plan proposal
+panel, AskUserQuestion panel, debug-mode banner). The pane header lives
+in `AgentChatPaneHeader.tsx` and surfaces session controls + the
+multi-provider model picker. The empty-state composer (before a session
+exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
+lives in `ChatHomeLanding.tsx`.
 
 ## Tauri command surface
 
@@ -478,11 +544,11 @@ to insert a stub chat pane in the active workspace.
 
 ## Dev affordances
 
-A dev-only "Spawn chat pane" button appears at the bottom of the
-sidebar in debug builds when `enable_agent_chat` is on. It invokes
-`dev_agent_chat_spawn_test_pane` to drop a stub chat pane into the
-active workspace. This is a temporary affordance for manual testing
-before the real chat UI lands.
+A dev-only "Spawn chat pane" button lives in the window title bar in
+debug builds when `enable_agent_chat` is on. It invokes
+`dev_agent_chat_spawn_test_pane` to drop a chat pane into the active
+workspace. Useful for quick manual testing without going through the
+sidebar `+` flow.
 
 ## Step 9 — Cross-provider MCP server runtime (shipped)
 
@@ -502,34 +568,28 @@ to extend MCP host support to Codex via an HTTP gateway.
 
 ## Roadmap (next steps)
 
-- **Step 10 — Skills sync** (planned). Mirror Step 9's cross-provider
-  pattern for skills: scan `~/.claude/skills/`, `~/.codex/skills/`,
-  `~/.opencode/skills/`, and `~/.codemux/skills/`; surface a unified
-  list with enable/disable + dedupe + sync-to-cloud. Touches the same
-  permission-system + SDK-options surface Step 9 used.
-- **Step 11 — Codex MCP via HTTP gateway** (planned). Codemux exposes
+- **Step 10 — Skills sync** (LANDED, Stages 1-6). See
+  `docs/features/skills-sync.md`.
+- **Step 10.5 — Project-scoped skills sync** (PLANNED, ~3-5 days).
+  Sync skills tied to specific git repos in addition to the user-global
+  ones already shipping. Schema is additive (`project_remote_url_hash`).
+  Trickiest piece is URL canonicalization.
+- **Step 11 — Codex MCP via HTTP gateway** (PLANNED). Codemux exposes
   a localhost streamable HTTP MCP endpoint, writes
   `[mcp_servers.codemux] url = "..."` into `~/.codex/config.toml`, and
   hot-reloads via the `config/mcpServer/reload` RPC when the registry
-  changes. Reuses the entire Stage 1–4 stack (registry, dispatcher,
-  prefixing, dedupe, cap, approval flow). Estimated complexity 40–50%
-  of Stage 3 (Claude facade). Spike at
-  `docs/plans/step-9-codex-mcp-spike.md` for staging proposal +
-  Issue #11284 risk mitigation.
+  changes. Reuses the entire Stage 1–4 stack. Spike at
+  `docs/plans/step-9-codex-mcp-spike.md`.
+- **Step 12 — Multi-provider chat** (LANDED, Stages 1-9). See
+  `docs/features/multi-provider-chat.md`.
+- **Step 13 — Agent Chat Beta toggle** (LANDED). See
+  `docs/plans/step-13-beta-toggle-research.md`.
+- **Promote agent-chat from Beta to default-on** once dogfooding
+  settles. Both feature flags would default to `true`; the legacy paths
+  stay in tree as a fallback for a release cycle before being removed.
 
 ## Known follow-ups
 
-- **Step 2: visual chat UI.** Replace the stub renderer with the
-  real reading column, composer (target picker + textarea + footer
-  pills), streaming indicators, status lines, content blocks, and
-  inline approvals per the `codemux-chat-ui` skill.
-- **Step 3: "+" icon rewiring.** Surface agent chat alongside
-  terminal and browser in the new-pane affordance, with the
-  default provider read from a setting rather than required at
-  creation time.
-- **Step 4: Home chat landing.** When a workspace has no panes,
-  show the chat-home empty state (centered composer, marquee
-  headline) instead of the current splash / first-pane flow.
 - **Recoverable thread-resume snippets.** The substring list in
   `agent_provider/codex/protocol.rs` (`RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS`)
   is inferred from an upstream reference and should be verified against

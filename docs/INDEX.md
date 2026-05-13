@@ -32,13 +32,16 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Auth system: `docs/features/auth.md`
 - Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
-- Skills sync (E2E, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
+- Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
+- Skills sync (E2E, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
+- Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)
+- Beta Features toggle (Step 13): `docs/plans/step-13-beta-toggle-research.md`; operator UI smoke at `docs/plans/step-13-ui-smoke-checklist.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
-- Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md`
+- Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
-- MCP server: `docs/features/mcp-server.md`
+- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`

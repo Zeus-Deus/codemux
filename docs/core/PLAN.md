@@ -4,7 +4,7 @@
 - Audience: Anyone deciding what to build next.
 - Authority: Build-order document, not release-readiness proof.
 - Update when: Major milestones, sequencing, or focus areas change.
-- Read next: `docs/core/STATUS.md`, `docs/plans/browser.md`, `docs/plans/openflow.md`
+- Read next: `docs/core/STATUS.md`, `docs/plans/openflow.md`, `docs/plans/windows-support.md`
 
 ## Planning Rules
 
@@ -15,9 +15,10 @@
 ## Roadmap At A Glance
 
 1. Foundations landed in meaningful form: phases 0 through 9.6 established the workspace shell, multi-session terminals, pane management, notifications, browser prototype, CLI and socket control, indexing, and project memory.
-2. Current focus: phases 10 through 15 are about hardening OpenFlow and getting the Linux + Windows release pipeline polished for daily use.
-3. Parallel track: Phase 18 (Windows support) is **shipping**. The Windows foundation merged in commit `cc9b946` and shipped in `v0.1.20` and `v0.1.21`. `main` is currently 8 commits past `v0.1.21`, all of them post-release Windows fixes (PowerShell as default shell, portable-pty fork for `CREATE_NO_WINDOW` / `SW_HIDE`, scrollback flush backstop, editor detection rewrite, window controls on full-screen views, system-process port filtering). OpenFlow-on-Windows and Authenticode signing remain gated before a polished Windows v1. See `docs/plans/windows-support.md`.
-4. Later: Phase 17 (macOS) has not been started.
+2. Steps 6 through 13 (cross-cutting agent-chat work) landed on `feature/agent-chat` and merged to `main` behind the Step 13 Beta Features toggle. The full chat stack — Claude / Codex / OpenCode providers, attachments, slash commands, skills sync, MCP host runtime — ships in every release since `v0.2.0` but is OFF by default. Users opt in via Settings → Beta Features.
+3. Current focus: phases 10 through 15 (OpenFlow hardening + Linux/Windows release polish), plus moving the agent-chat surface from opt-in Beta to default-on.
+4. Parallel track: Phase 18 (Windows support) is **shipping** in every release. Foundation merged in `cc9b946` and shipped in `v0.1.20`/`v0.1.21`; the hardening pass (PowerShell as default shell, portable-pty fork, scrollback flush backstop, editor detection rewrite, window controls, system-process port filtering, agent-browser argv + Chromium auto-detect, control-pipe retry, Tier-3 SendInput) is on `main` and shipping. OpenFlow-on-Windows and Authenticode signing remain gated before a polished Windows v1.
+5. Later: Phase 17 (macOS) has not been started.
 
 ## Ordered Phases
 
@@ -45,42 +46,47 @@
 
 ## Immediate Priority Order
 
-1. Cut the next release (`v0.1.22`) bundling the post-`v0.1.21` Windows fixes (PowerShell default shell, portable-pty fork, scrollback flush backstop, editor detection rewrite, window controls, system-process port filter) — the fixes are in the tree but every Windows user on `v0.1.21` is missing them
-2. Harden OpenFlow reliability and intervention flow
-3. Re-enable OpenFlow on Windows by rewriting the bash wrapper scripts in `openflow::prompts` (the only thing currently gating OpenFlow on Windows)
-4. Add notification sound playback
-5. Add memory drawer UI
-6. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
-7. Windows Authenticode code signing — pick OV vs EV certificate once SmartScreen friction starts showing up in user reports
-8. macOS support (Phase 17)
+1. Harden OpenFlow reliability and intervention flow (the largest remaining stability gap)
+2. Re-enable OpenFlow on Windows by rewriting the bash wrapper scripts in `openflow::prompts`
+3. Move the agent-chat surface from Beta-gated to default-on once dogfooding settles
+4. Add memory drawer UI
+5. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
+6. Windows Authenticode code signing — pick OV vs EV certificate once SmartScreen friction starts showing up in user reports
+7. macOS support (Phase 17)
 
 ## Cross-Cutting Steps (Tracked Outside Phase Numbering)
 
 The Phase numbering above (1-18) is the original product roadmap. Step-numbered work below is feature-scoped initiatives that span phases and have their own per-stage plan docs under `docs/plans/`. They land in parallel with the phase work.
 
-- **Step 9 — Cross-provider MCP runtime (LANDED).** Plan: `docs/plans/step-9-mcp-servers.md` + `docs/plans/step-9-codex-mcp-spike.md`. Codex support deferred to Step 11.
+- **Step 6–7 — Agent-chat pane + provider scaffolding (LANDED).** AgentProvider trait + Codex/Claude adapters + Tauri command surface + chat pane UI with streaming + approvals + mode pills + permission-mode restart. Behavior doc: `docs/features/agent-chat.md`.
+- **Step 8 — Attachments + context system (LANDED).** Files, folders, GitHub issues + PRs, images via `+` button + `@` mentions, paste, drop. Plan: `docs/plans/step-8-attachments.md`.
+- **Step 9 — Cross-provider MCP runtime (LANDED).** Plan: `docs/plans/step-9-mcp-servers.md` + `docs/plans/step-9-codex-mcp-spike.md`. Codex MCP support deferred to Step 11.
 - **Step 10 — End-to-end encrypted skills sync (LANDED).** Plan: `docs/plans/step-10-skills-sync.md`. Feature: `docs/features/skills-sync.md`.
-- **Step 10.5 — Project-scoped skills sync (PLANNED, ~3-5 days).** Sync skills tied to specific git repos in addition to the user-global ones already shipping. Same skill name across projects with different content per repo is a real authoring pattern. Schema is additive: Stage 1's `user_skills` table reserves `scope` as plaintext; 10.5 adds `project_remote_url_hash TEXT NULL` (HMAC of normalized git remote URL — server sees "skills for repo-with-this-hash" but never which repo). Stages: 10.5.1 schema migration + URL normalization, 10.5.2 push pipeline filter, 10.5.3 pull pipeline filter, 10.5.4 Settings UI, 10.5.5 polish. Trickiest piece is URL canonicalization (`https://github.com/u/r` ↔ `git@github.com:u/r.git` ↔ `https://github.com/u/r.git` are the same repo).
-- **Step 11 — Codex MCP support via HTTP gateway (PLANNED).** Spike: `docs/plans/step-9-codex-mcp-spike.md`. Codex doesn't expose an MCP host API, but `streamable HTTP MCP transport` landed stable in Codex (Sept 2025) + `config/mcpServer/reload` lets us hot-reload without bouncing the session. Plan: ship an HTTP MCP gateway in Codemux that Codex consumes as a single MCP entry, reusing the Step 9 registry. ~40-50% of Step 9 Stage 3's complexity.
-- **Step 12 — Multi-provider chat (Claude + Codex + OpenCode) (LANDED).** Feature doc: `docs/features/multi-provider-chat.md`. Research: `docs/plans/step-12-opencode-research.md`. Plan + per-stage history: `docs/plans/step-12-opencode-implementation-plan.md`. Operator UI smoke: `docs/plans/step-12-ui-smoke-checklist.md`. Stages 1-7 shipped (Stage 5 explicitly deferred to v2). Backend: OpenCode driver added alongside Claude/Codex with a Rust-direct-HTTP transport (no JSON-RPC sidecar — OpenCode runs as a managed local HTTP server with `kill_on_drop` + 32-char `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo.sub_provider: Option<String>` threads upstream provider id (`"openai"`, `"anthropic"`, `"openrouter"`) through capability harvest so federated models render with `OpenCode · {sub_provider}` subtitles and namespaced `${provider_id}/${model_id}` slugs. Frontend: Stage 4 unified provider+model picker (2-column popover — provider rail + searchable model list) replaces the old `ProviderPicker + ModelPicker` pair; `ENABLE_PROVIDER_PICKER` flipped on so Codex (previously hidden) is finally selectable; cross-provider search collapses provider grouping into a flat result list. Stage 6 favorites with `localStorage` persistence (`codemux:picker-favorites:v1`) and bubble-to-top sort across all surfaces. Live-tested against OpenCode 1.14.31: 116 providers / 4,354 models harvested in one round-trip. Deferred follow-ups: (1) v2 — multi-instance per provider (multiple Codex accounts, multiple OpenCode connections); `ProviderInstanceId` shim already in place from Stage 1. (2) v2 — picker keyboard shortcuts (`Ctrl+1..9` collides with workspace switching; needs a non-colliding namespace). (3) Future cleanup — OpenFlow capabilities convergence (its `list_models_for_tool` Tauri command has its own hardcoded model registry, currently linked to the chat-side fallback bundle by a parity-by-comment dependency at `src-tauri/src/agent_provider/codex/capabilities.rs:33`).
+- **Step 10.5 — Project-scoped skills sync (PLANNED, ~3-5 days).** Sync skills tied to specific git repos in addition to the user-global ones already shipping. Schema is additive: Stage 1's `user_skills` table already reserves `scope` as plaintext; 10.5 adds `project_remote_url_hash TEXT NULL` (HMAC of normalized git remote URL — server sees "skills for repo-with-this-hash" but never which repo). Trickiest piece is URL canonicalization (`https://github.com/u/r` ↔ `git@github.com:u/r.git` ↔ `https://github.com/u/r.git` are the same repo).
+- **Step 11 — Codex MCP support via HTTP gateway (PLANNED).** Spike: `docs/plans/step-9-codex-mcp-spike.md`. Codex doesn't expose an MCP host API, but streamable HTTP MCP transport landed stable in Codex (Sept 2025) + `config/mcpServer/reload` lets us hot-reload without bouncing the session. Plan: ship an HTTP MCP gateway in Codemux that Codex consumes as a single MCP entry, reusing the Step 9 registry. ~40-50% of Step 9 Stage 3's complexity.
+- **Step 12 — Multi-provider chat (Claude + Codex + OpenCode) (LANDED).** Feature doc: `docs/features/multi-provider-chat.md`. Research: `docs/plans/step-12-opencode-research.md`. Plan + per-stage history: `docs/plans/step-12-opencode-implementation-plan.md`. Operator UI smoke: `docs/plans/step-12-ui-smoke-checklist.md`. Stages 1-9 shipped (Stage 5 explicitly deferred to v2). Deferred follow-ups: multi-instance per provider, picker keyboard shortcuts (`Ctrl+1..9` collides with workspace switching), OpenFlow capabilities convergence.
+- **Step 13 — Agent Chat Beta toggle (LANDED).** Single Settings toggle "Beta Features" that controls every Step 6–12 GUI surface so the merge to `main` ships with the new behaviour OFF by default and the legacy behaviour preserved. Unifies `enable_agent_chat` and `enable_lazy_workspace_creation` flags. Research: `docs/plans/step-13-beta-toggle-research.md`. Smoke checklist: `docs/plans/step-13-ui-smoke-checklist.md`. Settings UI in `src/components/settings/beta-features-section.tsx`. Plain-quit on toggle off (no auto-restart) keeps user data intact.
 
 ## Recently Completed
 
-- **Step 12 — Multi-provider chat (Claude + Codex + OpenCode), Stages 1-7 shipped**: the chat composer's model picker now drives session creation across three drivers from one unified popover. OpenCode federates ~110+ upstream providers behind a single rail entry; only the connected upstreams surface (filtered at the data layer to keep the picker usable on a fully-configured machine — typically 5 connected of 116 visible). New OpenCode adapter is Rust-direct-HTTP against a managed `opencode serve` child (`kill_on_drop`, 32-char generated `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo` extended with `sub_provider`. Codex finally selectable in the GUI (previously hidden behind a stale `ENABLE_PROVIDER_PICKER` flag). Favorites with persistence + cross-provider score boost. Multi-instance per provider, picker keyboard shortcuts, and OpenFlow capabilities convergence all explicitly deferred to v2 / future cleanup. Plan + per-stage history at `docs/plans/step-12-opencode-implementation-plan.md`; current behavior at `docs/features/multi-provider-chat.md`; manual UI smoke checklist at `docs/plans/step-12-ui-smoke-checklist.md`.
-- **Step 10 — End-to-end encrypted skills sync (Stages 1-6, shipping)**: skills under `~/.codemux/skills/` and any other recognized provider's user path now sync end-to-end-encrypted across every device the user signs into. XChaCha20-Poly1305 per blob, key derived from `(password, email)` via the cross-product `codemux-api-*` HKDF protocol (byte-identical with Vexis, pinned in CI), persisted machine-bound at `~/.local/share/codemux/sync-key.enc`. Five `/api/skills` routes deployed to production, plus a custom `POST /api/auth/set-password` route to work around an upstream Better Auth bug. Settings → Account → Sync surface drives status + Export/Import/Forgot-password. Live programmatic smoke (`examples/stage5_smoke.rs`) verified against `api.codemux.org`. Plan + per-stage history at `docs/plans/step-10-skills-sync.md`; current behavior at `docs/features/skills-sync.md`; manual UI smoke checklist at `docs/plans/step-10-ui-smoke-checklist.md`.
-- Windows post-release hardening pass (commits between `v0.1.21` and current `main`): forked `portable-pty` to add `CREATE_NO_WINDOW` + `STARTF_USESHOWWINDOW + SW_HIDE` in `psuedocon.rs` (kills the visible `cmd.exe` flash on every PTY spawn), switched `default_shell()` to prefer PowerShell (`pwsh` → `powershell` → `COMSPEC` → `cmd.exe`), taught `agent_context::inject_agent_context` to emit PowerShell `$env:VAR` syntax for Claude / Codex / Pi / Gemini presets, rewrote `find_editors()` to use the `which::which()` Rust crate plus `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code / Cursor / VSCodium / Zed, extracted `<WindowChrome />` so login / settings / empty-state screens have minimize/maximize/close buttons on Windows, extended the close-handler scrollback flush timeout from 3s to 10s on Windows with a backend `flush_cache_to_disk` backstop for the cache miss case, added a Windows system-process name filter (`svchost.exe`, `System`, `lsass.exe`, etc.) so port detection doesn't surface 16+ kernel ports, routed preset failures through the sonner toast wrapper, and switched Windows preset commands to `\r` line terminators
-- Windows support foundation released in `v0.1.20` and `v0.1.21`: the `cc9b946` merge landed first, then `v0.1.20` / `v0.1.21` shipped to users with cfg gates, named-pipe control socket, Windows port detection, NSIS installer build, multi-platform `release.yml` matrix, cross-platform `latest.json` via tauri-action merge, and 38 Windows-specific tests
-- PTY child process tree cleanup on session close: single `killpg(pid, SIGKILL)` via a central `terminate_pty_session` helper called from every close path. Closes the TOCTOU window that previous SIGTERM→200ms→SIGKILL dance left exposed to PID recycling. Leaked ~20 GiB/day of zombie processes (Claude CLI, MCP servers, rust-analyzer) before the fix; now every close path tears down the whole group. `impl Drop for SessionRuntime` is a safety net that kills the group with a warning if any future refactor skips the normal close path.
+- **Browser stream stability fix (LANDED).** Unified port keying around `workspace_id`, PID-tracked daemons (was port-tracked), atomic teardown, symmetric `TcpListener::bind` bind probe, reactive `stream_url` reconnect on the frontend. Eliminates the silent stream failure that appeared after multiple concurrent worktrees used the browser. Plan archived at `docs/archive/browser-stream-fix.md`.
+- **Browser viewport presets.** `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` resizes the actual viewport via CDP so CSS media queries fire and screenshots capture at the simulated dimensions. MCP exposes `browser_viewport` + `browser_viewport_presets`.
+- **Performance pass** (`v0.2.3`–`v0.2.4`): high-frequency app-state emits coalesced into 16ms windows, `transition-all` scoped, markdown view + workspace-tied components stop re-rendering on every backend tick, workspace-switch mount-time IPC roundtrips cut, editor file read + language module import parallelised, worktree-include listener no longer re-attaches every tick, primitive fingerprint for `ensure-draft-when-empty` effect, all git/gh shell-outs moved off the GTK main thread.
+- **Review tab unfreeze** on repos with thousands of PRs (paginated fetch).
+- **Per-workspace display isolation** for agent-spawned GUI apps (X11/Wayland sandbox). Opt-in for human persona, default-on for agent persona; the human-default revert restored DISPLAY inheritance for the GUI flows where users actually paste images via Ctrl+V.
+- **Bitwarden-style password derivation** ported for cross-product login parity with Vexis (Argon2id + HKDF, pinned in CI).
+- **Stability**: stopped leaking agent-chat sidecars on workspace/tab/pane close; throttle reattach replay so multi-MB `pending_output` can't freeze the renderer; cap `pending_output` by bytes (256 MiB) rather than chunks.
+- **Windows post-release hardening** between `v0.1.21` and `v0.2.0`: forked `portable-pty` to add `STARTF_USESHOWWINDOW + SW_HIDE`, switched `default_shell()` to prefer PowerShell, taught `agent_context::inject_agent_context` to emit `$env:VAR` syntax, rewrote `find_editors()`, extracted `<WindowChrome />`, extended scrollback flush timeout to 10s + added `flush_cache_to_disk` backstop, Windows system-process port filter, sonner toast for preset failures, `\r` preset terminators, Tier-3 SendInput input injection, Claude Code hooks on Windows, agent-browser argv fix + ERROR_PIPE_BUSY retry, Edge auto-detect, `resolve_binary` Windows discovery branch.
+- **PTY child process tree cleanup** on session close: single `killpg(pid, SIGKILL)` via a central `terminate_pty_session` helper. Closes the TOCTOU window the old SIGTERM→200ms→SIGKILL dance exposed to PID recycling.
 - Session persistence: terminal scrollback save/restore and adapter-based resume
-- GitHub issue integration (link issues to workspaces, issue picker, auto-branch naming)
-- Browser wait conditions, JS evaluation, and CSS style inspection (MCP tools, 26→29)
+- GitHub issue integration (link to workspaces, picker, auto-branch naming)
+- Browser wait conditions, JS evaluation, CSS style inspection (MCP tools)
 - Custom keybind editor in Settings
-- Agent context injection for preset launches (Claude, Codex, Pi, Gemini)
-- Auto-update system (AppImage in-app update, toast notification)
-- Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
+- Auto-update system (AppImage / NSIS in-app update, toast notification)
+- Built-in file editor with CodeMirror, syntax highlighting, markdown preview
 - AI merge conflict resolver with temp-branch safety model
-- MCP server for agent self-orchestration (29 tools via JSON-RPC 2.0)
-- Settings panel (keyboard shortcuts, appearance, project scripts)
-- Auth system (GitHub OAuth, email/password, email verification)
+- MCP server for agent self-orchestration (31 tools via JSON-RPC 2.0)
+- Settings panel (keyboard shortcuts, appearance, project scripts, beta features, sync, skills, MCP, permissions)
+- Auth system (GitHub OAuth, email/password, email verification, encrypted token storage)
 - Synced settings (per-user server-synced with offline cache)
 - Claude CLI adapter for OpenFlow

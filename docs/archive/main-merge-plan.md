@@ -1,9 +1,9 @@
-# Plan — Merge `origin/main` into `feature/agent-chat`
+# Plan — Merge `origin/main` into `feature/agent-chat` (archived)
 
-- Purpose: Investigate the divergence and lay out the safest path to merge `origin/main` into `feature/agent-chat`.
-- Audience: The operator and the agent who will execute the merge.
-- Status: **Investigation only.** Nothing has been merged or modified. Decision (GO / MODIFY / DEFER) is the operator's.
-- Read next: `docs/plans/step-10-skills-sync.md` (auth derivation context), `docs/features/auth.md` (target structure on main).
+- Status: **LANDED — archived.** The merge executed and the feature-branch work landed on `main` in commit `a58c3d9` ("Merge branch 'feature/agent-chat' into main"). The agent-chat surface is currently shipping gated behind the Step 13 Beta Features toggle.
+- Purpose: Historical record of the pre-merge investigation and risk plan.
+- Audience: Anyone needing context on how the feature-branch divergence was reconciled.
+- Read next: `docs/features/auth.md`, `docs/plans/step-13-beta-toggle-research.md`.
 
 ## 1. Pre-merge backup tag
 

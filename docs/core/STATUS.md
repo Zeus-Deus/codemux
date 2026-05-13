@@ -8,138 +8,228 @@
 
 ## Current Headline
 
-Codemux is past Linux MVP and shipping Windows binaries. The workspace shell, terminal management, git integration, and ADE features are real and daily-drivable on both Linux and Windows. `v0.1.21` (the latest published release) ships the NSIS `.exe` installer with auto-update wired through the same `latest.json` as Linux. OpenFlow and the browser pane are still being hardened, and OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
+Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released tag is `v0.2.5`.
+
+The biggest change since the last reindex pass is **Step 13 Beta Features**: the agent-chat surface (Step 6–12: chat pane, multi-provider model picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) is implemented and merged to `main` but **OFF by default**. Users opt in via Settings → Beta Features, which flips both `enable_agent_chat` and `enable_lazy_workspace_creation` together. The legacy main-branch experience (preset bar, terminal panes, empty-state splash) is preserved for users who don't opt in.
+
+OpenFlow and the browser pane are still being hardened. OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
 
 The repo structure is clean and domain-split:
 
 - `src/` is the React + Tailwind + shadcn UI and Tauri IPC layer
 - `src-tauri/` is the Rust app/runtime layer
+- `sidecar/claude-agent/` is the Bun-compiled TypeScript subprocess that hosts the Claude Agent SDK
 
 ## Solid — Daily-Drivable Features
 
+### Workspace & terminals
 - Workspace shell, sidebar, workspace sections with color coding and drag-drop
-- Multi-session terminals with xterm.js, DOM rendering, kitty protocol
+- Multi-session terminals with xterm.js, WebGL renderer + Unicode 11 widths, kitty protocol, low-latency pane input
+- Hidden-pane terminal pause to eliminate cross-workspace typing lag
 - Tab bar with terminal, browser, editor, and diff tab types
 - Pane splits, resize, drag-swap, close
-- Git worktree-based workspaces (create from new/existing branch, import orphans)
-- Changes panel in right sidebar (stage/unstage/commit/push, inline per-file diffs, AI commit messages)
+- **Terminal pane persistence across workspace switch**: xterm.js `Terminal` instance + PTY-output channel survive component unmount via the module-level cache in `src/components/terminal/terminal-cache.ts`. Workspace switches reparent the wrapper into a hidden parking node instead of disposing, so alt-screen TUIs (Claude Code, lazygit, btop, vim) keep rendering correctly on return. Disposal is driven by AppState diffs in `useTerminalCacheGc` so close-pane / close-tab / close-workspace / PTY-exit all reach `disposeTerminal`.
+- **Session persistence**: terminal scrollback save/restore across restarts (Windows-only backend backstop in `scrollback::flush_cache_to_disk`), adapter-based resume for CLI tools (Claude Code `--resume`/`--continue` via hook-captured session IDs)
+
+### Git & GitHub
+- Git worktree-based workspaces (create from new/existing branch, import orphans, derivative-branch picker with recency)
+- Changes panel in right sidebar (stage/unstage/commit/push, inline per-file diffs, AI commit messages, Open-PR button on toolbar, AI merge resolver entry)
 - Full-pane diff viewer tab (unified/split layouts, section filters incl. `against_base`, hunk/file navigation, focus mode)
-- File tree panel (right sidebar, lazy-loaded, opens in built-in editor or external editor)
-- Search: keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+Shift+P via fd)
-- Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge)
-- Port detection (auto-scan, sidebar display, open in browser)
-- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini, Pi, Shell)
-- IDE integration (detect editors, open workspace, Ctrl+Shift+E)
+- Review tab (renamed from PR tab, React Query refactor): PR creation, header, reviews, checks, deployments, merge controls
+- Sidebar PR status icon per workspace with stale-clearing on branch switch and DRAFT collapse
+- "Checkout default branch" workspace action
+- Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge) with non-blocking activate + visibility-based gate
+- Sidebar ahead/behind arrows refresh against fresh remote refs
+- Auto-transition to main workspace after merge+delete
+- Merge-into-base runs on the blocking pool so it cannot freeze the GUI; uses `update-ref` for worktree compatibility
+- Hide stale merged-PR pill on long-lived branches
+- Review tab unfreezes on repos with thousands of PRs (paginated fetch)
+- All git/gh shell-outs moved off the GTK main thread to keep IPC responsive
+
+### GitHub issues
+- Link issues to workspaces, issue picker in creation dialog, sidebar display with detail popover, auto-branch naming from issue, prompt auto-injection of issue context
+- CLI: `codemux issue list/view/link`, control socket commands
+
+### Browser
+- Screenshot-driven Chromium session backed by `agent-browser` v0.24.0 (pure Rust, direct CDP)
+- Browser pane in pane layouts; address bar, refresh, home, external-link
+- Per-workspace stream sessions keyed by `workspace_id` (PID-tracked daemons, single canonical key, atomic teardown, symmetric `TcpListener` bind probe, reactive `stream_url` reconnect on the frontend)
+- Dynamic stream ports (9223–9299) for concurrent worktrees
+- Stealth Chromium flags + realistic user-agent string
+- Browser data management in Settings (clear cookies, clear all data, view data size)
+- Inspector panel for debugging web content
+- **Viewport presets**: `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` resizes the actual viewport via CDP so CSS media queries fire and screenshots capture at the simulated dimensions. MCP exposes `browser_viewport` + `browser_viewport_presets`.
+- Browser stream stability fix shipped (commit `7e36420`): unified port keying, hardened daemon lifecycle, dropped dead workspace_id alias lookups. Eliminates the silent stream failure that appeared after multiple concurrent worktrees used the browser.
+
+### Workspace creation
+- Multi-step creation dialog with task description, branch selection, agent preset
+- AI-generated branch names from task description
+- GitHub issue / PR linking with branch auto-fill
+- **Paste clipboard images directly into the prompt input** (in addition to the existing file picker)
+- File attachments appended to agent prompt
+- Project onboarding flow with package manager detection and setup script configuration
+- Orphan worktree detection and import
+- Derivative-branch picker (icons, recency, worktree tab)
+- Lazy workspace creation (Beta-gated): sidebar-plus and boot-into-Home open a client-side chat draft instead of eagerly materialising a workspace; the draft is promoted on first message send
+
+### Search & navigation
+- Keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+Shift+P via fd)
 - Command palette (Ctrl+K, fuzzy search across all actions)
-- PR integration (create, view, checks, merge via gh CLI, auth status check, incoming PRs list with fork checkout)
-- GitHub issue integration (link issues to workspaces, issue picker in creation dialog, sidebar display with detail popover, auto-branch naming from issue, prompt auto-injection of issue context, CLI `codemux issue list/view/link`, control socket commands)
-- Setup/teardown scripts (.codemux/config.json)
-- Workspace creation from branch with layout + preset selection
-- Notifications with D-Bus, Hyprland focus, attention badges
-- Local project memory and lexical indexing
-- CLI and socket control
-- Global overlay manager (single overlay at a time)
-- Auth system: GitHub OAuth, email/password with email verification, encrypted token storage
-- Zero-knowledge auth derivation (Step 10): `derive_login_credentials(password, email)` produces both the server-visible `AuthSecret` (sent to Better Auth in place of the raw password) and a client-only `EncryptionKey` (32 raw bytes, never leaves the device). Cross-product byte-identical with Vexis via the shared `codemux-api-*` HKDF labels — pinned in CI.
-- End-to-end-encrypted skills sync (Step 10, Stages 1-6 shipped): cross-device sync of user-authored skills under `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.opencode/skills/`. XChaCha20-Poly1305 per blob, machine-bound key persistence at `~/.local/share/codemux/sync-key.enc` (AES-GCM under `/etc/machine-id`). Push triggered by file watcher (1.5s frontend debounce on top of the watcher's 300ms), 5-min periodic when window is visible, or manual "Sync now" button. Last-write-wins conflict resolution by `updated_at`. Settings → Account → Sync surfaces live status + relative-time + Export/Import/Forgot-password controls. Multi-step reset dialog enforces export-or-explicit-skip before the destructive wipe. Production-deployed and end-to-end smoked (`examples/stage5_smoke.rs` against `api.codemux.org`). Project-scoped sync planned for Step 10.5 (schema's `scope` field is forward-compat). See `docs/features/skills-sync.md`.
+- Local lexical indexing (`codemux index build/search`)
+
+### Notifications
+- D-Bus desktop notifications via `notify_rust::Notification` (Normal urgency so daemons auto-dismiss)
+- Sidebar notification section with unread badge counts
+- Workspace alerts with severity levels
+- Desktop notification toast + chime when an off-screen agent finishes
+- Notification sound playback wired on all three platforms (Linux: `paplay` + freedesktop `complete.oga`; macOS: `afplay` + Glass.aiff; Windows: PowerShell SystemSounds)
+
+### Auth & sync
+- GitHub OAuth, email/password with email verification, encrypted token storage (AES-256-GCM, machine-bound key)
+- **Auth module split**: `auth/{mod,api,derivation}.rs` with the `AuthSecret` typed boundary on the API helpers (compile-time guard against raw-password leaks)
+- **Zero-knowledge auth derivation** (Step 10): `derive_login_credentials(password, email)` produces both the server-visible `AuthSecret` (sent to Better Auth in place of the raw password) and a client-only `EncryptionKey` (32 raw bytes, never leaves the device). Argon2id (m=64MiB, t=3, p=4) with email-bound salt, fanned out via HKDF-SHA256 to two domain-separated secrets. Cross-product byte-identical with Vexis via the shared `codemux-api-*` HKDF labels — pinned in CI.
+- **End-to-end-encrypted skills sync** (Step 10, Stages 1-6): cross-device sync of user-authored skills under `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.opencode/skills/`. XChaCha20-Poly1305 per blob, machine-bound key persistence at `~/.local/share/codemux/sync-key.enc` (AES-GCM under `/etc/machine-id`). Push triggered by file watcher (1.5s frontend debounce on top of the watcher's 300ms), 5-min periodic when window is visible, or manual "Sync now" button. Last-write-wins by `updated_at`. Settings → Account → Sync surfaces live status + relative-time + Export/Import/Forgot-password controls. Multi-step reset dialog enforces export-or-explicit-skip before the destructive wipe. Production-deployed and end-to-end smoked. See `docs/features/skills-sync.md`.
 - Per-user synced settings with server sync, offline cache, and dirty flag
+
+### Presets & launchers
+- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini, Pi, Shell)
+- Pin/unpin to control bar visibility
+- Auto-run on workspace creation or new tab
+- Partial-materialise recovery for preset DnD; new-tab preset launch
+- Preset failures surface as 8-second sonner toasts (was silently `.catch(console.error)`)
+- Agent context injection for Claude / Codex / Pi / Gemini presets (uses `$VAR` on POSIX, `$env:VAR` on Windows)
+
+### File tooling
+- File tree panel (right sidebar, lazy-loaded, `.gitignore`-aware, opens in built-in editor or external editor)
+- Built-in file editor with CodeMirror 6, syntax highlighting for 20+ languages, markdown preview (image loading in markdown and as standalone files)
+- IDE integration (detect editors, open workspace, Ctrl+Shift+E). On Windows, `find_editors()` uses the `which::which()` Rust crate plus `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code / Cursor / VSCodium / Zed; JetBrains stays PATH-only.
+- Port detection (auto-scan, sidebar display, open in browser). Windows path filters system processes (`svchost.exe`, `System`, `lsass.exe`, etc.) so the sidebar doesn't surface 16+ kernel-owned ports.
+
+### Theming
 - Neutral dark shell theming with Omarchy accent sync
-- Sans-serif shell chrome, monospace terminals
-- Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
+- Sans-serif chrome (DM Sans), monospace terminals
+- Terminal colors fully theme-reactive via CSS variables + MutationObserver
+- Fallback Tokyonight-inspired theme when Omarchy unavailable
+
+### Agent Chat (Beta — opt-in via Settings → Beta Features)
+- Full multi-provider chat pane with streaming, approvals, mode pills (Ask / Allow always / Plan / Debug), and permission-mode restart
+- **Three providers** behind one unified picker: **Claude** (Claude Agent SDK via Bun-compiled `claude-agent` sidecar), **Codex** (`codex app-server` JSON-RPC), **OpenCode** (federated — Rust-direct HTTP against a managed `opencode serve` child, 100+ upstream providers funneled through one rail entry). See `docs/features/multi-provider-chat.md`.
+- Unified provider+model picker (2-column popover: provider rail + searchable model list); favorites with `localStorage` persistence
+- Codex finally GUI-selectable (was hidden behind a stale `ENABLE_PROVIDER_PICKER` flag pre-Step 12)
+- Session history selector + draft surface chrome polish + plan proposals + AskUserQuestion panel + thinking indicator
+- **Attachments via `+` and `@`**: files, folders, GitHub issues + PRs, images via paste / drop / + picker. Inline chips, send-time injection, expand, caps, gif guard, chip tooltips
+- Slash command popup + Shift+Tab mode cycling
+- Cross-provider **skill system** (watcher, conflicts, disable, refined compat)
+- Per-tool body rendering in approval blocks (read/write/edit/grep/etc.)
+- **MCP host runtime**: Codemux discovers user-installed MCP servers across Codemux / Claude / Cursor paths, spawns each child once, dedupes identical configs, exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh. Settings panel and `+` popup surface enable/disable + status badges + tool list modal + 50-tool cap warning. Codex MCP support planned for Step 11 via HTTP gateway.
+- Permissions settings page with per-tool body rendering
+- Wired Debug mode pill with marker cleanup flow
+- Plain-quit on Beta toggle off (no auto-restart)
+- See `docs/features/agent-chat.md` for the canonical feature breakdown
+
+### Infrastructure
+- Global overlay manager (single overlay at a time)
 - MCP server exposing 31 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification, viewport presets)
-- Cross-provider MCP server runtime (Claude-side): Codemux hosts user-installed MCP servers, discovers configs across Codemux / Claude / Cursor paths, spawns each child once, dedupes identical configs, exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh. Settings panel and `+` popup both surface enable/disable + status badges + tool list modal + 50-tool cap warning. Codex MCP support planned for Step 11 via HTTP gateway (see `docs/plans/step-9-codex-mcp-spike.md`).
-- Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
-- Multi-provider chat (Step 12, Stages 1-9 shipped): the chat composer's model picker drives session creation across Claude + Codex + OpenCode in one unified popover (provider rail + searchable model list). OpenCode federates 100+ upstream providers behind a single rail entry; only the connected upstreams surface (filtered at the data layer). New OpenCode adapter is Rust-direct-HTTP against a managed `opencode serve` child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo.sub_provider` threads upstream provider id through the harvest so federated models render with `OpenCode · {sub_provider}` subtitles + namespaced `${provider_id}/${model_id}` slugs. Codex finally selectable in the GUI (was hidden behind a stale `ENABLE_PROVIDER_PICKER` flag pre-Step-12). Favorites persist via zustand + `localStorage` and bubble to the top of search results across all surfaces. Live-tested against OpenCode 1.14.31 (116 providers / 4,354 models). Multi-instance per provider + picker keyboard shortcuts deferred to v2; OpenFlow capabilities convergence tracked as future cleanup. See `docs/features/multi-provider-chat.md`.
-- Terminal pane persistence across workspace switch: xterm.js Terminal instance + PTY-output channel survive component unmount via the module-level cache in `src/components/terminal/terminal-cache.ts`. Workspace switches reparent the wrapper into a hidden parking node instead of disposing, so alt-screen TUIs (Claude Code, lazygit, btop, vim) keep rendering correctly on return. Disposal is driven by AppState diffs in `useTerminalCacheGc` so close-pane / close-tab / close-workspace / PTY-exit all reach `disposeTerminal`.
-- Auth-derivation module split: `auth.rs` lives at `auth/{mod,api,derivation}.rs` with the `AuthSecret` typed boundary on the API helpers (compile-time guard against raw-password leaks). Step 10's `EncryptionKey` + `derive_login_credentials` and the cross-product `auth_secret_matches_vexis_*` and `encryption_key_matches_vexis_for_known_input` hex pin tests now live alongside the algorithm in `auth/derivation.rs`.
-- Sidebar PR icon (per workspace, with stale-clearing on branch switch and a "DRAFT" collapse), "Checkout default branch" workspace action, Review tab (renamed from PR tab) with React Query refactor, "Open PR" button on the changes-panel toolbar, terminal Unicode-11 widths + WebGL renderer, hidden-pane terminal pause to remove cross-workspace typing lag, desktop notification toast + chime when an off-screen agent finishes, onboarding skip affordance + re-trap fix.
-- Windows portability: portable-pty repinned to upstream + hidden parent console, agent-browser Edge auto-detect + argv fix + ERROR_PIPE_BUSY retry, Tier-3 Win32 SendInput input injection, Claude Code hooks register on Windows, `resolve_binary` Windows discovery branch.
+- CLI and socket control (Unix socket on Linux/macOS, named pipe on Windows). Control-endpoint errors now surface instead of being swallowed.
+- Per-workspace display isolation (X11/Wayland sandboxing for agent-spawned GUI apps — opt-in for human persona, default-on for agent persona)
+- Local project memory (`codemux memory show/set/add`, `codemux handoff`)
+- Auto-update via Tauri updater (Linux AppImage + Windows NSIS, signed with the same Ed25519 key, shared `latest.json`)
+- Onboarding skip affordance + re-trap fix
+- Dev builds isolated from installed release (separate data dirs)
+
+### Performance
+- High-frequency app-state emits coalesced into 16 ms windows
+- `transition-all` scoped to actually-transitioning properties
+- Markdown view + workspace-tied components no longer re-render on every backend tick
+- Workspace-switch mount-time IPC roundtrips cut; IPC thread unblocked
+- Editor file read + language module import parallelised
+- Worktree-include listener no longer re-attaches every backend tick
+- `ensure-draft-when-empty` effect uses a primitive fingerprint
+- Chat transcript rows + file-tree nodes memoised to skip per-token re-renders
 
 ## Partial / Being Hardened
 
-- Browser pane: screenshot-driven, functional but lower fidelity than native
-- OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
-- AI merge resolver: backend and frontend working, needs testing depth and live validation
-- Browser automation depth: DOM commands, coordinate commands, and OS-level input work; wait conditions and JS evaluation added in v0.24.0
-- Browser viewport presets: `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` resizes the actual viewport via CDP so CSS media queries fire and screenshots capture at the simulated dimensions. Names are size buckets (not specific device models) so they don't go stale across hardware refreshes. MCP exposes `browser_viewport` + `browser_viewport_presets`. Replaces the older "wrap the page in a 375px iframe" workaround.
+- **OpenFlow**: orchestration works but large-run reliability and intervention flow still maturing. Backend-driven orchestration loop (5s active / 15s blocked). Disabled on Windows until the bash-wrapper rewrite lands.
+- **Browser pane**: screenshot-driven, functional but lower fidelity than a native embedded webview
+- **AI merge resolver**: backend and frontend working, recent fixes (close stdin + kill child on timeout, skip-permissions flags, blocking-pool offload), needs more depth of live validation
+- **Browser automation depth**: DOM commands, coordinate commands, OS-level input, wait conditions, JS evaluation, CSS style inspection — all working; toolbar back/forward/reload still need focused validation
 
 ## Known Constraints
 
 - Notification click-to-focus on Wayland and mako still needs deeper D-Bus or native handling
 - Control socket is local-user only and currently unauthenticated
-- Notification sound toggle exists in state, but actual audio playback is not implemented
-- Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation have been removed.
-- Feature docs exist for all major subsystems: auth, auto-update, browser, changes panel, code indexing, command palette, diff viewer, execution backends, file editor, file tree, GitHub issues, hooks, IDE integration, MCP server, merge resolver, notifications, observability, OpenFlow, ports, PR integration, presets, project memory, search, session persistence, settings, settings sync, setup-teardown, terminal, workspace creation, worktree setup
+- Agent Chat is **off by default**; opt in via Settings → Beta Features
+- Memory drawer UI is still backend + CLI only (no frontend drawer/panel yet)
+- File editor: no LSP integration, no multi-cursor, no rename/delete from editor
+- Context menus on pane headers are not yet implemented (workspace rows, section groups, tabs, changes panel rows, and sidebar ports section already have them)
+- Browser automation uses `agent-browser` v0.24.0 (pure Rust binary, direct CDP). The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP implementation are gone.
+- Feature docs exist for all major subsystems (see `docs/INDEX.md`)
 
 ## Windows Support
 
-Windows support has shipped in `v0.1.20` and `v0.1.21`. The Windows foundation merge (commit `cc9b946`) landed before `v0.1.20` was tagged, so every published release since `v0.1.20` includes the Windows binaries (NSIS `.exe` installer + auto-update). `main` is currently 8 commits past `v0.1.21`, all of them post-release Windows fixes.
+Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.2.5`.
 
-What landed in the foundation:
+What's in place:
 
 - `cfg`-gates cover every Linux-specific code path — the app compiles on `x86_64-pc-windows-msvc` without unsafe `unix` stubs
-- Control socket → named pipe (`\\.\pipe\codemux-{username}`) via `tokio::net::windows::named_pipe`
-- Port detection via `netstat -ano` parser (cross-platform pure function, unit-tested on Linux CI) with a Windows system-process name filter (`svchost.exe`, `System`, `lsass.exe`, etc.) so the UI doesn't surface 16+ kernel-owned ports that Linux's `/proc/*/fd/` permission filter naturally hides
-- Agent-browser port reclamation via `netstat -ano` + `taskkill` with exact-port matching
-- OpenFlow disabled at the UI + backend level on Windows (bash wrappers not yet ported) — sidebar shows a greyed-out "OpenFlow is not yet available on Windows" tooltip
-- `release.yml` builds on `[ubuntu-22.04, windows-latest]` with `fail-fast: false`; tauri-action merges both platforms into a single `latest.json` so existing Linux auto-updates keep working AND Windows clients auto-update the same way
+- Control socket → named pipe (`\\.\pipe\codemux-{username}`) via `tokio::net::windows::named_pipe`. Client now retries on `ERROR_PIPE_BUSY`.
+- Port detection via `netstat -ano` parser (cross-platform pure function, unit-tested on Linux CI) with a Windows system-process name filter
+- Agent-browser port reclamation via `netstat -ano` + `taskkill` with exact-port matching; auto-detect installed Chromium (Edge / Chrome / Brave / Chromium)
+- `portable-pty` fork pinned to `Zeus-Deus/portable-pty@codemux-0.8.1-no-window` (`STARTF_USESHOWWINDOW + SW_HIDE` so PTY spawns don't flash a `cmd.exe` console window)
+- **PowerShell is the default Windows shell** (`pwsh` → `powershell` → `COMSPEC` → literal `"cmd.exe"`). Agent context injection uses PowerShell `$env:VAR` syntax; preset commands terminate with `\r`. Gemini path writes its system-prompt temp file via PowerShell `Set-Content -NoNewline`.
+- Editor detection uses `which::which()` + `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code, Cursor, VSCodium, Zed; JetBrains stays PATH-only
+- `<WindowChrome />` extracted so login, empty-state, settings, and new-project screens have minimize/maximize/close buttons (Codemux runs with `decorations: false`)
+- Scrollback flush waits 10s on Windows (3s elsewhere); Windows-only `scrollback::flush_cache_to_disk` backend backstop catches anything the frontend can't persist before timeout
+- OpenFlow disabled at the UI + backend level on Windows (bash wrappers not yet ported)
+- `release.yml` builds on `[ubuntu-22.04, windows-latest]` with `fail-fast: false`; tauri-action merges both platforms into a single `latest.json`
 - NSIS installer produced on Windows CI (`--bundles nsis` to skip MSI which needs WiX)
+- Claude Code hooks register and execute on Windows
+- Tier-3 OS-level input injection via Win32 `SendInput`
+- Path normalization + four latent windows portability issues fixed
 
-Post-release Windows fixes (between `v0.1.21` and current `main`):
+Still gated before a polished Windows v1:
 
-- **`portable-pty` forked** — pinned to `Zeus-Deus/portable-pty` branch `codemux-0.8.1-no-window` (commit `a5022fec`). The fork ORs `CREATE_NO_WINDOW` and uses `STARTF_USESHOWWINDOW + SW_HIDE` in `psuedocon.rs` so terminal sessions stop flashing visible `cmd.exe` console windows on the Windows taskbar (upstream `portable-pty` 0.8.1 omits both flags from `dwCreationFlags`)
-- **PowerShell is now the default Windows shell**, replacing `cmd.exe`. `default_shell()` on Windows now resolves `pwsh` → `powershell` → `COMSPEC` → literal `"cmd.exe"`. The earlier `cmd.exe`-only decision in `docs/plans/windows-support.md` has been superseded — PowerShell ships pre-installed on every supported Windows version (10/11, Server 2016+) so the detection chain almost always succeeds
-- **Agent context injection learned PowerShell env-var syntax** — `$env:CODEMUX_AGENT_CONTEXT` (PowerShell) instead of `$CODEMUX_AGENT_CONTEXT` (POSIX). The previous Unix-only form would have been passed to `claude` as a literal `$CODEMUX_AGENT_CONTEXT` string instead of the expanded context. Affects the Claude / Codex / Pi / Gemini preset wrappers; OpenCode is env-var-only and unaffected. The Gemini path also writes its system-prompt temp file via PowerShell `Set-Content -NoNewline` and sets `$env:GEMINI_SYSTEM_MD` inline
-- **Editor detection rewritten for Windows** — `find_editors()` no longer shells out to a `which` binary (which doesn't exist on Windows). Now uses the `which::which()` Rust crate plus a `#[cfg(windows)]` fallback that probes `%LOCALAPPDATA%\Programs`, `%ProgramFiles%`, and `%ProgramFiles(x86)%` for well-known per-user install paths of VS Code, Cursor, VSCodium, and Zed. JetBrains IDEs stay PATH-only (Toolbox shims live on `PATH` already)
-- **Window controls extracted to a standalone `<WindowChrome />`** — Codemux runs with `decorations: false` so the OS never paints native chrome. The login screen, empty state, settings view, and new-project screen short-circuit `AppShell` BEFORE the title bar mounts, which on Windows left those screens with no way to minimize/maximize/close the app. `<WindowChrome />` wraps the same minimize/maximize/close cluster as `title-bar.tsx` in a draggable strip so every full-screen view exposes window controls. Linux + Hyprland was unaffected because the WM decorates the window itself
-- **Scrollback flush hardened on Windows** — the close handler now waits 10 seconds (Linux/macOS still 3) for the frontend to ack `serialize-terminal-buffers`, and a Windows-only backend backstop (`scrollback::flush_cache_to_disk`) drains any in-memory `ScrollbackCache` entries that the frontend didn't manage to persist before the timeout. Fixes silent scrollback truncation on Windows where slower Tauri IPC + slower xterm serialization for many panes routinely exceeded the old 3-second budget. The cache exists on Linux too but never has anything to flush in practice because the happy-path flush completes well within budget
-- **Preset failure now surfaces as a toast** — `preset-bar.tsx` previously caught `applyPreset` rejections with `.catch(console.error)`, so users who clicked a preset for an uninstalled CLI saw nothing happen. Failures are now routed through the existing sonner toast wrapper (`toast.error("Preset Name: {error}")`) for an 8-second bottom-right notification
-- **Windows preset commands get a `\r` line terminator** instead of `\n` so PowerShell actually executes the typed-in command on submit
-- **Test counts: 607 Rust tests** (530 lib + 65 git_operations + 12 github_operations) and **303 frontend tests** across 22 files, all passing on both `ubuntu-latest` and `windows-latest` CI legs at the time of `v0.1.21`. Step 10 (skills sync) and Step 12 (multi-provider chat) have grown the suite substantially since: as of Step 12 close-out the Rust lib is **1,122 tests** and the frontend Vitest suite is **1,500 tests across 93 files**. Two pre-existing flaky integration tests in `tests/codex_adapter.rs` (`interrupt_turn_sends_turn_interrupt`, `auth_probe_unauthenticated_matches_common_patterns`) intermittently fail under cargo's parallel scheduler (`fake_codex_app_server` helper-binary build race); both pass cleanly in isolation or with `--test-threads=1`
-
-Still gated before a real Windows v1 release:
-
-- Windows Authenticode code signing — SmartScreen warning expected on unsigned first-install, deferred behind a cert budget decision (the agent-browser `.exe` is already a Defender false-positive trigger so signing becomes more pressing as install friction reports come in)
-- OpenFlow bash wrapper rewrite — blocks OpenFlow on Windows
-- Tier 3 input injection via Win32 `SendInput` — deferred (Tier 1/2 sufficient for MVP)
+- Windows Authenticode code signing (SmartScreen friction expected on unsigned first-install; deferred behind a cert budget decision)
+- OpenFlow bash wrapper rewrite (blocks OpenFlow on Windows)
 - Full PTY lifecycle / worktree / agent-spawn integration tests on a live Windows runner
 
-See `docs/plans/windows-support.md` for the complete checklist and status.
+See `docs/plans/windows-support.md` for the complete checklist.
 
 ## React Frontend Status
 
-The frontend was rebuilt from Svelte to React + Tailwind v4 + shadcn. The Rust backend is unchanged. The port is complete and the old Svelte frontend has been removed.
+The frontend is React + Tailwind v4 + shadcn + Vite. The Rust backend is unchanged. The old Svelte frontend has been removed.
 
-### Ported and Working
+### Working
 
 - App shell: shadcn Sidebar with collapsible workspace sections, tab bar, right panel
-- Workspace list from real Tauri backend data (zustand + app-state-changed events)
-- Terminal panes with xterm.js DOM renderer + PTY via Tauri Channel
+- Workspace list from real Tauri backend data (zustand + app-state-changed events, coalesced into 16ms windows)
+- Terminal panes with xterm.js WebGL + DOM fallback + PTY via Tauri Channel, persistent across workspace switch
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
-- Right panel with Changes panel, File tree, and PR panel tabs
+- Right panel with Changes panel, File tree, and Review (PR) panel tabs
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph
+- Agent Chat UI: chat pane, composer (with `+` popup, `@` mention popup, slash command popup, image paste/drop), transcript, mode pill, model picker, session selector, attachment chips, plan proposal block, AskUserQuestion panel, thinking indicator, permission request block, tool-call card with per-tool body rendering, debug-mode banner + exit dialog
+- Settings panel (15+ sections including Beta Features, Sync, Skills, MCP, Permissions)
 - Command palette (Ctrl+K) with fuzzy search
 - Search: file name search (Ctrl+Shift+P) and content search (Ctrl+Shift+F)
-- Browser pane with screenshot-driven rendering and toolbar
+- Browser pane with screenshot-driven rendering and toolbar (reactive `stream_url` reconnect)
 - Workspace drag-and-drop reordering in sidebar
 - Terminal presets bar with quick-launch
-- Settings panel with keyboard shortcuts, appearance, and project scripts
-- Auth system with GitHub OAuth, email/password, session encryption
+- Auth system with GitHub OAuth, email/password, encrypted token storage
 - Synced settings (per-user server-synced with offline cache)
+- Skills sync UI (Settings → Account → Sync)
 - Semantic theming: shadcn oklch dark mode + custom --success/--danger/--warning tokens
-- Terminal theme reads dynamically from CSS variables via MutationObserver
-- Tauri bridge: 120+ typed command wrappers, 12 event helpers, all types ported
+- Tauri bridge: 120+ typed command wrappers, 12+ event helpers, all types ported
 
 ### Remaining Gaps
 
 - Context menus on pane headers (workspace rows, workspace section groups, tabs, changes panel rows, and sidebar ports section already have them)
-- Notification sound playback (toggle exists in settings and state, but no actual audio output)
-- Memory drawer UI (backend memory system exists, no frontend drawer/panel yet)
+- Memory drawer UI (backend memory system exists, CLI works, no frontend drawer/panel yet)
 - File editor: no LSP integration, no multi-cursor, no rename/delete from editor
 
 ## Read This With
 
 - `docs/core/PLAN.md` for build order
 - `docs/core/TESTING.md` for verification policy
-- `docs/features/*` for subsystem detail (auth, auto-update, browser, changes-panel, code-indexing, command-palette, diff-viewer, execution, file-editor, file-tree, github-issues, hooks, ide-integration, mcp-server, merge-resolver, notifications, observability, openflow, ports, review-integration, presets, project-memory, search, session-persistence, settings, settings-sync, setup-teardown, terminal, workspace-creation, worktree-setup)
-- `docs/plans/windows-support.md` for the active Windows cross-platform work
+- `docs/features/*` for subsystem detail
+- `docs/plans/windows-support.md` for the cross-platform checklist
+- `docs/plans/openflow.md` for the active OpenFlow hardening work

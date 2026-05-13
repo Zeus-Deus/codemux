@@ -1,9 +1,8 @@
-# Browser Stream Fix Plan
+# Browser Stream Fix Plan (archived)
 
-- Purpose: Repair the per-workspace browser stream so it survives concurrent agents on Linux, macOS, and Windows without breaking the existing automation surface.
-- Audience: Anyone changing `agent_browser.rs`, `control.rs`, `state_impl.rs`, or `BrowserPane.tsx` for stream stability.
-- Authority: Active work plan only; current behavior still lives in `docs/features/browser.md`.
-- Update when: A step lands, a question gets answered, or an unanticipated regression surfaces.
+- Status: **LANDED — archived.** The unified port keying + PID-tracked daemon lifecycle landed in commit `7e36420` ("fix(browser): unify port keying and harden daemon lifecycle"). Dead `workspace_id` alias lookups removed in commit `fba8697`. Current browser behaviour lives in `docs/features/browser.md`.
+- Purpose: Historical record of the cross-platform stream-stability work — PID tracking, single canonical key, atomic teardown, symmetric `TcpListener::bind` probe, reactive `stream_url` reconnect on the frontend.
+- Audience: Anyone debugging browser stream regressions or revisiting the reaper / PID-file / startup-adoption ideas (steps 5, 7, 8 from the original plan).
 - Read next: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md`, `AGENTS.md`.
 
 ## Goal
