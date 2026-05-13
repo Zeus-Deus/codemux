@@ -615,6 +615,72 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             crate::terminal::write_to_pty(pty_state, app_state, data, session_id)
                 .map(|_| serde_json::json!({ "written": true }))
         }
+        "read_terminal" => {
+            let pty_state: State<'_, PtyState> = app.state();
+            let app_state: State<'_, AppStateStore> = app.state();
+            let session_id = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // `lines` is optional and capped inside `read_terminal_output` so a
+            // hostile or sloppy caller can't ask for 10M lines. We accept any
+            // non-negative integer and let the helper clamp to its own
+            // READ_TERMINAL_MAX_LINES.
+            let lines = request
+                .params
+                .get("lines")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            crate::terminal::read_terminal_output(
+                pty_state.inner(),
+                app_state.inner(),
+                lines,
+                session_id,
+            )
+            .and_then(|out| serde_json::to_value(out).map_err(|e| e.to_string()))
+        }
+        "activate_workspace" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
+            workspace_id.and_then(|ws_id| {
+                // Reuse the in-app workspace-switch path so the socket / MCP
+                // surface gets identical side effects: git refresh, PTY
+                // hydration, app-state emit, persisted ui_state. See
+                // `activate_workspace_impl` for the full breakdown.
+                crate::commands::workspace::activate_workspace_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    ws_id.clone(),
+                )
+                .map(|_| serde_json::json!({ "workspace_id": ws_id, "activated": true }))
+            })
+        }
+        "port_list" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let workspace_filter = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let snap = state.snapshot();
+            // Filter on `workspace_id` when provided; otherwise return every
+            // detected port. `detected_ports` carries the same fields as
+            // `ports::PortInfo` plus the workspace association the detector
+            // assigns, so the wire payload is identical to what the UI's
+            // ports panel sees.
+            let ports = filter_ports_by_workspace(&snap.detected_ports, workspace_filter.as_deref());
+            serde_json::to_value(&ports)
+                .map(|ports_json| serde_json::json!({ "ports": ports_json }))
+                .map_err(|e| e.to_string())
+        }
         "browser_automation" => {
             let state: State<'_, AppStateStore> = app.state();
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
@@ -988,6 +1054,28 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
     }
 }
 
+/// Filter `ports` to entries whose `workspace_id` matches `workspace_filter`.
+/// `None` returns every detected port. Pulled out as a free function so the
+/// `port_list` socket-command logic can be exercised in unit tests without
+/// having to stand up an `AppStateStore` + Tauri runtime.
+///
+/// The vexis-agent integration calls this through the `port_list` MCP tool
+/// — see `mcp_server.rs::handle_tool_call` — and relies on the filter
+/// semantics being strict: a port without a `workspace_id` MUST NOT match
+/// any workspace filter, even an empty-string filter.
+fn filter_ports_by_workspace<'a>(
+    ports: &'a [crate::state::PortInfoSnapshot],
+    workspace_filter: Option<&str>,
+) -> Vec<&'a crate::state::PortInfoSnapshot> {
+    ports
+        .iter()
+        .filter(|p| match workspace_filter {
+            Some(filter) => p.workspace_id.as_deref() == Some(filter),
+            None => true,
+        })
+        .collect()
+}
+
 /// Resolve the repo path for control socket commands.
 /// Checks `repo_path` param first, then falls back to active workspace's project_root/cwd.
 fn resolve_control_repo_path(
@@ -1020,6 +1108,70 @@ fn resolve_control_repo_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::PortInfoSnapshot;
+
+    fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
+        PortInfoSnapshot {
+            port,
+            pid: 1000 + port as u32,
+            process_name: format!("proc-{port}"),
+            workspace_id: ws.map(str::to_string),
+            label: label.map(str::to_string),
+        }
+    }
+
+    // ─── port_list filter (socket command behaviour) ────────────────────
+    //
+    // The `port_list` socket command runs this filter directly on
+    // `AppStateSnapshot::detected_ports`. The MCP tool of the same name
+    // forwards the optional `workspace_id` argument unchanged, so anything
+    // we promise here is also the MCP-tool contract.
+
+    #[test]
+    fn port_list_filter_no_filter_returns_all() {
+        let ports = vec![
+            port(3000, Some("ws-a"), Some("next")),
+            port(8080, None, None),
+            port(4173, Some("ws-b"), Some("vite")),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, None);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn port_list_filter_by_workspace_id() {
+        let ports = vec![
+            port(3000, Some("ws-a"), Some("next")),
+            port(8080, None, None),
+            port(4173, Some("ws-b"), Some("vite")),
+            port(5173, Some("ws-a"), Some("vite")),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, Some("ws-a"));
+        let ports_only: Vec<u16> = filtered.iter().map(|p| p.port).collect();
+        assert_eq!(ports_only, vec![3000, 5173]);
+    }
+
+    #[test]
+    fn port_list_filter_excludes_unscoped_ports() {
+        // A port with no `workspace_id` must NOT match any workspace filter
+        // — including an empty-string filter — otherwise vexis-agent's
+        // brain sees "ports owned by no workspace" leak into a workspace
+        // query. The bug would be silent on the wire (just extra ports)
+        // but very confusing for the agent.
+        let ports = vec![port(8080, None, None), port(3000, Some("ws-a"), None)];
+        let filtered = filter_ports_by_workspace(&ports, Some(""));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn port_list_filter_unknown_workspace_returns_empty() {
+        let ports = vec![
+            port(3000, Some("ws-a"), None),
+            port(4173, Some("ws-b"), None),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, Some("ws-nonexistent"));
+        assert!(filtered.is_empty());
+    }
 
     /// Tiny echo handler used by the round-trip tests: reads one line at a
     /// time and writes it back unchanged. Mirrors the real `handle_client`

@@ -589,6 +589,26 @@ pub fn activate_workspace(
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
 ) -> Result<(), String> {
+    activate_workspace_impl(app, &state, &db, workspace_id)
+}
+
+/// Shared workspace-switch implementation used by both the Tauri command
+/// (sidebar / palette click) and the `activate_workspace` control-socket
+/// command exposed via the `workspace_open` MCP tool.
+///
+/// Keeping the body in one place guarantees both surfaces have identical
+/// side effects: the in-memory active id flip, the `populate_git_info`
+/// background refresh, lazy PTY hydration via
+/// `spawn_missing_ptys_for_workspace`, the synchronous `emit_app_state`
+/// to push the new snapshot to any open UI, and the
+/// `db.set_ui_state("active_workspace", …)` write that restores the
+/// active workspace on next launch.
+pub(crate) fn activate_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+) -> Result<(), String> {
     let activate_started = std::time::Instant::now();
     if state.activate_workspace(&workspace_id) {
         // Kick off git refresh in a background thread — don't block the
