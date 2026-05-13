@@ -46,7 +46,7 @@ The repo structure is clean and domain-split:
 - Neutral dark shell theming with Omarchy accent sync
 - Sans-serif shell chrome, monospace terminals
 - Built-in file editor with CodeMirror, syntax highlighting, and markdown preview
-- MCP server exposing 29 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification)
+- MCP server exposing 31 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification, viewport presets)
 - Cross-provider MCP server runtime (Claude-side): Codemux hosts user-installed MCP servers, discovers configs across Codemux / Claude / Cursor paths, spawns each child once, dedupes identical configs, exposes tools to the Claude SDK via an in-process facade with dynamic `setMcpServers` refresh. Settings panel and `+` popup both surface enable/disable + status badges + tool list modal + 50-tool cap warning. Codex MCP support planned for Step 11 via HTTP gateway (see `docs/plans/step-9-codex-mcp-spike.md`).
 - Session persistence: terminal scrollback saved/restored across restarts, adapter-based resume for CLI tools (Claude Code)
 - Multi-provider chat (Step 12, Stages 1-9 shipped): the chat composer's model picker drives session creation across Claude + Codex + OpenCode in one unified popover (provider rail + searchable model list). OpenCode federates 100+ upstream providers behind a single rail entry; only the connected upstreams surface (filtered at the data layer). New OpenCode adapter is Rust-direct-HTTP against a managed `opencode serve` child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`). `ChatModelInfo.sub_provider` threads upstream provider id through the harvest so federated models render with `OpenCode · {sub_provider}` subtitles + namespaced `${provider_id}/${model_id}` slugs. Codex finally selectable in the GUI (was hidden behind a stale `ENABLE_PROVIDER_PICKER` flag pre-Step-12). Favorites persist via zustand + `localStorage` and bubble to the top of search results across all surfaces. Live-tested against OpenCode 1.14.31 (116 providers / 4,354 models). Multi-instance per provider + picker keyboard shortcuts deferred to v2; OpenFlow capabilities convergence tracked as future cleanup. See `docs/features/multi-provider-chat.md`.
@@ -61,6 +61,7 @@ The repo structure is clean and domain-split:
 - OpenFlow: orchestration works but large-run reliability and intervention flow still maturing
 - AI merge resolver: backend and frontend working, needs testing depth and live validation
 - Browser automation depth: DOM commands, coordinate commands, and OS-level input work; wait conditions and JS evaluation added in v0.24.0
+- Browser viewport presets: `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` resizes the actual viewport via CDP so CSS media queries fire and screenshots capture at the simulated dimensions. Names are size buckets (not specific device models) so they don't go stale across hardware refreshes. MCP exposes `browser_viewport` + `browser_viewport_presets`. Replaces the older "wrap the page in a 375px iframe" workaround.
 
 ## Known Constraints
 

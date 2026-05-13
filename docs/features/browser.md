@@ -23,6 +23,7 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 - dynamic stream ports (9223-9299) for concurrent workspace browsers
 - browser data management in Settings (clear cookies, clear all data, view data size)
 - inspector panel for debugging web content
+- viewport presets for mobile / tablet / desktop responsive testing via `codemux browser viewport <preset>` (e.g. `mobile`, `tablet`, `desktop-large`, `reset`) or custom `WxH` dimensions — applies real viewport resize + DPR through CDP, so CSS media queries fire and screenshots capture at the simulated dimensions (replaces the older iframe trick)
 
 ## Expected Operating Model
 
@@ -45,8 +46,11 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 
 ## Important Touch Points
 
-- `src-tauri/src/agent_browser.rs` — `AgentBrowserManager`, stealth flags, stream port allocation, spawning
+- `src-tauri/src/agent_browser.rs` — `AgentBrowserManager`, stealth flags, stream port allocation, spawning, viewport argv builder (`resolve_viewport_params`, `format_dpr`)
+- `src-tauri/src/browser_viewport.rs` — preset table (`PRESETS`, `RESET_SPEC`) and `parse_spec` for preset / `WxH` / `reset` parsing
 - `src-tauri/src/commands/browser.rs` — Tauri commands for pane creation, URL navigation, automation
-- `src/components/browser/BrowserPane.tsx` — screenshot rendering, toolbar, address bar
+- `src-tauri/src/cli.rs` — `BrowserCommand::Viewport` and `BrowserCommand::ViewportPresets` CLI subcommands
+- `src-tauri/src/mcp_server.rs` — `browser_viewport` and `browser_viewport_presets` MCP tools
+- `src/components/browser/BrowserPane.tsx` — screenshot rendering, toolbar, address bar, auto-syncs viewport on pane resize via legacy `width`/`height` payload (which the new socket handler accepts unchanged)
 - `src/components/browser/InspectorPanel.tsx` — browser inspector/DevTools panel
 - `docs/reference/BROWSER-AGENT-COMMANDS.md` — CLI and socket command reference
