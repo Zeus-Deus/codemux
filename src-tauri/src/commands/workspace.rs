@@ -537,6 +537,37 @@ pub fn close_workspace_with_worktree(
     delete_branch: Option<bool>,
     force_delete: Option<bool>,
 ) -> Result<(), String> {
+    close_workspace_with_worktree_impl(
+        app,
+        &state,
+        &db,
+        workspace_id,
+        remove_worktree,
+        delete_branch,
+        force_delete,
+    )
+}
+
+/// Shared close-workspace implementation backing both the Tauri command
+/// (in-app sidebar / branch picker close affordances) and the
+/// `close_workspace` control-socket command exposed via the Phase 1.6
+/// `workspace_close` MCP tool.
+///
+/// Defers to `close_workspace_with_worktree` semantics regardless of
+/// whether the workspace actually is a worktree: when `worktree_path`
+/// is `None` (a plain workspace), the `remove_worktree` branch is a
+/// no-op and the function reduces to the same operation as
+/// `close_workspace`. Keeping a single impl avoids the brain needing
+/// two MCP tools for "close" depending on workspace type.
+pub(crate) fn close_workspace_with_worktree_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+    remove_worktree: bool,
+    delete_branch: Option<bool>,
+    force_delete: Option<bool>,
+) -> Result<(), String> {
     let force = force_delete.unwrap_or(false);
 
     // Worktree metadata still needs a pre-close snapshot for teardown +
@@ -901,6 +932,25 @@ pub fn cycle_pane(
 pub fn close_pane(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
+    pane_id: String,
+) -> Result<Option<String>, String> {
+    close_pane_impl(app, &state, pane_id)
+}
+
+/// Shared close-pane implementation backing both the Tauri command
+/// (pane "x" affordances in the in-app split header) and the
+/// `close_pane` control-socket command exposed via the Phase 1.6
+/// `pane_close` MCP tool.
+///
+/// Last-pane behavior matches the in-app path: `state.close_pane` removes
+/// the surface + tab when the closed pane was the last leaf, the
+/// workspace stays in state with `active_tab_id`/`active_surface_id`
+/// cleared (or moved to the first remaining tab). No "auto-close the
+/// workspace when the last pane is gone" rule — the workspace persists
+/// empty until the brain (or user) explicitly closes it.
+pub(crate) fn close_pane_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
     pane_id: String,
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
@@ -1746,6 +1796,206 @@ mod phase_1_5_workspace_create_path_tests {
             snap_after.workspaces.iter().any(|w| w.workspace_id == ws_id),
             "the returned workspace_id must be present in the new snapshot"
         );
+    }
+}
+
+#[cfg(test)]
+mod phase_1_6_close_tests {
+    //! Phase 1.6 regression coverage for the close-workspace and
+    //! close-pane state-layer contracts the new MCP tools rely on.
+    //!
+    //! The MCP tools wrap `close_workspace_with_worktree_impl` and
+    //! `close_pane_impl`, which both take a `tauri::AppHandle` — out of
+    //! reach for a pure unit test (same constraint Phase 1 documented
+    //! for dispatch tests). What we CAN test directly is the state
+    //! layer those impls delegate to:
+    //!
+    //! - `AppStateStore::close_workspace` — the mutation that makes
+    //!   the workspace disappear from snapshot.
+    //! - `AppStateStore::close_pane` — the mutation that makes a pane
+    //!   disappear, with the last-pane-in-surface side effects (surface
+    //!   + tab removal).
+    //!
+    //! End-to-end coverage (worktree removal on disk, PTY teardown,
+    //! agent-chat shutdown) requires the live Tauri runtime and is
+    //! exercised via the manual stdio smoke pattern from earlier
+    //! phases.
+    use super::*;
+    use crate::state::{AppStateStore, SplitDirection, WorkspacePresetLayout};
+
+    #[test]
+    fn close_workspace_removes_workspace_from_state() {
+        // workspace_close MCP tool regression: closing a workspace must
+        // make it disappear from the snapshot the brain reads via
+        // `workspace_list` / `app_status`.
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/phase-1-6-close-ws"),
+            WorkspacePresetLayout::Single,
+        );
+        assert!(
+            store.snapshot().workspaces.iter().any(|w| w.workspace_id == ws_id),
+            "fresh workspace must appear in snapshot pre-close"
+        );
+
+        assert!(
+            store.close_workspace(&ws_id.0).is_ok(),
+            "close should succeed"
+        );
+
+        assert!(
+            !store.snapshot().workspaces.iter().any(|w| w.workspace_id == ws_id),
+            "closed workspace must NOT appear in snapshot post-close"
+        );
+    }
+
+    #[test]
+    fn close_workspace_unknown_id_errors() {
+        // Defensive: the MCP brain might call `workspace_close` with a
+        // stale id from a cached `workspace_list`. The state layer must
+        // return a clean Err string the MCP layer can surface, not
+        // panic.
+        let store = AppStateStore::default();
+        let err = match store.close_workspace("workspace-does-not-exist") {
+            Ok(_) => panic!("closing unknown id must error, got Ok"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_lowercase().contains("not found")
+                || err.to_lowercase().contains("no workspace"),
+            "unexpected error string: {err}"
+        );
+    }
+
+    #[test]
+    fn close_pane_removes_pane_from_snapshot_after_split() {
+        // pane_close MCP tool regression: splitting a workspace then
+        // closing the new pane must leave exactly one pane behind. The
+        // surface stays (it still has the original pane), and the
+        // workspace stays open.
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/phase-1-6-close-pane"),
+            WorkspacePresetLayout::Single,
+        );
+        let initial = store.snapshot();
+        let ws = initial
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .expect("workspace must exist");
+        let active_pane = ws.surfaces[0].active_pane_id.0.clone();
+
+        let _new_session = store
+            .split_pane(&active_pane, SplitDirection::Horizontal)
+            .expect("split must succeed");
+
+        let after_split = store.snapshot();
+        let ws_after_split = after_split
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .unwrap();
+        let panes_after_split =
+            crate::state::collect_terminal_sessions(&ws_after_split.surfaces);
+        assert_eq!(
+            panes_after_split.len(),
+            2,
+            "expected 2 panes after split, got {panes_after_split:?}"
+        );
+
+        // Pick the pane that is NOT the original active_pane — that's
+        // the freshly-split sibling whose pane_id we need.
+        let target_pane_id = pick_non_active_pane(&ws_after_split.surfaces[0].root, &active_pane)
+            .expect("split should have produced a second pane");
+        let removed = store
+            .close_pane(&target_pane_id)
+            .expect("close_pane must succeed");
+        assert!(removed.is_some(), "closing a terminal pane returns its session_id");
+
+        let after_close = store.snapshot();
+        let ws_after_close = after_close
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .expect("workspace must still exist after closing one pane");
+        let panes_after_close =
+            crate::state::collect_terminal_sessions(&ws_after_close.surfaces);
+        assert_eq!(
+            panes_after_close.len(),
+            1,
+            "exactly one pane must remain; got {panes_after_close:?}"
+        );
+    }
+
+    #[test]
+    fn close_pane_last_pane_leaves_workspace_empty() {
+        // Documents the in-app last-pane semantics: closing the very
+        // last pane removes the surface + tab, but the workspace stays
+        // in state with empty tabs/surfaces. The brain must then
+        // explicitly call `workspace_close` to finalize. We pin this
+        // here so a future refactor can't silently start auto-closing
+        // workspaces on last-pane removal.
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/phase-1-6-last-pane"),
+            WorkspacePresetLayout::Single,
+        );
+        let snap = store.snapshot();
+        let active_pane = snap
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .unwrap()
+            .surfaces[0]
+            .active_pane_id
+            .0
+            .clone();
+
+        store.close_pane(&active_pane).expect("close_pane succeeds");
+
+        let after = store.snapshot();
+        let ws_after = after
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .expect("workspace must still exist after closing its last pane");
+        assert!(
+            ws_after.surfaces.is_empty(),
+            "surfaces must be cleared when the last pane is closed"
+        );
+        assert!(
+            ws_after.tabs.is_empty(),
+            "tabs must be cleared when the last pane is closed"
+        );
+    }
+
+    /// Walk a pane tree and return the pane_id of any terminal pane
+    /// whose id is NOT `exclude`. Helper for `close_pane_removes_pane…`
+    /// where the split has produced two terminal panes and we need
+    /// the one that isn't the original active pane.
+    fn pick_non_active_pane(
+        node: &crate::state::PaneNodeSnapshot,
+        exclude: &str,
+    ) -> Option<String> {
+        use crate::state::PaneNodeSnapshot;
+        match node {
+            PaneNodeSnapshot::Terminal { pane_id, .. } if pane_id.0 != exclude => {
+                Some(pane_id.0.clone())
+            }
+            PaneNodeSnapshot::Terminal { .. } => None,
+            PaneNodeSnapshot::Browser { pane_id, .. } if pane_id.0 != exclude => {
+                Some(pane_id.0.clone())
+            }
+            PaneNodeSnapshot::Browser { .. } => None,
+            PaneNodeSnapshot::AgentChat { pane_id, .. } if pane_id.0 != exclude => {
+                Some(pane_id.0.clone())
+            }
+            PaneNodeSnapshot::AgentChat { .. } => None,
+            PaneNodeSnapshot::Split { children, .. } => {
+                children.iter().find_map(|c| pick_non_active_pane(c, exclude))
+            }
+        }
     }
 }
 

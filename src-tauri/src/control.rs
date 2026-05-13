@@ -798,6 +798,71 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .map(|_| serde_json::json!({ "workspace_id": ws_id, "activated": true }))
             })
         }
+        "close_workspace" => {
+            // Phase 1.6: backs the `workspace_close` MCP tool. Wraps the
+            // existing `close_workspace_with_worktree_impl` so both the
+            // Tauri command and the socket arm share teardown, PTY
+            // termination, agent-chat shutdown, virtual-display release,
+            // and (when requested) `git worktree remove`. Safe default:
+            // `delete_worktree=false` — closing never destroys a worktree
+            // unless the brain asks for it.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
+            let delete_worktree = request
+                .params
+                .get("delete_worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let delete_branch = request.params.get("delete_branch").and_then(Value::as_bool);
+            let force = request.params.get("force_delete").and_then(Value::as_bool);
+            workspace_id.and_then(|ws_id| {
+                crate::commands::workspace::close_workspace_with_worktree_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    ws_id.clone(),
+                    delete_worktree,
+                    delete_branch,
+                    force,
+                )
+                .map(|_| {
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "closed": true,
+                        "worktree_removed": delete_worktree,
+                    })
+                })
+            })
+        }
+        "close_pane" => {
+            // Phase 1.6: backs the `pane_close` MCP tool. Wraps the
+            // existing `close_pane_impl`. State-layer `close_pane`
+            // handles the last-pane case by removing the surface + tab;
+            // workspace stays open until explicitly closed.
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: pane_id".to_string());
+            pane_id.and_then(|pid| {
+                crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
+                    .map(|removed_session_id| {
+                        serde_json::json!({
+                            "pane_id": pid,
+                            "closed": true,
+                            "removed_session_id": removed_session_id,
+                        })
+                    })
+            })
+        }
         "port_list" => {
             let state: State<'_, AppStateStore> = app.state();
             let workspace_filter = request

@@ -593,6 +593,105 @@ fn register_tools() -> Vec<McpTool> {
                 "properties": {}
             }),
         },
+        // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
+        McpTool {
+            name: "workspace_close",
+            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, releases the workspace's virtual display, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Id of the workspace to close (from `workspace_list` / `app_status`)."
+                    },
+                    "delete_worktree": {
+                        "type": "boolean",
+                        "description": "When true AND the workspace is backed by a git worktree, also runs `git worktree remove` after closing. No effect for non-worktree workspaces. Defaults to false.",
+                        "default": false
+                    },
+                    "delete_branch": {
+                        "type": "boolean",
+                        "description": "Only meaningful when `delete_worktree` is true. When true, deletes the branch the worktree was checked out at. Defaults to false.",
+                        "default": false
+                    },
+                    "force_delete": {
+                        "type": "boolean",
+                        "description": "Skip teardown scripts. Defaults to false (teardown errors abort the close).",
+                        "default": false
+                    }
+                },
+                "required": ["workspace_id"]
+            }),
+        },
+        McpTool {
+            name: "pane_close",
+            description: "Close a pane by id. Terminates the pane's PTY (for terminal panes) or marks the agent-attached browser session dismissed (for browser panes). When the closed pane was the last leaf in its surface, the surface and its tab are removed too; the workspace stays open with the remaining tabs (or with no tabs if every pane was closed).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": {
+                        "type": "string",
+                        "description": "Id of the pane to close (from `pane_list` / `workspace_info`)."
+                    }
+                },
+                "required": ["pane_id"]
+            }),
+        },
+        McpTool {
+            name: "issue_list",
+            description: "List GitHub issues for a repository using the `gh` CLI. Returns the same shape `gh issue list --json` produces (number, title, state, labels, etc.). Resolves the repo from the optional `repo_path`, otherwise from the active workspace's `project_root` or `cwd`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional absolute path to the git repository. Defaults to the active workspace's project root."
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Optional `gh issue list --search` query (e.g. \"label:bug is:open\")."
+                    }
+                }
+            }),
+        },
+        McpTool {
+            name: "issue_get",
+            description: "Fetch a single GitHub issue by number using the `gh` CLI. Returns the issue's number, title, state, body, labels, and other fields `gh issue view --json` provides. Repo resolution matches `issue_list`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "description": "Issue number.",
+                        "minimum": 1
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional absolute path to the git repository. Defaults to the active workspace's project root."
+                    }
+                },
+                "required": ["number"]
+            }),
+        },
+        McpTool {
+            name: "issue_link_workspace",
+            description: "Attach a GitHub issue to a workspace. The linked issue (number, title, state, labels) appears on the workspace card and the issue's url is exposed via `workspace_info`. Looks up the issue via `gh` against the workspace's project root.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace to attach the issue to. Defaults to the active workspace."
+                    },
+                    "number": {
+                        "type": "integer",
+                        "description": "Issue number to link.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["number"]
+            }),
+        },
     ]
 }
 
@@ -1071,6 +1170,78 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
         "preset_list" => call_socket("get_presets", json!({})).await,
 
+        // -- Lifecycle + issue tools (Phase 1.6) --
+        "workspace_close" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("workspace_close: missing required argument 'workspace_id'".to_string())
+            } else {
+                let mut params = json!({ "workspace_id": workspace_id });
+                if let Some(d) = arguments.get("delete_worktree").and_then(Value::as_bool) {
+                    params["delete_worktree"] = json!(d);
+                }
+                if let Some(d) = arguments.get("delete_branch").and_then(Value::as_bool) {
+                    params["delete_branch"] = json!(d);
+                }
+                if let Some(f) = arguments.get("force_delete").and_then(Value::as_bool) {
+                    params["force_delete"] = json!(f);
+                }
+                call_socket("close_workspace", params).await
+            }
+        }
+        "pane_close" => {
+            let pane_id = arguments
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if pane_id.is_empty() {
+                Err("pane_close: missing required argument 'pane_id'".to_string())
+            } else {
+                call_socket("close_pane", json!({ "pane_id": pane_id })).await
+            }
+        }
+        "issue_list" => {
+            let mut params = json!({});
+            if let Some(rp) = arguments.get("repo_path").and_then(Value::as_str) {
+                params["repo_path"] = json!(rp);
+            }
+            if let Some(s) = arguments.get("search").and_then(Value::as_str) {
+                params["search"] = json!(s);
+            }
+            call_socket("list_github_issues", params).await
+        }
+        "issue_get" => {
+            let number = arguments.get("number").and_then(Value::as_u64);
+            match number {
+                None => Err("issue_get: missing required argument 'number'".to_string()),
+                Some(n) => {
+                    let mut params = json!({ "number": n });
+                    if let Some(rp) = arguments.get("repo_path").and_then(Value::as_str) {
+                        params["repo_path"] = json!(rp);
+                    }
+                    call_socket("get_github_issue", params).await
+                }
+            }
+        }
+        "issue_link_workspace" => {
+            let number = arguments.get("number").and_then(Value::as_u64);
+            match number {
+                None => {
+                    Err("issue_link_workspace: missing required argument 'number'".to_string())
+                }
+                Some(n) => {
+                    let mut params = json!({ "number": n });
+                    if let Some(wid) = arguments.get("workspace_id").and_then(Value::as_str) {
+                        params["workspace_id"] = json!(wid);
+                    }
+                    call_socket("link_workspace_issue", params).await
+                }
+            }
+        }
+
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -1431,12 +1602,11 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        // Tool count bumped from 36 → 39 with the Phase 1.5 delegation
-        // primitives: worktree_create, preset_apply, preset_list. The
-        // workspace_create path-bug fix is a socket-arm patch, not a new
-        // tool. Keep this number in sync with register_tools() when
-        // adding new entries.
-        assert_eq!(tools.len(), 39);
+        // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
+        // issue tools: workspace_close, pane_close, issue_list,
+        // issue_get, issue_link_workspace. Keep this number in sync
+        // with register_tools() when adding new entries.
+        assert_eq!(tools.len(), 44);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -1474,6 +1644,13 @@ mod tests {
         assert!(names.contains(&"worktree_create"));
         assert!(names.contains(&"preset_apply"));
         assert!(names.contains(&"preset_list"));
+        // Phase 1.6 lifecycle + issue tools — pinning the contract for
+        // close/cleanup + GitHub issue browsing.
+        assert!(names.contains(&"workspace_close"));
+        assert!(names.contains(&"pane_close"));
+        assert!(names.contains(&"issue_list"));
+        assert!(names.contains(&"issue_get"));
+        assert!(names.contains(&"issue_link_workspace"));
     }
 
     #[test]
@@ -1572,10 +1749,11 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        // Bumped from 36 → 39 with the Phase 1.5 delegation primitives
-        // (worktree_create, preset_apply, preset_list). See
-        // tool_registry_has_all_tools for the canonical count.
-        assert_eq!(tools.len(), 39);
+        // Bumped from 39 → 44 with the Phase 1.6 lifecycle + issue
+        // tools (workspace_close, pane_close, issue_list, issue_get,
+        // issue_link_workspace). See tool_registry_has_all_tools for
+        // the canonical count.
+        assert_eq!(tools.len(), 44);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
