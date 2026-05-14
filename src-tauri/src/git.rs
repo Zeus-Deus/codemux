@@ -1482,13 +1482,22 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
         return false;
     };
     let expected_branch_ref = format!("refs/heads/{branch}");
+    // Compare paths as `Path`, not `&str`: on Windows `git worktree list`
+    // emits forward-slash paths (`C:/Users/...`) while our `target_path`
+    // comes from a `PathBuf` and uses backslashes (`C:\Users\...`). A raw
+    // string compare never matches there, so the reuse short-circuit in
+    // `git_create_worktree` is skipped and git re-runs `worktree add`,
+    // failing with `fatal: '<path>' already exists`. `Path` equality
+    // treats `/` and `\` as equivalent separators on Windows.
+    let target = Path::new(target_path);
+    let path_matches = |p: &Option<String>| p.as_deref().map(Path::new) == Some(target);
     let mut current_path: Option<String> = None;
     let mut current_branch: Option<String> = None;
     for raw in output.lines() {
         let line = raw.trim();
         if line.is_empty() {
             // End of a record — evaluate before resetting.
-            if current_path.as_deref() == Some(target_path)
+            if path_matches(&current_path)
                 && current_branch.as_deref() == Some(&expected_branch_ref)
             {
                 return true;
@@ -1504,8 +1513,7 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
         }
     }
     // Last record may not be terminated by a blank line.
-    current_path.as_deref() == Some(target_path)
-        && current_branch.as_deref() == Some(&expected_branch_ref)
+    path_matches(&current_path) && current_branch.as_deref() == Some(&expected_branch_ref)
 }
 
 pub fn git_create_worktree(
