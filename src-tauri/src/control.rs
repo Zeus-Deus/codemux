@@ -527,10 +527,45 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
 
 async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
-        "status" => Ok(serde_json::json!({
-            "socket_path": control_socket_path().map(|path| path.display().to_string()),
-            "protocol_version": CONTROL_PROTOCOL_VERSION
-        })),
+        "status" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let snap = state.snapshot();
+            // Workspace summary: id + title + cwd for every open workspace.
+            // Kept tight on purpose — a brain doing `app_status` wants a
+            // one-line description per workspace, not the full git/tab
+            // shape. Use `workspace_list` / `workspace_info` for the rest.
+            let workspaces: Vec<Value> = snap
+                .workspaces
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "workspace_id": w.workspace_id.0,
+                        "title": w.title,
+                        "cwd": w.cwd,
+                    })
+                })
+                .collect();
+            // Focused pane: the active workspace's active surface's active
+            // pane id. None when there's no open workspace.
+            let focused_pane = snap
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == snap.active_workspace_id)
+                .and_then(|w| {
+                    w.surfaces
+                        .iter()
+                        .find(|s| s.surface_id == w.active_surface_id)
+                        .map(|s| s.active_pane_id.0.clone())
+                });
+            Ok(serde_json::json!({
+                "socket_path": control_socket_path().map(|path| path.display().to_string()),
+                "protocol_version": CONTROL_PROTOCOL_VERSION,
+                "app_version": env!("CARGO_PKG_VERSION"),
+                "active_workspace_id": snap.active_workspace_id.0,
+                "focused_pane_id": focused_pane,
+                "workspaces": workspaces,
+            }))
+        }
         "get_app_state" => {
             let state: State<'_, AppStateStore> = app.state();
             serde_json::to_value(state.snapshot()).map_err(|error| error.to_string())
@@ -538,7 +573,18 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "create_workspace" => {
             let state: State<'_, AppStateStore> = app.state();
             let db: State<'_, crate::database::DatabaseStore> = app.state();
-            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, None)
+            // Phase 1.5 fix: the MCP `workspace_create` tool advertises an
+            // optional `path` argument in its schema and the MCP dispatcher
+            // (mcp_server.rs::workspace_create) packs it into params, but
+            // this arm previously hardcoded `None` — so every call landed
+            // at `current_project_root()` regardless of what the brain
+            // asked for. Reading the param closes the silent-drop.
+            let path = request
+                .params
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, path)
                 .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
         }
         "split_pane" => {
@@ -572,6 +618,95 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 initial_prompt,
             )
             .map(|()| serde_json::json!({ "ok": true }))
+        }
+        "create_worktree_workspace" => {
+            // Phase 1.5: backs the `worktree_create` MCP tool. The
+            // underlying impl already handles git worktree + workspace
+            // hydration + PTY spawn + setup scripts + .mcp.json autoconfig
+            // + preset launch with prompt injection in one atomic call —
+            // we only parse params and pass through.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let pty_state: State<'_, PtyState> = app.state();
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let repo_path = request
+                .params
+                .get("repo_path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: repo_path".to_string());
+            let branch = request
+                .params
+                .get("branch")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: branch".to_string());
+            // Defaults match Phase 1.5 plan §5: new_branch=true so the
+            // brain's natural "spin up a new feature branch" flow doesn't
+            // need an extra arg, base="main" since that's where almost
+            // every project forks from, layout="single" because the brain
+            // typically wants one terminal pane to attach a CLI agent to.
+            let new_branch = request
+                .params
+                .get("new_branch")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let base = request
+                .params
+                .get("base")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some("main".to_string()));
+            let layout = request
+                .params
+                .get("layout")
+                .and_then(Value::as_str)
+                .unwrap_or("single")
+                .to_string();
+            let initial_prompt = request
+                .params
+                .get("initial_prompt")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let agent_preset_id = request
+                .params
+                .get("agent_preset_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let pr_number = request
+                .params
+                .get("pr_number")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32);
+            match (repo_path, branch) {
+                (Ok(rp), Ok(br)) => crate::commands::workspace::create_worktree_workspace_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    &pty_state,
+                    &presets,
+                    rp,
+                    br,
+                    new_branch,
+                    base,
+                    layout,
+                    initial_prompt,
+                    agent_preset_id,
+                    pr_number,
+                )
+                .await
+                .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id })),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+        "get_presets" => {
+            // Phase 1.5: backs the `preset_list` MCP tool. Returns the
+            // preset registry enriched with `commands_available` so the
+            // brain can pre-filter to agents whose CLI is actually on
+            // PATH before calling `preset_apply` or `worktree_create`.
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let entries = crate::commands::presets::list_presets_with_availability(&presets);
+            Ok(serde_json::json!({ "presets": entries }))
         }
         "create_browser_pane" => {
             let state: State<'_, AppStateStore> = app.state();
@@ -614,6 +749,139 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             let data = request.params.get("data").and_then(Value::as_str).unwrap_or_default().to_string();
             crate::terminal::write_to_pty(pty_state, app_state, data, session_id)
                 .map(|_| serde_json::json!({ "written": true }))
+        }
+        "read_terminal" => {
+            let pty_state: State<'_, PtyState> = app.state();
+            let app_state: State<'_, AppStateStore> = app.state();
+            let session_id = request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // `lines` is optional and capped inside `read_terminal_output` so a
+            // hostile or sloppy caller can't ask for 10M lines. We accept any
+            // non-negative integer and let the helper clamp to its own
+            // READ_TERMINAL_MAX_LINES.
+            let lines = request
+                .params
+                .get("lines")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize);
+            crate::terminal::read_terminal_output(
+                pty_state.inner(),
+                app_state.inner(),
+                lines,
+                session_id,
+            )
+            .and_then(|out| serde_json::to_value(out).map_err(|e| e.to_string()))
+        }
+        "activate_workspace" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
+            workspace_id.and_then(|ws_id| {
+                // Reuse the in-app workspace-switch path so the socket / MCP
+                // surface gets identical side effects: git refresh, PTY
+                // hydration, app-state emit, persisted ui_state. See
+                // `activate_workspace_impl` for the full breakdown.
+                crate::commands::workspace::activate_workspace_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    ws_id.clone(),
+                )
+                .map(|_| serde_json::json!({ "workspace_id": ws_id, "activated": true }))
+            })
+        }
+        "close_workspace" => {
+            // Phase 1.6: backs the `workspace_close` MCP tool. Wraps the
+            // existing `close_workspace_with_worktree_impl` so both the
+            // Tauri command and the socket arm share teardown, PTY
+            // termination, agent-chat shutdown, virtual-display release,
+            // and (when requested) `git worktree remove`. Safe default:
+            // `delete_worktree=false` — closing never destroys a worktree
+            // unless the brain asks for it.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
+            let delete_worktree = request
+                .params
+                .get("delete_worktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let delete_branch = request.params.get("delete_branch").and_then(Value::as_bool);
+            let force = request.params.get("force_delete").and_then(Value::as_bool);
+            match workspace_id {
+                Ok(ws_id) => crate::commands::workspace::close_workspace_with_worktree_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    ws_id.clone(),
+                    delete_worktree,
+                    delete_branch,
+                    force,
+                )
+                .await
+                .map(|_| {
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "closed": true,
+                        "worktree_removed": delete_worktree,
+                    })
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        "close_pane" => {
+            // Phase 1.6: backs the `pane_close` MCP tool. Wraps the
+            // existing `close_pane_impl`. State-layer `close_pane`
+            // handles the last-pane case by removing the surface + tab;
+            // workspace stays open until explicitly closed.
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request
+                .params
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: pane_id".to_string());
+            pane_id.and_then(|pid| {
+                crate::commands::workspace::close_pane_impl(app.clone(), &state, pid.clone())
+                    .map(|removed_session_id| {
+                        serde_json::json!({
+                            "pane_id": pid,
+                            "closed": true,
+                            "removed_session_id": removed_session_id,
+                        })
+                    })
+            })
+        }
+        "port_list" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let workspace_filter = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let snap = state.snapshot();
+            // Filter on `workspace_id` when provided; otherwise return every
+            // detected port. `detected_ports` carries the same fields as
+            // `ports::PortInfo` plus the workspace association the detector
+            // assigns, so the wire payload is identical to what the UI's
+            // ports panel sees.
+            let ports = filter_ports_by_workspace(&snap.detected_ports, workspace_filter.as_deref());
+            serde_json::to_value(&ports)
+                .map(|ports_json| serde_json::json!({ "ports": ports_json }))
+                .map_err(|e| e.to_string())
         }
         "browser_automation" => {
             let state: State<'_, AppStateStore> = app.state();
@@ -988,6 +1256,28 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
     }
 }
 
+/// Filter `ports` to entries whose `workspace_id` matches `workspace_filter`.
+/// `None` returns every detected port. Pulled out as a free function so the
+/// `port_list` socket-command logic can be exercised in unit tests without
+/// having to stand up an `AppStateStore` + Tauri runtime.
+///
+/// The vexis-agent integration calls this through the `port_list` MCP tool
+/// — see `mcp_server.rs::handle_tool_call` — and relies on the filter
+/// semantics being strict: a port without a `workspace_id` MUST NOT match
+/// any workspace filter, even an empty-string filter.
+fn filter_ports_by_workspace<'a>(
+    ports: &'a [crate::state::PortInfoSnapshot],
+    workspace_filter: Option<&str>,
+) -> Vec<&'a crate::state::PortInfoSnapshot> {
+    ports
+        .iter()
+        .filter(|p| match workspace_filter {
+            Some(filter) => p.workspace_id.as_deref() == Some(filter),
+            None => true,
+        })
+        .collect()
+}
+
 /// Resolve the repo path for control socket commands.
 /// Checks `repo_path` param first, then falls back to active workspace's project_root/cwd.
 fn resolve_control_repo_path(
@@ -1020,6 +1310,70 @@ fn resolve_control_repo_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::PortInfoSnapshot;
+
+    fn port(port: u16, ws: Option<&str>, label: Option<&str>) -> PortInfoSnapshot {
+        PortInfoSnapshot {
+            port,
+            pid: 1000 + port as u32,
+            process_name: format!("proc-{port}"),
+            workspace_id: ws.map(str::to_string),
+            label: label.map(str::to_string),
+        }
+    }
+
+    // ─── port_list filter (socket command behaviour) ────────────────────
+    //
+    // The `port_list` socket command runs this filter directly on
+    // `AppStateSnapshot::detected_ports`. The MCP tool of the same name
+    // forwards the optional `workspace_id` argument unchanged, so anything
+    // we promise here is also the MCP-tool contract.
+
+    #[test]
+    fn port_list_filter_no_filter_returns_all() {
+        let ports = vec![
+            port(3000, Some("ws-a"), Some("next")),
+            port(8080, None, None),
+            port(4173, Some("ws-b"), Some("vite")),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, None);
+        assert_eq!(filtered.len(), 3);
+    }
+
+    #[test]
+    fn port_list_filter_by_workspace_id() {
+        let ports = vec![
+            port(3000, Some("ws-a"), Some("next")),
+            port(8080, None, None),
+            port(4173, Some("ws-b"), Some("vite")),
+            port(5173, Some("ws-a"), Some("vite")),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, Some("ws-a"));
+        let ports_only: Vec<u16> = filtered.iter().map(|p| p.port).collect();
+        assert_eq!(ports_only, vec![3000, 5173]);
+    }
+
+    #[test]
+    fn port_list_filter_excludes_unscoped_ports() {
+        // A port with no `workspace_id` must NOT match any workspace filter
+        // — including an empty-string filter — otherwise vexis-agent's
+        // brain sees "ports owned by no workspace" leak into a workspace
+        // query. The bug would be silent on the wire (just extra ports)
+        // but very confusing for the agent.
+        let ports = vec![port(8080, None, None), port(3000, Some("ws-a"), None)];
+        let filtered = filter_ports_by_workspace(&ports, Some(""));
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn port_list_filter_unknown_workspace_returns_empty() {
+        let ports = vec![
+            port(3000, Some("ws-a"), None),
+            port(4173, Some("ws-b"), None),
+        ];
+        let filtered = filter_ports_by_workspace(&ports, Some("ws-nonexistent"));
+        assert!(filtered.is_empty());
+    }
 
     /// Tiny echo handler used by the round-trip tests: reads one line at a
     /// time and writes it back unchanged. Mirrors the real `handle_client`

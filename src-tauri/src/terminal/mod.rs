@@ -1782,6 +1782,121 @@ pub fn write_to_pty_by_session_direct(
     )
 }
 
+/// Hard cap on `lines` that `read_terminal_output` will return. Guards against
+/// an MCP client asking for the entire 256 MiB pending-output buffer in one
+/// shot, which would (a) be useless to the agent and (b) bloat the JSON-RPC
+/// response over the stdio transport. Matches `terminal_read` MCP-tool docs.
+pub const READ_TERMINAL_MAX_LINES: usize = 5000;
+
+/// Default line count when `terminal_read` is called without an explicit
+/// `lines` argument. Sized so a typical "what's on screen right now" snapshot
+/// (a few hundred lines of agent output + tool calls) fits without truncation
+/// but the response stays compact.
+pub const READ_TERMINAL_DEFAULT_LINES: usize = 200;
+
+/// Outcome of a `read_terminal_output` call. Mirrors `write_to_pty`'s
+/// request/response shape (session_id resolution semantics, error type), but
+/// returns the buffered text plus how many lines were actually included so
+/// callers can detect truncation without diffing line counts themselves.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReadTerminalOutput {
+    pub session_id: String,
+    pub data: String,
+    pub lines_returned: usize,
+    pub total_lines: usize,
+    pub truncated: bool,
+}
+
+/// Read the most recent `requested_lines` (clamped to `READ_TERMINAL_MAX_LINES`)
+/// of PTY output from a session's in-memory `pending_output` buffer.
+///
+/// This is the read side of the MCP `terminal_read` tool. The buffer is the
+/// same rolling chunk deque that `attach_pty_output` replays to the frontend
+/// on workspace re-attach — it grows on every PTY chunk and is evicted FIFO at
+/// `OUTPUT_BUFFER_BYTE_LIMIT` (256 MiB in release builds), so this helper sees
+/// the same scrollback the user would see in the terminal pane minus anything
+/// the eviction loop has already discarded.
+///
+/// Output bytes are decoded with `from_utf8_lossy` and split on `\n`. Trailing
+/// `\r` from CRLF endings is stripped per line so agents reading the response
+/// don't have to handle Windows-style line endings themselves. Empty lines are
+/// preserved.
+pub fn read_terminal_output(
+    terminal_state: &PtyState,
+    app_state: &AppStateStore,
+    requested_lines: Option<usize>,
+    session_id: Option<String>,
+) -> Result<ReadTerminalOutput, String> {
+    let session_id = session_id
+        .or_else(|| {
+            app_state
+                .active_terminal_session_id()
+                .map(|session| session.0)
+        })
+        .ok_or_else(|| "No active terminal session found".to_string())?;
+
+    let line_cap = requested_lines
+        .unwrap_or(READ_TERMINAL_DEFAULT_LINES)
+        .min(READ_TERMINAL_MAX_LINES)
+        .max(1);
+
+    let chunks = {
+        let guard = terminal_state
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let runtime = guard
+            .get(&session_id)
+            .ok_or_else(|| format!("Terminal session {session_id} not found"))?;
+        runtime
+            .pending_output
+            .iter()
+            .cloned()
+            .collect::<Vec<Vec<u8>>>()
+    };
+
+    let total_bytes: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut combined = Vec::with_capacity(total_bytes);
+    for chunk in &chunks {
+        combined.extend_from_slice(chunk);
+    }
+    let (data, total_lines, lines_returned, truncated) = tail_pty_output(&combined, line_cap);
+
+    Ok(ReadTerminalOutput {
+        session_id,
+        data,
+        lines_returned,
+        total_lines,
+        truncated,
+    })
+}
+
+/// Pure helper used by `read_terminal_output` (and exercised directly in unit
+/// tests). Decodes raw PTY bytes with `from_utf8_lossy`, strips trailing
+/// `\r` from CRLF-terminated lines, and returns the last `line_cap` lines
+/// joined with `\n`.
+///
+/// Returns `(joined_text, total_lines, lines_returned, truncated)`. `truncated`
+/// is true iff we dropped any leading lines to fit under the cap.
+///
+/// Split out from `read_terminal_output` so the line-tailing contract can be
+/// tested without standing up a `PtyState` + `AppStateStore` + `tauri::State`
+/// — the rest of the read path is just lookup + state plumbing.
+pub fn tail_pty_output(raw: &[u8], line_cap: usize) -> (String, usize, usize, bool) {
+    let text = String::from_utf8_lossy(raw);
+    let lines: Vec<&str> = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    let total_lines = lines.len();
+    let cap = line_cap.max(1);
+    let start = total_lines.saturating_sub(cap);
+    let returned = &lines[start..];
+    let data = returned.join("\n");
+    let lines_returned = returned.len();
+    (data, total_lines, lines_returned, start > 0)
+}
+
 #[tauri::command]
 pub fn resize_pty(
     _app: AppHandle,
@@ -4404,5 +4519,247 @@ mod tests {
             // None without mocking the crate. The spawn path now fails
             // loudly (Fix 2). Documented as untested.
         }
+    }
+
+    // ── tail_pty_output (terminal_read core) ───────────────────────────
+    //
+    // `tail_pty_output` is the pure line-tailing helper inside
+    // `read_terminal_output`, which is the body of the `read_terminal`
+    // socket command and the `terminal_read` MCP tool. Anything we
+    // assert here is also the wire-format contract those callers see.
+
+    #[test]
+    fn tail_pty_output_empty_input() {
+        let (data, total, returned, truncated) = tail_pty_output(b"", 200);
+        // `"".split('\n')` yields a single empty string, so we report
+        // exactly one line. This is intentional — it gives the caller a
+        // stable invariant: total_lines >= 1 always.
+        assert_eq!(data, "");
+        assert_eq!(total, 1);
+        assert_eq!(returned, 1);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn tail_pty_output_under_cap_returns_all() {
+        let raw = b"alpha\nbeta\ngamma";
+        let (data, total, returned, truncated) = tail_pty_output(raw, 200);
+        assert_eq!(data, "alpha\nbeta\ngamma");
+        assert_eq!(total, 3);
+        assert_eq!(returned, 3);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn tail_pty_output_strips_crlf() {
+        // PTYs running on Windows or programs that explicitly emit CRLF
+        // (some agents, some shells) shouldn't leave \r at the end of
+        // every line in the MCP response. tail_pty_output normalizes.
+        let raw = b"first\r\nsecond\r\nthird";
+        let (data, total, _returned, _truncated) = tail_pty_output(raw, 200);
+        assert_eq!(data, "first\nsecond\nthird");
+        assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn tail_pty_output_caps_to_last_n_lines() {
+        // Build 10 lines, ask for last 3 — must return the trailing
+        // window and flag `truncated=true` so the caller can detect
+        // it without diffing counts.
+        let raw = (1..=10)
+            .map(|i| format!("line-{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (data, total, returned, truncated) = tail_pty_output(raw.as_bytes(), 3);
+        assert_eq!(data, "line-8\nline-9\nline-10");
+        assert_eq!(total, 10);
+        assert_eq!(returned, 3);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn tail_pty_output_zero_cap_is_treated_as_one() {
+        // The MCP schema constrains `lines` to >= 1, but defensively the
+        // helper clamps 0 to 1 so a buggy caller can't trip an index
+        // panic in `lines[start..]`.
+        let raw = b"alpha\nbeta\ngamma";
+        let (_data, _total, returned, _truncated) = tail_pty_output(raw, 0);
+        assert_eq!(returned, 1);
+    }
+
+    #[test]
+    fn tail_pty_output_invalid_utf8_is_lossy() {
+        // PTY bytes can be raw and partial — a half-decoded UTF-8 sequence
+        // must not panic. `from_utf8_lossy` replaces invalid sequences
+        // with U+FFFD, which is fine for an agent reading the response.
+        let raw = b"alpha\n\xFF\xFE\xFD\nbeta";
+        let (data, total, returned, _) = tail_pty_output(raw, 200);
+        assert!(data.starts_with("alpha\n"));
+        assert!(data.ends_with("\nbeta"));
+        assert_eq!(total, 3);
+        assert_eq!(returned, 3);
+    }
+
+    // ── read_terminal_output integration ───────────────────────────────
+    //
+    // Exercises the full PtyState lookup → chunk-collect → tail path,
+    // bypassing the Tauri State wrapper since `read_terminal_output`
+    // takes plain `&PtyState`/`&AppStateStore` refs. Guards the
+    // `read_terminal` socket command against regressions in the
+    // session-resolution and pending-output-aggregation logic.
+
+    #[test]
+    fn read_terminal_output_missing_session_errors() {
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+        let err = read_terminal_output(&pty, &app, None, Some("does-not-exist".to_string()))
+            .expect_err("missing session must error");
+        assert!(err.contains("does-not-exist"));
+    }
+
+    #[test]
+    fn read_terminal_output_no_active_session_errors() {
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+        // `default_app_state()` seeds a CWD workspace with an active
+        // surface, so `active_terminal_session_id()` returns Some.
+        // Wipe that so the no-active-session fallback fires — vexis-agent
+        // calls `terminal_read` without a session_id when it wants the
+        // focused pane, and we need a stable error if nothing is focused.
+        app.clear_workspaces();
+        let err = read_terminal_output(&pty, &app, None, None)
+            .expect_err("no active session must error");
+        assert!(
+            err.to_lowercase().contains("no active"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_terminal_output_concatenates_chunks() {
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-read",
+            || SessionRuntime::new("sess-read"),
+            |runtime| {
+                // Simulate two PTY chunks: the agent's prompt and a tool
+                // output line. The helper should glue them together in
+                // order, not interleave or sort.
+                runtime.pending_output.push_back(b"hello\n".to_vec());
+                runtime.pending_output.push_back(b"world".to_vec());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, Some(10), Some("sess-read".to_string())).unwrap();
+        assert_eq!(out.session_id, "sess-read");
+        assert_eq!(out.data, "hello\nworld");
+        assert_eq!(out.total_lines, 2);
+        assert_eq!(out.lines_returned, 2);
+        assert!(!out.truncated);
+    }
+
+    #[test]
+    fn read_terminal_output_default_when_lines_none() {
+        // The `read_terminal` socket-command arm passes `lines` straight
+        // through as `Option<usize>`. When the MCP caller omits the
+        // argument entirely, this must use `READ_TERMINAL_DEFAULT_LINES`
+        // (200) — not 0, not the cap. Builds 250 lines of buffered
+        // output and asks for the default; expect 200 returned with
+        // `truncated=true` and 250 total.
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-default",
+            || SessionRuntime::new("sess-default"),
+            |runtime| {
+                let bulk = (1..=250)
+                    .map(|i| format!("ln-{i}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                runtime.pending_output.push_back(bulk.into_bytes());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, None, Some("sess-default".to_string())).unwrap();
+        assert_eq!(
+            out.lines_returned, READ_TERMINAL_DEFAULT_LINES,
+            "default line count must be {READ_TERMINAL_DEFAULT_LINES}"
+        );
+        assert!(out.truncated, "older lines beyond the default must be dropped");
+        // 250 lines of "ln-N\n" + the trailing empty split = 251 total.
+        assert_eq!(out.total_lines, 251);
+    }
+
+    #[test]
+    fn read_terminal_output_clamps_to_max() {
+        // Even if the dispatcher passes `Some(usize::MAX)` (a brain
+        // ignoring the schema cap), the helper must clamp to
+        // `READ_TERMINAL_MAX_LINES` (5000). Asks for 1_000_000 lines
+        // against a tiny buffer; expect the full buffer back (since
+        // it's under the cap) but also assert the cap path was taken
+        // by checking the helper accepted a value larger than the cap
+        // without panicking and without returning more than the cap.
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-clamp",
+            || SessionRuntime::new("sess-clamp"),
+            |runtime| {
+                // 6000 lines so we can prove the cap fires.
+                let bulk = (1..=6000)
+                    .map(|i| format!("ln-{i}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                runtime.pending_output.push_back(bulk.into_bytes());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, Some(1_000_000), Some("sess-clamp".to_string()))
+                .unwrap();
+        assert_eq!(
+            out.lines_returned, READ_TERMINAL_MAX_LINES,
+            "must clamp to READ_TERMINAL_MAX_LINES ({READ_TERMINAL_MAX_LINES})"
+        );
+        assert!(out.truncated);
+    }
+
+    #[test]
+    fn read_terminal_output_applies_line_cap() {
+        let pty = PtyState::default();
+        let app = crate::state::AppStateStore::default();
+
+        with_session_runtime(
+            &pty.sessions,
+            "sess-cap",
+            || SessionRuntime::new("sess-cap"),
+            |runtime| {
+                let bulk = (1..=10)
+                    .map(|i| format!("ln-{i}\n"))
+                    .collect::<Vec<_>>()
+                    .join("");
+                runtime.pending_output.push_back(bulk.into_bytes());
+            },
+        );
+
+        let out =
+            read_terminal_output(&pty, &app, Some(3), Some("sess-cap".to_string())).unwrap();
+        // Last 3 of "ln-1..ln-10\n" — the trailing empty line counts, so
+        // the cap-3 window is "ln-9", "ln-10", "" → joined "ln-9\nln-10\n".
+        // Truncated must be true so the caller knows older lines exist.
+        assert!(out.truncated);
+        assert_eq!(out.lines_returned, 3);
+        assert!(out.data.contains("ln-9"));
+        assert!(out.data.contains("ln-10"));
+        assert!(!out.data.contains("ln-7"));
     }
 }

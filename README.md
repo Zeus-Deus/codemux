@@ -56,6 +56,10 @@ chmod +x Codemux-*.AppImage
 
 Split panes with keybinds, open a browser pane for testing, and use the changes panel to review diffs and commit when ready.
 
+## MCP Server
+
+Codemux ships an MCP server (`codemux mcp`) that lets any MCP-compatible client drive a running Codemux app programmatically — managing workspaces and git worktrees, launching agent presets, reading and writing terminals, controlling the browser pane, and browsing GitHub issues. It's bundled with the binary; no separate install. See the [MCP Server docs](https://docs.codemux.org/mcp-server) for setup and the full tool surface.
+
 ## Build from Source
 
 ```bash

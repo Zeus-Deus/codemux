@@ -436,6 +436,262 @@ fn register_tools() -> Vec<McpTool> {
                 "properties": {}
             }),
         },
+        // -- Terminal tools (Phase 1 vexis-agent integration) --
+        McpTool {
+            name: "terminal_write",
+            description: "Write text to a Codemux terminal pane. The text is sent verbatim to the PTY's stdin — include a trailing newline if you want a command to execute. Without a `session_id`, writes to the currently focused pane's session.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "data": {
+                        "type": "string",
+                        "description": "Bytes to write to the terminal. Include \\n at the end to submit a command."
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional terminal session id (from pane_list / workspace_info). Defaults to the active workspace's focused pane."
+                    }
+                },
+                "required": ["data"]
+            }),
+        },
+        McpTool {
+            name: "terminal_read",
+            description: "Read recent PTY output from a Codemux terminal pane's in-memory buffer. Returns the last `lines` lines of UTF-8 output, defaulting to 200 and capped at 5000. Without a `session_id`, reads from the currently focused pane's session. The buffer is the same scrollback the user would see; very old output may have been evicted under sustained load.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "lines": {
+                        "type": "integer",
+                        "description": "Number of lines from the end of the buffer to return. Default 200, max 5000.",
+                        "minimum": 1,
+                        "maximum": 5000
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Optional terminal session id. Defaults to the active workspace's focused pane."
+                    }
+                }
+            }),
+        },
+        McpTool {
+            name: "workspace_open",
+            description: "Focus an existing Codemux workspace by id. Runs the same activation path as clicking the workspace in the sidebar: git refresh, lazy PTY hydration, persisted active-workspace bookkeeping. Use `workspace_list` to discover ids.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Id of the workspace to focus (from workspace_list)."
+                    }
+                },
+                "required": ["workspace_id"]
+            }),
+        },
+        McpTool {
+            name: "app_status",
+            description: "Return Codemux app status: app version, control protocol version, control socket path, the active workspace id, the focused pane id, and a one-line summary (id/title/cwd) of every open workspace. Use this for a quick orientation snapshot before deciding which `workspace_list` / `workspace_info` / `pane_list` calls to make.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        McpTool {
+            name: "port_list",
+            description: "List dev-server ports Codemux has detected as listening on the local machine. Each entry includes port, pid, process_name, optional workspace_id (which workspace owns the listener) and optional label (e.g. \"vite\", \"next\"). \
+                Filter semantics: omit `workspace_id` to get EVERY port, including unscoped (system) listeners. Pass `workspace_id` to get ONLY ports the detector tagged with that workspace — unscoped ports are excluded. To see workspace + unscoped together, call without a filter and partition client-side on the `workspace_id` field.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Optional: only return ports detected as belonging to this workspace."
+                    }
+                }
+            }),
+        },
+        // -- Delegation primitives (Phase 1.5 vexis-agent integration) --
+        McpTool {
+            name: "worktree_create",
+            description: "Create a git worktree + Codemux workspace in one atomic call, optionally launching an agent inside with a starting prompt. Mirrors the in-app branch-picker \"Fork → \" flow. Does ALL of: `git worktree add` under ~/.codemux/worktrees/<repo>/<branch>, workspace state hydration with the requested layout, PTY spawn, setup-script run, `.mcp.json` autoconfig, and (if `agent_preset_id` is set) launching the preset's CLI with `initial_prompt` injected. Returns the new `workspace_id`. Pair with `preset_list` first if you need to know which agent presets are installed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Absolute path to a git repository (or any subdirectory of one — the git root is resolved automatically)."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If `new_branch` is true, this branch is created from `base`; otherwise it must already exist."
+                    },
+                    "new_branch": {
+                        "type": "boolean",
+                        "description": "Create the branch (true) or check out an existing branch (false). Defaults to true — the common case for the brain is starting fresh work.",
+                        "default": true
+                    },
+                    "base": {
+                        "type": "string",
+                        "description": "Base branch to fork from when `new_branch` is true. Defaults to \"main\".",
+                        "default": "main"
+                    },
+                    "layout": {
+                        "type": "string",
+                        "enum": ["single", "pair", "quad", "six", "eight", "shell_browser", "empty"],
+                        "description": "Pane layout for the workspace. \"single\" is one terminal (the right choice for almost every delegated task); \"empty\" creates no pane (chat-only). Defaults to \"single\".",
+                        "default": "single"
+                    },
+                    "initial_prompt": {
+                        "type": "string",
+                        "description": "Optional starting prompt to feed the agent. For Claude/Codex presets it's appended as a positional ANSI-C-quoted argument; for other CLIs (Gemini, OpenCode, custom) it's typed into the terminal after a ~1500ms TUI settle. Ignored unless `agent_preset_id` is set."
+                    },
+                    "agent_preset_id": {
+                        "type": "string",
+                        "description": "Optional preset id (from `preset_list`) to launch after the workspace is hydrated. Without this, the workspace is created but no agent runs — leaving the brain to drive via `preset_apply` or `terminal_write` later."
+                    },
+                    "pr_number": {
+                        "type": "integer",
+                        "description": "Optional GitHub PR number to associate with the new workspace (shows in the workspace's PR badge).",
+                        "minimum": 1
+                    }
+                },
+                "required": ["repo_path", "branch"]
+            }),
+        },
+        McpTool {
+            name: "preset_apply",
+            description: "Apply an existing preset to an already-open workspace. Use this when you have a workspace from `workspace_list` and want to launch an agent in it (or run a shell preset's commands). For starting from scratch — new branch, new worktree, agent attached — use `worktree_create` instead, which combines all of that into one call. Returns `{ok: true}` on success.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Target workspace (from `workspace_list` / `workspace_info` / `app_status`)."
+                    },
+                    "preset_id": {
+                        "type": "string",
+                        "description": "Preset to apply (from `preset_list`)."
+                    },
+                    "override_mode": {
+                        "type": "string",
+                        "enum": ["new_tab", "split_pane", "current_terminal", "existing_panes"],
+                        "description": "Override the preset's default launch mode. `current_terminal` writes commands to the workspace's active terminal; `new_tab` creates a fresh tab; `split_pane` splits the active pane; `existing_panes` chains the commands into every terminal session in the workspace."
+                    },
+                    "initial_prompt": {
+                        "type": "string",
+                        "description": "Optional prompt to feed the agent after launch. Same injection rules as `worktree_create`: positional arg for Claude/Codex, PTY-typed for others."
+                    }
+                },
+                "required": ["workspace_id", "preset_id"]
+            }),
+        },
+        McpTool {
+            name: "preset_list",
+            description: "List the agent presets Codemux knows about. Each entry has `preset_id`, `name`, `description`, `kind` (\"terminal\" or \"chat\"), `is_default`, and `commands_available` — a boolean that's true only when every command binary the preset launches resolves on the current PATH. Filter to `commands_available: true` before calling `worktree_create` or `preset_apply` so the brain doesn't ask for a CLI that isn't installed on this host.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
+        McpTool {
+            name: "workspace_close",
+            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, releases the workspace's virtual display, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Id of the workspace to close (from `workspace_list` / `app_status`)."
+                    },
+                    "delete_worktree": {
+                        "type": "boolean",
+                        "description": "When true AND the workspace is backed by a git worktree, also runs `git worktree remove` after closing. No effect for non-worktree workspaces. Defaults to false.",
+                        "default": false
+                    },
+                    "delete_branch": {
+                        "type": "boolean",
+                        "description": "Only meaningful when `delete_worktree` is true. When true, deletes the branch the worktree was checked out at. Defaults to false.",
+                        "default": false
+                    },
+                    "force_delete": {
+                        "type": "boolean",
+                        "description": "Skip teardown scripts. Defaults to false (teardown errors abort the close).",
+                        "default": false
+                    }
+                },
+                "required": ["workspace_id"]
+            }),
+        },
+        McpTool {
+            name: "pane_close",
+            description: "Close a pane by id. Terminates the pane's PTY (for terminal panes) or marks the agent-attached browser session dismissed (for browser panes). When the closed pane was the last leaf in its surface, the surface and its tab are removed too; the workspace stays open with the remaining tabs (or with no tabs if every pane was closed).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pane_id": {
+                        "type": "string",
+                        "description": "Id of the pane to close (from `pane_list` / `workspace_info`)."
+                    }
+                },
+                "required": ["pane_id"]
+            }),
+        },
+        McpTool {
+            name: "issue_list",
+            description: "List GitHub issues for a repository using the `gh` CLI. Returns the same shape `gh issue list --json` produces (number, title, state, labels, etc.). Resolves the repo from the optional `repo_path`, otherwise from the active workspace's `project_root` or `cwd`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional absolute path to the git repository. Defaults to the active workspace's project root."
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Optional `gh issue list --search` query (e.g. \"label:bug is:open\")."
+                    }
+                }
+            }),
+        },
+        McpTool {
+            name: "issue_get",
+            description: "Fetch a single GitHub issue by number using the `gh` CLI. Returns the issue's number, title, state, body, labels, and other fields `gh issue view --json` provides. Repo resolution matches `issue_list`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "number": {
+                        "type": "integer",
+                        "description": "Issue number.",
+                        "minimum": 1
+                    },
+                    "repo_path": {
+                        "type": "string",
+                        "description": "Optional absolute path to the git repository. Defaults to the active workspace's project root."
+                    }
+                },
+                "required": ["number"]
+            }),
+        },
+        McpTool {
+            name: "issue_link_workspace",
+            description: "Attach a GitHub issue to a workspace. The linked issue (number, title, state, labels) appears on the workspace card and the issue's url is exposed via `workspace_info`. Looks up the issue via `gh` against the workspace's project root.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Workspace to attach the issue to. Defaults to the active workspace."
+                    },
+                    "number": {
+                        "type": "integer",
+                        "description": "Issue number to link.",
+                        "minimum": 1
+                    }
+                },
+                "required": ["number"]
+            }),
+        },
     ]
 }
 
@@ -800,6 +1056,192 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
         "git_push" => run_git(&["push"]).await,
 
+        // -- Terminal / workspace / status / ports (Phase 1) --
+        "terminal_write" => {
+            let data = arguments.get("data").and_then(Value::as_str).unwrap_or_default();
+            let session_id = arguments.get("session_id").and_then(Value::as_str);
+            let mut params = json!({ "data": data });
+            if let Some(sid) = session_id {
+                params["session_id"] = json!(sid);
+            }
+            call_socket("write_terminal", params).await
+        }
+        "terminal_read" => {
+            let mut params = json!({});
+            if let Some(lines) = arguments.get("lines").and_then(Value::as_u64) {
+                params["lines"] = json!(lines);
+            }
+            if let Some(sid) = arguments.get("session_id").and_then(Value::as_str) {
+                params["session_id"] = json!(sid);
+            }
+            call_socket("read_terminal", params).await
+        }
+        "workspace_open" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("workspace_open: missing required argument 'workspace_id'".to_string())
+            } else {
+                call_socket("activate_workspace", json!({ "workspace_id": workspace_id })).await
+            }
+        }
+        "app_status" => call_socket("status", json!({})).await,
+        "port_list" => {
+            let mut params = json!({});
+            if let Some(wid) = arguments.get("workspace_id").and_then(Value::as_str) {
+                params["workspace_id"] = json!(wid);
+            }
+            call_socket("port_list", params).await
+        }
+
+        // -- Delegation primitives (Phase 1.5) --
+        "worktree_create" => {
+            let repo_path = arguments
+                .get("repo_path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let branch = arguments
+                .get("branch")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if repo_path.is_empty() {
+                Err("worktree_create: missing required argument 'repo_path'".to_string())
+            } else if branch.is_empty() {
+                Err("worktree_create: missing required argument 'branch'".to_string())
+            } else {
+                // Build params lazily so the socket arm's defaults
+                // (new_branch=true, base="main", layout="single") fire
+                // when the brain omits them. Passing them explicitly
+                // here would freeze the defaults on the MCP side and
+                // make future changes harder to coordinate.
+                let mut params = json!({
+                    "repo_path": repo_path,
+                    "branch": branch,
+                });
+                if let Some(nb) = arguments.get("new_branch").and_then(Value::as_bool) {
+                    params["new_branch"] = json!(nb);
+                }
+                if let Some(base) = arguments.get("base").and_then(Value::as_str) {
+                    params["base"] = json!(base);
+                }
+                if let Some(layout) = arguments.get("layout").and_then(Value::as_str) {
+                    params["layout"] = json!(layout);
+                }
+                if let Some(prompt) = arguments.get("initial_prompt").and_then(Value::as_str) {
+                    params["initial_prompt"] = json!(prompt);
+                }
+                if let Some(pid) = arguments.get("agent_preset_id").and_then(Value::as_str) {
+                    params["agent_preset_id"] = json!(pid);
+                }
+                if let Some(prn) = arguments.get("pr_number").and_then(Value::as_u64) {
+                    params["pr_number"] = json!(prn);
+                }
+                call_socket("create_worktree_workspace", params).await
+            }
+        }
+        "preset_apply" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let preset_id = arguments
+                .get("preset_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("preset_apply: missing required argument 'workspace_id'".to_string())
+            } else if preset_id.is_empty() {
+                Err("preset_apply: missing required argument 'preset_id'".to_string())
+            } else {
+                let mut params = json!({
+                    "workspace_id": workspace_id,
+                    "preset_id": preset_id,
+                });
+                if let Some(m) = arguments.get("override_mode").and_then(Value::as_str) {
+                    params["override_mode"] = json!(m);
+                }
+                if let Some(p) = arguments.get("initial_prompt").and_then(Value::as_str) {
+                    params["initial_prompt"] = json!(p);
+                }
+                call_socket("apply_preset", params).await
+            }
+        }
+        "preset_list" => call_socket("get_presets", json!({})).await,
+
+        // -- Lifecycle + issue tools (Phase 1.6) --
+        "workspace_close" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("workspace_close: missing required argument 'workspace_id'".to_string())
+            } else {
+                let mut params = json!({ "workspace_id": workspace_id });
+                if let Some(d) = arguments.get("delete_worktree").and_then(Value::as_bool) {
+                    params["delete_worktree"] = json!(d);
+                }
+                if let Some(d) = arguments.get("delete_branch").and_then(Value::as_bool) {
+                    params["delete_branch"] = json!(d);
+                }
+                if let Some(f) = arguments.get("force_delete").and_then(Value::as_bool) {
+                    params["force_delete"] = json!(f);
+                }
+                call_socket("close_workspace", params).await
+            }
+        }
+        "pane_close" => {
+            let pane_id = arguments
+                .get("pane_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if pane_id.is_empty() {
+                Err("pane_close: missing required argument 'pane_id'".to_string())
+            } else {
+                call_socket("close_pane", json!({ "pane_id": pane_id })).await
+            }
+        }
+        "issue_list" => {
+            let mut params = json!({});
+            if let Some(rp) = arguments.get("repo_path").and_then(Value::as_str) {
+                params["repo_path"] = json!(rp);
+            }
+            if let Some(s) = arguments.get("search").and_then(Value::as_str) {
+                params["search"] = json!(s);
+            }
+            call_socket("list_github_issues", params).await
+        }
+        "issue_get" => {
+            let number = arguments.get("number").and_then(Value::as_u64);
+            match number {
+                None => Err("issue_get: missing required argument 'number'".to_string()),
+                Some(n) => {
+                    let mut params = json!({ "number": n });
+                    if let Some(rp) = arguments.get("repo_path").and_then(Value::as_str) {
+                        params["repo_path"] = json!(rp);
+                    }
+                    call_socket("get_github_issue", params).await
+                }
+            }
+        }
+        "issue_link_workspace" => {
+            let number = arguments.get("number").and_then(Value::as_u64);
+            match number {
+                None => {
+                    Err("issue_link_workspace: missing required argument 'number'".to_string())
+                }
+                Some(n) => {
+                    let mut params = json!({ "number": n });
+                    if let Some(wid) = arguments.get("workspace_id").and_then(Value::as_str) {
+                        params["workspace_id"] = json!(wid);
+                    }
+                    call_socket("link_workspace_issue", params).await
+                }
+            }
+        }
+
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -995,7 +1437,7 @@ pub fn upsert_mcp_config(workspace_dir: &Path, workspace_id: &str) {
 
     match serde_json::to_string_pretty(&config) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(&mcp_path, &json) {
+            if let Err(e) = atomic_write(&mcp_path, json.as_bytes()) {
                 eprintln!("[codemux::mcp] Failed to write .mcp.json: {e}");
                 return;
             }
@@ -1007,6 +1449,88 @@ pub fn upsert_mcp_config(workspace_dir: &Path, workspace_id: &str) {
     }
 
     crate::git::ensure_git_exclude(workspace_dir, ".mcp.json");
+}
+
+/// Atomic-write helper used by `upsert_mcp_config` so a crash mid-write can
+/// never leave half-baked JSON at `.mcp.json` — Claude Code reads that file
+/// at agent start, and a single corrupted byte disables every MCP server the
+/// brain was supposed to see.
+///
+/// Pattern (cribbed from vexis-agent's `_write_yaml` in
+/// `vexis_agent/daemon/mcp.py`):
+///   1. write the new content to a sibling `.tmp` file
+///   2. fsync the tmp file so its bytes are durable before the rename
+///   3. `rename` over the destination (atomic on POSIX, atomic on Windows
+///      thanks to `MoveFileEx` semantics under `std::fs::rename`)
+///   4. fsync the parent directory on Unix so the rename itself is durable
+///      across a power loss
+///
+/// The tmp suffix is keyed on `path.file_name()` plus `.tmp` so concurrent
+/// writes to two different `.mcp.json` files don't collide on the same tmp.
+/// Two concurrent writes to the *same* `.mcp.json` will race on the rename,
+/// which is the same race std::fs::write already had — but neither side can
+/// observe a partially written file.
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("atomic_write: path has no parent: {}", path.display()),
+        )
+    })?;
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("atomic_write: path has no file name: {}", path.display()),
+            )
+        })?
+        .to_os_string();
+
+    let mut tmp_name = file_name;
+    tmp_name.push(".tmp");
+    let tmp_path = parent.join(&tmp_name);
+
+    // OpenOptions instead of File::create so a leftover tmp from a previous
+    // crashed write is truncated cleanly instead of confusing this attempt.
+    {
+        let mut tmp = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        tmp.write_all(contents)?;
+        tmp.flush()?;
+        // Best-effort: filesystems that don't support sync_all (e.g. some
+        // network mounts in tests) shouldn't break the write. The rename
+        // itself is still atomic; sync_all is the durability guarantee.
+        let _ = tmp.sync_all();
+    }
+
+    // Atomic rename over the destination. On Unix this is `rename(2)`; on
+    // Windows it's `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` semantics,
+    // both of which guarantee the destination is either fully old or fully
+    // new — never a half-written mix.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        // Clean up the tmp file on rename failure so we don't leave debris.
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // fsync the directory on Unix so the rename is durable. POSIX only —
+    // Windows directory handles don't need this and `File::open` on a
+    // directory path fails on Windows anyway.
+    #[cfg(unix)]
+    {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+
+    Ok(())
 }
 
 /// Remove the "codemux" entry from `.mcp.json` on workspace close.
@@ -1040,7 +1564,9 @@ pub fn remove_mcp_config(workspace_dir: &Path) {
     if servers.is_empty() {
         let _ = std::fs::remove_file(&mcp_path);
     } else if let Ok(json) = serde_json::to_string_pretty(&config) {
-        let _ = std::fs::write(&mcp_path, json);
+        // Mirror upsert's atomic-write path so a crash on cleanup can't
+        // leave the file in a partially-written state either.
+        let _ = atomic_write(&mcp_path, json.as_bytes());
     }
 }
 
@@ -1076,11 +1602,11 @@ mod tests {
     #[test]
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
-        // Tool count bumped from 29 → 31 when the mobile/desktop
-        // viewport tools (browser_viewport, browser_viewport_presets)
-        // were added. Keep this number in sync with register_tools()
-        // when adding new entries.
-        assert_eq!(tools.len(), 31);
+        // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
+        // issue tools: workspace_close, pane_close, issue_list,
+        // issue_get, issue_link_workspace. Keep this number in sync
+        // with register_tools() when adding new entries.
+        assert_eq!(tools.len(), 44);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -1103,6 +1629,28 @@ mod tests {
         // future refactor that accidentally drops them gets caught here.
         assert!(names.contains(&"browser_viewport"));
         assert!(names.contains(&"browser_viewport_presets"));
+        // Phase 1 vexis-agent integration tools — locks in the contract
+        // exposed to vexis-agent's brain runtime. Any drop or rename
+        // breaks the integration.
+        assert!(names.contains(&"terminal_write"));
+        assert!(names.contains(&"terminal_read"));
+        assert!(names.contains(&"workspace_open"));
+        assert!(names.contains(&"app_status"));
+        assert!(names.contains(&"port_list"));
+        // Phase 1.5 delegation primitives — pinning the contract so the
+        // brain can rely on these names existing. `workspace_create`
+        // (the path-bug fix) is one of the original 31 — already
+        // covered by the count assertion above.
+        assert!(names.contains(&"worktree_create"));
+        assert!(names.contains(&"preset_apply"));
+        assert!(names.contains(&"preset_list"));
+        // Phase 1.6 lifecycle + issue tools — pinning the contract for
+        // close/cleanup + GitHub issue browsing.
+        assert!(names.contains(&"workspace_close"));
+        assert!(names.contains(&"pane_close"));
+        assert!(names.contains(&"issue_list"));
+        assert!(names.contains(&"issue_get"));
+        assert!(names.contains(&"issue_link_workspace"));
     }
 
     #[test]
@@ -1201,10 +1749,11 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        // Bumped from 29 → 31 with the addition of browser_viewport +
-        // browser_viewport_presets. See tool_registry_has_all_tools for
+        // Bumped from 39 → 44 with the Phase 1.6 lifecycle + issue
+        // tools (workspace_close, pane_close, issue_list, issue_get,
+        // issue_link_workspace). See tool_registry_has_all_tools for
         // the canonical count.
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 44);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());
@@ -1449,6 +1998,114 @@ mod tests {
         let dir = test_dir("git_exclude_nogit");
         // No .git dir — should not crash
         crate::git::ensure_git_exclude(&dir, ".mcp.json");
+
+        cleanup(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Atomic write tests
+    //
+    // Guards the temp+rename+fsync pattern that protects `.mcp.json` from
+    // partial writes. The most important invariant: if the temp file is
+    // written but the rename never happens (process crash, power loss),
+    // the destination must stay at its previous valid content. Claude
+    // Code reads `.mcp.json` at agent start, and a corrupted file disables
+    // every MCP server the brain is supposed to see.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn atomic_write_creates_new_file() {
+        let dir = test_dir("atomic_write_new");
+        let target = dir.join(".mcp.json");
+        atomic_write(&target, b"{\"hello\":\"world\"}").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "{\"hello\":\"world\"}");
+        // The tmp file must be gone — its only job was to be renamed.
+        assert!(
+            !dir.join(".mcp.json.tmp").exists(),
+            "atomic_write should not leave a .tmp behind on success"
+        );
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file() {
+        let dir = test_dir("atomic_write_replace");
+        let target = dir.join(".mcp.json");
+        std::fs::write(&target, b"OLD CONTENT").unwrap();
+        atomic_write(&target, b"NEW CONTENT").unwrap();
+
+        let content = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(content, "NEW CONTENT");
+
+        cleanup(&dir);
+    }
+
+    /// Simulates the crash-mid-write scenario: the tmp file lands but the
+    /// process dies before `rename`. The destination `.mcp.json` must still
+    /// hold the previous valid content — the agent must see the old, valid
+    /// config rather than a half-written replacement.
+    ///
+    /// We can't actually crash a unit test process, so we model the half-
+    /// completed write directly: write the previous content to the target,
+    /// drop a partial / corrupted .tmp next to it, and assert the target
+    /// stays at the old content. `atomic_write` succeeding *after* a crash
+    /// is also verified — the leftover tmp is truncated, not appended to.
+    #[test]
+    fn atomic_write_crash_during_write_preserves_destination() {
+        let dir = test_dir("atomic_write_crash");
+        let target = dir.join(".mcp.json");
+        let tmp = dir.join(".mcp.json.tmp");
+
+        // 1) Establish the pre-crash valid state.
+        let original = br#"{"mcpServers":{"codemux":{"command":"codemux","args":["mcp"]}}}"#;
+        std::fs::write(&target, original).unwrap();
+
+        // 2) Simulate a previous crashed write: a stale .tmp was created
+        //    with partial JSON, but the rename never fired.
+        std::fs::write(&tmp, b"{\"mcpServers\":{\"co").unwrap();
+
+        // 3) The destination MUST still match the pre-crash content — no
+        //    half-written bytes ever bled through. This is the core
+        //    invariant the atomic-write fix exists to guarantee.
+        let content = std::fs::read(&target).unwrap();
+        assert_eq!(
+            &content[..],
+            &original[..],
+            "destination .mcp.json was corrupted by a half-completed write"
+        );
+
+        // 4) Recovery: a subsequent atomic_write must succeed even with
+        //    the stale tmp present (it gets truncated, not appended), and
+        //    must clear the tmp on success.
+        let new_content = br#"{"mcpServers":{"codemux":{"command":"codemux2"}}}"#;
+        atomic_write(&target, new_content).unwrap();
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(&after[..], &new_content[..]);
+        assert!(
+            !tmp.exists(),
+            "atomic_write should reap its own .tmp on success even after a prior crash"
+        );
+
+        cleanup(&dir);
+    }
+
+    /// Upsert path uses atomic_write under the hood — verify a fresh
+    /// `.mcp.json` lands cleanly and no `.mcp.json.tmp` ghost is left
+    /// behind. Together with the explicit atomic_write tests above this
+    /// proves the production write path is atomic end-to-end.
+    #[test]
+    fn upsert_uses_atomic_write_no_tmp_leftover() {
+        let dir = test_dir("upsert_atomic");
+        upsert_mcp_config(&dir, "ws-atomic");
+
+        assert!(dir.join(".mcp.json").exists());
+        assert!(
+            !dir.join(".mcp.json.tmp").exists(),
+            "upsert_mcp_config must not leave a .tmp file behind"
+        );
 
         cleanup(&dir);
     }

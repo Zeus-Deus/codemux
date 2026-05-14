@@ -18,6 +18,44 @@ pub fn get_presets(presets: State<'_, PresetStoreState>) -> Result<PresetStoreSn
     Ok(snapshot_from_store(&store))
 }
 
+/// Listing of presets with each entry's runtime-binary availability resolved
+/// for the current PATH. Used by the Phase 1.5 `get_presets` socket command
+/// and the `preset_list` MCP tool so a brain can pick a `preset_id` without
+/// blindly hoping the agent CLI is installed.
+///
+/// `commands_available` is `true` when every command in `preset.commands`
+/// (the `which`-lookup target, first whitespace-delimited token) resolves
+/// via `command_binary_exists` — which also checks
+/// `%USERPROFILE%\.local\bin` on Windows so AUR-installed agents are found.
+/// `kind` maps `PresetKind::Cli` → `"terminal"` and `PresetKind::ChatAgent`
+/// → `"chat"` to match the lowercase tag the brain's MCP schema describes.
+pub(crate) fn list_presets_with_availability(
+    presets: &PresetStoreState,
+) -> Vec<serde_json::Value> {
+    let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let default_id = store.default_preset_id.clone();
+    store
+        .presets
+        .iter()
+        .map(|p| {
+            let commands_available = p.commands.is_empty()
+                || p.commands.iter().all(|c| command_binary_exists(c));
+            let kind = match p.kind {
+                PresetKind::Cli => "terminal",
+                PresetKind::ChatAgent => "chat",
+            };
+            serde_json::json!({
+                "preset_id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "kind": kind,
+                "is_default": default_id.as_deref() == Some(p.id.as_str()),
+                "commands_available": commands_available,
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn create_preset(
     app: tauri::AppHandle,
@@ -1086,5 +1124,163 @@ mod tests {
                 "command_binary_exists should find the stub via the .local\\bin fallback",
             );
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Phase 1.5: list_presets_with_availability
+    //
+    // Backs the `get_presets` socket command (and the `preset_list` MCP
+    // tool). The brain relies on `commands_available` to filter out
+    // presets whose CLI isn't installed on the host before calling
+    // `preset_apply` or `worktree_create`. These tests pin the shape
+    // and the PATH-resolution semantics.
+    // ──────────────────────────────────────────────────────────────────
+
+    fn make_preset(id: &str, command: &str, kind: PresetKind) -> TerminalPreset {
+        TerminalPreset {
+            id: id.into(),
+            name: id.into(),
+            description: Some(format!("test preset {id}")),
+            commands: if command.is_empty() {
+                vec![]
+            } else {
+                vec![command.into()]
+            },
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: None,
+            pinned: false,
+            is_builtin: false,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind,
+        }
+    }
+
+    fn store_with(presets: Vec<TerminalPreset>, default_id: Option<&str>) -> PresetStoreState {
+        PresetStoreState {
+            inner: std::sync::Mutex::new(crate::presets::PresetStore {
+                schema_version: 1,
+                presets,
+                default_preset_id: default_id.map(str::to_string),
+                bar_visible: true,
+            }),
+        }
+    }
+
+    #[test]
+    fn list_presets_returns_required_fields() {
+        let store = store_with(
+            vec![make_preset("p-shell", "sh -c 'echo hi'", PresetKind::Cli)],
+            Some("p-shell"),
+        );
+        let entries = list_presets_with_availability(&store);
+        assert_eq!(entries.len(), 1);
+        let e = &entries[0];
+        // The MCP schema for `preset_list` advertises these exact keys.
+        // If any are renamed, the brain's filter logic breaks silently.
+        for key in &[
+            "preset_id",
+            "name",
+            "description",
+            "kind",
+            "is_default",
+            "commands_available",
+        ] {
+            assert!(e.get(*key).is_some(), "missing key: {key} in {e:?}");
+        }
+    }
+
+    #[test]
+    fn list_presets_kind_maps_cli_to_terminal_and_chat_agent_to_chat() {
+        // PresetKind::Cli must surface as "terminal" so the brain's
+        // schema-described enum matches reality. PresetKind::ChatAgent
+        // must surface as "chat" so the brain knows it routes through
+        // the agent-chat pane (Phase 2 territory, but the tag must
+        // still be honest today).
+        let store = store_with(
+            vec![
+                make_preset("p-cli", "true", PresetKind::Cli),
+                make_preset("p-chat", "true", PresetKind::ChatAgent),
+            ],
+            None,
+        );
+        let entries = list_presets_with_availability(&store);
+        let cli = entries.iter().find(|e| e["preset_id"] == "p-cli").unwrap();
+        let chat = entries.iter().find(|e| e["preset_id"] == "p-chat").unwrap();
+        assert_eq!(cli["kind"], "terminal");
+        assert_eq!(chat["kind"], "chat");
+    }
+
+    #[test]
+    fn list_presets_is_default_reflects_default_preset_id() {
+        let store = store_with(
+            vec![
+                make_preset("p-a", "true", PresetKind::Cli),
+                make_preset("p-b", "true", PresetKind::Cli),
+            ],
+            Some("p-b"),
+        );
+        let entries = list_presets_with_availability(&store);
+        let a = entries.iter().find(|e| e["preset_id"] == "p-a").unwrap();
+        let b = entries.iter().find(|e| e["preset_id"] == "p-b").unwrap();
+        assert_eq!(a["is_default"], false);
+        assert_eq!(b["is_default"], true);
+    }
+
+    #[test]
+    fn list_presets_commands_available_true_for_path_resolvable_binary() {
+        // `sh` is on PATH on every Unix CI runner; `git` is on every
+        // platform we target. Either is fine — pick one that's
+        // guaranteed available. The point is that a preset whose
+        // first whitespace token resolves via `which::which` must
+        // come back `commands_available: true`.
+        let store = store_with(
+            vec![make_preset("p-resolvable", "git status", PresetKind::Cli)],
+            None,
+        );
+        let entries = list_presets_with_availability(&store);
+        assert_eq!(
+            entries[0]["commands_available"], true,
+            "preset launching `git` must report commands_available=true; \
+             git is required on PATH for every supported platform"
+        );
+    }
+
+    #[test]
+    fn list_presets_commands_available_false_for_missing_binary() {
+        // The brain MUST be able to detect uninstalled agent CLIs.
+        // Pick a name that's almost certainly not on any PATH so the
+        // assertion holds even on dev machines with lots of tooling.
+        let bogus = "codemux-phase-1-5-binary-that-does-not-exist-anywhere";
+        let store = store_with(
+            vec![make_preset(
+                "p-missing",
+                &format!("{bogus} --flag"),
+                PresetKind::Cli,
+            )],
+            None,
+        );
+        let entries = list_presets_with_availability(&store);
+        assert_eq!(
+            entries[0]["commands_available"], false,
+            "preset whose CLI is not on PATH must report \
+             commands_available=false so the brain can pre-filter"
+        );
+    }
+
+    #[test]
+    fn list_presets_empty_commands_treated_as_available() {
+        // Shell presets have no commands (the user types into the
+        // freshly-spawned terminal). With an empty commands list there
+        // is no CLI to validate, so commands_available is vacuously
+        // true. The shell itself is launched by the platform; if it's
+        // missing, far bigger problems exist.
+        let store = store_with(
+            vec![make_preset("p-shell-empty", "", PresetKind::Cli)],
+            None,
+        );
+        let entries = list_presets_with_availability(&store);
+        assert_eq!(entries[0]["commands_available"], true);
     }
 }
