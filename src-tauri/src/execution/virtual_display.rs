@@ -30,7 +30,7 @@
 //!
 //! ## Tracked in `docs/plans/sandboxing.md` Phase 2.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
@@ -288,12 +288,28 @@ impl VirtualDisplayManager {
             }
         }
 
+        // Display numbers this manager already owns. Excluded from the
+        // probe below so a second workspace can never be handed the same
+        // number — even when the first workspace's Xvfb has silently died
+        // (its `/tmp/.X<n>-lock` + socket are gone, so the filesystem probe
+        // alone would consider the slot free and re-hand it out). The dead
+        // handle stays parked under its workspace_id and gets reaped on
+        // that workspace's next acquire.
+        let reserved: HashSet<u32> = inner
+            .by_workspace
+            .values()
+            .map(|h| h.display_number)
+            .collect();
+
         // Try up to 4 display-number slots before giving up. The probe
         // (`find_free_display_number`) can race with another process that
         // binds the number between our probe and Xvfb's socket creation;
         // on failure we advance and try the next slot.
-        let (xvfb, display_number, xauthority_path) =
-            spawn_xvfb_with_retry(DEFAULT_DISPLAY_START, DEFAULT_DISPLAY_MAX_TRIES)?;
+        let (xvfb, display_number, xauthority_path) = spawn_xvfb_with_retry(
+            DEFAULT_DISPLAY_START,
+            DEFAULT_DISPLAY_MAX_TRIES,
+            &reserved,
+        )?;
 
         let vnc = if options.watch_vnc {
             match create_vnc_password(display_number) {
@@ -408,13 +424,21 @@ fn find_executable(name: &str) -> Option<PathBuf> {
 /// Xvfb. Not part of the public API for app code — use `acquire` there.
 #[doc(hidden)]
 pub fn find_free_display_number_for_tests(start: u32, max_tries: u32) -> Option<u32> {
-    find_free_display_number(start, max_tries)
+    find_free_display_number(start, max_tries, &HashSet::new())
 }
 
-pub(crate) fn find_free_display_number(start: u32, max_tries: u32) -> Option<u32> {
+/// Find a display number not in use. `reserved` holds numbers the caller
+/// already owns (live or dead-but-still-tracked Xvfb handles) — those are
+/// skipped even when the filesystem probe says the slot is free, so two
+/// workspaces can never collide on a number.
+pub(crate) fn find_free_display_number(
+    start: u32,
+    max_tries: u32,
+    reserved: &HashSet<u32>,
+) -> Option<u32> {
     for offset in 0..max_tries {
         let n = start + offset;
-        if !display_number_in_use(n) {
+        if !reserved.contains(&n) && !display_number_in_use(n) {
             return Some(n);
         }
     }
@@ -757,6 +781,7 @@ fn xvfb_is_alive(handle: &mut XvfbHandle) -> bool {
 fn spawn_xvfb_with_retry(
     start: u32,
     max_tries: u32,
+    reserved: &HashSet<u32>,
 ) -> Result<(Child, u32, Option<PathBuf>), Error> {
     const MAX_RETRIES: u32 = 4;
     let mut last_err: Option<Error> = None;
@@ -765,7 +790,7 @@ fn spawn_xvfb_with_retry(
 
     for _ in 0..MAX_RETRIES {
         let display_number =
-            find_free_display_number(probe_start, probe_budget).ok_or_else(|| {
+            find_free_display_number(probe_start, probe_budget, reserved).ok_or_else(|| {
                 Error::NoFreeDisplay {
                     start: DEFAULT_DISPLAY_START,
                 }
@@ -1005,7 +1030,7 @@ mod tests {
     #[test]
     fn find_free_display_number_stops_when_none_available() {
         // max_tries=0 → immediate None regardless of state.
-        assert_eq!(find_free_display_number(1000, 0), None);
+        assert_eq!(find_free_display_number(1000, 0, &HashSet::new()), None);
     }
 
     #[test]
