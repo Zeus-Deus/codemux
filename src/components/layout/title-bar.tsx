@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
 import { SpawnChatPaneButton } from "@/components/debug/SpawnChatPaneButton";
+import { ResourceMonitor } from "./resource-monitor";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -320,6 +321,11 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       {/* Left */}
       <div className="flex items-center gap-1 pl-2">
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
+        {/* Resource monitor — CPU/memory usage of Codemux + every
+            terminal process tree. Self-gates on the
+            appearance.show_resource_monitor setting and renders null
+            when disabled. */}
+        <ResourceMonitor />
         {/* Dev-only spawn-chat-pane button. The component self-gates
             on import.meta.env.DEV + enable_agent_chat and renders null
             in release builds, so this mount stays invisible for users.

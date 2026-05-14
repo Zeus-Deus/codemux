@@ -32,7 +32,7 @@ import { useSyncedSettingsStore, DEFAULT_SETTINGS } from "./synced-settings-stor
 
 /** Full non-default settings covering every per-user field. */
 const FULL_CUSTOM: UserSettings = {
-  appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 20 },
+  appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 20, show_resource_monitor: true },
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 2000, cursor_style: "underline" },
   git: { default_base_branch: "develop" },
@@ -116,7 +116,7 @@ describe("settings single-store integration", () => {
       // User B — has different settings
       const userBSettings: UserSettings = {
         ...DEFAULT_SETTINGS,
-        appearance: { theme: "light", shell_font: null, terminal_font_size: 14 },
+        appearance: { theme: "light", shell_font: null, terminal_font_size: 14, show_resource_monitor: true },
         git: { default_base_branch: "release" },
       };
       mockGetSyncedSettings.mockResolvedValue(userBSettings);

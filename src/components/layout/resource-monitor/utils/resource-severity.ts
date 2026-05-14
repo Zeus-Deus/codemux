@@ -1,0 +1,54 @@
+// Severity heuristics for the resource monitor. A row is "elevated" or
+// "high" either on its own absolute usage or on its share of a parent
+// group that is itself under pressure — so a 200 MB pane looks calm when
+// the app is idle but stands out when it dominates a busy workspace.
+
+import type { UsageSeverity, UsageValues } from "../types";
+
+const KB = 1024;
+const MB = KB * 1024;
+const GB = MB * 1024;
+
+export function getUsageSeverity(
+  values: UsageValues,
+  totals: UsageValues,
+  options: { includeShare?: boolean } = {},
+): UsageSeverity {
+  const { includeShare = true } = options;
+
+  const isHighAbsolute = values.cpu >= 120 || values.memory >= 3 * GB;
+  if (isHighAbsolute) return "high";
+
+  const isElevatedAbsolute = values.cpu >= 70 || values.memory >= 1.5 * GB;
+  if (isElevatedAbsolute) return "elevated";
+
+  if (!includeShare) return "normal";
+
+  const isCpuPressure = totals.cpu >= 60;
+  const isMemoryPressure = totals.memory >= 1.5 * GB;
+  if (!isCpuPressure && !isMemoryPressure) return "normal";
+
+  const cpuShare = totals.cpu > 0 ? values.cpu / totals.cpu : 0;
+  const memoryShare = totals.memory > 0 ? values.memory / totals.memory : 0;
+
+  const isHighShare =
+    (isCpuPressure && cpuShare >= 0.55 && values.cpu >= 25) ||
+    (isMemoryPressure && memoryShare >= 0.55 && values.memory >= 768 * MB);
+  if (isHighShare) return "high";
+
+  const isElevatedShare =
+    (isCpuPressure && cpuShare >= 0.35 && values.cpu >= 15) ||
+    (isMemoryPressure && memoryShare >= 0.35 && values.memory >= 512 * MB);
+  if (isElevatedShare) return "elevated";
+
+  return "normal";
+}
+
+/** Severity of Codemux's share of total system RAM. */
+export function getTrackedHostMemorySeverity(
+  trackedMemorySharePercent: number,
+): UsageSeverity {
+  if (trackedMemorySharePercent >= 35) return "high";
+  if (trackedMemorySharePercent >= 20) return "elevated";
+  return "normal";
+}

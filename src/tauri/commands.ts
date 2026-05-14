@@ -38,6 +38,7 @@ import type {
   ModelInfo,
   OpenFlowCreateRunRequest,
   OpenFlowRunRecord,
+  ResourceMetricsSnapshot,
   OpenFlowRuntimeSnapshot,
   OrchestratorTriggerResult,
   PresetStoreSnapshot,
@@ -267,6 +268,11 @@ export const updateSetting = (section: string, key: string, value: unknown) =>
 
 export const resetSyncedSettings = () =>
   invoke<UserSettings>("reset_synced_settings");
+
+// ── Resource Monitor ──
+
+export const getResourceMetrics = () =>
+  invoke<ResourceMetricsSnapshot>("get_resource_metrics");
 
 // ── Core ──
 
