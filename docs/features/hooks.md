@@ -56,6 +56,8 @@ Codex, Gemini, OpenCode, and Pi registration is gated on the agent's config dire
 
 The full mapping lives in `map_event_type()`. The per-agent `*_HOOK_EVENTS` constants (and the OpenCode/Pi templates) decide which of these names each agent actually fires.
 
+Claude Code's `Notification` event is overloaded: it fires both for a genuine permission/approval prompt *and* for a 60-second idle reminder ("Claude is waiting for your input"). Only the permission case should raise the red dot — the idle reminder fires on an agent that has already finished and gone idle (green), and there is no follow-up event to clear a red dot raised from it. `notify.sh` therefore inspects the `Notification` payload's `message` field and forwards the event only when it describes a permission/approval request; the idle reminder is dropped before it reaches the hook server.
+
 ## What Works Today
 
 - Per-session agent status dots in the sidebar and tab bar for Claude Code, Codex, Gemini, OpenCode, and Pi, updated within milliseconds of the agent firing a lifecycle event
