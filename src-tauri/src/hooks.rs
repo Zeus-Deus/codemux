@@ -1145,12 +1145,16 @@ mod tests {
             "PermissionRequest must be registered for Codex"
         );
 
+        // The bare command is the script path with no event-type arg. On
+        // Windows it's wrapped in the `powershell ... -File` invocation, so
+        // compare against `build_hook_command` rather than the literal path.
+        let bare = build_hook_command("/home/test/.codemux/hooks/notify.sh", "");
         for (event_name, _) in CODEX_HOOK_EVENTS {
             let cmd = hooks[event_name][0]["hooks"][0]["command"]
                 .as_str()
                 .unwrap_or_else(|| panic!("{event_name} must have a command string"));
             assert_eq!(
-                cmd, "/home/test/.codemux/hooks/notify.sh",
+                cmd, bare,
                 "{event_name} must register the bare notify.sh path (no event arg)"
             );
         }
