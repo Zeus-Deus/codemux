@@ -84,6 +84,7 @@ function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSna
     git_deletions: 0,
     git_changed_files: 0,
     notification_count: 0,
+    notifications_muted: false,
     latest_agent_state: null,
     worktree_path: null,
     project_root: "/home/user/project",

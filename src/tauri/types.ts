@@ -704,6 +704,9 @@ export interface WorkspaceSnapshot {
   pr_state: string | null;
   pr_url: string | null;
   linked_issue: LinkedIssue | null;
+  /** When true, agent-completion desktop notifications for this workspace's
+   *  panes are suppressed. Status pills (spinner/dots) are unaffected. */
+  notifications_muted: boolean;
   tabs: TabSnapshot[];
   active_tab_id: string;
   active_surface_id: string;

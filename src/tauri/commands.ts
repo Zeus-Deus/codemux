@@ -327,6 +327,9 @@ export const activateWorkspace = (workspaceId: string) =>
 export const renameWorkspace = (workspaceId: string, title: string) =>
   invoke("rename_workspace", { workspaceId, title });
 
+export const setWorkspaceMuted = (workspaceId: string, muted: boolean) =>
+  invoke("set_workspace_muted", { workspaceId, muted });
+
 export const closeWorkspace = (workspaceId: string, forceDelete: boolean) =>
   invoke<string>("close_workspace", { workspaceId, forceDelete });
 

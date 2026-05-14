@@ -861,6 +861,24 @@ pub fn rename_workspace(
     }
 }
 
+/// Mute or unmute agent-completion desktop notifications for a workspace.
+/// Suppresses only the OS popup — status pills (working spinner, review and
+/// permission dots) keep updating regardless.
+#[tauri::command]
+pub fn set_workspace_muted(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    muted: bool,
+) -> Result<(), String> {
+    if state.set_workspace_muted(&workspace_id, muted) {
+        crate::state::emit_app_state(&app);
+        Ok(())
+    } else {
+        Err(format!("No workspace found for {workspace_id}"))
+    }
+}
+
 #[tauri::command]
 pub fn update_workspace_cwd(
     app: tauri::AppHandle,

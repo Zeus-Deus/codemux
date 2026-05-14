@@ -50,6 +50,7 @@ function makeWs(id: string): WorkspaceSnapshot {
     pr_url: null,
     linked_issue: null,
     notification_count: 0,
+    notifications_muted: false,
     latest_agent_state: null,
     tabs: [],
     active_tab_id: "",

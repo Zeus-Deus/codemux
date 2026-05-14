@@ -1146,6 +1146,7 @@ pub fn run() {
             commands::create_openflow_workspace,
             commands::activate_workspace,
             commands::rename_workspace,
+            commands::set_workspace_muted,
             commands::update_workspace_cwd,
             commands::close_workspace,
             commands::cycle_workspace,

@@ -24,7 +24,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { X, Laptop, GitBranch, Workflow, AlertTriangle } from "lucide-react";
+import { X, Laptop, GitBranch, Workflow, AlertTriangle, BellOff } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { PrStatusIcon, humanizePrState, prStatusToneClass } from "@/components/github/pr-status-icon";
 import {
@@ -33,6 +33,7 @@ import {
   closeWorkspace,
   closeWorkspaceWithWorktree,
   renameWorkspace,
+  setWorkspaceMuted,
   detectEditors,
   openInEditor,
   runWorkspaceSetup,
@@ -230,6 +231,13 @@ export function WorkspaceContextMenuItems({
     }
   };
 
+  const handleToggleMute = () => {
+    setWorkspaceMuted(
+      workspace.workspace_id,
+      !workspace.notifications_muted,
+    ).catch(console.error);
+  };
+
   const handleOpenInEditor = (editorId: string) => {
     openInEditor(editorId, workspace.cwd).catch(console.error);
   };
@@ -293,6 +301,11 @@ export function WorkspaceContextMenuItems({
         onClick={() => runWorkspaceSetup(workspace.workspace_id).catch(console.error)}
       >
         Re-run Setup
+      </ContextMenuItem>
+      <ContextMenuItem onClick={handleToggleMute}>
+        {workspace.notifications_muted
+          ? "Unmute notifications"
+          : "Mute notifications"}
       </ContextMenuItem>
       <ContextMenuSeparator />
       <ContextMenuItem onClick={onRemoveRequest}>
@@ -485,8 +498,23 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               {workspace.git_branch && (
                 <div className="flex items-center gap-1 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   <span className="truncate">{workspace.git_branch}</span>
-                  {(workspace.linked_issue || showPrIcon) && (
+                  {(workspace.linked_issue || showPrIcon || workspace.notifications_muted) && (
                     <div className="flex items-center gap-1 ml-auto shrink-0">
+                      {/* Muted indicator — only shown when muted; absence
+                          means notifications are on (the normal state). */}
+                      {workspace.notifications_muted && (
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <BellOff
+                              className="h-3 w-3 text-muted-foreground/60"
+                              aria-label="Notifications muted"
+                            />
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                            Agent notifications muted
+                          </TooltipContent>
+                        </Tooltip>
+                      )}
                       {workspace.linked_issue && (
                         <IssueDetailPopover
                           workspaceId={workspace.workspace_id}

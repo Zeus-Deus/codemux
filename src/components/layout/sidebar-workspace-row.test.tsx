@@ -2,24 +2,29 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mocks ──
 //
 // `vi.mock()` factories are hoisted above `import`s, so any spies they
 // reference must be created via `vi.hoisted` to survive that hoist.
-const { mockCheckoutDefault, mockGetDefaultBranch, mockToast } = vi.hoisted(
-  () => ({
-    mockCheckoutDefault: vi.fn(),
-    mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
-    mockToast: {
-      success: vi.fn(),
-      error: vi.fn(),
-      info: vi.fn(),
-      warning: vi.fn(),
-    },
-  }),
-);
+const {
+  mockCheckoutDefault,
+  mockGetDefaultBranch,
+  mockSetWorkspaceMuted,
+  mockToast,
+} = vi.hoisted(() => ({
+  mockCheckoutDefault: vi.fn(),
+  mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
+  mockSetWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
+  mockToast: {
+    success: vi.fn(),
+    error: vi.fn(),
+    info: vi.fn(),
+    warning: vi.fn(),
+  },
+}));
 
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
@@ -28,6 +33,7 @@ vi.mock("@/tauri/commands", () => ({
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
+  setWorkspaceMuted: (...args: unknown[]) => mockSetWorkspaceMuted(...args),
   detectEditors: vi.fn().mockResolvedValue([]),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
   openInEditor: vi.fn().mockResolvedValue(undefined),
@@ -106,6 +112,7 @@ function makeWorkspace(
     git_deletions: 0,
     git_changed_files: 0,
     notification_count: 0,
+    notifications_muted: false,
     latest_agent_state: null,
     worktree_path: null,
     project_root: "/home/user/projects/myapp",
@@ -134,6 +141,8 @@ beforeEach(() => {
   mockCheckoutDefault.mockReset();
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");
+  mockSetWorkspaceMuted.mockReset();
+  mockSetWorkspaceMuted.mockResolvedValue(undefined);
   mockToast.success.mockReset();
   mockToast.error.mockReset();
   __resetDefaultBranchCacheForTests();
@@ -359,5 +368,99 @@ describe("Checkout default branch menu item", () => {
     await flushDefaultBranchFetch();
 
     expect(mockGetDefaultBranch).not.toHaveBeenCalled();
+  });
+});
+
+describe("Mute notifications menu item", () => {
+  it("shows 'Mute notifications' when the workspace is not muted", async () => {
+    const ws = makeWorkspace({ notifications_muted: false });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(
+      screen.getByRole("menuitem", { name: /^Mute notifications$/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: /Unmute notifications/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows 'Unmute notifications' when the workspace is already muted", async () => {
+    const ws = makeWorkspace({ notifications_muted: true });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(
+      screen.getByRole("menuitem", { name: /Unmute notifications/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("calls setWorkspaceMuted(id, true) when muting an unmuted workspace", async () => {
+    const ws = makeWorkspace({
+      workspace_id: "ws-mute",
+      notifications_muted: false,
+    });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: /^Mute notifications$/i }),
+    );
+
+    expect(mockSetWorkspaceMuted).toHaveBeenCalledTimes(1);
+    expect(mockSetWorkspaceMuted).toHaveBeenCalledWith("ws-mute", true);
+  });
+
+  it("calls setWorkspaceMuted(id, false) when unmuting a muted workspace", async () => {
+    const ws = makeWorkspace({
+      workspace_id: "ws-mute",
+      notifications_muted: true,
+    });
+    render(
+      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: /Unmute notifications/i }),
+    );
+
+    expect(mockSetWorkspaceMuted).toHaveBeenCalledTimes(1);
+    expect(mockSetWorkspaceMuted).toHaveBeenCalledWith("ws-mute", false);
+  });
+});
+
+describe("Muted indicator on the workspace row", () => {
+  it("renders the BellOff indicator only when the workspace is muted", () => {
+    const muted = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow
+          workspace={makeWorkspace({ worktree_path: null, notifications_muted: true })}
+          isActive={false}
+        />
+      </TooltipProvider>,
+    );
+    expect(
+      muted.container.querySelector("svg.lucide-bell-off"),
+    ).toBeInTheDocument();
+    cleanup();
+
+    const unmuted = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow
+          workspace={makeWorkspace({ worktree_path: null, notifications_muted: false })}
+          isActive={false}
+        />
+      </TooltipProvider>,
+    );
+    expect(
+      unmuted.container.querySelector("svg.lucide-bell-off"),
+    ).not.toBeInTheDocument();
   });
 });
