@@ -96,20 +96,31 @@ pub fn start_hook_server(app: AppHandle) -> u16 {
 }
 
 /// Map agent-specific event names to canonical PaneStatus.
+///
+/// The vocabulary spans every agent Codemux can register hooks for:
+/// Claude Code (`UserPromptSubmit`, `PostToolUse`, `Stop`, ...), Codex
+/// (`task_started`, `task_complete`, `exec_approval_request`, ...),
+/// Gemini (`BeforeAgent`, `AfterAgent`, `AfterTool`, ...), and OpenCode
+/// (the plugin pre-normalizes to `Start` / `Stop` / `PermissionRequest`).
+/// This is the single source of truth for event-name → status; the
+/// per-agent registration just decides which of these names actually
+/// get wired up.
 fn map_event_type(event_type: &str) -> Option<PaneStatus> {
     match event_type {
         // Start events → Working
         "Start" | "UserPromptSubmit" | "PostToolUse" | "PostToolUseFailure" | "BeforeAgent"
-        | "AfterTool" | "sessionStart" | "userPromptSubmitted" | "postToolUse" => {
-            Some(PaneStatus::Working)
-        }
+        | "AfterTool" | "sessionStart" | "session_start" | "userPromptSubmitted"
+        | "postToolUse" | "task_started" => Some(PaneStatus::Working),
         // Stop events → Review (caller decides idle vs review)
-        "Stop" | "agent-turn-complete" | "AfterAgent" => Some(PaneStatus::Review),
+        "Stop" | "agent-turn-complete" | "AfterAgent" | "task_complete" => {
+            Some(PaneStatus::Review)
+        }
         // Session end → Idle (agent is exiting, always clear)
-        "sessionEnd" | "SessionEnd" => Some(PaneStatus::Idle),
+        "sessionEnd" | "SessionEnd" | "session_end" => Some(PaneStatus::Idle),
         // Permission events
-        "PermissionRequest" | "Notification" | "preToolUse" | "permission.ask"
-        | "beforeShellExecution" | "beforeMCPExecution" => Some(PaneStatus::Permission),
+        "PermissionRequest" | "Notification" | "PreToolUse" | "preToolUse" | "permission.ask"
+        | "beforeShellExecution" | "beforeMCPExecution" | "exec_approval_request"
+        | "apply_patch_approval_request" | "request_user_input" => Some(PaneStatus::Permission),
         _ => None,
     }
 }
@@ -319,15 +330,25 @@ const HOOK_SCRIPT: &str = r#"#!/bin/sh
 [ -z "$CODEMUX_HOOK_PORT" ] && exit 0
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 
+# Event type comes from the first arg when the agent's hook config can pass
+# one (Claude Code, Gemini). When it's absent — Codex registers a bare
+# command and the Pi extension pipes only JSON — fall back to the event
+# name carried in the agent's JSON payload.
 EVENT_TYPE="${1:-}"
-[ -z "$EVENT_TYPE" ] && exit 0
 
-# Claude Code passes JSON on stdin with session_id.
-# Extract it if jq is available; fall back gracefully if not.
+# Drain stdin once: the agent's JSON payload carries session_id and, for
+# Codex/Pi, the hook_event_name (Codex's older notify callback uses "type").
+INPUT=$(cat 2>/dev/null)
+
 AGENT_SID=""
 if command -v jq >/dev/null 2>&1; then
-  AGENT_SID=$(cat | jq -r '.session_id // empty' 2>/dev/null)
+  AGENT_SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+  if [ -z "$EVENT_TYPE" ]; then
+    EVENT_TYPE=$(printf '%s' "$INPUT" | jq -r '.hook_event_name // .type // empty' 2>/dev/null)
+  fi
 fi
+
+[ -z "$EVENT_TYPE" ] && exit 0
 
 URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
 if [ -n "$AGENT_SID" ]; then
@@ -348,23 +369,64 @@ $ErrorActionPreference = 'SilentlyContinue'
 if (-not $env:CODEMUX_HOOK_PORT)    { exit 0 }
 if (-not $env:CODEMUX_SESSION_ID)   { exit 0 }
 $eventType = if ($args.Count -gt 0) { $args[0] } else { '' }
-if (-not $eventType) { exit 0 }
 
-# Claude Code pipes JSON on stdin; extract session_id if present.
+# Agents pipe JSON on stdin; extract session_id, and the event name when
+# it wasn't passed as an arg (Codex / Pi).
 $agentSid = ''
 try {
     $raw = [Console]::In.ReadToEnd()
     if ($raw) {
         $obj = $raw | ConvertFrom-Json
         if ($obj.session_id) { $agentSid = $obj.session_id }
+        if (-not $eventType) {
+            if ($obj.hook_event_name) { $eventType = $obj.hook_event_name }
+            elseif ($obj.type)        { $eventType = $obj.type }
+        }
     }
 } catch {}
+
+if (-not $eventType) { exit 0 }
 
 $url = "http://127.0.0.1:$($env:CODEMUX_HOOK_PORT)/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
 if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
 
 # Fire-and-forget; ignore failures so a network blip never kills the agent.
 try { Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 | Out-Null } catch {}
+exit 0
+"#;
+
+/// Gemini CLI lifecycle hook. Unlike Claude/Codex, the Gemini CLI *blocks*
+/// on a hook until it receives valid JSON on stdout — so this script must
+/// `printf '{}'` before doing anything slow. The event type is passed as
+/// the literal `$1` arg (same model as `notify.sh`); stdin JSON is only
+/// mined for the agent `session_id`.
+#[cfg(not(target_os = "windows"))]
+const GEMINI_HOOK_SCRIPT: &str = r#"#!/bin/sh
+# Codemux Gemini lifecycle hook — notifies the hook server of agent status.
+# Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
+
+EVENT_TYPE="${1:-}"
+
+# Drain stdin (the Gemini JSON payload) first, then ALWAYS emit `{}` so the
+# Gemini CLI doesn't hang waiting on us — even if the rest is a no-op.
+INPUT=$(cat)
+printf '{}\n'
+
+[ -z "$CODEMUX_HOOK_PORT" ] && exit 0
+[ -z "$CODEMUX_SESSION_ID" ] && exit 0
+[ -z "$EVENT_TYPE" ] && exit 0
+
+AGENT_SID=""
+if command -v jq >/dev/null 2>&1; then
+  AGENT_SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
+fi
+
+URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
+if [ -n "$AGENT_SID" ]; then
+  URL="${URL}&agentSessionId=${AGENT_SID}"
+fi
+
+curl -s --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1 || true &
 exit 0
 "#;
 
@@ -386,30 +448,40 @@ fn user_home_dir() -> Option<String> {
     }
 }
 
-/// Write the hook notification script. On Unix this is `~/.codemux/hooks/notify.sh`;
-/// on Windows it's `~/.codemux/hooks/notify.ps1` (cmd.exe cannot execute `.sh`
-/// without explicit `bash` invocation, which would force a Git Bash dependency).
-pub fn ensure_hook_script() -> Option<String> {
+/// Write a file into `~/.codemux/hooks/` with the given name and body,
+/// making it executable on Unix. Returns the absolute path.
+///
+/// Shared by every agent hook artifact — the main `notify.sh`, the
+/// Gemini wrapper script, and the OpenCode plugin.
+fn write_hook_file(name: &str, body: &str, executable: bool) -> Option<String> {
     let home = user_home_dir()?;
     let hooks_dir = std::path::PathBuf::from(&home).join(".codemux/hooks");
     std::fs::create_dir_all(&hooks_dir).ok()?;
 
+    let path = hooks_dir.join(name);
+    std::fs::write(&path, body).ok()?;
+
+    #[cfg(unix)]
+    if executable {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755));
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// Write the hook notification script. On Unix this is `~/.codemux/hooks/notify.sh`;
+/// on Windows it's `~/.codemux/hooks/notify.ps1` (cmd.exe cannot execute `.sh`
+/// without explicit `bash` invocation, which would force a Git Bash dependency).
+pub fn ensure_hook_script() -> Option<String> {
     #[cfg(target_os = "windows")]
     let (script_name, script_body) = ("notify.ps1", HOOK_SCRIPT_PS1);
     #[cfg(not(target_os = "windows"))]
     let (script_name, script_body) = ("notify.sh", HOOK_SCRIPT);
 
-    let script_path = hooks_dir.join(script_name);
-    std::fs::write(&script_path, script_body).ok()?;
-
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755));
-    }
-
-    Some(script_path.to_string_lossy().into_owned())
+    write_hook_file(script_name, script_body, true)
 }
 
 /// Check if a hook entry (in Claude Code format) contains a codemux hook.
@@ -437,60 +509,78 @@ fn entry_contains_codemux_hook(entry: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Build the shell command Claude Code will invoke for a hook event.
-/// Unix: bash interprets the .sh script directly when run via the shell.
-/// Windows: cmd.exe cannot execute .ps1 directly, so we wrap it in a
+/// Build the shell command an agent will invoke for a hook event.
+///
+/// Unix: bash interprets the `.sh` script directly when run via the shell.
+/// Windows: cmd.exe cannot execute `.ps1` directly, so we wrap it in a
 /// `powershell -NoProfile -ExecutionPolicy Bypass -File ...` invocation
 /// (matches the way other Tauri/Electron tools register PS hooks).
+///
+/// An empty `event_type` produces a *bare* command (just the script path)
+/// — Codex registers one bare command for all events and the notify
+/// script recovers the event name from the JSON payload on stdin.
 fn build_hook_command(script_path: &str, event_type: &str) -> String {
     #[cfg(target_os = "windows")]
     {
-        format!(
-            "powershell -NoProfile -ExecutionPolicy Bypass -File \"{script_path}\" {event_type}"
-        )
+        let base =
+            format!("powershell -NoProfile -ExecutionPolicy Bypass -File \"{script_path}\"");
+        if event_type.is_empty() {
+            base
+        } else {
+            format!("{base} {event_type}")
+        }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        format!("{script_path} {event_type}")
+        if event_type.is_empty() {
+            script_path.to_string()
+        } else {
+            format!("{script_path} {event_type}")
+        }
     }
 }
 
-/// Register hooks with Claude Code's settings.json (~/.claude/settings.json).
-/// Only modifies the hooks section; preserves all other settings.
-pub fn register_claude_code_hooks() {
-    let Some(script_path) = ensure_hook_script() else {
-        eprintln!("[codemux::hooks] Failed to create hook script");
-        return;
-    };
-
-    let home = match user_home_dir() {
-        Some(h) => h,
-        None => return,
-    };
-
-    let settings_path = std::path::PathBuf::from(&home).join(".claude/settings.json");
-
-    // Read existing settings or create empty object
+/// Merge Codemux hook entries into a nested-format hook config file.
+///
+/// Claude Code (`~/.claude/settings.json`), Codex (`~/.codex/hooks.json`),
+/// and Gemini (`~/.gemini/settings.json`) all share the same shape:
+///
+/// ```json
+/// { "hooks": { "<EventName>": [ { "matcher"?: "", "hooks": [ {type, command} ] } ] } }
+/// ```
+///
+/// Only the `hooks` section is touched; every other user setting is
+/// preserved. A prior Codemux entry for an event is replaced in place so
+/// repeated startups never accumulate duplicates. `hook_events` maps each
+/// agent's event name to the canonical event-type arg passed to the
+/// notify script.
+fn merge_nested_hooks_file(
+    settings_path: &std::path::Path,
+    hook_events: &[(&str, &str)],
+    script_path: &str,
+) {
+    // Read existing settings or start from an empty object.
     let mut settings: serde_json::Value = if settings_path.exists() {
-        match std::fs::read_to_string(&settings_path) {
+        match std::fs::read_to_string(settings_path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or(serde_json::json!({})),
             Err(_) => serde_json::json!({}),
         }
     } else {
-        // Ensure directory exists
         if let Some(parent) = settings_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         serde_json::json!({})
     };
 
-    // Build hook commands
-    let hook_events = [
-        ("UserPromptSubmit", "UserPromptSubmit"),
-        ("Stop", "Stop"),
-        ("PermissionRequest", "PermissionRequest"),
-        ("SessionEnd", "sessionEnd"),
-    ];
+    // Defensive: if the file existed but held a non-object (corrupt /
+    // hand-edited), don't clobber it — bail rather than overwrite.
+    if !settings.is_object() {
+        eprintln!(
+            "[codemux::hooks] {} is not a JSON object; skipping hook merge",
+            settings_path.display()
+        );
+        return;
+    }
 
     let hooks = settings
         .as_object_mut()
@@ -498,8 +588,8 @@ pub fn register_claude_code_hooks() {
         .entry("hooks")
         .or_insert(serde_json::json!({}));
 
-    for (event_name, event_type) in &hook_events {
-        let hook_cmd = build_hook_command(&script_path, event_type);
+    for (event_name, event_type) in hook_events {
+        let hook_cmd = build_hook_command(script_path, event_type);
 
         let hook_array = hooks
             .as_object_mut()
@@ -507,7 +597,7 @@ pub fn register_claude_code_hooks() {
             .entry(*event_name)
             .or_insert(serde_json::json!([]));
 
-        // Claude Code hook format: each entry in the array must be
+        // Nested hook format: each entry is
         // { "matcher": "<pattern>", "hooks": [{ "type": "command", "command": "..." }] }
         let codemux_entry = serde_json::json!({
             "matcher": "",
@@ -515,13 +605,9 @@ pub fn register_claude_code_hooks() {
         });
 
         if let Some(arr) = hook_array.as_array_mut() {
-            // Find existing codemux hook entry (check inside hooks[].command)
-            let existing_idx = arr.iter().position(|entry| {
-                entry_contains_codemux_hook(entry)
-            });
-
+            // Replace an existing codemux entry in place; otherwise append.
+            let existing_idx = arr.iter().position(entry_contains_codemux_hook);
             if let Some(idx) = existing_idx {
-                // Update in place
                 arr[idx] = codemux_entry;
             } else {
                 arr.push(codemux_entry);
@@ -529,14 +615,384 @@ pub fn register_claude_code_hooks() {
         }
     }
 
-    // Write back
     match serde_json::to_string_pretty(&settings) {
         Ok(json) => {
-            let _ = std::fs::write(&settings_path, json);
+            let _ = std::fs::write(settings_path, json);
         }
         Err(e) => eprintln!("[codemux::hooks] Failed to serialize settings: {e}"),
     }
 }
+
+/// Register hooks with Claude Code's settings.json (~/.claude/settings.json).
+/// Only modifies the hooks section; preserves all other settings.
+///
+/// PostToolUse is registered so that when the user answers a
+/// PermissionRequest / Notification (e.g. picks an option from an
+/// AskUserQuestion menu), the tool's resolution fires PostToolUse →
+/// Working — clearing the stuck red pulse. Notification → Permission is
+/// registered as a belt-and-suspenders trigger so the red pulse appears
+/// reliably whenever Claude Code is awaiting user input.
+pub fn register_claude_code_hooks() {
+    let Some(script_path) = ensure_hook_script() else {
+        eprintln!("[codemux::hooks] Failed to create hook script");
+        return;
+    };
+    let Some(home) = user_home_dir() else { return };
+
+    let settings_path = std::path::PathBuf::from(&home).join(".claude/settings.json");
+    merge_nested_hooks_file(&settings_path, &CLAUDE_HOOK_EVENTS, &script_path);
+}
+
+/// Hook events registered with Claude Code. See `register_claude_code_hooks`.
+const CLAUDE_HOOK_EVENTS: [(&str, &str); 6] = [
+    ("UserPromptSubmit", "UserPromptSubmit"),
+    ("Stop", "Stop"),
+    ("PermissionRequest", "PermissionRequest"),
+    ("Notification", "Notification"),
+    ("PostToolUse", "PostToolUse"),
+    ("SessionEnd", "sessionEnd"),
+];
+
+/// Hook events registered with Codex via `~/.codex/hooks.json`.
+///
+/// Codex (≥0.129) auto-loads `~/.codex/hooks.json` and uses the same
+/// nested hook shape as Claude. The event names are verified against the
+/// `HookEventNameWire` enum in the Codex 0.130 binary — the full set is
+/// `PreToolUse`, `PermissionRequest`, `PostToolUse`, `PreCompact`,
+/// `PostCompact`, `SessionStart`, `UserPromptSubmit`, `Stop`. Note there
+/// is **no `SessionEnd`** (unlike Claude/Gemini).
+///
+/// Codex pipes its event JSON on stdin with `hook_event_name`, so all
+/// events register the *bare* notify-script path (the empty event-type
+/// arg) and `notify.sh` recovers the event name from the payload — this
+/// matches the format Codex itself writes when other tools register.
+///
+/// `PermissionRequest` is a first-class Codex hook event, so Codex gets
+/// the red "needs input" pulse, not just the amber/green cadence.
+const CODEX_HOOK_EVENTS: [(&str, &str); 4] = [
+    ("UserPromptSubmit", ""),
+    ("PostToolUse", ""),
+    ("PermissionRequest", ""),
+    ("Stop", ""),
+];
+
+/// Register hooks with Codex via `~/.codex/hooks.json`.
+///
+/// Only runs if `~/.codex` already exists — i.e. the user actually has
+/// Codex — so Codemux never creates config dirs for tools that aren't
+/// installed. The merge preserves any existing Codex hooks.
+pub fn register_codex_hooks() {
+    let Some(script_path) = ensure_hook_script() else {
+        eprintln!("[codemux::hooks] Failed to create hook script");
+        return;
+    };
+    let Some(home) = user_home_dir() else { return };
+
+    let codex_dir = std::path::PathBuf::from(&home).join(".codex");
+    if !codex_dir.exists() {
+        return; // Codex not installed — don't create stray config.
+    }
+
+    let hooks_path = codex_dir.join("hooks.json");
+    merge_nested_hooks_file(&hooks_path, &CODEX_HOOK_EVENTS, &script_path);
+}
+
+/// Hook events registered with Gemini via `~/.gemini/settings.json`.
+///
+/// Gemini (verified against the CLI 0.42 bundle) exposes the hook events
+/// `SessionStart`, `SessionEnd`, `BeforeAgent`, `AfterAgent`, `BeforeTool`,
+/// `AfterTool`, `BeforeModel`, `AfterModel`, `Notification`, `Stop`. We
+/// register `BeforeAgent`/`AfterTool` (amber), `AfterAgent` (green),
+/// `Notification` (red — needs input) and `SessionEnd` (clear). We skip
+/// `SessionStart` since it fires on boot while the agent is still idle.
+/// The settings file uses the same nested hook shape as Claude/Codex, and
+/// Gemini even auto-migrates Claude-format hook entries.
+#[cfg(not(target_os = "windows"))]
+const GEMINI_HOOK_EVENTS: [(&str, &str); 5] = [
+    ("BeforeAgent", "BeforeAgent"),
+    ("AfterTool", "AfterTool"),
+    ("AfterAgent", "AfterAgent"),
+    ("Notification", "Notification"),
+    ("SessionEnd", "SessionEnd"),
+];
+
+/// Write the Gemini hook script to `~/.codemux/hooks/gemini-notify.sh`.
+#[cfg(not(target_os = "windows"))]
+fn ensure_gemini_hook_script() -> Option<String> {
+    write_hook_file("gemini-notify.sh", GEMINI_HOOK_SCRIPT, true)
+}
+
+/// Register hooks with Gemini via `~/.gemini/settings.json`.
+///
+/// Only runs if `~/.gemini` already exists — i.e. the user actually has
+/// the Gemini CLI. Unix-only: the Gemini hook is a POSIX `sh` script
+/// (Windows Gemini support would need a PowerShell variant, same as the
+/// main `notify.ps1`).
+#[cfg(not(target_os = "windows"))]
+pub fn register_gemini_hooks() {
+    let Some(home) = user_home_dir() else { return };
+
+    let gemini_dir = std::path::PathBuf::from(&home).join(".gemini");
+    if !gemini_dir.exists() {
+        return; // Gemini CLI not installed — don't create stray config.
+    }
+
+    let Some(script_path) = ensure_gemini_hook_script() else {
+        eprintln!("[codemux::hooks] Failed to create Gemini hook script");
+        return;
+    };
+
+    let settings_path = gemini_dir.join("settings.json");
+    merge_nested_hooks_file(&settings_path, &GEMINI_HOOK_EVENTS, &script_path);
+}
+
+/// No-op on Windows — the Gemini hook script is POSIX `sh` only.
+#[cfg(target_os = "windows")]
+pub fn register_gemini_hooks() {}
+
+/// OpenCode notify plugin. OpenCode has no hook-config file like Claude or
+/// Codex — instead it loads JS plugins from its plugin directory. This
+/// plugin watches OpenCode's `session.status` busy/idle transitions and
+/// `permission.ask` events and shells out to `notify.sh`, normalizing to
+/// the canonical `Start` / `Stop` / `PermissionRequest` vocabulary.
+///
+/// `{{NOTIFY_PATH}}` is substituted with the absolute `notify.sh` path at
+/// install time. The plugin is a no-op unless `CODEMUX_SESSION_ID` is in
+/// the environment, so a user running OpenCode outside Codemux is
+/// unaffected.
+#[cfg(not(target_os = "windows"))]
+const OPENCODE_PLUGIN_TEMPLATE: &str = r#"// Codemux OpenCode notify plugin
+// Installed by Codemux — bridges OpenCode session lifecycle to the
+// Codemux agent status indicator (the working/idle/needs-input dot).
+// Safe to delete: Codemux rewrites it on startup.
+
+export const CodemuxNotifyPlugin = async ({ $ }) => {
+  // Only active inside a Codemux-managed terminal.
+  if (!process?.env?.CODEMUX_SESSION_ID) return {};
+
+  const notifyPath = "{{NOTIFY_PATH}}";
+
+  let currentState = "idle"; // "idle" | "busy"
+  let rootSessionID = null;
+  let stopSent = false;
+
+  const notify = async (eventType) => {
+    try {
+      // Event type is the literal argv arg; stdin is closed so notify.sh's
+      // session-id capture returns empty without blocking.
+      await $`bash ${notifyPath} ${eventType} < /dev/null`.quiet();
+    } catch {
+      // Best-effort — never break the agent over a status ping.
+    }
+  };
+
+  const isChildSession = (event) =>
+    Boolean(event?.properties?.info?.parentID);
+
+  const handleBusy = async (sessionID) => {
+    if (!rootSessionID) rootSessionID = sessionID;
+    if (sessionID !== rootSessionID) return;
+    if (currentState === "idle") {
+      currentState = "busy";
+      stopSent = false;
+      await notify("Start");
+    }
+  };
+
+  const handleStop = async (sessionID) => {
+    if (rootSessionID && sessionID !== rootSessionID) return;
+    if (currentState === "busy" && !stopSent) {
+      currentState = "idle";
+      stopSent = true;
+      rootSessionID = null;
+      await notify("Stop");
+    }
+  };
+
+  return {
+    event: async ({ event }) => {
+      const sessionID =
+        event?.properties?.sessionID ?? event?.properties?.info?.id ?? null;
+
+      // Ignore subagent/child sessions so background spawns don't flip the dot.
+      if (isChildSession(event)) return;
+
+      // Verified against @opencode-ai/sdk: session.status carries
+      // { properties: { sessionID, status: { type: "idle"|"busy"|"retry" } } };
+      // session.idle / session.error carry { properties: { sessionID } }.
+      if (event.type === "session.status") {
+        const status = event.properties?.status?.type;
+        if (status === "busy") await handleBusy(sessionID);
+        else if (status === "idle") await handleStop(sessionID);
+      }
+      if (event.type === "session.idle") await handleStop(sessionID);
+      if (event.type === "session.error") await handleStop(sessionID);
+    },
+    "permission.ask": async () => {
+      await notify("PermissionRequest");
+    },
+  };
+};
+"#;
+
+/// Resolve OpenCode's config directory: `$XDG_CONFIG_HOME/opencode` or
+/// `~/.config/opencode`.
+#[cfg(not(target_os = "windows"))]
+fn opencode_config_dir() -> Option<std::path::PathBuf> {
+    let config_home = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(x) if !x.trim().is_empty() => std::path::PathBuf::from(x),
+        _ => std::path::PathBuf::from(user_home_dir()?).join(".config"),
+    };
+    Some(config_home.join("opencode"))
+}
+
+/// Render the OpenCode plugin JS with the notify script path inlined.
+#[cfg(not(target_os = "windows"))]
+fn build_opencode_plugin(notify_script_path: &str) -> String {
+    OPENCODE_PLUGIN_TEMPLATE.replace("{{NOTIFY_PATH}}", notify_script_path)
+}
+
+/// Install the OpenCode notify plugin into OpenCode's plugin directory.
+///
+/// Only runs if OpenCode's config dir already exists — i.e. the user
+/// actually has OpenCode. Unix-only (the plugin shells out to `notify.sh`).
+#[cfg(not(target_os = "windows"))]
+pub fn register_opencode_plugin() {
+    let Some(config_dir) = opencode_config_dir() else { return };
+    if !config_dir.exists() {
+        return; // OpenCode not installed — don't create stray config.
+    }
+
+    let Some(script_path) = ensure_hook_script() else {
+        eprintln!("[codemux::hooks] Failed to create hook script");
+        return;
+    };
+
+    let plugin_dir = config_dir.join("plugin");
+    if std::fs::create_dir_all(&plugin_dir).is_err() {
+        eprintln!("[codemux::hooks] Failed to create OpenCode plugin dir");
+        return;
+    }
+
+    let plugin_path = plugin_dir.join("codemux-notify.js");
+    let content = build_opencode_plugin(&script_path);
+    let _ = std::fs::write(&plugin_path, content);
+}
+
+/// No-op on Windows — the OpenCode plugin shells out to a POSIX script.
+#[cfg(target_os = "windows")]
+pub fn register_opencode_plugin() {}
+
+/// Pi notify extension. Like OpenCode, Pi has no hook-config file — it
+/// auto-discovers TypeScript extensions in `~/.pi/agent/extensions/` at
+/// session start. This extension subscribes to Pi's agent lifecycle
+/// events and shells out to `notify.sh`.
+///
+/// Event names verified against the installed `@mariozechner/pi-coding-agent`
+/// `ExtensionAPI`: `before_agent_start`, `tool_execution_end`, `agent_end`,
+/// `session_shutdown` (note: there is no `session_end` event in this API,
+/// despite what older integrations assumed). Pi has no distinct
+/// permission/approval event, so Pi gets the amber/green working cadence
+/// but not the red needs-input pulse.
+///
+/// `{{NOTIFY_PATH}}` is substituted with the absolute `notify.sh` path.
+/// The extension no-ops unless `CODEMUX_SESSION_ID` is set.
+#[cfg(not(target_os = "windows"))]
+const PI_EXTENSION_TEMPLATE: &str = r#"// Codemux Pi notify extension
+// Installed by Codemux — bridges Pi's agent lifecycle to the Codemux
+// agent status indicator (the working/idle dot). Pi auto-discovers
+// extensions in ~/.pi/agent/extensions/ at session start, so no
+// registration step is needed. Safe to delete: Codemux rewrites it.
+
+import { spawn } from "node:child_process";
+
+const NOTIFY_PATH = "{{NOTIFY_PATH}}";
+
+export default function (pi: any) {
+  // Only active inside a Codemux-managed terminal.
+  if (!process.env.CODEMUX_SESSION_ID) return;
+
+  // Fire-and-forget: pipe the event name as JSON on stdin — notify.sh
+  // recovers it from hook_event_name when no arg is passed.
+  const fire = (eventName: string) => {
+    try {
+      const child = spawn(NOTIFY_PATH, [], {
+        stdio: ["pipe", "ignore", "ignore"],
+        detached: true,
+      });
+      child.on("error", () => {});
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(JSON.stringify({ hook_event_name: eventName }));
+      child.unref();
+    } catch {
+      // spawn() can throw synchronously (EACCES / ENOENT) — stay silent.
+    }
+  };
+
+  // Skip non-interactive sessions (print / RPC / subagent): those have
+  // ctx.hasUI === false and must not drive the host status dot. The
+  // `=== false` check keeps pre-hasUI Pi versions firing.
+  const skip = (ctx: any) => ctx && ctx.hasUI === false;
+
+  pi.on("before_agent_start", (_e: any, ctx: any) => {
+    if (skip(ctx)) return;
+    fire("UserPromptSubmit");
+  });
+  pi.on("tool_execution_end", (_e: any, ctx: any) => {
+    if (skip(ctx)) return;
+    fire("PostToolUse");
+  });
+  pi.on("agent_end", (_e: any, ctx: any) => {
+    if (skip(ctx)) return;
+    fire("Stop");
+  });
+  // Fires on Ctrl+C, /quit, /reload — make sure the dot doesn't get
+  // stuck "working" if Pi exits mid-run.
+  pi.on("session_shutdown", (_e: any, ctx: any) => {
+    if (skip(ctx)) return;
+    fire("Stop");
+  });
+}
+"#;
+
+/// Render the Pi extension TypeScript with the notify script path inlined.
+#[cfg(not(target_os = "windows"))]
+fn build_pi_extension(notify_script_path: &str) -> String {
+    PI_EXTENSION_TEMPLATE.replace("{{NOTIFY_PATH}}", notify_script_path)
+}
+
+/// Install the Pi notify extension into `~/.pi/agent/extensions/`.
+///
+/// Only runs if `~/.pi` already exists — i.e. the user actually has Pi.
+/// Unix-only (the extension shells out to `notify.sh`).
+#[cfg(not(target_os = "windows"))]
+pub fn register_pi_extension() {
+    let Some(home) = user_home_dir() else { return };
+
+    let pi_dir = std::path::PathBuf::from(&home).join(".pi");
+    if !pi_dir.exists() {
+        return; // Pi not installed — don't create stray config.
+    }
+
+    let Some(script_path) = ensure_hook_script() else {
+        eprintln!("[codemux::hooks] Failed to create hook script");
+        return;
+    };
+
+    let ext_dir = pi_dir.join("agent").join("extensions");
+    if std::fs::create_dir_all(&ext_dir).is_err() {
+        eprintln!("[codemux::hooks] Failed to create Pi extensions dir");
+        return;
+    }
+
+    let ext_path = ext_dir.join("codemux-notify.ts");
+    let content = build_pi_extension(&script_path);
+    let _ = std::fs::write(&ext_path, content);
+}
+
+/// No-op on Windows — the Pi extension shells out to a POSIX script.
+#[cfg(target_os = "windows")]
+pub fn register_pi_extension() {}
 
 /// Remove all Codemux hook entries from ~/.claude/settings.json.
 /// Preserves all other settings and non-Codemux hooks.
@@ -589,17 +1045,14 @@ pub fn unregister_claude_code_hooks() {
     }
 }
 
-/// Build the hooks JSON that would be written to ~/.claude/settings.json.
-/// Useful for testing the format without touching the filesystem.
-pub fn build_claude_hooks_json(script_path: &str) -> serde_json::Value {
-    let hook_events = [
-        ("UserPromptSubmit", "UserPromptSubmit"),
-        ("Stop", "Stop"),
-        ("PermissionRequest", "PermissionRequest"),
-    ];
-
+/// Build the nested hooks JSON for a given event set, without touching
+/// the filesystem. Useful for asserting the on-disk format in tests.
+pub fn build_nested_hooks_json(
+    script_path: &str,
+    hook_events: &[(&str, &str)],
+) -> serde_json::Value {
     let mut hooks = serde_json::json!({});
-    for (event_name, event_type) in &hook_events {
+    for (event_name, event_type) in hook_events {
         let hook_cmd = build_hook_command(script_path, event_type);
         hooks[event_name] = serde_json::json!([{
             "matcher": "",
@@ -609,16 +1062,226 @@ pub fn build_claude_hooks_json(script_path: &str) -> serde_json::Value {
     hooks
 }
 
+/// Build the hooks JSON that would be written to ~/.claude/settings.json.
+pub fn build_claude_hooks_json(script_path: &str) -> serde_json::Value {
+    build_nested_hooks_json(script_path, &CLAUDE_HOOK_EVENTS)
+}
+
+/// Build the hooks JSON that would be written to ~/.codex/hooks.json.
+pub fn build_codex_hooks_json(script_path: &str) -> serde_json::Value {
+    build_nested_hooks_json(script_path, &CODEX_HOOK_EVENTS)
+}
+
+/// Build the hooks JSON that would be written to ~/.gemini/settings.json.
+#[cfg(not(target_os = "windows"))]
+pub fn build_gemini_hooks_json(script_path: &str) -> serde_json::Value {
+    build_nested_hooks_json(script_path, &GEMINI_HOOK_EVENTS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_event_type_covers_all_agent_vocabularies() {
+        // Claude Code
+        assert_eq!(map_event_type("UserPromptSubmit"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("PostToolUse"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("Stop"), Some(PaneStatus::Review));
+        assert_eq!(map_event_type("SessionEnd"), Some(PaneStatus::Idle));
+        assert_eq!(
+            map_event_type("PermissionRequest"),
+            Some(PaneStatus::Permission)
+        );
+        assert_eq!(map_event_type("Notification"), Some(PaneStatus::Permission));
+
+        // Codex
+        assert_eq!(map_event_type("task_started"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("task_complete"), Some(PaneStatus::Review));
+        assert_eq!(map_event_type("session_end"), Some(PaneStatus::Idle));
+        assert_eq!(
+            map_event_type("exec_approval_request"),
+            Some(PaneStatus::Permission)
+        );
+        assert_eq!(
+            map_event_type("apply_patch_approval_request"),
+            Some(PaneStatus::Permission)
+        );
+        assert_eq!(
+            map_event_type("request_user_input"),
+            Some(PaneStatus::Permission)
+        );
+
+        // Gemini
+        assert_eq!(map_event_type("BeforeAgent"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("AfterTool"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("AfterAgent"), Some(PaneStatus::Review));
+
+        // OpenCode plugin pre-normalizes to these.
+        assert_eq!(map_event_type("Start"), Some(PaneStatus::Working));
+        assert_eq!(map_event_type("permission.ask"), Some(PaneStatus::Permission));
+
+        // Unknown / empty → no status change.
+        assert_eq!(map_event_type("totally-made-up"), None);
+        assert_eq!(map_event_type(""), None);
+    }
+
+    #[test]
+    fn codex_hooks_json_uses_bare_command() {
+        // Verified against the Codex 0.130 HookEventNameWire enum + the
+        // ~/.codex/hooks.json format Codex itself writes: every event
+        // registers the *bare* notify.sh path (no event arg) and Codex
+        // pipes the event name on stdin.
+        let hooks = build_codex_hooks_json("/home/test/.codemux/hooks/notify.sh");
+
+        // SessionEnd is NOT a Codex hook event — must not be registered.
+        assert!(
+            hooks.get("SessionEnd").is_none(),
+            "SessionEnd is not in Codex's HookEventNameWire enum"
+        );
+        // PermissionRequest IS a Codex hook event — Codex gets the red pulse.
+        assert!(
+            hooks.get("PermissionRequest").is_some(),
+            "PermissionRequest must be registered for Codex"
+        );
+
+        for (event_name, _) in CODEX_HOOK_EVENTS {
+            let cmd = hooks[event_name][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event_name} must have a command string"));
+            assert_eq!(
+                cmd, "/home/test/.codemux/hooks/notify.sh",
+                "{event_name} must register the bare notify.sh path (no event arg)"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn gemini_hooks_json_uses_nested_format() {
+        let hooks = build_gemini_hooks_json("/home/test/.codemux/hooks/gemini-notify.sh");
+
+        for (event_name, event_type) in GEMINI_HOOK_EVENTS {
+            let cmd = hooks[event_name][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{event_name} must have a command string"));
+            assert!(
+                cmd.contains(".codemux/hooks/gemini-notify.sh"),
+                "{event_name} command must reference the Gemini hook script"
+            );
+            assert!(
+                cmd.contains(event_type),
+                "{event_name} command must pass '{event_type}' as the event arg"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn gemini_hook_script_emits_json_before_work() {
+        // The Gemini CLI blocks on the hook until it gets JSON on stdout —
+        // the `printf '{}'` must come before any network call.
+        let printf_idx = GEMINI_HOOK_SCRIPT
+            .find("printf '{}")
+            .expect("Gemini hook must emit {} on stdout");
+        let curl_idx = GEMINI_HOOK_SCRIPT
+            .find("curl")
+            .expect("Gemini hook must dispatch via curl");
+        assert!(
+            printf_idx < curl_idx,
+            "Gemini hook must print {{}} before the curl dispatch"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn opencode_plugin_inlines_notify_path_and_guards_env() {
+        let plugin = build_opencode_plugin("/home/test/.codemux/hooks/notify.sh");
+        assert!(
+            plugin.contains("/home/test/.codemux/hooks/notify.sh"),
+            "plugin must inline the notify script path"
+        );
+        assert!(
+            !plugin.contains("{{NOTIFY_PATH}}"),
+            "plugin must not leave the placeholder unsubstituted"
+        );
+        assert!(
+            plugin.contains("CODEMUX_SESSION_ID"),
+            "plugin must no-op unless running inside a Codemux terminal"
+        );
+        // Normalizes to the canonical vocabulary map_event_type understands.
+        for token in ["\"Start\"", "\"Stop\"", "\"PermissionRequest\""] {
+            assert!(
+                plugin.contains(token),
+                "plugin must emit the {token} canonical event"
+            );
+        }
+        // session.busy is not a real OpenCode event — must not be referenced.
+        assert!(
+            !plugin.contains("session.busy"),
+            "plugin must not reference the non-existent session.busy event"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn pi_extension_inlines_notify_path_and_uses_verified_events() {
+        let ext = build_pi_extension("/home/test/.codemux/hooks/notify.sh");
+        assert!(
+            ext.contains("/home/test/.codemux/hooks/notify.sh"),
+            "extension must inline the notify script path"
+        );
+        assert!(
+            !ext.contains("{{NOTIFY_PATH}}"),
+            "extension must not leave the placeholder unsubstituted"
+        );
+        assert!(
+            ext.contains("CODEMUX_SESSION_ID"),
+            "extension must no-op unless running inside a Codemux terminal"
+        );
+        // Verified @mariozechner/pi-coding-agent ExtensionAPI events.
+        for ev in [
+            "before_agent_start",
+            "tool_execution_end",
+            "agent_end",
+            "session_shutdown",
+        ] {
+            assert!(ext.contains(ev), "extension must subscribe to {ev}");
+        }
+        // `session_end` is NOT a real Pi event (older integrations assumed it).
+        assert!(
+            !ext.contains("\"session_end\""),
+            "extension must not subscribe to the non-existent session_end event"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn notify_script_recovers_event_from_stdin_when_no_arg() {
+        // Codex registers a bare command and the Pi extension pipes only
+        // JSON — both rely on notify.sh reading hook_event_name from stdin.
+        assert!(
+            HOOK_SCRIPT.contains("hook_event_name"),
+            "notify.sh must fall back to hook_event_name from the JSON payload"
+        );
+        assert!(
+            HOOK_SCRIPT.contains("EVENT_TYPE=\"${1:-}\""),
+            "notify.sh must still accept the event type as the first arg"
+        );
+    }
 
     #[test]
     fn hook_json_matches_claude_code_format() {
         let hooks = build_claude_hooks_json("/home/test/.codemux/hooks/notify.sh");
 
         // Each event key must be an array
-        for event in ["UserPromptSubmit", "Stop", "PermissionRequest"] {
+        for event in [
+            "UserPromptSubmit",
+            "Stop",
+            "PermissionRequest",
+            "Notification",
+            "PostToolUse",
+        ] {
             let arr = hooks[event].as_array().expect(&format!("{event} must be an array"));
             assert!(!arr.is_empty(), "{event} array must not be empty");
 

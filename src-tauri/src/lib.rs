@@ -511,7 +511,15 @@ pub fn run() {
             // Hook server must be running BEFORE PTYs spawn so that restored
             // sessions get CODEMUX_HOOK_PORT in their environment.
             hooks::start_hook_server(app.handle().clone());
+            // Register agent lifecycle hooks so the status dot tracks
+            // working / needs-input / done. Claude Code always; Codex,
+            // Gemini, OpenCode, and Pi only when their config dir already
+            // exists (so we never create config for uninstalled tools).
             hooks::register_claude_code_hooks();
+            hooks::register_codex_hooks();
+            hooks::register_gemini_hooks();
+            hooks::register_opencode_plugin();
+            hooks::register_pi_extension();
 
             terminal::spawn_missing_ptys(handle);
 
