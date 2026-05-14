@@ -706,11 +706,20 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   }, []);
 
   // ── Focus management ──
+  // Depends on `sessionId` as well as `focused`: when a new tab is created
+  // or a preset launches a CLI agent, PaneContainer swaps the active surface
+  // but React reuses this same TerminalPane fiber. `focused` stays `true`
+  // across that swap (the active pane of both surfaces is focused), so an
+  // effect keyed only on `focused` would never re-run — leaving the freshly
+  // mounted terminal unfocused until the user clicks it. Keying on
+  // `sessionId` re-focuses whenever the underlying terminal changes. The
+  // main mount effect is declared earlier, so it has already pointed
+  // `termRef.current` at the new terminal by the time this runs.
   useEffect(() => {
     if (focused && termRef.current) {
       termRef.current.focus();
     }
-  }, [focused]);
+  }, [focused, sessionId]);
 
   return (
     <div ref={shellRef} className="relative flex flex-1 w-full h-full min-w-0 min-h-0 bg-background">
