@@ -359,6 +359,11 @@ pub struct WorkspaceSnapshot {
     pub pr_url: Option<String>,
     #[serde(default)]
     pub linked_issue: Option<crate::github::LinkedIssue>,
+    /// When true, agent-completion desktop notifications for panes in this
+    /// workspace are suppressed. Only the OS popup is gated — the status
+    /// pills (working spinner, review/permission dots) are unaffected.
+    #[serde(default)]
+    pub notifications_muted: bool,
     #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
@@ -636,6 +641,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             linked_issue: None,
+            notifications_muted: false,
             notification_count: 0,
             latest_agent_state: Some("configuring".into()),
             tabs: vec![],
@@ -760,6 +766,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             linked_issue: None,
+            notifications_muted: false,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![],
@@ -856,6 +863,7 @@ impl AppStateStore {
             pr_state: None,
             pr_url: None,
             linked_issue: None,
+            notifications_muted: false,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -1098,6 +1106,35 @@ impl AppStateStore {
             return true;
         }
         false
+    }
+
+    /// Toggle agent-completion desktop notifications for a workspace.
+    /// Returns true if the workspace was found. Only gates the OS popup;
+    /// status pills are driven separately and stay live.
+    pub fn set_workspace_muted(&self, workspace_id: &str, muted: bool) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.notifications_muted = muted;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the workspace containing `session_id` has notifications muted.
+    /// Used by the hook handler to suppress the completion popup.
+    pub fn is_session_workspace_muted(&self, session_id: &str) -> bool {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().any(|ws| {
+            ws.notifications_muted
+                && ws
+                    .surfaces
+                    .iter()
+                    .any(|s| find_terminal_pane_id(&s.root, session_id).is_some())
+        })
     }
 
     pub fn update_workspace_git_info(
@@ -3099,6 +3136,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_state: None,
             pr_url: None,
             linked_issue: None,
+            notifications_muted: false,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -4208,6 +4246,44 @@ mod tests {
         let fallback = store.close_terminal_session(&created.0).unwrap();
         assert_eq!(fallback.0, first_active.0);
         assert_eq!(store.snapshot().terminal_sessions.len(), 1);
+    }
+
+    #[test]
+    fn workspace_mute_toggles_and_scopes_to_the_owning_session() {
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux"),
+            WorkspacePresetLayout::Single,
+        );
+
+        // Pull the terminal session id that belongs to this workspace.
+        let snapshot = store.snapshot();
+        let workspace = workspace_by_id(&snapshot, &workspace_id);
+        let session_id = match &workspace.surfaces[0].root {
+            PaneNodeSnapshot::Terminal { session_id, .. } => session_id.0.clone(),
+            other => panic!("Single layout should have a terminal root, got {other:?}"),
+        };
+
+        // Default: not muted — the hook handler would NOT suppress.
+        assert!(!workspace.notifications_muted);
+        assert!(!store.is_session_workspace_muted(&session_id));
+
+        // Mute: both the snapshot flag and the session lookup flip.
+        assert!(store.set_workspace_muted(&workspace_id.0, true));
+        assert!(store.is_session_workspace_muted(&session_id));
+        assert!(
+            workspace_by_id(&store.snapshot(), &workspace_id).notifications_muted
+        );
+
+        // Muting is scoped: an unknown session is never reported muted.
+        assert!(!store.is_session_workspace_muted("session-does-not-exist"));
+
+        // Unmute: back to the un-suppressed state.
+        assert!(store.set_workspace_muted(&workspace_id.0, false));
+        assert!(!store.is_session_workspace_muted(&session_id));
+
+        // Unknown workspace id: the mutator reports "not found".
+        assert!(!store.set_workspace_muted("workspace-does-not-exist", true));
     }
 
     #[test]

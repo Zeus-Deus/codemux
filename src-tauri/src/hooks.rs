@@ -151,9 +151,13 @@ fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus)
     state::schedule_emit_app_state(app);
 
     // Fire desktop notification on agent completion when the user can't already
-    // see the pane. Mirrors Superset's "suppress if visible" behavior.
+    // see the pane. Mirrors the "suppress if visible" behavior. A workspace
+    // can also be explicitly muted (right-click → Mute notifications) — useful
+    // when a pane runs a process that spawns agent subprocesses of its own,
+    // whose lifecycle hooks would otherwise pop notifications for this pane.
     if status == PaneStatus::Review
         && !crate::notifications::should_suppress(app, is_active)
+        && !state.is_session_workspace_muted(session_id)
     {
         let workspace_title = workspace_title_for_session(&snapshot, session_id)
             .unwrap_or_else(|| "Workspace".to_string());

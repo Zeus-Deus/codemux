@@ -3344,6 +3344,7 @@ mod tests {
             pr_state: None,
             pr_url: None,
             linked_issue: None,
+            notifications_muted: false,
             tabs: Vec::new(),
             active_tab_id: String::new(),
             active_surface_id: SurfaceId(String::new()),
