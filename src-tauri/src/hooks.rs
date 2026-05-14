@@ -117,7 +117,13 @@ fn map_event_type(event_type: &str) -> Option<PaneStatus> {
         }
         // Session end → Idle (agent is exiting, always clear)
         "sessionEnd" | "SessionEnd" | "session_end" => Some(PaneStatus::Idle),
-        // Permission events
+        // Permission events.
+        //
+        // `Notification` reaches here only for genuine permission/approval
+        // prompts: the hook script inspects the payload's `message` and
+        // drops Claude Code's 60s idle reminder ("waiting for your input")
+        // before it ever hits the server, so the red dot is not raised on
+        // a finished, idle agent.
         "PermissionRequest" | "Notification" | "PreToolUse" | "preToolUse" | "permission.ask"
         | "beforeShellExecution" | "beforeMCPExecution" | "exec_approval_request"
         | "apply_patch_approval_request" | "request_user_input" => Some(PaneStatus::Permission),
@@ -354,6 +360,26 @@ fi
 
 [ -z "$EVENT_TYPE" ] && exit 0
 
+# Claude Code fires `Notification` for two unrelated situations: a real
+# permission/approval prompt ("Claude needs your permission to use Bash")
+# AND a 60s idle reminder ("Claude is waiting for your input"). Only the
+# permission case should drive the red needs-input dot — forwarding the
+# idle reminder would flip a finished agent's green dot to red with no
+# follow-up event left to ever clear it. Inspect the payload's `message`
+# and drop anything that is not a permission/approval request.
+if [ "$EVENT_TYPE" = "Notification" ]; then
+  NOTIF_MSG=""
+  if command -v jq >/dev/null 2>&1; then
+    NOTIF_MSG=$(printf '%s' "$INPUT" | jq -r '.message // empty' 2>/dev/null)
+  fi
+  # jq missing, or no `message` field — fall back to the raw payload.
+  [ -z "$NOTIF_MSG" ] && NOTIF_MSG="$INPUT"
+  case "$NOTIF_MSG" in
+    *permission*|*Permission*|*approval*|*Approval*) : ;;
+    *) exit 0 ;;
+  esac
+fi
+
 URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
 if [ -n "$AGENT_SID" ]; then
   URL="${URL}&agentSessionId=${AGENT_SID}"
@@ -390,6 +416,18 @@ try {
 } catch {}
 
 if (-not $eventType) { exit 0 }
+
+# Claude Code fires `Notification` for two unrelated situations: a real
+# permission/approval prompt AND a 60s idle reminder ("Claude is waiting
+# for your input"). Only the permission case should drive the red
+# needs-input dot — forwarding the idle reminder would flip a finished
+# agent's green dot to red with no follow-up event left to clear it.
+if ($eventType -eq 'Notification') {
+    $notifMsg = ''
+    try { if ($obj -and $obj.message) { $notifMsg = $obj.message } } catch {}
+    if (-not $notifMsg) { $notifMsg = $raw }
+    if ($notifMsg -notmatch '(?i)permission|approval') { exit 0 }
+}
 
 $url = "http://127.0.0.1:$($env:CODEMUX_HOOK_PORT)/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
 if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
@@ -633,9 +671,11 @@ fn merge_nested_hooks_file(
 /// PostToolUse is registered so that when the user answers a
 /// PermissionRequest / Notification (e.g. picks an option from an
 /// AskUserQuestion menu), the tool's resolution fires PostToolUse →
-/// Working — clearing the stuck red pulse. Notification → Permission is
-/// registered as a belt-and-suspenders trigger so the red pulse appears
-/// reliably whenever Claude Code is awaiting user input.
+/// Working — clearing the stuck red pulse. Notification drives the red
+/// pulse, but Claude Code fires it both for permission prompts and for a
+/// 60s idle reminder; the hook script forwards only the permission case
+/// (see HOOK_SCRIPT) so a finished agent's green dot is never flipped to
+/// a red dot that has no follow-up event to clear it.
 pub fn register_claude_code_hooks() {
     let Some(script_path) = ensure_hook_script() else {
         eprintln!("[codemux::hooks] Failed to create hook script");
@@ -1275,6 +1315,40 @@ mod tests {
         assert!(
             HOOK_SCRIPT.contains("EVENT_TYPE=\"${1:-}\""),
             "notify.sh must still accept the event type as the first arg"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn notify_script_drops_claude_idle_notification() {
+        // Claude Code fires `Notification` both for permission prompts and
+        // for a 60s idle reminder. notify.sh must inspect the payload's
+        // `message` and forward only the permission case — otherwise a
+        // finished agent's green dot flips to a red dot that never clears.
+        assert!(
+            HOOK_SCRIPT.contains("$EVENT_TYPE\" = \"Notification\""),
+            "notify.sh must special-case the Notification event"
+        );
+        assert!(
+            HOOK_SCRIPT.contains(".message"),
+            "notify.sh must read the Notification payload's message field"
+        );
+        assert!(
+            HOOK_SCRIPT.contains("*permission*"),
+            "notify.sh must forward Notification only for permission/approval messages"
+        );
+
+        // The message guard must run before the curl dispatch so the idle
+        // reminder is dropped, not merely classified after the fact.
+        let guard_idx = HOOK_SCRIPT
+            .find("*permission*")
+            .expect("notify.sh must guard the Notification event");
+        let curl_idx = HOOK_SCRIPT
+            .find("curl")
+            .expect("notify.sh must dispatch via curl");
+        assert!(
+            guard_idx < curl_idx,
+            "the Notification message guard must run before the curl dispatch"
         );
     }
 
