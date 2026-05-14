@@ -141,6 +141,76 @@ describe("MarkdownRendered", () => {
     expect(container.querySelector("img")).toBe(initialImg);
   });
 
+  it("renders raw HTML blocks instead of escaping them as text", () => {
+    // A README commonly centers its header with a raw `<div>`. Without
+    // rehypeRaw this leaks through as literal `<div align="center">`
+    // text; with it, a real element is produced.
+    const { container } = render(
+      <MarkdownRendered
+        content={`<div align="center">\n\n# Centered\n\n</div>`}
+        filePath="/repo/README.md"
+      />,
+    );
+    const div = container.querySelector("div[align='center']");
+    expect(div).not.toBeNull();
+    expect(div!.querySelector("h1")?.textContent).toBe("Centered");
+    expect(container.textContent).not.toContain("<div");
+  });
+
+  it("resolves src on raw HTML <img> tags, not just markdown images", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={`<img src="assets/logo.svg" alt="Logo" width="80" />`}
+        filePath="/repo/README.md"
+      />,
+    );
+    const img = container.querySelector("img");
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute("src")).toBe("mock-asset:/repo/assets/logo.svg");
+    expect(img!.getAttribute("alt")).toBe("Logo");
+    expect(img!.getAttribute("width")).toBe("80");
+  });
+
+  it("renders a README-style centered header with mixed HTML and markdown", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={[
+          `<div align="center">`,
+          ``,
+          `<img src="assets/logo/logo.svg" alt="Codemux" width="80" />`,
+          ``,
+          `# Codemux`,
+          ``,
+          `![Screenshot](assets/home.png)`,
+          ``,
+          `</div>`,
+        ].join("\n")}
+        filePath="/repo/README.md"
+      />,
+    );
+    const imgs = container.querySelectorAll("img");
+    expect(imgs).toHaveLength(2);
+    expect(imgs[0].getAttribute("src")).toBe(
+      "mock-asset:/repo/assets/logo/logo.svg",
+    );
+    expect(imgs[1].getAttribute("src")).toBe("mock-asset:/repo/assets/home.png");
+    expect(container.querySelector("div[align='center'] h1")?.textContent).toBe(
+      "Codemux",
+    );
+  });
+
+  it("blocks executable link schemes while keeping safe ones", () => {
+    const { container } = render(
+      <MarkdownRendered
+        content={`[click](javascript:alert(1))`}
+        filePath="/repo/README.md"
+      />,
+    );
+    const link = container.querySelector("a");
+    expect(link).not.toBeNull();
+    expect(link!.getAttribute("href") ?? "").not.toContain("javascript:");
+  });
+
   it("still re-renders when content actually changes", () => {
     const { rerender, container } = render(
       <MarkdownRendered content={`# A`} filePath="/r/d.md" />,
