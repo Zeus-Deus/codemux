@@ -39,6 +39,7 @@ pub mod os_input;
 pub mod ports;
 pub mod presets;
 pub mod project;
+pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
 pub mod skills;
@@ -152,6 +153,7 @@ pub fn run() {
         .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
+        .manage(resource_metrics::ResourceMonitorState::default())
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
@@ -1394,6 +1396,7 @@ pub fn run() {
             commands::update_setting,
             commands::reset_synced_settings,
             commands::get_package_format,
+            resource_metrics::get_resource_metrics,
             commands::debug_log,
             commands::clear_adapter_captures,
             scrollback::save_terminal_scrollback,

@@ -50,6 +50,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Review tab / PR integration: `docs/features/review-integration.md`
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system: `docs/features/terminal.md`
+- Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
 - Agent hooks: `docs/features/hooks.md`

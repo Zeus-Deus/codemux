@@ -847,6 +847,22 @@ export function SettingsView() {
               <SettingRow label="Border radius" description="Controls the roundness of all UI elements.">
                 <span className="text-sm text-muted-foreground">0.45rem</span>
               </SettingRow>
+              <Separator />
+              <SettingRow
+                label="Resource monitor"
+                description="Show the CPU/memory monitor icon in the title bar."
+              >
+                <Switch
+                  checked={syncedSettings.appearance.show_resource_monitor}
+                  onCheckedChange={(checked) => {
+                    updateSyncedSetting(
+                      "appearance",
+                      "show_resource_monitor",
+                      checked,
+                    ).catch(console.error);
+                  }}
+                />
+              </SettingRow>
             </div>
           </div>
         );

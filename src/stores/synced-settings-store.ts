@@ -8,7 +8,12 @@ import {
 } from "@/tauri/commands";
 
 const DEFAULT_SETTINGS: UserSettings = {
-  appearance: { theme: "system", shell_font: null, terminal_font_size: 13 },
+  appearance: {
+    theme: "system",
+    shell_font: null,
+    terminal_font_size: 13,
+    show_resource_monitor: true,
+  },
   editor: { default_ide: null },
   terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
   git: { default_base_branch: "main" },
@@ -164,3 +169,6 @@ export const selectKeyboardShortcuts = (s: SyncedSettingsState): Record<string, 
 
 export const selectShowHiddenFiles = (s: SyncedSettingsState): boolean =>
   s.settings.file_tree.show_hidden_files;
+
+export const selectShowResourceMonitor = (s: SyncedSettingsState): boolean =>
+  s.settings.appearance.show_resource_monitor;

@@ -14,6 +14,7 @@ export interface AppearanceSettings {
   theme: string;
   shell_font: string | null;
   terminal_font_size: number;
+  show_resource_monitor: boolean;
 }
 
 export interface EditorSettings {
@@ -57,6 +58,61 @@ export interface UserSettings {
   notifications: NotificationSyncSettings;
   file_tree: FileTreeSyncSettings;
   session_restore: SessionRestoreSettings;
+}
+
+// ── Resource Monitor ──
+// Mirrors src-tauri/src/resource_metrics.rs. `cpu` is a percentage where
+// 100 == one core fully busy (it can exceed 100 across cores). `memory`
+// values are resident bytes.
+
+export interface ResourceUsageValues {
+  cpu: number;
+  memory: number;
+}
+
+export interface ResourceSessionMetrics {
+  session_id: string;
+  pane_id: string;
+  pid: number;
+  title: string | null;
+  cpu: number;
+  memory: number;
+}
+
+export interface ResourceWorkspaceMetrics {
+  workspace_id: string;
+  project_id: string;
+  project_name: string;
+  workspace_name: string;
+  cpu: number;
+  memory: number;
+  sessions: ResourceSessionMetrics[];
+}
+
+export interface ResourceAppMetrics {
+  cpu: number;
+  memory: number;
+  main: ResourceUsageValues;
+  web_view: ResourceUsageValues;
+  other: ResourceUsageValues;
+}
+
+export interface ResourceHostMetrics {
+  total_memory: number;
+  free_memory: number;
+  used_memory: number;
+  memory_usage_percent: number;
+  cpu_core_count: number;
+  load_average_1m: number;
+}
+
+export interface ResourceMetricsSnapshot {
+  app: ResourceAppMetrics;
+  workspaces: ResourceWorkspaceMetrics[];
+  host: ResourceHostMetrics;
+  total_cpu: number;
+  total_memory: number;
+  collected_at: number;
 }
 
 // ── Auth ──

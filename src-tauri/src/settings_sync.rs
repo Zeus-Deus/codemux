@@ -34,6 +34,9 @@ pub struct AppearanceSettings {
     pub shell_font: Option<String>,
     #[serde(default = "default_font_size")]
     pub terminal_font_size: f32,
+    /// Show the resource monitor (CPU/memory) icon in the title bar.
+    #[serde(default = "default_true")]
+    pub show_resource_monitor: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -42,6 +45,7 @@ impl Default for AppearanceSettings {
             theme: default_theme(),
             shell_font: None,
             terminal_font_size: default_font_size(),
+            show_resource_monitor: true,
         }
     }
 }
@@ -468,6 +472,7 @@ mod tests {
                 theme: "dark".into(),
                 shell_font: Some("Fira Code".into()),
                 terminal_font_size: 18.5,
+                show_resource_monitor: false,
             },
             editor: EditorSettings {
                 default_ide: Some("cursor".into()),

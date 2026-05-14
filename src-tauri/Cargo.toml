@@ -75,6 +75,9 @@ nucleo-matcher = "0.3"
 # is a valid image (not just RGBA bytes with a .png extension) and
 # so the encoded bytes never have to cross the JS IPC boundary.
 png = "0.17"
+# Cross-platform process + system metrics for the resource monitor.
+# Powers per-terminal CPU/memory aggregation in resource_metrics.rs.
+sysinfo = "0.33"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

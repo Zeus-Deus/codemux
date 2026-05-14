@@ -27,7 +27,7 @@ import {
 import type { UserSettings } from "@/tauri/types";
 
 const DARK_SETTINGS: UserSettings = {
-  appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 16 },
+  appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 16, show_resource_monitor: true },
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 5000, cursor_style: "block" },
   git: { default_base_branch: "develop" },
@@ -193,7 +193,7 @@ describe("synced-settings-store", () => {
       // User B logs in — loadSettings fetches User B's settings from server
       const userBSettings: UserSettings = {
         ...DEFAULT_SETTINGS,
-        appearance: { theme: "light", shell_font: null, terminal_font_size: 14 },
+        appearance: { theme: "light", shell_font: null, terminal_font_size: 14, show_resource_monitor: true },
         git: { default_base_branch: "develop" },
       };
       mockGetSyncedSettings.mockResolvedValue(userBSettings);
@@ -217,7 +217,7 @@ describe("synced-settings-store", () => {
       // Event arrives with User B's settings (only appearance changed, rest is defaults)
       const userBSettings: UserSettings = {
         ...DEFAULT_SETTINGS,
-        appearance: { theme: "light", shell_font: null, terminal_font_size: 12 },
+        appearance: { theme: "light", shell_font: null, terminal_font_size: 12, show_resource_monitor: true },
       };
       useSyncedSettingsStore.getState().applySettingsFromEvent(userBSettings);
 
