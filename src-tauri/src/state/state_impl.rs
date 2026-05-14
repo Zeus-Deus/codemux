@@ -4001,9 +4001,26 @@ fn remove_pane_from_tree(
 /// Build a stable browser session name from a workspace cwd so that
 /// agent-browser's storage state (cookies, localStorage) persists across
 /// app restarts. Uses the directory basename plus a short hash for uniqueness.
+///
+/// agent-browser turns the session name into a Unix domain socket path
+/// (`<socket_dir>/<session>.sock`) and rejects it once that path exceeds
+/// the platform `sun_path` limit (~103 bytes). For codemux-managed
+/// worktrees the directory basename *is* the git branch name, which is
+/// unbounded — a long branch like
+/// `feature/add-integration-tests-for-the-browser-pane` overflows the
+/// socket path and breaks `codemux browser` entirely for that workspace.
+/// Cap the human-readable portion so the full session name stays well
+/// under both that limit and agent-browser's own 1–64 char cap, while
+/// the hash (computed over the *full* cwd) keeps it stable and unique.
 fn stable_browser_session_name(cwd: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    /// Max bytes of branch/dir name kept in the session name. With the
+    /// `ws-` prefix (3) and `-<6 hex>` hash suffix (7) this caps the
+    /// whole session name at 42 bytes, leaving ~56 bytes of headroom for
+    /// the socket directory before the ~103-byte `sun_path` limit.
+    const MAX_DIR_NAME: usize = 32;
 
     let dir_name = std::path::Path::new(cwd)
         .file_name()
@@ -4012,7 +4029,10 @@ fn stable_browser_session_name(cwd: &str) -> String {
     let mut hasher = DefaultHasher::new();
     cwd.hash(&mut hasher);
     let hash = hasher.finish();
-    format!("ws-{}-{:06x}", dir_name, hash & 0xFFFFFF)
+    // Truncate on a UTF-8 char boundary so multi-byte branch names stay
+    // valid; the hash below still disambiguates shared prefixes.
+    let short_name: String = dir_name.chars().take(MAX_DIR_NAME).collect();
+    format!("ws-{}-{:06x}", short_name, hash & 0xFFFFFF)
 }
 
 fn next_id(prefix: &str) -> String {
@@ -4658,6 +4678,57 @@ mod tests {
 
         assert_eq!(s1.session_id, s2.session_id);
         assert_eq!(store.snapshot().agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn stable_browser_session_name_bounds_socket_path_for_long_branches() {
+        // Reproduction: a codemux worktree whose git branch name is long.
+        // The worktree dir basename *is* the branch name, and before the
+        // fix it landed in the session name verbatim, overflowing
+        // agent-browser's Unix-domain-socket `sun_path` budget.
+        let long_branch = "feature/add-comprehensive-integration-tests-for-the-agent-browser-pane";
+        let cwd = format!("/home/zeus/.codemux/worktrees/codemux/{long_branch}");
+        let name = stable_browser_session_name(&cwd);
+
+        // agent-browser rejects session names outside 1..=64 chars.
+        assert!(
+            (1..=64).contains(&name.len()),
+            "session name must fit agent-browser's 1-64 char cap, got {} chars: {name}",
+            name.len()
+        );
+
+        // agent-browser builds `<socket_dir>/<session>.sock` and refuses
+        // paths over ~103 bytes. Check the worst realistic socket dir
+        // (`$XDG_RUNTIME_DIR/agent-browser` with a 7-digit uid) still fits.
+        let socket_path = format!("/run/user/1234567/agent-browser/{name}.sock");
+        assert!(
+            socket_path.len() <= 103,
+            "socket path must stay under the sun_path limit, got {} bytes: {socket_path}",
+            socket_path.len()
+        );
+
+        assert!(name.starts_with("ws-"), "expected ws- prefix, got: {name}");
+    }
+
+    #[test]
+    fn stable_browser_session_name_is_stable_and_unique() {
+        // Same cwd -> same name (cookie/storage persistence across restarts).
+        let cwd = "/home/zeus/.codemux/worktrees/codemux/main";
+        assert_eq!(
+            stable_browser_session_name(cwd),
+            stable_browser_session_name(cwd)
+        );
+
+        // Two long branches sharing the first 32 chars still get distinct
+        // names: the hash is taken over the *full* cwd, not the truncated
+        // basename, so truncation never collapses two workspaces together.
+        let a = stable_browser_session_name(
+            "/home/zeus/.codemux/worktrees/codemux/feature-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-one",
+        );
+        let b = stable_browser_session_name(
+            "/home/zeus/.codemux/worktrees/codemux/feature-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-two",
+        );
+        assert_ne!(a, b, "shared 32-char prefix must not collide: {a} == {b}");
     }
 
     #[test]
