@@ -1,8 +1,25 @@
 import { memo, useMemo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
+import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 
 import { resolveAssetSrc } from "@/lib/asset-url";
+
+/**
+ * react-markdown's default `urlTransform` would strip the `data:` and
+ * resolved `asset:` URLs we depend on, so we override it. But because
+ * `rehypeRaw` lets a document's own raw HTML through, the transform is
+ * still the right place to neutralise dangerous link schemes
+ * (`javascript:`, `vbscript:`) that could otherwise ride in on a raw
+ * `<a href>`. Everything else — http(s), data, blob, asset, tauri,
+ * relative and absolute filesystem paths — passes through untouched so
+ * `resolveAssetSrc` can do its job on image `src`s.
+ */
+const DANGEROUS_URL = /^\s*(javascript|vbscript):/i;
+
+function safeUrlTransform(url: string): string {
+  return DANGEROUS_URL.test(url) ? "" : url;
+}
 
 interface Props {
   content: string;
@@ -30,7 +47,13 @@ interface Props {
  * `<ReactMarkdown>` call entirely.
  */
 function MarkdownRenderedImpl({ content, filePath }: Props) {
-  const plugins = useMemo(() => [remarkGfm], []);
+  const remarkPlugins = useMemo(() => [remarkGfm], []);
+  // `rehypeRaw` re-parses the raw HTML that GFM leaves as opaque nodes
+  // (e.g. a README's `<div align="center">` wrapper and `<img>` logo) so
+  // it renders as real elements instead of escaped text. Raw `<img>`
+  // tags become proper `img` nodes, so the `img` override below still
+  // routes their `src` through `resolveAssetSrc`.
+  const rehypePlugins = useMemo(() => [rehypeRaw], []);
 
   const components = useMemo<Components>(
     () => ({
@@ -46,14 +69,15 @@ function MarkdownRenderedImpl({ content, filePath }: Props) {
     <div className="flex-1 min-h-0 overflow-auto bg-[var(--background)]">
       <div className="markdown-rendered max-w-3xl px-8 py-6">
         <ReactMarkdown
-          remarkPlugins={plugins}
+          remarkPlugins={remarkPlugins}
+          rehypePlugins={rehypePlugins}
           components={components}
           // react-markdown's default urlTransform strips data: URIs and
           // other non-http schemes for safety. The content here is the
           // user's own local markdown — we resolve filesystem paths via
-          // `resolveAssetSrc` and want data: image URIs to render. An
-          // identity transform restores both.
-          urlTransform={(url) => url}
+          // `resolveAssetSrc` and want data: image URIs to render. Our
+          // transform keeps those but still blocks executable schemes.
+          urlTransform={safeUrlTransform}
         >
           {content}
         </ReactMarkdown>
