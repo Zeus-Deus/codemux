@@ -151,7 +151,7 @@ export function ResourceMonitor({ className }: ResourceMonitorProps) {
               variant="ghost"
               size="icon-sm"
               aria-label="Resource monitor"
-              className={className}
+              className={cn("text-muted-foreground", className)}
             >
               <Cpu className="h-3.5 w-3.5" />
             </Button>

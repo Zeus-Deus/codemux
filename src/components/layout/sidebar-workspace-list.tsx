@@ -307,7 +307,7 @@ export function SidebarWorkspaceList() {
           {projectGroups.map((group, idx) => (
             <div key={group.projectPath}>
               {idx > 0 && (
-                <div className="mx-3 h-px bg-muted-foreground/20" />
+                <div className="h-px bg-sidebar-border" />
               )}
               <div
                 data-drop-zone-project={group.projectPath}
