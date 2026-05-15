@@ -113,6 +113,7 @@ function AppMenu() {
               variant="ghost"
               size="icon-sm"
               aria-label="App menu"
+              className="text-muted-foreground"
             >
               <Settings className="h-3.5 w-3.5" />
             </Button>
