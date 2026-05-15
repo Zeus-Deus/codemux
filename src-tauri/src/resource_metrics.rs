@@ -150,6 +150,17 @@ impl ProcessTree {
         let mut name_of: HashMap<Pid, String> = HashMap::new();
 
         for (pid, process) in system.processes() {
+            // sysinfo iterates `/proc/[pid]/task/[tid]` on Linux, so its
+            // process table is full of *threads* alongside real processes.
+            // A thread shares its leader's address space, so its `memory()`
+            // reports the exact same RSS as the leader — summing them
+            // multiplies one WebKit/Chromium/node process's RAM by its
+            // thread count (10–30×), which is what made the RAM-share
+            // readout exceed 100%. Keep only the thread-group leaders so
+            // every process is counted once.
+            if process.thread_kind().is_some() {
+                continue;
+            }
             usage_of.insert(
                 *pid,
                 UsageValues {
@@ -793,6 +804,56 @@ Shared_Clean:      16384 kB
             project_identity(None, ""),
             ("unknown".to_string(), "Project".to_string()),
         );
+    }
+
+    #[test]
+    fn build_filters_threads_from_real_sysinfo_table() {
+        // Regression for the >100% RAM-share bug: on Linux, sysinfo enumerates
+        // `/proc/[pid]/task/[tid]` entries, so its process table is dominated
+        // by *threads* of multi-threaded processes (WebKit, node, Chromium).
+        // Each thread reports the same RSS as its leader, so without
+        // filtering, summing across a tree multiplies one process's memory by
+        // its thread count.
+        //
+        // The build must drop every entry where `thread_kind().is_some()`,
+        // leaving only the thread-group leaders.
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+
+        let raw_thread_count = system
+            .processes()
+            .values()
+            .filter(|p| p.thread_kind().is_some())
+            .count();
+
+        let tree = ProcessTree::build(&system);
+
+        for (pid, _) in &tree.usage_of {
+            let process = system
+                .process(*pid)
+                .expect("kept PID must exist in sysinfo table");
+            assert!(
+                process.thread_kind().is_none(),
+                "PID {pid} survived ProcessTree::build but is a thread \
+                 (kind={:?}); this would re-introduce the RAM double-counting bug",
+                process.thread_kind(),
+            );
+        }
+
+        // Sanity: on any realistic Linux host the system has at least one
+        // multi-threaded process. If this assertion ever fires on CI it's
+        // worth checking, but it means the test isn't exercising the fix.
+        if raw_thread_count > 0 {
+            assert!(
+                tree.usage_of.len() < system.processes().len(),
+                "expected ProcessTree to be smaller than sysinfo's raw \
+                 process table after filtering threads",
+            );
+        }
     }
 
     #[test]
