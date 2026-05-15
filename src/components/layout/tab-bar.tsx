@@ -313,7 +313,7 @@ export function TabBar({ workspace }: Props) {
               <Button
                 variant="ghost"
                 size="icon-sm"
-                className="ml-0.5 shrink-0"
+                className="ml-1 shrink-0 bg-muted/50 text-muted-foreground"
                 title="New tab"
                 aria-label="New tab"
               >

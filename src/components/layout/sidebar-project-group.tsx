@@ -183,7 +183,7 @@ export function SidebarProjectGroup({
   const isHomeGroup = projectName === "Home" && projectPath === homeDir;
 
   return (
-    <div className="py-1.5">
+    <div className="pt-1.5">
       {/* Project header */}
       <ContextMenu>
         <ContextMenuTrigger asChild>
@@ -211,7 +211,7 @@ export function SidebarProjectGroup({
 
             <Button
               variant="ghost"
-              className="flex-1 justify-start gap-1.5 min-w-0 text-left h-auto p-0 hover:bg-transparent"
+              className="flex-1 justify-start gap-1.5 min-w-0 text-left h-auto p-0 hover:bg-transparent dark:hover:bg-transparent"
               onClick={handleToggle}
             >
               <span className="truncate text-foreground">{projectName}</span>

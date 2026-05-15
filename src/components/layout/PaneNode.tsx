@@ -210,7 +210,7 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
                   node.direction === "horizontal"
                     ? "top-1 bottom-1 -right-[6px] w-3 cursor-col-resize"
                     : "left-1 right-1 -bottom-[6px] h-3 cursor-row-resize"
-                } bg-primary/30 rounded-full`}
+                } bg-foreground/20 hover:bg-foreground/30 data-[dragging=true]:bg-foreground/30 rounded-full`}
                 onPointerDown={(e) => startResize(e, node as PaneNodeSnapshot & { kind: "split" }, i)}
               />
             )}

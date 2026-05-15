@@ -113,6 +113,7 @@ function AppMenu() {
               variant="ghost"
               size="icon-sm"
               aria-label="App menu"
+              className="text-muted-foreground"
             >
               <Settings className="h-3.5 w-3.5" />
             </Button>
@@ -292,8 +293,9 @@ function SidebarToggleButton({
           variant="ghost"
           size="icon-sm"
           aria-label="Toggle sidebar"
+          aria-pressed={open}
           onClick={onToggle}
-          className={cn(open && "text-foreground")}
+          className="text-muted-foreground"
         >
           <PanelLeft className="h-3.5 w-3.5" />
         </Button>
@@ -321,11 +323,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       {/* Left */}
       <div className="flex items-center gap-1 pl-2">
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
-        {/* Resource monitor — CPU/memory usage of Codemux + every
-            terminal process tree. Self-gates on the
-            appearance.show_resource_monitor setting and renders null
-            when disabled. */}
-        <ResourceMonitor />
         {/* Dev-only spawn-chat-pane button. The component self-gates
             on import.meta.env.DEV + enable_agent_chat and renders null
             in release builds, so this mount stays invisible for users.
@@ -342,6 +339,11 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
 
       {/* Right */}
       <div className="flex items-center gap-1.5 pr-0.5">
+        {/* Resource monitor — CPU/memory usage of Codemux + every
+            terminal process tree. Self-gates on the
+            appearance.show_resource_monitor setting and renders null
+            when disabled. */}
+        <ResourceMonitor />
         <IdeLauncher />
         <AppMenu />
         <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
