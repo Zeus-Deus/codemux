@@ -47,7 +47,13 @@ pub async fn install_supervisor(
 ) {
     let map = registry().await;
     let mut guard = map.lock().await;
-    if let Some(prev) = guard.insert(workspace_id.to_string(), supervisor) {
+    let prev = guard.insert(workspace_id.to_string(), supervisor);
+    eprintln!(
+        "[registry] install_supervisor({workspace_id}, replaced_existing={})",
+        prev.is_some()
+    );
+    drop(guard);
+    if let Some(prev) = prev {
         // Run shutdown in the background so install_supervisor stays
         // snappy — the new supervisor is already in the map and live.
         tokio::spawn(async move { prev.shutdown().await });
@@ -61,7 +67,14 @@ pub async fn get_supervisor(
 ) -> Option<Arc<TunnelSupervisor>> {
     let map = registry().await;
     let guard = map.lock().await;
-    guard.get(workspace_id).cloned()
+    let result = guard.get(workspace_id).cloned();
+    eprintln!(
+        "[registry] get_supervisor({workspace_id}) -> {} (registry has {} entries: {:?})",
+        if result.is_some() { "FOUND" } else { "MISS" },
+        guard.len(),
+        guard.keys().collect::<Vec<_>>(),
+    );
+    result
 }
 
 /// Stop and remove the supervisor for a workspace. Called on
@@ -206,13 +219,30 @@ pub async fn client_for_workspace(
     // connect+hello retry loop below.
     let tunnel_wait = Duration::from_secs(20);
     let mut rx = supervisor.subscribe();
+    // Mark the initial subscribed value as seen so `rx.changed()`
+    // wakes ONLY on subsequent updates. Without this, on a freshly
+    // subscribed receiver, changed() can resolve immediately on
+    // the current value, throwing off the wait timing. We then
+    // do an explicit borrow_and_update at the top of every
+    // iteration to pick up changes between awaits.
+    let initial_status = rx.borrow_and_update().clone();
     let deadline = Instant::now() + tunnel_wait;
     eprintln!(
-        "[client_for_workspace:{workspace_id}] waiting for tunnel local-socket bind"
+        "[client_for_workspace:{workspace_id}] waiting for tunnel local-socket bind \
+         (initial supervisor status: {initial_status:?})"
     );
+    let mut iter: u32 = 0;
     loop {
-        let status = rx.borrow().clone();
+        iter += 1;
+        let status = rx.borrow_and_update().clone();
         use crate::ssh::TunnelStatus;
+        // Log every iteration for the first few + every ~5s after
+        // so the log doesn't drown but we see the polling alive.
+        if iter <= 3 || iter % 10 == 0 {
+            eprintln!(
+                "[client_for_workspace:{workspace_id}] poll iter={iter} status={status:?}"
+            );
+        }
         match status {
             TunnelStatus::Connected { ssh_pid } => {
                 eprintln!(
@@ -255,6 +285,10 @@ pub async fn client_for_workspace(
     // ~always fail because the daemon takes 1-5s to come up but
     // we'd try to connect immediately.
     let connect_deadline = Instant::now() + Duration::from_secs(20);
+    // The compiler can't see that this is read on the timeout
+    // branch (it sees per-iteration overwrites without a read in
+    // between for the happy path) — silence the warning.
+    #[allow(unused_assignments)]
     let mut last_err: Option<String> = None;
     let client_arc = loop {
         match PtyDaemonClient::connect(supervisor.local_socket()).await {

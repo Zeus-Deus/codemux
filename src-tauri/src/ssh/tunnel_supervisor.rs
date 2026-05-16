@@ -151,7 +151,14 @@ async fn run_supervisor(
         if *shutdown_rx.borrow() {
             return;
         }
-        let _ = inner.status_tx.send(TunnelStatus::Pending);
+        // IMPORTANT: use send_replace, not send. `send` no-ops the
+        // update when receiver_count() == 0 — which is the common
+        // case here because the supervisor publishes status before
+        // any consumer has subscribed (the consumer subscribes
+        // lazily from client_for_workspace). With plain `send`, a
+        // Connected status published before the consumer subscribes
+        // is silently dropped, so the consumer sees Pending forever.
+        let _ = inner.status_tx.send_replace(TunnelStatus::Pending);
 
         let opts = TunnelOptions {
             ssh_target: &ssh_target,
@@ -182,14 +189,14 @@ async fn run_supervisor(
                 eprintln!("[tunnel-supervisor] spawn failed: {error}");
                 record_failure(&mut failures);
                 if circuit_open(&failures) {
-                    let _ = inner.status_tx.send(TunnelStatus::CircuitOpen {
+                    let _ = inner.status_tx.send_replace(TunnelStatus::CircuitOpen {
                         recent_failures: failures.len() as u32,
                     });
                     return;
                 }
                 attempt += 1;
                 let delay = backoff_delay(attempt);
-                let _ = inner.status_tx.send(TunnelStatus::Reconnecting {
+                let _ = inner.status_tx.send_replace(TunnelStatus::Reconnecting {
                     attempt,
                     delay_ms: delay.as_millis() as u64,
                 });
@@ -207,9 +214,14 @@ async fn run_supervisor(
             Ok(()) => {
                 let ssh_pid = child.id().unwrap_or(0);
                 *inner.current_child.lock().await = Some(child);
-                let _ = inner
+                let prev = inner
                     .status_tx
-                    .send(TunnelStatus::Connected { ssh_pid });
+                    .send_replace(TunnelStatus::Connected { ssh_pid });
+                eprintln!(
+                    "[tunnel-supervisor] published Connected via send_replace \
+                     (ssh_pid={ssh_pid}, receivers={}, prev={prev:?})",
+                    inner.status_tx.receiver_count(),
+                );
                 attempt = 0; // success resets the attempt counter
 
                 // Watchdog: wait for SSH to exit or shutdown signal.
@@ -242,14 +254,14 @@ async fn run_supervisor(
         }
 
         if circuit_open(&failures) {
-            let _ = inner.status_tx.send(TunnelStatus::CircuitOpen {
+            let _ = inner.status_tx.send_replace(TunnelStatus::CircuitOpen {
                 recent_failures: failures.len() as u32,
             });
             return;
         }
         attempt += 1;
         let delay = backoff_delay(attempt);
-        let _ = inner.status_tx.send(TunnelStatus::Reconnecting {
+        let _ = inner.status_tx.send_replace(TunnelStatus::Reconnecting {
             attempt,
             delay_ms: delay.as_millis() as u64,
         });
@@ -408,6 +420,46 @@ mod tests {
         assert!(!circuit_open(&failures));
         record_failure(&mut failures);
         assert!(circuit_open(&failures));
+    }
+
+    /// Regression test: the supervisor publishes status before any
+    /// consumer subscribes (the consumer subscribes lazily from
+    /// `client_for_workspace`). `watch::Sender::send` silently drops
+    /// the update when `receiver_count() == 0` — so we must use
+    /// `send_replace`. This test pins the assumption in case anyone
+    /// "refactors" send_replace back to send.
+    #[tokio::test]
+    async fn send_replace_persists_without_active_receivers() {
+        let (tx, rx) = watch::channel(TunnelStatus::Pending);
+        drop(rx); // mimic dropping `_status_rx` after spawn() returns
+        // Plain send would fail here. send_replace updates the value
+        // regardless of receiver count.
+        let _ = tx.send_replace(TunnelStatus::Connected { ssh_pid: 42 });
+        let mut new_rx = tx.subscribe();
+        assert_eq!(
+            *new_rx.borrow_and_update(),
+            TunnelStatus::Connected { ssh_pid: 42 },
+            "subscriber that joins AFTER send_replace must see the new value"
+        );
+    }
+
+    /// Counter-test that documents why we can't use plain `send`:
+    /// it silently drops updates when no receiver is alive.
+    #[tokio::test]
+    async fn plain_send_silently_drops_without_active_receivers() {
+        let (tx, rx) = watch::channel(TunnelStatus::Pending);
+        drop(rx);
+        let result = tx.send(TunnelStatus::Connected { ssh_pid: 42 });
+        assert!(result.is_err(), "send must fail when receiver_count == 0");
+        // And critically — the value did NOT update. A later
+        // subscriber sees the old initial value.
+        let mut new_rx = tx.subscribe();
+        assert_eq!(
+            *new_rx.borrow_and_update(),
+            TunnelStatus::Pending,
+            "plain send drops the update when no receivers are alive — \
+             this is exactly the bug we fixed by switching to send_replace"
+        );
     }
 
     #[test]
