@@ -291,12 +291,45 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
     }
 }
 
-/// Quote a path for safe inclusion in a shell command (single-quoted).
-/// Defensive against pathological host paths like `/tmp/a b 'c'`.
+/// Quote a path for safe inclusion in a shell command, while
+/// preserving leading `~/` and `~user/` so the remote shell still
+/// expands them to the appropriate home directory.
+///
+/// Defensive against pathological host paths like `/tmp/a b 'c'`
+/// — single quotes around the body block every shell metachar
+/// inside.
+///
+/// The tilde-preservation matters because our remote paths use
+/// the conventional `~/.codemux/worktrees/<project>/<branch>`
+/// layout. A naive `'~/foo'` would tell the shell "create a
+/// literal `~` dir," not "create `foo` inside your home." We hit
+/// this in production with the push flow: mkdir succeeded
+/// creating `~/...` in cwd, then rsync failed because the
+/// expected `$HOME/...` parent didn't exist.
 fn shell_escape(path: &str) -> String {
-    // Replace any embedded single-quote with the POSIX-safe sequence
-    // `'\''` (close-quote, escaped-quote, open-quote).
-    let escaped = path.replace('\'', r"'\''");
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("~/{}", shell_escape_body(rest));
+    }
+    // `~user/...` — less common but legitimate for paths into
+    // another user's home. Tilde + user must stay unquoted for
+    // the shell to expand it.
+    if path.starts_with('~') {
+        if let Some(slash_off) = path[1..].find('/') {
+            let split = 1 + slash_off + 1;
+            let (tilde_user_slash, rest) = path.split_at(split);
+            return format!("{}{}", tilde_user_slash, shell_escape_body(rest));
+        }
+        // Bare `~` or `~user` with nothing after — no body to
+        // quote, the tilde IS the whole path.
+        return path.to_string();
+    }
+    shell_escape_body(path)
+}
+
+fn shell_escape_body(s: &str) -> String {
+    // POSIX-safe single-quote escape: replace any inner `'` with
+    // `'\''` (close-quote, escaped quote, open-quote).
+    let escaped = s.replace('\'', r"'\''");
     format!("'{escaped}'")
 }
 
@@ -496,6 +529,44 @@ mod tests {
         assert_eq!(shell_escape("simple"), "'simple'");
         assert_eq!(shell_escape("with space"), "'with space'");
         assert_eq!(shell_escape("/path/with'quote"), r"'/path/with'\''quote'");
+    }
+
+    #[test]
+    fn shell_escape_preserves_tilde_for_remote_home_expansion() {
+        // Regression guard: a naive quote like `'~/foo'` tells the
+        // shell to use a LITERAL `~` directory instead of the
+        // user's home. Real-world failure: push to a remote where
+        // the username doesn't match the local one would silently
+        // create `cwd/~/.codemux/...` and rsync would fail with a
+        // confusing "No such file or directory" because the
+        // expected `$HOME/.codemux/...` parent never existed.
+        assert_eq!(shell_escape("~/.codemux/worktrees/proj/branch"),
+                   "~/'.codemux/worktrees/proj/branch'");
+    }
+
+    #[test]
+    fn shell_escape_preserves_tilde_user_form() {
+        // `~user/...` is the rarer "into another user's home"
+        // form. Same hazard, same fix.
+        assert_eq!(shell_escape("~alice/code/x"), "~alice/'code/x'");
+    }
+
+    #[test]
+    fn shell_escape_bare_tilde_unchanged() {
+        // `~` alone is just the home dir reference; nothing to
+        // quote.
+        assert_eq!(shell_escape("~"), "~");
+        assert_eq!(shell_escape("~alice"), "~alice");
+    }
+
+    #[test]
+    fn shell_escape_tilde_with_embedded_quote_in_body() {
+        // The tilde-preserving variant must still escape inner
+        // quotes in the post-tilde body.
+        assert_eq!(
+            shell_escape("~/path/with'quote/file"),
+            r"~/'path/with'\''quote/file'"
+        );
     }
 
     #[test]
