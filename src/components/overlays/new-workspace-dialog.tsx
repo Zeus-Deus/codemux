@@ -936,20 +936,23 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           )}
         </div>
 
-        {/* Bottom row: project + branch + device pickers as muted
-            pills. All three are "workspace identity" choices — what
-            project, on what branch, on what device. The agent
-            picker is a separate tier (session content) and stays
-            inside the textarea footer above. */}
+        {/* Bottom row: device + project + branch pickers as muted
+            pills. All three are "workspace identity" choices — on
+            what device, what project, on what branch. Device
+            comes leftmost because picking "where" constrains
+            everything downstream (project list, branch list). The
+            agent picker is a separate tier (session content) and
+            stays inside the textarea footer above. */}
         <div className="flex items-center gap-2 px-4 pb-3">
+          {/* Device picker — leftmost in the identity row. `null`
+              = local. Styled to match the project + branch pills
+              (rounded-full, bg-muted/60, ChevronDown). */}
+          <DevicePicker hostId={hostId} onSelectHostId={setHostId} />
+
           <ProjectPicker
             value={projectDir || null}
             onChange={(path) => setProjectDir(path)}
           />
-
-          {/* Device picker — leftmost-after-project in the identity
-              row. `null` = local. */}
-          <DevicePicker hostId={hostId} onSelectHostId={setHostId} />
 
           {/* Base branch picker */}
           {isGitRepo !== false && (

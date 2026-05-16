@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 
-import { Check, ChevronsUpDown, Monitor, Server } from "lucide-react";
+import { Check, ChevronDown, Monitor, Server } from "lucide-react";
 
 import {
   DropdownMenu,
@@ -96,18 +96,23 @@ export function DevicePicker({
           aria-label={`Device: ${label}`}
           title={label}
           className={cn(
-            "inline-flex h-7 max-w-[160px] items-center gap-1.5",
-            "rounded-md border border-border bg-background px-2",
-            "text-xs text-foreground/90",
-            "hover:bg-muted/50 focus-visible:outline-none",
-            "focus-visible:ring-1 focus-visible:ring-ring",
+            // Matches the project + branch picker pills in the
+            // bottom row of the new-workspace dialog. Same shape
+            // (rounded-full), same surface (bg-muted/60), same
+            // text class, same ChevronDown affordance. Without
+            // this match the device picker visually breaks the
+            // identity row.
+            "inline-flex items-center gap-1.5 rounded-full",
+            "bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground",
+            "transition-colors hover:bg-muted hover:text-foreground",
+            "outline-none max-w-[160px]",
             className,
           )}
         >
           {isLocal ? (
-            <Monitor className="size-3.5 shrink-0" />
+            <Monitor className="h-3.5 w-3.5 shrink-0" />
           ) : (
-            <Server className="size-3.5 shrink-0" />
+            <Server className="h-3.5 w-3.5 shrink-0" />
           )}
           {!iconOnly && (
             <span className="min-w-0 flex-1 truncate text-left">{label}</span>
@@ -118,7 +123,7 @@ export function DevicePicker({
             />
           )}
           {!iconOnly && (
-            <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+            <ChevronDown className="h-2.5 w-2.5 shrink-0 opacity-40" />
           )}
         </button>
       </DropdownMenuTrigger>
