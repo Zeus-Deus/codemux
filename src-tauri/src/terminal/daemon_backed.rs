@@ -269,12 +269,30 @@ pub async fn spawn_pty_for_agent_via_daemon(
     // same `queue_or_send_output` the in-process path uses.
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let read_app = app.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(chunk) = rx.recv().await {
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
         }
         eprintln!(
             "[codemux::terminal::daemon_backed] read loop ended for session {read_session_id}"
+        );
+        // Parity with the in-process path's waiter thread: when the
+        // daemon-side session ends (natural exit, push-triggered
+        // terminate, or daemon connection lost), tell the frontend via
+        // the lifecycle event. Without this the frontend keeps thinking
+        // the session is live and the next write/resize fails with a
+        // confusing "not currently writable" — instead of a clean
+        // "session ended" the UI can react to.
+        emit_terminal_status(
+            &read_app,
+            &read_sessions,
+            TerminalStatusPayload {
+                session_id: read_session_id.clone(),
+                state: TerminalLifecycleState::Exited,
+                message: Some("Agent ended".into()),
+                exit_code: None,
+            },
         );
     });
 
@@ -316,9 +334,6 @@ pub async fn spawn_pty_for_session_via_daemon(
     // `client_for_workspace` returns the right one (caching for
     // perf so repeated spawns in the same workspace reuse the
     // connection).
-    let shell = super::default_shell();
-    app_state.update_terminal_session_shell(&session_id, shell.clone());
-
     let snapshot = app_state.snapshot();
     let owning_ws = super::find_owning_workspace(&snapshot, &session_id);
     let workspace_id = owning_ws
@@ -326,6 +341,22 @@ pub async fn spawn_pty_for_session_via_daemon(
         .unwrap_or_default();
     let host_id = owning_ws.and_then(|w| w.host_id);
     let is_remote = host_id.is_some();
+
+    // Shell choice depends on local vs remote:
+    // - LOCAL: use `$SHELL` from the laptop (the user's preferred shell).
+    // - REMOTE: use bare `bash` — `$SHELL` on the laptop is an absolute
+    //   path to the laptop's shell binary (e.g. `/usr/bin/fish`) which
+    //   almost certainly doesn't exist at that path on the remote host.
+    //   Sending it as argv to the remote daemon makes the spawn fail
+    //   immediately, the daemon closes the session, and the read loop
+    //   ends without a single byte of output. Bare `bash` (resolved via
+    //   the remote daemon's PATH) is on every Linux distro and macOS.
+    let shell = if is_remote {
+        "bash".to_string()
+    } else {
+        super::default_shell()
+    };
+    app_state.update_terminal_session_shell(&session_id, shell.clone());
 
     // Emit an early "Connecting…" status for remote spawns so the
     // overlay shows progress during the tunnel + daemon-handshake
@@ -613,6 +644,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
     let scanner_session_id = session_id.clone();
+    let read_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut line_buf: Vec<u8> = Vec::new();
         while let Some(chunk) = rx.recv().await {
@@ -635,6 +667,19 @@ pub async fn spawn_pty_for_session_via_daemon(
         }
         eprintln!(
             "[codemux::terminal::daemon_backed] shell read loop ended for {read_session_id}"
+        );
+        // See agent path: emit Exited so the frontend reacts cleanly
+        // instead of falling into the "not currently writable" pit on
+        // the next keystroke.
+        emit_terminal_status(
+            &read_app,
+            &read_sessions,
+            TerminalStatusPayload {
+                session_id: read_session_id.clone(),
+                state: TerminalLifecycleState::Exited,
+                message: Some("Shell ended".into()),
+                exit_code: None,
+            },
         );
     });
 
