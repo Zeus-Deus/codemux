@@ -270,6 +270,27 @@ pub async fn spawn_pty_for_session_via_daemon(
     let host_id = owning_ws.and_then(|w| w.host_id);
     let is_remote = host_id.is_some();
 
+    // Emit an early "Connecting…" status for remote spawns so the
+    // overlay shows progress during the tunnel + daemon-handshake
+    // wait. Without this the user sees "Starting persistent shell"
+    // for up to 40s with no movement — looks like a hang.
+    if is_remote {
+        emit_terminal_status(
+            &app,
+            &sessions,
+            TerminalStatusPayload {
+                session_id: session_id.clone(),
+                state: TerminalLifecycleState::Starting,
+                message: Some(
+                    "Connecting to remote host (this can take up to 20s on \
+                     first connect)…"
+                        .into(),
+                ),
+                exit_code: None,
+            },
+        );
+    }
+
     let client = match crate::ssh::client_for_workspace(
         &app,
         &workspace_id,

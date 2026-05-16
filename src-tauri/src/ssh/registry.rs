@@ -200,14 +200,26 @@ pub async fn client_for_workspace(
     };
 
     // Wait for the tunnel to become Connected (or fail loudly).
-    let tunnel_wait = Duration::from_secs(15);
+    // Connected fires when the LOCAL socket file appears, i.e.
+    // when SSH -L successfully bound the local side. It does NOT
+    // mean the remote daemon is up and listening yet — see the
+    // connect+hello retry loop below.
+    let tunnel_wait = Duration::from_secs(20);
     let mut rx = supervisor.subscribe();
     let deadline = Instant::now() + tunnel_wait;
+    eprintln!(
+        "[client_for_workspace:{workspace_id}] waiting for tunnel local-socket bind"
+    );
     loop {
         let status = rx.borrow().clone();
         use crate::ssh::TunnelStatus;
         match status {
-            TunnelStatus::Connected { .. } => break,
+            TunnelStatus::Connected { ssh_pid } => {
+                eprintln!(
+                    "[client_for_workspace:{workspace_id}] tunnel local-socket bound, ssh_pid={ssh_pid}"
+                );
+                break;
+            }
             TunnelStatus::CircuitOpen { recent_failures } => {
                 return Err(PtyDaemonError::Daemon(format!(
                     "tunnel circuit breaker open ({recent_failures} recent \
@@ -218,7 +230,8 @@ pub async fn client_for_workspace(
         }
         if Instant::now() >= deadline {
             return Err(PtyDaemonError::Daemon(format!(
-                "tunnel for workspace {workspace_id} did not come up within {:?}",
+                "tunnel for workspace {workspace_id} did not come up within {:?} \
+                 (check Settings → Hosts → Test connection)",
                 tunnel_wait
             )));
         }
@@ -231,10 +244,53 @@ pub async fn client_for_workspace(
         .await;
     }
 
-    // Connect a fresh client to the tunneled local socket. The
-    // client is already Arc-wrapped by its constructor — share
-    // across all panes in this workspace via the cache.
-    let client_arc = PtyDaemonClient::connect(supervisor.local_socket()).await?;
+    // Connect + Hello with retry. SSH -L can have the local socket
+    // bound before the remote daemon is ready to accept (esp. for
+    // a cold-start of a multi-hundred-MB debug binary, or any
+    // first-run after a fresh install). Connect attempts during
+    // that gap fail silently with EOF or "connection refused".
+    // Retry every 500ms for up to 20s.
+    //
+    // Without this, the first spawn after a fresh push would
+    // ~always fail because the daemon takes 1-5s to come up but
+    // we'd try to connect immediately.
+    let connect_deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_err: Option<String> = None;
+    let client_arc = loop {
+        match PtyDaemonClient::connect(supervisor.local_socket()).await {
+            Ok(c) => {
+                // Connection accepted — but verify the daemon is
+                // actually responsive by doing a Hello round-trip.
+                // SSH -L's connection-refused → succeed-then-EOF
+                // semantics means a successful connect() doesn't
+                // prove the remote side is healthy.
+                match c.hello().await {
+                    Ok((pid, version, _)) => {
+                        eprintln!(
+                            "[client_for_workspace:{workspace_id}] daemon reached: \
+                             pid={pid} version={version}"
+                        );
+                        break c;
+                    }
+                    Err(error) => {
+                        last_err = Some(format!("hello: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                last_err = Some(format!("connect: {error}"));
+            }
+        }
+        if Instant::now() >= connect_deadline {
+            return Err(PtyDaemonError::Daemon(format!(
+                "tunnel up but remote daemon never responded after 20s \
+                 (last error: {}). The remote codemux-remote binary may have \
+                 failed to start — try Test connection in Settings → Hosts.",
+                last_err.unwrap_or_else(|| "unknown".into())
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
     {
         let map = workspace_clients().await;
         let mut guard = map.lock().await;
