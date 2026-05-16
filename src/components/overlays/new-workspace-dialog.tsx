@@ -762,12 +762,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             {/* Footer inside textarea border */}
             <div className="flex items-center justify-between px-3 pb-3 pt-0">
               <div className="flex items-center gap-2 min-w-0">
-                {/* Device picker — leftmost pill matching superset's
-                    DevicePicker placement. The host the new
-                    workspace will run on. `null` = local. */}
-                <DevicePicker hostId={hostId} onSelectHostId={setHostId} />
-
-                {/* Agent picker — pill with real icon */}
+                {/* Agent picker — pill with real icon. The DEVICE
+                    picker used to live here too, but it belongs
+                    with project + branch in the row below — those
+                    are all "workspace identity" choices, while the
+                    agent is "session content." See bottom row. */}
                 <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
@@ -937,12 +936,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           )}
         </div>
 
-        {/* Bottom row: project + branch pickers as muted pills */}
+        {/* Bottom row: project + branch + device pickers as muted
+            pills. All three are "workspace identity" choices — what
+            project, on what branch, on what device. The agent
+            picker is a separate tier (session content) and stays
+            inside the textarea footer above. */}
         <div className="flex items-center gap-2 px-4 pb-3">
           <ProjectPicker
             value={projectDir || null}
             onChange={(path) => setProjectDir(path)}
           />
+
+          {/* Device picker — leftmost-after-project in the identity
+              row. `null` = local. */}
+          <DevicePicker hostId={hostId} onSelectHostId={setHostId} />
 
           {/* Base branch picker */}
           {isGitRepo !== false && (
