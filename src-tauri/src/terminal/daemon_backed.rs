@@ -253,14 +253,12 @@ pub async fn spawn_pty_for_session_via_daemon(
         return Err("session already reserved by another spawn".into());
     }
 
-    let client = match ensure_daemon().await {
-        Ok(c) => c,
-        Err(error) => {
-            remove_session_runtime(&sessions, &session_id);
-            return Err(format!("ensure_daemon: {error}"));
-        }
-    };
-
+    // Resolve the workspace + its host assignment BEFORE picking a
+    // daemon client. host_id=None → local daemon (this device).
+    // host_id=Some(...) → SSH-tunneled remote daemon. Either way
+    // `client_for_workspace` returns the right one (caching for
+    // perf so repeated spawns in the same workspace reuse the
+    // connection).
     let shell = super::default_shell();
     app_state.update_terminal_session_shell(&session_id, shell.clone());
 
@@ -269,6 +267,22 @@ pub async fn spawn_pty_for_session_via_daemon(
     let workspace_id = owning_ws
         .map(|w| w.workspace_id.0.clone())
         .unwrap_or_default();
+    let host_id = owning_ws.and_then(|w| w.host_id);
+    let is_remote = host_id.is_some();
+
+    let client = match crate::ssh::client_for_workspace(
+        &app,
+        &workspace_id,
+        host_id,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(error) => {
+            remove_session_runtime(&sessions, &session_id);
+            return Err(format!("daemon client: {error}"));
+        }
+    };
 
     // ── Scrollback restore + adapter resume parity with in-process path.
     //
@@ -280,11 +294,38 @@ pub async fn spawn_pty_for_session_via_daemon(
     let session_restore_enabled = crate::settings_sync::load_cache()
         .map(|s| s.session_restore.enabled)
         .unwrap_or(true);
-    let mut effective_cwd = session_working_dir(&app_state, &session_id);
+    // Remote workspaces spawn into the conventional remote path
+    // (`~/.codemux/worktrees/<project>/<branch>`) rather than the
+    // local cwd — the workspace's `cwd` field is a local-filesystem
+    // path that doesn't exist on the remote host. Local workspaces
+    // keep using the local cwd as before.
+    let mut effective_cwd = if is_remote {
+        let project_name = owning_ws
+            .and_then(|w| {
+                w.project_root
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "workspace".to_string());
+        let branch = owning_ws
+            .and_then(|w| w.git_branch.clone())
+            .unwrap_or_else(|| "main".to_string());
+        crate::ssh::conventional_remote_path(&project_name, &branch)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        session_working_dir(&app_state, &session_id)
+    };
     let mut auto_resume_command: Option<String> = None;
     let mut pane_id_for_env: Option<String> = None;
 
-    if session_restore_enabled {
+    // Scrollback restore + adapter resume are local-machine
+    // concepts (the cache lives on disk on the laptop). Skip them
+    // for remote workspaces — when chat-on-remote ships we'll
+    // revisit how to coordinate adapter state across the tunnel.
+    if session_restore_enabled && !is_remote {
         if let Some(adapter_state) =
             app.try_state::<crate::session_adapters::AdapterState>()
         {
@@ -342,11 +383,19 @@ pub async fn spawn_pty_for_session_via_daemon(
     if let Some(port) = crate::hooks::hook_port() {
         env.push(("CODEMUX_HOOK_PORT".into(), port.to_string()));
     }
-    if let Some((shim_dir, current_exe)) = super::ensure_openflow_cli_shims() {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let prefixed = super::build_child_path(&shim_dir, &current_path);
-        env.push(("PATH".into(), prefixed));
-        env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
+    // PATH + CLI shim injection are local-machine concepts —
+    // injecting the laptop's PATH into a remote shell would be
+    // worse than nothing (paths to /home/zeus/... etc don't exist
+    // on the remote, and the shim dir lives in the laptop's
+    // filesystem). For remote workspaces the remote shell uses
+    // its own default PATH from the user's ~/.bashrc / ~/.zshrc.
+    if !is_remote {
+        if let Some((shim_dir, current_exe)) = super::ensure_openflow_cli_shims() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let prefixed = super::build_child_path(&shim_dir, &current_path);
+            env.push(("PATH".into(), prefixed));
+            env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
+        }
     }
 
     emit_terminal_status(

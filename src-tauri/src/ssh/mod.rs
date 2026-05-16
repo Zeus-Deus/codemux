@@ -43,8 +43,9 @@ pub use push::{
     PullResult, PushOptions, PushResult,
 };
 pub use registry::{
-    get_supervisor, install_supervisor, local_socket_for_workspace,
-    shutdown_supervisor,
+    client_for_workspace, forget_workspace_client, get_supervisor,
+    install_supervisor, local_socket_for_workspace,
+    remote_socket_for_workspace, shutdown_supervisor,
 };
 pub use tunnel::{spawn_ssh_tunnel, TunnelHandle};
 pub use tunnel_supervisor::{TunnelStatus, TunnelSupervisor};

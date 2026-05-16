@@ -275,7 +275,7 @@ export function WorkspaceContextMenuItems({
     try {
       const result = await workspacePullBack(workspace.workspace_id);
       if (result.ok) {
-        toast.success("Pulled back to This Mac", {
+        toast.success("Pulled back to this device", {
           description: result.message,
         });
       } else {
@@ -390,7 +390,7 @@ export function WorkspaceContextMenuItems({
       <ContextMenuSeparator />
       {isRemote ? (
         <ContextMenuItem onClick={() => void handlePullBack()}>
-          Pull back to This Mac
+          Pull back to this device
         </ContextMenuItem>
       ) : hosts.length > 0 ? (
         <ContextMenuSub>

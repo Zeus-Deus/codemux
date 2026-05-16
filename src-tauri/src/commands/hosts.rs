@@ -388,10 +388,8 @@ pub async fn workspace_push_to_host(
                 // down.
                 let local_socket =
                     crate::ssh::local_socket_for_workspace(&workspace_id);
-                let remote_socket = format!(
-                    "/tmp/codemux-ptyd-{}.sock",
-                    workspace_id.replace(['/', ' '], "-")
-                );
+                let remote_socket =
+                    crate::ssh::remote_socket_for_workspace(&workspace_id);
                 let supervisor = crate::ssh::TunnelSupervisor::spawn(
                     host.ssh_target.clone(),
                     remote_socket,
@@ -399,6 +397,19 @@ pub async fn workspace_push_to_host(
                     "codemux-remote".to_string(),
                 );
                 crate::ssh::install_supervisor(&workspace_id, supervisor).await;
+                // Stop-sync-restart for live PTYs: terminate the
+                // workspace's existing local sessions so the
+                // frontend's terminal-cache GC detects them dying
+                // and triggers a respawn. The respawn goes through
+                // `spawn_pty_for_session` → daemon path →
+                // `client_for_workspace` which now sees host_id is
+                // set and routes through the new tunnel. Same model
+                // as the local persistent-daemon case described in
+                // docs/features/persistent-agents.md, just over
+                // SSH. Without this the user is stuck staring at
+                // local sessions inside a "remote" workspace until
+                // they manually close panes.
+                terminate_workspace_sessions(&app, &workspace_id);
                 WorkspacePushOutcome {
                     ok: true,
                     message: format!("Workspace pushed to {}", host.name),
@@ -500,11 +511,17 @@ pub async fn workspace_pull_back(
                 // again and the next pane spawn uses the local
                 // pty-daemon.
                 app_state.set_workspace_host_id(&workspace_id, None)?;
-                // Shut down the workspace's tunnel supervisor —
-                // there's nothing to maintain a tunnel to anymore.
-                // Idempotent for workspaces that were pulled without
-                // a tunnel ever being installed.
+                // Forget the cached tunneled client BEFORE shutting
+                // down the supervisor — order matters because the
+                // cached client holds a socket that the supervisor
+                // is about to unbind.
+                crate::ssh::forget_workspace_client(&workspace_id).await;
                 crate::ssh::shutdown_supervisor(&workspace_id).await;
+                // Symmetric to push: terminate remote-routed PTY
+                // sessions so the frontend respawns them, this time
+                // routing through the local daemon (host_id is now
+                // None).
+                terminate_workspace_sessions(&app, &workspace_id);
                 WorkspacePullOutcome {
                     ok: true,
                     message: format!("Workspace pulled back from {}", host.name),
@@ -578,4 +595,37 @@ fn schedule_background_sync(app: tauri::AppHandle) {
             eprintln!("[codemux::hosts] background sync failed: {error}");
         }
     });
+}
+
+/// Terminate every PTY session belonging to the given workspace.
+///
+/// Called from both push (so existing local sessions stop and the
+/// frontend respawns them, this time routed through the tunnel)
+/// and pull (symmetric — terminate remote-routed sessions so they
+/// respawn locally). The frontend's terminal-cache GC detects the
+/// session dying and re-mounts the pane, which goes through
+/// `spawn_pty_for_session` → routing chooses the right daemon
+/// based on the workspace's current host_id.
+///
+/// Walks the workspace's pane tree via the existing helper and
+/// invokes `terminate_pty_session` on every collected session id.
+/// For persistent (daemon-backed) sessions, the terminate path
+/// already routes the kill through the daemon — see
+/// `terminal::terminate_pty_session`.
+fn terminate_workspace_sessions(
+    app: &tauri::AppHandle,
+    workspace_id: &str,
+) {
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let pty_state: tauri::State<'_, crate::terminal::PtyState> = app.state();
+    let snapshot = app_state.snapshot();
+    let session_ids: Vec<String> = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
+        .unwrap_or_default();
+    for sid in session_ids {
+        crate::terminal::terminate_pty_session(&pty_state.sessions, &sid);
+    }
 }
