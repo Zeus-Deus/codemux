@@ -337,7 +337,7 @@ export function HostsSection() {
                 </Label>
                 <Input
                   id="host-add-target"
-                  placeholder="zeus@10.0.0.5"
+                  placeholder="user@host"
                   value={draft.ssh_target}
                   onChange={(e) =>
                     setDraft({ ...draft, ssh_target: e.target.value })
