@@ -236,16 +236,11 @@ pub async fn spawn_pty_for_agent_via_daemon(
 }
 
 /// Daemon-backed shell spawn — the persistent equivalent of
-/// `spawn_pty_for_session_in_process`. Mirrors enough of the env construction
-/// from the in-process path that user-typed commands inside the shell see
-/// the same `CODEMUX_*` and workspace env they always have.
-///
-/// Tradeoff vs. the in-process path: the session adapter system (which
-/// rewinds scrollback and offers `--resume` for matching agents) is NOT
-/// wired here yet. The whole point of persistent shells is that they
-/// genuinely survive — there's nothing to "resume." Scrollback may still
-/// be replayed by the daemon's per-session replay buffer when the client
-/// reattaches.
+/// `spawn_pty_for_session_in_process`. Mirrors the env construction,
+/// scrollback restore, and session-adapter wiring of the in-process path
+/// so user-typed commands inside the shell get the same Codemux context
+/// AND reopening a previously-killed agent triggers the same
+/// `claude --continue` / adapter-driven resume the in-process path does.
 pub async fn spawn_pty_for_session_via_daemon(
     app: AppHandle,
     session_id: String,
@@ -269,12 +264,48 @@ pub async fn spawn_pty_for_session_via_daemon(
     let shell = super::default_shell();
     app_state.update_terminal_session_shell(&session_id, shell.clone());
 
-    let cwd = session_working_dir(&app_state, &session_id);
     let snapshot = app_state.snapshot();
     let owning_ws = super::find_owning_workspace(&snapshot, &session_id);
     let workspace_id = owning_ws
         .map(|w| w.workspace_id.0.clone())
         .unwrap_or_default();
+
+    // ── Scrollback restore + adapter resume parity with in-process path.
+    //
+    // If there's saved scrollback for this session id, and the session-
+    // restore setting is on, we (a) use the original cwd so CWD-scoped
+    // tools like `claude --resume` find their state, and (b) capture an
+    // `auto_resume_command` that we'll write into the shell after spawn.
+    // Mirrors `spawn_pty_for_session_in_process` lines around 1166-1200.
+    let session_restore_enabled = crate::settings_sync::load_cache()
+        .map(|s| s.session_restore.enabled)
+        .unwrap_or(true);
+    let mut effective_cwd = session_working_dir(&app_state, &session_id);
+    let mut auto_resume_command: Option<String> = None;
+    let mut pane_id_for_env: Option<String> = None;
+
+    if session_restore_enabled {
+        if let Some(adapter_state) =
+            app.try_state::<crate::session_adapters::AdapterState>()
+        {
+            if let Some((ws_id, pane_id, meta)) =
+                crate::scrollback::find_scrollback_meta_for_session(&session_id)
+            {
+                effective_cwd =
+                    super::resolve_session_cwd(&meta.working_directory, &effective_cwd);
+                pane_id_for_env = Some(pane_id.clone());
+                if let Some(resume_command) =
+                    super::resolve_resume_command(&snapshot, &meta, &adapter_state)
+                {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] restored session at \
+                         {ws_id}/{pane_id} for {session_id}; auto-resume armed"
+                    );
+                    auto_resume_command = Some(resume_command);
+                }
+            }
+        }
+    }
 
     let mut env: Vec<(String, String)> = vec![
         ("TERM".into(), "xterm-256color".into()),
@@ -304,6 +335,18 @@ pub async fn spawn_pty_for_session_via_daemon(
             "CODEMUX_AGENT_CONTEXT".into(),
             crate::agent_context::build_agent_context(None, None, None, None),
         ));
+    }
+    if let Some(pane_id) = pane_id_for_env.as_ref() {
+        env.push(("CODEMUX_PANE_ID".into(), pane_id.clone()));
+    }
+    if let Some(port) = crate::hooks::hook_port() {
+        env.push(("CODEMUX_HOOK_PORT".into(), port.to_string()));
+    }
+    if let Some((shim_dir, current_exe)) = super::ensure_openflow_cli_shims() {
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let prefixed = super::build_child_path(&shim_dir, &current_path);
+        env.push(("PATH".into(), prefixed));
+        env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
     }
 
     emit_terminal_status(
@@ -337,7 +380,7 @@ pub async fn spawn_pty_for_session_via_daemon(
                 session_id.clone(),
                 workspace_id,
                 vec![shell.clone()],
-                cwd,
+                effective_cwd,
                 env,
                 DEFAULT_ROWS,
                 DEFAULT_COLS,
@@ -372,6 +415,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     };
 
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
+    let auto_resume_clone = auto_resume_command.clone();
     with_session_runtime(
         &sessions,
         &session_id,
@@ -382,8 +426,25 @@ pub async fn spawn_pty_for_session_via_daemon(
             runtime.child_pid = Some(pid);
             runtime.persistent = true;
             runtime.is_spawning = false;
+            runtime.skip_preset_launch = auto_resume_clone.is_some();
+            runtime.resume_command = auto_resume_clone;
         },
     );
+
+    // Send the resume command via the same write-when-ready path the
+    // in-process spawn uses. Because our `DaemonWriter` is already in
+    // `runtime.writer`, this lands at the daemon, which writes to the
+    // master fd; the shell sees it as if the user typed it.
+    if let Some(command) = auto_resume_command {
+        let sessions_for_command = sessions.clone();
+        let session_id_for_command = session_id.clone();
+        crate::commands::presets::write_command_when_ready(
+            sessions_for_command,
+            session_id_for_command,
+            command,
+            120,
+        );
+    }
 
     emit_terminal_status(
         &app,
@@ -398,10 +459,47 @@ pub async fn spawn_pty_for_session_via_daemon(
         },
     );
 
+    // ── Reader task: drain the daemon's mpsc into queue_or_send_output AND
+    // feed the adapter line scanner so agents like Claude Code can capture
+    // their session ID for `--resume`. Parity with the in-process read
+    // loop's line buffer at terminal/mod.rs:1377.
+    let adapter_clone: Option<crate::session_adapters::AdapterState> = app
+        .try_state::<crate::session_adapters::AdapterState>()
+        .map(|s| s.inner().clone());
+    let original_cmd = snapshot
+        .terminal_sessions
+        .iter()
+        .find(|s| s.session_id.0 == session_id)
+        .and_then(|s| s.original_command.clone());
+    let has_scanner = if let (Some(ref adapter), Some(ref cmd)) =
+        (&adapter_clone, &original_cmd)
+    {
+        adapter.start_scanner(&session_id, cmd).is_some()
+    } else {
+        false
+    };
+
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let scanner_session_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
+        let mut line_buf: Vec<u8> = Vec::new();
         while let Some(chunk) = rx.recv().await {
+            // Adapter scanner (cheap when has_scanner=false).
+            if has_scanner {
+                if let Some(ref adapter) = adapter_clone {
+                    for &byte in &chunk {
+                        if byte == b'\n' {
+                            let line = String::from_utf8_lossy(&line_buf);
+                            let clean = super::strip_ansi_codes(&line);
+                            adapter.scan_line(&scanner_session_id, &clean);
+                            line_buf.clear();
+                        } else if byte != b'\r' {
+                            line_buf.push(byte);
+                        }
+                    }
+                }
+            }
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
         }
         eprintln!(

@@ -83,37 +83,46 @@ Defined in `src-tauri/src/pty_daemon/protocol.rs`. Bump `PROTOCOL_VERSION` for a
 
 ## Settings
 
-```jsonc
-{
-  "persistent_agents": {
-    "enabled": false   // off by default; flip to true to opt in
-  }
-}
-```
+**There is no setting.** Persistent agents are the default behavior of the app — every PTY spawn goes through the daemon, full stop. This is intentional: agents not dying when the app closes is a strict UX upgrade, and the upcoming cloud-push feature builds on the same mechanism.
 
-The setting only gates whether **new** sessions go through the daemon. Once a daemon is running, sessions it owns are always reattached on launch regardless of the setting — otherwise toggling the setting off would silently lose live agents.
+The only escape hatch is the env var **`CODEMUX_DISABLE_PTY_DAEMON=1`**, which forces the in-process path. Treat it as a panic button for the field if a regression ever ships; normal users never need it.
 
-There is no UI for this yet. Users opt in by editing `~/.local/share/codemux[-dev]/settings-cache.json` directly. Adding a Settings → Sessions toggle is a follow-up.
+## Graceful Fallback
+
+The daemon path is **always safe**. Every error route falls back to the in-process PTY path so the user always gets a working terminal:
+
+| Failure | Behavior |
+|---|---|
+| Daemon binary missing or can't spawn | log + in-process fallback |
+| Socket race / connect timeout | log + in-process fallback |
+| Protocol version mismatch on adoption | log + spawn fresh daemon, fall back if that fails |
+| Windows (named-pipe IPC not wired yet) | in-process, every time, no daemon code touched |
+| `CODEMUX_DISABLE_PTY_DAEMON=1` | in-process, no daemon code touched |
+| **Crash circuit open** (3 daemon failures within 60 s) | fast-fail + in-process for rest of process lifetime |
+
+The crash circuit prevents a broken daemon from turning into a tight respawn loop. Tracked by `pty_daemon::supervisor::{circuit_is_open, total_failures, reset_circuit}`. Resets only on app restart (intentional — recurring failures are an environment problem, not a transient hiccup).
 
 ## What Works Today
 
-- Shells survive Codemux app close (verified end-to-end via `npm run tauri:dev`).
-- Agent processes inside those shells survive (they're children of the daemon-owned shell — kernel never sends SIGHUP because the daemon still holds the master fd).
-- Fresh Codemux launch adopts the running daemon and reattaches to live sessions.
+- **Default behavior:** no setting, no opt-in. Every shell goes through the daemon automatically.
+- Shells + agents inside them survive Codemux app close (verified end-to-end via `npm run tauri:dev`).
+- Fresh Codemux launch adopts the running daemon and reattaches to live sessions (`[codemux::terminal::daemon_backed] reattaching to live shell session ...`).
 - Pane-close from the UI properly tears the agent down via the daemon (no leaked PTYs).
-- Cross-platform compile (Unix path validated; Windows compiles but named-pipe + `DETACHED_PROCESS` paths haven't been exercised on a real Windows box yet).
-- Integration tests (`src-tauri/tests/pty_daemon_persistence.rs`) cover the headline invariant — a child spawned through the daemon must outlive the client that spawned it.
+- Session-adapter resume wired for daemon-backed sessions: reopening a Claude pane auto-types `--resume <session_id>` (or `--continue` fallback) just like the in-process path.
+- Scrollback restoration: daemon-backed sessions use the same `~/.local/share/codemux[-dev]/scrollback/` cache.
+- **Real exit codes** via a per-session waiter thread (no more `-1` sentinel).
+- **Resize** for daemon-backed sessions routes through `client.resize` over the socket.
+- **Graceful fallback at every error site** — daemon failure never breaks the terminal.
+- **Crash circuit breaker** caps daemon respawn attempts.
+- **Late-attacher exit signal**: clients that attach after a child has already exited receive an immediate `Exited` event instead of hanging.
+- Integration tests (`src-tauri/tests/pty_daemon_persistence.rs` + `pty_daemon_circuit_breaker.rs`): handshake, list, child survives client disconnect, second client sees session, exit code 0 / non-zero reporting, resize round-trip, write-to-unknown error shape, circuit-breaker trip + reset.
 
 ## Current Constraints (Follow-ups)
 
-- **Windows path is scaffolded but unvalidated.** The supervisor uses `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and `server.rs::run` is `#[cfg(unix)]`-gated on the listener; a Windows port (named pipes + tokio's `windows::named_pipe`) is the obvious next step.
-- **No fd-handoff during daemon upgrades.** Bumping the daemon version means the user has to manually shut down the running daemon and reopen the app, which loses sessions. The superset pattern of passing PTY master fds via SCM_RIGHTS during upgrade is tracked but not implemented.
-- **No crash circuit breaker.** A broken daemon will respawn indefinitely; we should cap to ~3 failures in 60 seconds like superset does.
-- **Session adapter system (scrollback restore, Claude `--continue`)** is not wired for daemon-backed sessions. They get a clean slate on reattach (the daemon's per-session replay buffer feeds recent bytes back). Combining adapter resume with daemon reattach is a follow-up.
-- **No comm-log piping for daemon-backed OpenFlow agents.** The in-process spawn path tees PTY output to the comm log; the daemon path skips this. OpenFlow agents should opt out of persistent mode until the comm log is wired (or just `enabled: false`).
-- **Resize on daemon-backed sessions is wired but underused.** The existing `resize_pty` Tauri command flows through `runtime.master.resize`, which is `None` for persistent sessions. A dedicated daemon-side resize call exists in the protocol but isn't yet routed from the resize command.
-- **Settings UI is missing.** Editing JSON is hostile. A toggle in the Settings panel is one short PR.
-- **Daemon's child-exit detection is best-effort.** The read thread sees EOF and removes the session, but it can't reap the child or report a real exit code (it doesn't own the `Child` handle). The `Exited` event ships `exit_code: -1` until we wire a proper waiter.
+- **Windows path is scaffolded but not wired.** The supervisor + server are `#[cfg(unix)]`-gated; on Windows the daemon path is disabled entirely and the in-process path is used (zero regression). A Windows port needs tokio's `windows::named_pipe` for the IPC and `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` creation flags (already in `spawn_daemon_detached`'s cfg-gated branch).
+- **No fd-handoff during daemon upgrades.** Bumping the daemon version means the user has to manually shut down the running daemon and reopen the app to use the new protocol; live sessions are lost. The superset pattern of passing PTY master fds via SCM_RIGHTS during upgrade is the next step.
+- **No comm-log piping for daemon-backed OpenFlow agents.** The in-process agent spawn tees PTY output to the comm log; the daemon path skips this. OpenFlow runs in this codepath but the comm log won't be populated. Fix is to wire the same tee in `daemon_backed::spawn_pty_for_agent_via_daemon`'s reader task.
+- **Daemon doesn't shut itself down when no sessions exist for a long time.** Memory cost is small but non-zero; an idle-timeout reaper could close the daemon after, say, an hour with no live sessions to be a good citizen.
 
 ## Important Touch Points
 
@@ -122,25 +131,28 @@ There is no UI for this yet. Users opt in by editing `~/.local/share/codemux[-de
 - `src-tauri/src/pty_daemon/client.rs` — Tauri-side socket client; demuxes responses + events.
 - `src-tauri/src/pty_daemon/manifest.rs` — `pty-daemon-manifest.json` read/write/atomic-replace.
 - `src-tauri/src/pty_daemon/supervisor.rs` — `ensure_daemon`, adoption, spawn-detached.
-- `src-tauri/src/terminal/mod.rs` — `spawn_pty_for_session` / `spawn_pty_for_agent` routing, `persistent_agents_enabled`, persistent-aware `terminate_pty_session` + `Drop for SessionRuntime`.
-- `src-tauri/src/terminal/daemon_backed.rs` — the daemon-backed spawn implementations, `DaemonWriter`.
-- `src-tauri/src/settings_sync.rs` — `PersistentAgentsSettings`.
+- `src-tauri/src/terminal/mod.rs` — `spawn_pty_for_session` / `spawn_pty_for_agent` routing, `daemon_path_viable`, persistent-aware `terminate_pty_session` + `Drop for SessionRuntime`, `resize_pty` routing.
+- `src-tauri/src/terminal/daemon_backed.rs` — the daemon-backed spawn implementations, `DaemonWriter`, scrollback + adapter resume wiring.
 - `src-tauri/src/cli.rs` — `CommandSet::PtyDaemon { socket }` subcommand wiring.
-- `src-tauri/src/lib.rs` — startup adoption warmup.
-- `src-tauri/tests/pty_daemon_persistence.rs` — survival + reattach integration tests.
+- `src-tauri/src/lib.rs` — startup adoption warmup (Unix-only).
+- `src-tauri/tests/pty_daemon_persistence.rs` — survival, reattach, exit code, resize, error-handling integration tests.
+- `src-tauri/tests/pty_daemon_circuit_breaker.rs` — circuit breaker unit tests.
 
 ## Troubleshooting
 
-**Agent died with the app despite the setting being on:**
-- Check `~/.local/share/codemux[-dev]/settings-cache.json` — the dev frontend currently rewrites the cache on every sync, sometimes resetting `persistent_agents.enabled` back to `false`. Set it back to `true` and restart the app. (Settings UI work will fix this.)
-- Look for `[codemux::pty_daemon] startup adoption` and `[codemux::terminal::daemon_backed]` lines in the app's stderr. Absence means the spawn took the in-process path.
+**Agent died with the app close:**
+- Look for `[codemux::pty_daemon] startup adoption ok` and `[codemux::terminal::daemon_backed]` lines in the app's stderr. Absence means the spawn took the in-process fallback path — check the preceding log line for the reason (circuit open, daemon binary missing, socket bind failed).
+- If you see `circuit OPEN: N ensure_daemon failures within 60s` — the breaker tripped. Restart the app to reset.
 
 **Reattach didn't pick up old session:**
 - Verify the daemon is still alive: `ps -p $(jq .pid ~/.local/share/codemux[-dev]/pty-daemon-manifest.json)`.
-- Check the daemon's session list: connect to the socket with `nc -U ~/.local/share/codemux[-dev]/ptyd.sock` and send `{"type":"list","request_id":1}\n`.
+- Check the daemon's session list: connect to the socket with `socat - UNIX-CONNECT:~/.local/share/codemux[-dev]/ptyd.sock` and send `{"type":"list","request_id":1}\n`.
 - Stale manifests are handled by the `kill(pid, 0)` check in `supervisor::try_adopt`. If a manifest points to a dead PID, the supervisor logs and ignores it.
 
-**How to fully reset:**
+**Need to disable persistent mode entirely (panic button):**
+- Set `CODEMUX_DISABLE_PTY_DAEMON=1` in the environment before launching Codemux. Every PTY spawn will go through the in-process path; the daemon is never touched. This is the rollback path if a regression ever ships.
+
+**How to fully reset state:**
 - Kill the daemon: `pkill -f "codemux pty-daemon"`.
 - Remove the manifest + socket: `rm -f ~/.local/share/codemux[-dev]/{pty-daemon-manifest.json,ptyd.sock}`.
-- Toggle `persistent_agents.enabled` to `false` in the settings cache.
+- Next app launch spawns a fresh daemon automatically.

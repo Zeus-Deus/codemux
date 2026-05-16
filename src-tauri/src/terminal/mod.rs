@@ -24,8 +24,9 @@ use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
 /// Persistent-agent path: routes spawns through `codemux pty-daemon` so
-/// they survive the app being closed. Gated by
-/// `settings_sync::PersistentAgentsSettings::enabled`.
+/// they survive the app being closed. Unix-only — Windows builds use the
+/// in-process path exclusively.
+#[cfg(unix)]
 pub mod daemon_backed;
 
 static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
@@ -1012,40 +1013,45 @@ fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, Strin
 }
 
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
-    // Persistent path: when the user has opted in, every shell goes through
-    // the long-lived `codemux pty-daemon` so closing the app doesn't kill
-    // it. The agent commands the user later types into the shell inherit
-    // the shell's lifetime, so this is what actually makes "close laptop,
-    // agent keeps running" work for the normal preset-driven flow (which
+    // Persistent path: every shell goes through the long-lived
+    // `codemux pty-daemon` so closing the app doesn't kill it. The
+    // agent commands the user later types into the shell inherit the
+    // shell's lifetime, so this is what makes "close laptop, agent
+    // keeps running" work for the normal preset-driven flow (which
     // spawns a shell first and writes the agent command into it).
     //
-    // Fallback is silent: any daemon error drops back to the in-process
-    // spawn so the user always gets a working terminal.
-    if persistent_agents_enabled() {
-        let app_clone = app.clone();
-        let session_id_clone = session_id.clone();
-        tauri::async_runtime::spawn(async move {
-            match daemon_backed::spawn_pty_for_session_via_daemon(
-                app_clone.clone(),
-                session_id_clone.clone(),
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    eprintln!(
-                        "[codemux::terminal] persistent-shell path failed for session \
-                         {session_id_clone}: {error}; falling back to in-process spawn"
-                    );
-                    let sid = session_id_clone.clone();
-                    let app_fb = app_clone.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        spawn_pty_for_session_in_process(app_fb, sid);
-                    });
+    // Fallback is silent and total: any daemon error — circuit breaker
+    // open, daemon binary missing, socket race, version mismatch,
+    // platform without IPC support — drops to the in-process spawn so
+    // the user always gets a working terminal.
+    #[cfg(unix)]
+    {
+        if daemon_path_viable() {
+            let app_clone = app.clone();
+            let session_id_clone = session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                match daemon_backed::spawn_pty_for_session_via_daemon(
+                    app_clone.clone(),
+                    session_id_clone.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::terminal] persistent-shell path failed for session \
+                             {session_id_clone}: {error}; falling back to in-process spawn"
+                        );
+                        let sid = session_id_clone.clone();
+                        let app_fb = app_clone.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            spawn_pty_for_session_in_process(app_fb, sid);
+                        });
+                    }
                 }
-            }
-        });
-        return;
+            });
+            return;
+        }
     }
     spawn_pty_for_session_in_process(app, session_id);
 }
@@ -2019,6 +2025,47 @@ pub fn resize_pty(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
+    // Persistent (daemon-backed) sessions have `master: None` because the
+    // daemon owns the PTY. Route the resize over the socket instead. We
+    // do this on a tokio task so the sync command handler returns
+    // immediately; resize is fire-and-forget at the terminal level
+    // anyway (xterm doesn't wait for an ack). Unix-only because the
+    // daemon doesn't exist on Windows.
+    #[cfg(unix)]
+    {
+        let persistent = with_session_runtime(
+            &terminal_state.sessions,
+            &session_id,
+            || SessionRuntime::new(&session_id),
+            |runtime| Ok::<bool, String>(runtime.persistent),
+        )?;
+        if persistent {
+            let session_id_clone = session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                match crate::pty_daemon::ensure_daemon().await {
+                    Ok(client) => {
+                        if let Err(error) =
+                            client.resize(session_id_clone.clone(), rows, cols).await
+                        {
+                            eprintln!(
+                                "[codemux::terminal] daemon resize failed for \
+                                 {session_id_clone}: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::terminal] cannot reach daemon to resize \
+                             {session_id_clone}: {error}"
+                        );
+                    }
+                }
+            });
+            app_state.update_terminal_session_size(&session_id, cols, rows);
+            return Ok(());
+        }
+    }
+
     with_session_runtime(
         &terminal_state.sessions,
         &session_id,
@@ -2073,12 +2120,12 @@ pub fn spawn_pty_for_agent(
     extra_env: Vec<(String, String)>,
     execution_policy: crate::execution::ExecutionPolicy,
 ) {
-    // Persistent-agents path: if the user has opted in, the agent runs
-    // inside `codemux pty-daemon` so it survives this process exiting.
-    // Falls back silently to the in-process path on any error (cannot
-    // reach daemon, Windows where we haven't wired named pipes yet,
-    // adoption mismatch) so the user still gets a working agent.
-    if persistent_agents_enabled() {
+    // Persistent path: the agent runs inside `codemux pty-daemon` so it
+    // survives this process exiting. Same graceful-fallback contract as
+    // the shell path — any daemon error silently drops back to
+    // in-process spawn so the user always gets a working agent.
+    #[cfg(unix)]
+    if daemon_path_viable() {
         let app_for_daemon = app.clone();
         let session_id_for_daemon = session_id.clone();
         let workspace_id_for_daemon = workspace_id.clone();
@@ -2137,41 +2184,39 @@ pub fn spawn_pty_for_agent(
     );
 }
 
-/// Reads the `persistent_agents.enabled` setting from the local cache.
-/// Defaults to `false` when the cache is missing or unreadable — we never
-/// silently opt the user in.
-fn persistent_agents_enabled() -> bool {
-    if persistent_agents_setting_enabled() {
-        return true;
-    }
-    // Even when the setting is currently off, if a daemon is still running
-    // from a previous launch, we route through it so reattach works (the
-    // daemon's idempotent spawn handler returns the existing pid for any
-    // session id it already owns). Otherwise users would lose their
-    // persistent sessions on the next launch if they toggled the setting
-    // off in the meantime.
-    daemon_manifest_is_alive()
-}
-
-fn persistent_agents_setting_enabled() -> bool {
-    settings_sync::load_cache()
-        .map(|s| s.persistent_agents.enabled)
-        .unwrap_or(false)
-}
-
-fn daemon_manifest_is_alive() -> bool {
-    let Some(manifest) = crate::pty_daemon::manifest::read_manifest() else {
+/// Decide whether to try the persistent-PTY-daemon path for this spawn.
+///
+/// Default app behavior: **always try the daemon first**. The only reasons
+/// to skip it are:
+///
+/// - The platform isn't wired yet (Windows IPC TBD — falls back cleanly to
+///   the in-process path so Windows users get the old behavior with zero
+///   regression).
+/// - The crash circuit breaker is open (daemon has been failing in a tight
+///   loop; we stop trying for the rest of this app run).
+/// - An env-var kill switch is set (`CODEMUX_DISABLE_PTY_DAEMON=1`), so we
+///   have a panic button if a release ships and something goes badly wrong
+///   in the field. Users never need to touch this in normal operation.
+///
+/// There is **no user-facing setting**. Persistent agents are the default
+/// because the future cloud-push feature builds on the same mechanism, and
+/// "your agent didn't die when the app closed" is a strict UX upgrade.
+fn daemon_path_viable() -> bool {
+    if std::env::var_os("CODEMUX_DISABLE_PTY_DAEMON").is_some() {
         return false;
-    };
-    #[cfg(unix)]
-    {
-        unsafe { libc::kill(manifest.pid as i32, 0) == 0 }
     }
     #[cfg(not(unix))]
     {
-        // No cheap liveness check on Windows yet — assume alive.
-        let _ = manifest;
-        true
+        // Windows path: scaffolded but unvalidated. Until the named-pipe
+        // server is wired and tested on a real Windows box, fall back to
+        // in-process so Windows users keep the existing behavior. This
+        // returns `false` unconditionally; flip when Windows support
+        // lands.
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        !crate::pty_daemon::supervisor::circuit_is_open()
     }
 }
 

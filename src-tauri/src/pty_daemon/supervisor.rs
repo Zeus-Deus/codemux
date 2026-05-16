@@ -16,17 +16,95 @@ use crate::pty_daemon::client::{PtyDaemonClient, PtyDaemonError};
 use crate::pty_daemon::manifest::{manifest_path, read_manifest, socket_dir};
 use crate::pty_daemon::protocol::PROTOCOL_VERSION;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
 /// Globally-cached client. Initialized lazily by `ensure_daemon`.
 static CLIENT: OnceCell<Arc<PtyDaemonClient>> = OnceCell::const_new();
 
+/// Crash circuit breaker state.
+///
+/// We track the most recent `ensure_daemon` failure timestamps. If `CRASH_BUDGET`
+/// failures land within `CRASH_WINDOW`, the circuit opens and `circuit_is_open`
+/// returns true until the process restarts. The spawn paths consult this and
+/// silently fall back to the in-process PTY path so the user always gets a
+/// working terminal, even if the daemon is fundamentally broken on their
+/// system.
+///
+/// The circuit is intentionally *one-shot per process lifetime*: once tripped,
+/// it stays tripped. A user who hits this likely has a deeper environmental
+/// problem (no permissions in `$HOME`, the daemon binary is missing, etc.)
+/// and our auto-retry would just burn battery. Restarting the app gives them
+/// a fresh chance.
+const CRASH_BUDGET: usize = 3;
+const CRASH_WINDOW: Duration = Duration::from_secs(60);
+
+static CIRCUIT_OPEN: AtomicBool = AtomicBool::new(false);
+static FAILURE_TIMESTAMPS: Mutex<Vec<Instant>> = Mutex::new(Vec::new());
+static TOTAL_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// True if the crash circuit breaker has tripped this process lifetime.
+pub fn circuit_is_open() -> bool {
+    CIRCUIT_OPEN.load(Ordering::Relaxed)
+}
+
+/// Total number of `ensure_daemon` failures observed this process lifetime.
+/// Used by diagnostics + tests. Cheap atomic read.
+#[allow(dead_code)]
+pub fn total_failures() -> u64 {
+    TOTAL_FAILURES.load(Ordering::Relaxed)
+}
+
+/// Record a failure. Trips the circuit if we exceed the budget within the
+/// window. Returns `true` if this failure tripped the circuit.
+fn record_failure() -> bool {
+    TOTAL_FAILURES.fetch_add(1, Ordering::Relaxed);
+    let now = Instant::now();
+    let mut guard = FAILURE_TIMESTAMPS.lock().unwrap_or_else(|e| e.into_inner());
+    // Evict failures older than the window so we only count recent ones.
+    guard.retain(|t| now.duration_since(*t) <= CRASH_WINDOW);
+    guard.push(now);
+    if guard.len() >= CRASH_BUDGET && !CIRCUIT_OPEN.swap(true, Ordering::SeqCst) {
+        eprintln!(
+            "[codemux::pty_daemon::supervisor] crash circuit OPEN: {} ensure_daemon \
+             failures within {:?}; further PTY spawns will use the in-process path \
+             until the app restarts",
+            guard.len(),
+            CRASH_WINDOW
+        );
+        return true;
+    }
+    false
+}
+
+/// Reset the circuit breaker. Tests use this; production code does not.
+/// Public (not `#[cfg(test)]`) so the integration test in
+/// `tests/pty_daemon_circuit_breaker.rs` can call it — `#[cfg(test)]`
+/// only enables items for the crate's own `cargo test` build, not for
+/// out-of-tree integration test binaries.
+#[doc(hidden)]
+pub fn reset_circuit() {
+    CIRCUIT_OPEN.store(false, Ordering::SeqCst);
+    FAILURE_TIMESTAMPS.lock().unwrap().clear();
+    TOTAL_FAILURES.store(0, Ordering::Relaxed);
+}
+
 /// Return a connected client, spawning + adopting as needed. Cheap on the
 /// second call.
+///
+/// Errors here are counted against the crash circuit breaker. If we trip
+/// the breaker, subsequent calls **fast-fail** with a sentinel error so
+/// callers can drop to the in-process fallback without paying the spawn
+/// or socket-timeout cost again.
 pub async fn ensure_daemon() -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
-    CLIENT
+    if circuit_is_open() {
+        return Err(PtyDaemonError::Daemon(
+            "circuit breaker open: too many recent failures, using in-process fallback".into(),
+        ));
+    }
+    let result = CLIENT
         .get_or_try_init(|| async {
             // Try adoption first.
             if let Some(client) = try_adopt().await {
@@ -47,7 +125,11 @@ pub async fn ensure_daemon() -> Result<Arc<PtyDaemonClient>, PtyDaemonError> {
             Ok(client)
         })
         .await
-        .cloned()
+        .cloned();
+    if result.is_err() {
+        record_failure();
+    }
+    result
 }
 
 async fn try_adopt() -> Option<Arc<PtyDaemonClient>> {

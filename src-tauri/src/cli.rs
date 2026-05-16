@@ -576,8 +576,20 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             // The daemon's `run` only returns on a fatal listener error;
             // it never returns Ok. Translate into a CLI error string so the
             // outer harness logs it and the process exits non-zero.
-            crate::pty_daemon::server::run(socket).await?;
-            Ok(true)
+            //
+            // Windows: not yet implemented; print a clear message rather
+            // than a link error. The Tauri side never spawns this on
+            // Windows because `daemon_path_viable()` is false there.
+            #[cfg(unix)]
+            {
+                crate::pty_daemon::server::run(socket).await?;
+                Ok(true)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                Err("codemux pty-daemon is Unix-only for now".to_string())
+            }
         }
         Some(CommandSet::Capabilities) => {
             let caps = json!({

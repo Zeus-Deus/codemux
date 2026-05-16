@@ -39,6 +39,11 @@ pub mod os_input;
 pub mod ports;
 pub mod presets;
 pub mod project;
+// The PTY daemon is Unix-only for now. Windows builds get the in-process
+// PTY path with zero regression (the `daemon_path_viable()` gate in
+// `terminal/mod.rs` returns false on non-Unix and we never touch this
+// module from any code path).
+#[cfg(unix)]
 pub mod pty_daemon;
 pub mod resource_metrics;
 pub mod scripts;
@@ -526,19 +531,19 @@ pub fn run() {
 
             terminal::spawn_missing_ptys(handle);
 
-            // Warm up the PTY daemon connection. We adopt unconditionally
-            // when a manifest is present (regardless of the
-            // `persistent_agents.enabled` setting) so a user who turned
-            // the setting off after creating persistent sessions still
-            // reattaches to those sessions on this launch. We only spawn
-            // a fresh daemon if the setting is on; otherwise an absent
-            // manifest means "nothing to adopt, leave the daemon dormant."
+            // Warm up the PTY daemon connection. The daemon is now the
+            // default for every PTY spawn (subject to graceful fallback
+            // for Windows + circuit-breaker reasons — see
+            // `terminal::daemon_path_viable`), so we eagerly adopt or
+            // spawn it during setup so the first agent spawn doesn't pay
+            // the spawn-detached latency on the critical path.
+            //
+            // Skipping the warmup when `CODEMUX_DISABLE_PTY_DAEMON=1` is
+            // set lets a user kill the daemon entirely if a regression
+            // ever ships and they need to roll back without uninstalling.
+            #[cfg(unix)]
             {
-                let setting_on = settings_sync::load_cache()
-                    .map(|s| s.persistent_agents.enabled)
-                    .unwrap_or(false);
-                let manifest_present = pty_daemon::manifest::read_manifest().is_some();
-                if setting_on || manifest_present {
+                if std::env::var_os("CODEMUX_DISABLE_PTY_DAEMON").is_none() {
                     tauri::async_runtime::spawn(async move {
                         match pty_daemon::ensure_daemon().await {
                             Ok(client) => match client.list().await {
@@ -556,7 +561,8 @@ pub fn run() {
                             },
                             Err(error) => {
                                 eprintln!(
-                                    "[codemux::pty_daemon] startup adoption failed: {error}"
+                                    "[codemux::pty_daemon] startup adoption failed: {error} \
+                                     (falling back to in-process PTYs)"
                                 );
                             }
                         }

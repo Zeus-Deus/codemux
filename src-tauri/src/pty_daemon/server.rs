@@ -45,6 +45,16 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 /// `scrollback.rs` system.
 const REPLAY_BUFFER_BYTES: usize = 256 * 1024;
 
+/// Frames pushed through a session's broadcast channel. The reader thread
+/// emits `Output` for every PTY chunk; the waiter thread emits `Exited`
+/// exactly once when the child finally exits. Connection handlers map each
+/// variant to the matching `ServerEvent`.
+#[derive(Clone, Debug)]
+enum SessionFrame {
+    Output(Vec<u8>),
+    Exited(i32),
+}
+
 struct DaemonSession {
     session_id: String,
     workspace_id: String,
@@ -60,12 +70,17 @@ struct DaemonSession {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     /// Writer half, also mutex-guarded for the same reason.
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
-    /// Broadcast channel for output frames. Each attached client owns one
-    /// receiver; the read thread is the sole sender.
-    output_tx: broadcast::Sender<Vec<u8>>,
+    /// Broadcast channel for output AND exit frames. Each attached client
+    /// owns one receiver; the read thread and waiter thread are the only
+    /// senders.
+    frame_tx: broadcast::Sender<SessionFrame>,
     /// Replay buffer for cold-start. Ring-buffered: when full, oldest bytes
     /// are evicted in 4KB chunks so the trim cost stays bounded.
     replay: Arc<Mutex<Vec<u8>>>,
+    /// Final exit code once the waiter thread has reaped the child. Used
+    /// by late attachers who connect after the child exited: they see this
+    /// value in the `Listed` response instead of getting silence.
+    exit_code: Arc<Mutex<Option<i32>>>,
 }
 
 #[derive(Default)]
@@ -77,6 +92,19 @@ type SharedState = Arc<Mutex<DaemonState>>;
 
 /// Entry point for `codemux pty-daemon`. Binds the Unix socket, writes the
 /// manifest, then accepts client connections until shutdown.
+///
+/// Windows path is not implemented yet — the binary's CLI dispatcher
+/// returns a clear error and exits. The Tauri-side supervisor's
+/// `circuit_is_open()` check + `daemon_path_viable()` on Windows already
+/// make this unreachable on Windows in practice, but we keep the
+/// cfg-gate so a careless user running `codemux pty-daemon` by hand on
+/// Windows gets a readable failure instead of a link error.
+#[cfg(not(unix))]
+pub async fn run(_socket_path: PathBuf) -> Result<(), String> {
+    Err("codemux pty-daemon is not yet implemented on Windows".into())
+}
+
+#[cfg(unix)]
 pub async fn run(socket_path: PathBuf) -> Result<(), String> {
     use tokio::net::UnixListener;
 
@@ -148,6 +176,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
     }
 }
 
+#[cfg(unix)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     state: SharedState,
@@ -157,7 +186,7 @@ async fn handle_connection(
     // Each client connection holds receivers for whatever sessions it's
     // attached to. When the receiver yields a frame, we forward to the
     // socket. Detach removes the entry.
-    let mut attached: HashMap<String, broadcast::Receiver<Vec<u8>>> = HashMap::new();
+    let mut attached: HashMap<String, broadcast::Receiver<SessionFrame>> = HashMap::new();
 
     let mut line = String::new();
     loop {
@@ -176,13 +205,25 @@ async fn handle_connection(
         for (sid, rx) in attached.iter_mut() {
             loop {
                 match rx.try_recv() {
-                    Ok(data) => {
+                    Ok(SessionFrame::Output(data)) => {
                         let frame = Frame::Event(ServerEvent::Output {
                             session_id: sid.clone(),
                             data_b64: base64::engine::general_purpose::STANDARD.encode(&data),
                         });
                         write_frame(&mut write_half, &frame).await?;
                         drained_any = true;
+                    }
+                    Ok(SessionFrame::Exited(code)) => {
+                        let frame = Frame::Event(ServerEvent::Exited {
+                            session_id: sid.clone(),
+                            exit_code: code,
+                        });
+                        write_frame(&mut write_half, &frame).await?;
+                        drained_any = true;
+                        // The session will be removed by the waiter
+                        // thread; we just detach our local receiver.
+                        to_detach.push(sid.clone());
+                        break;
                     }
                     Err(broadcast::error::TryRecvError::Empty) => break,
                     Err(broadcast::error::TryRecvError::Lagged(_)) => {
@@ -193,9 +234,8 @@ async fn handle_connection(
                         );
                     }
                     Err(broadcast::error::TryRecvError::Closed) => {
-                        // Session ended — emit Exited (we don't know the
-                        // code from here; the read thread already wrote
-                        // one if it observed the wait()) and detach.
+                        // Sender (reader + waiter) dropped. Session is
+                        // definitely gone; detach.
                         to_detach.push(sid.clone());
                         break;
                     }
@@ -247,6 +287,7 @@ async fn handle_connection(
     }
 }
 
+#[cfg(unix)]
 async fn write_frame(
     write_half: &mut tokio::net::unix::OwnedWriteHalf,
     frame: &Frame,
@@ -262,7 +303,7 @@ async fn write_frame(
 async fn handle_request(
     req: ClientRequest,
     state: SharedState,
-    attached: &mut HashMap<String, broadcast::Receiver<Vec<u8>>>,
+    attached: &mut HashMap<String, broadcast::Receiver<SessionFrame>>,
 ) -> ServerResponse {
     match req {
         ClientRequest::Hello { request_id } => ServerResponse::Hello {
@@ -310,25 +351,18 @@ async fn handle_request(
             drop(guard);
             // Subscribe to live output (after replay so we don't drop
             // anything in the gap).
-            let rx = session.output_tx.subscribe();
+            let rx = session.frame_tx.subscribe();
             attached.insert(session_id.clone(), rx);
             // Flush replay buffer first so the freshly-attached xterm
             // has something to render.
             let replay = { session.replay.lock().await.clone() };
-            // We can't push the Output frame from here (no write_half in
-            // scope). Instead: stuff the replay through the broadcast
-            // channel-equivalent by sending a "synthetic" message ahead
-            // of the live stream. Simplest path: push directly into the
-            // session's channel — the client's `attached` receiver will
-            // pick it up on the next drain pass.
-            //
-            // We DO need to be careful: the broadcast channel may have
-            // newer live data already queued behind the replay. Since
-            // broadcast is FIFO per receiver, pushing replay now means
-            // the client sees [replay..., live...], which is what we
-            // want.
             if !replay.is_empty() {
-                let _ = session.output_tx.send(replay);
+                let _ = session.frame_tx.send(SessionFrame::Output(replay));
+            }
+            // Late-attachers to an exited session: emit Exited
+            // immediately so they don't sit waiting on a dead channel.
+            if let Some(code) = *session.exit_code.lock().await {
+                let _ = session.frame_tx.send(SessionFrame::Exited(code));
             }
             ServerResponse::Attached {
                 request_id,
@@ -518,11 +552,9 @@ async fn spawn_pty(
     let pid = child
         .process_id()
         .ok_or_else(|| "spawned child has no pid".to_string())?;
-    // We don't hold the Child handle past this point — once the master is
-    // open the child stays alive on its own; when it exits the read thread
-    // sees EOF and removes the session. Keeping Child would require
-    // a wait() in another thread just to reap, which we skip for the MVP.
-    drop(child);
+    // Keep the Child handle so we can reap it and report an honest exit
+    // code via the Exited event. The child moves into the waiter thread
+    // spawned below.
 
     // Drop the slave handle in the parent so EOF propagates correctly once
     // the child exits (same invariant as the in-process spawn path).
@@ -537,8 +569,9 @@ async fn spawn_pty(
         .take_writer()
         .map_err(|e| format!("take writer: {e}"))?;
 
-    let (tx, _rx) = broadcast::channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
+    let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
     let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));
+    let exit_code = Arc::new(Mutex::new(None));
 
     let session = Arc::new(DaemonSession {
         session_id: session_id.clone(),
@@ -554,8 +587,9 @@ async fn spawn_pty(
             .unwrap_or(0),
         master: Arc::new(Mutex::new(pair.master)),
         writer: Arc::new(Mutex::new(writer)),
-        output_tx: tx.clone(),
+        frame_tx: tx.clone(),
         replay: replay.clone(),
+        exit_code: exit_code.clone(),
     });
 
     {
@@ -565,8 +599,7 @@ async fn spawn_pty(
 
     // Read loop on a blocking thread — portable-pty's reader is sync.
     let read_session_id = session_id.clone();
-    let read_state = state.clone();
-    let read_tx = tx;
+    let read_tx = tx.clone();
     let read_replay = replay;
     std::thread::spawn(move || {
         let mut reader = reader;
@@ -587,7 +620,7 @@ async fn spawn_pty(
                             rb.drain(0..excess);
                         }
                     }
-                    let _ = read_tx.send(chunk);
+                    let _ = read_tx.send(SessionFrame::Output(chunk));
                 }
                 Err(error) => {
                     eprintln!(
@@ -597,36 +630,48 @@ async fn spawn_pty(
                 }
             }
         }
-        // Reader hit EOF — child has exited (or the master was closed).
-        // Wait for the child, emit Exited, remove the session.
-        // We need the Child handle though, which we don't keep here.
-        // For MVP, observe exit by querying the OS: `libc::waitpid` is
-        // racy from a non-owning thread, so we rely on `kill(pid, 0)` to
-        // detect death. The exit code is therefore unknown; -1 sentinel.
-        let exit_code = -1;
-        let exited = ServerEvent::Exited {
-            session_id: read_session_id.clone(),
-            exit_code,
-        };
-        // Send through the broadcast channel as a final synthetic frame —
-        // attached clients will see this when they next drain. We piggy-
-        // back on the Output channel by encoding a special marker, OR we
-        // can just drop the session and let the channel closure signal
-        // end-of-stream.
-        // Simpler: drop the session from state; client gets `Closed` on
-        // its receiver next try_recv.
-        let _ = exited; // not transmitted in this MVP path
-        let mut guard = match read_state.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                // If we can't grab the lock immediately, spawn a tokio
-                // task to do it. We need a runtime handle, but we're on
-                // a plain std::thread. Skip the cleanup — the session
-                // will linger in the map until an explicit Close.
-                return;
+        // EOF on the master — child has exited or the slave was closed.
+        // We DO NOT touch the session map here; the waiter thread owns
+        // teardown so the exit_code lands before the session disappears.
+    });
+
+    // Waiter thread: owns the Child, blocks on wait(), publishes the real
+    // exit code, then evicts the session from the daemon's state. We pin
+    // the rt handle so we can hop back into the tokio world to drop the
+    // session under the same `Mutex` everyone else uses.
+    let wait_session_id = session_id.clone();
+    let wait_state = state.clone();
+    let wait_tx = tx;
+    let wait_exit_code = exit_code;
+    let rt_handle = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let code: i32 = match child.wait() {
+            Ok(status) => {
+                // ExitStatus on Unix encodes signal+code; portable-pty's
+                // ExitStatus exposes only the numeric code. Anything other
+                // than a clean exit reports as a non-zero code already.
+                status.exit_code() as i32
+            }
+            Err(error) => {
+                eprintln!(
+                    "[codemux::pty_daemon] wait() failed on session {wait_session_id}: {error}"
+                );
+                -1
             }
         };
-        guard.sessions.remove(&read_session_id);
+        // Record the exit code so late-attachers see it.
+        rt_handle.block_on(async {
+            *wait_exit_code.lock().await = Some(code);
+        });
+        // Emit Exited to any currently-attached client.
+        let _ = wait_tx.send(SessionFrame::Exited(code));
+        // Evict from the daemon's session map so subsequent
+        // Write/Resize/Attach for this id error with "unknown session".
+        rt_handle.block_on(async {
+            let mut guard = wait_state.lock().await;
+            guard.sessions.remove(&wait_session_id);
+        });
     });
 
     Ok(pid)

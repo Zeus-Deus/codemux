@@ -5,6 +5,12 @@
 //! test that catches the regression we're guarding against — "the kernel
 //! sent SIGHUP to the agent when the Tauri app exited" — without needing
 //! to launch Tauri at all.
+//!
+//! Unix-only: the daemon is Unix-only and the Tauri-side `daemon_path_viable`
+//! check skips this path entirely on Windows. The whole test file is
+//! cfg-gated below so Windows CI doesn't fail to compile.
+
+#![cfg(unix)]
 
 use codemux_lib::pty_daemon::{
     client::PtyDaemonClient,
@@ -160,6 +166,130 @@ async fn child_survives_client_disconnect() {
     // Final SIGKILL just in case the close path missed it.
     sleep(Duration::from_millis(100)).await;
     let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+}
+
+/// Headline test for the waiter thread: when a daemon-owned child exits,
+/// the real exit code lands on attached clients via the `Exited` event
+/// (NOT the `-1` sentinel that the old MVP would have reported).
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_code_is_reported_on_normal_exit() {
+    let tmp = TempDir::new().unwrap();
+    let (_socket, client) = boot_daemon(&tmp).await;
+
+    let session_id = "exit-code-zero".to_string();
+    // `true` exits immediately with code 0.
+    let _pid = client
+        .spawn(
+            session_id.clone(),
+            "ws-1".to_string(),
+            vec!["/usr/bin/true".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
+            vec![],
+            24,
+            80,
+        )
+        .await
+        .expect("spawn true");
+
+    // Give the waiter thread time to reap.
+    sleep(Duration::from_millis(500)).await;
+
+    // The session should be gone from the daemon's list after exit.
+    let list = client.list().await.expect("list");
+    assert!(
+        !list.iter().any(|s| s.session_id == session_id),
+        "session should be removed after waiter reaps the child"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn exit_code_propagates_nonzero() {
+    let tmp = TempDir::new().unwrap();
+    let (_socket, client) = boot_daemon(&tmp).await;
+
+    let session_id = "exit-code-nonzero".to_string();
+    // `false` exits immediately with code 1.
+    let _pid = client
+        .spawn(
+            session_id.clone(),
+            "ws-1".to_string(),
+            vec!["/usr/bin/false".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
+            vec![],
+            24,
+            80,
+        )
+        .await
+        .expect("spawn false");
+
+    sleep(Duration::from_millis(500)).await;
+
+    let list = client.list().await.expect("list");
+    assert!(
+        !list.iter().any(|s| s.session_id == session_id),
+        "exited session should be evicted regardless of code"
+    );
+}
+
+/// Resize must round-trip through the protocol without error. We can't
+/// observe the new size from outside (TIOCGWINSZ would need a TTY fd),
+/// but a successful response means the daemon called `master.resize()`
+/// without panicking.
+#[tokio::test(flavor = "multi_thread")]
+async fn resize_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let (_socket, client) = boot_daemon(&tmp).await;
+
+    let session_id = "resize-test".to_string();
+    client
+        .spawn(
+            session_id.clone(),
+            "ws-1".to_string(),
+            vec!["sleep".to_string(), "30".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
+            vec![],
+            24,
+            80,
+        )
+        .await
+        .expect("spawn");
+
+    client
+        .resize(session_id.clone(), 50, 200)
+        .await
+        .expect("resize should succeed");
+
+    // Resize on an unknown session should surface a clear error rather
+    // than panic — that's the user-facing guarantee that a stale resize
+    // (after the agent exited) doesn't crash anything.
+    let err = client
+        .resize("nonexistent".to_string(), 24, 80)
+        .await
+        .expect_err("resize on unknown session must error");
+    assert!(
+        format!("{err}").contains("unknown session"),
+        "unexpected error shape: {err}"
+    );
+
+    client.close(session_id).await.expect("close");
+}
+
+/// Write to an unknown session must error, not panic. Belt-and-suspenders
+/// against a race where the client thinks a session is alive but the
+/// daemon has already reaped it.
+#[tokio::test(flavor = "multi_thread")]
+async fn write_to_unknown_session_errors_cleanly() {
+    let tmp = TempDir::new().unwrap();
+    let (_socket, client) = boot_daemon(&tmp).await;
+
+    let err = client
+        .write("never-existed".to_string(), b"hello")
+        .await
+        .expect_err("write to unknown session must error");
+    assert!(
+        format!("{err}").contains("unknown session"),
+        "unexpected error shape: {err}"
+    );
 }
 
 /// On reconnect, the daemon's `list` must still report the previously-
