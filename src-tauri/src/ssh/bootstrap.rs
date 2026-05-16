@@ -47,32 +47,94 @@ pub fn target_for_uname(uname: &str) -> Option<&'static str> {
     }
 }
 
-/// Return the on-disk path of the bundled `codemux-remote` binary
-/// matching the given target triple. The release CI puts these at
-/// `src-tauri/binaries/codemux-remote-<target>`; in dev builds the
-/// path may not exist if the cross-compile step was skipped — the
-/// caller handles `None` by returning `BinaryNotBundled`.
+/// Return the on-disk path of the `codemux-remote` binary matching
+/// the given target triple. Searched locations, in order:
+///
+/// 1. **Bundled, target-suffixed** under the working directory or
+///    `src-tauri/binaries/` — what the release CI's cross-compile +
+///    bundling step produces (`codemux-remote-x86_64-unknown-linux-gnu`,
+///    etc.). This is the production path.
+///
+/// 2. **Dev sibling next to the running codemux executable** —
+///    `current_exe().parent()/codemux-remote[.exe]`. Cargo produces
+///    this when you `cargo build --bin codemux-remote`, sitting at
+///    `src-tauri/target/debug/codemux-remote` next to `codemux`.
+///    Only used when the target triple matches the build's host
+///    triple (you can't push a linux binary to a mac, even in dev).
+///
+/// 3. **Returns `None`** — caller treats as `BinaryNotBundled` and
+///    the UI surfaces the "your build doesn't include this" error
+///    with the wanted target triple so the user knows what's
+///    missing.
+///
+/// The dev sibling fallback is what lets `cargo build && npm run
+/// tauri:dev` work for push to a SAME-ARCH remote without running
+/// the full release pipeline. Different-arch remotes still need
+/// the cross-compiled bundle.
 pub fn bundled_binary_path(target: &str) -> Option<PathBuf> {
-    // The runtime resolution is "binary lives next to the laptop
-    // codemux executable's resources dir." In Tauri that's the
-    // app's bundle resource dir at runtime; in dev/tests we fall
-    // back to looking under the workspace `src-tauri/binaries/`.
-    //
-    // We try both so dev builds also work without hard-coding a
-    // Tauri-only API into this module.
     let candidates = [
         PathBuf::from(format!("binaries/codemux-remote-{target}")),
         PathBuf::from(format!("src-tauri/binaries/codemux-remote-{target}")),
-        PathBuf::from(format!(
-            "../binaries/codemux-remote-{target}"
-        )),
+        PathBuf::from(format!("../binaries/codemux-remote-{target}")),
     ];
     for c in candidates {
         if c.exists() {
             return Some(c);
         }
     }
+
+    // Dev fallback: look for `codemux-remote` sitting next to the
+    // running codemux executable, matching ONLY when the requested
+    // target is the same triple we built for. The host build target
+    // is whatever cargo gave us at compile time — `TARGET` isn't a
+    // standard env var rust exposes, so we synthesize it from the
+    // platform cfgs that are stable across rustc versions.
+    if target_matches_build_host(target) {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                let sibling_name = if cfg!(windows) {
+                    "codemux-remote.exe"
+                } else {
+                    "codemux-remote"
+                };
+                let candidate = parent.join(sibling_name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
     None
+}
+
+/// True when `target` equals the rust target triple this codemux
+/// binary was compiled for. Used to gate the dev-sibling fallback:
+/// a linux-built codemux must NOT scp its own codemux-remote to a
+/// macOS host even when one happens to be sitting next to it.
+fn target_matches_build_host(target: &str) -> bool {
+    // Cover the four release targets. cfg-gated rather than reading
+    // a build-time TARGET env var because rust doesn't set one
+    // reliably and target_arch/target_os are the source of truth at
+    // compile time.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    return target == "x86_64-unknown-linux-gnu";
+    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    return target == "aarch64-unknown-linux-gnu";
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    return target == "x86_64-apple-darwin";
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    return target == "aarch64-apple-darwin";
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    )))]
+    {
+        let _ = target;
+        false
+    }
 }
 
 pub struct BootstrapOptions<'a> {
