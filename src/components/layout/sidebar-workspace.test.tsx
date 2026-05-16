@@ -15,6 +15,7 @@ vi.mock("@/tauri/commands", () => ({
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
+  setWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
   detectEditors: vi.fn().mockResolvedValue([]),
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
   openInEditor: vi.fn().mockResolvedValue(undefined),
@@ -28,6 +29,16 @@ vi.mock("@/tauri/commands", () => ({
     number: 92, title: "Test", state: "Open", labels: [], assignees: [],
     url: "https://github.com/u/r/issues/92", body: null,
   }),
+  // Cloud-push step 2 additions — same shape as the other mock in
+  // sidebar-workspace-row.test.tsx.
+  hostsList: vi.fn().mockResolvedValue([]),
+  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
+  workspacePushToHost: vi
+    .fn()
+    .mockResolvedValue({ ok: true, message: "", remote_path: null, rsync_summary: null }),
+  workspacePullBack: vi
+    .fn()
+    .mockResolvedValue({ ok: true, message: "", rsync_summary: null }),
 }));
 
 // `useDefaultBranch` uses a module-level cache; reset between suites so a

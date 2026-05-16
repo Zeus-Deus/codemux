@@ -14,15 +14,25 @@ interface AppStore {
    *  lazy-draft home detection) should treat null as "not yet known"
    *  and fall back to today's path-basename grouping. */
   homeDir: string | null;
+  /** Workspace id currently being pushed to or pulled from a remote
+   *  host. Drives the spinner icon on the sidebar row so the user
+   *  sees the operation is in flight. Null when no push/pull is
+   *  running. Set by the workspace context menu's Move/Pull handlers
+   *  and cleared in the completion callback (success or failure). */
+  workspacePushPullInFlight: string | null;
   setAppState: (snapshot: AppStateSnapshot) => void;
   setHomeDir: (homeDir: string) => void;
+  setWorkspacePushPullInFlight: (workspaceId: string | null) => void;
 }
 
 export const useAppStore = create<AppStore>((set) => ({
   appState: null,
   homeDir: null,
+  workspacePushPullInFlight: null,
   setAppState: (snapshot) => set({ appState: snapshot }),
   setHomeDir: (homeDir) => set({ homeDir }),
+  setWorkspacePushPullInFlight: (workspaceId) =>
+    set({ workspacePushPullInFlight: workspaceId }),
 }));
 
 // Derived selectors

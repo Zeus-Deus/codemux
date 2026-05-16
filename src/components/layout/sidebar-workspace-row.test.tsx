@@ -38,6 +38,18 @@ vi.mock("@/tauri/commands", () => ({
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
   openInEditor: vi.fn().mockResolvedValue(undefined),
   runWorkspaceSetup: vi.fn().mockResolvedValue(undefined),
+  // Added in cloud-push step 2: the workspace row's context menu
+  // now lists configured hosts under "Move to host…" and surfaces
+  // Pull back / push handlers. Mock them as no-ops so the existing
+  // checkout-default tests keep passing.
+  hostsList: vi.fn().mockResolvedValue([]),
+  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
+  workspacePushToHost: vi
+    .fn()
+    .mockResolvedValue({ ok: true, message: "", remote_path: null, rsync_summary: null }),
+  workspacePullBack: vi
+    .fn()
+    .mockResolvedValue({ ok: true, message: "", rsync_summary: null }),
 }));
 
 vi.mock("@/lib/toast", () => ({
