@@ -95,27 +95,29 @@ export function DevicePicker({
           type="button"
           aria-label={`Device: ${label}`}
           title={label}
+          // Class string is intentionally identical to
+          // `ProjectPicker`'s trigger so the row of pills looks
+          // uniform. Don't reformat into separate string literals —
+          // the previous attempt diverged enough that the pill
+          // rendered taller than its neighbors. Match-by-string is
+          // the most reliable diff guard.
           className={cn(
-            // Matches the project + branch picker pills in the
-            // bottom row of the new-workspace dialog. Same shape
-            // (rounded-full), same surface (bg-muted/60), same
-            // text class, same ChevronDown affordance. Without
-            // this match the device picker visually breaks the
-            // identity row.
-            "inline-flex items-center gap-1.5 rounded-full",
-            "bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground",
-            "transition-colors hover:bg-muted hover:text-foreground",
-            "outline-none max-w-[160px]",
+            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none",
             className,
           )}
         >
           {isLocal ? (
-            <Monitor className="h-3.5 w-3.5 shrink-0" />
+            <Monitor className="h-3.5 w-3.5" />
           ) : (
-            <Server className="h-3.5 w-3.5 shrink-0" />
+            <Server className="h-3.5 w-3.5" />
           )}
           {!iconOnly && (
-            <span className="min-w-0 flex-1 truncate text-left">{label}</span>
+            // Match the project picker's label shape exactly —
+            // `max-w-[120px] truncate`, no flex-1. flex-1 was
+            // letting the pill stretch wider than its content, so
+            // the icon + label spacing read differently than the
+            // neighboring project/branch pills.
+            <span className="max-w-[120px] truncate">{label}</span>
           )}
           {!isLocal && (
             <OnlineDot
@@ -123,7 +125,7 @@ export function DevicePicker({
             />
           )}
           {!iconOnly && (
-            <ChevronDown className="h-2.5 w-2.5 shrink-0 opacity-40" />
+            <ChevronDown className="h-2.5 w-2.5 opacity-40" />
           )}
         </button>
       </DropdownMenuTrigger>
