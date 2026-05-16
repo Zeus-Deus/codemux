@@ -200,6 +200,16 @@ pub struct SessionRuntime {
     ///   instead of getting torn down.
     /// - Drop is a no-op for persistent sessions; the daemon outlives us.
     pub persistent: bool,
+    /// The daemon client this session was spawned through. Set on every
+    /// daemon-backed spawn (local or tunneled-remote).
+    ///
+    /// Resize and close MUST route through this client, not through
+    /// `ensure_daemon()` directly — `ensure_daemon` always returns the
+    /// LOCAL daemon, which doesn't know about sessions that live on a
+    /// remote host's daemon. Pre-fix, every resize/close on a remote
+    /// session hit `unknown session` because the command went to the
+    /// wrong daemon.
+    pub daemon_client: Option<Arc<crate::pty_daemon::PtyDaemonClient>>,
 }
 
 impl SessionRuntime {
@@ -223,6 +233,7 @@ impl SessionRuntime {
             resume_command: None,
             is_spawning: false,
             persistent: false,
+            daemon_client: None,
         }
     }
 }
@@ -1671,6 +1682,10 @@ pub(crate) fn terminate_pty_session(
     // detached tokio task so the close path stays sync.
     let was_persistent = runtime.persistent;
     let pid = runtime.child_pid.take();
+    // Capture the daemon client BEFORE dropping runtime — for remote
+    // sessions this is the per-workspace SSH-tunneled client; for local
+    // sessions it's the singleton local-daemon client.
+    let daemon_client = runtime.daemon_client.take();
     if was_persistent {
         runtime.output_channel = None;
         runtime.pending_output.clear();
@@ -1680,7 +1695,17 @@ pub(crate) fn terminate_pty_session(
         drop(runtime);
         let session_id = session_id.to_string();
         tauri::async_runtime::spawn(async move {
-            match crate::pty_daemon::ensure_daemon().await {
+            // Use the session's captured client. Fall back to the local
+            // daemon only if the runtime never recorded one (restored
+            // session before reattach completes) — this fallback is
+            // harmless because the local daemon will just no-op on an
+            // unknown session id rather than affecting the wrong process.
+            let client_res = if let Some(c) = daemon_client {
+                Ok(c)
+            } else {
+                crate::pty_daemon::ensure_daemon().await
+            };
+            match client_res {
                 Ok(client) => {
                     if let Err(error) = client.close(session_id.clone()).await {
                         eprintln!(
@@ -2093,16 +2118,33 @@ pub fn resize_pty(
     // daemon doesn't exist on Windows.
     #[cfg(unix)]
     {
-        let persistent = with_session_runtime(
+        // Snapshot persistent + the daemon client that owns this session.
+        // The client is captured at spawn time and may be either the local
+        // singleton or a per-workspace SSH-tunneled client; either way it's
+        // the one that knows about this session id.
+        let (persistent, daemon_client) = with_session_runtime(
             &terminal_state.sessions,
             &session_id,
             || SessionRuntime::new(&session_id),
-            |runtime| Ok::<bool, String>(runtime.persistent),
+            |runtime| {
+                Ok::<_, String>((runtime.persistent, runtime.daemon_client.clone()))
+            },
         )?;
         if persistent {
             let session_id_clone = session_id.clone();
+            // Fall back to ensure_daemon ONLY if the runtime is missing the
+            // client — which happens on restored sessions before the
+            // spawn-or-reattach path has run. For remote sessions on first
+            // reattach this would route to the wrong daemon, but the
+            // reattach path also re-populates daemon_client, so this gap
+            // closes within the same tick.
             tauri::async_runtime::spawn(async move {
-                match crate::pty_daemon::ensure_daemon().await {
+                let client_res = if let Some(c) = daemon_client {
+                    Ok(c)
+                } else {
+                    crate::pty_daemon::ensure_daemon().await
+                };
+                match client_res {
                     Ok(client) => {
                         if let Err(error) =
                             client.resize(session_id_clone.clone(), rows, cols).await

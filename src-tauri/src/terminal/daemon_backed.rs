@@ -21,7 +21,7 @@ use super::{
     TerminalLifecycleState, TerminalStatusPayload, DEFAULT_COLS, DEFAULT_ROWS,
 };
 use crate::execution::ExecutionPolicy;
-use crate::pty_daemon::{ensure_daemon, PtyDaemonClient};
+use crate::pty_daemon::PtyDaemonClient;
 use crate::state::AppStateStore;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
@@ -48,13 +48,43 @@ pub async fn spawn_pty_for_agent_via_daemon(
         return Err("session already reserved by another spawn".into());
     }
 
-    // Reach (or spawn) the daemon BEFORE the heavy env construction so we
-    // fail fast on the trivial cases (daemon binary missing, socket race).
-    let client = match ensure_daemon().await {
+    // Resolve the workspace + its host BEFORE picking a daemon client.
+    // Remote workspaces route through their per-workspace SSH-tunneled
+    // daemon; local workspaces use the singleton local daemon. Same
+    // dispatch the shell spawn path uses.
+    let snapshot = app_state.snapshot();
+    let owning_ws = super::find_owning_workspace(&snapshot, &session_id);
+    let host_id = owning_ws.and_then(|w| w.host_id);
+    let is_remote = host_id.is_some();
+
+    if is_remote {
+        emit_terminal_status(
+            &app,
+            &sessions,
+            TerminalStatusPayload {
+                session_id: session_id.clone(),
+                state: TerminalLifecycleState::Starting,
+                message: Some(
+                    "Connecting to remote host (this can take up to 20s on \
+                     first connect)…"
+                        .into(),
+                ),
+                exit_code: None,
+            },
+        );
+    }
+
+    let client = match crate::ssh::client_for_workspace(
+        &app,
+        &workspace_id,
+        host_id,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(error) => {
             remove_session_runtime(&sessions, &session_id);
-            return Err(format!("ensure_daemon: {error}"));
+            return Err(format!("daemon client: {error}"));
         }
     };
 
@@ -87,7 +117,28 @@ pub async fn spawn_pty_for_agent_via_daemon(
         },
     );
 
-    let cwd = session_working_dir(&app_state, &session_id);
+    // Remote workspaces resolve their cwd to the conventional remote path
+    // (`~/.codemux/worktrees/<project>/<branch>`) — the local cwd doesn't
+    // exist on the remote host. Local workspaces keep their actual cwd.
+    let cwd = if is_remote {
+        let project_name = owning_ws
+            .and_then(|w| {
+                w.project_root
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "workspace".to_string());
+        let branch = owning_ws
+            .and_then(|w| w.git_branch.clone())
+            .unwrap_or_else(|| "main".to_string());
+        crate::ssh::conventional_remote_path(&project_name, &branch)
+            .to_string_lossy()
+            .to_string()
+    } else {
+        session_working_dir(&app_state, &session_id)
+    };
     let env = build_agent_env(
         &app_state,
         &workspace_id,
@@ -95,6 +146,7 @@ pub async fn spawn_pty_for_agent_via_daemon(
         &extra_env,
         &execution_policy,
         &prepared,
+        is_remote,
     );
 
     let mut full_argv = vec![prepared.executable.clone()];
@@ -177,6 +229,7 @@ pub async fn spawn_pty_for_agent_via_daemon(
 
     // Build a writer that funnels sync writes into the async client.
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
+    let client_for_runtime = client.clone();
 
     with_session_runtime(
         &sessions,
@@ -191,6 +244,10 @@ pub async fn spawn_pty_for_agent_via_daemon(
             runtime.child_pid = Some(pid);
             runtime.persistent = true;
             runtime.is_spawning = false;
+            // Capture the client so resize/close land on the right daemon
+            // (local singleton or per-workspace SSH-tunneled — same client
+            // we just spawned through).
+            runtime.daemon_client = Some(client_for_runtime);
         },
     );
 
@@ -486,6 +543,7 @@ pub async fn spawn_pty_for_session_via_daemon(
 
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
     let auto_resume_clone = auto_resume_command.clone();
+    let client_for_runtime = client.clone();
     with_session_runtime(
         &sessions,
         &session_id,
@@ -498,6 +556,9 @@ pub async fn spawn_pty_for_session_via_daemon(
             runtime.is_spawning = false;
             runtime.skip_preset_launch = auto_resume_clone.is_some();
             runtime.resume_command = auto_resume_clone;
+            // Same as the agent path — capture the client so resize/close
+            // route to the daemon that actually owns this session id.
+            runtime.daemon_client = Some(client_for_runtime);
         },
     );
 
@@ -635,6 +696,7 @@ fn build_agent_env(
     extra_env: &[(String, String)],
     execution_policy: &ExecutionPolicy,
     prepared: &crate::execution::PreparedExecutionCommand,
+    is_remote: bool,
 ) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = Vec::new();
 
@@ -686,11 +748,18 @@ fn build_agent_env(
     // CLI shim path. The in-process path calls ensure_openflow_cli_shims(),
     // which is platform-gated; we mirror the same call shape so the shim
     // dir gets created (idempotent) and PATH is prefixed identically.
-    if let Some((shim_dir, current_exe)) = super::ensure_openflow_cli_shims() {
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let prefixed_path = super::build_child_path(&shim_dir, &current_path);
-        env.push(("PATH".to_string(), prefixed_path));
-        env.push(("CODEMUX_CLI_SAFE_PATH".to_string(), current_exe));
+    //
+    // Skip for remote workspaces — the shim dir lives in the laptop's
+    // filesystem and the inherited PATH would point at /home/zeus/...
+    // paths that don't exist on the remote. Remote agents use the
+    // remote shell's own default PATH.
+    if !is_remote {
+        if let Some((shim_dir, current_exe)) = super::ensure_openflow_cli_shims() {
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let prefixed_path = super::build_child_path(&shim_dir, &current_path);
+            env.push(("PATH".to_string(), prefixed_path));
+            env.push(("CODEMUX_CLI_SAFE_PATH".to_string(), current_exe));
+        }
     }
 
     // Adapter-provided env (e.g. OpenFlow agent context).
