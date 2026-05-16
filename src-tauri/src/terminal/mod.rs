@@ -1038,6 +1038,51 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                 {
                     Ok(()) => {}
                     Err(error) => {
+                        // Critical: do NOT fall back to in-process
+                        // spawn for REMOTE workspaces. A remote
+                        // workspace's host_id says "this lives on
+                        // pandora," and silently spawning a local
+                        // shell would lie about where the user's
+                        // sessions are running — leading to the
+                        // exact "Cloud icon but local pwd" bug we
+                        // shipped a fix for in the prior commit.
+                        // Surface the failure as Failed status; the
+                        // UI shows the error and the user can pull
+                        // back / retry. Local workspaces (host_id
+                        // == None) still get the in-process
+                        // fallback because for them it's correct.
+                        let app_for_check = app_clone.clone();
+                        let is_remote_workspace = is_remote_workspace_for_session(
+                            &app_for_check,
+                            &session_id_clone,
+                        );
+                        if is_remote_workspace {
+                            eprintln!(
+                                "[codemux::terminal] remote-shell spawn failed for session \
+                                 {session_id_clone}: {error}; NOT falling back to local"
+                            );
+                            // Emit Failed so the terminal pane
+                            // surfaces a useful message instead of
+                            // hanging on "Starting…" forever.
+                            let pty_state: State<'_, PtyState> =
+                                app_clone.state();
+                            emit_terminal_status(
+                                &app_clone,
+                                &pty_state.sessions,
+                                TerminalStatusPayload {
+                                    session_id: session_id_clone.clone(),
+                                    state: TerminalLifecycleState::Failed,
+                                    message: Some(format!(
+                                        "Couldn't reach the remote host: {error}. \
+                                         Try Test Connection in Settings → Hosts, \
+                                         or right-click → Pull back."
+                                    )),
+                                    exit_code: None,
+                                },
+                            );
+                            remove_session_runtime(&pty_state.sessions, &session_id_clone);
+                            return;
+                        }
                         eprintln!(
                             "[codemux::terminal] persistent-shell path failed for session \
                              {session_id_clone}: {error}; falling back to in-process spawn"
@@ -1054,6 +1099,21 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
         }
     }
     spawn_pty_for_session_in_process(app, session_id);
+}
+
+/// True if the session belongs to a workspace with `host_id` set.
+/// Used to gate the in-process fallback — local workspaces still
+/// fall back happily, remote ones must surface the real error.
+#[cfg(unix)]
+fn is_remote_workspace_for_session(
+    app: &AppHandle,
+    session_id: &str,
+) -> bool {
+    let app_state: State<'_, AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    find_owning_workspace(&snapshot, session_id)
+        .and_then(|w| w.host_id)
+        .is_some()
 }
 
 fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {

@@ -390,11 +390,24 @@ pub async fn workspace_push_to_host(
                     crate::ssh::local_socket_for_workspace(&workspace_id);
                 let remote_socket =
                     crate::ssh::remote_socket_for_workspace(&workspace_id);
+                // Forget the cached PtyDaemonClient BEFORE
+                // installing the new supervisor. A re-push with a
+                // stale client in cache would have the next spawn
+                // attempt connect to the OLD tunnel's socket
+                // (which is about to be torn down), causing the
+                // shell to hang at "Starting…" forever.
+                crate::ssh::forget_workspace_client(&workspace_id).await;
                 let supervisor = crate::ssh::TunnelSupervisor::spawn(
                     host.ssh_target.clone(),
                     remote_socket,
                     local_socket,
-                    "codemux-remote".to_string(),
+                    // Absolute path via $HOME, not bare
+                    // `codemux-remote`. Non-interactive SSH
+                    // shells often don't have ~/.local/bin on
+                    // PATH (only interactive shells do, via
+                    // ~/.profile / ~/.bashrc). Bootstrap installs
+                    // here, tunnel must reach here.
+                    "$HOME/.local/bin/codemux-remote".to_string(),
                 );
                 crate::ssh::install_supervisor(&workspace_id, supervisor).await;
                 // Stop-sync-restart for live PTYs: terminate the
