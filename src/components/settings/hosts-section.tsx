@@ -360,7 +360,12 @@ export function HostsSection() {
                 >
                   Cancel
                 </Button>
-                <Button type="button" size="sm" onClick={handleAdd}>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={handleAdd}
+                >
                   Add
                 </Button>
               </div>
@@ -435,7 +440,12 @@ export function HostsSection() {
                 <X className="mr-1 size-3.5" />
                 Cancel
               </Button>
-              <Button type="button" size="sm" onClick={handleSaveEdit}>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={handleSaveEdit}
+              >
                 <Check className="mr-1 size-3.5" />
                 Save
               </Button>
@@ -491,6 +501,7 @@ export function HostsSection() {
                     testResults[selected.id].uname && (
                       <Button
                         type="button"
+                        variant="secondary"
                         size="sm"
                         disabled={installingId === selected.id}
                         onClick={() =>
