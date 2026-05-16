@@ -3608,6 +3608,7 @@ mod tests {
             active_tab_id: String::new(),
             active_surface_id: SurfaceId(String::new()),
             surfaces: Vec::new(),
+            host_id: None,
         }
     }
 

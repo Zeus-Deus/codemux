@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
 import {
   hostsAdd,
+  hostsBootstrapInstall,
   hostsDelete,
   hostsList,
   hostsTestConnection,
@@ -63,6 +64,7 @@ export function HostsSection() {
     {},
   );
   const [testingId, setTestingId] = useState<number | null>(null);
+  const [installingId, setInstallingId] = useState<number | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -189,6 +191,44 @@ export function HostsSection() {
       setTestingId(null);
     }
   }, []);
+
+  const handleInstallRemote = useCallback(
+    async (host: HostView, uname: string) => {
+      const consented = window.confirm(
+        `Install codemux-remote on ${host.name}?\n\n` +
+          `Codemux Remote is a small helper (~8 MB) that runs in your ` +
+          `user account on the host and lets your laptop run agents ` +
+          `there. No root access required. Source: github.com/Zeus-Deus/codemux`,
+      );
+      if (!consented) return;
+      setInstallingId(host.id);
+      try {
+        const result = await hostsBootstrapInstall(host.id, uname);
+        // Surface the install result alongside the test result so the
+        // user sees "installed" then can press Test again to verify.
+        setTestResults((prev) => ({
+          ...prev,
+          [host.id]: {
+            ok: result.ok,
+            message: result.message,
+            needs_install: !result.ok && prev[host.id]?.needs_install,
+            uname: prev[host.id]?.uname ?? uname,
+          },
+        }));
+      } catch (err) {
+        setTestResults((prev) => ({
+          ...prev,
+          [host.id]: {
+            ok: false,
+            message: typeof err === "string" ? err : String(err),
+          },
+        }));
+      } finally {
+        setInstallingId(null);
+      }
+    },
+    [],
+  );
 
   if (loading) {
     return (
@@ -411,16 +451,41 @@ export function HostsSection() {
                 )}
               </Button>
               {testResults[selected.id] && (
-                <p
-                  className={cn(
-                    "mt-2 text-xs",
-                    testResults[selected.id].ok
-                      ? "text-emerald-500"
-                      : "text-muted-foreground",
-                  )}
-                >
-                  {testResults[selected.id].message}
-                </p>
+                <div className="mt-2 space-y-2">
+                  <p
+                    className={cn(
+                      "text-xs",
+                      testResults[selected.id].ok
+                        ? "text-emerald-500"
+                        : "text-muted-foreground",
+                    )}
+                  >
+                    {testResults[selected.id].message}
+                  </p>
+                  {testResults[selected.id].needs_install &&
+                    testResults[selected.id].uname && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={installingId === selected.id}
+                        onClick={() =>
+                          void handleInstallRemote(
+                            selected,
+                            testResults[selected.id].uname as string,
+                          )
+                        }
+                      >
+                        {installingId === selected.id ? (
+                          <>
+                            <Loader2 className="mr-2 size-3.5 animate-spin" />
+                            Installing…
+                          </>
+                        ) : (
+                          "Install codemux-remote on this host"
+                        )}
+                      </Button>
+                    )}
+                </div>
               )}
             </div>
 

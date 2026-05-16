@@ -1556,6 +1556,17 @@ export interface HostView {
 export interface HostTestResult {
   ok: boolean;
   message: string;
+  /** True when probe succeeded but `codemux-remote` isn't installed
+   *  on the host yet. Triggers the bootstrap-install consent modal. */
+  needs_install?: boolean;
+  /** Reported `uname -sm` from the probe, forwarded into the
+   *  bootstrap call so we don't re-probe. */
+  uname?: string | null;
+}
+
+export interface HostBootstrapResult {
+  ok: boolean;
+  message: string;
 }
 
 export const hostsList = () => invoke<HostView[]>("hosts_list");
@@ -1571,3 +1582,14 @@ export const hostsDelete = (id: number) =>
 
 export const hostsTestConnection = (id: number) =>
   invoke<HostTestResult>("hosts_test_connection", { id });
+
+/** Install `codemux-remote` on a host that the probe reported as
+ *  reachable-but-missing. Pass the `uname` string returned by the
+ *  probe so we don't have to re-probe. */
+export const hostsBootstrapInstall = (id: number, uname: string) =>
+  invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
+
+/** Assign (or clear) the host a workspace runs on. `null` clears
+ *  the assignment (back to local). */
+export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
+  invoke<void>("set_workspace_host", { workspaceId, hostId });

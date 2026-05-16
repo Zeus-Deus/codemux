@@ -45,6 +45,11 @@ pub mod project;
 // module from any code path).
 #[cfg(unix)]
 pub mod pty_daemon;
+// SSH transport for the cloud-push feature. Unix-only — relies on
+// the system `ssh` + `scp` binaries (with the user's existing
+// `~/.ssh/config`, agent, and known_hosts).
+#[cfg(unix)]
+pub mod ssh;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
@@ -1446,6 +1451,8 @@ pub fn run() {
             commands::hosts_update,
             commands::hosts_delete,
             commands::hosts_test_connection,
+            commands::hosts_bootstrap_install,
+            commands::set_workspace_host,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

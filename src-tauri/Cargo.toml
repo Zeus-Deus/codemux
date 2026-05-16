@@ -138,3 +138,23 @@ path = "tests/helpers/fake_claude_sidecar/main.rs"
 test = false
 doctest = false
 bench = false
+
+# `codemux-remote` — the slim server-side binary that runs on the
+# remote host the laptop pushes workspaces to. Same Rust crate
+# (`codemux_lib`), but a UI-free entry point: no Tauri, no webkit,
+# no frontend dependencies. Step 2c of the cloud-push series.
+#
+# Cross-compile targets (set up in the release CI, not in this file):
+#   x86_64-unknown-linux-gnu        (most servers + home labs)
+#   aarch64-unknown-linux-gnu       (Raspberry Pi, AWS Graviton)
+#   x86_64-apple-darwin             (older Intel Macs)
+#   aarch64-apple-darwin            (Apple Silicon Macs)
+#
+# The laptop's codemux bundles the four binaries as resources and
+# scp's the matching one to the remote at bootstrap time.
+[[bin]]
+name = "codemux-remote"
+path = "src/bin/codemux_remote.rs"
+test = false
+doctest = false
+bench = false

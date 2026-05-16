@@ -65,6 +65,11 @@ vi.mock("@/tauri/commands", () => ({
     url: "https://github.com/u/r/issues/92",
     body: "Implement the backend endpoints.",
   }),
+  // Added in step 2b: the new-workspace dialog now embeds the
+  // DevicePicker, which reads from hostsList. The submit flow
+  // calls setWorkspaceHost when a non-local host is chosen.
+  hostsList: vi.fn().mockResolvedValue([]),
+  setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
 }));
 
 import {

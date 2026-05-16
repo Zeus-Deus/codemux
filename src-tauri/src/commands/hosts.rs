@@ -103,29 +103,193 @@ pub fn hosts_delete(
     Ok(())
 }
 
-/// Test whether the configured SSH target is reachable.
-///
-/// This is a stub for step 2a — actual SSH probing lands in step 2d
-/// alongside the bootstrap flow. We return a clear "not implemented
-/// yet" result so the UI can show a helpful message instead of a
-/// hang. The frontend can already render the button + result panel
-/// against this contract.
+/// Assign (or clear) the host a workspace runs on. Used by the
+/// workspace header badge + the future "Push to host" action. Passes
+/// the host_id straight through to the in-memory `AppState`; the
+/// snapshot persists via the normal save path.
 #[tauri::command]
-pub fn hosts_test_connection(
-    _db: State<'_, DatabaseStore>,
+pub fn set_workspace_host(
+    app: tauri::AppHandle,
+    app_state: tauri::State<'_, crate::state::AppStateStore>,
+    workspace_id: String,
+    host_id: Option<i64>,
+) -> Result<(), String> {
+    app_state.set_workspace_host_id(&workspace_id, host_id)?;
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+/// Test whether the configured SSH target is reachable, and whether
+/// `codemux-remote` is already installed there.
+///
+/// Three observable outcomes for the UI (maps directly to
+/// `HostTestResult`):
+/// - reachable + installed → green light, ready to push
+/// - reachable + missing binary → trigger the bootstrap-install
+///   consent modal
+/// - unreachable → display the SSH error verbatim so the user can
+///   debug their `~/.ssh/config` / network / key access
+///
+/// Unix-only — the underlying `ssh::probe` module is `#[cfg(unix)]`.
+/// On Windows we return a clear "not yet implemented" message; the
+/// rest of the UI degrades gracefully because the daemon path is
+/// also disabled on Windows.
+#[tauri::command]
+pub async fn hosts_test_connection(
+    db: State<'_, DatabaseStore>,
     id: i64,
 ) -> Result<HostTestResult, String> {
-    let _ = id;
-    Ok(HostTestResult {
-        ok: false,
-        message: "SSH connection testing ships in a follow-up. The host \
-                  record is saved; transport wiring is the next step."
-            .into(),
-    })
+    // Look up the host record by local id so the frontend doesn't
+    // have to round-trip the ssh_target.
+    let host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| format!("Host not found: {id}"))?;
+
+    #[cfg(unix)]
+    {
+        use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
+        let outcome = probe_host(ProbeOptions::new(&host.ssh_target)).await;
+        Ok(match outcome {
+            ProbeOutcome::Reachable {
+                codemux_remote_version: Some(version),
+                uname,
+            } => HostTestResult {
+                ok: true,
+                message: format!(
+                    "Connected. codemux-remote v{version} is installed{}",
+                    uname
+                        .map(|u| format!(" ({u})"))
+                        .unwrap_or_default()
+                ),
+                needs_install: false,
+                uname: None,
+            },
+            ProbeOutcome::Reachable {
+                codemux_remote_version: None,
+                uname,
+            } => HostTestResult {
+                ok: false,
+                message: format!(
+                    "Reachable, but codemux-remote isn't installed yet{}",
+                    uname
+                        .as_ref()
+                        .map(|u| format!(" ({u})"))
+                        .unwrap_or_default()
+                ),
+                needs_install: true,
+                uname,
+            },
+            ProbeOutcome::Unreachable { reason } => HostTestResult {
+                ok: false,
+                message: reason,
+                needs_install: false,
+                uname: None,
+            },
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = host;
+        Ok(HostTestResult {
+            ok: false,
+            message: "SSH transport is Unix-only for now. Windows support \
+                      is tracked alongside the wider Windows cloud-push port."
+                .into(),
+            needs_install: false,
+            uname: None,
+        })
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct HostTestResult {
+    pub ok: bool,
+    pub message: String,
+    /// True when the probe succeeded but `codemux-remote` isn't
+    /// installed. The UI uses this to switch from "show test result"
+    /// to "offer the bootstrap-install modal."
+    #[serde(default)]
+    pub needs_install: bool,
+    /// Reported `uname -sm` from the probe. Forwarded to the
+    /// bootstrap-install flow so we don't have to re-probe.
+    #[serde(default)]
+    pub uname: Option<String>,
+}
+
+/// Bootstrap-install `codemux-remote` on a host that the probe says
+/// is reachable but missing the binary. Driven by the consent modal:
+/// the frontend asks the user to confirm before invoking.
+///
+/// Unix-only — the underlying `ssh::bootstrap` module is
+/// `#[cfg(unix)]`. On Windows we return an error message.
+#[tauri::command]
+pub async fn hosts_bootstrap_install(
+    db: State<'_, DatabaseStore>,
+    id: i64,
+    uname: String,
+) -> Result<HostBootstrapResult, String> {
+    let host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| format!("Host not found: {id}"))?;
+
+    #[cfg(unix)]
+    {
+        use crate::ssh::bootstrap::{
+            bootstrap_remote, BootstrapOptions, BootstrapResult,
+        };
+        let outcome = bootstrap_remote(BootstrapOptions::new(
+            &host.ssh_target,
+            uname.trim(),
+        ))
+        .await;
+        Ok(match outcome {
+            BootstrapResult::Installed { reported_version } => HostBootstrapResult {
+                ok: true,
+                message: format!(
+                    "codemux-remote v{reported_version} installed on {}",
+                    host.name
+                ),
+            },
+            BootstrapResult::BinaryNotBundled { wanted_target } => {
+                HostBootstrapResult {
+                    ok: false,
+                    message: format!(
+                        "Codemux build doesn't include codemux-remote for {wanted_target}. \
+                         This is a packaging issue — please report it.",
+                    ),
+                }
+            }
+            BootstrapResult::UploadFailed { reason } => HostBootstrapResult {
+                ok: false,
+                message: format!("Upload failed: {reason}"),
+            },
+            BootstrapResult::PostInstallProbeFailed { reason } => {
+                HostBootstrapResult {
+                    ok: false,
+                    message: format!(
+                        "Installed but failed to verify: {reason}. Try testing the \
+                         connection again."
+                    ),
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, uname);
+        Ok(HostBootstrapResult {
+            ok: false,
+            message: "SSH transport is Unix-only for now.".into(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct HostBootstrapResult {
     pub ok: bool,
     pub message: String,
 }
