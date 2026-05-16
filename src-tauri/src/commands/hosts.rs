@@ -13,7 +13,7 @@
 
 use crate::database::{DatabaseStore, HostRecord};
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{Manager, State};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HostView {
@@ -292,6 +292,240 @@ pub async fn hosts_bootstrap_install(
 pub struct HostBootstrapResult {
     pub ok: bool,
     pub message: String,
+}
+
+/// Push a workspace to a remote host. Two-step under the hood:
+///   1. rsync the worktree to the conventional remote path
+///      (`~/.codemux/worktrees/<sanitized-project>/<sanitized-branch>`)
+///      so agents inside see the same filesystem layout they would
+///      locally.
+///   2. Stamp `workspace.host_id = host_id` so the UI shows the
+///      remote badge + future spawns route through the remote
+///      tunnel.
+///
+/// Running PTY sessions are NOT migrated across the network — they
+/// terminate cleanly, the user reopens panes on the remote, and
+/// adapter-aware agents (Claude Code, Codex) auto-resume via the
+/// existing scrollback adapter mechanism. This is documented in
+/// `docs/features/remote-hosts.md`.
+#[tauri::command]
+pub async fn workspace_push_to_host(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, DatabaseStore>,
+    workspace_id: String,
+) -> Result<crate::commands::hosts::WorkspacePushOutcome, String> {
+    // Resolve the host_id the user has already chosen on the
+    // workspace. Pushing requires an explicit host assignment —
+    // there's no implicit "default host" we'd pick on the user's
+    // behalf.
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+    let host_id = ws
+        .host_id
+        .ok_or_else(|| "Workspace has no host assigned. Pick a host first.".to_string())?;
+    let host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+
+    let local_worktree = match ws.worktree_path.as_ref() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(&ws.cwd),
+    };
+    if local_worktree.as_os_str().is_empty() {
+        return Err("Workspace has no local path to push.".into());
+    }
+
+    let project_name = ws
+        .project_root
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+    let branch = ws
+        .git_branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+
+    #[cfg(unix)]
+    {
+        let remote_path =
+            crate::ssh::conventional_remote_path(&project_name, &branch);
+        let remote_path_str = remote_path.to_string_lossy().to_string();
+        let opts = crate::ssh::PushOptions::new(
+            &host.ssh_target,
+            &local_worktree,
+            &remote_path_str,
+        );
+        let result = crate::ssh::push_workspace(opts).await;
+        let outcome = match result {
+            crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
+                WorkspacePushOutcome {
+                    ok: true,
+                    message: format!("Workspace pushed to {}", host.name),
+                    remote_path: Some(remote_path_str.clone()),
+                    rsync_summary: Some(rsync_summary),
+                }
+            }
+            crate::ssh::PushResult::RsyncFailed { reason } => WorkspacePushOutcome {
+                ok: false,
+                message: format!("rsync failed: {reason}"),
+                remote_path: None,
+                rsync_summary: None,
+            },
+            crate::ssh::PushResult::HostUnreachable { reason } => {
+                WorkspacePushOutcome {
+                    ok: false,
+                    message: format!("Host unreachable: {reason}"),
+                    remote_path: None,
+                    rsync_summary: None,
+                }
+            }
+            crate::ssh::PushResult::LocalNotFound { path } => WorkspacePushOutcome {
+                ok: false,
+                message: format!("Local worktree not found at {path}"),
+                remote_path: None,
+                rsync_summary: None,
+            },
+        };
+        crate::state::emit_app_state(&app);
+        Ok(outcome)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (local_worktree, project_name, branch, host);
+        Ok(WorkspacePushOutcome {
+            ok: false,
+            message: "SSH transport is Unix-only for now.".into(),
+            remote_path: None,
+            rsync_summary: None,
+        })
+    }
+}
+
+/// Pull a workspace back from its current host to local. Mirrors the
+/// push flow: rsync remote → local, clear `host_id`. The user reopens
+/// panes locally and adapter-aware agents auto-resume.
+#[tauri::command]
+pub async fn workspace_pull_back(
+    app: tauri::AppHandle,
+    db: tauri::State<'_, DatabaseStore>,
+    workspace_id: String,
+) -> Result<WorkspacePullOutcome, String> {
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    let ws = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+    let host_id = ws
+        .host_id
+        .ok_or_else(|| "Workspace is already local.".to_string())?;
+    let host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+
+    let local_worktree = match ws.worktree_path.as_ref() {
+        Some(p) => std::path::PathBuf::from(p),
+        None => std::path::PathBuf::from(&ws.cwd),
+    };
+    let project_name = ws
+        .project_root
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+    let branch = ws
+        .git_branch
+        .clone()
+        .unwrap_or_else(|| "main".to_string());
+
+    #[cfg(unix)]
+    {
+        let remote_path =
+            crate::ssh::conventional_remote_path(&project_name, &branch);
+        let remote_path_str = remote_path.to_string_lossy().to_string();
+        let opts = crate::ssh::PullOptions::new(
+            &host.ssh_target,
+            &remote_path_str,
+            &local_worktree,
+        );
+        let result = crate::ssh::pull_workspace_back(opts).await;
+        let outcome = match result {
+            crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
+                // On success: clear host_id so the workspace is local
+                // again and the next pane spawn uses the local
+                // pty-daemon.
+                app_state.set_workspace_host_id(&workspace_id, None)?;
+                WorkspacePullOutcome {
+                    ok: true,
+                    message: format!("Workspace pulled back from {}", host.name),
+                    rsync_summary: Some(rsync_summary),
+                }
+            }
+            crate::ssh::PullResult::RsyncFailed { reason } => {
+                WorkspacePullOutcome {
+                    ok: false,
+                    message: format!("rsync failed: {reason}"),
+                    rsync_summary: None,
+                }
+            }
+            crate::ssh::PullResult::HostUnreachable { reason } => {
+                WorkspacePullOutcome {
+                    ok: false,
+                    message: format!("Host unreachable: {reason}"),
+                    rsync_summary: None,
+                }
+            }
+            crate::ssh::PullResult::RemoteNotFound { path } => {
+                WorkspacePullOutcome {
+                    ok: false,
+                    message: format!(
+                        "Remote worktree not found at {path}. The host may have \
+                         been wiped or the workspace was never pushed."
+                    ),
+                    rsync_summary: None,
+                }
+            }
+        };
+        crate::state::emit_app_state(&app);
+        Ok(outcome)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (local_worktree, project_name, branch, host);
+        Ok(WorkspacePullOutcome {
+            ok: false,
+            message: "SSH transport is Unix-only for now.".into(),
+            rsync_summary: None,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspacePushOutcome {
+    pub ok: bool,
+    pub message: String,
+    pub remote_path: Option<String>,
+    pub rsync_summary: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspacePullOutcome {
+    pub ok: bool,
+    pub message: String,
+    pub rsync_summary: Option<String>,
 }
 
 /// Fire-and-forget background sync attempt. Reads the cached auth token

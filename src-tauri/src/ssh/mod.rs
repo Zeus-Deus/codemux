@@ -31,8 +31,15 @@
 
 pub mod bootstrap;
 pub mod probe;
+pub mod push;
 pub mod tunnel;
+pub mod tunnel_supervisor;
 
 pub use bootstrap::{bootstrap_remote, BootstrapResult};
 pub use probe::{probe_host, ProbeOutcome};
+pub use push::{
+    conventional_remote_path, pull_workspace_back, push_workspace, PullOptions,
+    PullResult, PushOptions, PushResult,
+};
 pub use tunnel::{spawn_ssh_tunnel, TunnelHandle};
+pub use tunnel_supervisor::{TunnelStatus, TunnelSupervisor};

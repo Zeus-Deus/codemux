@@ -440,6 +440,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   {workspace.title}
                 </span>
 
+                {/* Remote host badge — subtle pill showing which host
+                    this workspace runs on, when it's not local. Used
+                    by the cloud-push flow (steps 2b-2d). Hidden for
+                    local workspaces because that's the default and
+                    we don't want noise on every row. */}
+                {workspace.host_id !== null && workspace.host_id !== undefined && (
+                  <span
+                    title={`Runs on remote host #${workspace.host_id}`}
+                    className="shrink-0 inline-flex items-center gap-0.5 rounded-sm bg-muted px-1 py-0.5 text-[9px] font-mono uppercase tracking-wider text-muted-foreground"
+                  >
+                    ☁
+                  </span>
+                )}
+
                 {/* Ahead/behind indicators */}
                 {(workspace.git_ahead > 0 || workspace.git_behind > 0) && (
                   <span className="flex items-center gap-1 shrink-0 text-[10px] font-mono tabular-nums">

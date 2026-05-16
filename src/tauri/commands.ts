@@ -1589,6 +1589,28 @@ export const hostsTestConnection = (id: number) =>
 export const hostsBootstrapInstall = (id: number, uname: string) =>
   invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
 
+export interface WorkspacePushOutcome {
+  ok: boolean;
+  message: string;
+  remote_path: string | null;
+  rsync_summary: string | null;
+}
+
+export interface WorkspacePullOutcome {
+  ok: boolean;
+  message: string;
+  rsync_summary: string | null;
+}
+
+/** Push a workspace to its assigned host. Requires the workspace's
+ *  host_id to be set (via DevicePicker or setWorkspaceHost). */
+export const workspacePushToHost = (workspaceId: string) =>
+  invoke<WorkspacePushOutcome>("workspace_push_to_host", { workspaceId });
+
+/** Pull a remote workspace back to local. Clears host_id on success. */
+export const workspacePullBack = (workspaceId: string) =>
+  invoke<WorkspacePullOutcome>("workspace_pull_back", { workspaceId });
+
 /** Assign (or clear) the host a workspace runs on. `null` clears
  *  the assignment (back to local). */
 export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>

@@ -767,6 +767,11 @@ export interface WorkspaceSnapshot {
   active_tab_id: string;
   active_surface_id: string;
   surfaces: SurfaceSnapshot[];
+  /** Cloud-push (step 2b+): which host this workspace runs on. `null`
+   *  means local. Refers to the local `hosts` table id. Optional in
+   *  the TS type because older snapshots persisted without the field
+   *  and the Rust side falls back to `None` via serde default. */
+  host_id?: number | null;
 }
 
 export interface PersistenceSchema {

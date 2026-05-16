@@ -1453,6 +1453,8 @@ pub fn run() {
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
             commands::set_workspace_host,
+            commands::workspace_push_to_host,
+            commands::workspace_pull_back,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,
