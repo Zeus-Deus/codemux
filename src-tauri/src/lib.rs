@@ -39,6 +39,7 @@ pub mod os_input;
 pub mod ports;
 pub mod presets;
 pub mod project;
+pub mod pty_daemon;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
@@ -524,6 +525,44 @@ pub fn run() {
             hooks::register_pi_extension();
 
             terminal::spawn_missing_ptys(handle);
+
+            // Warm up the PTY daemon connection. We adopt unconditionally
+            // when a manifest is present (regardless of the
+            // `persistent_agents.enabled` setting) so a user who turned
+            // the setting off after creating persistent sessions still
+            // reattaches to those sessions on this launch. We only spawn
+            // a fresh daemon if the setting is on; otherwise an absent
+            // manifest means "nothing to adopt, leave the daemon dormant."
+            {
+                let setting_on = settings_sync::load_cache()
+                    .map(|s| s.persistent_agents.enabled)
+                    .unwrap_or(false);
+                let manifest_present = pty_daemon::manifest::read_manifest().is_some();
+                if setting_on || manifest_present {
+                    tauri::async_runtime::spawn(async move {
+                        match pty_daemon::ensure_daemon().await {
+                            Ok(client) => match client.list().await {
+                                Ok(sessions) => {
+                                    eprintln!(
+                                        "[codemux::pty_daemon] startup adoption ok: {} live sessions",
+                                        sessions.len()
+                                    );
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "[codemux::pty_daemon] startup adoption: list failed: {error}"
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                eprintln!(
+                                    "[codemux::pty_daemon] startup adoption failed: {error}"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
 
             // Initialize the project index from the active workspace's CWD.
             // If no workspace exists yet, the index stays empty and the watcher

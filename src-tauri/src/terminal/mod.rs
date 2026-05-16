@@ -23,6 +23,11 @@ use crate::project::current_project_root;
 use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
+/// Persistent-agent path: routes spawns through `codemux pty-daemon` so
+/// they survive the app being closed. Gated by
+/// `settings_sync::PersistentAgentsSettings::enabled`.
+pub mod daemon_backed;
+
 static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
     std::sync::OnceLock::new();
 
@@ -183,6 +188,17 @@ pub struct SessionRuntime {
     /// where two callers both passed the "writer/master is None" check while
     /// the slow ConPTY initialization was in flight on Windows.
     pub is_spawning: bool,
+    /// Set when this session is owned by the `codemux pty-daemon` process
+    /// instead of the in-process portable-pty path. The PID stored in
+    /// `child_pid` belongs to a process the daemon spawned — NOT a direct
+    /// child of the Tauri app. Implications:
+    ///
+    /// - `terminate_pty_session` must NOT call `killpg` for these sessions
+    ///   (we don't own the process group; the daemon does).
+    /// - On window close, persistent sessions detach from the daemon
+    ///   instead of getting torn down.
+    /// - Drop is a no-op for persistent sessions; the daemon outlives us.
+    pub persistent: bool,
 }
 
 impl SessionRuntime {
@@ -205,6 +221,7 @@ impl SessionRuntime {
             skip_preset_launch: false,
             resume_command: None,
             is_spawning: false,
+            persistent: false,
         }
     }
 }
@@ -220,6 +237,14 @@ impl SessionRuntime {
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
         if let Some(pid) = self.child_pid.take() {
+            // Persistent sessions are owned by `codemux pty-daemon`, not by
+            // this process. We must NOT kill them on drop — that defeats
+            // the whole point of running them detached. The daemon will
+            // tear them down via its own `Close` request when the user
+            // explicitly closes the pane.
+            if self.persistent {
+                return;
+            }
             eprintln!(
                 "[codemux::terminal] SessionRuntime dropped with live child_pid={pid} — \
                  normal close path was skipped. Killing process group as last resort."
@@ -987,6 +1012,45 @@ fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, Strin
 }
 
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
+    // Persistent path: when the user has opted in, every shell goes through
+    // the long-lived `codemux pty-daemon` so closing the app doesn't kill
+    // it. The agent commands the user later types into the shell inherit
+    // the shell's lifetime, so this is what actually makes "close laptop,
+    // agent keeps running" work for the normal preset-driven flow (which
+    // spawns a shell first and writes the agent command into it).
+    //
+    // Fallback is silent: any daemon error drops back to the in-process
+    // spawn so the user always gets a working terminal.
+    if persistent_agents_enabled() {
+        let app_clone = app.clone();
+        let session_id_clone = session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            match daemon_backed::spawn_pty_for_session_via_daemon(
+                app_clone.clone(),
+                session_id_clone.clone(),
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::terminal] persistent-shell path failed for session \
+                         {session_id_clone}: {error}; falling back to in-process spawn"
+                    );
+                    let sid = session_id_clone.clone();
+                    let app_fb = app_clone.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        spawn_pty_for_session_in_process(app_fb, sid);
+                    });
+                }
+            }
+        });
+        return;
+    }
+    spawn_pty_for_session_in_process(app, session_id);
+}
+
+fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
@@ -1532,10 +1596,47 @@ pub(crate) fn terminate_pty_session(
         return;
     };
 
+    // Persistent (daemon-backed) sessions: the PID is owned by the
+    // `codemux pty-daemon` process, not us. killpg would either signal a
+    // process group we don't own (no-op + spurious EPERM in stderr) or, if
+    // PIDs got recycled into something we *do* own, send SIGKILL to the
+    // wrong process. The correct teardown for a persistent session is to
+    // ask the daemon to close it via the socket. We do that here on a
+    // detached tokio task so the close path stays sync.
+    let was_persistent = runtime.persistent;
+    let pid = runtime.child_pid.take();
+    if was_persistent {
+        runtime.output_channel = None;
+        runtime.pending_output.clear();
+        runtime.pending_output_bytes = 0;
+        // Drop runtime first so any held Arcs (writer, etc.) release before
+        // we await the daemon round-trip.
+        drop(runtime);
+        let session_id = session_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            match crate::pty_daemon::ensure_daemon().await {
+                Ok(client) => {
+                    if let Err(error) = client.close(session_id.clone()).await {
+                        eprintln!(
+                            "[codemux::terminal] daemon close failed for persistent session \
+                             {session_id}: {error}"
+                        );
+                    }
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::terminal] cannot reach daemon to close persistent session \
+                         {session_id}: {error}"
+                    );
+                }
+            }
+        });
+        return;
+    }
+
     // Clear child_pid to None *first* so the `Drop for SessionRuntime`
     // safety-net impl stays silent on the happy path. Any non-None value
     // printed by Drop means something skipped this function.
-    let pid = runtime.child_pid.take();
     runtime.output_channel = None;
     runtime.pending_output.clear();
     runtime.pending_output_bytes = 0;
@@ -1965,6 +2066,119 @@ pub fn clear_agent_status(session_id: String, app_state: State<'_, AppStateStore
 /// are arguments.  `extra_env` is a list of `(key, value)` pairs that will be
 /// set on the spawned process on top of the normal Codemux env vars.
 pub fn spawn_pty_for_agent(
+    app: AppHandle,
+    session_id: String,
+    workspace_id: String,
+    argv: Vec<String>,
+    extra_env: Vec<(String, String)>,
+    execution_policy: crate::execution::ExecutionPolicy,
+) {
+    // Persistent-agents path: if the user has opted in, the agent runs
+    // inside `codemux pty-daemon` so it survives this process exiting.
+    // Falls back silently to the in-process path on any error (cannot
+    // reach daemon, Windows where we haven't wired named pipes yet,
+    // adoption mismatch) so the user still gets a working agent.
+    if persistent_agents_enabled() {
+        let app_for_daemon = app.clone();
+        let session_id_for_daemon = session_id.clone();
+        let workspace_id_for_daemon = workspace_id.clone();
+        let argv_for_daemon = argv.clone();
+        let extra_env_for_daemon = extra_env.clone();
+        let execution_policy_for_daemon = execution_policy.clone();
+        tauri::async_runtime::spawn(async move {
+            match daemon_backed::spawn_pty_for_agent_via_daemon(
+                app_for_daemon.clone(),
+                session_id_for_daemon.clone(),
+                workspace_id_for_daemon,
+                argv_for_daemon,
+                extra_env_for_daemon,
+                execution_policy_for_daemon,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::terminal] persistent-agent path failed for session \
+                         {session_id_for_daemon}: {error}; falling back to in-process spawn"
+                    );
+                    // Re-enter the function on a non-tokio context so the
+                    // original sync spawn path runs. We re-call ourselves;
+                    // the recursion is bounded because we won't re-enter
+                    // this `if` branch on the fallback (we cleared the
+                    // setting? no — we just rely on the reservation
+                    // already being cleared and try again sync). The
+                    // simplest safe fallback: call the legacy spawn
+                    // helper from a blocking task.
+                    let app2 = app_for_daemon.clone();
+                    let sid2 = session_id_for_daemon.clone();
+                    let ws2 = workspace_id.clone();
+                    let argv2 = argv.clone();
+                    let env2 = extra_env.clone();
+                    let pol2 = execution_policy.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        spawn_pty_for_agent_in_process(
+                            app2, sid2, ws2, argv2, env2, pol2,
+                        );
+                    });
+                }
+            }
+        });
+        return;
+    }
+
+    spawn_pty_for_agent_in_process(
+        app,
+        session_id,
+        workspace_id,
+        argv,
+        extra_env,
+        execution_policy,
+    );
+}
+
+/// Reads the `persistent_agents.enabled` setting from the local cache.
+/// Defaults to `false` when the cache is missing or unreadable — we never
+/// silently opt the user in.
+fn persistent_agents_enabled() -> bool {
+    if persistent_agents_setting_enabled() {
+        return true;
+    }
+    // Even when the setting is currently off, if a daemon is still running
+    // from a previous launch, we route through it so reattach works (the
+    // daemon's idempotent spawn handler returns the existing pid for any
+    // session id it already owns). Otherwise users would lose their
+    // persistent sessions on the next launch if they toggled the setting
+    // off in the meantime.
+    daemon_manifest_is_alive()
+}
+
+fn persistent_agents_setting_enabled() -> bool {
+    settings_sync::load_cache()
+        .map(|s| s.persistent_agents.enabled)
+        .unwrap_or(false)
+}
+
+fn daemon_manifest_is_alive() -> bool {
+    let Some(manifest) = crate::pty_daemon::manifest::read_manifest() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(manifest.pid as i32, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        // No cheap liveness check on Windows yet — assume alive.
+        let _ = manifest;
+        true
+    }
+}
+
+/// In-process PTY spawn — the original behavior. Renamed so the public
+/// `spawn_pty_for_agent` can choose between this and the daemon-backed
+/// path based on settings.
+fn spawn_pty_for_agent_in_process(
     app: AppHandle,
     session_id: String,
     workspace_id: String,

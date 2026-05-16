@@ -24,6 +24,8 @@ pub struct UserSettings {
     pub file_tree: FileTreeSettings,
     #[serde(default)]
     pub session_restore: SessionRestoreSettings,
+    #[serde(default)]
+    pub persistent_agents: PersistentAgentsSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -133,6 +135,27 @@ impl Default for SessionRestoreSettings {
             scrollback_lines: default_scrollback_lines(),
             max_total_mb: default_max_total_mb(),
         }
+    }
+}
+
+/// "Persistent agents" — when enabled, agent PTYs are spawned inside the
+/// long-lived `codemux pty-daemon` process instead of as direct children of
+/// the Tauri app. Closing the app no longer kills the agent; reopening
+/// reattaches.
+///
+/// Off by default while the feature stabilizes. The setting is the only
+/// way to opt in; there is no per-session toggle yet.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PersistentAgentsSettings {
+    /// Master switch. When false, agent spawns go through the in-process
+    /// `portable-pty` path and die with the app like today.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for PersistentAgentsSettings {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -504,6 +527,7 @@ mod tests {
                 scrollback_lines: 5000,
                 max_total_mb: 50,
             },
+            persistent_agents: PersistentAgentsSettings { enabled: true },
         };
 
         let json = serde_json::to_string(&s).unwrap();
