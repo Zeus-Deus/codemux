@@ -136,6 +136,11 @@ async fn run_supervisor(
     remote_binary: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    eprintln!(
+        "[tunnel-supervisor] start: ssh_target={ssh_target} \
+         local_socket={local_socket:?} remote_socket={remote_socket} \
+         remote_binary={remote_binary}"
+    );
     // Failure timestamps form a sliding window; we count failures in
     // the last `CIRCUIT_WINDOW` and trip the breaker when we exceed
     // the cap.
@@ -155,6 +160,7 @@ async fn run_supervisor(
             remote_binary: &remote_binary,
         };
         let argv = build_tunnel_argv(&opts);
+        eprintln!("[tunnel-supervisor] attempt {} argv: ssh {}", attempt + 1, argv.join(" "));
         let mut cmd = Command::new("ssh");
         for arg in &argv {
             cmd.arg(arg);
@@ -165,7 +171,13 @@ async fn run_supervisor(
 
         let spawn_res = cmd.spawn();
         let mut child = match spawn_res {
-            Ok(c) => c,
+            Ok(c) => {
+                eprintln!(
+                    "[tunnel-supervisor] ssh spawned ok, pid={:?}",
+                    c.id()
+                );
+                c
+            }
             Err(error) => {
                 eprintln!("[tunnel-supervisor] spawn failed: {error}");
                 record_failure(&mut failures);
@@ -210,7 +222,20 @@ async fn run_supervisor(
                 record_failure(&mut failures);
             }
             Err(reason) => {
-                eprintln!("[tunnel-supervisor] tunnel did not come up: {reason}");
+                // Capture SSH stderr verbatim so we can see WHY the
+                // tunnel failed. Most useful failures (host
+                // unreachable, permission denied, port-forwarding
+                // refused) write to stderr before SSH exits.
+                let mut stderr_dump = String::new();
+                if let Some(mut err_stream) = child.stderr.take() {
+                    use tokio::io::AsyncReadExt;
+                    let _ = err_stream.read_to_string(&mut stderr_dump).await;
+                }
+                eprintln!(
+                    "[tunnel-supervisor] tunnel did not come up: {reason}\n\
+                     [tunnel-supervisor] ssh stderr: {}",
+                    stderr_dump.trim()
+                );
                 let _ = child.kill().await;
                 record_failure(&mut failures);
             }
@@ -256,6 +281,11 @@ async fn wait_for_socket(
     deadline: Duration,
 ) -> Result<(), String> {
     let start = Instant::now();
+    let mut last_log_at_secs: u64 = 0;
+    eprintln!(
+        "[tunnel-supervisor] waiting for local socket {:?} (deadline {:?})",
+        local_socket, deadline
+    );
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             let mut stderr = String::new();
@@ -271,7 +301,20 @@ async fn wait_for_socket(
         if local_socket.exists() {
             // Tiny grace beat so the daemon's listener is fully up.
             tokio::time::sleep(Duration::from_millis(50)).await;
+            eprintln!(
+                "[tunnel-supervisor] local socket appeared after {:?}",
+                start.elapsed()
+            );
             return Ok(());
+        }
+        let elapsed_secs = start.elapsed().as_secs();
+        if elapsed_secs > last_log_at_secs {
+            // Per-second progress so we know the loop is alive.
+            eprintln!(
+                "[tunnel-supervisor] still waiting for socket (elapsed {}s, ssh alive)",
+                elapsed_secs
+            );
+            last_log_at_secs = elapsed_secs;
         }
         if start.elapsed() >= deadline {
             return Err(format!(
