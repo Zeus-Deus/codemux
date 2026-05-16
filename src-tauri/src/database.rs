@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -165,6 +165,47 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Hosts (Step 2 of cloud push — Settings → Hosts pane data model).
+        --
+        -- Each row is a user-defined SSH target plus a friendly name. The
+        -- workspace will eventually carry a `host_id` pointing at one of
+        -- these (or NULL meaning local). SSH credentials are NOT stored
+        -- here and never leave the device — they live in ~/.ssh/. This
+        -- table holds only the *identity* of the remote box.
+        --
+        -- `server_id` is the row id assigned by the API when this host
+        -- syncs to the cloud, used to correlate local <-> server rows on
+        -- merge. NULL until the first successful push.
+        --
+        -- `deleted_at` is a soft-delete tombstone so deletions sync
+        -- cleanly: we keep the row locally with a deletion timestamp,
+        -- push the delete, then the next pull will see it gone from
+        -- the server and we can hard-delete locally. Matches the
+        -- pattern Vexis uses for voice data lifecycle.
+        --
+        -- `dirty` flag mirrors the settings-sync model: 1 means the
+        -- local row has unpushed changes, 0 means it matches the
+        -- last-known server state. Lets `hosts_sync` push only what
+        -- changed.
+        CREATE TABLE IF NOT EXISTS hosts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT 'local',
+            server_id TEXT,
+            name TEXT NOT NULL,
+            ssh_target TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            deleted_at TEXT,
+            dirty INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(user_id, server_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_hosts_user
+            ON hosts(user_id, deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_hosts_dirty
+            ON hosts(user_id, dirty)
+            WHERE dirty = 1;
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -421,6 +462,253 @@ impl DatabaseStore {
         .filter_map(|r| r.ok())
         .collect()
     }
+}
+
+// ── Hosts (Step 2 of cloud push) ──
+//
+// CRUD over the `hosts` table. Soft-delete semantics: `delete_host`
+// stamps `deleted_at` rather than removing the row, so the sync layer
+// has a tombstone to push. `purge_synced_deletes` is called by the
+// sync layer after a successful round-trip to physically remove
+// already-acknowledged tombstones.
+//
+// SSH credentials live in `~/.ssh/`, never here. This table holds
+// identity only.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct HostRecord {
+    pub id: i64,
+    pub server_id: Option<String>,
+    pub name: String,
+    pub ssh_target: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
+    pub dirty: bool,
+}
+
+impl DatabaseStore {
+    /// Insert a new host. Marked dirty so the next sync round-trip pushes it.
+    pub fn insert_host(&self, name: &str, ssh_target: &str) -> Result<HostRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO hosts (user_id, name, ssh_target, dirty)
+             VALUES ('local', ?1, ?2, 1)",
+            params![name, ssh_target],
+        )
+        .map_err(|e| format!("Failed to insert host: {e}"))?;
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+             FROM hosts WHERE id = ?1",
+            params![id],
+            row_to_host,
+        )
+        .map_err(|e| format!("Failed to re-read inserted host: {e}"))
+    }
+
+    /// Return all non-deleted hosts for the local user.
+    pub fn list_hosts(&self) -> Vec<HostRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+             FROM hosts
+             WHERE user_id = 'local' AND deleted_at IS NULL
+             ORDER BY name COLLATE NOCASE ASC",
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_hosts prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_host) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_hosts query_map failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Return every host row including soft-deleted tombstones — used
+    /// by the sync layer to push pending deletions to the server.
+    pub fn list_hosts_for_sync(&self) -> Vec<HostRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+             FROM hosts WHERE user_id = 'local'",
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_hosts_for_sync prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_host) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_hosts_for_sync query_map failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Return only rows with unpushed changes (dirty=1). Used by the
+    /// sync layer's "push my deltas" step so we don't re-upload rows
+    /// that already match the server.
+    pub fn list_dirty_hosts(&self) -> Vec<HostRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+             FROM hosts WHERE user_id = 'local' AND dirty = 1",
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_dirty_hosts prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_host) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_dirty_hosts query_map failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    pub fn update_host(
+        &self,
+        id: i64,
+        name: &str,
+        ssh_target: &str,
+    ) -> Result<HostRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "UPDATE hosts
+                 SET name = ?1, ssh_target = ?2, updated_at = datetime('now'), dirty = 1
+                 WHERE id = ?3 AND user_id = 'local' AND deleted_at IS NULL",
+                params![name, ssh_target, id],
+            )
+            .map_err(|e| format!("Failed to update host: {e}"))?;
+        if affected == 0 {
+            return Err(format!("No host with id {id}"));
+        }
+        conn.query_row(
+            "SELECT id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty
+             FROM hosts WHERE id = ?1",
+            params![id],
+            row_to_host,
+        )
+        .map_err(|e| format!("Failed to re-read updated host: {e}"))
+    }
+
+    /// Soft-delete: stamp `deleted_at` and mark dirty so the next sync
+    /// pushes the tombstone. The row stays in the DB until
+    /// `purge_synced_deletes` runs.
+    pub fn delete_host(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "UPDATE hosts
+                 SET deleted_at = datetime('now'), updated_at = datetime('now'), dirty = 1
+                 WHERE id = ?1 AND user_id = 'local' AND deleted_at IS NULL",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to soft-delete host: {e}"))?;
+        if affected == 0 {
+            return Err(format!("No host with id {id}"));
+        }
+        Ok(())
+    }
+
+    /// Clear the dirty flag on a host after a successful push. Optionally
+    /// stamp `server_id` if this was the first upload.
+    pub fn mark_host_synced(
+        &self,
+        id: i64,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(sid) = server_id {
+            conn.execute(
+                "UPDATE hosts SET dirty = 0, server_id = ?1 WHERE id = ?2",
+                params![sid, id],
+            )
+            .map_err(|e| format!("Failed to mark host synced: {e}"))?;
+        } else {
+            conn.execute("UPDATE hosts SET dirty = 0 WHERE id = ?1", params![id])
+                .map_err(|e| format!("Failed to mark host synced: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Hard-delete tombstones the server has confirmed it removed. Safe
+    /// to call after a successful sync round-trip; no-op when nothing
+    /// matches.
+    pub fn purge_acknowledged_deletes(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM hosts WHERE deleted_at IS NOT NULL AND dirty = 0",
+            [],
+        )
+        .map_err(|e| format!("Failed to purge tombstones: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert a row received from the server. If a local row already
+    /// exists with the same `server_id`, update in place; otherwise
+    /// insert. Always marked `dirty = 0` because this row came from the
+    /// server.
+    pub fn upsert_host_from_server(
+        &self,
+        server_id: &str,
+        name: &str,
+        ssh_target: &str,
+        created_at: &str,
+        updated_at: &str,
+        deleted_at: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        // Try to update an existing row first.
+        let updated = conn
+            .execute(
+                "UPDATE hosts
+                 SET name = ?1, ssh_target = ?2, created_at = ?3, updated_at = ?4,
+                     deleted_at = ?5, dirty = 0
+                 WHERE user_id = 'local' AND server_id = ?6",
+                params![name, ssh_target, created_at, updated_at, deleted_at, server_id],
+            )
+            .map_err(|e| format!("Failed to update host from server: {e}"))?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO hosts (user_id, server_id, name, ssh_target, created_at, updated_at, deleted_at, dirty)
+                 VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![server_id, name, ssh_target, created_at, updated_at, deleted_at],
+            )
+            .map_err(|e| format!("Failed to insert host from server: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
+    let dirty_int: i64 = row.get(7)?;
+    Ok(HostRecord {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        name: row.get(2)?,
+        ssh_target: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        deleted_at: row.get(6)?,
+        dirty: dirty_int != 0,
+    })
 }
 
 // ── Agent Chat Sessions ──
@@ -2125,5 +2413,203 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
         let rec = db.get_agent_chat_session("t").unwrap();
         assert_eq!(rec.title.as_deref(), Some("Persisted"));
+    }
+
+    // ── Hosts CRUD tests ──
+    //
+    // These exercise the soft-delete + dirty-flag invariants the sync
+    // layer relies on. A bug here means hosts silently disappear or
+    // duplicate on the user's other devices — much worse than a UI
+    // glitch, so the coverage is intentionally thorough.
+
+    #[test]
+    fn hosts_insert_and_list() {
+        let db = init_test_database();
+        assert!(db.list_hosts().is_empty());
+
+        let h = db.insert_host("homelab", "zeus@10.0.0.5").unwrap();
+        assert_eq!(h.name, "homelab");
+        assert_eq!(h.ssh_target, "zeus@10.0.0.5");
+        assert!(h.dirty, "new rows must be marked dirty so sync picks them up");
+        assert!(h.server_id.is_none(), "fresh inserts have no server_id");
+        assert!(h.deleted_at.is_none());
+
+        let list = db.list_hosts();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, h.id);
+    }
+
+    #[test]
+    fn hosts_list_ordered_case_insensitive() {
+        let db = init_test_database();
+        db.insert_host("zebra", "u@a").unwrap();
+        db.insert_host("Apple", "u@b").unwrap();
+        db.insert_host("banana", "u@c").unwrap();
+        let names: Vec<String> = db.list_hosts().into_iter().map(|h| h.name).collect();
+        assert_eq!(names, vec!["Apple", "banana", "zebra"]);
+    }
+
+    #[test]
+    fn hosts_update_marks_dirty() {
+        let db = init_test_database();
+        let h = db.insert_host("orig", "old@host").unwrap();
+        db.mark_host_synced(h.id, Some("srv-1")).unwrap();
+        // After mark_synced, the row should be clean.
+        let clean = db.list_hosts().into_iter().find(|x| x.id == h.id).unwrap();
+        assert!(!clean.dirty);
+        assert_eq!(clean.server_id.as_deref(), Some("srv-1"));
+
+        let updated = db.update_host(h.id, "renamed", "new@host").unwrap();
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.ssh_target, "new@host");
+        assert!(updated.dirty, "edits must re-mark the row dirty");
+        assert_eq!(
+            updated.server_id.as_deref(),
+            Some("srv-1"),
+            "server_id survives a rename so we update-not-recreate on push"
+        );
+    }
+
+    #[test]
+    fn hosts_update_unknown_id_errors() {
+        let db = init_test_database();
+        let result = db.update_host(9999, "x", "y");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn hosts_delete_is_soft_and_dirty() {
+        let db = init_test_database();
+        let h = db.insert_host("doomed", "u@h").unwrap();
+        db.delete_host(h.id).unwrap();
+
+        // Soft-deleted rows do NOT appear in list_hosts.
+        assert!(db.list_hosts().is_empty());
+
+        // But they DO appear in list_hosts_for_sync so the tombstone
+        // can be pushed to the server.
+        let pending = db.list_hosts_for_sync();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].deleted_at.is_some());
+        assert!(
+            pending[0].dirty,
+            "tombstones must be dirty so the sync layer pushes them"
+        );
+    }
+
+    #[test]
+    fn hosts_delete_unknown_id_errors() {
+        let db = init_test_database();
+        assert!(db.delete_host(9999).is_err());
+    }
+
+    #[test]
+    fn hosts_dirty_list_filters_correctly() {
+        let db = init_test_database();
+        let dirty = db.insert_host("a", "u@a").unwrap();
+        let clean = db.insert_host("b", "u@b").unwrap();
+        db.mark_host_synced(clean.id, Some("srv-b")).unwrap();
+
+        let only_dirty = db.list_dirty_hosts();
+        assert_eq!(only_dirty.len(), 1);
+        assert_eq!(only_dirty[0].id, dirty.id);
+    }
+
+    #[test]
+    fn hosts_purge_acknowledged_deletes() {
+        let db = init_test_database();
+        let h = db.insert_host("temp", "u@t").unwrap();
+        db.delete_host(h.id).unwrap();
+        // Before mark_synced: still a tombstone, must NOT be purged.
+        db.purge_acknowledged_deletes().unwrap();
+        assert_eq!(db.list_hosts_for_sync().len(), 1);
+        // After mark_synced: tombstone is acknowledged, NOW purge.
+        db.mark_host_synced(h.id, Some("srv-t")).unwrap();
+        db.purge_acknowledged_deletes().unwrap();
+        assert!(db.list_hosts_for_sync().is_empty());
+    }
+
+    #[test]
+    fn hosts_upsert_from_server_new_then_update() {
+        let db = init_test_database();
+        // First sync: server has a row we don't.
+        db.upsert_host_from_server(
+            "srv-1",
+            "from-cloud",
+            "user@cloud",
+            "2026-05-01 12:00:00",
+            "2026-05-01 12:00:00",
+            None,
+        )
+        .unwrap();
+        let after_first = db.list_hosts();
+        assert_eq!(after_first.len(), 1);
+        assert_eq!(after_first[0].server_id.as_deref(), Some("srv-1"));
+        assert!(
+            !after_first[0].dirty,
+            "server-sourced rows must NOT be dirty (they already match the server)"
+        );
+
+        // Second sync: server reports a rename. We must update in place,
+        // not insert a duplicate.
+        db.upsert_host_from_server(
+            "srv-1",
+            "renamed-from-cloud",
+            "user@cloud",
+            "2026-05-01 12:00:00",
+            "2026-05-02 09:00:00",
+            None,
+        )
+        .unwrap();
+        let after_second = db.list_hosts();
+        assert_eq!(after_second.len(), 1, "no duplicate row");
+        assert_eq!(after_second[0].name, "renamed-from-cloud");
+
+        // Third sync: server marks the row deleted.
+        db.upsert_host_from_server(
+            "srv-1",
+            "renamed-from-cloud",
+            "user@cloud",
+            "2026-05-01 12:00:00",
+            "2026-05-03 09:00:00",
+            Some("2026-05-03 09:00:00"),
+        )
+        .unwrap();
+        // list_hosts hides deleted rows; list_hosts_for_sync sees them.
+        assert!(db.list_hosts().is_empty());
+        let raw = db.list_hosts_for_sync();
+        assert_eq!(raw.len(), 1);
+        assert!(raw[0].deleted_at.is_some());
+    }
+
+    #[test]
+    fn hosts_local_and_remote_coexist_until_paired() {
+        // Realistic scenario: user adds a host on their laptop while
+        // offline. Meanwhile their desktop synced a different host.
+        // Once auth comes back and pull/push run, both rows should
+        // coexist with distinct server_ids — no merge collision.
+        let db = init_test_database();
+        let local = db.insert_host("laptop-only", "u@laptop").unwrap();
+        db.upsert_host_from_server(
+            "srv-desktop",
+            "desktop-only",
+            "u@desktop",
+            "2026-05-01 12:00:00",
+            "2026-05-01 12:00:00",
+            None,
+        )
+        .unwrap();
+        let list = db.list_hosts();
+        assert_eq!(list.len(), 2);
+        // Pretend the local row got pushed; mark it synced.
+        db.mark_host_synced(local.id, Some("srv-laptop")).unwrap();
+        // Now both rows have distinct server_ids.
+        let mut sids: Vec<String> = db
+            .list_hosts()
+            .into_iter()
+            .filter_map(|h| h.server_id)
+            .collect();
+        sids.sort();
+        assert_eq!(sids, vec!["srv-desktop".to_string(), "srv-laptop".to_string()]);
     }
 }

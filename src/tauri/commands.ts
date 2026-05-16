@@ -1534,3 +1534,40 @@ export const listMcpToolsWithCapInfo = () =>
  *  cap. */
 export const listMcpToolsForServer = (id: string) =>
   invoke<McpTool[]>("list_mcp_tools_for_server", { id });
+
+// ── Hosts (Settings → Hosts, Step 2 of cloud-push) ──
+//
+// SSH credentials never enter these payloads. The frontend only
+// sends name + sshTarget; auth is the OS's job (`~/.ssh/config`,
+// agent, keys). `dirty` indicates the row has unpushed changes; the
+// UI surfaces it as a small "syncing…" hint.
+export interface HostView {
+  id: number;
+  /** The server-assigned id once this host has synced to the cloud,
+   *  null for hosts created offline that haven't synced yet. */
+  server_id: string | null;
+  name: string;
+  ssh_target: string;
+  created_at: string;
+  updated_at: string;
+  dirty: boolean;
+}
+
+export interface HostTestResult {
+  ok: boolean;
+  message: string;
+}
+
+export const hostsList = () => invoke<HostView[]>("hosts_list");
+
+export const hostsAdd = (name: string, sshTarget: string) =>
+  invoke<HostView>("hosts_add", { name, sshTarget });
+
+export const hostsUpdate = (id: number, name: string, sshTarget: string) =>
+  invoke<HostView>("hosts_update", { id, name, sshTarget });
+
+export const hostsDelete = (id: number) =>
+  invoke<void>("hosts_delete", { id });
+
+export const hostsTestConnection = (id: number) =>
+  invoke<HostTestResult>("hosts_test_connection", { id });

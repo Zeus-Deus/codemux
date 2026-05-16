@@ -52,6 +52,7 @@ pub mod skills;
 pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
+pub mod hosts_sync;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -1440,6 +1441,11 @@ pub fn run() {
             commands::update_synced_settings,
             commands::update_setting,
             commands::reset_synced_settings,
+            commands::hosts_list,
+            commands::hosts_add,
+            commands::hosts_update,
+            commands::hosts_delete,
+            commands::hosts_test_connection,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,
