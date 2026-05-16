@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useMemo, useState, useRef, useCallback } from "react";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -12,6 +12,11 @@ import { useUIStore } from "@/stores/ui-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { reorderWorkspaces } from "@/tauri/commands";
+import {
+  applyDeviceFilter,
+  SidebarDeviceFilter,
+  type DeviceFilterValue,
+} from "./sidebar-device-filter";
 
 interface DragState {
   type: "workspace" | "project";
@@ -25,7 +30,18 @@ interface DropTarget {
 
 export function SidebarWorkspaceList() {
   const appState = useAppStore((s) => s.appState);
-  const allWorkspaces = appState?.workspaces ?? [];
+  const allWorkspacesRaw = appState?.workspaces ?? [];
+  // Device filter — "All / This device / per-host". Per-session
+  // local state; not persisted (matches superset). The filter is
+  // applied BEFORE the project grouping so empty project groups
+  // get hidden naturally when the user narrows to a host that
+  // doesn't contain any workspaces from a given project.
+  const [deviceFilter, setDeviceFilter] =
+    useState<DeviceFilterValue>("all");
+  const allWorkspaces = useMemo(
+    () => applyDeviceFilter(allWorkspacesRaw, deviceFilter),
+    [allWorkspacesRaw, deviceFilter],
+  );
   // Home-rooted workspaces flow through the same grouping pipeline as
   // any other project now; `groupWorkspacesByProject` labels them as
   // "Home" when their `project_root` matches the cached $HOME.
@@ -288,6 +304,15 @@ export function SidebarWorkspaceList() {
   return (
     <SidebarGroup className="p-0">
       <SidebarGroupContent>
+        {/* Device filter — appears only when remote hosts are
+            configured. Stays inline with the workspace list so it
+            takes zero extra vertical space when not in use. */}
+        <div className="px-2 pt-1.5">
+          <SidebarDeviceFilter
+            value={deviceFilter}
+            onChange={setDeviceFilter}
+          />
+        </div>
         <div
           ref={listRef}
           className="relative"

@@ -41,9 +41,7 @@ import {
   checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
-  hostsList,
   renameWorkspace,
-  setWorkspaceHost,
   setWorkspaceMuted,
   detectEditors,
   openInEditor,
@@ -52,6 +50,7 @@ import {
   workspacePushToHost,
   type HostView,
 } from "@/tauri/commands";
+import { useHosts } from "@/stores/hosts-store";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -228,17 +227,13 @@ export function WorkspaceContextMenuItems({
     workspace.project_root ?? (isWorktree ? null : workspace.cwd),
   );
 
-  // Hosts feed the "Move to host..." submenu. Local-only when empty.
-  const [hosts, setHosts] = useState<HostView[]>([]);
+  // Hosts feed the "Move to host..." submenu. Reads from the shared
+  // store cache so N workspace rows share ONE IPC round-trip instead
+  // of one each. See `src/stores/hosts-store.ts`.
+  const hosts = useHosts();
 
   useEffect(() => {
     detectEditors().then(setEditors).catch(console.error);
-    hostsList().then(setHosts).catch(() => {
-      // If the list fails, the submenu just shows "No hosts" and the
-      // user is nudged to add one in Settings → Hosts. We don't want
-      // a broken hosts table to break the rest of the menu.
-      setHosts([]);
-    });
   }, []);
 
   const isRemote =
@@ -247,36 +242,27 @@ export function WorkspaceContextMenuItems({
     (s) => s.setWorkspacePushPullInFlight,
   );
 
-  // Push the workspace to the chosen host. The push command on the
-  // backend handles the rsync + flips host_id. On success the user
-  // sees the spinner switch to the Cloud icon. On failure the
-  // workspace stays local with a toast explaining what happened.
+  // Push the workspace to the chosen host. The backend atomically
+  // sets host_id only on successful rsync, so we don't need the
+  // optimistic-set + rollback dance that used to flicker the icon.
+  // On failure the workspace stays local with a toast.
   const handleMoveToHost = async (host: HostView) => {
     setPushPullInFlight(workspace.workspace_id);
     try {
-      // Assign the host first so the push command's "workspace has
-      // host_id" check passes. If push fails we'll roll back.
-      await setWorkspaceHost(workspace.workspace_id, host.id);
-      const result = await workspacePushToHost(workspace.workspace_id);
+      const result = await workspacePushToHost(
+        workspace.workspace_id,
+        host.id,
+      );
       if (result.ok) {
         toast.success(`Pushed to ${host.name}`, {
           description: result.message,
         });
       } else {
-        // Roll back the host assignment so the user isn't left in a
-        // half-remote state.
-        await setWorkspaceHost(workspace.workspace_id, null).catch(
-          console.error,
-        );
         toast.error(`Push to ${host.name} failed`, {
           description: result.message,
         });
       }
     } catch (err) {
-      // Best-effort rollback on any throw too.
-      await setWorkspaceHost(workspace.workspace_id, null).catch(
-        console.error,
-      );
       const message = err instanceof Error ? err.message : String(err);
       toast.error("Push failed", { description: message });
     } finally {

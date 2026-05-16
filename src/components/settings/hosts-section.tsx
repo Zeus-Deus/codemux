@@ -24,6 +24,7 @@ import {
   type HostTestResult,
   type HostView,
 } from "@/tauri/commands";
+import { useHostsStore } from "@/stores/hosts-store";
 
 /**
  * Settings → Hosts (Step 2 of cloud-push).
@@ -112,6 +113,10 @@ export function HostsSection() {
       setSelectedId(created.id);
       setDraft(null);
       setError(null);
+      // Invalidate the shared store so other surfaces (DevicePicker,
+      // workspace context menu submenus) see the new host immediately
+      // without a per-component refetch.
+      void useHostsStore.getState().refresh();
     } catch (err) {
       setError(typeof err === "string" ? err : String(err));
     }
@@ -144,6 +149,7 @@ export function HostsSection() {
       );
       setEditingId(null);
       setError(null);
+      void useHostsStore.getState().refresh();
     } catch (err) {
       setError(typeof err === "string" ? err : String(err));
     }
@@ -169,6 +175,7 @@ export function HostsSection() {
       if (selectedId === host.id) {
         setSelectedId(null);
       }
+      void useHostsStore.getState().refresh();
     } catch (err) {
       setError(typeof err === "string" ? err : String(err));
     }
@@ -194,12 +201,23 @@ export function HostsSection() {
 
   const handleInstallRemote = useCallback(
     async (host: HostView, uname: string) => {
-      const consented = window.confirm(
-        `Install codemux-remote on ${host.name}?\n\n` +
-          `Codemux Remote is a small helper (~8 MB) that runs in your ` +
-          `user account on the host and lets your laptop run agents ` +
-          `there. No root access required. Source: github.com/Zeus-Deus/codemux`,
-      );
+      // The "always auto-install" preference (set via the checkbox
+      // below) skips the consent prompt for power users. Stored in
+      // localStorage so it persists per-device — installing the
+      // helper is a per-device decision (different machines may
+      // have different SSH key access).
+      const autoInstall =
+        localStorage.getItem("codemux.hosts.autoInstallRemote") === "1";
+      const consented =
+        autoInstall ||
+        window.confirm(
+          `Install codemux-remote on ${host.name}?\n\n` +
+            `Codemux Remote is a small helper (~8 MB) that runs in your ` +
+            `user account on the host and lets your laptop run agents ` +
+            `there. No root access required. Source: github.com/Zeus-Deus/codemux\n\n` +
+            `Tip: enable "Always install automatically" in Settings → Hosts ` +
+            `to skip this prompt on new hosts.`,
+        );
       if (!consented) return;
       setInstallingId(host.id);
       try {
@@ -359,6 +377,13 @@ export function HostsSection() {
               Add host
             </Button>
           )}
+
+          {/* "Always auto-install codemux-remote on new hosts" —
+              skips the consent modal on subsequent installs. Stored
+              in localStorage because it's a per-device decision
+              (different machines may have different SSH key
+              access). */}
+          <AutoInstallToggle />
         </div>
       </div>
 
@@ -519,4 +544,34 @@ export function HostsSection() {
 
 function byNameInsensitive(a: HostView, b: HostView): number {
   return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+}
+
+const AUTO_INSTALL_KEY = "codemux.hosts.autoInstallRemote";
+
+function AutoInstallToggle() {
+  const [enabled, setEnabled] = useState(false);
+  useEffect(() => {
+    setEnabled(localStorage.getItem(AUTO_INSTALL_KEY) === "1");
+  }, []);
+  return (
+    <label className="mt-3 flex items-start gap-2 text-[11px] text-muted-foreground cursor-pointer">
+      <input
+        type="checkbox"
+        className="mt-0.5 size-3 shrink-0"
+        checked={enabled}
+        onChange={(e) => {
+          const next = e.target.checked;
+          setEnabled(next);
+          if (next) {
+            localStorage.setItem(AUTO_INSTALL_KEY, "1");
+          } else {
+            localStorage.removeItem(AUTO_INSTALL_KEY);
+          }
+        }}
+      />
+      <span className="leading-tight">
+        Always install codemux-remote automatically when missing
+      </span>
+    </label>
+  );
 }

@@ -1602,10 +1602,11 @@ export interface WorkspacePullOutcome {
   rsync_summary: string | null;
 }
 
-/** Push a workspace to its assigned host. Requires the workspace's
- *  host_id to be set (via DevicePicker or setWorkspaceHost). */
-export const workspacePushToHost = (workspaceId: string) =>
-  invoke<WorkspacePushOutcome>("workspace_push_to_host", { workspaceId });
+/** Push a workspace to a host. The backend atomically sets the
+ *  workspace's host_id only on successful rsync — no need for the
+ *  frontend to do an optimistic-set + rollback dance. */
+export const workspacePushToHost = (workspaceId: string, hostId: number) =>
+  invoke<WorkspacePushOutcome>("workspace_push_to_host", { workspaceId, hostId });
 
 /** Pull a remote workspace back to local. Clears host_id on success. */
 export const workspacePullBack = (workspaceId: string) =>

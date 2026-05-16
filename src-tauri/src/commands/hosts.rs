@@ -294,14 +294,21 @@ pub struct HostBootstrapResult {
     pub message: String,
 }
 
-/// Push a workspace to a remote host. Two-step under the hood:
+/// Push a workspace to a remote host.
+///
+/// Atomic contract: `host_id` is set on the workspace ONLY when the
+/// rsync succeeds. The frontend can therefore call this as a single
+/// command without doing an optimistic-set-then-rollback dance,
+/// which used to cause a brief icon flicker on failure.
+///
+/// Three-step under the hood:
 ///   1. rsync the worktree to the conventional remote path
 ///      (`~/.codemux/worktrees/<sanitized-project>/<sanitized-branch>`)
 ///      so agents inside see the same filesystem layout they would
 ///      locally.
-///   2. Stamp `workspace.host_id = host_id` so the UI shows the
-///      remote badge + future spawns route through the remote
-///      tunnel.
+///   2. On success, stamp `workspace.host_id = host_id`.
+///   3. On failure, host_id stays at its previous value (typically
+///      None) and the outcome carries the captured rsync stderr.
 ///
 /// Running PTY sessions are NOT migrated across the network — they
 /// terminate cleanly, the user reopens panes on the remote, and
@@ -313,11 +320,11 @@ pub async fn workspace_push_to_host(
     app: tauri::AppHandle,
     db: tauri::State<'_, DatabaseStore>,
     workspace_id: String,
+    // The host to push to. The frontend passes host_id directly
+    // (instead of pre-setting it on the workspace) so a failed push
+    // doesn't leave the workspace in a half-remote state.
+    host_id: i64,
 ) -> Result<crate::commands::hosts::WorkspacePushOutcome, String> {
-    // Resolve the host_id the user has already chosen on the
-    // workspace. Pushing requires an explicit host assignment —
-    // there's no implicit "default host" we'd pick on the user's
-    // behalf.
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     let snapshot = app_state.snapshot();
     let ws = snapshot
@@ -325,9 +332,6 @@ pub async fn workspace_push_to_host(
         .iter()
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    let host_id = ws
-        .host_id
-        .ok_or_else(|| "Workspace has no host assigned. Pick a host first.".to_string())?;
     let host = db
         .list_hosts()
         .into_iter()
@@ -367,6 +371,34 @@ pub async fn workspace_push_to_host(
         let result = crate::ssh::push_workspace(opts).await;
         let outcome = match result {
             crate::ssh::PushResult::Pushed { rsync_summary, .. } => {
+                // Atomicity guarantee — see fn doc. Stamp host_id
+                // ONLY after rsync confirms success.
+                if let Err(error) =
+                    app_state.set_workspace_host_id(&workspace_id, Some(host_id))
+                {
+                    eprintln!(
+                        "[hosts] push succeeded but host_id assignment failed: {error}"
+                    );
+                }
+                // Spawn (or replace) the TunnelSupervisor that keeps
+                // the remote daemon reachable. The supervisor handles
+                // SSH flaps with its built-in exponential backoff +
+                // circuit breaker. Registered by workspace id so
+                // subsequent push/pull/close can find and shut it
+                // down.
+                let local_socket =
+                    crate::ssh::local_socket_for_workspace(&workspace_id);
+                let remote_socket = format!(
+                    "/tmp/codemux-ptyd-{}.sock",
+                    workspace_id.replace(['/', ' '], "-")
+                );
+                let supervisor = crate::ssh::TunnelSupervisor::spawn(
+                    host.ssh_target.clone(),
+                    remote_socket,
+                    local_socket,
+                    "codemux-remote".to_string(),
+                );
+                crate::ssh::install_supervisor(&workspace_id, supervisor).await;
                 WorkspacePushOutcome {
                     ok: true,
                     message: format!("Workspace pushed to {}", host.name),
@@ -468,6 +500,11 @@ pub async fn workspace_pull_back(
                 // again and the next pane spawn uses the local
                 // pty-daemon.
                 app_state.set_workspace_host_id(&workspace_id, None)?;
+                // Shut down the workspace's tunnel supervisor —
+                // there's nothing to maintain a tunnel to anymore.
+                // Idempotent for workspaces that were pulled without
+                // a tunnel ever being installed.
+                crate::ssh::shutdown_supervisor(&workspace_id).await;
                 WorkspacePullOutcome {
                     ok: true,
                     message: format!("Workspace pulled back from {}", host.name),

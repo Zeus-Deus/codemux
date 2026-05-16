@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import { Check, ChevronsUpDown, Monitor, Server } from "lucide-react";
 
@@ -13,7 +13,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import { hostsList, type HostView } from "@/tauri/commands";
+import { useHosts } from "@/stores/hosts-store";
 
 /**
  * Compact "where will this run" picker. Mirrors the shape of
@@ -75,27 +75,11 @@ export function DevicePicker({
   localLabel = "Local Device",
   iconOnly = false,
 }: DevicePickerProps) {
-  const [hosts, setHosts] = useState<HostView[]>([]);
-
-  // Reload on mount + whenever a settings-Sync event fires. Cheap
-  // enough that we don't bother coalescing.
-  useEffect(() => {
-    let alive = true;
-    void hostsList()
-      .then((list) => {
-        if (alive) setHosts(list);
-      })
-      .catch(() => {
-        // If listing fails (DB not initialized, etc.) just fall back
-        // to a local-only picker. The component must never throw — a
-        // crash here would break the surrounding new-workspace
-        // dialog.
-        if (alive) setHosts([]);
-      });
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // Single shared cache across every DevicePicker + workspace
+  // context menu instance. First read kicks off the lazy load;
+  // subsequent reads (anywhere in the tree) hand back the cached
+  // list. See `src/stores/hosts-store.ts`.
+  const hosts = useHosts();
 
   const selectedHost = useMemo(
     () => hosts.find((h) => h.id === hostId) ?? null,

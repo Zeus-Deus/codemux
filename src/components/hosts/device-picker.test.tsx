@@ -9,8 +9,17 @@ vi.mock("@/tauri/commands", () => ({
 
 import { hostsList, type HostView } from "@/tauri/commands";
 import { DevicePicker } from "./device-picker";
+import { __resetHostsStoreForTests } from "@/stores/hosts-store";
 
 afterEach(() => cleanup());
+
+// The hosts store is module-level (singleton) so previous tests'
+// mock returns linger across cases. Reset before each so every
+// test starts from "unloaded, empty list" — same precondition the
+// production app sees on first launch.
+beforeEach(() => {
+  __resetHostsStoreForTests();
+});
 
 function host(over: Partial<HostView>): HostView {
   return {

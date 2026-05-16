@@ -1,4 +1,4 @@
-import { ArrowUp, Plus, Square } from "lucide-react";
+import { ArrowUp, Monitor, Plus, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -158,6 +158,12 @@ export function ComposerFooter({
           onChange={onPermissionModeChange}
           disabled={controlsDisabled || modeIsActive}
         />
+        {/* Chat-on-remote is honest about its current capability:
+            the picker is here so the visual layout matches the
+            new-workspace dialog (Device pill alongside the other
+            session controls), but it's pinned to Local Device until
+            agent-chat-on-remote ships. Tooltip explains why. */}
+        <ChatDeviceLocalOnlyIndicator />
       </div>
       <div className="ml-auto">
         {streaming && showStopButton ? (
@@ -191,5 +197,42 @@ export function ComposerFooter({
         )}
       </div>
     </div>
+  );
+}
+
+/**
+ * Pinned "Local Device" indicator for the chat composer.
+ *
+ * Mirrors the visual shape of the new-workspace dialog's
+ * `<DevicePicker>` pill (Monitor icon + label) so the chat surface
+ * looks consistent with the workspace creation surface. The picker
+ * is intentionally NOT interactive yet — chat-on-remote has open
+ * design questions (session migration semantics, where the chat
+ * sidecar runs, token streaming latency over SSH) that we haven't
+ * answered. Shipping a working picker without answering them would
+ * confuse the first user who picked a remote host and watched their
+ * chat session NOT move.
+ *
+ * Tooltip explains the current state. When agent-chat-on-remote
+ * ships, replace this with the real `<DevicePicker>` from
+ * `@/components/hosts/device-picker`.
+ */
+function ChatDeviceLocalOnlyIndicator() {
+  return (
+    <span
+      className={cn(
+        "inline-flex h-7 items-center gap-1.5 rounded-md border border-border",
+        "bg-background px-2 text-xs text-foreground/60",
+        "cursor-help select-none",
+      )}
+      title={
+        "Agent Chat sessions currently run locally regardless of " +
+        "workspace host. Remote agent chat is on the roadmap."
+      }
+      aria-label="Chat runs locally"
+    >
+      <Monitor className="size-3.5 shrink-0" />
+      <span>Local</span>
+    </span>
   );
 }

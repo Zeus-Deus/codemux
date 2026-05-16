@@ -32,6 +32,7 @@
 pub mod bootstrap;
 pub mod probe;
 pub mod push;
+pub mod registry;
 pub mod tunnel;
 pub mod tunnel_supervisor;
 
@@ -40,6 +41,10 @@ pub use probe::{probe_host, ProbeOutcome};
 pub use push::{
     conventional_remote_path, pull_workspace_back, push_workspace, PullOptions,
     PullResult, PushOptions, PushResult,
+};
+pub use registry::{
+    get_supervisor, install_supervisor, local_socket_for_workspace,
+    shutdown_supervisor,
 };
 pub use tunnel::{spawn_ssh_tunnel, TunnelHandle};
 pub use tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
