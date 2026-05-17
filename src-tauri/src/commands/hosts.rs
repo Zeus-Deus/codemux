@@ -360,6 +360,34 @@ pub async fn workspace_push_to_host(
 
     #[cfg(unix)]
     {
+        // Auto-update the remote codemux-remote binary if our version
+        // doesn't match what's installed on the host. Skipping this is
+        // what made the cwd bug so painful: my fix lived in the local
+        // binary but pandora was still running the May-16 build, and
+        // every "the bug isn't fixed" loop was actually "the binary
+        // we sent commands to didn't have the fix yet."
+        //
+        // Cheap when versions match (one SSH probe, ~1s). When they
+        // differ we re-bootstrap (~10s) — but that only happens once
+        // per Codemux version bump, and the next call is back to fast.
+        //
+        // For dev users editing daemon code without bumping the version
+        // string, the version check passes and the stale-binary problem
+        // returns. Workaround: manually re-scp, or rebuild + clear
+        // ~/.local/bin/codemux-remote on the remote so the version
+        // probe sees MISSING and triggers a bootstrap.
+        if let Err(error) = ensure_remote_binary_current(&host).await {
+            // Don't block the push on this — if the auto-update fails,
+            // the push may still work with the older binary. Log loudly
+            // so we know to look here next time something cwd-shaped
+            // misbehaves.
+            eprintln!(
+                "[hosts] auto-update of codemux-remote on {} failed (continuing \
+                 with existing binary): {error}",
+                host.name
+            );
+        }
+
         let remote_path =
             crate::ssh::conventional_remote_path(&project_name, &branch);
         let remote_path_str = remote_path.to_string_lossy().to_string();
@@ -685,6 +713,102 @@ fn schedule_background_sync(app: tauri::AppHandle) {
             eprintln!("[codemux::hosts] background sync failed: {error}");
         }
     });
+}
+
+/// Probe the remote `codemux-remote` binary's version. If it
+/// doesn't match what we'd ship from this Codemux build, re-bootstrap
+/// (scp the current binary + chmod + verify) so the daemon spawn the
+/// supervisor's about to make uses the up-to-date binary. Also kills
+/// any running daemon on the remote so the next SSH `exec` can bind
+/// the same socket without an "address in use" conflict.
+///
+/// Returns Ok on either "already current, nothing to do" or "updated
+/// successfully." Returns Err only when the bootstrap attempt itself
+/// failed (network down, no bundled binary for the target uname, etc.).
+/// Caller decides whether to propagate or warn-and-continue.
+#[cfg(unix)]
+async fn ensure_remote_binary_current(host: &crate::database::HostRecord) -> Result<(), String> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    // Step 1: probe the installed binary's version.
+    let probe = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(&host.ssh_target)
+        .arg("$HOME/.local/bin/codemux-remote --version 2>/dev/null || echo MISSING")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("version probe: spawn ssh: {e}"))?;
+    let stdout = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    // `codemux-remote --version` prints `codemux-remote X.Y.Z` to stdout.
+    let remote_version = stdout
+        .strip_prefix("codemux-remote ")
+        .map(|s| s.trim().to_string());
+    let our_version = env!("CARGO_PKG_VERSION");
+    if remote_version.as_deref() == Some(our_version) {
+        eprintln!(
+            "[hosts] {} already has codemux-remote {our_version} — skipping bootstrap",
+            host.name
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "[hosts] {} needs bootstrap: remote_version={:?} our_version={our_version}",
+        host.name, remote_version
+    );
+
+    // Step 2: figure out the remote uname so we can pick the right
+    // bundled binary.
+    let uname_output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(&host.ssh_target)
+        .arg("uname -s -m")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("uname probe: spawn ssh: {e}"))?;
+    let uname = String::from_utf8_lossy(&uname_output.stdout).trim().to_string();
+    if uname.is_empty() {
+        return Err("uname probe returned empty string".into());
+    }
+
+    // Step 3: kill any running daemon. Otherwise the freshly-bootstrapped
+    // binary won't actually be used until the next SSH-spawn cycle, and
+    // a stale daemon still bound to the workspace's Unix socket would
+    // make that next spawn fail with "address in use."
+    let _ = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(&host.ssh_target)
+        .arg("pkill -f 'codemux-remote pty-daemon' 2>/dev/null || true")
+        .status()
+        .await;
+
+    // Step 4: bootstrap (scp + chmod + verify).
+    use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
+    match bootstrap_remote(BootstrapOptions::new(&host.ssh_target, &uname)).await {
+        BootstrapResult::Installed { reported_version } => {
+            eprintln!(
+                "[hosts] bootstrapped {} → codemux-remote {reported_version}",
+                host.name
+            );
+            Ok(())
+        }
+        BootstrapResult::BinaryNotBundled { wanted_target } => Err(format!(
+            "this Codemux build doesn't include a codemux-remote for {wanted_target}"
+        )),
+        BootstrapResult::UploadFailed { reason } => Err(format!("upload: {reason}")),
+        BootstrapResult::PostInstallProbeFailed { reason } => {
+            Err(format!("verify: {reason}"))
+        }
+    }
 }
 
 /// Terminate every PTY session belonging to the given workspace.
