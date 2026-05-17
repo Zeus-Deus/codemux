@@ -209,6 +209,13 @@ pub struct SessionRuntime {
     /// remote host's daemon. Pre-fix, every resize/close on a remote
     /// session hit `unknown session` because the command went to the
     /// wrong daemon.
+    ///
+    /// `#[cfg(unix)]` because the `pty_daemon` module is Unix-only
+    /// (the daemon talks Unix sockets, the cloud-push feature is
+    /// Unix-only). Keeping the field absent on Windows avoids a
+    /// stub type and matches how the rest of the daemon plumbing
+    /// gates itself.
+    #[cfg(unix)]
     pub daemon_client: Option<Arc<crate::pty_daemon::PtyDaemonClient>>,
 }
 
@@ -233,6 +240,7 @@ impl SessionRuntime {
             resume_command: None,
             is_spawning: false,
             persistent: false,
+            #[cfg(unix)]
             daemon_client: None,
         }
     }
@@ -445,6 +453,7 @@ fn with_existing_session_runtime<T>(
 /// - `false` if the runtime is missing, its `daemon_client` is None,
 ///   or it points to a different Arc (the caller is a stale read
 ///   task from a previous spawn).
+#[cfg(unix)]
 pub(crate) fn is_runtime_owned_by_client(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
@@ -459,6 +468,7 @@ pub(crate) fn is_runtime_owned_by_client(
     .unwrap_or(false)
 }
 
+#[cfg(unix)]
 pub(crate) fn emit_exited_if_client_owner(
     app: &AppHandle,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
@@ -1764,48 +1774,60 @@ pub(crate) fn terminate_pty_session(
     // detached tokio task so the close path stays sync.
     let was_persistent = runtime.persistent;
     let pid = runtime.child_pid.take();
-    // Capture the daemon client BEFORE dropping runtime — for remote
-    // sessions this is the per-workspace SSH-tunneled client; for local
-    // sessions it's the singleton local-daemon client.
-    let daemon_client = runtime.daemon_client.take();
-    if was_persistent {
-        runtime.output_channel = None;
-        runtime.pending_output.clear();
-        runtime.pending_output_bytes = 0;
-        // Drop runtime first so any held Arcs (writer, etc.) release before
-        // we await the daemon round-trip.
-        drop(runtime);
-        let session_id = session_id.to_string();
-        tauri::async_runtime::spawn(async move {
-            // Use the session's captured client. Fall back to the local
-            // daemon only if the runtime never recorded one (restored
-            // session before reattach completes) — this fallback is
-            // harmless because the local daemon will just no-op on an
-            // unknown session id rather than affecting the wrong process.
-            let client_res = if let Some(c) = daemon_client {
-                Ok(c)
-            } else {
-                crate::pty_daemon::ensure_daemon().await
-            };
-            match client_res {
-                Ok(client) => {
-                    if let Err(error) = client.close(session_id.clone()).await {
+    // Persistent (daemon-backed) sessions are Unix-only — the
+    // pty_daemon module is `#[cfg(unix)]`. On Windows `was_persistent`
+    // is always false (the daemon path never runs to set the flag),
+    // so this branch is effectively dead on Windows; we cfg-gate it
+    // so the compiler doesn't try to resolve `pty_daemon` or the
+    // (also cfg-gated) `daemon_client` field there.
+    #[cfg(unix)]
+    {
+        // Capture the daemon client BEFORE dropping runtime — for
+        // remote sessions this is the per-workspace SSH-tunneled
+        // client; for local sessions it's the singleton local-daemon
+        // client.
+        let daemon_client = runtime.daemon_client.take();
+        if was_persistent {
+            runtime.output_channel = None;
+            runtime.pending_output.clear();
+            runtime.pending_output_bytes = 0;
+            // Drop runtime first so any held Arcs (writer, etc.) release before
+            // we await the daemon round-trip.
+            drop(runtime);
+            let session_id = session_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                // Use the session's captured client. Fall back to the local
+                // daemon only if the runtime never recorded one (restored
+                // session before reattach completes) — this fallback is
+                // harmless because the local daemon will just no-op on an
+                // unknown session id rather than affecting the wrong process.
+                let client_res = if let Some(c) = daemon_client {
+                    Ok(c)
+                } else {
+                    crate::pty_daemon::ensure_daemon().await
+                };
+                match client_res {
+                    Ok(client) => {
+                        if let Err(error) = client.close(session_id.clone()).await {
+                            eprintln!(
+                                "[codemux::terminal] daemon close failed for persistent session \
+                                 {session_id}: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
                         eprintln!(
-                            "[codemux::terminal] daemon close failed for persistent session \
+                            "[codemux::terminal] cannot reach daemon to close persistent session \
                              {session_id}: {error}"
                         );
                     }
                 }
-                Err(error) => {
-                    eprintln!(
-                        "[codemux::terminal] cannot reach daemon to close persistent session \
-                         {session_id}: {error}"
-                    );
-                }
-            }
-        });
-        return;
+            });
+            return;
+        }
     }
+    #[cfg(not(unix))]
+    let _ = was_persistent;
 
     // Clear child_pid to None *first* so the `Drop for SessionRuntime`
     // safety-net impl stays silent on the happy path. Any non-None value
@@ -3041,6 +3063,14 @@ mod tests {
     // debugging session that landed in commit 6bb557e. If anyone
     // simplifies the affected logic later, these tests will catch
     // re-regressions before the user does.
+    //
+    // Unix-only — the helpers being tested (is_runtime_owned_by_client,
+    // terminate_pty_session_keep_channel) and the PtyDaemonClient
+    // they exercise are `#[cfg(unix)]` because the daemon model is
+    // Unix-only. On Windows there's nothing to test here.
+    #[cfg(unix)]
+    mod cross_machine_push {
+        use super::*;
 
     /// `is_runtime_owned_by_client` returns true when the runtime's
     /// `daemon_client` is the SAME Arc allocation as the caller's
@@ -3183,6 +3213,7 @@ mod tests {
              its own Starting → Ready)"
         );
     }
+    } // mod cross_machine_push
 
     // ── Shell + PATH tests ───────────────────────────────────────────
     //
