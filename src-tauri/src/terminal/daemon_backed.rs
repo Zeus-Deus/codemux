@@ -270,6 +270,7 @@ pub async fn spawn_pty_for_agent_via_daemon(
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
     let read_app = app.clone();
+    let read_client = client.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(chunk) = rx.recv().await {
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
@@ -277,22 +278,16 @@ pub async fn spawn_pty_for_agent_via_daemon(
         eprintln!(
             "[codemux::terminal::daemon_backed] read loop ended for session {read_session_id}"
         );
-        // Parity with the in-process path's waiter thread: when the
-        // daemon-side session ends (natural exit, push-triggered
-        // terminate, or daemon connection lost), tell the frontend via
-        // the lifecycle event. Without this the frontend keeps thinking
-        // the session is live and the next write/resize fails with a
-        // confusing "not currently writable" — instead of a clean
-        // "session ended" the UI can react to.
-        emit_terminal_status(
+        // Only emit Exited if WE'RE still the runtime's daemon client.
+        // Otherwise this is a stale read task whose session was already
+        // replaced by a fresh spawn — emitting now would clobber the
+        // new spawn's Ready and leave a phantom "ended" overlay.
+        super::emit_exited_if_client_owner(
             &read_app,
             &read_sessions,
-            TerminalStatusPayload {
-                session_id: read_session_id.clone(),
-                state: TerminalLifecycleState::Exited,
-                message: Some("Agent ended".into()),
-                exit_code: None,
-            },
+            &read_session_id,
+            &read_client,
+            "Agent ended",
         );
     });
 
@@ -320,11 +315,19 @@ pub async fn spawn_pty_for_session_via_daemon(
     app: AppHandle,
     session_id: String,
 ) -> Result<(), String> {
+    let entry_ts = std::time::Instant::now();
+    eprintln!(
+        "[trace:{session_id}] spawn_via_daemon ENTRY t=0ms"
+    );
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
 
     if !super::try_reserve_session_spawn(&sessions, &session_id) {
+        eprintln!(
+            "[trace:{session_id}] try_reserve FAILED at t={}ms",
+            entry_ts.elapsed().as_millis()
+        );
         return Err("session already reserved by another spawn".into());
     }
 
@@ -421,9 +424,18 @@ pub async fn spawn_pty_for_session_via_daemon(
         let branch = owning_ws
             .and_then(|w| w.git_branch.clone())
             .unwrap_or_else(|| "main".to_string());
-        crate::ssh::conventional_remote_path(&project_name, &branch)
+        let computed = crate::ssh::conventional_remote_path(&project_name, &branch)
             .to_string_lossy()
-            .to_string()
+            .to_string();
+        eprintln!(
+            "[codemux::terminal::daemon_backed] remote cwd for {session_id}: \
+             {computed} (owning_ws={}, project_root={:?}, git_branch={:?}, \
+             project_name={project_name:?}, branch={branch:?})",
+            owning_ws.is_some(),
+            owning_ws.and_then(|w| w.project_root.clone()),
+            owning_ws.and_then(|w| w.git_branch.clone()),
+        );
+        computed
     } else {
         session_working_dir(&app_state, &session_id)
     };
@@ -594,20 +606,37 @@ pub async fn spawn_pty_for_session_via_daemon(
     );
 
     // Idempotent reattach for shells (same logic as agents).
-    let existing = client
-        .list()
-        .await
+    let list_result = client.list().await;
+    let list_snapshot = list_result.as_ref().ok().map(|v| {
+        v.iter()
+            .map(|s| format!("{}@pid{}", s.session_id, s.pid))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    eprintln!(
+        "[trace:{session_id}] daemon.list() at t={}ms returned: [{}]",
+        entry_ts.elapsed().as_millis(),
+        list_snapshot.unwrap_or_else(|| "ERR".to_string())
+    );
+    let existing = list_result
         .ok()
         .and_then(|list| list.into_iter().find(|s| s.session_id == session_id));
 
+    let reattached;
     let pid = if let Some(existing) = existing {
+        reattached = true;
         eprintln!(
-            "[codemux::terminal::daemon_backed] reattaching to live shell session \
-             {session_id} pid={}",
-            existing.pid
+            "[trace:{session_id}] DECISION=reattach pid={} at t={}ms",
+            existing.pid,
+            entry_ts.elapsed().as_millis()
         );
         existing.pid
     } else {
+        reattached = false;
+        eprintln!(
+            "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
+            entry_ts.elapsed().as_millis()
+        );
         match client
             .spawn(
                 session_id.clone(),
@@ -648,7 +677,20 @@ pub async fn spawn_pty_for_session_via_daemon(
     };
 
     let writer = DaemonWriter::new(client.clone(), session_id.clone());
-    let auto_resume_clone = auto_resume_command.clone();
+    // If we reattached to an existing daemon session, the agent (or
+    // bash) is ALREADY running there. We must NOT auto-write the
+    // preset/resume command — that would type the command as a chat
+    // message into the running agent (the "claude" appearing as a
+    // message bug). Only write on fresh_spawn where the new bash
+    // genuinely needs the agent launched.
+    let auto_resume_clone = if reattached {
+        eprintln!(
+            "[trace:{session_id}] reattached — suppressing auto-write of resume command"
+        );
+        None
+    } else {
+        auto_resume_command.clone()
+    };
     let client_for_runtime = client.clone();
     with_session_runtime(
         &sessions,
@@ -660,8 +702,11 @@ pub async fn spawn_pty_for_session_via_daemon(
             runtime.child_pid = Some(pid);
             runtime.persistent = true;
             runtime.is_spawning = false;
-            runtime.skip_preset_launch = auto_resume_clone.is_some();
-            runtime.resume_command = auto_resume_clone;
+            // On reattach, skip_preset_launch must ALSO be true so the
+            // preset launcher (separate from auto-write) doesn't fire
+            // a preset write into the live agent.
+            runtime.skip_preset_launch = reattached || auto_resume_clone.is_some();
+            runtime.resume_command = auto_resume_clone.clone();
             // Same as the agent path — capture the client so resize/close
             // route to the daemon that actually owns this session id.
             runtime.daemon_client = Some(client_for_runtime);
@@ -672,7 +717,10 @@ pub async fn spawn_pty_for_session_via_daemon(
     // in-process spawn uses. Because our `DaemonWriter` is already in
     // `runtime.writer`, this lands at the daemon, which writes to the
     // master fd; the shell sees it as if the user typed it.
-    if let Some(command) = auto_resume_command {
+    //
+    // Already gated to None on reattach above, so this no-ops in the
+    // reattach path even though we still iterate the if-let.
+    if let Some(command) = auto_resume_clone {
         let sessions_for_command = sessions.clone();
         let session_id_for_command = session_id.clone();
         crate::commands::presets::write_command_when_ready(
@@ -720,6 +768,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     let read_session_id = session_id.clone();
     let scanner_session_id = session_id.clone();
     let read_app = app.clone();
+    let read_client = client.clone();
     tauri::async_runtime::spawn(async move {
         let mut line_buf: Vec<u8> = Vec::new();
         while let Some(chunk) = rx.recv().await {
@@ -743,18 +792,14 @@ pub async fn spawn_pty_for_session_via_daemon(
         eprintln!(
             "[codemux::terminal::daemon_backed] shell read loop ended for {read_session_id}"
         );
-        // See agent path: emit Exited so the frontend reacts cleanly
-        // instead of falling into the "not currently writable" pit on
-        // the next keystroke.
-        emit_terminal_status(
+        // Skip emit if this is a stale read task whose session was
+        // already replaced by a fresh spawn. See `emit_exited_if_client_owner`.
+        super::emit_exited_if_client_owner(
             &read_app,
             &read_sessions,
-            TerminalStatusPayload {
-                session_id: read_session_id.clone(),
-                state: TerminalLifecycleState::Exited,
-                message: Some("Shell ended".into()),
-                exit_code: None,
-            },
+            &read_session_id,
+            &read_client,
+            "Shell ended",
         );
     });
 

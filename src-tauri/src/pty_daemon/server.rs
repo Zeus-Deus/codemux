@@ -549,6 +549,13 @@ async fn spawn_pty(
     // single byte of prompt rendered. Expand here on the daemon side
     // where we know the local HOME.
     let resolved_cwd = expand_tilde(&cwd);
+    let cwd_exists = std::path::Path::new(&resolved_cwd).exists();
+    eprintln!(
+        "[daemon::spawn] session={session_id} input_cwd={cwd:?} \
+         resolved_cwd={resolved_cwd:?} exists={cwd_exists} \
+         HOME={:?}",
+        std::env::var("HOME").ok()
+    );
     cmd.cwd(&resolved_cwd);
     for (k, v) in &env {
         cmd.env(k, v);

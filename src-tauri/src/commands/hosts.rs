@@ -410,6 +410,69 @@ pub async fn workspace_push_to_host(
                     "$HOME/.local/bin/codemux-remote".to_string(),
                 );
                 crate::ssh::install_supervisor(&workspace_id, supervisor).await;
+
+                // Close any pre-existing sessions on this workspace's
+                // remote daemon BEFORE respawning. The daemon process
+                // outlives the Codemux app — a session_id from a
+                // previous (possibly buggy) push run is still alive on
+                // the daemon, and the spawn path's reattach logic will
+                // happily attach to it, inheriting its old cwd. For
+                // example: an earlier push that left a bash in
+                // `/home/deus` because of a cwd bug stays in
+                // `/home/deus` forever, and every subsequent push that
+                // hits the same session id ends up there too.
+                //
+                // Each workspace gets its own per-workspace tunnel +
+                // its own codemux-remote pty-daemon process (different
+                // socket per workspace), so closing every session on
+                // this daemon only affects this workspace.
+                //
+                // Filter defensively by workspace_id anyway in case
+                // that invariant ever changes.
+                match crate::ssh::client_for_workspace(
+                    &app,
+                    &workspace_id,
+                    Some(host_id),
+                )
+                .await
+                {
+                    Ok(remote_client) => match remote_client.list().await {
+                        Ok(remote_sessions) => {
+                            let mut closed = 0usize;
+                            for s in remote_sessions {
+                                if !s.workspace_id.is_empty()
+                                    && s.workspace_id != workspace_id
+                                {
+                                    continue;
+                                }
+                                if let Err(e) =
+                                    remote_client.close(s.session_id.clone()).await
+                                {
+                                    eprintln!(
+                                        "[hosts] failed to close stale remote session \
+                                         {} on push: {e}",
+                                        s.session_id
+                                    );
+                                } else {
+                                    closed += 1;
+                                }
+                            }
+                            eprintln!(
+                                "[hosts] closed {closed} stale remote session(s) for \
+                                 workspace {workspace_id} before respawn"
+                            );
+                        }
+                        Err(e) => eprintln!(
+                            "[hosts] failed to list remote sessions before respawn: {e}"
+                        ),
+                    },
+                    Err(e) => eprintln!(
+                        "[hosts] failed to reach remote daemon for pre-respawn \
+                         cleanup: {e} (continuing — fresh sessions will be created \
+                         but stale ones may persist on the daemon)"
+                    ),
+                }
+
                 // Stop-sync-restart for live PTYs: terminate the
                 // workspace's existing local sessions, then
                 // explicitly re-spawn each pane's session so the
@@ -426,13 +489,6 @@ pub async fn workspace_push_to_host(
                 // and now routes through `client_for_workspace`
                 // which sees host_id is set → remote daemon →
                 // fresh shells appear on the host machine.
-                //
-                // Caveat: agent sessions (Claude, opencode, etc.)
-                // come back as plain shells in this respawn — we
-                // don't yet recover the original adapter spec from
-                // the session metadata. The user can re-launch
-                // their agent manually from the shell. Faithful
-                // agent respawn is a follow-up.
                 terminate_workspace_sessions(&app, &workspace_id);
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),

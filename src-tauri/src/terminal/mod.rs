@@ -419,6 +419,53 @@ fn with_existing_session_runtime<T>(
     guard.get_mut(session_id).map(f)
 }
 
+/// Emit `Exited` for `session_id` ONLY if the runtime's `daemon_client`
+/// still points at `client` (Arc::ptr_eq). Otherwise we're a stale
+/// read task whose session was already replaced by a fresh spawn —
+/// emitting Exited here would overwrite the new spawn's Ready and
+/// leave the user with a permanent "Shell ended" overlay on a session
+/// that's actually alive.
+///
+/// Called from the daemon-backed read tasks (agent + shell) when
+/// their mpsc returns None. The race is real and easy to trigger:
+/// push → `terminate_pty_session_keep_channel` tells the daemon to
+/// close the old session (background task), spawn_missing_ptys
+/// respawns and emits Ready, then the old session's close finally
+/// flushes its rx → read task ends → without this check, we'd emit
+/// a stale Exited and clobber Ready.
+pub(crate) fn emit_exited_if_client_owner(
+    app: &AppHandle,
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    client: &Arc<crate::pty_daemon::PtyDaemonClient>,
+    message: &str,
+) {
+    let still_ours = with_existing_session_runtime(sessions, session_id, |rt| {
+        rt.daemon_client
+            .as_ref()
+            .map(|c| Arc::ptr_eq(c, client))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false);
+    if !still_ours {
+        eprintln!(
+            "[codemux::terminal] skip Exited for {session_id}: stale read task \
+             (runtime daemon_client is None or differs — session was respawned)"
+        );
+        return;
+    }
+    emit_terminal_status(
+        app,
+        sessions,
+        TerminalStatusPayload {
+            session_id: session_id.to_string(),
+            state: TerminalLifecycleState::Exited,
+            message: Some(message.to_string()),
+            exit_code: None,
+        },
+    );
+}
+
 fn emit_terminal_status(
     app: &AppHandle,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
@@ -1062,6 +1109,22 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
                         // back / retry. Local workspaces (host_id
                         // == None) still get the in-process
                         // fallback because for them it's correct.
+                        // "Already reserved" is benign — another spawn
+                        // task for the same session id is already in
+                        // flight (sibling pane spawn race, workspace
+                        // re-activation, etc.). Silently no-op instead
+                        // of clobbering the in-flight spawn with a
+                        // Failed status that the user sees as a
+                        // "Reconnecting" / "Couldn't reach the host"
+                        // popup over a session that's actually fine.
+                        if error.contains("already reserved") {
+                            eprintln!(
+                                "[codemux::terminal] suppressing benign 'already reserved' \
+                                 spawn-retry for session {session_id_clone} \
+                                 (sibling spawn in flight; no UI change)"
+                            );
+                            return;
+                        }
                         let app_for_check = app_clone.clone();
                         let is_remote_workspace = is_remote_workspace_for_session(
                             &app_for_check,
