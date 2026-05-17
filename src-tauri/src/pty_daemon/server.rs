@@ -703,11 +703,19 @@ async fn spawn_pty(
 /// daemon DOES know its own `$HOME`. Resolving here means the laptop
 /// stays portable and we avoid a round trip to ask "what's your HOME".
 fn expand_tilde(path: &str) -> String {
+    expand_tilde_with(path, std::env::var("HOME").ok().as_deref())
+}
+
+/// Pure-function core of `expand_tilde`, parameterized on `home` so
+/// unit tests don't have to mutate the process-wide `HOME` env var
+/// (which pollutes other tests that read $HOME — e.g. process_kill
+/// tests that compute paths from $HOME).
+fn expand_tilde_with(path: &str, home: Option<&str>) -> String {
     if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+        return home.map(|h| h.to_string()).unwrap_or_else(|| path.to_string());
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home {
             return format!("{home}/{rest}");
         }
     }
@@ -740,42 +748,64 @@ fn kill_session_pid(_pid: u32) {
 mod tests {
     use super::*;
 
+    // These tests exercise `expand_tilde_with`, the pure-function
+    // core that takes `home` as an argument — NOT `expand_tilde`,
+    // which reads $HOME globally. We deliberately don't touch
+    // `std::env::set_var("HOME", ...)` because that mutation is
+    // process-wide and pollutes any other test in the binary that
+    // reads $HOME (e.g. terminal::tests::process_kill — confirmed
+    // experimentally that env::set_var here caused 10 process_kill
+    // failures in the full-suite ordering).
+
     #[test]
     fn expand_tilde_slash_uses_home_env() {
-        // SAFETY: setting env in a single-threaded #[test] is fine
-        // because cargo test runs each test in its own thread but the
-        // env mutation here is scoped to assertion-checking only and
-        // doesn't outlive this test.
-        std::env::set_var("HOME", "/fake/home");
         assert_eq!(
-            expand_tilde("~/.codemux/worktrees/proj/branch"),
+            expand_tilde_with(
+                "~/.codemux/worktrees/proj/branch",
+                Some("/fake/home"),
+            ),
             "/fake/home/.codemux/worktrees/proj/branch"
         );
     }
 
     #[test]
     fn expand_tilde_bare_returns_home() {
-        std::env::set_var("HOME", "/another/home");
-        assert_eq!(expand_tilde("~"), "/another/home");
+        assert_eq!(expand_tilde_with("~", Some("/another/home")), "/another/home");
     }
 
     #[test]
     fn expand_tilde_absolute_path_unchanged() {
-        std::env::set_var("HOME", "/whatever");
-        assert_eq!(expand_tilde("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(
+            expand_tilde_with("/usr/local/bin", Some("/whatever")),
+            "/usr/local/bin"
+        );
     }
 
     #[test]
     fn expand_tilde_relative_path_unchanged() {
-        std::env::set_var("HOME", "/whatever");
-        assert_eq!(expand_tilde("relative/path"), "relative/path");
+        assert_eq!(
+            expand_tilde_with("relative/path", Some("/whatever")),
+            "relative/path"
+        );
     }
 
     #[test]
     fn expand_tilde_mid_path_tilde_unchanged() {
         // We only handle a LEADING tilde — `foo/~/bar` is not a
         // tilde-expansion form; treat it as a literal path.
-        std::env::set_var("HOME", "/whatever");
-        assert_eq!(expand_tilde("foo/~/bar"), "foo/~/bar");
+        assert_eq!(
+            expand_tilde_with("foo/~/bar", Some("/whatever")),
+            "foo/~/bar"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_with_no_home_leaves_tilde_alone() {
+        // When $HOME isn't set on the actual remote daemon, the
+        // expansion is a no-op and the daemon's chdir would fail.
+        // Better to surface the failure than silently chdir
+        // somewhere unexpected.
+        assert_eq!(expand_tilde_with("~/foo", None), "~/foo");
+        assert_eq!(expand_tilde_with("~", None), "~");
     }
 }
