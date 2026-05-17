@@ -122,12 +122,9 @@ fn run_daemon(socket: PathBuf) -> ExitCode {
     }
 }
 
-#[cfg(not(unix))]
-fn run_daemon(_socket: PathBuf) -> ExitCode {
-    eprintln!(
-        "[codemux-remote] PTY daemon mode is Unix-only for now. \
-         Windows servers as Codemux push targets are tracked \
-         alongside the desktop Windows port."
-    );
-    ExitCode::from(2)
-}
+// The pre-existing `#[cfg(not(unix))] fn run_daemon` stub used
+// PathBuf + ExitCode, which now live behind `#[cfg(unix)]` imports.
+// On Windows it's also unreachable — the new `#[cfg(not(unix))] main`
+// at the top of this file exits before any subcommand dispatch.
+// So we remove the stub; if anything ever needs a Windows codepath
+// for the daemon, it'll be a real implementation, not a stub.
