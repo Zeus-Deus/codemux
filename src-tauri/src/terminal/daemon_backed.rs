@@ -804,6 +804,82 @@ pub async fn spawn_pty_for_session_via_daemon(
         },
     );
 
+    // Preflight: for remote workspaces, verify the agent binary
+    // we're about to write actually exists on the remote host. If
+    // it doesn't, emit a Failed lifecycle event with an actionable
+    // install message INSTEAD of writing the command into bash and
+    // letting the user see a confusing "bash: claude: command not
+    // found" inline. Only runs for remote + fresh-spawn (not
+    // reattach — if we're reattaching, the agent's already running).
+    if is_remote && !reattached {
+        if let Some(ref command) = auto_resume_clone {
+            let binary = command
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if !binary.is_empty() {
+                if let Some(host_id_val) = host_id {
+                    let host = app
+                        .state::<crate::database::DatabaseStore>()
+                        .list_hosts()
+                        .into_iter()
+                        .find(|h| h.id == host_id_val);
+                    if let Some(host) = host {
+                        let check_cmd = format!(
+                            "command -v {} >/dev/null 2>&1 && echo OK || echo MISSING",
+                            crate::commands::hosts::shell_word_quote(&binary)
+                        );
+                        let check = tokio::process::Command::new("ssh")
+                            .arg("-o")
+                            .arg("BatchMode=yes")
+                            .arg("-o")
+                            .arg("ConnectTimeout=5")
+                            .arg(&host.ssh_target)
+                            .arg(&check_cmd)
+                            .output()
+                            .await;
+                        if let Ok(out) = check {
+                            let result = String::from_utf8_lossy(&out.stdout)
+                                .trim()
+                                .to_string();
+                            if result == "MISSING" {
+                                eprintln!(
+                                    "[codemux::terminal::daemon_backed] preflight: \
+                                     {binary} is not installed on {} — surfacing \
+                                     Failed status instead of writing doomed command",
+                                    host.name
+                                );
+                                emit_terminal_status(
+                                    &app,
+                                    &sessions,
+                                    TerminalStatusPayload {
+                                        session_id: session_id.clone(),
+                                        state: TerminalLifecycleState::Failed,
+                                        message: Some(format!(
+                                            "{binary} isn't installed on {}. Install it \
+                                             on the host (see the agent's docs), then \
+                                             push the workspace again.",
+                                            host.name
+                                        )),
+                                        exit_code: None,
+                                    },
+                                );
+                                // Don't write the command — let the bare bash
+                                // prompt remain on the pane as a fallback.
+                                return Ok(());
+                            }
+                            // result == "OK" → proceed to write.
+                            // result == anything-else (SSH error, etc.) →
+                            // proceed anyway; transient SSH failures
+                            // shouldn't block legitimate spawns.
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Send the resume command via the same write-when-ready path the
     // in-process spawn uses. Because our `DaemonWriter` is already in
     // `runtime.writer`, this lands at the daemon, which writes to the

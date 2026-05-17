@@ -945,8 +945,9 @@ async fn sync_claude_projects(
 /// Minimal shell-quote for the encoded dir name. Encoded paths
 /// contain only `[A-Za-z0-9_-]` so this is mostly defensive; we
 /// just escape single quotes the standard way and wrap in single
-/// quotes.
-fn shell_word_quote(s: &str) -> String {
+/// quotes. Also used by terminal::daemon_backed for the agent-
+/// binary preflight check.
+pub(crate) fn shell_word_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
