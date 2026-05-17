@@ -21,12 +21,30 @@
 //! grows named-pipe support — tracked alongside the desktop-side
 //! Windows port.
 
+// Unix-only — the daemon's server uses tokio::net::UnixListener which
+// doesn't exist on Windows, and the cloud-push feature (the only thing
+// that needs codemux-remote) is also `#[cfg(unix)]`. On Windows this
+// binary compiles to a no-op stub below.
+#![cfg_attr(not(unix), allow(unused_imports, dead_code))]
+
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("codemux-remote is a Unix-only binary (daemon uses Unix sockets).");
+    eprintln!("Building it on Windows produces this no-op stub. The cloud-push");
+    eprintln!("feature requires a Unix-side daemon on the remote host.");
+    std::process::ExitCode::from(1)
+}
+
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::ExitCode;
 
+#[cfg(unix)]
 use clap::{Parser, Subcommand};
 
 /// Codemux remote agent.
+#[cfg(unix)]
 #[derive(Parser)]
 #[command(
     name = "codemux-remote",
@@ -41,6 +59,7 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[cfg(unix)]
 #[derive(Subcommand)]
 enum Command {
     /// Run as the PTY daemon, binding a Unix socket at `--socket`.
@@ -56,6 +75,7 @@ enum Command {
     Version,
 }
 
+#[cfg(unix)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
