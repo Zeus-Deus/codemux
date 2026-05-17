@@ -39,6 +39,17 @@ pub mod os_input;
 pub mod ports;
 pub mod presets;
 pub mod project;
+// The PTY daemon is Unix-only for now. Windows builds get the in-process
+// PTY path with zero regression (the `daemon_path_viable()` gate in
+// `terminal/mod.rs` returns false on non-Unix and we never touch this
+// module from any code path).
+#[cfg(unix)]
+pub mod pty_daemon;
+// SSH transport for the cloud-push feature. Unix-only — relies on
+// the system `ssh` + `scp` binaries (with the user's existing
+// `~/.ssh/config`, agent, and known_hosts).
+#[cfg(unix)]
+pub mod ssh;
 pub mod resource_metrics;
 pub mod scripts;
 pub mod scrollback;
@@ -46,6 +57,7 @@ pub mod skills;
 pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
+pub mod hosts_sync;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -524,6 +536,45 @@ pub fn run() {
             hooks::register_pi_extension();
 
             terminal::spawn_missing_ptys(handle);
+
+            // Warm up the PTY daemon connection. The daemon is now the
+            // default for every PTY spawn (subject to graceful fallback
+            // for Windows + circuit-breaker reasons — see
+            // `terminal::daemon_path_viable`), so we eagerly adopt or
+            // spawn it during setup so the first agent spawn doesn't pay
+            // the spawn-detached latency on the critical path.
+            //
+            // Skipping the warmup when `CODEMUX_DISABLE_PTY_DAEMON=1` is
+            // set lets a user kill the daemon entirely if a regression
+            // ever ships and they need to roll back without uninstalling.
+            #[cfg(unix)]
+            {
+                if std::env::var_os("CODEMUX_DISABLE_PTY_DAEMON").is_none() {
+                    tauri::async_runtime::spawn(async move {
+                        match pty_daemon::ensure_daemon().await {
+                            Ok(client) => match client.list().await {
+                                Ok(sessions) => {
+                                    eprintln!(
+                                        "[codemux::pty_daemon] startup adoption ok: {} live sessions",
+                                        sessions.len()
+                                    );
+                                }
+                                Err(error) => {
+                                    eprintln!(
+                                        "[codemux::pty_daemon] startup adoption: list failed: {error}"
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                eprintln!(
+                                    "[codemux::pty_daemon] startup adoption failed: {error} \
+                                     (falling back to in-process PTYs)"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
 
             // Initialize the project index from the active workspace's CWD.
             // If no workspace exists yet, the index stays empty and the watcher
@@ -1395,6 +1446,15 @@ pub fn run() {
             commands::update_synced_settings,
             commands::update_setting,
             commands::reset_synced_settings,
+            commands::hosts_list,
+            commands::hosts_add,
+            commands::hosts_update,
+            commands::hosts_delete,
+            commands::hosts_test_connection,
+            commands::hosts_bootstrap_install,
+            commands::set_workspace_host,
+            commands::workspace_push_to_host,
+            commands::workspace_pull_back,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

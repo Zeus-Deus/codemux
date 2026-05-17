@@ -370,6 +370,18 @@ pub struct WorkspaceSnapshot {
     pub active_tab_id: String,
     pub active_surface_id: SurfaceId,
     pub surfaces: Vec<SurfaceSnapshot>,
+    /// Which host this workspace runs on. `None` means local (this
+    /// device). When set, refers to a row id in the local `hosts`
+    /// table (the SQLite primary key, not the cloud server_id, so
+    /// reassignment after sync just bumps the row's `server_id`
+    /// without breaking workspace references).
+    ///
+    /// Added in step 2b of the cloud-push series. Strictly additive —
+    /// existing persisted workspaces deserialize as `None` thanks to
+    /// `#[serde(default)]`, and all today-shipping code paths treat
+    /// `None` as "local" exactly as before.
+    #[serde(default)]
+    pub host_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -658,6 +670,7 @@ impl AppStateStore {
                     children: vec![],
                 },
             }],
+            host_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -773,6 +786,7 @@ impl AppStateStore {
             active_tab_id: String::new(),
             active_surface_id: SurfaceId(String::new()),
             surfaces: vec![],
+            host_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -882,6 +896,7 @@ impl AppStateStore {
                 active_pane_id,
                 root,
             }],
+            host_id: None,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1106,6 +1121,26 @@ impl AppStateStore {
             return true;
         }
         false
+    }
+
+    /// Assign (or clear) the host this workspace runs on. `None`
+    /// means local. Used by the DevicePicker pill at workspace
+    /// create time and by the future "Push to host" / "Pull back"
+    /// actions. Returns Err with a clear message if the workspace
+    /// id isn't found so the frontend can surface it.
+    pub fn set_workspace_host_id(
+        &self,
+        workspace_id: &str,
+        host_id: Option<i64>,
+    ) -> Result<(), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
+        workspace.host_id = host_id;
+        Ok(())
     }
 
     /// Toggle agent-completion desktop notifications for a workspace.
@@ -3159,6 +3194,7 @@ fn default_app_state() -> AppStateSnapshot {
                     title: "Terminal".into(),
                 },
             }],
+            host_id: None,
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,

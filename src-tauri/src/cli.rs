@@ -42,6 +42,15 @@ pub enum CommandSet {
     Capabilities,
     /// Start MCP server (JSON-RPC over stdio)
     Mcp,
+    /// Run as the persistent PTY daemon (internal subcommand spawned by the
+    /// Tauri app; long-lived process that owns agent PTYs so they survive
+    /// the app being closed).
+    PtyDaemon {
+        /// Absolute path of the Unix socket to bind. The Tauri app passes
+        /// this when spawning the daemon.
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -562,6 +571,25 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
         Some(CommandSet::Mcp) => {
             crate::mcp_server::run_mcp_server().await?;
             Ok(true)
+        }
+        Some(CommandSet::PtyDaemon { socket }) => {
+            // The daemon's `run` only returns on a fatal listener error;
+            // it never returns Ok. Translate into a CLI error string so the
+            // outer harness logs it and the process exits non-zero.
+            //
+            // Windows: not yet implemented; print a clear message rather
+            // than a link error. The Tauri side never spawns this on
+            // Windows because `daemon_path_viable()` is false there.
+            #[cfg(unix)]
+            {
+                crate::pty_daemon::server::run(socket).await?;
+                Ok(true)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                Err("codemux pty-daemon is Unix-only for now".to_string())
+            }
         }
         Some(CommandSet::Capabilities) => {
             let caps = json!({

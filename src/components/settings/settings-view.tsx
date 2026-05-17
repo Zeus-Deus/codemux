@@ -111,7 +111,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical } from "lucide-react";
 
-type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -144,6 +144,11 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
         ] as NavItem[])
       : []),
     { id: "browser", label: "Browser", icon: Globe },
+    // Hosts pane — Step 2 of cloud-push. Listed in Editor & Workflow
+    // because picking which machine to run on is a workflow decision,
+    // not a personal preference. Always visible (no flag gate) since
+    // the underlying daemon is now standard built-in behavior.
+    { id: "hosts", label: "Hosts", icon: Server },
     { id: "session_restore", label: "Session Restore", icon: RotateCcw },
   ];
 
@@ -176,12 +181,13 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "beta_features",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "git", "agent", "permissions", "skills", "mcp", "browser",
+  "git", "agent", "permissions", "skills", "mcp", "hosts", "browser",
   "shortcuts", "notifications", "session_restore",
 ];
 
 import { KeybindEditor } from "./keybind-editor";
 import { BetaFeaturesSection } from "./beta-features-section";
+import { HostsSection } from "./hosts-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
@@ -1212,6 +1218,17 @@ export function SettingsView() {
 
       case "browser":
         return <BrowserSection />;
+
+      case "hosts":
+        return (
+          <div>
+            <SectionHeader
+              title="Hosts"
+              description="Remote machines you can push workspaces to. SSH credentials stay on your device — only the host name and SSH target sync across your devices."
+            />
+            <HostsSection />
+          </div>
+        );
 
       case "projects":
         return (

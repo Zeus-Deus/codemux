@@ -1534,3 +1534,85 @@ export const listMcpToolsWithCapInfo = () =>
  *  cap. */
 export const listMcpToolsForServer = (id: string) =>
   invoke<McpTool[]>("list_mcp_tools_for_server", { id });
+
+// ── Hosts (Settings → Hosts, Step 2 of cloud-push) ──
+//
+// SSH credentials never enter these payloads. The frontend only
+// sends name + sshTarget; auth is the OS's job (`~/.ssh/config`,
+// agent, keys). `dirty` indicates the row has unpushed changes; the
+// UI surfaces it as a small "syncing…" hint.
+export interface HostView {
+  id: number;
+  /** The server-assigned id once this host has synced to the cloud,
+   *  null for hosts created offline that haven't synced yet. */
+  server_id: string | null;
+  name: string;
+  ssh_target: string;
+  created_at: string;
+  updated_at: string;
+  dirty: boolean;
+}
+
+export interface HostTestResult {
+  ok: boolean;
+  message: string;
+  /** True when probe succeeded but `codemux-remote` isn't installed
+   *  on the host yet. Triggers the bootstrap-install consent modal. */
+  needs_install?: boolean;
+  /** Reported `uname -sm` from the probe, forwarded into the
+   *  bootstrap call so we don't re-probe. */
+  uname?: string | null;
+}
+
+export interface HostBootstrapResult {
+  ok: boolean;
+  message: string;
+}
+
+export const hostsList = () => invoke<HostView[]>("hosts_list");
+
+export const hostsAdd = (name: string, sshTarget: string) =>
+  invoke<HostView>("hosts_add", { name, sshTarget });
+
+export const hostsUpdate = (id: number, name: string, sshTarget: string) =>
+  invoke<HostView>("hosts_update", { id, name, sshTarget });
+
+export const hostsDelete = (id: number) =>
+  invoke<void>("hosts_delete", { id });
+
+export const hostsTestConnection = (id: number) =>
+  invoke<HostTestResult>("hosts_test_connection", { id });
+
+/** Install `codemux-remote` on a host that the probe reported as
+ *  reachable-but-missing. Pass the `uname` string returned by the
+ *  probe so we don't have to re-probe. */
+export const hostsBootstrapInstall = (id: number, uname: string) =>
+  invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
+
+export interface WorkspacePushOutcome {
+  ok: boolean;
+  message: string;
+  remote_path: string | null;
+  rsync_summary: string | null;
+}
+
+export interface WorkspacePullOutcome {
+  ok: boolean;
+  message: string;
+  rsync_summary: string | null;
+}
+
+/** Push a workspace to a host. The backend atomically sets the
+ *  workspace's host_id only on successful rsync — no need for the
+ *  frontend to do an optimistic-set + rollback dance. */
+export const workspacePushToHost = (workspaceId: string, hostId: number) =>
+  invoke<WorkspacePushOutcome>("workspace_push_to_host", { workspaceId, hostId });
+
+/** Pull a remote workspace back to local. Clears host_id on success. */
+export const workspacePullBack = (workspaceId: string) =>
+  invoke<WorkspacePullOutcome>("workspace_pull_back", { workspaceId });
+
+/** Assign (or clear) the host a workspace runs on. `null` clears
+ *  the assignment (back to local). */
+export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
+  invoke<void>("set_workspace_host", { workspaceId, hostId });

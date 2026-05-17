@@ -23,6 +23,12 @@ use crate::project::current_project_root;
 use crate::settings_sync;
 use crate::state::{self, AppStateStore, TerminalSessionState};
 
+/// Persistent-agent path: routes spawns through `codemux pty-daemon` so
+/// they survive the app being closed. Unix-only — Windows builds use the
+/// in-process path exclusively.
+#[cfg(unix)]
+pub mod daemon_backed;
+
 static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
     std::sync::OnceLock::new();
 
@@ -183,6 +189,34 @@ pub struct SessionRuntime {
     /// where two callers both passed the "writer/master is None" check while
     /// the slow ConPTY initialization was in flight on Windows.
     pub is_spawning: bool,
+    /// Set when this session is owned by the `codemux pty-daemon` process
+    /// instead of the in-process portable-pty path. The PID stored in
+    /// `child_pid` belongs to a process the daemon spawned — NOT a direct
+    /// child of the Tauri app. Implications:
+    ///
+    /// - `terminate_pty_session` must NOT call `killpg` for these sessions
+    ///   (we don't own the process group; the daemon does).
+    /// - On window close, persistent sessions detach from the daemon
+    ///   instead of getting torn down.
+    /// - Drop is a no-op for persistent sessions; the daemon outlives us.
+    pub persistent: bool,
+    /// The daemon client this session was spawned through. Set on every
+    /// daemon-backed spawn (local or tunneled-remote).
+    ///
+    /// Resize and close MUST route through this client, not through
+    /// `ensure_daemon()` directly — `ensure_daemon` always returns the
+    /// LOCAL daemon, which doesn't know about sessions that live on a
+    /// remote host's daemon. Pre-fix, every resize/close on a remote
+    /// session hit `unknown session` because the command went to the
+    /// wrong daemon.
+    ///
+    /// `#[cfg(unix)]` because the `pty_daemon` module is Unix-only
+    /// (the daemon talks Unix sockets, the cloud-push feature is
+    /// Unix-only). Keeping the field absent on Windows avoids a
+    /// stub type and matches how the rest of the daemon plumbing
+    /// gates itself.
+    #[cfg(unix)]
+    pub daemon_client: Option<Arc<crate::pty_daemon::PtyDaemonClient>>,
 }
 
 impl SessionRuntime {
@@ -205,6 +239,9 @@ impl SessionRuntime {
             skip_preset_launch: false,
             resume_command: None,
             is_spawning: false,
+            persistent: false,
+            #[cfg(unix)]
+            daemon_client: None,
         }
     }
 }
@@ -220,6 +257,14 @@ impl SessionRuntime {
 impl Drop for SessionRuntime {
     fn drop(&mut self) {
         if let Some(pid) = self.child_pid.take() {
+            // Persistent sessions are owned by `codemux pty-daemon`, not by
+            // this process. We must NOT kill them on drop — that defeats
+            // the whole point of running them detached. The daemon will
+            // tear them down via its own `Close` request when the user
+            // explicitly closes the pane.
+            if self.persistent {
+                return;
+            }
             eprintln!(
                 "[codemux::terminal] SessionRuntime dropped with live child_pid={pid} — \
                  normal close path was skipped. Killing process group as last resort."
@@ -380,6 +425,74 @@ fn with_existing_session_runtime<T>(
 ) -> Option<T> {
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     guard.get_mut(session_id).map(f)
+}
+
+/// Emit `Exited` for `session_id` ONLY if the runtime's `daemon_client`
+/// still points at `client` (Arc::ptr_eq). Otherwise we're a stale
+/// read task whose session was already replaced by a fresh spawn —
+/// emitting Exited here would overwrite the new spawn's Ready and
+/// leave the user with a permanent "Shell ended" overlay on a session
+/// that's actually alive.
+///
+/// Called from the daemon-backed read tasks (agent + shell) when
+/// their mpsc returns None. The race is real and easy to trigger:
+/// push → `terminate_pty_session_keep_channel` tells the daemon to
+/// close the old session (background task), spawn_missing_ptys
+/// respawns and emits Ready, then the old session's close finally
+/// flushes its rx → read task ends → without this check, we'd emit
+/// a stale Exited and clobber Ready.
+/// Pure-function core of the "is this read task still relevant" check.
+/// Extracted from `emit_exited_if_client_owner` so the Arc-pointer
+/// comparison logic can be unit-tested without needing a real
+/// `tauri::AppHandle` or `PtyDaemonClient`.
+///
+/// Returns:
+/// - `true` if the runtime exists AND its `daemon_client` is the
+///   same Arc allocation as `client` (pointer-equal). The caller is
+///   the current owner and should emit.
+/// - `false` if the runtime is missing, its `daemon_client` is None,
+///   or it points to a different Arc (the caller is a stale read
+///   task from a previous spawn).
+#[cfg(unix)]
+pub(crate) fn is_runtime_owned_by_client(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    client: &Arc<crate::pty_daemon::PtyDaemonClient>,
+) -> bool {
+    with_existing_session_runtime(sessions, session_id, |rt| {
+        rt.daemon_client
+            .as_ref()
+            .map(|c| Arc::ptr_eq(c, client))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(unix)]
+pub(crate) fn emit_exited_if_client_owner(
+    app: &AppHandle,
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    client: &Arc<crate::pty_daemon::PtyDaemonClient>,
+    message: &str,
+) {
+    if !is_runtime_owned_by_client(sessions, session_id, client) {
+        eprintln!(
+            "[codemux::terminal] skip Exited for {session_id}: stale read task \
+             (runtime daemon_client is None or differs — session was respawned)"
+        );
+        return;
+    }
+    emit_terminal_status(
+        app,
+        sessions,
+        TerminalStatusPayload {
+            session_id: session_id.to_string(),
+            state: TerminalLifecycleState::Exited,
+            message: Some(message.to_string()),
+            exit_code: None,
+        },
+    );
 }
 
 fn emit_terminal_status(
@@ -987,6 +1100,126 @@ fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, Strin
 }
 
 pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
+    // Persistent path: every shell goes through the long-lived
+    // `codemux pty-daemon` so closing the app doesn't kill it. The
+    // agent commands the user later types into the shell inherit the
+    // shell's lifetime, so this is what makes "close laptop, agent
+    // keeps running" work for the normal preset-driven flow (which
+    // spawns a shell first and writes the agent command into it).
+    //
+    // Fallback is silent and total: any daemon error — circuit breaker
+    // open, daemon binary missing, socket race, version mismatch,
+    // platform without IPC support — drops to the in-process spawn so
+    // the user always gets a working terminal.
+    #[cfg(unix)]
+    {
+        if daemon_path_viable() {
+            let app_clone = app.clone();
+            let session_id_clone = session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                match daemon_backed::spawn_pty_for_session_via_daemon(
+                    app_clone.clone(),
+                    session_id_clone.clone(),
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        // Critical: do NOT fall back to in-process
+                        // spawn for REMOTE workspaces. A remote
+                        // workspace's host_id says "this lives on
+                        // pandora," and silently spawning a local
+                        // shell would lie about where the user's
+                        // sessions are running — leading to the
+                        // exact "Cloud icon but local pwd" bug we
+                        // shipped a fix for in the prior commit.
+                        // Surface the failure as Failed status; the
+                        // UI shows the error and the user can pull
+                        // back / retry. Local workspaces (host_id
+                        // == None) still get the in-process
+                        // fallback because for them it's correct.
+                        // "Already reserved" is benign — another spawn
+                        // task for the same session id is already in
+                        // flight (sibling pane spawn race, workspace
+                        // re-activation, etc.). Silently no-op instead
+                        // of clobbering the in-flight spawn with a
+                        // Failed status that the user sees as a
+                        // "Reconnecting" / "Couldn't reach the host"
+                        // popup over a session that's actually fine.
+                        if error.contains("already reserved") {
+                            eprintln!(
+                                "[codemux::terminal] suppressing benign 'already reserved' \
+                                 spawn-retry for session {session_id_clone} \
+                                 (sibling spawn in flight; no UI change)"
+                            );
+                            return;
+                        }
+                        let app_for_check = app_clone.clone();
+                        let is_remote_workspace = is_remote_workspace_for_session(
+                            &app_for_check,
+                            &session_id_clone,
+                        );
+                        if is_remote_workspace {
+                            eprintln!(
+                                "[codemux::terminal] remote-shell spawn failed for session \
+                                 {session_id_clone}: {error}; NOT falling back to local"
+                            );
+                            // Emit Failed so the terminal pane
+                            // surfaces a useful message instead of
+                            // hanging on "Starting…" forever.
+                            let pty_state: State<'_, PtyState> =
+                                app_clone.state();
+                            emit_terminal_status(
+                                &app_clone,
+                                &pty_state.sessions,
+                                TerminalStatusPayload {
+                                    session_id: session_id_clone.clone(),
+                                    state: TerminalLifecycleState::Failed,
+                                    message: Some(format!(
+                                        "Couldn't reach the remote host: {error}. \
+                                         Try Test Connection in Settings → Hosts, \
+                                         or right-click → Pull back."
+                                    )),
+                                    exit_code: None,
+                                },
+                            );
+                            remove_session_runtime(&pty_state.sessions, &session_id_clone);
+                            return;
+                        }
+                        eprintln!(
+                            "[codemux::terminal] persistent-shell path failed for session \
+                             {session_id_clone}: {error}; falling back to in-process spawn"
+                        );
+                        let sid = session_id_clone.clone();
+                        let app_fb = app_clone.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            spawn_pty_for_session_in_process(app_fb, sid);
+                        });
+                    }
+                }
+            });
+            return;
+        }
+    }
+    spawn_pty_for_session_in_process(app, session_id);
+}
+
+/// True if the session belongs to a workspace with `host_id` set.
+/// Used to gate the in-process fallback — local workspaces still
+/// fall back happily, remote ones must surface the real error.
+#[cfg(unix)]
+fn is_remote_workspace_for_session(
+    app: &AppHandle,
+    session_id: &str,
+) -> bool {
+    let app_state: State<'_, AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    find_owning_workspace(&snapshot, session_id)
+        .and_then(|w| w.host_id)
+        .is_some()
+}
+
+fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
@@ -1532,10 +1765,73 @@ pub(crate) fn terminate_pty_session(
         return;
     };
 
+    // Persistent (daemon-backed) sessions: the PID is owned by the
+    // `codemux pty-daemon` process, not us. killpg would either signal a
+    // process group we don't own (no-op + spurious EPERM in stderr) or, if
+    // PIDs got recycled into something we *do* own, send SIGKILL to the
+    // wrong process. The correct teardown for a persistent session is to
+    // ask the daemon to close it via the socket. We do that here on a
+    // detached tokio task so the close path stays sync.
+    let was_persistent = runtime.persistent;
+    let pid = runtime.child_pid.take();
+    // Persistent (daemon-backed) sessions are Unix-only — the
+    // pty_daemon module is `#[cfg(unix)]`. On Windows `was_persistent`
+    // is always false (the daemon path never runs to set the flag),
+    // so this branch is effectively dead on Windows; we cfg-gate it
+    // so the compiler doesn't try to resolve `pty_daemon` or the
+    // (also cfg-gated) `daemon_client` field there.
+    #[cfg(unix)]
+    {
+        // Capture the daemon client BEFORE dropping runtime — for
+        // remote sessions this is the per-workspace SSH-tunneled
+        // client; for local sessions it's the singleton local-daemon
+        // client.
+        let daemon_client = runtime.daemon_client.take();
+        if was_persistent {
+            runtime.output_channel = None;
+            runtime.pending_output.clear();
+            runtime.pending_output_bytes = 0;
+            // Drop runtime first so any held Arcs (writer, etc.) release before
+            // we await the daemon round-trip.
+            drop(runtime);
+            let session_id = session_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                // Use the session's captured client. Fall back to the local
+                // daemon only if the runtime never recorded one (restored
+                // session before reattach completes) — this fallback is
+                // harmless because the local daemon will just no-op on an
+                // unknown session id rather than affecting the wrong process.
+                let client_res = if let Some(c) = daemon_client {
+                    Ok(c)
+                } else {
+                    crate::pty_daemon::ensure_daemon().await
+                };
+                match client_res {
+                    Ok(client) => {
+                        if let Err(error) = client.close(session_id.clone()).await {
+                            eprintln!(
+                                "[codemux::terminal] daemon close failed for persistent session \
+                                 {session_id}: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::terminal] cannot reach daemon to close persistent session \
+                             {session_id}: {error}"
+                        );
+                    }
+                }
+            });
+            return;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = was_persistent;
+
     // Clear child_pid to None *first* so the `Drop for SessionRuntime`
     // safety-net impl stays silent on the happy path. Any non-None value
     // printed by Drop means something skipped this function.
-    let pid = runtime.child_pid.take();
     runtime.output_channel = None;
     runtime.pending_output.clear();
     runtime.pending_output_bytes = 0;
@@ -1591,6 +1887,78 @@ pub fn close_terminal_session(
     Ok(fallback_session.0)
 }
 
+/// Like `terminate_pty_session` but preserves `output_channel` +
+/// `pending_output` for daemon-backed (persistent) sessions, so the
+/// frontend's xterm stays connected across the kill-and-respawn that
+/// happens on workspace push/pull.
+///
+/// Without this, terminate removes the runtime entirely; the next
+/// spawn creates a fresh runtime with no output channel; all of the
+/// respawned PTY's output (including the agent's UI) goes into
+/// `pending_output` and only becomes visible when the user tab-
+/// switches away and back, which triggers `attach_pty_output` to
+/// reattach the channel and flush the buffer.
+///
+/// Falls back to the regular `terminate_pty_session` for non-
+/// persistent sessions — the in-process path doesn't have the same
+/// "respawn into same session id" pattern and its terminate semantics
+/// should stay unchanged.
+#[cfg(unix)]
+pub(crate) fn terminate_pty_session_keep_channel(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) {
+    // Mutate in place if persistent. Returns Some(daemon_client) for
+    // a persistent session we handled, None otherwise (we then fall
+    // through to the regular terminate).
+    let handled = with_existing_session_runtime(sessions, session_id, |rt| {
+        if !rt.persistent {
+            return None;
+        }
+        let daemon_client = rt.daemon_client.take();
+        rt.child_pid = None;
+        rt.writer = None;
+        rt.master = None;
+        // `persistent` flips to false so try_reserve_session_spawn
+        // sees an idle slot and reserves it. The next spawn flips it
+        // back to true after attaching.
+        rt.persistent = false;
+        rt.is_spawning = false;
+        rt.skip_preset_launch = false;
+        rt.resume_command = None;
+        // PRESERVED (the whole point): output_channel,
+        // pending_output, pending_output_bytes, last_status.
+        Some(daemon_client)
+    })
+    .flatten();
+
+    match handled {
+        Some(daemon_client) => {
+            // Tell the (old) daemon to close its side of the session.
+            // For remote workspaces this is the per-workspace SSH-
+            // tunneled client; for local persistent it's the singleton
+            // local daemon client. Background tokio task so we stay
+            // sync at this call site.
+            if let Some(client) = daemon_client {
+                let session_id = session_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = client.close(session_id.clone()).await {
+                        eprintln!(
+                            "[codemux::terminal] daemon close (keep-channel) failed for \
+                             {session_id}: {error}"
+                        );
+                    }
+                });
+            }
+        }
+        None => {
+            // Not persistent (or runtime missing) — defer to the
+            // regular terminate which handles the in-process path.
+            terminate_pty_session(sessions, session_id);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn restart_terminal_session(
     app: AppHandle,
@@ -1618,12 +1986,31 @@ pub fn get_terminal_status(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    let status = with_session_runtime(
+    // Use the existing-only variant. The auto-create variant
+    // (`with_session_runtime`) would conjure a fresh `SessionRuntime`
+    // here whose `last_status` defaults to `Starting`, which the
+    // frontend would dutifully display as a "Terminal starting…"
+    // overlay over a session that's actually dead. This was the
+    // spurious-Starting-popup bug on tab return for remote
+    // workspaces: the push terminated the session, the frontend
+    // later called getTerminalStatus, the auto-create gave back a
+    // synthetic Starting, and the popup appeared.
+    //
+    // Returning a synthetic Exited on miss is more honest — the
+    // session has no runtime, it's not coming back on its own. The
+    // frontend's overlay handler already knows how to display Exited
+    // cleanly.
+    let status = with_existing_session_runtime(
         &terminal_state.sessions,
         &session_id,
-        || SessionRuntime::new(&session_id),
         |runtime| runtime.last_status.clone(),
-    );
+    )
+    .unwrap_or_else(|| TerminalStatusPayload {
+        session_id: session_id.clone(),
+        state: TerminalLifecycleState::Exited,
+        message: Some("Session is no longer running".into()),
+        exit_code: None,
+    });
 
     Ok(status)
 }
@@ -1918,6 +2305,64 @@ pub fn resize_pty(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
+    // Persistent (daemon-backed) sessions have `master: None` because the
+    // daemon owns the PTY. Route the resize over the socket instead. We
+    // do this on a tokio task so the sync command handler returns
+    // immediately; resize is fire-and-forget at the terminal level
+    // anyway (xterm doesn't wait for an ack). Unix-only because the
+    // daemon doesn't exist on Windows.
+    #[cfg(unix)]
+    {
+        // Snapshot persistent + the daemon client that owns this session.
+        // The client is captured at spawn time and may be either the local
+        // singleton or a per-workspace SSH-tunneled client; either way it's
+        // the one that knows about this session id.
+        let (persistent, daemon_client) = with_session_runtime(
+            &terminal_state.sessions,
+            &session_id,
+            || SessionRuntime::new(&session_id),
+            |runtime| {
+                Ok::<_, String>((runtime.persistent, runtime.daemon_client.clone()))
+            },
+        )?;
+        if persistent {
+            let session_id_clone = session_id.clone();
+            // Fall back to ensure_daemon ONLY if the runtime is missing the
+            // client — which happens on restored sessions before the
+            // spawn-or-reattach path has run. For remote sessions on first
+            // reattach this would route to the wrong daemon, but the
+            // reattach path also re-populates daemon_client, so this gap
+            // closes within the same tick.
+            tauri::async_runtime::spawn(async move {
+                let client_res = if let Some(c) = daemon_client {
+                    Ok(c)
+                } else {
+                    crate::pty_daemon::ensure_daemon().await
+                };
+                match client_res {
+                    Ok(client) => {
+                        if let Err(error) =
+                            client.resize(session_id_clone.clone(), rows, cols).await
+                        {
+                            eprintln!(
+                                "[codemux::terminal] daemon resize failed for \
+                                 {session_id_clone}: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::terminal] cannot reach daemon to resize \
+                             {session_id_clone}: {error}"
+                        );
+                    }
+                }
+            });
+            app_state.update_terminal_session_size(&session_id, cols, rows);
+            return Ok(());
+        }
+    }
+
     with_session_runtime(
         &terminal_state.sessions,
         &session_id,
@@ -1965,6 +2410,117 @@ pub fn clear_agent_status(session_id: String, app_state: State<'_, AppStateStore
 /// are arguments.  `extra_env` is a list of `(key, value)` pairs that will be
 /// set on the spawned process on top of the normal Codemux env vars.
 pub fn spawn_pty_for_agent(
+    app: AppHandle,
+    session_id: String,
+    workspace_id: String,
+    argv: Vec<String>,
+    extra_env: Vec<(String, String)>,
+    execution_policy: crate::execution::ExecutionPolicy,
+) {
+    // Persistent path: the agent runs inside `codemux pty-daemon` so it
+    // survives this process exiting. Same graceful-fallback contract as
+    // the shell path — any daemon error silently drops back to
+    // in-process spawn so the user always gets a working agent.
+    #[cfg(unix)]
+    if daemon_path_viable() {
+        let app_for_daemon = app.clone();
+        let session_id_for_daemon = session_id.clone();
+        let workspace_id_for_daemon = workspace_id.clone();
+        let argv_for_daemon = argv.clone();
+        let extra_env_for_daemon = extra_env.clone();
+        let execution_policy_for_daemon = execution_policy.clone();
+        tauri::async_runtime::spawn(async move {
+            match daemon_backed::spawn_pty_for_agent_via_daemon(
+                app_for_daemon.clone(),
+                session_id_for_daemon.clone(),
+                workspace_id_for_daemon,
+                argv_for_daemon,
+                extra_env_for_daemon,
+                execution_policy_for_daemon,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::terminal] persistent-agent path failed for session \
+                         {session_id_for_daemon}: {error}; falling back to in-process spawn"
+                    );
+                    // Re-enter the function on a non-tokio context so the
+                    // original sync spawn path runs. We re-call ourselves;
+                    // the recursion is bounded because we won't re-enter
+                    // this `if` branch on the fallback (we cleared the
+                    // setting? no — we just rely on the reservation
+                    // already being cleared and try again sync). The
+                    // simplest safe fallback: call the legacy spawn
+                    // helper from a blocking task.
+                    let app2 = app_for_daemon.clone();
+                    let sid2 = session_id_for_daemon.clone();
+                    let ws2 = workspace_id.clone();
+                    let argv2 = argv.clone();
+                    let env2 = extra_env.clone();
+                    let pol2 = execution_policy.clone();
+                    tauri::async_runtime::spawn_blocking(move || {
+                        spawn_pty_for_agent_in_process(
+                            app2, sid2, ws2, argv2, env2, pol2,
+                        );
+                    });
+                }
+            }
+        });
+        return;
+    }
+
+    spawn_pty_for_agent_in_process(
+        app,
+        session_id,
+        workspace_id,
+        argv,
+        extra_env,
+        execution_policy,
+    );
+}
+
+/// Decide whether to try the persistent-PTY-daemon path for this spawn.
+///
+/// Default app behavior: **always try the daemon first**. The only reasons
+/// to skip it are:
+///
+/// - The platform isn't wired yet (Windows IPC TBD — falls back cleanly to
+///   the in-process path so Windows users get the old behavior with zero
+///   regression).
+/// - The crash circuit breaker is open (daemon has been failing in a tight
+///   loop; we stop trying for the rest of this app run).
+/// - An env-var kill switch is set (`CODEMUX_DISABLE_PTY_DAEMON=1`), so we
+///   have a panic button if a release ships and something goes badly wrong
+///   in the field. Users never need to touch this in normal operation.
+///
+/// There is **no user-facing setting**. Persistent agents are the default
+/// because the future cloud-push feature builds on the same mechanism, and
+/// "your agent didn't die when the app closed" is a strict UX upgrade.
+fn daemon_path_viable() -> bool {
+    if std::env::var_os("CODEMUX_DISABLE_PTY_DAEMON").is_some() {
+        return false;
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows path: scaffolded but unvalidated. Until the named-pipe
+        // server is wired and tested on a real Windows box, fall back to
+        // in-process so Windows users keep the existing behavior. This
+        // returns `false` unconditionally; flip when Windows support
+        // lands.
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        !crate::pty_daemon::supervisor::circuit_is_open()
+    }
+}
+
+/// In-process PTY spawn — the original behavior. Renamed so the public
+/// `spawn_pty_for_agent` can choose between this and the daemon-backed
+/// path based on settings.
+fn spawn_pty_for_agent_in_process(
     app: AppHandle,
     session_id: String,
     workspace_id: String,
@@ -2501,6 +3057,164 @@ mod tests {
     fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(Mutex::new(HashMap::new()))
     }
+
+    // ── Regression tests for the cross-machine push spawn bugs ────────
+    //
+    // Each of these pins one of the four bugs from the marathon
+    // debugging session that landed in commit 6bb557e. If anyone
+    // simplifies the affected logic later, these tests will catch
+    // re-regressions before the user does.
+    //
+    // Unix-only — the helpers being tested (is_runtime_owned_by_client,
+    // terminate_pty_session_keep_channel) and the PtyDaemonClient
+    // they exercise are `#[cfg(unix)]` because the daemon model is
+    // Unix-only. On Windows there's nothing to test here.
+    #[cfg(unix)]
+    mod cross_machine_push {
+        use super::*;
+
+    /// `is_runtime_owned_by_client` returns true when the runtime's
+    /// `daemon_client` is the SAME Arc allocation as the caller's
+    /// — that's a current read task and Exited should fire.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_matching_arc_returns_true() {
+        let sessions = make_sessions();
+        let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = Some(client.clone());
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            is_runtime_owned_by_client(&sessions, "session-X", &client),
+            "same Arc allocation must be detected as owner"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when the runtime's
+    /// `daemon_client` is a DIFFERENT Arc allocation (the session was
+    /// respawned with a fresh client). The caller is a stale read
+    /// task whose Exited would clobber the new spawn's Ready.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_different_arc_returns_false() {
+        let sessions = make_sessions();
+        let old_client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        let new_client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = Some(new_client.clone());
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-X", &old_client),
+            "old read task's stale Arc must be detected as no-longer-owner — \
+             without this check, the stale Exited overrides the new spawn's Ready"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when the runtime
+    /// has no daemon_client yet — covers the window between
+    /// `terminate_pty_session_keep_channel` clearing the client and
+    /// the new spawn populating it. A stale read task whose mpsc
+    /// returns None during this window must NOT emit Exited.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_none_client_returns_false() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = None;
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-X", &client),
+            "runtime with no daemon_client (between terminate and respawn) \
+             must not be claimed by a stale read task"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when no runtime
+    /// exists for the session id — covers the "session was fully
+    /// removed" case. No Exited should fire for nonexistent sessions.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_missing_runtime_returns_false() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-missing", &client),
+            "no runtime → no owner → must return false"
+        );
+    }
+
+    /// `terminate_pty_session_keep_channel` for a daemon-backed
+    /// (persistent) session must PRESERVE `output_channel` and
+    /// `pending_output` so the frontend's xterm stays attached
+    /// across the kill-and-respawn that happens on workspace push.
+    /// Without this, the respawned PTY's output buffers in
+    /// `pending_output` until a tab-switch forces re-attach.
+    #[tokio::test]
+    async fn terminate_keep_channel_preserves_channel_for_persistent_session() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        let starting_payload = TerminalStatusPayload {
+            session_id: "session-X".into(),
+            state: TerminalLifecycleState::Ready,
+            message: Some("ready".into()),
+            exit_code: None,
+        };
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.persistent = true;
+            rt.daemon_client = Some(client.clone());
+            rt.child_pid = Some(12345);
+            rt.last_status = starting_payload.clone();
+            // Stash some pending output to verify it survives.
+            rt.pending_output.push_back(b"prior\n".to_vec());
+            rt.pending_output_bytes = 6;
+            guard.insert("session-X".into(), rt);
+        }
+
+        terminate_pty_session_keep_channel(&sessions, "session-X");
+        // Give the spawned tokio task a tick to run, even though
+        // we're not asserting on its side-effects.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let guard = sessions.lock().unwrap();
+        let rt = guard
+            .get("session-X")
+            .expect("runtime must still exist (the whole point of keep_channel)");
+        assert!(
+            rt.daemon_client.is_none(),
+            "daemon_client must be taken (old client is dead)"
+        );
+        assert!(rt.writer.is_none(), "writer must be cleared");
+        assert!(rt.child_pid.is_none(), "child_pid must be cleared");
+        assert!(!rt.persistent, "persistent flag must flip false so try_reserve sees idle");
+        assert!(!rt.is_spawning, "is_spawning must be false");
+        // The critical preservation property:
+        assert_eq!(
+            rt.pending_output.len(),
+            1,
+            "pending_output must be preserved — clearing it loses any output \
+             that arrived between terminate and the frontend's next attach"
+        );
+        assert!(
+            matches!(rt.last_status.state, TerminalLifecycleState::Ready),
+            "last_status must be preserved (don't overwrite the existing \
+             lifecycle state with a synthetic Exited; the respawn will emit \
+             its own Starting → Ready)"
+        );
+    }
+    } // mod cross_machine_push
 
     // ── Shell + PATH tests ───────────────────────────────────────────
     //
@@ -3349,6 +4063,7 @@ mod tests {
             active_tab_id: String::new(),
             active_surface_id: SurfaceId(String::new()),
             surfaces: Vec::new(),
+            host_id: None,
         }
     }
 

@@ -45,17 +45,34 @@ function ProjectAvatar({
   name,
   color,
   className,
+  size = "md",
 }: {
   name: string;
   color: string | null | undefined;
   className?: string;
+  /**
+   * Visual size variant.
+   * - `md` (default, 20px): the original size; used inside the
+   *   dropdown CommandItem list where there's plenty of vertical
+   *   room and the badge serves as the primary visual ID.
+   * - `sm` (14px): used inside the trigger pill so the pill stays
+   *   the same height as the neighboring device/branch pills,
+   *   which use 14px lucide icons. Without this the trigger pill
+   *   rendered ~6px taller than its row-mates.
+   */
+  size?: "sm" | "md";
 }) {
   const letter = (name || "?").charAt(0).toUpperCase();
   const hasColor = !!color;
+  const sizeClasses =
+    size === "sm"
+      ? "size-3.5 text-[8px] border"
+      : "size-5 text-[10px] border-[1.5px]";
   return (
     <div
       className={cn(
-        "size-5 rounded flex items-center justify-center shrink-0 text-[10px] font-medium border-[1.5px]",
+        "rounded flex items-center justify-center shrink-0 font-medium",
+        sizeClasses,
         !hasColor && "bg-muted text-muted-foreground border-border",
         className,
       )}
@@ -145,7 +162,15 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
           className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none"
         >
           {selectedName ? (
-            <ProjectAvatar name={selectedName} color={selectedColor} />
+            // `size="sm"` keeps the trigger pill the same height
+            // as the neighboring device + branch pills (their
+            // icons are 14px lucide glyphs). The full-size avatar
+            // is still used inside the dropdown list below.
+            <ProjectAvatar
+              name={selectedName}
+              color={selectedColor}
+              size="sm"
+            />
           ) : (
             <FolderOpen className="h-3.5 w-3.5" />
           )}

@@ -53,6 +53,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
+- Persistent agents (PTY daemon — step 1 of cloud push): `docs/features/persistent-agents.md`
+- Remote hosts (DevicePicker + codemux-remote + SSH transport — steps 2b/2c/2d of cloud push): `docs/features/remote-hosts.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`

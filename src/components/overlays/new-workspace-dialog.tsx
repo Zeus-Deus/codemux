@@ -16,6 +16,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { BranchPicker } from "./branch-picker";
+import { DevicePicker } from "@/components/hosts/device-picker";
 import {
   Tooltip,
   TooltipContent,
@@ -45,6 +46,7 @@ import {
   createWorkspace,
   createWorktreeWorkspace,
   importWorktreeWorkspace,
+  setWorkspaceHost,
   activateWorkspace,
   getPresets,
   checkIsGitRepo,
@@ -129,6 +131,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [branchAutoFilled, setBranchAutoFilled] = useState(false);
   const [branchMode, setBranchMode] = useState<"create_new" | "open_existing">("create_new");
   const [openExistingBranch, setOpenExistingBranch] = useState<string | null>(null);
+  // Which host the new workspace will run on. `null` = local (this
+  // device). Step 2b: the picker writes to this; the actual remote
+  // execution wiring happens in step 2d. For now selecting a remote
+  // host still creates the workspace locally — the host_id is
+  // recorded so the future "Push to host" action can pick it up
+  // without re-prompting.
+  const [hostId, setHostId] = useState<number | null>(null);
 
   // Data state
   const [presets, setPresets] = useState<TerminalPreset[]>([]);
@@ -162,6 +171,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setBranchAutoFilled(false);
     setBranchMode("create_new");
     setOpenExistingBranch(null);
+    setHostId(null);
   }
   prevOpenRef.current = open;
 
@@ -482,6 +492,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             toast.warning("Workspace created but issue linking failed. You can re-link from the workspace.");
           }
         }
+        if (hostId !== null) {
+          try {
+            await setWorkspaceHost(wsId, hostId);
+          } catch (hostErr) {
+            console.error("Failed to set workspace host:", hostErr);
+          }
+        }
         removePendingWorkspace(tempId);
         await activateWorkspace(wsId);
         return;
@@ -578,6 +595,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
 
+      // Persist host_id on the new workspace. Best-effort: a failed
+      // call only loses the device assignment, not the workspace
+      // itself — and the user can re-pick the host from the
+      // workspace header badge.
+      if (hostId !== null) {
+        try {
+          await setWorkspaceHost(wsId, hostId);
+        } catch (hostErr) {
+          console.error("Failed to set workspace host:", hostErr);
+        }
+      }
+
       removePendingWorkspace(tempId);
       await activateWorkspace(wsId);
     } catch (err) {
@@ -597,6 +626,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     allBranches,
     branchMode,
     openExistingBranch,
+    hostId,
     branchWorkspaceMap,
     worktrees,
     existingWorktreePaths,
@@ -731,8 +761,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
             {/* Footer inside textarea border */}
             <div className="flex items-center justify-between px-3 pb-3 pt-0">
-              {/* Agent picker — pill with real icon */}
-              <DropdownMenu>
+              <div className="flex items-center gap-2 min-w-0">
+                {/* Agent picker — pill with real icon. The DEVICE
+                    picker used to live here too, but it belongs
+                    with project + branch in the row below — those
+                    are all "workspace identity" choices, while the
+                    agent is "session content." See bottom row. */}
+                <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <button
                     type="button"
@@ -771,6 +806,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   ))}
                 </DropdownMenuContent>
               </DropdownMenu>
+              </div>
 
               <div className="flex items-center gap-1">
                 {/* Attach files */}
@@ -900,8 +936,19 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           )}
         </div>
 
-        {/* Bottom row: project + branch pickers as muted pills */}
+        {/* Bottom row: device + project + branch pickers as muted
+            pills. All three are "workspace identity" choices — on
+            what device, what project, on what branch. Device
+            comes leftmost because picking "where" constrains
+            everything downstream (project list, branch list). The
+            agent picker is a separate tier (session content) and
+            stays inside the textarea footer above. */}
         <div className="flex items-center gap-2 px-4 pb-3">
+          {/* Device picker — leftmost in the identity row. `null`
+              = local. Styled to match the project + branch pills
+              (rounded-full, bg-muted/60, ChevronDown). */}
+          <DevicePicker hostId={hostId} onSelectHostId={setHostId} />
+
           <ProjectPicker
             value={projectDir || null}
             onChange={(path) => setProjectDir(path)}

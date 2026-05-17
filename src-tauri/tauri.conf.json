@@ -4,9 +4,9 @@
   "version": "0.3.1",
   "identifier": "com.codemux.app",
   "build": {
-    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && npm run dev",
+    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && npm run build",
+    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh && npm run build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -37,7 +37,8 @@
       "binaries/agent-browser"
     ],
     "resources": [
-      "binaries/codemux-claude-sidecar-*"
+      "binaries/codemux-claude-sidecar-*",
+      "binaries/codemux-remote-*"
     ],
     "linux": {
       "deb": {

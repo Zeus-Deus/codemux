@@ -241,28 +241,44 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   }, []);
 
   // ── Update status overlay ──
+  //
+  // Mutates DOM directly (h2/p/.status-meta) rather than going
+  // through React for perf — terminal status fires per IPC tick
+  // and we don't want to schedule a re-render of the whole pane
+  // for every status update.
+  //
+  // The visual state (spinner vs warning indicator) is also
+  // toggled via display=flex/none on the two icon slots inside
+  // .status-indicator — same DOM-mutation pattern. The Tailwind
+  // classes on the slots define the static look; we just toggle
+  // visibility based on state.
   const updateStatusOverlay = useCallback((status: TerminalStatusPayload) => {
     statusRef.current = status;
     const el = statusOverlayRef.current;
     if (!el) return;
     if (status.state === "ready") {
       el.style.display = "none";
-    } else {
-      el.style.display = "flex";
-      el.className = `terminal-overlay ${status.state}`;
-      const h2 = el.querySelector("h2");
-      const p = el.querySelector("p");
-      const code = el.querySelector(".status-meta");
-      if (h2)
-        h2.textContent =
-          status.state === "failed"
-            ? "Terminal unavailable"
-            : "Terminal starting";
-      if (p) p.textContent = status.message ?? "Waiting for shell status...";
-      if (code)
-        code.textContent =
-          status.exit_code !== null ? `Exit code: ${status.exit_code}` : "";
+      return;
     }
+    el.style.display = "flex";
+    // Keep the base classes (positioning, backdrop) and append
+    // the state for any state-specific CSS hooks downstream.
+    el.className = `terminal-overlay ${status.state} absolute inset-0 z-0 flex items-center justify-center p-6 bg-background/95 backdrop-blur-sm`;
+    const failed = status.state === "failed";
+    // Swap spinner vs warning indicator visibility.
+    const spinner = el.querySelector<HTMLElement>(".status-indicator .spinner");
+    const warning = el.querySelector<HTMLElement>(".status-indicator .warning");
+    if (spinner) spinner.style.display = failed ? "none" : "block";
+    if (warning) warning.style.display = failed ? "flex" : "none";
+    const h2 = el.querySelector("h2");
+    const p = el.querySelector("p");
+    const code = el.querySelector(".status-meta");
+    if (h2)
+      h2.textContent = failed ? "Terminal unavailable" : "Terminal starting";
+    if (p) p.textContent = status.message ?? "Waiting for shell status...";
+    if (code)
+      code.textContent =
+        status.exit_code !== null ? `Exit code: ${status.exit_code}` : "";
   }, []);
 
   // ── Terminal status event ──
@@ -729,17 +745,44 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       />
       <div
         ref={statusOverlayRef}
-        className="terminal-overlay starting absolute inset-0 z-0 flex items-center justify-center p-4 bg-background/90"
+        className="terminal-overlay starting absolute inset-0 z-0 flex items-center justify-center p-6 bg-background/95 backdrop-blur-sm"
         style={{ display: statusRef.current.state === "ready" ? "none" : "flex" }}
       >
-        <div className="w-full max-w-[440px] p-4 border border-border rounded-sm bg-card">
-          <h2 className="mb-2 text-sm font-semibold text-foreground">
-            Terminal starting
-          </h2>
-          <p className="text-sm text-muted-foreground">
-            {statusRef.current.message ?? "Waiting for shell status..."}
-          </p>
-          <span className="status-meta mt-3 inline-block text-xs text-primary" />
+        {/* Centered status card. The h2/p/code below are mutated
+            DOM-side in updateStatusOverlay() for perf — don't
+            change their tags or query selectors without updating
+            the mutation code. The spinner is CSS-animated and
+            hidden via `[data-state="failed"]` so failed state
+            gets the warning dot instead.
+
+            For remote workspaces hitting tunnel timeout, the
+            failure message includes a "Try Test Connection /
+            Pull back" suggestion (see terminal/mod.rs Failed
+            emit path). */}
+        <div className="w-full max-w-[420px] rounded-lg border border-border bg-card shadow-lg overflow-hidden">
+          <div className="flex items-center gap-3 px-5 py-4 border-b border-border/60">
+            {/* Spinner shown for starting state, warning dot for
+                failed. CSS-only so DOM mutations on state change
+                just toggle the data attribute via className. */}
+            <div className="status-indicator relative size-4 shrink-0">
+              <div className="spinner absolute inset-0 rounded-full border-2 border-muted border-t-primary animate-spin" />
+              <div
+                className="warning absolute inset-0 rounded-full bg-destructive/90 hidden items-center justify-center text-[10px] font-bold text-destructive-foreground"
+                aria-hidden
+              >
+                !
+              </div>
+            </div>
+            <h2 className="text-sm font-semibold text-foreground leading-tight">
+              Terminal starting
+            </h2>
+          </div>
+          <div className="px-5 py-4 space-y-2">
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              {statusRef.current.message ?? "Waiting for shell status..."}
+            </p>
+            <span className="status-meta inline-block text-xs font-mono text-muted-foreground/70" />
+          </div>
         </div>
       </div>
     </div>

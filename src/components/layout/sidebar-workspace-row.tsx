@@ -24,7 +24,16 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { X, Laptop, GitBranch, Workflow, AlertTriangle, BellOff } from "lucide-react";
+import {
+  X,
+  Laptop,
+  GitBranch,
+  Workflow,
+  AlertTriangle,
+  BellOff,
+  Cloud,
+  Loader2,
+} from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { PrStatusIcon, humanizePrState, prStatusToneClass } from "@/components/github/pr-status-icon";
 import {
@@ -37,7 +46,11 @@ import {
   detectEditors,
   openInEditor,
   runWorkspaceSetup,
+  workspacePullBack,
+  workspacePushToHost,
+  type HostView,
 } from "@/tauri/commands";
+import { useHosts } from "@/stores/hosts-store";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -214,9 +227,69 @@ export function WorkspaceContextMenuItems({
     workspace.project_root ?? (isWorktree ? null : workspace.cwd),
   );
 
+  // Hosts feed the "Move to host..." submenu. Reads from the shared
+  // store cache so N workspace rows share ONE IPC round-trip instead
+  // of one each. See `src/stores/hosts-store.ts`.
+  const hosts = useHosts();
+
   useEffect(() => {
     detectEditors().then(setEditors).catch(console.error);
   }, []);
+
+  const isRemote =
+    workspace.host_id !== null && workspace.host_id !== undefined;
+  const setPushPullInFlight = useAppStore(
+    (s) => s.setWorkspacePushPullInFlight,
+  );
+
+  // Push the workspace to the chosen host. The backend atomically
+  // sets host_id only on successful rsync, so we don't need the
+  // optimistic-set + rollback dance that used to flicker the icon.
+  // On failure the workspace stays local with a toast.
+  const handleMoveToHost = async (host: HostView) => {
+    setPushPullInFlight(workspace.workspace_id);
+    try {
+      const result = await workspacePushToHost(
+        workspace.workspace_id,
+        host.id,
+      );
+      if (result.ok) {
+        toast.success(`Pushed to ${host.name}`, {
+          description: result.message,
+        });
+      } else {
+        toast.error(`Push to ${host.name} failed`, {
+          description: result.message,
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error("Push failed", { description: message });
+    } finally {
+      setPushPullInFlight(null);
+    }
+  };
+
+  const handlePullBack = async () => {
+    setPushPullInFlight(workspace.workspace_id);
+    try {
+      const result = await workspacePullBack(workspace.workspace_id);
+      if (result.ok) {
+        toast.success("Pulled back to this device", {
+          description: result.message,
+        });
+      } else {
+        toast.error("Pull back failed", {
+          description: result.message,
+        });
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error("Pull back failed", { description: message });
+    } finally {
+      setPushPullInFlight(null);
+    }
+  };
 
   const handleRename = () => {
     const newTitle = window.prompt("Rename workspace", workspace.title);
@@ -307,6 +380,41 @@ export function WorkspaceContextMenuItems({
           ? "Unmute notifications"
           : "Mute notifications"}
       </ContextMenuItem>
+
+      {/* Cloud-push (step 2): Move to host… / Pull back. Position is
+          between mute and Close Worktree so destructive actions stay
+          at the bottom. Move shows a submenu of configured hosts;
+          Pull back appears only when the workspace is currently
+          remote. Both fall back to "go to Settings" when no hosts
+          are configured. */}
+      <ContextMenuSeparator />
+      {isRemote ? (
+        <ContextMenuItem onClick={() => void handlePullBack()}>
+          Pull back to this device
+        </ContextMenuItem>
+      ) : hosts.length > 0 ? (
+        <ContextMenuSub>
+          <ContextMenuSubTrigger>Move to host…</ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            {hosts.map((host) => (
+              <ContextMenuItem
+                key={host.id}
+                onClick={() => void handleMoveToHost(host)}
+              >
+                {host.name}
+              </ContextMenuItem>
+            ))}
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+      ) : (
+        <ContextMenuItem
+          disabled
+          title="Add hosts in Settings → Hosts to push workspaces"
+        >
+          Move to host… (no hosts configured)
+        </ContextMenuItem>
+      )}
+
       <ContextMenuSeparator />
       <ContextMenuItem onClick={onRemoveRequest}>
         Close Worktree
@@ -374,14 +482,29 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   // and the button's Hide-only dialog feels like a ghost click. Match
   // Cursor 3: hide the X on these rows.
   const canDelete = !isPrimary;
-  const icon =
-    workspace.workspace_type === "open_flow" ? (
-      <Workflow className="h-4 w-4 shrink-0 text-muted-foreground" />
-    ) : isPrimary ? (
-      <Laptop className="h-4 w-4 shrink-0 text-muted-foreground" />
-    ) : (
-      <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
-    );
+  // Icon picks up the workspace's location: Cloud for remote
+  // workspaces (host_id set), Loader2 while a push/pull is in flight,
+  // Workflow for OpenFlow workspaces, Laptop for the primary
+  // checkout, GitBranch for local branch workspaces. The remote
+  // disconnect indicator (CloudOff in muted color) lands when the
+  // TunnelSupervisor's status feed is wired into this row — for now
+  // a remote workspace is just "Cloud."
+  const isRemote =
+    workspace.host_id !== null && workspace.host_id !== undefined;
+  const isPushOrPullInFlight = useAppStore(
+    (s) => s.workspacePushPullInFlight === workspace.workspace_id,
+  );
+  const icon = isPushOrPullInFlight ? (
+    <Loader2 className="h-4 w-4 shrink-0 text-muted-foreground animate-spin" />
+  ) : isRemote ? (
+    <Cloud className="h-4 w-4 shrink-0 text-muted-foreground" />
+  ) : workspace.workspace_type === "open_flow" ? (
+    <Workflow className="h-4 w-4 shrink-0 text-muted-foreground" />
+  ) : isPrimary ? (
+    <Laptop className="h-4 w-4 shrink-0 text-muted-foreground" />
+  ) : (
+    <GitBranch className="h-4 w-4 shrink-0 text-muted-foreground" />
+  );
 
   const showPrIcon = !!workspace.pr_state && workspaceStatus !== "working";
   const prHumanState = humanizePrState(workspace.pr_state);
@@ -439,6 +562,10 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 )}>
                   {workspace.title}
                 </span>
+
+                {/* Remote workspaces are signalled by the leading
+                    Cloud icon (set above). No badge here — the icon
+                    swap is the indicator. */}
 
                 {/* Ahead/behind indicators */}
                 {(workspace.git_ahead > 0 || workspace.git_behind > 0) && (

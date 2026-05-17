@@ -692,10 +692,27 @@ fn wait_and_write_command(
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
-            let _ = writer.write_all(command_to_write.as_bytes());
-            let _ = writer.write_all(PTY_COMMAND_TERMINATOR);
-            let _ = writer.flush();
+            let result_a = writer.write_all(command_to_write.as_bytes());
+            let result_b = writer.write_all(PTY_COMMAND_TERMINATOR);
+            let result_c = writer.flush();
+            eprintln!(
+                "[codemux::presets] wrote preset/resume command to {session_id} \
+                 (write_ok={}, terminator_ok={}, flush_ok={}, cmd={command_to_write:?})",
+                result_a.is_ok(),
+                result_b.is_ok(),
+                result_c.is_ok(),
+            );
+        } else {
+            eprintln!(
+                "[codemux::presets] cannot write command to {session_id}: \
+                 runtime.writer is None"
+            );
         }
+    } else {
+        eprintln!(
+            "[codemux::presets] cannot write command to {session_id}: \
+             runtime missing from sessions map"
+        );
     }
 }
 
