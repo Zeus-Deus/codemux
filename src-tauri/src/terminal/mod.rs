@@ -1810,12 +1810,31 @@ pub fn get_terminal_status(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    let status = with_session_runtime(
+    // Use the existing-only variant. The auto-create variant
+    // (`with_session_runtime`) would conjure a fresh `SessionRuntime`
+    // here whose `last_status` defaults to `Starting`, which the
+    // frontend would dutifully display as a "Terminal starting…"
+    // overlay over a session that's actually dead. This was the
+    // spurious-Starting-popup bug on tab return for remote
+    // workspaces: the push terminated the session, the frontend
+    // later called getTerminalStatus, the auto-create gave back a
+    // synthetic Starting, and the popup appeared.
+    //
+    // Returning a synthetic Exited on miss is more honest — the
+    // session has no runtime, it's not coming back on its own. The
+    // frontend's overlay handler already knows how to display Exited
+    // cleanly.
+    let status = with_existing_session_runtime(
         &terminal_state.sessions,
         &session_id,
-        || SessionRuntime::new(&session_id),
         |runtime| runtime.last_status.clone(),
-    );
+    )
+    .unwrap_or_else(|| TerminalStatusPayload {
+        session_id: session_id.clone(),
+        state: TerminalLifecycleState::Exited,
+        message: Some("Session is no longer running".into()),
+        exit_code: None,
+    });
 
     Ok(status)
 }
