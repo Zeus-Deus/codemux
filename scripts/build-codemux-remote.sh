@@ -42,6 +42,15 @@ esac
 if [ ! -f "$SRC" ] && [ ! -f "$SRC_DEBUG" ] \
    && [ ! -f "$SRC_RELEASE_NO_TRIPLE" ] && [ ! -f "$SRC_DEBUG_NO_TRIPLE" ]; then
   echo "[build-codemux-remote] no existing binary — building debug"
+  # Chicken-and-egg: `codemux-remote` is a [[bin]] inside the same Cargo
+  # package as the `codemux` Tauri app, so `cargo build --bin
+  # codemux-remote` triggers that package's build.rs (tauri_build::build()).
+  # That build script scans tauri.conf.json's
+  # `bundle.resources = ["binaries/codemux-remote-*"]` glob and panics if
+  # nothing matches — but on a fresh checkout, nothing matches *until*
+  # we build the binary. Plant an empty stub at the glob target first so
+  # the resource scan passes; we overwrite it with the real binary below.
+  touch "$DST"
   cargo build --bin codemux-remote --manifest-path src-tauri/Cargo.toml
 fi
 
