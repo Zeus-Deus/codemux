@@ -487,26 +487,55 @@ pub async fn spawn_pty_for_session_via_daemon(
 
         if is_remote {
             // Remote: keep the conventional remote cwd; relaunch with
-            // ONLY the agent binary name (first whitespace-delimited
-            // token). The full original command often carries laptop-
+            // a CURATED subset of the original command's args, NOT
+            // the full thing. The full command often carries laptop-
             // specific args like `--system-prompt "$CODEMUX_AGENT_CONTEXT"`
-            // that the agent on the remote may not accept (different
-            // version, different conventions). Bare `claude` /
-            // `opencode` / `codex` is the lowest-common-denominator
-            // that works on any machine where the binary is installed.
-            // No --resume suffix either because the session JSONLs
-            // aren't synced to the remote yet.
+            // that the agent on the remote rejects (different version,
+            // different env content). What we keep:
+            //   - The binary name (first whitespace token)
+            //   - `--dangerously-skip-permissions` if it was set, so
+            //     remote claude doesn't block on approval prompts
+            //     (matches the user's local preset intent)
+            //   - `--resume <uuid>` if we captured a Claude session
+            //     id locally — the JSONLs were rsynced by the push
+            //     flow so this actually continues the conversation
             let full = in_memory_original
                 .clone()
                 .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
-            let cmd_opt = full.and_then(|s| {
-                s.split_whitespace().next().map(|t| t.to_string())
+            let agent_binary = full
+                .as_deref()
+                .and_then(|s| s.split_whitespace().next())
+                .map(|t| t.to_string());
+            // Detect --dangerously-skip-permissions in the original.
+            let had_skip_perms = full
+                .as_deref()
+                .map(|s| s.contains("--dangerously-skip-permissions"))
+                .unwrap_or(false);
+            // Look up the captured Claude session UUID (if any) from
+            // the in-memory snapshot's adapter_captures.
+            let claude_uuid = snapshot
+                .terminal_sessions
+                .iter()
+                .find(|s| s.session_id.0 == session_id)
+                .and_then(|s| s.adapter_captures.get("claude_session_id"))
+                .cloned();
+            let cmd_opt = agent_binary.map(|bin| {
+                let mut parts = vec![bin];
+                if had_skip_perms {
+                    parts.push("--dangerously-skip-permissions".to_string());
+                }
+                if let Some(uuid) = claude_uuid.as_ref() {
+                    parts.push("--resume".to_string());
+                    parts.push(uuid.clone());
+                }
+                parts.join(" ")
             });
             if let Some(cmd) = cmd_opt {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote relaunch for {session_id}: \
-                     {cmd} (stripped from full original_command; \
+                     {cmd} (skip_perms={had_skip_perms}, has_uuid={}; \
                      in_memory={}, disk_meta={})",
+                    claude_uuid.is_some(),
                     in_memory_original.is_some(),
                     disk_meta.is_some(),
                 );
@@ -518,28 +547,82 @@ pub async fn spawn_pty_for_session_via_daemon(
                      applied) — spawning bare bash"
                 );
             }
-        } else if let Some(adapter_state) =
-            app.try_state::<crate::session_adapters::AdapterState>()
-        {
-            // Local: full resume with --resume <uuid>. The original
-            // pipeline (disk meta + adapter capture lookup) still
-            // governs because that's where the captured UUID lives.
-            if let Some((ws_id, pane_id, meta)) = disk_meta {
+        } else {
+            // Local: use the SAME in-memory-first strategy as the
+            // remote branch. Pull-back lands here (the workspace was
+            // just migrated from remote → local, scrollback meta
+            // isn't persisted yet because the user hasn't closed
+            // the app since the migration). Reading only disk_meta
+            // means a fresh shell spawns instead of relaunching the
+            // agent — exactly the bug the user reported on pull-back.
+            //
+            // For the rare case where in_memory_original is missing
+            // AND disk_meta is present (e.g. an app-restart respawn
+            // before the user has interacted), we still fall back to
+            // the disk path which uses the full resolve_resume_command
+            // pipeline (more accurate, includes per-adapter args).
+            let full = in_memory_original
+                .clone()
+                .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
+            let agent_binary = full
+                .as_deref()
+                .and_then(|s| s.split_whitespace().next())
+                .map(|t| t.to_string());
+            let had_skip_perms = full
+                .as_deref()
+                .map(|s| s.contains("--dangerously-skip-permissions"))
+                .unwrap_or(false);
+            let claude_uuid = snapshot
+                .terminal_sessions
+                .iter()
+                .find(|s| s.session_id.0 == session_id)
+                .and_then(|s| s.adapter_captures.get("claude_session_id"))
+                .cloned();
+
+            // Prefer the existing scrollback+adapter pipeline when
+            // BOTH disk_meta and adapter_state are available — it
+            // handles all the per-adapter quirks the bare-binary
+            // path doesn't. Otherwise synthesize like the remote
+            // branch does.
+            if let (Some(adapter_state), Some((ws_id, pane_id, meta))) = (
+                app.try_state::<crate::session_adapters::AdapterState>(),
+                disk_meta.as_ref(),
+            ) {
                 effective_cwd = super::resolve_session_cwd(
                     &meta.working_directory,
                     &effective_cwd,
                 );
                 if let Some(resume_command) = super::resolve_resume_command(
                     &snapshot,
-                    &meta,
+                    meta,
                     &adapter_state,
                 ) {
                     eprintln!(
-                        "[codemux::terminal::daemon_backed] restored session at \
-                         {ws_id}/{pane_id} for {session_id}; auto-resume armed"
+                        "[codemux::terminal::daemon_backed] local restore via \
+                         disk_meta+adapter for {session_id} at {ws_id}/{pane_id}"
                     );
                     auto_resume_command = Some(resume_command);
                 }
+            } else if let Some(bin) = agent_binary {
+                // No disk_meta (pull-back, fresh-after-preset, etc.)
+                // — synthesize from in-memory exactly like the remote
+                // path. This is what makes pull-back actually relaunch
+                // Claude with the just-synced conversation history.
+                let mut parts = vec![bin];
+                if had_skip_perms {
+                    parts.push("--dangerously-skip-permissions".to_string());
+                }
+                if let Some(uuid) = claude_uuid.as_ref() {
+                    parts.push("--resume".to_string());
+                    parts.push(uuid.clone());
+                }
+                let cmd = parts.join(" ");
+                eprintln!(
+                    "[codemux::terminal::daemon_backed] local relaunch via in-memory for \
+                     {session_id}: {cmd} (skip_perms={had_skip_perms}, has_uuid={})",
+                    claude_uuid.is_some()
+                );
+                auto_resume_command = Some(cmd);
             }
         }
     }

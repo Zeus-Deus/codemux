@@ -398,6 +398,30 @@ async fn run_capture_with_timeout(
 ///
 /// Returns `~/.codemux/worktrees/<sanitized-project>/<sanitized-branch>`
 /// with leading-slash + non-`[A-Za-z0-9_.-]` collapsed to `-`.
+/// Encode an absolute path the way Claude Code does for its
+/// per-project session-history directory. Claude stores each
+/// project's conversation JSONLs at
+/// `~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl`, where
+/// the encoding replaces both `/` AND `.` with `-`.
+///
+/// Example: `/home/zeus/.codemux/worktrees/proj/main` →
+/// `-home-zeus--codemux-worktrees-proj-main`. The double dash comes
+/// from `/.codemux`: the `/` becomes `-` AND the `.` becomes `-`,
+/// adjacent. (Confirmed empirically: replacing only `/` produces
+/// `-home-zeus-.codemux-...` which Claude doesn't recognize — Claude
+/// uses `-home-zeus--codemux-...` with the dot ALSO mapped to `-`.)
+///
+/// Used by the push flow to figure out where on the remote host to
+/// rsync the laptop's Claude session JSONLs so `claude --resume <uuid>`
+/// finds them.
+pub fn claude_project_dir_name(absolute_path: &std::path::Path) -> String {
+    absolute_path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect()
+}
+
 pub fn conventional_remote_path(project_name: &str, branch: &str) -> PathBuf {
     fn sanitize(s: &str) -> String {
         s.chars()
@@ -421,6 +445,40 @@ pub fn conventional_remote_path(project_name: &str, branch: &str) -> PathBuf {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn claude_project_dir_name_matches_observed_encoding() {
+        // Pinned against a real directory listing on the author's
+        // machine — Claude Code stores per-project session JSONLs at
+        // `~/.claude/projects/<encoded>/` where the encoding is just
+        // `/` → `-`. The double-dash for `/.codemux` is incidental
+        // (leading `/` of `.codemux` becomes `-`, adjacent to the
+        // preceding `-`).
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new(
+                "/home/zeus/.codemux/worktrees/codemux-step1-test/final-smoke"
+            )),
+            "-home-zeus--codemux-worktrees-codemux-step1-test-final-smoke"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_handles_simple_path() {
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new("/home/user")),
+            "-home-user"
+        );
+    }
+
+    #[test]
+    fn claude_project_dir_name_handles_no_leading_slash() {
+        // Relative paths shouldn't really be passed here, but make
+        // sure we don't panic if they are.
+        assert_eq!(
+            claude_project_dir_name(std::path::Path::new("foo/bar")),
+            "foo-bar"
+        );
+    }
 
     #[test]
     fn push_rsync_argv_has_trailing_slash_on_source() {

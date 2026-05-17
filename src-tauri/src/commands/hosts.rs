@@ -439,6 +439,74 @@ pub async fn workspace_push_to_host(
                 );
                 crate::ssh::install_supervisor(&workspace_id, supervisor).await;
 
+                // Sync Claude session JSONLs from
+                // ~/.claude/projects/<local-encoded>/ to the
+                // remote's matching encoded path, so a fresh
+                // `claude --resume <uuid>` on the remote finds the
+                // conversation history. Best-effort: failure here
+                // only loses continuity, never blocks the push.
+                //
+                // We need the REMOTE's absolute cwd (with remote
+                // $HOME) for the encoded dir name. Query $HOME via
+                // ssh — ~1s round trip, only when there's actually
+                // local history to sync.
+                let local_workspace_cwd =
+                    std::path::PathBuf::from(&ws.cwd);
+                if !local_workspace_cwd.as_os_str().is_empty() {
+                    match tokio::process::Command::new("ssh")
+                        .arg("-o")
+                        .arg("BatchMode=yes")
+                        .arg(&host.ssh_target)
+                        .arg("echo $HOME")
+                        .output()
+                        .await
+                    {
+                        Ok(out) if out.status.success() => {
+                            let remote_home =
+                                String::from_utf8_lossy(&out.stdout)
+                                    .trim()
+                                    .to_string();
+                            if !remote_home.is_empty() {
+                                // Build the remote absolute cwd:
+                                // <remote_home>/.codemux/worktrees/<project>/<branch>
+                                let conv = crate::ssh::conventional_remote_path(
+                                    &project_name,
+                                    &branch,
+                                );
+                                let conv_str = conv.to_string_lossy();
+                                let remote_rel = conv_str
+                                    .strip_prefix("~/")
+                                    .unwrap_or(&conv_str);
+                                let remote_absolute_cwd =
+                                    std::path::PathBuf::from(&remote_home)
+                                        .join(remote_rel);
+                                if let Err(error) = sync_claude_projects(
+                                    &host.ssh_target,
+                                    &local_workspace_cwd,
+                                    &remote_absolute_cwd,
+                                )
+                                .await
+                                {
+                                    eprintln!(
+                                        "[hosts] Claude JSONL sync failed (continuing — \
+                                         agent will launch but conversation will be \
+                                         fresh): {error}"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(out) => eprintln!(
+                            "[hosts] ssh 'echo $HOME' failed (status {}); \
+                             skipping Claude JSONL sync",
+                            out.status
+                        ),
+                        Err(e) => eprintln!(
+                            "[hosts] ssh 'echo $HOME' spawn failed: {e}; \
+                             skipping Claude JSONL sync"
+                        ),
+                    }
+                }
+
                 // Close any pre-existing sessions on this workspace's
                 // remote daemon BEFORE respawning. The daemon process
                 // outlives the Codemux app — a session_id from a
@@ -619,6 +687,74 @@ pub async fn workspace_pull_back(
         let result = crate::ssh::pull_workspace_back(opts).await;
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
+                // Symmetric Claude JSONL sync (remote → local) BEFORE
+                // we kill the remote and respawn locally. Without this,
+                // any conversation continuation that happened on the
+                // remote would be lost on pull-back.
+                //
+                // SAFETY: we only sync the workspace's specific
+                // encoded directory (not the whole projects/ tree),
+                // and we use rsync's default per-file mtime/size
+                // comparison so newer files (the remote's continued
+                // session) overwrite older ones (laptop's pre-push
+                // version). We do NOT pass --delete, so any local-
+                // only session files (e.g. older runs that never
+                // went to the remote) survive untouched.
+                let local_workspace_cwd =
+                    std::path::PathBuf::from(&ws.cwd);
+                if !local_workspace_cwd.as_os_str().is_empty() {
+                    match tokio::process::Command::new("ssh")
+                        .arg("-o")
+                        .arg("BatchMode=yes")
+                        .arg(&host.ssh_target)
+                        .arg("echo $HOME")
+                        .output()
+                        .await
+                    {
+                        Ok(out) if out.status.success() => {
+                            let remote_home =
+                                String::from_utf8_lossy(&out.stdout)
+                                    .trim()
+                                    .to_string();
+                            if !remote_home.is_empty() {
+                                let conv = crate::ssh::conventional_remote_path(
+                                    &project_name,
+                                    &branch,
+                                );
+                                let conv_str = conv.to_string_lossy();
+                                let remote_rel = conv_str
+                                    .strip_prefix("~/")
+                                    .unwrap_or(&conv_str);
+                                let remote_absolute_cwd =
+                                    std::path::PathBuf::from(&remote_home)
+                                        .join(remote_rel);
+                                if let Err(error) = pull_claude_projects(
+                                    &host.ssh_target,
+                                    &remote_absolute_cwd,
+                                    &local_workspace_cwd,
+                                )
+                                .await
+                                {
+                                    eprintln!(
+                                        "[hosts] Claude JSONL pull-back failed \
+                                         (continuing — agent will launch with whatever \
+                                         conversation history was already local): {error}"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(out) => eprintln!(
+                            "[hosts] ssh 'echo $HOME' failed on pull-back (status {}); \
+                             skipping Claude JSONL sync",
+                            out.status
+                        ),
+                        Err(e) => eprintln!(
+                            "[hosts] ssh 'echo $HOME' spawn failed on pull-back: {e}; \
+                             skipping Claude JSONL sync"
+                        ),
+                    }
+                }
+
                 // On success: clear host_id so the workspace is local
                 // again and the next pane spawn uses the local
                 // pty-daemon.
@@ -713,6 +849,193 @@ fn schedule_background_sync(app: tauri::AppHandle) {
             eprintln!("[codemux::hosts] background sync failed: {error}");
         }
     });
+}
+
+/// Sync the laptop's per-workspace Claude session JSONLs to the
+/// matching encoded directory on the remote host, so a fresh
+/// `claude --resume <uuid>` invocation on the remote finds the
+/// conversation history we built up locally.
+///
+/// Returns Ok(()) on success OR on benign "nothing to sync" (no
+/// local sessions for this workspace). Returns Err on actual
+/// rsync/SSH failure. Caller decides whether to propagate or
+/// warn-and-continue — for now we warn-and-continue because the
+/// agent will still launch (just without continuity), which is a
+/// strictly better outcome than blocking the push.
+#[cfg(unix)]
+async fn sync_claude_projects(
+    ssh_target: &str,
+    local_cwd: &std::path::Path,
+    remote_cwd: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    // Step 1: figure out the laptop-side source dir. If no Claude
+    // session has ever been started in this workspace, the dir
+    // doesn't exist — nothing to sync, success.
+    let local_home = std::env::var("HOME")
+        .map_err(|_| "HOME env var not set on laptop".to_string())?;
+    let local_dir_name = crate::ssh::claude_project_dir_name(local_cwd);
+    let local_source = std::path::PathBuf::from(&local_home)
+        .join(".claude")
+        .join("projects")
+        .join(&local_dir_name);
+    if !local_source.exists() {
+        eprintln!(
+            "[hosts] no local Claude session history for this workspace \
+             ({}); skipping JSONL sync",
+            local_source.display()
+        );
+        return Ok(());
+    }
+
+    // Step 2: compute the remote-side destination dir name. The
+    // encoded path uses the REMOTE's absolute cwd (with remote
+    // $HOME), not the laptop's.
+    let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
+    // Use `~/.claude/projects/<encoded>/` on the remote — rsync
+    // tilde-expands via the remote shell.
+    let remote_dest = format!("{ssh_target}:~/.claude/projects/{remote_dir_name}/");
+
+    // Step 3: ensure the remote dest dir exists. rsync creates the
+    // LAST path component but not parents; mkdir -p covers the
+    // ~/.claude/projects/<encoded>/ chain in one shot.
+    let mkdir = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(ssh_target)
+        .arg(format!(
+            "mkdir -p ~/.claude/projects/{}",
+            shell_word_quote(&remote_dir_name)
+        ))
+        .status()
+        .await
+        .map_err(|e| format!("ssh mkdir spawn: {e}"))?;
+    if !mkdir.success() {
+        return Err(format!("mkdir on remote failed (status: {mkdir})"));
+    }
+
+    // Step 4: rsync the JSONLs. Use trailing slash on source so
+    // contents (not the dir itself) land at the destination. No
+    // --delete because the remote may have OTHER sessions started
+    // there that we don't want to wipe.
+    let source_with_slash = format!("{}/", local_source.display());
+    let rsync = Command::new("rsync")
+        .arg("-a")
+        .arg("--no-owner")
+        .arg("--no-group")
+        .arg("-e")
+        .arg("ssh -o BatchMode=yes")
+        .arg(&source_with_slash)
+        .arg(&remote_dest)
+        .status()
+        .await
+        .map_err(|e| format!("rsync spawn: {e}"))?;
+    if !rsync.success() {
+        return Err(format!("rsync failed (status: {rsync})"));
+    }
+    eprintln!(
+        "[hosts] synced Claude session JSONLs: {} → {}",
+        local_source.display(),
+        remote_dest
+    );
+    Ok(())
+}
+
+/// Minimal shell-quote for the encoded dir name. Encoded paths
+/// contain only `[A-Za-z0-9_-]` so this is mostly defensive; we
+/// just escape single quotes the standard way and wrap in single
+/// quotes.
+fn shell_word_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Symmetric to `sync_claude_projects` but pulls remote → local.
+/// Called from the pull-back flow so any conversation that
+/// continued on the remote comes back with the workspace files.
+///
+/// SAFETY (the explicit thing the user asked us to be careful about):
+/// - Scoped to ONE specific encoded directory (this workspace's),
+///   never the whole `~/.claude/projects/` tree
+/// - NO `--delete` flag — we don't want to nuke local-only files
+///   (older sessions, local-only experiments). The union of local
+///   and remote files exists after pull
+/// - Rsync's default per-file mtime/size comparison picks the
+///   newer copy when both sides have the same UUID (the remote
+///   one is newer because that's where the continuation happened)
+///
+/// Errors are non-fatal — the agent will still launch locally,
+/// just without the remote-side continuation.
+#[cfg(unix)]
+async fn pull_claude_projects(
+    ssh_target: &str,
+    remote_cwd: &std::path::Path,
+    local_cwd: &std::path::Path,
+) -> Result<(), String> {
+    use tokio::process::Command;
+
+    let local_home = std::env::var("HOME")
+        .map_err(|_| "HOME env var not set on laptop".to_string())?;
+    let local_dir_name = crate::ssh::claude_project_dir_name(local_cwd);
+    let local_dest = std::path::PathBuf::from(&local_home)
+        .join(".claude")
+        .join("projects")
+        .join(&local_dir_name);
+    // mkdir the local destination if it doesn't exist (first time
+    // pulling a workspace whose Claude sessions never ran locally).
+    if !local_dest.exists() {
+        if let Err(e) = std::fs::create_dir_all(&local_dest) {
+            return Err(format!("create local dest: {e}"));
+        }
+    }
+
+    let remote_dir_name = crate::ssh::claude_project_dir_name(remote_cwd);
+    // Check the remote dir exists first — if not, nothing to pull.
+    let probe = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(ssh_target)
+        .arg(format!(
+            "test -d ~/.claude/projects/{} && echo EXISTS || echo MISSING",
+            shell_word_quote(&remote_dir_name)
+        ))
+        .output()
+        .await
+        .map_err(|e| format!("ssh probe spawn: {e}"))?;
+    let probe_out = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+    if probe_out != "EXISTS" {
+        eprintln!(
+            "[hosts] no remote Claude session history at \
+             ~/.claude/projects/{remote_dir_name}/ on {ssh_target}; \
+             skipping pull-back of JSONLs"
+        );
+        return Ok(());
+    }
+
+    let remote_source = format!(
+        "{ssh_target}:~/.claude/projects/{remote_dir_name}/"
+    );
+    let local_dest_with_slash = format!("{}/", local_dest.display());
+    let rsync = Command::new("rsync")
+        .arg("-a")
+        .arg("--no-owner")
+        .arg("--no-group")
+        .arg("-e")
+        .arg("ssh -o BatchMode=yes")
+        .arg(&remote_source)
+        .arg(&local_dest_with_slash)
+        .status()
+        .await
+        .map_err(|e| format!("rsync spawn: {e}"))?;
+    if !rsync.success() {
+        return Err(format!("rsync failed (status: {rsync})"));
+    }
+    eprintln!(
+        "[hosts] pulled Claude session JSONLs back: {} → {}",
+        remote_source,
+        local_dest.display()
+    );
+    Ok(())
 }
 
 /// Probe the remote `codemux-remote` binary's version. If it
