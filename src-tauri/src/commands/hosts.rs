@@ -411,18 +411,33 @@ pub async fn workspace_push_to_host(
                 );
                 crate::ssh::install_supervisor(&workspace_id, supervisor).await;
                 // Stop-sync-restart for live PTYs: terminate the
-                // workspace's existing local sessions so the
-                // frontend's terminal-cache GC detects them dying
-                // and triggers a respawn. The respawn goes through
-                // `spawn_pty_for_session` → daemon path →
-                // `client_for_workspace` which now sees host_id is
-                // set and routes through the new tunnel. Same model
-                // as the local persistent-daemon case described in
-                // docs/features/persistent-agents.md, just over
-                // SSH. Without this the user is stuck staring at
-                // local sessions inside a "remote" workspace until
-                // they manually close panes.
+                // workspace's existing local sessions, then
+                // explicitly re-spawn each pane's session so the
+                // user's terminals come back online on the remote
+                // daemon. We tried "let the frontend respawn from
+                // GC" originally but the frontend has no auto-
+                // respawn path (the cache GC only DISPOSES dead
+                // entries); without an explicit backend respawn
+                // the user just sees "shell ended" overlays and
+                // has to manually close + reopen every pane.
+                //
+                // `spawn_pty_for_session` is idempotent per
+                // session id (gated by `try_reserve_session_spawn`),
+                // and now routes through `client_for_workspace`
+                // which sees host_id is set → remote daemon →
+                // fresh shells appear on the host machine.
+                //
+                // Caveat: agent sessions (Claude, opencode, etc.)
+                // come back as plain shells in this respawn — we
+                // don't yet recover the original adapter spec from
+                // the session metadata. The user can re-launch
+                // their agent manually from the shell. Faithful
+                // agent respawn is a follow-up.
                 terminate_workspace_sessions(&app, &workspace_id);
+                crate::terminal::spawn_missing_ptys_for_workspace(
+                    app.clone(),
+                    &workspace_id,
+                );
                 WorkspacePushOutcome {
                     ok: true,
                     message: format!("Workspace pushed to {}", host.name),
@@ -531,10 +546,16 @@ pub async fn workspace_pull_back(
                 crate::ssh::forget_workspace_client(&workspace_id).await;
                 crate::ssh::shutdown_supervisor(&workspace_id).await;
                 // Symmetric to push: terminate remote-routed PTY
-                // sessions so the frontend respawns them, this time
-                // routing through the local daemon (host_id is now
-                // None).
+                // sessions and immediately respawn each pane's
+                // session on the local daemon (host_id is now
+                // None, so `client_for_workspace` returns the
+                // local singleton). Same agent-caveat as push —
+                // see the long comment in `workspace_push_to_host`.
                 terminate_workspace_sessions(&app, &workspace_id);
+                crate::terminal::spawn_missing_ptys_for_workspace(
+                    app.clone(),
+                    &workspace_id,
+                );
                 WorkspacePullOutcome {
                     ok: true,
                     message: format!("Workspace pulled back from {}", host.name),
