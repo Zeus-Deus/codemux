@@ -774,12 +774,34 @@ impl std::io::Write for DaemonWriter {
         let client = self.client.clone();
         let session_id = self.session_id.clone();
         let data = buf.to_vec();
+        let len = data.len();
+        // Log the bytes so we can verify that auto-resume-command and
+        // user keystrokes are actually being dispatched to the daemon
+        // (and from there to the remote master fd). Cap the preview at
+        // 80 chars so a long claude --resume command line is readable
+        // in stderr without flooding.
+        let preview: String = String::from_utf8_lossy(&data)
+            .chars()
+            .take(80)
+            .collect();
+        eprintln!(
+            "[codemux::terminal::daemon_backed] DaemonWriter dispatching {len}B to \
+             {session_id}: {preview:?}"
+        );
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = client.write(session_id.clone(), &data).await {
-                eprintln!(
-                    "[codemux::terminal::daemon_backed] write to session {session_id} \
-                     failed: {error}"
-                );
+            match client.write(session_id.clone(), &data).await {
+                Ok(()) => {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] DaemonWriter dispatch ok for \
+                         {session_id} ({len}B delivered to daemon)"
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
+                         {session_id}: {error}"
+                    );
+                }
             }
         });
         Ok(buf.len())
