@@ -454,42 +454,68 @@ pub async fn spawn_pty_for_session_via_daemon(
     // (b) determine Claude's path-encoding rule from its source;
     // (c) rsync the per-project JSONLs with path translation.
     if session_restore_enabled {
-        if let Some(adapter_state) =
+        let disk_meta = crate::scrollback::find_scrollback_meta_for_session(&session_id);
+        if let Some((_, ref pane_id, _)) = disk_meta {
+            pane_id_for_env = Some(pane_id.clone());
+        }
+
+        // For the agent-relaunch command, prefer the IN-MEMORY snapshot
+        // because the disk-side scrollback meta is only persisted on
+        // explicit close (via flush_cache_to_disk) — not on every
+        // keystroke. So a user who opens Claude, sends one message,
+        // and immediately pushes has no disk meta yet, and the disk
+        // lookup returns None. The in-memory snapshot has the original
+        // command from the moment the preset was applied
+        // (update_terminal_session_command in commands/presets.rs).
+        let in_memory_original = snapshot
+            .terminal_sessions
+            .iter()
+            .find(|s| s.session_id.0 == session_id)
+            .and_then(|s| s.original_command.clone());
+
+        if is_remote {
+            // Remote: keep the conventional remote cwd; relaunch the
+            // bare original command (no --resume suffix because the
+            // session JSONLs aren't synced to the remote yet).
+            let cmd_opt = in_memory_original
+                .clone()
+                .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
+            if let Some(cmd) = cmd_opt {
+                eprintln!(
+                    "[codemux::terminal::daemon_backed] remote relaunch for {session_id}: \
+                     {cmd} (in_memory={}, disk_meta={})",
+                    in_memory_original.is_some(),
+                    disk_meta.is_some(),
+                );
+                auto_resume_command = Some(cmd);
+            } else {
+                eprintln!(
+                    "[codemux::terminal::daemon_backed] remote respawn for {session_id} \
+                     has no original_command (was a plain shell, or preset wasn't yet \
+                     applied) — spawning bare bash"
+                );
+            }
+        } else if let Some(adapter_state) =
             app.try_state::<crate::session_adapters::AdapterState>()
         {
-            if let Some((ws_id, pane_id, meta)) =
-                crate::scrollback::find_scrollback_meta_for_session(&session_id)
-            {
-                pane_id_for_env = Some(pane_id.clone());
-                if is_remote {
-                    // Remote: keep the conventional remote cwd; relaunch
-                    // the bare original command (no --resume suffix).
-                    if let Some(cmd) = meta.original_command.clone() {
-                        eprintln!(
-                            "[codemux::terminal::daemon_backed] remote session at \
-                             {ws_id}/{pane_id} for {session_id}; relaunching \
-                             agent fresh (conversation NOT resumed — session files \
-                             not yet synced to remote): {cmd}"
-                        );
-                        auto_resume_command = Some(cmd);
-                    }
-                } else {
-                    // Local: full resume with --resume <uuid>.
-                    effective_cwd = super::resolve_session_cwd(
-                        &meta.working_directory,
-                        &effective_cwd,
+            // Local: full resume with --resume <uuid>. The original
+            // pipeline (disk meta + adapter capture lookup) still
+            // governs because that's where the captured UUID lives.
+            if let Some((ws_id, pane_id, meta)) = disk_meta {
+                effective_cwd = super::resolve_session_cwd(
+                    &meta.working_directory,
+                    &effective_cwd,
+                );
+                if let Some(resume_command) = super::resolve_resume_command(
+                    &snapshot,
+                    &meta,
+                    &adapter_state,
+                ) {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] restored session at \
+                         {ws_id}/{pane_id} for {session_id}; auto-resume armed"
                     );
-                    if let Some(resume_command) = super::resolve_resume_command(
-                        &snapshot,
-                        &meta,
-                        &adapter_state,
-                    ) {
-                        eprintln!(
-                            "[codemux::terminal::daemon_backed] restored session at \
-                             {ws_id}/{pane_id} for {session_id}; auto-resume armed"
-                        );
-                        auto_resume_command = Some(resume_command);
-                    }
+                    auto_resume_command = Some(resume_command);
                 }
             }
         }
