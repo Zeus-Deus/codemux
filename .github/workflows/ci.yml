@@ -149,6 +149,28 @@ jobs:
             chmod +x "$DEST" 2>/dev/null || true
           fi
 
+      - name: Stage codemux-remote binary (placeholder for cargo check)
+        shell: bash
+        run: |
+          # tauri.conf.json's `bundle.resources = ["binaries/codemux-remote-*"]`
+          # makes tauri-build fail at compile time if no matching file
+          # exists. In release.yml the Ubuntu runner actually builds this
+          # binary (it ships in the .deb/.rpm/AppImage). In ci.yml we
+          # only need cargo check / cargo test to succeed — a zero-byte
+          # placeholder satisfies the glob without spending the time to
+          # cross-compile. Same pattern as the agent-browser stage above.
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          mkdir -p src-tauri/binaries
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-remote-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-remote-$TARGET" ;;
+          esac
+          if [ ! -f "$DEST" ]; then
+            echo "[ci] Creating zero-byte codemux-remote placeholder at $DEST"
+            touch "$DEST"
+            chmod +x "$DEST" 2>/dev/null || true
+          fi
+
       - name: Sidecar ToS boundary check
         # Static check that forbids the sidecar from reading Claude
         # credential files, hitting Anthropic URLs directly, spawning
