@@ -507,10 +507,18 @@ pub async fn spawn_pty_for_session_via_daemon(
                 .and_then(|s| s.split_whitespace().next())
                 .map(|t| t.to_string());
             // Detect --dangerously-skip-permissions in the original.
+            // Restrict to claude only — this flag is Claude-specific
+            // and other agents (opencode, codex, gemini) would either
+            // ignore it or error out. Without the binary check we'd
+            // forward a meaningless / hostile flag to those agents.
             let had_skip_perms = full
                 .as_deref()
                 .map(|s| s.contains("--dangerously-skip-permissions"))
-                .unwrap_or(false);
+                .unwrap_or(false)
+                && agent_binary
+                    .as_deref()
+                    .map(|b| b == "claude")
+                    .unwrap_or(false);
             // Look up the captured Claude session UUID (if any) from
             // the in-memory snapshot's adapter_captures.
             let claude_uuid = snapshot
