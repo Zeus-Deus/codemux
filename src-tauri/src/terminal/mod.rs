@@ -1783,6 +1783,77 @@ pub fn close_terminal_session(
     Ok(fallback_session.0)
 }
 
+/// Like `terminate_pty_session` but preserves `output_channel` +
+/// `pending_output` for daemon-backed (persistent) sessions, so the
+/// frontend's xterm stays connected across the kill-and-respawn that
+/// happens on workspace push/pull.
+///
+/// Without this, terminate removes the runtime entirely; the next
+/// spawn creates a fresh runtime with no output channel; all of the
+/// respawned PTY's output (including the agent's UI) goes into
+/// `pending_output` and only becomes visible when the user tab-
+/// switches away and back, which triggers `attach_pty_output` to
+/// reattach the channel and flush the buffer.
+///
+/// Falls back to the regular `terminate_pty_session` for non-
+/// persistent sessions — the in-process path doesn't have the same
+/// "respawn into same session id" pattern and its terminate semantics
+/// should stay unchanged.
+pub(crate) fn terminate_pty_session_keep_channel(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) {
+    // Mutate in place if persistent. Returns Some(daemon_client) for
+    // a persistent session we handled, None otherwise (we then fall
+    // through to the regular terminate).
+    let handled = with_existing_session_runtime(sessions, session_id, |rt| {
+        if !rt.persistent {
+            return None;
+        }
+        let daemon_client = rt.daemon_client.take();
+        rt.child_pid = None;
+        rt.writer = None;
+        rt.master = None;
+        // `persistent` flips to false so try_reserve_session_spawn
+        // sees an idle slot and reserves it. The next spawn flips it
+        // back to true after attaching.
+        rt.persistent = false;
+        rt.is_spawning = false;
+        rt.skip_preset_launch = false;
+        rt.resume_command = None;
+        // PRESERVED (the whole point): output_channel,
+        // pending_output, pending_output_bytes, last_status.
+        Some(daemon_client)
+    })
+    .flatten();
+
+    match handled {
+        Some(daemon_client) => {
+            // Tell the (old) daemon to close its side of the session.
+            // For remote workspaces this is the per-workspace SSH-
+            // tunneled client; for local persistent it's the singleton
+            // local daemon client. Background tokio task so we stay
+            // sync at this call site.
+            if let Some(client) = daemon_client {
+                let session_id = session_id.to_string();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = client.close(session_id.clone()).await {
+                        eprintln!(
+                            "[codemux::terminal] daemon close (keep-channel) failed for \
+                             {session_id}: {error}"
+                        );
+                    }
+                });
+            }
+        }
+        None => {
+            // Not persistent (or runtime missing) — defer to the
+            // regular terminate which handles the in-process path.
+            terminate_pty_session(sessions, session_id);
+        }
+    }
+}
+
 #[tauri::command]
 pub fn restart_terminal_session(
     app: AppHandle,

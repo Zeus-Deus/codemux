@@ -474,16 +474,27 @@ pub async fn spawn_pty_for_session_via_daemon(
             .and_then(|s| s.original_command.clone());
 
         if is_remote {
-            // Remote: keep the conventional remote cwd; relaunch the
-            // bare original command (no --resume suffix because the
-            // session JSONLs aren't synced to the remote yet).
-            let cmd_opt = in_memory_original
+            // Remote: keep the conventional remote cwd; relaunch with
+            // ONLY the agent binary name (first whitespace-delimited
+            // token). The full original command often carries laptop-
+            // specific args like `--system-prompt "$CODEMUX_AGENT_CONTEXT"`
+            // that the agent on the remote may not accept (different
+            // version, different conventions). Bare `claude` /
+            // `opencode` / `codex` is the lowest-common-denominator
+            // that works on any machine where the binary is installed.
+            // No --resume suffix either because the session JSONLs
+            // aren't synced to the remote yet.
+            let full = in_memory_original
                 .clone()
                 .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
+            let cmd_opt = full.and_then(|s| {
+                s.split_whitespace().next().map(|t| t.to_string())
+            });
             if let Some(cmd) = cmd_opt {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote relaunch for {session_id}: \
-                     {cmd} (in_memory={}, disk_meta={})",
+                     {cmd} (stripped from full original_command; \
+                     in_memory={}, disk_meta={})",
                     in_memory_original.is_some(),
                     disk_meta.is_some(),
                 );
@@ -774,34 +785,14 @@ impl std::io::Write for DaemonWriter {
         let client = self.client.clone();
         let session_id = self.session_id.clone();
         let data = buf.to_vec();
-        let len = data.len();
-        // Log the bytes so we can verify that auto-resume-command and
-        // user keystrokes are actually being dispatched to the daemon
-        // (and from there to the remote master fd). Cap the preview at
-        // 80 chars so a long claude --resume command line is readable
-        // in stderr without flooding.
-        let preview: String = String::from_utf8_lossy(&data)
-            .chars()
-            .take(80)
-            .collect();
-        eprintln!(
-            "[codemux::terminal::daemon_backed] DaemonWriter dispatching {len}B to \
-             {session_id}: {preview:?}"
-        );
+        // Only log on failure — the happy path fires for every
+        // keystroke, which would flood stderr.
         tauri::async_runtime::spawn(async move {
-            match client.write(session_id.clone(), &data).await {
-                Ok(()) => {
-                    eprintln!(
-                        "[codemux::terminal::daemon_backed] DaemonWriter dispatch ok for \
-                         {session_id} ({len}B delivered to daemon)"
-                    );
-                }
-                Err(error) => {
-                    eprintln!(
-                        "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
-                         {session_id}: {error}"
-                    );
-                }
+            if let Err(error) = client.write(session_id.clone(), &data).await {
+                eprintln!(
+                    "[codemux::terminal::daemon_backed] DaemonWriter dispatch failed for \
+                     {session_id}: {error}"
+                );
             }
         });
         Ok(buf.len())

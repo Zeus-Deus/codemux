@@ -660,6 +660,16 @@ fn terminate_workspace_sessions(
         .map(|w| crate::state::collect_terminal_sessions(&w.surfaces))
         .unwrap_or_default();
     for sid in session_ids {
-        crate::terminal::terminate_pty_session(&pty_state.sessions, &sid);
+        // Use the keep-channel variant so the frontend's xterm output
+        // channel survives the kill-and-respawn. Otherwise the user
+        // has to tab-switch away and back to see the respawned PTY's
+        // output (claude UI, shell prompt, etc.) — the regular
+        // terminate clears the output_channel and a fresh spawn gets
+        // a fresh runtime with no channel, so all post-respawn output
+        // buffers in pending_output until something forces a re-attach.
+        crate::terminal::terminate_pty_session_keep_channel(
+            &pty_state.sessions,
+            &sid,
+        );
     }
 }
