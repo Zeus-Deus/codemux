@@ -70,6 +70,34 @@ pub struct PtyDaemonClient {
 }
 
 impl PtyDaemonClient {
+    /// Test-only constructor that produces a real `Arc<PtyDaemonClient>`
+    /// with a connected-but-unused socket pair, so unit tests that need
+    /// to verify Arc identity (e.g. `Arc::ptr_eq` checks in
+    /// `terminal::is_runtime_owned_by_client`) can produce distinct
+    /// client allocations without setting up a real daemon process.
+    ///
+    /// The returned client is functional for `Arc::ptr_eq` but will hang
+    /// indefinitely on any request — never use it for actual RPC in
+    /// tests.
+    #[cfg(test)]
+    pub(crate) async fn new_for_test_arc_identity() -> Arc<Self> {
+        use tokio::net::UnixStream;
+        // socketpair() guarantees we get two halves we can hold
+        // forever without external setup; the other half is dropped
+        // immediately to avoid leaking fds, since we don't actually
+        // exchange frames in these tests.
+        let (a, _b) = UnixStream::pair().expect("socketpair");
+        let (_read_half, write_half) = a.into_split();
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let attached: AttachMap = Arc::new(Mutex::new(HashMap::new()));
+        Arc::new(Self {
+            writer: Arc::new(Mutex::new(write_half)),
+            next_request_id: AtomicU64::new(1),
+            pending,
+            attached,
+        })
+    }
+
     pub async fn connect(socket_path: &Path) -> Result<Arc<Self>, PtyDaemonError> {
         let stream = UnixStream::connect(socket_path).await?;
         let (read_half, write_half) = stream.into_split();

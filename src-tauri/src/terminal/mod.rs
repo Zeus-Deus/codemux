@@ -433,6 +433,32 @@ fn with_existing_session_runtime<T>(
 /// respawns and emits Ready, then the old session's close finally
 /// flushes its rx → read task ends → without this check, we'd emit
 /// a stale Exited and clobber Ready.
+/// Pure-function core of the "is this read task still relevant" check.
+/// Extracted from `emit_exited_if_client_owner` so the Arc-pointer
+/// comparison logic can be unit-tested without needing a real
+/// `tauri::AppHandle` or `PtyDaemonClient`.
+///
+/// Returns:
+/// - `true` if the runtime exists AND its `daemon_client` is the
+///   same Arc allocation as `client` (pointer-equal). The caller is
+///   the current owner and should emit.
+/// - `false` if the runtime is missing, its `daemon_client` is None,
+///   or it points to a different Arc (the caller is a stale read
+///   task from a previous spawn).
+pub(crate) fn is_runtime_owned_by_client(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    client: &Arc<crate::pty_daemon::PtyDaemonClient>,
+) -> bool {
+    with_existing_session_runtime(sessions, session_id, |rt| {
+        rt.daemon_client
+            .as_ref()
+            .map(|c| Arc::ptr_eq(c, client))
+            .unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 pub(crate) fn emit_exited_if_client_owner(
     app: &AppHandle,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
@@ -440,14 +466,7 @@ pub(crate) fn emit_exited_if_client_owner(
     client: &Arc<crate::pty_daemon::PtyDaemonClient>,
     message: &str,
 ) {
-    let still_ours = with_existing_session_runtime(sessions, session_id, |rt| {
-        rt.daemon_client
-            .as_ref()
-            .map(|c| Arc::ptr_eq(c, client))
-            .unwrap_or(false)
-    })
-    .unwrap_or(false);
-    if !still_ours {
+    if !is_runtime_owned_by_client(sessions, session_id, client) {
         eprintln!(
             "[codemux::terminal] skip Exited for {session_id}: stale read task \
              (runtime daemon_client is None or differs — session was respawned)"
@@ -3014,6 +3033,155 @@ mod tests {
 
     fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    // ── Regression tests for the cross-machine push spawn bugs ────────
+    //
+    // Each of these pins one of the four bugs from the marathon
+    // debugging session that landed in commit 6bb557e. If anyone
+    // simplifies the affected logic later, these tests will catch
+    // re-regressions before the user does.
+
+    /// `is_runtime_owned_by_client` returns true when the runtime's
+    /// `daemon_client` is the SAME Arc allocation as the caller's
+    /// — that's a current read task and Exited should fire.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_matching_arc_returns_true() {
+        let sessions = make_sessions();
+        let client = crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = Some(client.clone());
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            is_runtime_owned_by_client(&sessions, "session-X", &client),
+            "same Arc allocation must be detected as owner"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when the runtime's
+    /// `daemon_client` is a DIFFERENT Arc allocation (the session was
+    /// respawned with a fresh client). The caller is a stale read
+    /// task whose Exited would clobber the new spawn's Ready.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_different_arc_returns_false() {
+        let sessions = make_sessions();
+        let old_client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        let new_client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = Some(new_client.clone());
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-X", &old_client),
+            "old read task's stale Arc must be detected as no-longer-owner — \
+             without this check, the stale Exited overrides the new spawn's Ready"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when the runtime
+    /// has no daemon_client yet — covers the window between
+    /// `terminate_pty_session_keep_channel` clearing the client and
+    /// the new spawn populating it. A stale read task whose mpsc
+    /// returns None during this window must NOT emit Exited.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_none_client_returns_false() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.daemon_client = None;
+            guard.insert("session-X".into(), rt);
+        }
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-X", &client),
+            "runtime with no daemon_client (between terminate and respawn) \
+             must not be claimed by a stale read task"
+        );
+    }
+
+    /// `is_runtime_owned_by_client` returns false when no runtime
+    /// exists for the session id — covers the "session was fully
+    /// removed" case. No Exited should fire for nonexistent sessions.
+    #[tokio::test]
+    async fn is_runtime_owned_by_client_missing_runtime_returns_false() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        assert!(
+            !is_runtime_owned_by_client(&sessions, "session-missing", &client),
+            "no runtime → no owner → must return false"
+        );
+    }
+
+    /// `terminate_pty_session_keep_channel` for a daemon-backed
+    /// (persistent) session must PRESERVE `output_channel` and
+    /// `pending_output` so the frontend's xterm stays attached
+    /// across the kill-and-respawn that happens on workspace push.
+    /// Without this, the respawned PTY's output buffers in
+    /// `pending_output` until a tab-switch forces re-attach.
+    #[tokio::test]
+    async fn terminate_keep_channel_preserves_channel_for_persistent_session() {
+        let sessions = make_sessions();
+        let client =
+            crate::pty_daemon::PtyDaemonClient::new_for_test_arc_identity().await;
+        let starting_payload = TerminalStatusPayload {
+            session_id: "session-X".into(),
+            state: TerminalLifecycleState::Ready,
+            message: Some("ready".into()),
+            exit_code: None,
+        };
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut rt = SessionRuntime::new("session-X");
+            rt.persistent = true;
+            rt.daemon_client = Some(client.clone());
+            rt.child_pid = Some(12345);
+            rt.last_status = starting_payload.clone();
+            // Stash some pending output to verify it survives.
+            rt.pending_output.push_back(b"prior\n".to_vec());
+            rt.pending_output_bytes = 6;
+            guard.insert("session-X".into(), rt);
+        }
+
+        terminate_pty_session_keep_channel(&sessions, "session-X");
+        // Give the spawned tokio task a tick to run, even though
+        // we're not asserting on its side-effects.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let guard = sessions.lock().unwrap();
+        let rt = guard
+            .get("session-X")
+            .expect("runtime must still exist (the whole point of keep_channel)");
+        assert!(
+            rt.daemon_client.is_none(),
+            "daemon_client must be taken (old client is dead)"
+        );
+        assert!(rt.writer.is_none(), "writer must be cleared");
+        assert!(rt.child_pid.is_none(), "child_pid must be cleared");
+        assert!(!rt.persistent, "persistent flag must flip false so try_reserve sees idle");
+        assert!(!rt.is_spawning, "is_spawning must be false");
+        // The critical preservation property:
+        assert_eq!(
+            rt.pending_output.len(),
+            1,
+            "pending_output must be preserved — clearing it loses any output \
+             that arrived between terminate and the frontend's next attach"
+        );
+        assert!(
+            matches!(rt.last_status.state, TerminalLifecycleState::Ready),
+            "last_status must be preserved (don't overwrite the existing \
+             lifecycle state with a synthetic Exited; the respawn will emit \
+             its own Starting → Ready)"
+        );
     }
 
     // ── Shell + PATH tests ───────────────────────────────────────────
