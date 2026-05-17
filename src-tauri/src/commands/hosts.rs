@@ -226,6 +226,7 @@ pub struct HostTestResult {
 /// `#[cfg(unix)]`. On Windows we return an error message.
 #[tauri::command]
 pub async fn hosts_bootstrap_install(
+    app: tauri::AppHandle,
     db: State<'_, DatabaseStore>,
     id: i64,
     uname: String,
@@ -241,10 +242,10 @@ pub async fn hosts_bootstrap_install(
         use crate::ssh::bootstrap::{
             bootstrap_remote, BootstrapOptions, BootstrapResult,
         };
-        let outcome = bootstrap_remote(BootstrapOptions::new(
-            &host.ssh_target,
-            uname.trim(),
-        ))
+        let outcome = bootstrap_remote(
+            BootstrapOptions::new(&host.ssh_target, uname.trim())
+                .with_app(&app),
+        )
         .await;
         Ok(match outcome {
             BootstrapResult::Installed { reported_version } => HostBootstrapResult {
@@ -376,7 +377,7 @@ pub async fn workspace_push_to_host(
         // returns. Workaround: manually re-scp, or rebuild + clear
         // ~/.local/bin/codemux-remote on the remote so the version
         // probe sees MISSING and triggers a bootstrap.
-        if let Err(error) = ensure_remote_binary_current(&host).await {
+        if let Err(error) = ensure_remote_binary_current(&app, &host).await {
             // Don't block the push on this — if the auto-update fails,
             // the push may still work with the older binary. Log loudly
             // so we know to look here next time something cwd-shaped
@@ -1051,7 +1052,10 @@ async fn pull_claude_projects(
 /// failed (network down, no bundled binary for the target uname, etc.).
 /// Caller decides whether to propagate or warn-and-continue.
 #[cfg(unix)]
-async fn ensure_remote_binary_current(host: &crate::database::HostRecord) -> Result<(), String> {
+async fn ensure_remote_binary_current(
+    app: &tauri::AppHandle,
+    host: &crate::database::HostRecord,
+) -> Result<(), String> {
     use std::process::Stdio;
     use tokio::process::Command;
 
@@ -1117,7 +1121,11 @@ async fn ensure_remote_binary_current(host: &crate::database::HostRecord) -> Res
 
     // Step 4: bootstrap (scp + chmod + verify).
     use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
-    match bootstrap_remote(BootstrapOptions::new(&host.ssh_target, &uname)).await {
+    match bootstrap_remote(
+        BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
+    )
+    .await
+    {
         BootstrapResult::Installed { reported_version } => {
             eprintln!(
                 "[hosts] bootstrapped {} → codemux-remote {reported_version}",

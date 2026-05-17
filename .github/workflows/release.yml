@@ -139,6 +139,36 @@ jobs:
             exit 1
           fi
 
+      - name: Build codemux-remote binary (Linux x86_64 only)
+        # Used by the push-to-host (cloud-push) feature: this binary is
+        # scp'd to the user's remote SSH host the first time they push a
+        # workspace. Bundled as a Tauri resource so the laptop app can
+        # find it via app.path().resource_dir() at install time.
+        #
+        # Scoped to ubuntu-22.04 + x86_64-unknown-linux-gnu for v1:
+        #   - Windows Codemux can't push (remote daemon is #[cfg(unix)])
+        #   - ARM64 Linux + macOS remotes need additional rustup targets
+        #     and (for macOS) a macOS runner — deferred until demand
+        # If those expand later, add `--target` flags here for each
+        # extra triple and stage them at the matching path.
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          cargo build --release --bin codemux-remote --manifest-path src-tauri/Cargo.toml
+          mkdir -p src-tauri/binaries
+          cp src-tauri/target/release/codemux-remote \
+             src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu
+          chmod +x src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu
+          # Sanity-check: the file must be non-empty and executable. A
+          # broken binary here would ship a release whose cloud-push
+          # feature dies at first use with "Codemux build doesn't
+          # include codemux-remote for x86_64-unknown-linux-gnu".
+          if [ ! -s src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu ]; then
+            echo "::error::codemux-remote build did not produce a non-empty binary"
+            exit 1
+          fi
+          ls -la src-tauri/binaries/codemux-remote-*
+
       - name: Configure git identity
         # Some tauri build code paths call `git rev-parse` to embed a commit
         # hash into the binary metadata. Those calls succeed on a detached

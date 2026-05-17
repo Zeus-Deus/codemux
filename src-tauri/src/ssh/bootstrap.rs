@@ -50,28 +50,56 @@ pub fn target_for_uname(uname: &str) -> Option<&'static str> {
 /// Return the on-disk path of the `codemux-remote` binary matching
 /// the given target triple. Searched locations, in order:
 ///
-/// 1. **Bundled, target-suffixed** under the working directory or
-///    `src-tauri/binaries/` — what the release CI's cross-compile +
-///    bundling step produces (`codemux-remote-x86_64-unknown-linux-gnu`,
-///    etc.). This is the production path.
+/// 1. **Tauri resource dir** (`app.path().resource_dir() /
+///    binaries/codemux-remote-<target>`) — what an INSTALLED Codemux
+///    sees. The release CI builds codemux-remote, places it under
+///    `src-tauri/binaries/`, and tauri.conf.json's
+///    `bundle.resources = ["binaries/codemux-remote-*"]` packages
+///    it into the app bundle. At runtime it lives under the OS's
+///    standard resource location (e.g. `/usr/lib/codemux/resources/`
+///    for a `.deb` install). Requires an AppHandle, hence the
+///    `Option<&AppHandle>` parameter.
 ///
-/// 2. **Dev sibling next to the running codemux executable** —
+/// 2. **Source-tree relative paths** (`binaries/...`,
+///    `src-tauri/binaries/...`, `../binaries/...`) — for dev mode
+///    where `cargo run` puts cwd at the repo root or `src-tauri/`.
+///
+/// 3. **Dev sibling next to the running codemux executable** —
 ///    `current_exe().parent()/codemux-remote[.exe]`. Cargo produces
 ///    this when you `cargo build --bin codemux-remote`, sitting at
 ///    `src-tauri/target/debug/codemux-remote` next to `codemux`.
 ///    Only used when the target triple matches the build's host
 ///    triple (you can't push a linux binary to a mac, even in dev).
 ///
-/// 3. **Returns `None`** — caller treats as `BinaryNotBundled` and
+/// 4. **Returns `None`** — caller treats as `BinaryNotBundled` and
 ///    the UI surfaces the "your build doesn't include this" error
 ///    with the wanted target triple so the user knows what's
 ///    missing.
 ///
-/// The dev sibling fallback is what lets `cargo build && npm run
-/// tauri:dev` work for push to a SAME-ARCH remote without running
-/// the full release pipeline. Different-arch remotes still need
-/// the cross-compiled bundle.
-pub fn bundled_binary_path(target: &str) -> Option<PathBuf> {
+/// The Tauri resource_dir path is REQUIRED for installed-mode use;
+/// without it, an installed Codemux can't find its bundled binary
+/// and push-to-host dies on first attempt. The dev fallbacks are
+/// what let `cargo build && npm run tauri:dev` work for push to a
+/// SAME-ARCH remote without running the full release pipeline.
+pub fn bundled_binary_path(
+    app: Option<&tauri::AppHandle>,
+    target: &str,
+) -> Option<PathBuf> {
+    // Tauri resource dir — the installed-mode path. Skipped in
+    // tests / non-Tauri contexts where `app` is None.
+    if let Some(app) = app {
+        use tauri::Manager;
+        if let Ok(resource_dir) = app.path().resource_dir() {
+            let candidate = resource_dir
+                .join("binaries")
+                .join(format!("codemux-remote-{target}"));
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // Source-tree relative — dev mode with `cargo run`.
     let candidates = [
         PathBuf::from(format!("binaries/codemux-remote-{target}")),
         PathBuf::from(format!("src-tauri/binaries/codemux-remote-{target}")),
@@ -145,6 +173,11 @@ pub struct BootstrapOptions<'a> {
     /// PATH for most modern shells.
     pub remote_install_path: &'a str,
     pub timeout: Duration,
+    /// Optional Tauri AppHandle. When Some, `bundled_binary_path`
+    /// can locate the binary in the app's resource_dir (installed
+    /// mode). When None (tests, CLI paths), only the source-tree +
+    /// sibling fallbacks are tried.
+    pub app: Option<&'a tauri::AppHandle>,
 }
 
 impl<'a> BootstrapOptions<'a> {
@@ -154,7 +187,13 @@ impl<'a> BootstrapOptions<'a> {
             uname,
             remote_install_path: "~/.local/bin/codemux-remote",
             timeout: Duration::from_secs(90),
+            app: None,
         }
+    }
+
+    pub fn with_app(mut self, app: &'a tauri::AppHandle) -> Self {
+        self.app = Some(app);
+        self
     }
 }
 
@@ -167,7 +206,7 @@ pub async fn bootstrap_remote(opts: BootstrapOptions<'_>) -> BootstrapResult {
             };
         }
     };
-    let local_binary = match bundled_binary_path(target) {
+    let local_binary = match bundled_binary_path(opts.app, target) {
         Some(p) => p,
         None => {
             return BootstrapResult::BinaryNotBundled {
