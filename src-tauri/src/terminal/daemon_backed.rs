@@ -430,28 +430,66 @@ pub async fn spawn_pty_for_session_via_daemon(
     let mut auto_resume_command: Option<String> = None;
     let mut pane_id_for_env: Option<String> = None;
 
-    // Scrollback restore + adapter resume are local-machine
-    // concepts (the cache lives on disk on the laptop). Skip them
-    // for remote workspaces — when chat-on-remote ships we'll
-    // revisit how to coordinate adapter state across the tunnel.
-    if session_restore_enabled && !is_remote {
+    // Scrollback restore + adapter relaunch.
+    //
+    // LOCAL: full resume — the scrollback meta lives on this disk, the
+    // adapter's captured session id (e.g. Claude's UUID) is in
+    // adapter_captures, and Claude's `~/.claude/projects/<encoded-cwd>/`
+    // JSONLs are reachable. So we land in the original cwd and inject
+    // `<original> --resume <uuid>` so Claude continues the conversation.
+    //
+    // REMOTE: best-effort relaunch — same scrollback lookup (still on the
+    // laptop's disk, that's fine), but we do NOT use the original local
+    // cwd (path doesn't exist on the remote) and we do NOT append
+    // `--resume <uuid>` (Claude's per-project JSONLs aren't synced to the
+    // remote yet, so --resume would fail with "session not found").
+    // Instead we inject the bare `original_command` so Claude (or
+    // whichever adapter) at least starts on the remote with a fresh
+    // conversation. Honest UX given today's constraint.
+    //
+    // TODO (Tier 2): sync `~/.claude/projects/<encoded-local-cwd>/` →
+    // remote `~/.claude/projects/<encoded-remote-cwd>/` during the
+    // push flow, then re-enable the `--resume <uuid>` suffix for
+    // remote. Needs: (a) discover remote $HOME on first connect;
+    // (b) determine Claude's path-encoding rule from its source;
+    // (c) rsync the per-project JSONLs with path translation.
+    if session_restore_enabled {
         if let Some(adapter_state) =
             app.try_state::<crate::session_adapters::AdapterState>()
         {
             if let Some((ws_id, pane_id, meta)) =
                 crate::scrollback::find_scrollback_meta_for_session(&session_id)
             {
-                effective_cwd =
-                    super::resolve_session_cwd(&meta.working_directory, &effective_cwd);
                 pane_id_for_env = Some(pane_id.clone());
-                if let Some(resume_command) =
-                    super::resolve_resume_command(&snapshot, &meta, &adapter_state)
-                {
-                    eprintln!(
-                        "[codemux::terminal::daemon_backed] restored session at \
-                         {ws_id}/{pane_id} for {session_id}; auto-resume armed"
+                if is_remote {
+                    // Remote: keep the conventional remote cwd; relaunch
+                    // the bare original command (no --resume suffix).
+                    if let Some(cmd) = meta.original_command.clone() {
+                        eprintln!(
+                            "[codemux::terminal::daemon_backed] remote session at \
+                             {ws_id}/{pane_id} for {session_id}; relaunching \
+                             agent fresh (conversation NOT resumed — session files \
+                             not yet synced to remote): {cmd}"
+                        );
+                        auto_resume_command = Some(cmd);
+                    }
+                } else {
+                    // Local: full resume with --resume <uuid>.
+                    effective_cwd = super::resolve_session_cwd(
+                        &meta.working_directory,
+                        &effective_cwd,
                     );
-                    auto_resume_command = Some(resume_command);
+                    if let Some(resume_command) = super::resolve_resume_command(
+                        &snapshot,
+                        &meta,
+                        &adapter_state,
+                    ) {
+                        eprintln!(
+                            "[codemux::terminal::daemon_backed] restored session at \
+                             {ws_id}/{pane_id} for {session_id}; auto-resume armed"
+                        );
+                        auto_resume_command = Some(resume_command);
+                    }
                 }
             }
         }
