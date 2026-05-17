@@ -1903,6 +1903,7 @@ pub fn close_terminal_session(
 /// persistent sessions — the in-process path doesn't have the same
 /// "respawn into same session id" pattern and its terminate semantics
 /// should stay unchanged.
+#[cfg(unix)]
 pub(crate) fn terminate_pty_session_keep_channel(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
