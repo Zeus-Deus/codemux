@@ -1158,6 +1158,7 @@ async fn ensure_remote_binary_current(
 /// For persistent (daemon-backed) sessions, the terminate path
 /// already routes the kill through the daemon — see
 /// `terminal::terminate_pty_session`.
+#[cfg(unix)]
 fn terminate_workspace_sessions(
     app: &tauri::AppHandle,
     workspace_id: &str,
