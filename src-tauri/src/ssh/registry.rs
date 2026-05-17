@@ -205,7 +205,17 @@ pub async fn client_for_workspace(
                 host.ssh_target.clone(),
                 remote_socket,
                 local_socket,
-                "codemux-remote".to_string(),
+                // Same absolute path the push flow uses (see
+                // commands/hosts.rs:workspace_push_to_host). Non-
+                // interactive SSH shells don't have ~/.local/bin on
+                // PATH (only interactive shells do via ~/.profile /
+                // ~/.bashrc), so the bare `codemux-remote` would fail
+                // → SSH exits immediately → supervisor loops forever
+                // → client_for_workspace times out at 20s. This used
+                // to break "open app, click a remote workspace pane,
+                // session-X spawn fails" — the lazy path here was
+                // forgotten when the push path was fixed.
+                "$HOME/.local/bin/codemux-remote".to_string(),
             );
             install_supervisor(workspace_id, s.clone()).await;
             s

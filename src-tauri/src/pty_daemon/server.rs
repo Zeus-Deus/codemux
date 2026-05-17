@@ -540,7 +540,16 @@ async fn spawn_pty(
     for arg in argv.iter().skip(1) {
         cmd.arg(arg);
     }
-    cmd.cwd(&cwd);
+    // Tilde expansion: `cmd.cwd` calls `chdir` (libc), which does NOT
+    // expand `~/` — that's a shell-only thing. Tunneled spawns from
+    // remote workspaces pass `~/.codemux/worktrees/...` as cwd because
+    // the laptop side doesn't know the remote's HOME. If we passed the
+    // literal `~` to chdir, the child would fail to enter its cwd and
+    // (on some shells) exit immediately, killing the session before a
+    // single byte of prompt rendered. Expand here on the daemon side
+    // where we know the local HOME.
+    let resolved_cwd = expand_tilde(&cwd);
+    cmd.cwd(&resolved_cwd);
     for (k, v) in &env {
         cmd.env(k, v);
     }
@@ -677,6 +686,27 @@ async fn spawn_pty(
     Ok(pid)
 }
 
+/// Expand a leading `~/` (or bare `~`) in a path-as-string into the
+/// process's `$HOME`. No-op for paths without a leading tilde or when
+/// `$HOME` is unset.
+///
+/// Why this lives on the daemon side: tunneled spawns from a remote
+/// workspace pass `~/.codemux/worktrees/<project>/<branch>` as cwd
+/// because the laptop side doesn't know the remote's `$HOME`. The
+/// daemon DOES know its own `$HOME`. Resolving here means the laptop
+/// stays portable and we avoid a round trip to ask "what's your HOME".
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
+}
+
 #[cfg(unix)]
 fn kill_session_pid(pid: u32) {
     // Same single-SIGKILL killpg policy as the in-process path uses, for
@@ -697,4 +727,48 @@ fn kill_session_pid(pid: u32) {
 fn kill_session_pid(_pid: u32) {
     // Windows path TBD — TerminateProcess + JobObject. Tracked in
     // the windows-support follow-up; for the MVP we only run on Unix.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_tilde_slash_uses_home_env() {
+        // SAFETY: setting env in a single-threaded #[test] is fine
+        // because cargo test runs each test in its own thread but the
+        // env mutation here is scoped to assertion-checking only and
+        // doesn't outlive this test.
+        std::env::set_var("HOME", "/fake/home");
+        assert_eq!(
+            expand_tilde("~/.codemux/worktrees/proj/branch"),
+            "/fake/home/.codemux/worktrees/proj/branch"
+        );
+    }
+
+    #[test]
+    fn expand_tilde_bare_returns_home() {
+        std::env::set_var("HOME", "/another/home");
+        assert_eq!(expand_tilde("~"), "/another/home");
+    }
+
+    #[test]
+    fn expand_tilde_absolute_path_unchanged() {
+        std::env::set_var("HOME", "/whatever");
+        assert_eq!(expand_tilde("/usr/local/bin"), "/usr/local/bin");
+    }
+
+    #[test]
+    fn expand_tilde_relative_path_unchanged() {
+        std::env::set_var("HOME", "/whatever");
+        assert_eq!(expand_tilde("relative/path"), "relative/path");
+    }
+
+    #[test]
+    fn expand_tilde_mid_path_tilde_unchanged() {
+        // We only handle a LEADING tilde — `foo/~/bar` is not a
+        // tilde-expansion form; treat it as a literal path.
+        std::env::set_var("HOME", "/whatever");
+        assert_eq!(expand_tilde("foo/~/bar"), "foo/~/bar");
+    }
 }
