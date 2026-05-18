@@ -258,26 +258,26 @@ export function HostsSection() {
   }
 
   return (
-    <div className="flex h-full min-h-[400px]">
+    <div className="flex h-full min-h-[420px] gap-6">
       {/* Sidebar */}
-      <div className="w-64 shrink-0 border-r border-border pr-3">
-        <div className="mb-3 flex items-center justify-between">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <div className="w-56 shrink-0 border-r border-border/60 pr-5 flex flex-col">
+        <div className="mb-3 flex items-end justify-between gap-2">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
             Hosts
-          </h3>
-          <span className="text-[10px] text-muted-foreground/60 tabular-nums">
+          </p>
+          <span className="text-[11px] text-muted-foreground/60 tabular-nums">
             {hosts.length}
           </span>
         </div>
 
         {hosts.length === 0 && !draft && (
-          <p className="rounded-md border border-dashed border-border p-3 text-xs text-muted-foreground">
+          <div className="rounded-lg border border-dashed border-border/60 p-3 text-[12px] text-muted-foreground/80 leading-relaxed">
             No remote hosts yet. Add one to push workspaces from your laptop to a
             server you can SSH into.
-          </p>
+          </div>
         )}
 
-        <ul className="space-y-0.5">
+        <ul className="space-y-px">
           {hosts.map((host) => {
             const result = testResults[host.id];
             const isOnline = result?.ok === true;
@@ -287,26 +287,25 @@ export function HostsSection() {
                   type="button"
                   onClick={() => setSelectedId(host.id)}
                   className={cn(
-                    "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
-                    "hover:bg-muted/50",
-                    selectedId === host.id && "bg-muted",
+                    "group/host flex w-full items-center gap-2.5 rounded-md px-2.5 h-8 text-left text-[13px] transition-colors",
+                    selectedId === host.id
+                      ? "bg-muted text-foreground"
+                      : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
                   )}
                 >
                   <span
                     aria-hidden
                     className={cn(
-                      "size-1.5 shrink-0 rounded-full",
-                      isOnline ? "bg-emerald-500" : "bg-muted-foreground/40",
+                      "size-1.5 shrink-0 rounded-full transition-colors",
+                      isOnline ? "bg-success" : "bg-muted-foreground/40",
                     )}
                   />
                   <span className="min-w-0 flex-1 truncate">{host.name}</span>
                   {host.dirty && (
                     <span
                       title="Pending sync"
-                      className="text-[10px] text-amber-500"
-                    >
-                      •
-                    </span>
+                      className="size-1.5 shrink-0 rounded-full bg-warning"
+                    />
                   )}
                 </button>
               </li>
@@ -314,11 +313,11 @@ export function HostsSection() {
           })}
         </ul>
 
-        <div className="mt-3 border-t border-border pt-3">
+        <div className="mt-4 pt-4 border-t border-border/40">
           {draft ? (
-            <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3">
-              <div className="space-y-1">
-                <Label htmlFor="host-add-name" className="text-xs">
+            <div className="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="host-add-name" className="text-[11px] text-muted-foreground/85 font-normal">
                   Name
                 </Label>
                 <Input
@@ -329,10 +328,11 @@ export function HostsSection() {
                     setDraft({ ...draft, name: e.target.value })
                   }
                   autoFocus
+                  className="h-8 text-[13px]"
                 />
               </div>
-              <div className="space-y-1">
-                <Label htmlFor="host-add-target" className="text-xs">
+              <div className="space-y-1.5">
+                <Label htmlFor="host-add-target" className="text-[11px] text-muted-foreground/85 font-normal">
                   SSH target
                 </Label>
                 <Input
@@ -342,17 +342,19 @@ export function HostsSection() {
                   onChange={(e) =>
                     setDraft({ ...draft, ssh_target: e.target.value })
                   }
+                  className="h-8 text-[13px] font-mono"
                 />
-                <p className="text-[10px] text-muted-foreground">
-                  Anything `ssh` accepts. Your keys + config in `~/.ssh/` are
-                  used as-is.
+                <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
+                  Anything <code className="font-mono text-[10.5px]">ssh</code> accepts.
+                  Your keys + config in <code className="font-mono text-[10.5px]">~/.ssh/</code> are used as-is.
                 </p>
               </div>
-              <div className="flex justify-end gap-2 pt-1">
+              <div className="flex justify-end gap-1.5 pt-1">
                 <Button
                   type="button"
                   variant="ghost"
                   size="sm"
+                  className="h-7 px-3 text-[12px]"
                   onClick={() => {
                     setDraft(null);
                     setError(null);
@@ -364,6 +366,7 @@ export function HostsSection() {
                   type="button"
                   variant="secondary"
                   size="sm"
+                  className="h-7 px-3 text-[12px]"
                   onClick={handleAdd}
                 >
                   Add
@@ -373,9 +376,9 @@ export function HostsSection() {
           ) : (
             <Button
               type="button"
-              variant="outline"
+              variant="ghost"
               size="sm"
-              className="w-full justify-start gap-2"
+              className="w-full justify-start gap-2 h-8 px-2.5 text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
               onClick={() => setDraft({ name: "", ssh_target: "" })}
             >
               <Plus className="size-3.5" />
@@ -393,24 +396,28 @@ export function HostsSection() {
       </div>
 
       {/* Detail */}
-      <div className="flex-1 pl-6">
+      <div className="flex-1 min-w-0">
         {error && (
-          <div className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[12px] text-destructive leading-relaxed">
             {error}
           </div>
         )}
 
         {!selected ? (
-          <div className="flex h-full items-center justify-center text-center text-sm text-muted-foreground">
-            <div className="space-y-2">
-              <Server className="mx-auto size-8 opacity-30" />
-              <p>Select a host from the sidebar, or add a new one.</p>
+          <div className="flex h-full items-center justify-center text-center">
+            <div className="space-y-3">
+              <div className="mx-auto size-12 rounded-full bg-muted/40 border border-border/40 flex items-center justify-center">
+                <Server className="size-5 text-muted-foreground/60" />
+              </div>
+              <p className="text-[13px] text-muted-foreground/80">
+                Select a host from the list, or add a new one.
+              </p>
             </div>
           </div>
         ) : editingId === selected.id ? (
-          <div className="space-y-4">
-            <div className="space-y-1">
-              <Label htmlFor="host-edit-name">Name</Label>
+          <div className="space-y-5">
+            <div className="space-y-1.5">
+              <Label htmlFor="host-edit-name" className="text-[13px] font-medium text-foreground">Name</Label>
               <Input
                 id="host-edit-name"
                 value={editDraft.name}
@@ -418,35 +425,39 @@ export function HostsSection() {
                   setEditDraft({ ...editDraft, name: e.target.value })
                 }
                 autoFocus
+                className="h-9 text-[13px]"
               />
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="host-edit-target">SSH target</Label>
+            <div className="space-y-1.5">
+              <Label htmlFor="host-edit-target" className="text-[13px] font-medium text-foreground">SSH target</Label>
               <Input
                 id="host-edit-target"
                 value={editDraft.ssh_target}
                 onChange={(e) =>
                   setEditDraft({ ...editDraft, ssh_target: e.target.value })
                 }
+                className="h-9 text-[13px] font-mono"
               />
             </div>
-            <div className="flex justify-end gap-2">
+            <div className="flex justify-end gap-1.5 pt-2">
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
+                className="h-8 gap-1.5 text-[12px]"
                 onClick={handleCancelEdit}
               >
-                <X className="mr-1 size-3.5" />
+                <X className="size-3.5" />
                 Cancel
               </Button>
               <Button
                 type="button"
                 variant="secondary"
                 size="sm"
+                className="h-8 gap-1.5 text-[12px]"
                 onClick={handleSaveEdit}
               >
-                <Check className="mr-1 size-3.5" />
+                <Check className="size-3.5" />
                 Save
               </Button>
             </div>
@@ -455,54 +466,71 @@ export function HostsSection() {
           <div className="space-y-6">
             <div>
               <div className="mb-1 flex items-center gap-2">
-                <h2 className="text-base font-semibold">{selected.name}</h2>
+                <h3 className="text-[15px] font-semibold tracking-tight text-foreground">{selected.name}</h3>
                 {selected.dirty && (
-                  <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-medium text-amber-500">
+                  <span className="rounded-full bg-warning/15 border border-warning/30 px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider text-warning">
                     Pending sync
                   </span>
                 )}
               </div>
-              <p className="font-mono text-xs text-muted-foreground">
+              <p className="font-mono text-[12px] text-muted-foreground/85">
                 {selected.ssh_target}
               </p>
             </div>
 
-            <div className="rounded-md border border-border bg-muted/20 p-3">
-              <p className="mb-2 text-xs font-medium">Test connection</p>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={testingId === selected.id}
-                onClick={() => void handleTestConnection(selected)}
-              >
-                {testingId === selected.id ? (
-                  <>
-                    <Loader2 className="mr-2 size-3.5 animate-spin" />
-                    Testing…
-                  </>
-                ) : (
-                  "Test now"
-                )}
-              </Button>
-              {testResults[selected.id] && (
-                <div className="mt-2 space-y-2">
-                  <p
-                    className={cn(
-                      "text-xs",
-                      testResults[selected.id].ok
-                        ? "text-emerald-500"
-                        : "text-muted-foreground",
-                    )}
-                  >
-                    {testResults[selected.id].message}
+            <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[13px] font-medium text-foreground">Test connection</p>
+                  <p className="text-[11.5px] text-muted-foreground/75 leading-relaxed mt-0.5">
+                    Probes SSH reachability and the remote codemux-remote helper.
                   </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 text-[12px] gap-1.5 shrink-0"
+                  disabled={testingId === selected.id}
+                  onClick={() => void handleTestConnection(selected)}
+                >
+                  {testingId === selected.id ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" />
+                      Testing…
+                    </>
+                  ) : (
+                    "Test now"
+                  )}
+                </Button>
+              </div>
+              {testResults[selected.id] && (
+                <div className="space-y-2.5 pt-3 border-t border-border/40">
+                  <div className="flex items-start gap-2">
+                    <span
+                      className={cn(
+                        "size-1.5 rounded-full shrink-0 mt-1.5",
+                        testResults[selected.id].ok ? "bg-success" : "bg-muted-foreground/50",
+                      )}
+                    />
+                    <p
+                      className={cn(
+                        "text-[12px] leading-relaxed",
+                        testResults[selected.id].ok
+                          ? "text-success"
+                          : "text-muted-foreground/85",
+                      )}
+                    >
+                      {testResults[selected.id].message}
+                    </p>
+                  </div>
                   {testResults[selected.id].needs_install &&
                     testResults[selected.id].uname && (
                       <Button
                         type="button"
                         variant="secondary"
                         size="sm"
+                        className="h-8 text-[12px]"
                         disabled={installingId === selected.id}
                         onClick={() =>
                           void handleInstallRemote(
@@ -513,7 +541,7 @@ export function HostsSection() {
                       >
                         {installingId === selected.id ? (
                           <>
-                            <Loader2 className="mr-2 size-3.5 animate-spin" />
+                            <Loader2 className="mr-1.5 size-3.5 animate-spin" />
                             Installing…
                           </>
                         ) : (
@@ -525,24 +553,25 @@ export function HostsSection() {
               )}
             </div>
 
-            <div className="flex justify-between border-t border-border pt-4">
+            <div className="flex items-center justify-between pt-4 border-t border-border/40">
               <Button
                 type="button"
                 variant="outline"
                 size="sm"
+                className="h-8 gap-1.5 text-[12px]"
                 onClick={() => handleStartEdit(selected)}
               >
-                <Pencil className="mr-1 size-3.5" />
+                <Pencil className="size-3.5" />
                 Edit
               </Button>
               <Button
                 type="button"
                 variant="ghost"
                 size="sm"
-                className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                className="h-8 gap-1.5 text-[12px] text-destructive hover:bg-destructive/10 hover:text-destructive"
                 onClick={() => void handleDelete(selected)}
               >
-                <Trash2 className="mr-1 size-3.5" />
+                <Trash2 className="size-3.5" />
                 Remove
               </Button>
             </div>
@@ -565,10 +594,10 @@ function AutoInstallToggle() {
     setEnabled(localStorage.getItem(AUTO_INSTALL_KEY) === "1");
   }, []);
   return (
-    <label className="mt-3 flex items-start gap-2 text-[11px] text-muted-foreground cursor-pointer">
+    <label className="mt-3 flex items-start gap-2 text-[11.5px] text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors">
       <input
         type="checkbox"
-        className="mt-0.5 size-3 shrink-0"
+        className="mt-0.5 size-3 shrink-0 accent-foreground"
         checked={enabled}
         onChange={(e) => {
           const next = e.target.checked;
@@ -580,7 +609,7 @@ function AutoInstallToggle() {
           }
         }}
       />
-      <span className="leading-tight">
+      <span>
         Always install codemux-remote automatically when missing
       </span>
     </label>
