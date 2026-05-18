@@ -285,6 +285,21 @@ export function SidebarWorkspaceList() {
     clearDrag();
   }, [clearDrag]);
 
+  // Clear the indicator when the cursor leaves the list bounds — without
+  // this the indicator hangs at its last computed position whenever you
+  // drag out into the main pane and back. relatedTarget is the element
+  // entered, so we only clear when leaving the list subtree entirely.
+  const handleDragLeave = useCallback(
+    (e: React.DragEvent) => {
+      const listEl = listRef.current;
+      const next = e.relatedTarget as Node | null;
+      if (!listEl || (next && listEl.contains(next))) return;
+      setDropIndicatorY(null);
+      dropTargetRef.current = null;
+    },
+    [],
+  );
+
   return (
     <SidebarGroup className="p-0">
       <SidebarGroupContent>
@@ -292,40 +307,47 @@ export function SidebarWorkspaceList() {
           ref={listRef}
           className="relative"
           onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onDragEnd={handleDragEnd}
         >
-          {/* Drop indicator line */}
+          {/* Drop indicator — leading dot + thin neutral line, inset to
+              match the pill margin system. Replaces a full-width orange
+              bar that read as a glitch against the rest of the sidebar's
+              calm palette. */}
           {dropIndicatorY !== null && (
             <div
-              className="absolute left-2 right-2 h-0.5 bg-primary rounded-full z-30 pointer-events-none"
-              style={{ top: dropIndicatorY }}
-            />
+              className="absolute left-3 right-3 z-30 pointer-events-none flex items-center"
+              style={{ top: dropIndicatorY - 1 }}
+            >
+              <div className="h-1.5 w-1.5 rounded-full bg-foreground/70 shrink-0 -ml-0.5" />
+              <div className="h-px flex-1 bg-foreground/40 rounded-full" />
+            </div>
           )}
 
-          {/* Workspaces grouped by project */}
-          {projectGroups.map((group, idx) => (
-            <div key={group.projectPath}>
-              {idx > 0 && (
-                <div className="h-px bg-sidebar-border" />
-              )}
-              <div
-                data-drop-zone-project={group.projectPath}
-                className={dragState?.type === "project" && dragState.id === group.projectPath ? "opacity-40" : ""}
-              >
-                <SidebarProjectGroup
-                  projectName={group.projectName}
-                  projectPath={group.projectPath}
-                  workspaces={group.workspaces}
-                  activeWorkspaceId={activeWorkspaceId}
-                  onWorkspaceDragStart={handleWorkspaceDragStart}
-                  onProjectDragStart={handleProjectDragStart(group.projectPath)}
-                  dragStateId={dragState?.id ?? null}
-                  pendingWorkspaces={pendingWorkspaces.filter(
-                    (pw) => pw.projectPath === group.projectPath,
-                  )}
-                />
-              </div>
+          {/* Workspaces grouped by project. Group separation is
+              communicated by spacing alone (the project group's pt
+              gives the gap) — no horizontal dividers, since the
+              header typography + indentation + pill highlights
+              already mark each group clearly. */}
+          {projectGroups.map((group) => (
+            <div
+              key={group.projectPath}
+              data-drop-zone-project={group.projectPath}
+              className={dragState?.type === "project" && dragState.id === group.projectPath ? "opacity-40" : ""}
+            >
+              <SidebarProjectGroup
+                projectName={group.projectName}
+                projectPath={group.projectPath}
+                workspaces={group.workspaces}
+                activeWorkspaceId={activeWorkspaceId}
+                onWorkspaceDragStart={handleWorkspaceDragStart}
+                onProjectDragStart={handleProjectDragStart(group.projectPath)}
+                dragStateId={dragState?.id ?? null}
+                pendingWorkspaces={pendingWorkspaces.filter(
+                  (pw) => pw.projectPath === group.projectPath,
+                )}
+              />
             </div>
           ))}
         </div>
