@@ -1237,6 +1237,8 @@ pub fn run() {
             commands::git_fetch_prune,
             commands::git_stash_push,
             commands::git_stash_pop,
+            commands::git_amend_commit,
+            commands::git_undo_last_commit,
             commands::get_commit_files,
             commands::git_discard_file,
             commands::git_log_entries,

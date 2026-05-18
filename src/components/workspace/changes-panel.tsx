@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -9,438 +10,129 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
-  Popover,
-  PopoverTrigger,
-  PopoverContent,
-} from "@/components/ui/popover";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
-import {
   Tooltip,
   TooltipTrigger,
   TooltipContent,
-  TooltipProvider,
 } from "@/components/ui/tooltip";
 import {
-  HoverCard,
-  HoverCardTrigger,
-  HoverCardContent,
-} from "@/components/ui/hover-card";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
-import {
-  Plus,
-  Minus,
-  GitCommit,
-  ArrowUp,
-  ArrowDown,
   RefreshCw,
   Loader2,
-  Check,
-  Trash2,
-  ChevronRight,
   Sparkles,
+  GitBranch,
+  ArrowUp,
+  ArrowDown,
+  ArrowUpDown,
+  Download,
+  Trash2,
+  Plus,
+  Minus,
+  Check,
+  ChevronDown,
+  X,
   AlertTriangle,
   GitMerge,
-  XCircle,
-  CheckCircle2,
-  ChevronDown,
-  ArrowUpToLine,
-  GitBranch,
+  Pencil,
+  Undo2,
   Archive,
   ArchiveRestore,
-  List,
-  FolderTree,
-  ArrowDownUp,
-  Download,
-  Settings,
+  Send,
 } from "lucide-react";
 import {
+  VscDiffAdded,
+  VscDiffModified,
+  VscDiffRemoved,
+  VscDiffRenamed,
+} from "react-icons/vsc";
+import {
   getGitStatus,
-  getGitDiff,
   getGitBranchInfo,
   gitStageFiles,
   gitUnstageFiles,
   gitCommitChanges,
   gitPushChanges,
   gitPullChanges,
+  gitFetchChanges,
   gitDiscardFile,
-  gitLogEntries,
+  gitAmendCommit,
+  gitUndoLastCommit,
+  gitStashPush,
+  gitStashPop,
   getMergeState,
-  mergeBranch,
-  resolveConflictOurs,
-  resolveConflictTheirs,
-  markConflictResolved,
   abortMerge,
   continueMerge,
-  mergeIntoBase,
-  completeMergeIntoBase,
-  abortMergeIntoBase,
   createTab,
   activateTab,
   checkClaudeAvailable,
-  getBaseBranchDiff,
-  getDefaultBranch,
-  listBranches,
-  gitFetchChanges,
-  gitStashPush,
-  gitStashPop,
-  getCommitFiles,
-  mergePullRequest,
-  refreshWorkspacePr,
-  activateWorkspace,
-  closeWorkspace,
-  createWorkspace,
-  setAiResolverStrategy,
 } from "@/tauri/commands";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
-import {
-  ContextMenu,
-  ContextMenuTrigger,
-  ContextMenuContent,
-  ContextMenuItem,
-} from "@/components/ui/context-menu";
-import {
-  VscDiffAdded,
-  VscDiffModified,
-  VscDiffRemoved,
-  VscDiffRenamed,
-  VscCopy,
-} from "react-icons/vsc";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useQueryClient } from "@tanstack/react-query";
-import { PrStatusIcon } from "@/components/github/pr-status-icon";
-import { cn } from "@/lib/utils";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
-import { useAiMergeStore } from "@/stores/ai-merge-store";
+import { cn } from "@/lib/utils";
 import type {
   WorkspaceSnapshot,
   GitFileStatus,
   GitBranchInfo,
-  GitLogEntry,
   MergeState,
-  CommitFileEntry,
 } from "@/tauri/types";
 
 interface Props {
   workspace: WorkspaceSnapshot;
 }
 
-const STATUS_ICON_CLASS = "w-3 h-3";
-
-function StatusIcon({ status }: { status: string }) {
-  switch (status) {
-    case "added":
-    case "untracked":
-      return <VscDiffAdded className={STATUS_ICON_CLASS} />;
-    case "modified":
-      return <VscDiffModified className={STATUS_ICON_CLASS} />;
-    case "deleted":
-      return <VscDiffRemoved className={STATUS_ICON_CLASS} />;
-    case "renamed":
-      return <VscDiffRenamed className={STATUS_ICON_CLASS} />;
-    case "copied":
-      return <VscCopy className={STATUS_ICON_CLASS} />;
-    case "conflicted":
-      return <VscDiffModified className={STATUS_ICON_CLASS} />;
-    default:
-      return null;
-  }
-}
-
-const STATUS_COLOR: Record<string, string> = {
-  added: "text-green-400",
-  modified: "text-yellow-400",
-  deleted: "text-red-400",
-  renamed: "text-blue-400",
-  untracked: "text-green-400",
-  copied: "text-purple-400",
-  conflicted: "text-red-400",
+// ── File-status icon mapping ──
+//
+// Each git status carries a color through the file row; everything else
+// stays muted so the eye lands on what changed, not on the chrome.
+const STATUS_META: Record<string, { icon: React.ReactNode; color: string; label: string }> = {
+  added:      { icon: <VscDiffAdded className="size-3" />,    color: "text-success",  label: "Added" },
+  modified:   { icon: <VscDiffModified className="size-3" />, color: "text-warning",  label: "Modified" },
+  removed:    { icon: <VscDiffRemoved className="size-3" />,  color: "text-danger",   label: "Removed" },
+  renamed:    { icon: <VscDiffRenamed className="size-3" />,  color: "text-info",     label: "Renamed" },
+  untracked:  { icon: <VscDiffAdded className="size-3" />,    color: "text-success/70", label: "Untracked" },
+  conflicted: { icon: <AlertTriangle className="size-3" />,   color: "text-danger",   label: "Conflict" },
 };
-
-const CONFLICT_TYPE_LABEL: Record<string, string> = {
-  both_modified: "Both Modified",
-  both_added: "Both Added",
-  both_deleted: "Both Deleted",
-  deleted_by_them: "Deleted by Them",
-  deleted_by_us: "Deleted by Us",
-  added_by_them: "Added by Them",
-  added_by_us: "Added by Us",
-};
-
-// ── Helpers ──
-
-function groupByDirectory(files: GitFileStatus[]): Array<{ dir: string; files: GitFileStatus[] }> {
-  const map = new Map<string, GitFileStatus[]>();
-  for (const file of files) {
-    const lastSlash = file.path.lastIndexOf("/");
-    const dir = lastSlash >= 0 ? file.path.substring(0, lastSlash) : "";
-    const arr = map.get(dir) || [];
-    arr.push(file);
-    map.set(dir, arr);
-  }
-  // Sort: root ("") first, then alphabetical
-  return Array.from(map.entries())
-    .sort(([a], [b]) => {
-      if (a === "") return -1;
-      if (b === "") return 1;
-      return a.localeCompare(b);
-    })
-    .map(([dir, files]) => ({ dir, files }));
-}
 
 function fileName(path: string): string {
-  const idx = path.lastIndexOf("/");
-  return idx >= 0 ? path.substring(idx + 1) : path;
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  return i >= 0 ? path.slice(i + 1) : path;
 }
 
-// ── Section Header ──
-
-function SectionHeader({
-  title,
-  count,
-  expanded,
-  onToggle,
-  actions,
-  variant = "default",
-}: {
-  title: string;
-  count: number;
-  expanded: boolean;
-  onToggle: () => void;
-  actions?: React.ReactNode;
-  variant?: "default" | "danger";
-}) {
-  const textColor = variant === "danger" ? "text-danger" : "text-muted-foreground";
-  return (
-    <div className="flex items-center">
-      <button
-        type="button"
-        className="flex flex-1 items-center gap-1.5 text-left min-w-0 hover:bg-accent/30 rounded-sm px-2 py-1.5 cursor-pointer transition-colors"
-        onClick={onToggle}
-      >
-        <ChevronRight
-          className={`h-3 w-3 shrink-0 ${textColor} transition-transform ${expanded ? "rotate-90" : ""}`}
-        />
-        <span className={`text-xs font-medium uppercase tracking-wide ${textColor}`}>
-          {title}
-        </span>
-        <span className={`text-xs tabular-nums ${textColor}`}>{count}</span>
-      </button>
-      {actions && (
-        <div className="flex items-center gap-0.5 shrink-0 pr-1.5">{actions}</div>
-      )}
-    </div>
-  );
-}
-
-// ── Commit Row ──
-
-const COMMIT_FILE_COLOR: Record<string, string> = {
-  added: "text-green-400",
-  modified: "text-yellow-400",
-  deleted: "text-red-400",
-  renamed: "text-blue-400",
-  copied: "text-purple-400",
-};
-
-function formatRelativeTime(timeAgo: string): string {
-  // The backend returns e.g. "3 hours ago", "5 minutes ago", "2 days ago"
-  // Convert to compact format: "3h ago", "5m ago", "2d ago"
-  const match = timeAgo.match(/^(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago$/);
-  if (!match) return timeAgo;
-  const [, n, unit] = match;
-  const abbrev: Record<string, string> = {
-    second: "s", minute: "m", hour: "h", day: "d", week: "w", month: "mo", year: "y",
-  };
-  return `${n}${abbrev[unit] ?? unit} ago`;
-}
-
-function CommitRow({
-  commit,
-  cwd,
-  expanded,
-  onToggle,
-}: {
-  commit: GitLogEntry;
-  cwd: string;
-  expanded: boolean;
-  onToggle: () => void;
-}) {
-  const [files, setFiles] = useState<CommitFileEntry[] | null>(null);
-
-  useEffect(() => {
-    if (expanded && files === null) {
-      getCommitFiles(cwd, commit.hash)
-        .then(setFiles)
-        .catch(() => setFiles([]));
-    }
-  }, [expanded, cwd, commit.hash, files]);
-
-  const handleCopyHash = () => {
-    navigator.clipboard.writeText(commit.hash).catch(console.error);
-  };
-
-  return (
-    <div>
-      <ContextMenu>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <ContextMenuTrigger asChild>
-              <button
-                type="button"
-                className="flex w-full items-center gap-1.5 rounded-sm px-1.5 py-1 text-left hover:bg-accent/50 cursor-pointer transition-colors"
-                onClick={onToggle}
-              >
-                <ChevronRight
-                  className={`h-2.5 w-2.5 shrink-0 text-muted-foreground transition-transform ${expanded ? "rotate-90" : ""}`}
-                />
-                <span className="shrink-0 text-[10px] font-mono text-muted-foreground">
-                  {commit.short_hash}
-                </span>
-                <span className="flex-1 truncate text-xs text-foreground">{commit.message}</span>
-                <span className="shrink-0 text-[10px] text-muted-foreground">
-                  {formatRelativeTime(commit.time_ago)}
-                </span>
-              </button>
-            </ContextMenuTrigger>
-          </TooltipTrigger>
-          <TooltipContent side="right" className="text-xs max-w-64">
-            {commit.message}
-          </TooltipContent>
-        </Tooltip>
-        <ContextMenuContent className="w-52">
-          <ContextMenuItem onClick={handleCopyHash} className="text-xs">
-            <Check className="h-3.5 w-3.5 mr-2" />
-            Copy Commit Hash
-          </ContextMenuItem>
-        </ContextMenuContent>
-      </ContextMenu>
-      {expanded && files && files.length > 0 && (
-        <div className="ml-4 pl-1.5 border-l border-border mt-0.5 mb-0.5">
-          {files.map((f) => (
-            <div
-              key={f.path}
-              className="flex items-center gap-1 px-1 py-0.5 text-xs"
-            >
-              <span className={`shrink-0 w-4 flex items-center justify-center ${COMMIT_FILE_COLOR[f.status] ?? "text-muted-foreground"}`}>
-                <StatusIcon status={f.status} />
-              </span>
-              <span className="truncate text-xs text-foreground">{fileName(f.path)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── Diff View ──
-
-function DiffView({ diff }: { diff: string }) {
-  if (!diff) {
-    return (
-      <pre className="mx-1 mb-1 rounded-sm bg-muted/30 p-1.5 text-[10px] leading-normal font-mono text-muted-foreground">
-        (empty diff)
-      </pre>
-    );
-  }
-  const lines = diff.split("\n");
-  return (
-    <div className="mx-1 mb-1 max-h-48 overflow-auto rounded-sm bg-muted/30 text-[10px] leading-normal font-mono">
-      {lines.map((line, i) => {
-        let cls = "px-1.5 whitespace-pre-wrap break-all";
-        if (line.startsWith("+") && !line.startsWith("+++")) {
-          cls += " text-success bg-success/10";
-        } else if (line.startsWith("-") && !line.startsWith("---")) {
-          cls += " text-danger bg-danger/10";
-        } else if (line.startsWith("@@")) {
-          cls += " text-muted-foreground/60 bg-muted/30 text-[9px]";
-        } else {
-          cls += " text-muted-foreground";
-        }
-        return (
-          <div key={i} className={cls}>
-            {line || " "}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-// ── File Row ──
+// ── FileRow ──
 
 function FileRow({
   file,
   staged,
   cwd,
-  expanded,
-  onToggleExpand,
   onRefresh,
   onOpenDiff,
-  activeDiffFile,
 }: {
   file: GitFileStatus;
   staged: boolean;
   cwd: string;
-  expanded: boolean;
-  onToggleExpand: () => void;
   onRefresh: () => void;
-  onOpenDiff?: (filePath: string, staged: boolean) => void;
-  activeDiffFile?: string | null;
+  onOpenDiff: (filePath: string, staged: boolean) => void;
 }) {
-  const [diff, setDiff] = useState<string | null>(null);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
-
-  useEffect(() => {
-    if (expanded) {
-      getGitDiff(cwd, file.path, staged)
-        .then(setDiff)
-        .catch(() => setDiff("Failed to load diff"));
-    } else {
-      setDiff(null);
-    }
-  }, [expanded, cwd, file.path, staged]);
+  const meta = STATUS_META[file.status] ?? STATUS_META.modified;
+  const name = fileName(file.path);
+  const dir = file.path.length > name.length ? file.path.slice(0, -name.length - 1) : "";
 
   const handleStageToggle = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      if (staged) {
-        await gitUnstageFiles(cwd, [file.path]);
-      } else {
-        await gitStageFiles(cwd, [file.path]);
-      }
+      if (staged) await gitUnstageFiles(cwd, [file.path]);
+      else await gitStageFiles(cwd, [file.path]);
       onRefresh();
     } catch (err) {
-      console.error("Stage/unstage failed:", err);
+      toast.error(String(err));
     }
   };
 
+  // Two-tap discard so a stray hover-click can't blow away uncommitted
+  // work. The 3s timeout reverts the row to its idle state if the user
+  // doesn't follow through.
   const handleDiscard = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!confirmDiscard) {
@@ -452,116 +144,10 @@ function FileRow({
       await gitDiscardFile(cwd, file.path);
       onRefresh();
     } catch (err) {
-      console.error("Discard failed:", err);
+      toast.error(String(err));
     }
     setConfirmDiscard(false);
   };
-
-  const name = fileName(file.path);
-
-  return (
-    <div>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <div
-            role="button"
-            tabIndex={0}
-            className={`group flex w-full items-stretch gap-1 rounded-sm text-left hover:bg-accent/50 transition-colors cursor-default px-1.5 ${activeDiffFile === file.path ? "bg-accent/30" : ""}`}
-            onClick={(e) => {
-              if (e.altKey || !onOpenDiff) {
-                onToggleExpand();
-              } else {
-                onOpenDiff(file.path, staged);
-              }
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onToggleExpand();
-              }
-            }}
-          >
-            <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-              <span className={`shrink-0 w-4 flex items-center justify-center ${STATUS_COLOR[file.status] ?? "text-muted-foreground"}`}>
-                <StatusIcon status={file.status} />
-              </span>
-              <span className="flex-1 min-w-0 flex items-center gap-1">
-                <span className="truncate text-xs text-foreground">{name}</span>
-                {(file.additions > 0 || file.deletions > 0) && (
-                  <span className="flex items-center gap-0.5 shrink-0 text-[10px] tabular-nums opacity-60">
-                    {file.additions > 0 && (
-                      <span className="text-success">+{file.additions}</span>
-                    )}
-                    {file.deletions > 0 && (
-                      <span className="text-danger">-{file.deletions}</span>
-                    )}
-                  </span>
-                )}
-              </span>
-            </div>
-            <div className="flex items-center shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
-              {!staged && (
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className={confirmDiscard ? "text-danger hover:text-danger" : "text-muted-foreground"}
-                  onClick={handleDiscard}
-                  title={confirmDiscard ? "Click again to discard" : "Discard changes"}
-                >
-                  <Trash2 className="h-3 w-3" />
-                </Button>
-              )}
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="text-muted-foreground"
-                onClick={handleStageToggle}
-                title={staged ? "Unstage" : "Stage"}
-              >
-                {staged ? <Minus className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
-              </Button>
-            </div>
-          </div>
-        </TooltipTrigger>
-        <TooltipContent side="left" className="text-xs">
-          {file.path}
-        </TooltipContent>
-      </Tooltip>
-      {expanded && diff !== null && <DiffView diff={diff} />}
-    </div>
-  );
-}
-
-// ── Conflict File Row ──
-
-function ConflictFileRow({
-  file,
-  cwd,
-  onRefresh,
-  onOpenDiff,
-}: {
-  file: GitFileStatus;
-  cwd: string;
-  onRefresh: () => void;
-  onOpenDiff?: (filePath: string, staged: boolean) => void;
-}) {
-  const [busy, setBusy] = useState<string | null>(null);
-
-  const handleResolve = async (action: "ours" | "theirs" | "resolved") => {
-    setBusy(action);
-    try {
-      if (action === "ours") await resolveConflictOurs(cwd, file.path);
-      else if (action === "theirs") await resolveConflictTheirs(cwd, file.path);
-      else await markConflictResolved(cwd, file.path);
-      onRefresh();
-    } catch (err) {
-      console.error("Resolve failed:", err);
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const name = fileName(file.path);
 
   return (
     <Tooltip>
@@ -569,54 +155,50 @@ function ConflictFileRow({
         <div
           role="button"
           tabIndex={0}
-          className="group flex w-full items-stretch gap-1 rounded-sm px-1.5 text-left hover:bg-danger/10 transition-colors cursor-default"
-          onClick={() => onOpenDiff?.(file.path, false)}
+          onClick={() => onOpenDiff(file.path, staged)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              onOpenDiff(file.path, staged);
+            }
+          }}
+          className="group/file flex items-center gap-1.5 px-2.5 h-6 cursor-default rounded-sm hover:bg-muted/40 transition-colors"
         >
-          <div className="flex items-center gap-1.5 flex-1 min-w-0 py-1">
-            <span className="shrink-0 w-4 flex items-center justify-center text-red-400">
-              <StatusIcon status="conflicted" />
+          <span className={cn("shrink-0 flex items-center justify-center w-3", meta.color)}>
+            {meta.icon}
+          </span>
+          <span className="truncate text-xs text-foreground min-w-0 flex-1">
+            {name}
+            {dir && (
+              <span className="ml-1 text-[10px] text-muted-foreground/40">{dir}</span>
+            )}
+          </span>
+          {(file.additions > 0 || file.deletions > 0) && (
+            <span className="shrink-0 flex items-center gap-1 text-[10px] tabular-nums text-muted-foreground/60 group-hover/file:opacity-0 transition-opacity">
+              {file.additions > 0 && <span className="text-success">+{file.additions}</span>}
+              {file.deletions > 0 && <span className="text-danger">{file.deletions}</span>}
             </span>
-            <span className="flex-1 min-w-0 flex items-center gap-1">
-              <span className="truncate text-xs text-foreground">{name}</span>
-              {file.conflict_type && (
-                <span className="shrink-0 text-[9px] text-danger/70 bg-danger/10 px-1 rounded">
-                  {CONFLICT_TYPE_LABEL[file.conflict_type] ?? file.conflict_type}
-                </span>
-              )}
-            </span>
-          </div>
-          <div className="flex items-center shrink-0 gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+          )}
+          <span className="shrink-0 hidden group-hover/file:flex items-center gap-0.5 ml-auto absolute right-1">
             <Button
               variant="ghost"
               size="icon-xs"
-              className="text-foreground"
-              onClick={(e) => { e.stopPropagation(); handleResolve("ours"); }}
-              title="Accept ours"
-              disabled={busy !== null}
+              className={cn("size-5", confirmDiscard ? "text-danger" : "text-muted-foreground hover:text-foreground")}
+              onClick={handleDiscard}
+              title={confirmDiscard ? "Click again to discard" : "Discard changes"}
             >
-              {busy === "ours" ? <Loader2 className="h-3 w-3 animate-spin" /> : <span className="text-[9px] font-bold">O</span>}
+              <Trash2 className="size-3" />
             </Button>
             <Button
               variant="ghost"
               size="icon-xs"
-              className="text-purple-400"
-              onClick={(e) => { e.stopPropagation(); handleResolve("theirs"); }}
-              title="Accept theirs"
-              disabled={busy !== null}
+              className="size-5 text-muted-foreground hover:text-foreground"
+              onClick={handleStageToggle}
+              title={staged ? "Unstage" : "Stage"}
             >
-              {busy === "theirs" ? <Loader2 className="h-3 w-3 animate-spin" /> : <span className="text-[9px] font-bold">T</span>}
+              {staged ? <Minus className="size-3" /> : <Plus className="size-3" />}
             </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="text-success"
-              onClick={(e) => { e.stopPropagation(); handleResolve("resolved"); }}
-              title="Mark as resolved"
-              disabled={busy !== null}
-            >
-              {busy === "resolved" ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle2 className="h-3 w-3" />}
-            </Button>
-          </div>
+          </span>
         </div>
       </TooltipTrigger>
       <TooltipContent side="left" className="text-xs">
@@ -626,502 +208,131 @@ function ConflictFileRow({
   );
 }
 
-// ── Conflicts Section ──
-
-function ConflictsSection({
-  files,
-  cwd,
-  onRefresh,
-  onOpenDiff,
-  resolverStatus,
-  resolverError,
-  resolverFiles,
-  resolverTempBranch,
-  resolverCli,
-  resolverModel,
-  resolverStrategy,
-  onStartResolve,
-  onApproveResolve,
-  onRejectResolve,
-  onChangeResolverStrategy,
-}: {
-  files: GitFileStatus[];
-  cwd: string;
-  onRefresh: () => void;
-  onOpenDiff?: (filePath: string, staged: boolean) => void;
-  resolverStatus: string;
-  resolverError: string | null;
-  resolverFiles: string[];
-  resolverTempBranch: string | null;
-  resolverCli: string;
-  resolverModel: string | null;
-  resolverStrategy: string;
-  onStartResolve: () => void;
-  onApproveResolve: () => void;
-  onRejectResolve: () => void;
-  onChangeResolverStrategy: (strategy: string) => void;
-}) {
-  // Show resolver progress UI when active
-  if (resolverStatus !== "idle") {
-    return (
-      <div className="py-1 space-y-1.5">
-        <div className="px-1.5">
-          <div className="flex items-center gap-1.5 py-0.5 pl-0.5">
-            <span className="text-xs font-medium uppercase tracking-wide text-danger">
-              Conflicts
-            </span>
-          </div>
-        </div>
-
-        {resolverStatus === "creating_branch" && (
-          <div className="flex items-center gap-1.5 px-1 py-1">
-            <Loader2 className="h-3 w-3 animate-spin text-primary" />
-            <span className="text-xs text-muted-foreground">Creating temp branch...</span>
-          </div>
-        )}
-
-        {resolverStatus === "resolving" && (
-          <div className="space-y-1">
-            <HoverCard openDelay={150} closeDelay={100}>
-              <HoverCardTrigger asChild>
-                <div
-                  className="flex items-center gap-1.5 px-1 py-1 cursor-help rounded hover:bg-muted/40"
-                  data-testid="resolver-progress-trigger"
-                >
-                  <Loader2 className="h-3 w-3 animate-spin text-primary" />
-                  <span className="text-xs text-muted-foreground underline decoration-dotted decoration-muted-foreground/40 underline-offset-2">
-                    AI is resolving {resolverFiles.length || ""} conflict{resolverFiles.length === 1 ? "" : "s"}...
-                  </span>
-                </div>
-              </HoverCardTrigger>
-              <HoverCardContent side="bottom" align="start" className="w-72">
-                <div className="space-y-2">
-                  <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                    Resolver
-                  </div>
-                  <div className="text-xs">
-                    <span className="text-muted-foreground">Agent:</span>{" "}
-                    <span className="font-mono">{resolverCli}</span>
-                    {resolverModel && (
-                      <>
-                        {" "}
-                        <span className="text-muted-foreground">·</span>{" "}
-                        <span className="font-mono">{resolverModel}</span>
-                      </>
-                    )}
-                  </div>
-                  {resolverTempBranch && (
-                    <div className="text-xs">
-                      <span className="text-muted-foreground">Branch:</span>{" "}
-                      <span className="font-mono break-all">{resolverTempBranch}</span>
-                    </div>
-                  )}
-                  <div className="space-y-0.5">
-                    <div className="text-[10px] uppercase tracking-wide text-muted-foreground">
-                      Conflicting files ({resolverFiles.length})
-                    </div>
-                    {resolverFiles.length === 0 ? (
-                      <div className="text-xs text-muted-foreground italic">none reported</div>
-                    ) : (
-                      <ul className="space-y-0.5 max-h-40 overflow-y-auto">
-                        {resolverFiles.map((path) => (
-                          <li key={path} className="text-xs font-mono break-all">
-                            {path}
-                          </li>
-                        ))}
-                      </ul>
-                    )}
-                  </div>
-                  <div className="text-[10px] text-muted-foreground pt-1 border-t border-border">
-                    Working on a temp branch — your branch is untouched until you approve.
-                  </div>
-                </div>
-              </HoverCardContent>
-            </HoverCard>
-            <Button
-              size="xs"
-              variant="ghost"
-              className="text-[10px] h-5 text-danger"
-              onClick={onRejectResolve}
-            >
-              <XCircle className="h-3 w-3 mr-0.5" />
-              Stop & Abort
-            </Button>
-          </div>
-        )}
-
-        {resolverStatus === "review" && (
-          <div className="space-y-1.5">
-            <div className="flex items-center gap-1.5 px-1 py-1">
-              <CheckCircle2 className="h-3.5 w-3.5 text-success" />
-              <span className="text-xs text-foreground font-medium">Conflicts resolved — review changes</span>
-            </div>
-            <div className="flex gap-1">
-              <Button
-                size="xs"
-                className="text-[10px] h-6 flex-1 bg-success/20 text-success hover:bg-success/30"
-                onClick={onApproveResolve}
-              >
-                <CheckCircle2 className="h-3 w-3 mr-0.5" />
-                Approve
-              </Button>
-              <Button
-                size="xs"
-                variant="ghost"
-                className="text-[10px] h-6 text-danger"
-                onClick={onRejectResolve}
-              >
-                <XCircle className="h-3 w-3 mr-0.5" />
-                Reject
-              </Button>
-            </div>
-          </div>
-        )}
-
-        {resolverStatus === "applying" && (
-          <div className="flex items-center gap-1.5 px-1 py-1">
-            <Loader2 className="h-3 w-3 animate-spin text-success" />
-            <span className="text-xs text-muted-foreground">Applying resolution...</span>
-          </div>
-        )}
-
-        {resolverStatus === "error" && (
-          <div className="space-y-1">
-            <p className="text-[10px] text-danger break-words px-1">{resolverError}</p>
-            <div className="flex gap-1">
-              <Button
-                size="xs"
-                variant="ghost"
-                className="text-[10px] h-5"
-                onClick={onStartResolve}
-              >
-                Try Again
-              </Button>
-              <Button
-                size="xs"
-                variant="ghost"
-                className="text-[10px] h-5 text-danger"
-                onClick={onRejectResolve}
-              >
-                Abort
-              </Button>
-            </div>
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  const [conflictsCollapsed, setConflictsCollapsed] = useState(false);
-
-  return (
-    <div className="py-1">
-      <SectionHeader
-        title="Conflicts"
-        count={files.length}
-        expanded={!conflictsCollapsed}
-        onToggle={() => setConflictsCollapsed(!conflictsCollapsed)}
-        variant="danger"
-      />
-      {!conflictsCollapsed && (
-        <>
-          {files.map((file) => (
-            <ConflictFileRow
-              key={file.path}
-              file={file}
-              cwd={cwd}
-              onRefresh={onRefresh}
-              onOpenDiff={onOpenDiff}
-            />
-          ))}
-          {/* Strategy override + Resolve action. Strategy defaults to whatever
-              the user picked in Settings; per-conflict overrides persist back to
-              the same setting so the next conflict starts from their last choice.
-              No "enable" gate — running the resolver only happens on click and
-              the result still requires explicit approval before any real branch
-              is touched, so gating it added friction without any safety value. */}
-          <div
-            className="px-1.5 mt-1 flex items-stretch gap-1"
-            data-testid="resolver-actions"
-          >
-            <Select value={resolverStrategy} onValueChange={onChangeResolverStrategy}>
-              <SelectTrigger
-                className="h-6 text-[10px] w-28 flex-shrink-0 px-1.5"
-                aria-label="Resolution strategy"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="smart_merge" className="text-xs">
-                  Smart merge
-                </SelectItem>
-                <SelectItem value="keep_both" className="text-xs">
-                  Keep both
-                </SelectItem>
-                <SelectItem value="prefer_ours" className="text-xs">
-                  Prefer mine
-                </SelectItem>
-                <SelectItem value="prefer_theirs" className="text-xs">
-                  Prefer target
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <Button
-              size="xs"
-              variant="secondary"
-              className="text-[10px] h-6 flex-1"
-              onClick={onStartResolve}
-              aria-label="Resolve conflicts with AI"
-            >
-              <Sparkles className="h-3 w-3 mr-1" />
-              Resolve with AI
-            </Button>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-// ── Directory Group ──
-
-function DirectoryGroup({
-  dir,
-  files,
-  staged,
-  cwd,
-  expandedFile,
-  expandedStaged,
-  onToggleExpand,
-  onRefresh,
-  onOpenDiff,
-  activeDiffFile,
-}: {
-  dir: string;
-  files: GitFileStatus[];
-  staged: boolean;
-  cwd: string;
-  expandedFile: string | null;
-  expandedStaged: boolean;
-  onToggleExpand: (path: string, staged: boolean) => void;
-  onRefresh: () => void;
-  onOpenDiff?: (filePath: string, staged: boolean) => void;
-  activeDiffFile?: string | null;
-}) {
-  // Root-level files (no directory) render without header
-  if (dir === "") {
-    return (
-      <>
-        {files.map((f) => (
-          <FileRow
-            key={f.path}
-            file={f}
-            staged={staged}
-            cwd={cwd}
-            expanded={expandedFile === f.path && expandedStaged === staged}
-            onToggleExpand={() => onToggleExpand(f.path, staged)}
-            onRefresh={onRefresh}
-            onOpenDiff={onOpenDiff}
-            activeDiffFile={activeDiffFile}
-          />
-        ))}
-      </>
-    );
-  }
-
-  return (
-    <div>
-      <div className="flex items-center gap-1 px-1.5 py-0.5">
-        <span className="truncate text-[10px] text-muted-foreground">{dir}</span>
-        <span className="text-[10px] text-muted-foreground/50 shrink-0 tabular-nums">
-          {files.length}
-        </span>
-      </div>
-      <div>
-        {files.map((f) => (
-          <FileRow
-            key={f.path}
-            file={f}
-            staged={staged}
-            cwd={cwd}
-            expanded={expandedFile === f.path && expandedStaged === staged}
-            onToggleExpand={() => onToggleExpand(f.path, staged)}
-            onRefresh={onRefresh}
-            onOpenDiff={onOpenDiff}
-            activeDiffFile={activeDiffFile}
-          />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ── File Section (Staged / Changes) ──
+// ── FileSection (Staged / Changed grouping) ──
 
 function FileSection({
   label,
   files,
   staged,
   cwd,
-  expandedFile,
-  expandedStaged,
-  onToggleExpand,
   onRefresh,
-  onBulkAction,
-  bulkLabel,
   onOpenDiff,
-  activeDiffFile,
-  flat,
 }: {
   label: string;
   files: GitFileStatus[];
   staged: boolean;
   cwd: string;
-  expandedFile: string | null;
-  expandedStaged: boolean;
-  onToggleExpand: (path: string, staged: boolean) => void;
   onRefresh: () => void;
-  onBulkAction: () => void;
-  bulkLabel: string;
-  onOpenDiff?: (filePath: string, staged: boolean) => void;
-  activeDiffFile?: string | null;
-  flat?: boolean;
+  onOpenDiff: (filePath: string, staged: boolean) => void;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
-  const groups = useMemo(() => groupByDirectory(files), [files]);
-
+  if (files.length === 0) return null;
   return (
-    <div>
-      <SectionHeader
-        title={label}
-        count={files.length}
-        expanded={!collapsed}
-        onToggle={() => setCollapsed(!collapsed)}
-        actions={
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button variant="ghost" size="icon-xs" className="h-6 w-6" onClick={onBulkAction}>
-                {staged ? <Minus className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">{bulkLabel}</TooltipContent>
-          </Tooltip>
-        }
-      />
-      {!collapsed && (
-        <div className="px-0.5 pb-1">
-          {flat ? files.map((f) => (
-            <FileRow
-              key={f.path}
-              file={f}
-              staged={staged}
-              cwd={cwd}
-              expanded={expandedFile === f.path && expandedStaged === staged}
-              onToggleExpand={() => onToggleExpand(f.path, staged)}
-              onRefresh={onRefresh}
-              onOpenDiff={onOpenDiff}
-              activeDiffFile={activeDiffFile}
-            />
-          )) : groups.map((group) => (
-            <DirectoryGroup
-              key={group.dir}
-              dir={group.dir}
-              files={group.files}
-              staged={staged}
-              cwd={cwd}
-              expandedFile={expandedFile}
-              expandedStaged={expandedStaged}
-              onToggleExpand={onToggleExpand}
-              onRefresh={onRefresh}
-              onOpenDiff={onOpenDiff}
-              activeDiffFile={activeDiffFile}
-            />
-          ))}
-        </div>
+    <div className="mb-2">
+      <div className="flex items-center px-2.5 h-5 text-[10px] font-medium tracking-wider uppercase text-muted-foreground/60">
+        <span>{label}</span>
+        <span className="ml-1.5 tabular-nums text-muted-foreground/40">{files.length}</span>
+      </div>
+      <div className="flex flex-col">
+        {files.map((file) => (
+          <FileRow
+            key={`${staged ? "s" : "u"}-${file.path}`}
+            file={file}
+            staged={staged}
+            cwd={cwd}
+            onRefresh={onRefresh}
+            onOpenDiff={onOpenDiff}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── BranchPill ──
+
+function BranchPill({ info }: { info: GitBranchInfo | null }) {
+  if (!info?.branch) return null;
+  const ahead = info.ahead ?? 0;
+  const behind = info.behind ?? 0;
+  return (
+    <div className="flex items-center gap-1.5 px-2.5 h-7 text-[11px] text-muted-foreground/80 border-b border-border/40">
+      <GitBranch className="size-3 shrink-0" />
+      <span className="truncate font-mono text-foreground/90">{info.branch}</span>
+      {(ahead > 0 || behind > 0) && (
+        <span className="ml-auto flex items-center gap-1.5 tabular-nums text-[10px]">
+          {behind > 0 && (
+            <span className="flex items-center gap-0.5 text-warning">
+              <ArrowDown className="size-2.5" />
+              {behind}
+            </span>
+          )}
+          {ahead > 0 && (
+            <span className="flex items-center gap-0.5 text-info">
+              <ArrowUp className="size-2.5" />
+              {ahead}
+            </span>
+          )}
+        </span>
+      )}
+      {!info.has_upstream && (
+        <span className="ml-auto text-[10px] italic text-muted-foreground/60">no remote</span>
       )}
     </div>
   );
 }
 
-// ── Main Panel ──
+// ── ChangesPanel ──
 
 export function ChangesPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const queryClient = useQueryClient();
-  // Invalidates every Review-tab query for this workspace so the
-  // panel refetches the moment a commit / push / pull / merge lands.
-  // Mirrors Superset's onRefresh wiring at CommitInput.tsx:57-101.
-  const invalidateReviewQueries = useCallback(() => {
-    queryClient.invalidateQueries({
-      predicate: (q) =>
-        q.queryKey[0] === "pr" && q.queryKey[2] === workspace.workspace_id,
-    });
-  }, [queryClient, workspace.workspace_id]);
+
   const [files, setFiles] = useState<GitFileStatus[]>([]);
   const [branchInfo, setBranchInfo] = useState<GitBranchInfo | null>(null);
-  const [commits, setCommits] = useState<GitLogEntry[]>([]);
   const [mergeState, setMergeState] = useState<MergeState | null>(null);
-  const [expandedFile, setExpandedFile] = useState<string | null>(null);
-  const [expandedStaged, setExpandedStaged] = useState(false);
-  const [commitMsg, setCommitMsg] = useState("");
-  const [busyAction, setBusyAction] = useState<"commit" | "push" | "pull" | "merge" | "fetch" | "stash" | null>(null);
-  const [viewMode, setViewMode] = useState<"grouped" | "flat">("grouped");
-  const [gitError, setGitError] = useState<string | null>(null);
-  const [commitsExpanded, setCommitsExpanded] = useState(false);
-  const [expandedCommits, setExpandedCommits] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState<"commit" | "push" | "pull" | "sync" | "fetch" | "merge" | "amend" | "undo" | "stash" | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [editedMsg, setEditedMsg] = useState("");
+  const [pushAfterCommit, setPushAfterCommit] = useState(false);
   const [claudeReady, setClaudeReady] = useState<boolean | null>(null);
-  // Tracks an in-flight `gh pr merge`. While set, the merge dropdown
-  // items are disabled and the chevron shows a spinner so the user
-  // doesn't double-fire the command.
-  const [mergingPr, setMergingPr] = useState<null | "squash" | "merge" | "rebase">(null);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Against-base state
-  const [baseBranch, setBaseBranch] = useState<string>("main");
-  const [baseBranchFiles, setBaseBranchFiles] = useState<GitFileStatus[]>([]);
-  const [baseBranchExpanded, setBaseBranchExpanded] = useState(false);
-  const [remoteBranches, setRemoteBranches] = useState<string[]>([]);
-  const [baseBranchPickerOpen, setBaseBranchPickerOpen] = useState(false);
-
   const config = useAppStore((s) => s.appState?.config);
-  const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
   const aiEnabled = config?.ai_commit_message_enabled ?? true;
-
   const generation = useAiCommitStore((s) => s.getGeneration(workspace.workspace_id));
   const requestGeneration = useAiCommitStore((s) => s.requestGeneration);
   const consumeMessage = useAiCommitStore((s) => s.consumeMessage);
   const clearGeneration = useAiCommitStore((s) => s.clearGeneration);
-  const isGenerating = generation?.status === "generating";
+
+  const diffSetFile = useDiffStore((s) => s.setFile);
+  const diffInitTab = useDiffStore((s) => s.initTab);
+
+  const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
+  const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
+  const conflicted = useMemo(() => files.filter((f) => f.status === "conflicted"), [files]);
+  const isMerging = !!(mergeState?.is_merging || mergeState?.is_rebasing);
+  const totalChanges = files.length;
 
   const refresh = useCallback(() => {
     if (!cwd) return;
     Promise.all([
-      getGitStatus(cwd).catch((e) => { console.error("[ChangesPanel] git status failed:", e); return [] as GitFileStatus[]; }),
-      getGitBranchInfo(cwd).catch((e) => { console.error("[ChangesPanel] branch info failed:", e); return null; }),
-      gitLogEntries(cwd, 10).catch((e) => { console.error("[ChangesPanel] git log failed:", e); return [] as GitLogEntry[]; }),
+      getGitStatus(cwd).catch(() => [] as GitFileStatus[]),
+      getGitBranchInfo(cwd).catch(() => null),
       getMergeState(cwd).catch(() => null as MergeState | null),
-    ]).then(([status, info, log, merge]) => {
-      setFiles(status);
+    ]).then(([s, info, merge]) => {
+      setFiles(s);
       if (info) setBranchInfo(info);
-      setCommits(log);
       setMergeState(merge);
     });
   }, [cwd]);
 
   useEffect(() => {
     refresh();
-    refreshRef.current = setInterval(refresh, 10000);
+    refreshRef.current = setInterval(refresh, 10_000);
     return () => {
       if (refreshRef.current) clearInterval(refreshRef.current);
     };
   }, [refresh]);
-
-  useEffect(() => {
-    if (gitError) {
-      const t = setTimeout(() => setGitError(null), 8000);
-      return () => clearTimeout(t);
-    }
-  }, [gitError]);
 
   useEffect(() => {
     if (aiEnabled) {
@@ -1129,1365 +340,629 @@ export function ChangesPanel({ workspace }: Props) {
     }
   }, [aiEnabled]);
 
-  useEffect(() => {
-    if (generation?.status === "done") {
-      const msg = consumeMessage(workspace.workspace_id);
-      if (msg) setCommitMsg(msg);
-    } else if (generation?.status === "error") {
-      setGitError(generation.error ?? "Generation failed");
-      clearGeneration(workspace.workspace_id);
-    }
-  }, [generation?.status, workspace.workspace_id, consumeMessage, clearGeneration]);
-
-  // Fetch default branch and remote branches on mount
-  useEffect(() => {
-    if (!cwd) return;
-    getDefaultBranch(cwd).then(setBaseBranch).catch(() => setBaseBranch("main"));
-    listBranches(cwd, true).then(setRemoteBranches).catch(() => {});
-  }, [cwd]);
-
-  // Fetch base branch diff
-  const refreshBaseDiff = useCallback(() => {
-    if (!cwd) return;
-    getBaseBranchDiff(cwd, baseBranch)
-      .then((result) => setBaseBranchFiles(result.files))
-      .catch(() => setBaseBranchFiles([]));
-  }, [cwd, baseBranch]);
-
-  useEffect(() => { refreshBaseDiff(); }, [refreshBaseDiff]);
-
-  const sortedBaseBranches = useMemo(() => {
-    return [...remoteBranches].sort((a, b) => {
-      const aDefault = a === "main" || a === "master";
-      const bDefault = b === "main" || b === "master";
-      if (aDefault && !bDefault) return -1;
-      if (!aDefault && bDefault) return 1;
-      return a.localeCompare(b);
+  // Invalidate Review-tab queries so the PR badge reflects a fresh
+  // commit / push / pull immediately instead of waiting for the 60s
+  // background poll.
+  const invalidateReviewQueries = useCallback(() => {
+    queryClient.invalidateQueries({
+      predicate: (q) =>
+        q.queryKey[0] === "pr" && q.queryKey[2] === workspace.workspace_id,
     });
-  }, [remoteBranches]);
+  }, [queryClient, workspace.workspace_id]);
 
-  const staged = useMemo(() => files.filter((f) => f.is_staged), [files]);
-  const unstaged = useMemo(() => files.filter((f) => f.is_unstaged), [files]);
-  const conflicted = useMemo(() => files.filter((f) => f.status === "conflicted"), [files]);
-  const isMerging = mergeState?.is_merging || mergeState?.is_rebasing || false;
-
-  const resolver = useAiMergeStore((s) => s.getResolver(workspace.workspace_id));
-  const startResolution = useAiMergeStore((s) => s.startResolution);
-  const approveResolution = useAiMergeStore((s) => s.approveResolution);
-  const rejectResolution = useAiMergeStore((s) => s.rejectResolution);
-
-  const handleStartResolve = () => {
-    const cli = config?.ai_resolver_cli ?? "claude";
-    const model = config?.ai_resolver_model ?? null;
-    const strategy = config?.ai_resolver_strategy ?? "smart_merge";
-    const target = "main"; // TODO: detect actual target branch
-    startResolution(workspace.workspace_id, cwd, target, cli, model, strategy);
-  };
-
-  const handleApproveResolve = () => {
-    approveResolution(workspace.workspace_id, cwd, "Resolve merge conflicts").then(refresh);
-  };
-
-  const handleRejectResolve = () => {
-    rejectResolution(workspace.workspace_id, cwd).then(refresh);
-  };
-
-  /** Persist a new resolver strategy. Backend update; the snapshot
-   *  refresh propagates the change back to `config?.ai_resolver_strategy`,
-   *  which the UI re-reads on next render. */
-  const handleSetResolverStrategy = (v: string) => {
-    setAiResolverStrategy(v).catch(console.error);
-  };
-
-  /** Open Settings → Git so the user can change CLI / model / default strategy. */
-  const setShowSettings = useUIStore((s) => s.setShowSettings);
-  const handleOpenResolverSettings = () => {
-    setShowSettings(true, "git");
-  };
-
-  const busy = busyAction !== null;
-
-  const handleGenerateCommitMsg = () => {
-    if (isGenerating || staged.length === 0) return;
-    setGitError(null);
-    // The commits backend now supports any of the three CLIs (claude /
-    // codex / opencode), same way the merge resolver does. We forward
-    // both the CLI and the model so they stay paired — the picker in
-    // settings always writes them atomically, but `??` defaults guard
-    // against legacy configs that pre-date the `ai_commit_message_cli`
-    // field.
-    const cli = config?.ai_commit_message_cli ?? "claude";
-    const model = config?.ai_commit_message_model ?? null;
-    requestGeneration(workspace.workspace_id, cwd, cli, model);
-  };
-
-  const handleAbortMerge = async () => {
-    if (busy) return;
-    setBusyAction("commit");
-    setGitError(null);
-    try {
-      await abortMerge(cwd);
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleCompleteMerge = async () => {
-    if (busy) return;
-    setBusyAction("commit");
-    setGitError(null);
-    try {
-      const msg = commitMsg.trim() || "Merge commit";
-      await continueMerge(cwd, msg);
-      setCommitMsg("");
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleCommit = async () => {
-    if (!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0) return;
-    setBusyAction("commit");
-    setGitError(null);
-    try {
-      await gitCommitChanges(cwd, commitMsg.trim());
-      setCommitMsg("");
-      setExpandedFile(null);
-      refresh();
-      refreshBaseDiff();
-      invalidateReviewQueries();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handlePush = async () => {
-    if (busy) return;
-    setBusyAction("push");
-    setGitError(null);
-    try {
-      const needsPublish = branchInfo && !branchInfo.has_upstream;
-      await gitPushChanges(cwd, !!needsPublish);
-      refresh();
-      refreshBaseDiff();
-      invalidateReviewQueries();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handlePull = async () => {
-    if (busy) return;
-    setBusyAction("pull");
-    setGitError(null);
-    try {
-      await gitPullChanges(cwd);
-      refresh();
-      invalidateReviewQueries();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleFetch = async () => {
-    if (busy) return;
-    setBusyAction("fetch");
-    setGitError(null);
-    try {
-      await gitFetchChanges(cwd);
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  // Refresh button is what users naturally reach for when they want to
-  // know "is my branch up to date with the remote?" Without a fetch
-  // step the answer is computed against stale local refs and the
-  // ahead/behind arrows in the sidebar never update on demand. We fetch
-  // first, then refresh local panel state and the base-branch diff.
-  // Fetch failures (offline, no remote, rejected creds) are logged but
-  // don't block the local refresh — partial freshness still helps.
-  const handleRefresh = async () => {
-    if (busy) return;
-    setBusyAction("fetch");
-    setGitError(null);
-    try {
-      await gitFetchChanges(cwd);
-    } catch (err) {
-      console.warn("[ChangesPanel] fetch failed during refresh:", err);
-    }
-    refresh();
-    refreshBaseDiff();
-    setBusyAction(null);
-  };
-
-  // Merge the open PR via `gh pr merge`. Method maps to GitHub's three
-  // merge strategies. After success, kick refreshWorkspacePr so the
-  // sidebar pill flips to MERGED (purple) without waiting for the 60s
-  // background poll, plus refresh the changes panel itself so deleted
-  // branch / fetch state catches up. On failure, surface the raw error
-  // via toast — no two-tap confirmation since the dropdown click itself
-  // is the deliberate action.
-  const handleMergePr = async (method: "squash" | "merge" | "rebase") => {
-    if (workspace.pr_number == null || mergingPr !== null) return;
-    setMergingPr(method);
-    try {
-      await mergePullRequest(cwd, workspace.pr_number, method);
-      const verb =
-        method === "squash" ? "squashed" : method === "rebase" ? "rebased" : "merged";
-      toast.success(`PR #${workspace.pr_number} ${verb}`);
-      refreshWorkspacePr(workspace.workspace_id).catch(console.error);
-      refresh();
-      refreshBaseDiff();
-      invalidateReviewQueries();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      toast.error(`Couldn't merge PR: ${msg}`);
-    } finally {
-      setMergingPr(null);
-    }
-  };
-
-  const handleFetchAndPull = async () => {
-    if (busy) return;
-    setBusyAction("fetch");
-    setGitError(null);
-    try {
-      await gitFetchChanges(cwd);
-      setBusyAction("pull");
-      await gitPullChanges(cwd);
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleSync = async () => {
-    if (busy) return;
-    setBusyAction("pull");
-    setGitError(null);
-    try {
-      await gitPullChanges(cwd);
-      setBusyAction("push");
-      await gitPushChanges(cwd, false);
-      refresh();
-      refreshBaseDiff();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleStash = async (includeUntracked: boolean) => {
-    if (busy) return;
-    setBusyAction("stash");
-    setGitError(null);
-    try {
-      await gitStashPush(cwd, includeUntracked);
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleStashPop = async () => {
-    if (busy) return;
-    setBusyAction("stash");
-    setGitError(null);
-    try {
-      await gitStashPop(cwd);
-      refresh();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const [mergeSuccess, setMergeSuccess] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (mergeSuccess) {
-      const t = setTimeout(() => setMergeSuccess(null), 4000);
-      return () => clearTimeout(t);
-    }
-  }, [mergeSuccess]);
-
-  const handleMergeBranch = async () => {
-    if (busy || isMerging) return;
-    setBusyAction("merge");
-    setGitError(null);
-    setMergeSuccess(null);
-    try {
-      const result = await mergeBranch(cwd, baseBranch);
-      refresh();
-      refreshBaseDiff();
-      if (result === "up_to_date") {
-        setMergeSuccess(`Already up to date with ${baseBranch}`);
-      } else if (result === "merged") {
-        setMergeSuccess(`Merged ${baseBranch} into current branch`);
-      }
-      // "conflicts" — merge banner and conflict UI handle this automatically
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  // ── Merge into base state ──
-  const [mergeIntoBaseState, setMergeIntoBaseState] = useState<{
-    active: boolean;
-    sourceBranch: string;
-    baseBranch: string;
-    tempBranch: string;
-    deleteSourceAfter: boolean;
-  } | null>(null);
-  const [showMergeIntoDialog, setShowMergeIntoDialog] = useState(false);
-  const [mergeIntoDeleteBranch, setMergeIntoDeleteBranch] = useState(false);
-
-  /** After merge+delete, switch to the main workspace and close the dead feature workspace. */
-  const transitionToBaseWorkspace = useCallback(async (targetBranch: string) => {
-    const projectRoot = workspace.project_root ?? workspace.cwd;
-    const currentWsId = workspace.workspace_id;
-
-    // Find an existing workspace on the base branch in the same project
-    const baseWs = workspaces.find(
-      (ws) => ws.git_branch === targetBranch
-        && ws.workspace_id !== currentWsId
-        && (ws.project_root ?? ws.cwd) === projectRoot,
-    );
-
-    let targetWsId: string | null = baseWs?.workspace_id ?? null;
-
-    if (!targetWsId) {
-      // No workspace for base branch — create one at the project root
-      try {
-        targetWsId = await createWorkspace(projectRoot);
-      } catch (err) {
-        toast.error(`Could not create workspace for ${targetBranch}: ${err}`);
-        return; // Don't close current workspace — better to stay on detached HEAD
-      }
-    }
-
-    await activateWorkspace(targetWsId);
-    toast.success(`Merged into ${targetBranch} — switched workspace`);
-
-    // Close the dead feature workspace (UI-only, worktree already gone)
-    try {
-      await closeWorkspace(currentWsId, false);
-    } catch {
-      // Non-blocking — workspace will just linger in sidebar
-    }
-  }, [workspace, workspaces]);
-
-  const handleMergeIntoBase = async () => {
-    if (busy || isMerging) return;
-    setBusyAction("merge");
-    setGitError(null);
-    setMergeSuccess(null);
-    setMergeIntoBaseState(null);
-    setShowMergeIntoDialog(false);
-    try {
-      const result = await mergeIntoBase(cwd, baseBranch, mergeIntoDeleteBranch);
-      if (result.status === "already_up_to_date") {
-        setMergeSuccess(`Already up to date — nothing to merge into ${baseBranch}`);
-      } else if (result.status === "merged") {
-        if (mergeIntoDeleteBranch) {
-          await transitionToBaseWorkspace(baseBranch);
-          return; // workspace is closing — skip refresh
-        }
-        setMergeSuccess(`Successfully merged ${result.source_branch} into ${baseBranch}`);
-      } else if (result.status === "conflicts" && result.temp_branch) {
-        setMergeIntoBaseState({
-          active: true,
-          sourceBranch: result.source_branch,
-          baseBranch,
-          tempBranch: result.temp_branch,
-          deleteSourceAfter: mergeIntoDeleteBranch,
-        });
-      }
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-      try { refresh(); } catch { /* ignore */ }
-      try { refreshBaseDiff(); } catch { /* ignore */ }
-    }
-  };
-
-  const handleCompleteMergeIntoBase = async () => {
-    if (!mergeIntoBaseState || busy) return;
-    setBusyAction("merge");
-    setGitError(null);
-    try {
-      await completeMergeIntoBase(
-        cwd,
-        mergeIntoBaseState.baseBranch,
-        mergeIntoBaseState.tempBranch,
-        mergeIntoBaseState.sourceBranch,
-        mergeIntoBaseState.deleteSourceAfter,
-      );
-      if (mergeIntoBaseState.deleteSourceAfter) {
-        setMergeIntoBaseState(null);
-        await transitionToBaseWorkspace(mergeIntoBaseState.baseBranch);
-        return; // workspace is closing — skip refresh
-      }
-      setMergeSuccess(`Successfully merged ${mergeIntoBaseState.sourceBranch} into ${mergeIntoBaseState.baseBranch}`);
-      setMergeIntoBaseState(null);
-      refresh();
-      refreshBaseDiff();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleAbortMergeIntoBase = async () => {
-    if (!mergeIntoBaseState || busy) return;
-    setBusyAction("merge");
-    setGitError(null);
-    try {
-      await abortMergeIntoBase(cwd, mergeIntoBaseState.sourceBranch, mergeIntoBaseState.tempBranch);
-      setMergeSuccess(`Merge aborted. No changes were made to ${mergeIntoBaseState.baseBranch}.`);
-      setMergeIntoBaseState(null);
-      refresh();
-      refreshBaseDiff();
-    } catch (err) {
-      setGitError(String(err));
-    } finally {
-      setBusyAction(null);
-    }
-  };
-
-  const handleStageAll = async () => {
-    const paths = unstaged.map((f) => f.path);
-    if (paths.length === 0) return;
-    await gitStageFiles(cwd, paths).catch(console.error);
-    refresh();
-  };
-
-  const handleUnstageAll = async () => {
-    const paths = staged.map((f) => f.path);
-    if (paths.length === 0) return;
-    await gitUnstageFiles(cwd, paths).catch(console.error);
-    refresh();
-  };
-
-  // Smart primary action for ButtonGroup
-  const canCommit = !!commitMsg.trim() && staged.length > 0 && !busy && conflicted.length === 0;
-  const pushCount = branchInfo?.ahead ?? 0;
-  const pullCount = branchInfo?.behind ?? 0;
-  const hasUpstream = branchInfo?.has_upstream ?? false;
-
-  const primaryAction = (() => {
-    if (canCommit) {
-      return {
-        label: "Commit",
-        icon: busyAction === "commit" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <GitCommit className="h-3.5 w-3.5" />,
-        handler: handleCommit,
-        disabled: false,
-        tooltip: "Commit staged changes (Ctrl+Enter)",
-        badge: null as string | null,
-      };
-    }
-    if (pushCount > 0 && pullCount > 0) {
-      return {
-        label: "Sync",
-        icon: (busyAction === "push" || busyAction === "pull") ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDownUp className="h-3.5 w-3.5" />,
-        handler: handleSync,
-        disabled: busy,
-        tooltip: `Pull ${pullCount}, push ${pushCount}`,
-        badge: `${pullCount}/${pushCount}`,
-      };
-    }
-    if (pushCount > 0) {
-      return {
-        label: "Push",
-        icon: busyAction === "push" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUp className="h-3.5 w-3.5" />,
-        handler: handlePush,
-        disabled: busy,
-        tooltip: `Push ${pushCount} commit${pushCount !== 1 ? "s" : ""} to remote`,
-        badge: String(pushCount),
-      };
-    }
-    if (pullCount > 0) {
-      return {
-        label: "Pull",
-        icon: busyAction === "pull" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowDown className="h-3.5 w-3.5" />,
-        handler: handlePull,
-        disabled: busy,
-        tooltip: `Pull ${pullCount} commit${pullCount !== 1 ? "s" : ""}`,
-        badge: String(pullCount),
-      };
-    }
-    if (!hasUpstream && branchInfo?.branch) {
-      return {
-        label: "Publish Branch",
-        icon: busyAction === "push" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowUp className="h-3.5 w-3.5" />,
-        handler: handlePush,
-        disabled: busy,
-        tooltip: "Publish branch to remote",
-        badge: null,
-      };
-    }
-    return {
-      label: "Commit",
-      icon: <GitCommit className="h-3.5 w-3.5" />,
-      handler: handleCommit,
-      disabled: true,
-      tooltip: staged.length === 0 ? "No staged changes" : "Enter a commit message",
-      badge: null,
-    };
-  })();
-
-  const handleToggleExpand = (path: string, isStaged: boolean) => {
-    if (expandedFile === path && expandedStaged === isStaged) {
-      setExpandedFile(null);
-    } else {
-      setExpandedFile(path);
-      setExpandedStaged(isStaged);
-    }
-  };
-
-  const diffSetFile = useDiffStore((s) => s.setFile);
-  const diffInitTab = useDiffStore((s) => s.initTab);
-  const diffSetSection = useDiffStore((s) => s.setSection);
-  const diffSetBaseBranch = useDiffStore((s) => s.setBaseBranch);
-
-  // Find active diff tab and its current file for highlighting
-  const activeDiffTab = workspace.tabs.find((t) => t.kind === "diff");
-  const activeDiffState = useDiffStore((s) =>
-    activeDiffTab ? s.getTab(activeDiffTab.tab_id) : undefined,
-  );
-  const activeDiffFile = activeDiffState?.filePath ?? null;
-
-  const handleOpenDiff = useCallback(
+  const openDiff = useCallback(
     async (filePath: string, isStaged: boolean) => {
-      const existingDiffTab = workspace.tabs.find((t) => t.kind === "diff");
-      if (existingDiffTab) {
-        await activateTab(workspace.workspace_id, existingDiffTab.tab_id).catch(
-          console.error,
-        );
-        diffSetFile(existingDiffTab.tab_id, filePath, isStaged);
-      } else {
-        try {
-          const tabId = await createTab(workspace.workspace_id, "diff");
-          diffInitTab(tabId, { file: filePath, staged: isStaged });
-        } catch (err) {
-          console.error("Failed to create diff tab:", err);
-        }
+      const existing = workspace.tabs.find((t) => t.kind === "diff");
+      if (existing) {
+        await activateTab(workspace.workspace_id, existing.tab_id).catch(console.error);
+        diffSetFile(existing.tab_id, filePath, isStaged);
+        return;
+      }
+      try {
+        const tabId = await createTab(workspace.workspace_id, "diff");
+        diffInitTab(tabId, { file: filePath, staged: isStaged });
+      } catch (err) {
+        console.error("Failed to create diff tab:", err);
       }
     },
     [workspace, diffSetFile, diffInitTab],
   );
 
-  const handleOpenBaseDiff = useCallback(
-    async (filePath: string) => {
-      const existingDiffTab = workspace.tabs.find((t) => t.kind === "diff");
-      if (existingDiffTab) {
-        await activateTab(workspace.workspace_id, existingDiffTab.tab_id).catch(console.error);
-        diffSetFile(existingDiffTab.tab_id, filePath, false);
-        diffSetBaseBranch(existingDiffTab.tab_id, baseBranch);
-        diffSetSection(existingDiffTab.tab_id, "against_base");
-      } else {
-        try {
-          const tabId = await createTab(workspace.workspace_id, "diff");
-          diffInitTab(tabId, { file: filePath, staged: false });
-          diffSetBaseBranch(tabId, baseBranch);
-          diffSetSection(tabId, "against_base");
-        } catch (err) {
-          console.error("Failed to create diff tab:", err);
-        }
+  // ── Commit flow ──
+  //
+  // One button does it all: stage anything unstaged, ask the AI for a
+  // message, surface a preview the user can confirm or edit. If AI is
+  // unavailable we drop straight into the textarea so the user always
+  // has a path forward. `andPush` lets the dropdown's "Commit & Push"
+  // option chain a push after the commit lands.
+  const beginCommit = async (andPush: boolean = false) => {
+    if (busy) return;
+    if (totalChanges === 0) return;
+    setPushAfterCommit(andPush);
+    if (unstaged.length > 0 && staged.length === 0) {
+      try {
+        await gitStageFiles(cwd, unstaged.map((f) => f.path));
+        refresh();
+      } catch (err) {
+        toast.error(`Stage failed: ${err}`);
+        return;
       }
-    },
-    [workspace, baseBranch, diffSetFile, diffSetBaseBranch, diffSetSection, diffInitTab],
-  );
+    }
+    const canUseAi = aiEnabled && claudeReady !== false;
+    if (canUseAi) {
+      const cli = config?.ai_commit_message_cli ?? "claude";
+      const model = config?.ai_commit_message_model ?? null;
+      requestGeneration(workspace.workspace_id, cwd, cli, model);
+    } else {
+      setEditedMsg("");
+      setEditing(true);
+    }
+  };
+
+  const finalizeCommit = async (msg: string) => {
+    const trimmed = msg.trim();
+    if (!trimmed) return;
+    setBusy("commit");
+    try {
+      await gitCommitChanges(cwd, trimmed);
+      clearGeneration(workspace.workspace_id);
+      setEditing(false);
+      setEditedMsg("");
+      if (pushAfterCommit) {
+        setBusy("push");
+        try {
+          await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
+        } catch (err) {
+          toast.error(`Push after commit failed: ${err}`);
+        }
+        setPushAfterCommit(false);
+      }
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Commit failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleAmend = async () => {
+    if (busy) return;
+    setBusy("amend");
+    try {
+      if (unstaged.length > 0 && staged.length === 0) {
+        await gitStageFiles(cwd, unstaged.map((f) => f.path));
+      }
+      await gitAmendCommit(cwd, null);
+      toast.success("Amended last commit");
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Amend failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleUndoLastCommit = async () => {
+    if (busy) return;
+    setBusy("undo");
+    try {
+      await gitUndoLastCommit(cwd);
+      toast.success("Undid last commit (changes kept)");
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Undo failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleStashPush = async () => {
+    if (busy) return;
+    setBusy("stash");
+    try {
+      await gitStashPush(cwd, true);
+      toast.success("Stashed changes");
+      refresh();
+    } catch (err) {
+      toast.error(`Stash failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleStashPop = async () => {
+    if (busy) return;
+    setBusy("stash");
+    try {
+      await gitStashPop(cwd);
+      toast.success("Popped stash");
+      refresh();
+    } catch (err) {
+      toast.error(`Stash pop failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // Watch AI generation — drop the result into the preview banner on
+  // success, surface the error and reset on failure.
+  useEffect(() => {
+    if (!generation) return;
+    if (generation.status === "error") {
+      toast.error(generation.error ?? "Generation failed");
+      clearGeneration(workspace.workspace_id);
+    }
+  }, [generation, clearGeneration, workspace.workspace_id]);
+
+  const handlePush = async () => {
+    if (busy) return;
+    setBusy("push");
+    try {
+      await gitPushChanges(cwd, branchInfo ? !branchInfo.has_upstream : false);
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Push failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handlePull = async () => {
+    if (busy) return;
+    setBusy("pull");
+    try {
+      await gitPullChanges(cwd);
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Pull failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleSync = async () => {
+    if (busy) return;
+    setBusy("sync");
+    try {
+      await gitPullChanges(cwd);
+      await gitPushChanges(cwd, false);
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Sync failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleFetch = async () => {
+    if (busy) return;
+    setBusy("fetch");
+    try {
+      await gitFetchChanges(cwd);
+      refresh();
+    } catch (err) {
+      toast.error(`Fetch failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleAbortMerge = async () => {
+    if (busy) return;
+    setBusy("merge");
+    try {
+      await abortMerge(cwd);
+      refresh();
+    } catch (err) {
+      toast.error(`Abort failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleContinueMerge = async () => {
+    if (busy) return;
+    setBusy("merge");
+    try {
+      await continueMerge(cwd, "Merge commit");
+      refresh();
+      invalidateReviewQueries();
+    } catch (err) {
+      toast.error(`Continue failed: ${err}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  // ── Render ──
+
+  const generatedMsg = generation?.status === "done" ? generation.message ?? "" : "";
+  const isGenerating = generation?.status === "generating";
+  const showPreview = !!generatedMsg && !editing;
+  const showEditor = editing;
 
   return (
-    <>
-    <TooltipProvider>
-      <div className="flex h-full flex-col">
-        {/* Toolbar row — above commit area */}
-        <div className="flex items-center gap-0.5 px-2 py-1.5">
-          {/* Base branch selector */}
-          {remoteBranches.length > 1 ? (
-            <Popover open={baseBranchPickerOpen} onOpenChange={setBaseBranchPickerOpen}>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <PopoverTrigger asChild>
-                    <Button variant="ghost" size="icon-xs" className="size-6 p-0">
-                      <GitBranch className="h-3.5 w-3.5" />
-                    </Button>
-                  </PopoverTrigger>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="text-xs">
-                  Base: {baseBranch}
-                </TooltipContent>
-              </Tooltip>
-              <PopoverContent align="start" className="w-[260px] p-0">
-                <Command>
-                  <CommandInput placeholder="Search branches..." className="h-8" />
-                  <CommandList
-                    className="max-h-[300px] [scrollbar-width:thin]"
-                    onWheel={(e) => e.stopPropagation()}
-                  >
-                    <CommandEmpty>No branches match</CommandEmpty>
-                    <CommandGroup>
-                      {sortedBaseBranches.map((b) => {
-                        const isDefault = b === "main" || b === "master";
-                        const isSelected = b === baseBranch;
-                        return (
-                          <CommandItem
-                            key={b}
-                            value={b}
-                            onSelect={() => {
-                              setBaseBranch(b);
-                              setBaseBranchPickerOpen(false);
-                            }}
-                            className="h-8 text-xs gap-2 px-2"
-                          >
-                            <span className="flex-1 min-w-0 truncate font-mono">
-                              {b}
-                            </span>
-                            {isDefault && (
-                              <span className="text-[10px] text-muted-foreground shrink-0">
-                                default
-                              </span>
-                            )}
-                            {isSelected && (
-                              <Check className="h-3 w-3 shrink-0 text-foreground" />
-                            )}
-                          </CommandItem>
-                        );
-                      })}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button variant="ghost" size="icon-xs" className="size-6 p-0" disabled>
-                  <GitBranch className="h-3.5 w-3.5" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-xs">
-                Base: {baseBranch}
-              </TooltipContent>
-            </Tooltip>
-          )}
-
-          {/* Stash dropdown */}
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <Button variant="ghost" size="icon-xs" className="size-6 p-0" disabled={busy}>
-                    <Archive className="h-3.5 w-3.5" />
-                  </Button>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-xs">
-                Stash
-              </TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent align="start" className="w-52">
-              <DropdownMenuItem onClick={() => handleStash(false)} className="text-xs">
-                <Archive className="h-3.5 w-3.5" />
-                Stash Changes
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={() => handleStash(true)} className="text-xs">
-                <Archive className="h-3.5 w-3.5" />
-                Stash (Include Untracked)
-              </DropdownMenuItem>
-              <DropdownMenuSeparator />
-              <DropdownMenuItem onClick={handleStashPop} className="text-xs">
-                <ArchiveRestore className="h-3.5 w-3.5" />
-                Pop Stash
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-
-          {/* The icon-only merge dropdown that lived here was the original
-              "buried in a row of glyphs" affordance. It's been replaced by
-              the labeled "Merge → {baseBranch}" CTA in the commit area
-              (see below) which mirrors the Commit ButtonGroup shape and
-              gives the workflow exit a real identity. The same two
-              actions (merge into base, merge base into current) are still
-              available via that CTA's primary click and caret dropdown. */}
-
-          {/* View mode toggle */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="size-6 p-0"
-                onClick={() => setViewMode(viewMode === "grouped" ? "flat" : "grouped")}
-              >
-                {viewMode === "grouped" ? <FolderTree className="h-3.5 w-3.5" /> : <List className="h-3.5 w-3.5" />}
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              {viewMode === "grouped" ? "Switch to flat view" : "Switch to grouped view"}
-            </TooltipContent>
-          </Tooltip>
-
-          {/* Refresh */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="size-6 p-0"
-                onClick={handleRefresh}
-                disabled={busy}
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" className="text-xs">
-              Refresh
-            </TooltipContent>
-          </Tooltip>
-
-          {/* PR button — right-aligned (Superset's ChangesHeader pattern).
-              Renders only when a PR URL is known. For OPEN PRs it's a
-              split button: main half opens GitHub, chevron half opens a
-              merge dropdown (squash / merge commit / rebase). For
-              MERGED/CLOSED/DRAFT PRs only the GitHub-link half renders
-              since merge methods don't apply to them. */}
-          {workspace.pr_url && (
-            <div className="ml-auto flex items-center">
-              <Button
-                variant="outline"
-                size="xs"
-                className={cn(
-                  workspace.pr_state === "OPEN" &&
-                    workspace.pr_number != null &&
-                    "rounded-r-none border-r-0",
-                )}
-                onClick={() => openUrl(workspace.pr_url!).catch(console.error)}
-                aria-label={
-                  workspace.pr_number != null
-                    ? `Open PR #${workspace.pr_number} on GitHub`
-                    : "Open PR on GitHub"
-                }
-              >
-                <PrStatusIcon state={workspace.pr_state} size={3} />
-                {workspace.pr_number != null && (
-                  <span className="tabular-nums">#{workspace.pr_number}</span>
-                )}
-              </Button>
-              {workspace.pr_state === "OPEN" && workspace.pr_number != null && (
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="outline"
-                      size="icon-xs"
-                      className="size-6 p-0 rounded-l-none"
-                      disabled={mergingPr !== null}
-                      aria-label="Merge PR"
-                    >
-                      {mergingPr !== null ? (
-                        <Loader2 className="h-3 w-3 animate-spin" />
-                      ) : (
-                        <ChevronDown className="h-3 w-3" />
-                      )}
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-fit">
-                    <DropdownMenuItem
-                      onClick={() => handleMergePr("squash")}
-                      disabled={mergingPr !== null}
-                      className="text-xs"
-                    >
-                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
-                      Squash and merge
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={() => handleMergePr("merge")}
-                      disabled={mergingPr !== null}
-                      className="text-xs"
-                    >
-                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
-                      Create merge commit
-                    </DropdownMenuItem>
-                    <DropdownMenuItem
-                      onClick={() => handleMergePr("rebase")}
-                      disabled={mergingPr !== null}
-                      className="text-xs"
-                    >
-                      <GitMerge className="h-3.5 w-3.5 text-muted-foreground/60" />
-                      Rebase and merge
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              )}
-            </div>
-          )}
-        </div>
-
-        {/* Commit area */}
-        <div className="flex flex-col gap-1.5 px-2 py-2 border-b border-border">
-          {/* Textarea with AI sparkle overlay */}
-          <div className="relative">
-            <Textarea
-              placeholder="Commit message"
-              value={commitMsg}
-              onChange={(e) => setCommitMsg(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !primaryAction.disabled) {
-                  e.preventDefault();
-                  primaryAction.handler();
-                }
-              }}
-              disabled={isGenerating}
-              className="min-h-[52px] resize-none text-xs bg-background pr-7"
-            />
-            {aiEnabled && (
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <span className="absolute top-1.5 right-1.5 shrink-0" tabIndex={0}>
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      className="h-5 w-5"
-                      disabled={staged.length === 0 || isGenerating || claudeReady === false}
-                      onClick={handleGenerateCommitMsg}
-                    >
-                      {isGenerating
-                        ? <Loader2 className="h-3 w-3 animate-spin" />
-                        : <Sparkles className="h-3 w-3" />}
-                    </Button>
-                  </span>
-                </TooltipTrigger>
-                <TooltipContent side="top" className="text-xs">
-                  {claudeReady === false
-                    ? "Claude CLI not found"
-                    : staged.length === 0
-                      ? "Stage files first"
-                      : "Generate commit message"}
-                </TooltipContent>
-              </Tooltip>
-            )}
-          </div>
-
-          {/* Smart ButtonGroup: primary action + dropdown */}
-          <div data-slot="button-group" className="flex w-full items-stretch">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="flex-1 gap-1.5 h-7 text-xs rounded-r-none border-r-0"
-                  onClick={primaryAction.handler}
-                  disabled={primaryAction.disabled}
-                >
-                  {primaryAction.icon}
-                  <span>{primaryAction.label}</span>
-                  {primaryAction.badge && (
-                    <span className="text-[10px] opacity-70">{primaryAction.badge}</span>
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" className="text-xs">{primaryAction.tooltip}</TooltipContent>
-            </Tooltip>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="h-7 px-1.5 rounded-l-none"
-                  disabled={busy}
-                >
-                  <ChevronDown className="h-3.5 w-3.5" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end" className="w-48 text-xs">
-                <DropdownMenuItem
-                  onClick={handleCommit}
-                  disabled={!commitMsg.trim() || staged.length === 0 || busy || conflicted.length > 0}
-                  className="text-xs"
-                >
-                  <GitCommit className="h-3.5 w-3.5" />
-                  Commit
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={() => {
-                    if (!commitMsg.trim() || staged.length === 0 || busy) return;
-                    (async () => {
-                      try {
-                        await gitCommitChanges(cwd, commitMsg.trim());
-                        setCommitMsg("");
-                        await handlePush();
-                      } catch (err) { setGitError(String(err)); }
-                      refresh();
-                      refreshBaseDiff();
-                    })();
-                  }}
-                  disabled={!commitMsg.trim() || staged.length === 0 || busy}
-                  className="text-xs"
-                >
-                  <ArrowUp className="h-3.5 w-3.5" />
-                  Commit & Push
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onClick={handlePush}
-                  disabled={busy || (branchInfo?.has_upstream && (branchInfo?.ahead ?? 0) === 0)}
-                  className="text-xs"
-                >
-                  <ArrowUp className="h-3.5 w-3.5" />
-                  <span className="flex-1">{!branchInfo?.has_upstream ? "Publish Branch" : "Push"}</span>
-                  {(branchInfo?.ahead ?? 0) > 0 && (
-                    <span className="text-[10px] text-muted-foreground">{branchInfo?.ahead}</span>
-                  )}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={handlePull}
-                  disabled={busy || !branchInfo?.has_upstream || (branchInfo?.behind ?? 0) === 0}
-                  className="text-xs"
-                >
-                  <ArrowDown className="h-3.5 w-3.5" />
-                  <span className="flex-1">Pull</span>
-                  {(branchInfo?.behind ?? 0) > 0 && (
-                    <span className="text-[10px] text-muted-foreground">{branchInfo?.behind}</span>
-                  )}
-                </DropdownMenuItem>
-                <DropdownMenuItem
-                  onClick={handleSync}
-                  disabled={busy || ((branchInfo?.ahead ?? 0) === 0 && (branchInfo?.behind ?? 0) === 0)}
-                  className="text-xs"
-                >
-                  <ArrowDownUp className="h-3.5 w-3.5" />
-                  Sync
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={handleFetch} disabled={busy} className="text-xs">
-                  <Download className="h-3.5 w-3.5" />
-                  Fetch
-                </DropdownMenuItem>
-                <DropdownMenuItem onClick={handleFetchAndPull} disabled={busy} className="text-xs">
-                  <Download className="h-3.5 w-3.5" />
-                  Fetch & Pull
-                </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem onClick={handleRefresh} disabled={busy} className="text-xs">
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  Refresh
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-
-          {/* Worktree exit: labeled "Merge → base" CTA. Visible whenever the
-              user is on a feature branch and not in an in-progress merge or
-              conflict-resolution flow — even if there's nothing to merge yet.
-              Discoverability matters: a new user needs to SEE the button
-              before their first commit so they learn it exists. When there is
-              nothing to merge the button stays disabled with a tooltip
-              explaining what they need to do next. Mirrors the commit
-              ButtonGroup shape so it reads as a peer action, not a hidden
-              tool. */}
-          {branchInfo?.branch !== baseBranch
-            && !isMerging
-            && !mergeIntoBaseState?.active
-            && conflicted.length === 0 && (
-            <div className="flex flex-col gap-0.5">
-              {/* `data-slot="button-group"` is required: the Button
-                  component's `in-data-[slot=button-group]:rounded-lg` rule
-                  swaps the corner radius from the per-size default (10–12px)
-                  to `rounded-lg` so adjacent grouped buttons line up. The
-                  Commit ButtonGroup above uses the same slot — without it
-                  the borders/corners visibly diverge from Commit. */}
-              <div data-slot="button-group" className="flex w-full items-stretch">
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      className="flex-1 gap-1.5 h-7 text-xs rounded-r-none border-r-0"
-                      onClick={() => setShowMergeIntoDialog(true)}
-                      disabled={busy || baseBranchFiles.length === 0}
-                      aria-label={`Merge into ${baseBranch}`}
-                    >
-                      {busyAction === "merge" ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <ArrowUpToLine className="h-3.5 w-3.5" />
-                      )}
-                      <span>Merge → {baseBranch}</span>
-                      {baseBranchFiles.length > 0 && (
-                        <span className="text-[10px] opacity-70">{baseBranchFiles.length}</span>
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="bottom" className="text-xs">
-                    {baseBranchFiles.length === 0
-                      ? `Nothing to merge yet — commit your changes first`
-                      : `Land this worktree on ${baseBranch}`}
-                  </TooltipContent>
-                </Tooltip>
-                <DropdownMenu>
-                  <DropdownMenuTrigger asChild>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      className="h-7 px-1.5 rounded-l-none"
-                      disabled={busy}
-                      aria-label="Merge options"
-                    >
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    </Button>
-                  </DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="w-56 text-xs">
-                    <DropdownMenuItem
-                      onClick={handleMergeBranch}
-                      disabled={isMerging}
-                      className="text-xs"
-                    >
-                      <ArrowDown className="h-3.5 w-3.5" />
-                      Merge {baseBranch} into current
-                    </DropdownMenuItem>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuItem
-                      onClick={handleOpenResolverSettings}
-                      className="text-xs"
-                    >
-                      <Settings className="h-3.5 w-3.5" />
-                      Resolver settings
-                    </DropdownMenuItem>
-                  </DropdownMenuContent>
-                </DropdownMenu>
-              </div>
-              <p className="text-[10px] text-muted-foreground px-0.5 flex items-center gap-1">
-                <Sparkles className="h-2.5 w-2.5" />
-                AI resolves conflicts automatically
-              </p>
-            </div>
-          )}
-
-          {gitError && (
-            <p className="text-[10px] text-destructive break-words px-0.5">{gitError}</p>
-          )}
-        </div>
-
-        {/* Merge conflict banner */}
-        {isMerging && mergeIntoBaseState?.active ? (
-          <div className="px-1.5 py-1.5 bg-primary/10 border-b border-primary/20">
-            <div className="flex items-center gap-1.5 mb-1">
-              <ArrowUpToLine className="h-3.5 w-3.5 text-primary shrink-0" />
-              <span className="text-xs text-primary font-medium">
-                Merging &ldquo;{mergeIntoBaseState.sourceBranch}&rdquo; into &ldquo;{mergeIntoBaseState.baseBranch}&rdquo;
-                {conflicted.length > 0 && ` — ${conflicted.length} conflict${conflicted.length !== 1 ? "s" : ""}`}
-              </span>
-            </div>
-            <div className="flex gap-1">
-              {conflicted.length === 0 ? (
-                <Button
-                  size="xs"
-                  className="text-[10px] h-5 flex-1 bg-success/20 text-success hover:bg-success/30"
-                  onClick={handleCompleteMergeIntoBase}
-                  disabled={busy}
-                >
-                  <GitMerge className="h-3 w-3 mr-0.5" />
-                  {busyAction === "merge" ? "Completing..." : `Complete Merge into ${mergeIntoBaseState.baseBranch}`}
-                </Button>
-              ) : null}
-              <Button
-                size="xs"
-                variant="ghost"
-                className="text-[10px] h-5 text-danger hover:text-danger"
-                onClick={handleAbortMergeIntoBase}
-                disabled={busy}
-              >
-                <XCircle className="h-3 w-3 mr-0.5" />
-                Abort
-              </Button>
-            </div>
-          </div>
-        ) : isMerging ? (
-          <div className="px-1.5 py-1.5 bg-danger/10 border-b border-danger/20">
-            <div className="flex items-center gap-1.5 mb-1">
-              <AlertTriangle className="h-3.5 w-3.5 text-danger shrink-0" />
-              <span className="text-xs text-danger font-medium">
-                {mergeState?.is_rebasing ? "Rebase" : "Merge"} in progress
-                {conflicted.length > 0 && ` — ${conflicted.length} conflict${conflicted.length !== 1 ? "s" : ""}`}
-              </span>
-            </div>
-            <div className="flex gap-1">
-              {conflicted.length === 0 ? (
-                <Button
-                  size="xs"
-                  className="text-[10px] h-5 flex-1 bg-success/20 text-success hover:bg-success/30"
-                  onClick={handleCompleteMerge}
-                  disabled={busy}
-                >
-                  <GitMerge className="h-3 w-3 mr-0.5" />
-                  {busyAction === "commit" ? "Completing..." : "Complete Merge"}
-                </Button>
-              ) : null}
-              <Button
-                size="xs"
-                variant="ghost"
-                className="text-[10px] h-5 text-danger hover:text-danger"
-                onClick={handleAbortMerge}
-                disabled={busy}
-              >
-                <XCircle className="h-3 w-3 mr-0.5" />
-                Abort
-              </Button>
-            </div>
-          </div>
-        ) : null}
-
-        {/* No changes message */}
-        {files.length === 0 && !isMerging && (
-          <div className="flex flex-col items-center justify-center min-h-[120px] text-muted-foreground">
-            <Check className="h-5 w-5 mb-1.5 opacity-40" />
-            <p className="text-xs">No changes</p>
-          </div>
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+        <span className="text-[11px] font-medium text-muted-foreground tracking-wide">
+          Changes
+        </span>
+        {totalChanges > 0 && (
+          <span className="ml-1.5 text-[10px] tabular-nums text-muted-foreground/60">
+            {totalChanges}
+          </span>
         )}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="ml-auto"
+              onClick={() => { setBusy("fetch"); gitFetchChanges(cwd).catch(() => {}).finally(() => { setBusy(null); refresh(); }); }}
+              aria-label="Refresh"
+              disabled={busy !== null}
+            >
+              <RefreshCw className={cn("size-3", busy === "fetch" && "animate-spin")} />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" sideOffset={4}>Refresh</TooltipContent>
+        </Tooltip>
+      </div>
 
-        {/* File list */}
-        <div className="flex-1 min-h-0 overflow-y-auto">
-          <div className="px-1">
-            {(conflicted.length > 0 || resolver.status !== "idle") && (
-              <ConflictsSection
-                files={conflicted}
-                cwd={cwd}
-                onRefresh={refresh}
-                onOpenDiff={handleOpenDiff}
-                resolverStatus={resolver.status}
-                resolverError={resolver.error}
-                resolverFiles={resolver.conflictingFiles.map((f) => f.path)}
-                resolverTempBranch={resolver.tempBranch}
-                resolverCli={config?.ai_resolver_cli ?? "claude"}
-                resolverModel={config?.ai_resolver_model ?? null}
-                resolverStrategy={config?.ai_resolver_strategy ?? "smart_merge"}
-                onStartResolve={handleStartResolve}
-                onApproveResolve={handleApproveResolve}
-                onRejectResolve={handleRejectResolve}
-                onChangeResolverStrategy={handleSetResolverStrategy}
-              />
+      <BranchPill info={branchInfo} />
+
+      {isMerging && (
+        <div className="flex items-center gap-2 px-2.5 py-2 bg-warning/10 border-b border-warning/30">
+          <GitMerge className="size-3.5 text-warning shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-[11px] font-medium text-foreground">Merge in progress</p>
+            {conflicted.length > 0 && (
+              <p className="text-[10px] text-muted-foreground">
+                {conflicted.length} conflict{conflicted.length === 1 ? "" : "s"} to resolve
+              </p>
             )}
+          </div>
+          <Button
+            variant="ghost"
+            size="xs"
+            className="h-6 text-[10px] text-muted-foreground hover:text-foreground"
+            onClick={handleAbortMerge}
+            disabled={busy !== null}
+          >
+            Abort
+          </Button>
+          {conflicted.length === 0 && (
+            <Button
+              size="xs"
+              variant="ghost"
+              className="h-6 text-[10px] bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+              onClick={handleContinueMerge}
+              disabled={busy !== null}
+            >
+              Continue
+            </Button>
+          )}
+        </div>
+      )}
 
-            {staged.length > 0 && (
+      <ScrollArea className="flex-1 min-h-0">
+        <div className="py-1">
+          {totalChanges === 0 ? (
+            <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-muted-foreground/70">
+              <Check className="size-4 opacity-50" />
+              <p className="text-[11px]">Working tree clean</p>
+            </div>
+          ) : (
+            <>
               <FileSection
                 label="Staged"
                 files={staged}
                 staged
                 cwd={cwd}
-                expandedFile={expandedFile}
-                expandedStaged={expandedStaged}
-                onToggleExpand={handleToggleExpand}
                 onRefresh={refresh}
-                onBulkAction={handleUnstageAll}
-                bulkLabel="Unstage all"
-                onOpenDiff={handleOpenDiff}
-                activeDiffFile={activeDiffFile}
-                flat={viewMode === "flat"}
+                onOpenDiff={openDiff}
               />
-            )}
-
-            {unstaged.length > 0 && (
               <FileSection
-                label="Unstaged"
-                files={unstaged}
+                label="Changed"
+                files={unstaged.filter((f) => f.status !== "conflicted")}
                 staged={false}
                 cwd={cwd}
-                expandedFile={expandedFile}
-                expandedStaged={expandedStaged}
-                onToggleExpand={handleToggleExpand}
                 onRefresh={refresh}
-                onBulkAction={handleStageAll}
-                bulkLabel="Stage all"
-                onOpenDiff={handleOpenDiff}
-                activeDiffFile={activeDiffFile}
-                flat={viewMode === "flat"}
+                onOpenDiff={openDiff}
               />
-            )}
-
-            {mergeSuccess && (
-              <div className="px-2 py-1">
-                <p className="text-[10px] text-success flex items-center gap-1">
-                  <CheckCircle2 className="h-3 w-3 shrink-0" />
-                  {mergeSuccess}
-                </p>
-              </div>
-            )}
-
-            {/* Against Base — files changed vs base branch (hidden when on the base branch itself) */}
-            {baseBranchFiles.length > 0 && branchInfo?.branch !== baseBranch && (
-              <div className="py-1">
-                <SectionHeader
-                  title={`Against ${baseBranch}`}
-                  count={baseBranchFiles.length}
-                  expanded={baseBranchExpanded}
-                  onToggle={() => setBaseBranchExpanded(!baseBranchExpanded)}
-                  actions={
-                    <>
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <Button
-                            variant="ghost"
-                            size="icon-xs"
-                            className="h-6 w-6"
-                            onClick={handleMergeBranch}
-                            disabled={busy || isMerging}
-                          >
-                            {busyAction === "merge" ? (
-                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                            ) : (
-                              <GitMerge className="h-3.5 w-3.5" />
-                            )}
-                          </Button>
-                        </TooltipTrigger>
-                        <TooltipContent side="left">
-                          Merge {baseBranch} into current branch
-                        </TooltipContent>
-                      </Tooltip>
-                      {branchInfo?.branch !== baseBranch && (
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon-xs"
-                              className="h-6 w-6"
-                              onClick={() => setShowMergeIntoDialog(true)}
-                              disabled={busy || isMerging || !!mergeIntoBaseState}
-                            >
-                              <ArrowUpToLine className="h-3.5 w-3.5" />
-                            </Button>
-                          </TooltipTrigger>
-                          <TooltipContent side="left">
-                            Merge current branch into {baseBranch}
-                          </TooltipContent>
-                        </Tooltip>
-                      )}
-                    </>
-                  }
-                />
-                {baseBranchExpanded && (
-                  <div>
-                    {viewMode === "flat" ? baseBranchFiles.map((f) => (
-                      <FileRow
-                        key={f.path}
-                        file={f}
-                        staged={false}
-                        cwd={cwd}
-                        expanded={false}
-                        onToggleExpand={() => {}}
-                        onRefresh={refreshBaseDiff}
-                        onOpenDiff={(filePath) => handleOpenBaseDiff(filePath)}
-                        activeDiffFile={activeDiffFile}
-                      />
-                    )) : groupByDirectory(baseBranchFiles).map((group) => (
-                      <DirectoryGroup
-                        key={group.dir}
-                        dir={group.dir}
-                        files={group.files}
-                        staged={false}
-                        cwd={cwd}
-                        expandedFile={null}
-                        expandedStaged={false}
-                        onToggleExpand={() => {}}
-                        onRefresh={refreshBaseDiff}
-                        onOpenDiff={(filePath) => handleOpenBaseDiff(filePath)}
-                        activeDiffFile={activeDiffFile}
-                      />
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {/* Commits — collapsed by default */}
-            {commits.length > 0 && (
-              <div className="py-1">
-                <SectionHeader
-                  title="Commits"
-                  count={commits.length}
-                  expanded={commitsExpanded}
-                  onToggle={() => setCommitsExpanded(!commitsExpanded)}
-                />
-                {commitsExpanded &&
-                  commits.map((commit) => (
-                    <CommitRow
-                      key={commit.hash}
-                      commit={commit}
-                      cwd={cwd}
-                      expanded={expandedCommits.has(commit.hash)}
-                      onToggle={() => {
-                        setExpandedCommits((prev) => {
-                          const next = new Set(prev);
-                          if (next.has(commit.hash)) next.delete(commit.hash);
-                          else next.add(commit.hash);
-                          return next;
-                        });
-                      }}
-                    />
-                  ))}
-              </div>
-            )}
-          </div>
+              <FileSection
+                label="Conflicts"
+                files={conflicted}
+                staged={false}
+                cwd={cwd}
+                onRefresh={refresh}
+                onOpenDiff={openDiff}
+              />
+            </>
+          )}
         </div>
-      </div>
-    </TooltipProvider>
+      </ScrollArea>
 
-    {/* Merge into base confirmation dialog */}
-    <AlertDialog open={showMergeIntoDialog} onOpenChange={setShowMergeIntoDialog}>
-      <AlertDialogContent>
-        <AlertDialogHeader>
-          <AlertDialogTitle>Merge into {baseBranch}</AlertDialogTitle>
-          <AlertDialogDescription>
-            This will merge your changes from &ldquo;{branchInfo?.branch}&rdquo; into &ldquo;{baseBranch}&rdquo;.
-            A temporary branch will be used to ensure {baseBranch} is not modified until the merge is verified clean.
-          </AlertDialogDescription>
-        </AlertDialogHeader>
-        <label className="flex items-center gap-2 py-2 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={mergeIntoDeleteBranch}
-            onChange={(e) => setMergeIntoDeleteBranch(e.target.checked)}
-            className="rounded border-border"
+      {/* Action bar — the panel's single moment of weight. Holds the
+          AI-message preview banner (when present) above the smart
+          Commit button. Banner uses a left-rule pull-quote treatment
+          so the generated text reads as an editorial artifact, not
+          just another form field. */}
+      <div className="shrink-0 border-t border-border/60 bg-card/40 p-2 space-y-2">
+        {showPreview && (
+          <div className="rounded-md border border-border/60 bg-background overflow-hidden">
+            <div className="flex items-start gap-2 px-2.5 py-2 border-l-2 border-l-primary/70">
+              <Sparkles className="size-3 text-primary/80 mt-0.5 shrink-0" />
+              <p className="flex-1 text-[11px] leading-snug text-foreground whitespace-pre-wrap break-words">
+                {generatedMsg}
+              </p>
+            </div>
+            <div className="flex items-center gap-1 px-1.5 py-1 border-t border-border/40">
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 text-[10px] flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                onClick={() => finalizeCommit(generatedMsg)}
+                disabled={busy !== null}
+              >
+                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+              </Button>
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 text-[10px] text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  const msg = consumeMessage(workspace.workspace_id) ?? generatedMsg;
+                  setEditedMsg(msg);
+                  setEditing(true);
+                }}
+                disabled={busy !== null}
+              >
+                Edit
+              </Button>
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => clearGeneration(workspace.workspace_id)}
+                disabled={busy !== null}
+                aria-label="Discard message"
+              >
+                <X className="size-3" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {showEditor && (
+          <div className="rounded-md border border-border/60 bg-background overflow-hidden">
+            <Textarea
+              autoFocus
+              value={editedMsg}
+              onChange={(e) => setEditedMsg(e.target.value)}
+              placeholder="Commit message"
+              className="text-[11px] leading-snug resize-none border-0 rounded-none min-h-16 focus-visible:ring-0"
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  finalizeCommit(editedMsg);
+                }
+              }}
+            />
+            <div className="flex items-center gap-1 px-1.5 py-1 border-t border-border/40">
+              <Button
+                size="xs"
+                variant="ghost"
+                className="h-6 text-[10px] flex-1 bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                onClick={() => finalizeCommit(editedMsg)}
+                disabled={!editedMsg.trim() || busy !== null}
+              >
+                {busy === "commit" ? <Loader2 className="size-3 animate-spin" /> : "Commit"}
+              </Button>
+              <Button
+                size="icon-xs"
+                variant="ghost"
+                className="text-muted-foreground hover:text-foreground"
+                onClick={() => { setEditing(false); setEditedMsg(""); }}
+                disabled={busy !== null}
+                aria-label="Cancel"
+              >
+                <X className="size-3" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {!showPreview && !showEditor && (
+          <SmartCommitButton
+            hasChanges={totalChanges > 0}
+            staged={staged.length}
+            isGenerating={isGenerating ?? false}
+            isMerging={isMerging}
+            busy={busy}
+            onCommit={() => beginCommit(false)}
+            onCommitAndPush={() => beginCommit(true)}
+            onAmend={handleAmend}
+            onUndoLastCommit={handleUndoLastCommit}
+            onStashPush={handleStashPush}
+            onStashPop={handleStashPop}
+            onPush={handlePush}
+            onPull={handlePull}
+            onSync={handleSync}
+            onFetch={handleFetch}
+            ahead={branchInfo?.ahead ?? 0}
+            behind={branchInfo?.behind ?? 0}
           />
-          <span className="text-sm text-muted-foreground">
-            Delete &ldquo;{branchInfo?.branch}&rdquo; after merge
-          </span>
-        </label>
-        <AlertDialogFooter>
-          <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <AlertDialogAction variant="ghost" onClick={handleMergeIntoBase} className="bg-foreground text-background hover:bg-foreground/90">
-            Merge into {baseBranch}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
-    </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── SmartCommitButton ──
+//
+// Primary action morphs with state: Commit when there's something to
+// commit, Push when ahead, Pull when behind, Sync when both, Fetch when
+// clean and even. Dropdown always exposes every action so power users
+// aren't trapped by the heuristic.
+function SmartCommitButton({
+  hasChanges,
+  staged,
+  isGenerating,
+  isMerging,
+  busy,
+  onCommit,
+  onCommitAndPush,
+  onAmend,
+  onUndoLastCommit,
+  onStashPush,
+  onStashPop,
+  onPush,
+  onPull,
+  onSync,
+  onFetch,
+  ahead,
+  behind,
+}: {
+  hasChanges: boolean;
+  staged: number;
+  isGenerating: boolean;
+  isMerging: boolean;
+  busy: string | null;
+  onCommit: () => void;
+  onCommitAndPush: () => void;
+  onAmend: () => void;
+  onUndoLastCommit: () => void;
+  onStashPush: () => void;
+  onStashPop: () => void;
+  onPush: () => void;
+  onPull: () => void;
+  onSync: () => void;
+  onFetch: () => void;
+  ahead: number;
+  behind: number;
+}) {
+  const primary = (() => {
+    if (isMerging) return null;
+    if (hasChanges) {
+      return {
+        label: isGenerating ? "Writing message…" : staged > 0 ? `Commit ${staged}` : "Commit",
+        icon: isGenerating ? <Loader2 className="size-3 animate-spin" /> : <Sparkles className="size-3" />,
+        action: onCommit,
+        disabled: isGenerating || busy !== null,
+      };
+    }
+    if (ahead > 0 && behind > 0) {
+      return { label: "Sync", icon: <ArrowUpDown className="size-3" />, action: onSync, disabled: busy !== null };
+    }
+    if (ahead > 0) {
+      return { label: `Push ${ahead}`, icon: <ArrowUp className="size-3" />, action: onPush, disabled: busy !== null };
+    }
+    if (behind > 0) {
+      return { label: `Pull ${behind}`, icon: <ArrowDown className="size-3" />, action: onPull, disabled: busy !== null };
+    }
+    return { label: "Fetch", icon: <Download className="size-3" />, action: onFetch, disabled: busy !== null };
+  })();
+
+  if (!primary) {
+    return (
+      <div className="text-[10px] text-muted-foreground/60 text-center py-1">
+        Resolve or abort the merge above.
+      </div>
+    );
+  }
+
+  // Neutral fill matched to the panel chrome instead of the theme's
+  // `--primary` accent — `--primary` is theme-defined (orange on
+  // ember-dark, blue on default-dark) and the sidebar reads cleaner
+  // when the action button blends with the card surface rather than
+  // competing with it.
+  const fillCls =
+    "bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60";
+
+  return (
+    <div className="flex items-stretch gap-px rounded-md overflow-hidden">
+      <Button
+        size="sm"
+        variant="ghost"
+        className={cn(
+          "flex-1 h-8 text-xs gap-1.5 rounded-r-none border-r-0",
+          fillCls,
+        )}
+        onClick={primary.action}
+        disabled={primary.disabled}
+      >
+        {primary.icon}
+        {primary.label}
+      </Button>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            size="sm"
+            variant="ghost"
+            className={cn("h-8 w-7 px-0 rounded-l-none border-l-0", fillCls)}
+            aria-label="More actions"
+            disabled={busy !== null}
+          >
+            <ChevronDown className="size-3" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="min-w-[200px]">
+          {hasChanges && (
+            <>
+              <DropdownMenuItem onClick={onCommit} disabled={isGenerating}>
+                <Sparkles className="size-3 mr-2" />
+                Commit (AI message)
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={onCommitAndPush} disabled={isGenerating}>
+                <Send className="size-3 mr-2" />
+                Commit & Push
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={onAmend}>
+                <Pencil className="size-3 mr-2" />
+                Amend last commit
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          <DropdownMenuItem onClick={onPush}>
+            <ArrowUp className="size-3 mr-2" />
+            Push {ahead > 0 && <span className="ml-auto text-[10px] tabular-nums text-foreground/70">{ahead}</span>}
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={onPull}>
+            <ArrowDown className="size-3 mr-2" />
+            Pull {behind > 0 && <span className="ml-auto text-[10px] tabular-nums text-foreground/70">{behind}</span>}
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={onSync}>
+            <ArrowUpDown className="size-3 mr-2" />
+            Sync
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={onFetch}>
+            <Download className="size-3 mr-2" />
+            Fetch
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={onStashPush} disabled={!hasChanges}>
+            <Archive className="size-3 mr-2" />
+            Stash changes
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={onStashPop}>
+            <ArchiveRestore className="size-3 mr-2" />
+            Pop stash
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={onUndoLastCommit} className="text-muted-foreground focus:text-foreground">
+            <Undo2 className="size-3 mr-2" />
+            Undo last commit
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
   );
 }

@@ -670,6 +670,12 @@ export const gitStashPush = (path: string, includeUntracked: boolean) =>
 export const gitStashPop = (path: string) =>
   invoke("git_stash_pop", { path });
 
+export const gitAmendCommit = (path: string, message: string | null = null) =>
+  invoke("git_amend_commit", { path, message });
+
+export const gitUndoLastCommit = (path: string) =>
+  invoke("git_undo_last_commit", { path });
+
 export const gitDiscardFile = (path: string, file: string) =>
   invoke("git_discard_file", { path, file });
 

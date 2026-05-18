@@ -50,14 +50,14 @@ const TreeNode = memo(function TreeNode({
       <div>
         <Button
           variant="ghost"
-          className={`w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs ${entry.is_gitignored ? "opacity-50" : ""}`}
-          style={{ paddingLeft: `${8 + depth * 16}px` }}
+          className={`group/row w-full justify-start gap-1.5 rounded-none px-2 py-1 h-auto text-xs font-normal hover:bg-muted/40 ${entry.is_gitignored ? "opacity-50" : ""}`}
+          style={{ paddingLeft: `${8 + depth * 14}px` }}
           onClick={() => onToggleDir(entry.path)}
         >
           <ChevronRight
-            className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${isExpanded ? "rotate-90" : ""}`}
+            className={`h-3 w-3 shrink-0 text-muted-foreground/60 transition-transform ${isExpanded ? "rotate-90" : ""}`}
           />
-          <Folder className="h-3 w-3 shrink-0 text-primary/70" />
+          <Folder className="h-3.5 w-3.5 shrink-0 text-primary/70" />
           <span className="truncate text-foreground">{entry.name}</span>
           {isLoading && <Loader2 className="h-2.5 w-2.5 animate-spin text-muted-foreground ml-auto" />}
         </Button>
@@ -77,10 +77,10 @@ const TreeNode = memo(function TreeNode({
             ))}
             {children.length === 0 && (
               <p
-                className="text-[10px] text-muted-foreground/50 py-0.5"
-                style={{ paddingLeft: `${8 + (depth + 1) * 16}px` }}
+                className="text-[10px] text-muted-foreground/40 py-0.5 italic"
+                style={{ paddingLeft: `${8 + (depth + 1) * 14}px` }}
               >
-                (empty)
+                empty
               </p>
             )}
           </div>
@@ -92,15 +92,15 @@ const TreeNode = memo(function TreeNode({
   return (
     <Button
       variant="ghost"
-      className={`w-full justify-start gap-1 rounded-sm px-1.5 py-0.5 h-auto text-xs ${entry.is_gitignored ? "opacity-50" : ""}`}
-      style={{ paddingLeft: `${8 + depth * 16}px` }}
+      className={`group/row w-full justify-start gap-1.5 rounded-none px-2 py-1 h-auto text-xs font-normal hover:bg-muted/40 ${entry.is_gitignored ? "opacity-50" : ""}`}
+      style={{ paddingLeft: `${8 + depth * 14}px` }}
       onClick={() => onClickFile(entry.path)}
     >
       <span className="w-3 shrink-0" />
-      <FileTypeIcon filename={entry.name} className="h-3.5 w-3.5 opacity-75" />
+      <FileTypeIcon filename={entry.name} className="h-3.5 w-3.5 opacity-80" />
       <span className="truncate text-foreground">{entry.name}</span>
       {entry.size !== null && (
-        <span className="ml-auto text-[10px] text-muted-foreground/50 tabular-nums shrink-0">
+        <span className="ml-auto text-[10px] text-muted-foreground/40 tabular-nums shrink-0">
           {entry.size > 1024
             ? `${(entry.size / 1024).toFixed(0)}K`
             : `${entry.size}B`}
@@ -175,39 +175,49 @@ export function FileTreePanel({ workspace }: Props) {
       .catch(() => setRootEntries([]));
   };
 
+  // Last path segment as a soft label — gives users a "you are here"
+  // anchor without showing a long absolute path. Falls back to "Files"
+  // if cwd is empty (workspace not yet attached).
+  const folderLabel = cwd.split(/[/\\]/).filter(Boolean).pop() ?? "Files";
+
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-end gap-0.5 p-1.5 border-b border-border">
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={showHidden ? "Hide hidden files" : "Show hidden files"}
-              onClick={() => updateSetting("file_tree", "show_hidden_files", !showHidden)}
-            >
-              {showHidden ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>
-            {showHidden ? "Hide hidden files" : "Show hidden files"}
-          </TooltipContent>
-        </Tooltip>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label="Refresh"
-              onClick={refreshRoot}
-            >
-              <RefreshCw className="h-3 w-3" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>
-            Refresh
-          </TooltipContent>
-        </Tooltip>
+      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+        <span className="text-[11px] font-medium text-muted-foreground tracking-wide truncate">
+          {folderLabel}
+        </span>
+        <div className="ml-auto flex items-center gap-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={showHidden ? "Hide hidden files" : "Show hidden files"}
+                onClick={() => updateSetting("file_tree", "show_hidden_files", !showHidden)}
+              >
+                {showHidden ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4}>
+              {showHidden ? "Hide hidden files" : "Show hidden files"}
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Refresh"
+                onClick={refreshRoot}
+              >
+                <RefreshCw className="h-3 w-3" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom" sideOffset={4}>
+              Refresh
+            </TooltipContent>
+          </Tooltip>
+        </div>
       </div>
       <ScrollArea className="flex-1">
         <div className="py-1">
@@ -224,8 +234,8 @@ export function FileTreePanel({ workspace }: Props) {
             />
           ))}
           {rootEntries.length === 0 && (
-            <p className="text-xs text-muted-foreground text-center py-6">
-              No files found
+            <p className="text-xs text-muted-foreground/60 text-center py-8">
+              No files
             </p>
           )}
         </div>

@@ -200,7 +200,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           <CommandItem
             onSelect={() =>
               run(() =>
-                ws && toggleRightPanel(ws.workspace_id, "changes"),
+                ws && toggleRightPanel(ws.workspace_id, "files"),
               )
             }
           >
