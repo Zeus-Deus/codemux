@@ -124,6 +124,22 @@ pub async fn git_fetch_prune(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn git_amend_commit(path: String, message: Option<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_amend_commit(Path::new(&path), message.as_deref())
+    })
+    .await
+    .map_err(|e| format!("git_amend_commit task join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn git_undo_last_commit(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::git::git_undo_last_commit(Path::new(&path)))
+        .await
+        .map_err(|e| format!("git_undo_last_commit task join failed: {e}"))?
+}
+
+#[tauri::command]
 pub async fn git_stash_push(path: String, include_untracked: bool) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         crate::git::git_stash_push(Path::new(&path), include_untracked)

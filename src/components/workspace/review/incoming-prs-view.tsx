@@ -106,13 +106,13 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
 
   return (
     <div
-      className="group px-3 py-1.5 hover:bg-accent/30 rounded-sm transition-colors cursor-default min-w-0"
+      className="group px-2.5 py-1.5 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
       onClick={() => { if (existingWs) activateWorkspace(existingWs.workspace_id); }}
     >
-      <div className="flex items-center gap-1 min-w-0">
+      <div className="flex items-center gap-1.5 min-w-0 h-5">
         <ChecksIndicator status={pr.checks_status} />
-        <span className="text-muted-foreground font-mono text-xs shrink-0">#{pr.number}</span>
-        <span className={`truncate flex-1 min-w-0 text-sm ${pr.is_draft ? "italic text-muted-foreground" : ""}`}>
+        <span className="text-muted-foreground/60 font-mono text-[11px] tabular-nums shrink-0">#{pr.number}</span>
+        <span className={`truncate flex-1 min-w-0 text-xs ${pr.is_draft ? "italic text-muted-foreground" : "text-foreground"}`}>
           {pr.title}
         </span>
         {pr.is_draft && (
@@ -125,13 +125,16 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
         )}
       </div>
 
-      <div className="flex items-center gap-1 mt-0.5 min-w-0">
-        <span className="text-[11px] text-muted-foreground/60 shrink-0">{pr.author}</span>
+      {/* Bottom row pins to h-5 so the hover-swap (text spans →
+          buttons) doesn't reflow the row height — both states share
+          the button height. */}
+      <div className="flex items-center gap-1.5 mt-0.5 min-w-0 h-5">
+        <span className="text-[10px] text-muted-foreground/60 shrink-0">{pr.author}</span>
         {pr.head_branch && (
-          <span className="text-[11px] text-muted-foreground/60 font-mono truncate min-w-0">{pr.head_branch}</span>
+          <span className="text-[10px] text-muted-foreground/40 font-mono truncate min-w-0">{pr.head_branch}</span>
         )}
 
-        <span className="flex items-center gap-1 shrink-0 group-hover:hidden ml-auto">
+        <span className="flex items-center gap-1.5 shrink-0 group-hover:hidden ml-auto tabular-nums">
           {pr.additions != null && pr.additions > 0 && (
             <span className="text-[10px] font-mono text-success">+{pr.additions}</span>
           )}
@@ -139,15 +142,15 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
             <span className="text-[10px] font-mono text-danger">&minus;{pr.deletions}</span>
           )}
           {pr.updated_at && (
-            <span className="text-[10px] text-muted-foreground">{formatRelativeTime(pr.updated_at)}</span>
+            <span className="text-[10px] text-muted-foreground/60">{formatRelativeTime(pr.updated_at)}</span>
           )}
         </span>
 
-        <span className="hidden group-hover:flex items-center gap-1 shrink-0 ml-auto">
+        <span className="hidden group-hover:flex items-center gap-0.5 shrink-0 ml-auto">
           <Button
             size="xs"
             variant="ghost"
-            className="h-5 px-1.5 text-[10px]"
+            className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
             onClick={handleView}
             title="View on GitHub"
           >
@@ -158,7 +161,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
             <Button
               size="xs"
               variant="ghost"
-              className="h-5 px-1.5 text-[10px]"
+              className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
               onClick={handleCheckout}
               title={existingWs ? "Switch to workspace" : "Checkout in new worktree"}
             >
@@ -242,70 +245,69 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
   }, [fetchPrs, refreshKey]);
 
   return (
-    <div className="px-1.5 pb-3">
-      {/* Header */}
-      <div className="flex items-center gap-2 px-1.5 pb-2 min-w-0">
-        <span className="text-xs font-medium text-foreground truncate">Pull Requests</span>
+    <div className="flex flex-col">
+      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
+        <span className="text-[11px] font-medium text-muted-foreground tracking-wide truncate">
+          Pull Requests
+        </span>
         {!loading && prs.length > 0 && (
-          <Badge variant="secondary" className="h-4 px-1.5 text-[10px] leading-none shrink-0">
+          <span className="ml-1.5 text-[10px] tabular-nums text-muted-foreground/60">
             {prs.length}
-          </Badge>
+          </span>
         )}
       </div>
 
-      {/* Error */}
-      {error && (
-        <div className="mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
-          <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
-          <span className="break-words">{error}</span>
-        </div>
-      )}
+      <div className="px-1.5 pt-1.5 pb-3">
+        {error && (
+          <div className="mx-1.5 mb-2 flex items-start gap-1.5 rounded bg-danger/10 px-2 py-1.5 text-xs text-danger">
+            <AlertCircle className="h-3 w-3 mt-0.5 shrink-0" />
+            <span className="break-words">{error}</span>
+          </div>
+        )}
 
-      {/* Loading */}
-      {loading && (
-        <div className="flex flex-col gap-2 px-3 py-2">
-          {[1, 2, 3].map((i) => (
-            <div key={i} className="animate-pulse flex gap-2">
-              <div className="h-3 w-6 bg-muted rounded" />
-              <div className="h-3 flex-1 bg-muted rounded" />
-              <div className="h-3 w-12 bg-muted rounded" />
-            </div>
-          ))}
-        </div>
-      )}
+        {loading && (
+          <div className="flex flex-col gap-2 px-2 py-2">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="animate-pulse flex gap-2">
+                <div className="h-3 w-6 bg-muted rounded" />
+                <div className="h-3 flex-1 bg-muted rounded" />
+                <div className="h-3 w-12 bg-muted rounded" />
+              </div>
+            ))}
+          </div>
+        )}
 
-      {/* Empty state */}
-      {!loading && !error && prs.length === 0 && (
-        <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
-          <GitPullRequest className="h-8 w-8 opacity-30 mb-2" />
-          <p className="text-xs">No open pull requests</p>
-        </div>
-      )}
+        {!loading && !error && prs.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
+            <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
+            <p className="text-[11px]">No open pull requests</p>
+          </div>
+        )}
 
-      {/* PR list */}
-      {!loading && prs.length > 0 && (
-        <div className="flex flex-col gap-0.5">
-          {prs.map((pr) => (
-            <IncomingPrRow
-              key={pr.number}
-              pr={pr}
-              projectRoot={projectRoot}
-              existingWs={(pr.head_branch && wsByBranch.get(pr.head_branch)) || null}
-            />
-          ))}
-          {prs.length >= 50 && (
-            <button
-              className="text-[10px] text-muted-foreground hover:text-foreground px-3 py-1 transition-colors"
-              onClick={() => {
-                const repoUrl = prs[0]?.url?.replace(/\/pull\/\d+$/, "/pulls");
-                if (repoUrl) openUrl(repoUrl);
-              }}
-            >
-              View all on GitHub &rarr;
-            </button>
-          )}
-        </div>
-      )}
+        {!loading && prs.length > 0 && (
+          <div className="flex flex-col gap-0.5">
+            {prs.map((pr) => (
+              <IncomingPrRow
+                key={pr.number}
+                pr={pr}
+                projectRoot={projectRoot}
+                existingWs={(pr.head_branch && wsByBranch.get(pr.head_branch)) || null}
+              />
+            ))}
+            {prs.length >= 50 && (
+              <button
+                className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2.5 py-1 mt-1 transition-colors text-left"
+                onClick={() => {
+                  const repoUrl = prs[0]?.url?.replace(/\/pull\/\d+$/, "/pulls");
+                  if (repoUrl) openUrl(repoUrl);
+                }}
+              >
+                View all on GitHub &rarr;
+              </button>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }

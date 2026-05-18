@@ -285,6 +285,20 @@ pub fn git_fetch(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+pub fn git_amend_commit(repo_path: &Path, message: Option<&str>) -> Result<(), String> {
+    if let Some(msg) = message {
+        run_git(repo_path, &["commit", "--amend", "-m", msg])?;
+    } else {
+        run_git(repo_path, &["commit", "--amend", "--no-edit"])?;
+    }
+    Ok(())
+}
+
+pub fn git_undo_last_commit(repo_path: &Path) -> Result<(), String> {
+    run_git(repo_path, &["reset", "--soft", "HEAD~1"])?;
+    Ok(())
+}
+
 pub fn git_stash_push(repo_path: &Path, include_untracked: bool) -> Result<(), String> {
     if include_untracked {
         run_git(repo_path, &["stash", "push", "--include-untracked"])?;

@@ -49,10 +49,18 @@ function collectPaneIds(node: PaneNodeSnapshot): string[] {
 }
 
 export function TabBar({ workspace }: Props) {
-  const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
+  const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspace.workspace_id] ?? null,
   );
+
+  // True toggle: any open tab closes the panel; closed state opens
+  // straight to Files. `toggleRightPanel` on the store flips by *tab
+  // identity*, which would switch from Review→Files instead of closing,
+  // taking two clicks to dismiss.
+  const togglePanel = () => {
+    setRightPanelTab(workspace.workspace_id, rightPanelTab == null ? "files" : null);
+  };
 
   // Compute per-tab status from pane statuses
   const paneStatuses = useAppStore((s) => s.appState?.pane_statuses ?? {});
@@ -367,17 +375,16 @@ export function TabBar({ workspace }: Props) {
         </div>
       </Tabs>
 
-      {!rightPanelTab && (
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          className="ml-1 shrink-0"
-          onClick={() => toggleRightPanel(workspace.workspace_id, "changes")}
-          title="Open panel"
-        >
-          <FileDiff className="h-3.5 w-3.5" />
-        </Button>
-      )}
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        className={`ml-1 shrink-0 ${rightPanelTab ? "bg-card text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+        onClick={togglePanel}
+        title={rightPanelTab ? "Close panel" : "Open panel"}
+        aria-pressed={rightPanelTab != null}
+      >
+        <FileDiff className="h-3.5 w-3.5" />
+      </Button>
     </div>
   );
 }

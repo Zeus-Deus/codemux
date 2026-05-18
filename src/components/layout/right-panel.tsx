@@ -1,5 +1,4 @@
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { Button } from "@/components/ui/button";
 import { Check, Loader2, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
@@ -32,14 +31,9 @@ function rollupChecks(checks: CheckInfo[]): ChecksRollup {
   return allDone ? "success" : "pending";
 }
 
-/**
- * Tab-trigger badge for the Review tab. Subscribes to the same React
- * Query keys the ReviewPanel uses but with `enabled: false` so the tab
- * trigger only reads cached data — no fetches start until the user
- * actually opens the Review panel. Once the panel has been opened
- * (priming the cache), the tab keeps showing live status as the panel
- * polls in the background, even after the user switches tabs.
- */
+// Reads cached PR query data (enabled:false) so the Review tab can show
+// a check + comment-count badge without triggering its own fetches.
+// Once the panel mounts, its polling keeps these values fresh in cache.
 function ReviewTabBadge({
   workspaceId,
   prNumber,
@@ -66,9 +60,11 @@ function ReviewTabBadge({
 
   return (
     <>
-      <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
-        {commentCount}
-      </span>
+      {commentCount > 0 && (
+        <span className="ml-1 text-[10px] tabular-nums text-muted-foreground/60">
+          {commentCount}
+        </span>
+      )}
       {status === "pending" && (
         <Loader2 className="ml-1 size-3 animate-spin text-amber-500" />
       )}
@@ -82,6 +78,10 @@ function ReviewTabBadge({
   );
 }
 
+// Tab styling mirrors the main tab-bar's active/inactive treatment so
+// the right-panel header reads as a continuation of the tab strip, not
+// a separate slab. Active = card fill + foreground text; inactive =
+// muted text with a hairline divider, hover lifts toward foreground.
 const TAB_TRIGGER_CLS = cn(
   "px-3 !h-full !py-0 !m-0 text-xs !rounded-none !border-transparent !shadow-none after:!hidden",
   "data-[state=active]:!bg-card data-[state=active]:!text-foreground",
@@ -96,29 +96,25 @@ export function RightPanel({ workspace, activeTab }: Props) {
     setRightPanelTab(workspace.workspace_id, value as RightPanelTab);
   };
 
-  const handleClose = () => {
-    setRightPanelTab(workspace.workspace_id, null);
-  };
-
   return (
-    <div className="flex h-full min-h-0 flex-col border-l border-border/50 bg-background overflow-hidden">
+    <div className="flex h-full min-h-0 flex-col border-l border-border bg-background overflow-hidden">
       <Tabs
         value={activeTab}
         onValueChange={handleTabChange}
         className="flex h-full flex-col"
       >
-        <div className="flex items-center h-[52px] shrink-0 border-b border-border/50">
+        <div className="flex items-center h-[45px] shrink-0 border-b border-border">
           <TabsList variant="line" className="!h-full !p-0 gap-0 flex-1">
+            <TabsTrigger value="files" className={TAB_TRIGGER_CLS}>
+              Files
+            </TabsTrigger>
             <TabsTrigger value="changes" className={TAB_TRIGGER_CLS}>
               Changes
               {workspace.git_changed_files > 0 && (
-                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground">
+                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground/60">
                   {workspace.git_changed_files}
                 </span>
               )}
-            </TabsTrigger>
-            <TabsTrigger value="files" className={TAB_TRIGGER_CLS}>
-              Files
             </TabsTrigger>
             <TabsTrigger value="review" className={TAB_TRIGGER_CLS}>
               Review
@@ -130,21 +126,12 @@ export function RightPanel({ workspace, activeTab }: Props) {
               )}
             </TabsTrigger>
           </TabsList>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            className="shrink-0"
-            onClick={handleClose}
-            title="Close panel"
-          >
-            <X className="h-3 w-3" />
-          </Button>
         </div>
-        <TabsContent value="changes" className="flex-1 overflow-hidden">
-          <ChangesPanel workspace={workspace} />
-        </TabsContent>
         <TabsContent value="files" className="flex-1 overflow-hidden">
           <FileTreePanel workspace={workspace} />
+        </TabsContent>
+        <TabsContent value="changes" className="flex-1 overflow-hidden">
+          <ChangesPanel workspace={workspace} />
         </TabsContent>
         <TabsContent value="review" className="flex-1 overflow-hidden">
           <ReviewPanel workspace={workspace} />
