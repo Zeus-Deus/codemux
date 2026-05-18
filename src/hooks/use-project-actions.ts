@@ -11,6 +11,7 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
+import { basename } from "@/lib/path";
 
 /** True when the first-project legacy onboarding wizard should be
  *  suppressed. Two reasons fire it:
@@ -46,7 +47,7 @@ export function useProjectActions() {
     const folder = await pickFolderDialog("Open project");
     if (!folder) return { success: false };
 
-    const name = folder.split("/").filter(Boolean).pop() || folder;
+    const name = basename(folder);
     const isGit = await checkIsGitRepo(folder);
 
     if (!isGit) {
@@ -80,7 +81,7 @@ export function useProjectActions() {
   const cloneProject = useCallback(
     async (url: string, targetDir: string) => {
       const clonedPath = await gitCloneRepo(url, targetDir);
-      const name = clonedPath.split("/").filter(Boolean).pop() || clonedPath;
+      const name = basename(clonedPath);
       await dbAddRecentProject(clonedPath, name);
 
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;

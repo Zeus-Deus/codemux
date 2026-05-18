@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { basename } from "@/lib/path";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   pickFolderDialog,
@@ -105,8 +106,7 @@ export function NewProjectScreen() {
         projectPath = await gitCloneRepo(url, targetDir);
       }
 
-      const name =
-        projectPath.split("/").filter(Boolean).pop() || projectPath;
+      const name = basename(projectPath);
       await dbAddRecentProject(projectPath, name);
       const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
       const wsId = await createEmptyWorkspace(projectPath);

@@ -21,6 +21,7 @@ import {
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { basename } from "@/lib/path";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
 import { useProjectActions } from "@/hooks/use-project-actions";
 
@@ -137,7 +138,7 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
     if (group) return group.projectName;
     const recent = recentProjects.find((p) => p.path === value);
     if (recent) return recent.name;
-    return value.split("/").filter(Boolean).pop() || value;
+    return basename(value);
   }, [value, projectGroups, recentProjects]);
 
   const selectedColor = value ? projectColors[value] || null : null;

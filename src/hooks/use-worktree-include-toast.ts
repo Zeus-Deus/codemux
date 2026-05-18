@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { onWorktreeIncludesApplied } from "@/tauri/events";
 import { dbGetUiState, dbSetUiState } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
+import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 
 /**
@@ -48,7 +49,7 @@ export function useWorktreeIncludeToast() {
       const shown = await dbGetUiState(key).catch(() => null);
       if (shown === "true") return;
 
-      const fileNames = payload.copied.map((f) => f.split("/").pop()).join(", ");
+      const fileNames = payload.copied.map((f) => basename(f)).join(", ");
       toast.info(
         `Copied default files (${fileNames}) to worktree. Customize in Settings > Projects or add a .codemuxinclude file.`,
         { duration: 8000 },

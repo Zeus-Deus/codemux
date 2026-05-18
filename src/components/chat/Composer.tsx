@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
@@ -837,7 +838,7 @@ export function Composer({
     return fileMatches.map((match) => ({
       id: `file:${match.absolute_path}`,
       label: match.path,
-      command: `@${match.path.split("/").pop() ?? match.path}`,
+      command: `@${basename(match.path)}`,
       icon: FileIcon,
       group: "FILES",
       onSelect: () => {},
@@ -1220,7 +1221,7 @@ export function Composer({
           (m) => `attach-file:${m.absolute_path}` === item.id,
         );
         if (match) {
-          const filename = match.path.split("/").pop() ?? match.path;
+          const filename = basename(match.path);
           insertInlineToken(filename);
           onAttachFile?.(match);
         }
@@ -1232,8 +1233,8 @@ export function Composer({
           (m) => `attach-folder:${m.absolute_path}` === item.id,
         );
         if (match) {
-          const basename = match.path.split("/").pop() ?? match.path;
-          insertInlineToken(basename);
+          const folderName = basename(match.path);
+          insertInlineToken(folderName);
           onAttachFolder?.(match);
         }
         closeAttachPopup();
@@ -1336,7 +1337,7 @@ export function Composer({
       // keystroke (collapsed when the next char is already a space).
       // Mirrors the skill-insertion pattern at the slash popup —
       // both inline-token systems share the same shape.
-      const filename = match.path.split("/").pop() ?? match.path;
+      const filename = basename(match.path);
       replaceMentionWithToken(filename);
       closeMention();
       onAttachFile?.(match);

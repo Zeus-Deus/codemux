@@ -3,6 +3,7 @@ import { X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useAppStore } from "@/stores/app-store";
+import { basename } from "@/lib/path";
 import { useUIStore } from "@/stores/ui-store";
 import {
   dbGetUiState,
@@ -26,9 +27,7 @@ export function SidebarSetupBanner() {
   }, [appState]);
 
   const projectRoot = activeWorkspace?.project_root ?? null;
-  const projectName = projectRoot
-    ? projectRoot.split("/").pop() ?? "project"
-    : null;
+  const projectName = projectRoot ? basename(projectRoot) || "project" : null;
 
   // Check if there are any workspaces for this project
   const hasProjectWorkspaces = useMemo(() => {

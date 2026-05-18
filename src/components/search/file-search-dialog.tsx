@@ -12,6 +12,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { useActiveWorkspaceCwd, useAppStore } from "@/stores/app-store";
 import { searchFileNames } from "@/tauri/commands";
 import { openEditorTab } from "@/lib/open-editor-tab";
+import { basename } from "@/lib/path";
 
 export function FileSearchDialog() {
   const open = useUIStore((s) => s.showFileSearch);
@@ -136,8 +137,9 @@ export function FileSearchDialog() {
             </p>
           )}
           {results.map((filePath, idx) => {
-            const parts = filePath.split("/");
-            const fileName = parts.pop() || filePath;
+            const fileName = basename(filePath);
+            const parts = filePath.split(/[\\/]/);
+            parts.pop();
             const dirPath = parts.join("/");
             return (
               <button

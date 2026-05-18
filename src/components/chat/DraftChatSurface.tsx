@@ -13,6 +13,7 @@ import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
+import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 import {
   useAgentChatStore,
@@ -354,7 +355,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const filename = match.path.split("/").pop() ?? match.path;
+      const filename = basename(match.path);
       addStagedAttachment(draft.threadId, {
         id,
         kind: "file",
@@ -470,12 +471,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const basename = match.path.split("/").pop() ?? match.path;
+      const folderName = basename(match.path);
       addStagedAttachment(draft.threadId, {
         id,
         kind: "folder",
         ref: match.absolute_path,
-        metadata: { label: basename, isLoading: true },
+        metadata: { label: folderName, isLoading: true },
       });
       void (async () => {
         try {
@@ -487,7 +488,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           updateStagedAttachment(draft.threadId, id, {
             resolvedContent: buildFolderResolvedContent(info),
             metadata: {
-              label: basename,
+              label: folderName,
               isLoading: false,
               fetchedAt: Date.now(),
             },
@@ -495,7 +496,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
         } catch (err) {
           updateStagedAttachment(draft.threadId, id, {
             metadata: {
-              label: basename,
+              label: folderName,
               isLoading: false,
               error: String(err),
             },

@@ -1,4 +1,5 @@
 import { useEditorStore } from "@/stores/editor-store";
+import { basename } from "@/lib/path";
 import { createTab, activateTab, renameTab } from "@/tauri/commands";
 import type { TabSnapshot } from "@/tauri/types";
 
@@ -19,7 +20,7 @@ export async function openEditorTab(
   const tabId = await createTab(workspaceId, "editor");
   useEditorStore.getState().initTab(tabId, { filePath });
 
-  const filename = filePath.split("/").pop() ?? "Editor";
+  const filename = basename(filePath) || "Editor";
   await renameTab(workspaceId, tabId, filename);
 
   return tabId;

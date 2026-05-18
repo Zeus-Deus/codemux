@@ -8,6 +8,7 @@ import { Switch } from "@/components/ui/switch";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { basename } from "@/lib/path";
 import {
   Sheet,
   SheetContent,
@@ -641,7 +642,7 @@ export function SettingsView() {
     return st?.workspaces.find((w) => w.workspace_id === st.active_workspace_id);
   });
   const projectRoot = activeWorkspace?.project_root ?? null;
-  const projectName = projectRoot ? projectRoot.split("/").pop() ?? "Project" : "Project";
+  const projectName = projectRoot ? basename(projectRoot) || "Project" : "Project";
 
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const navGroups = buildNavGroups(enableAgentChat);

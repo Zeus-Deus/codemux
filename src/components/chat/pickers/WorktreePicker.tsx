@@ -15,6 +15,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
+import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 import {
   useAppStore,
@@ -58,10 +59,6 @@ interface WorktreePickerProps {
   onWorktreeCreated: (workspaceId: string) => void;
 
   disabled?: boolean;
-}
-
-function basename(path: string): string {
-  return path.split("/").filter(Boolean).pop() || path;
 }
 
 export function WorktreePicker({

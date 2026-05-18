@@ -15,6 +15,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { basename } from "@/lib/path";
 import { BranchPicker } from "./branch-picker";
 import { DevicePicker } from "@/components/hosts/device-picker";
 import {
@@ -482,7 +483,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           await applyPreset(wsId, selectedAgentId, "current_terminal", fullPrompt);
         }
 
-        const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
+        const pName = basename(projectDir);
         dbAddRecentProject(projectDir, pName).catch(console.error);
         if (linkedIssue) {
           try {
@@ -582,7 +583,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
       // Track as recent project
       const pName =
-        projectDir.split("/").filter(Boolean).pop() || projectDir;
+        basename(projectDir);
       dbAddRecentProject(projectDir, pName).catch(console.error);
 
       // Link issue to the new workspace
@@ -743,7 +744,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   >
                     <Paperclip className="h-2.5 w-2.5" />
                     <span className="max-w-[160px] truncate">
-                      {file.split("/").pop()}
+                      {basename(file)}
                     </span>
                     <button
                       type="button"

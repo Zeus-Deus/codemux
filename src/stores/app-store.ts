@@ -6,6 +6,7 @@ import type {
   WorkspaceSnapshot,
   SurfaceSnapshot,
 } from "@/tauri/types";
+import { basename, tailSegments } from "@/lib/path";
 
 interface AppStore {
   appState: AppStateSnapshot | null;
@@ -293,7 +294,7 @@ export function groupWorkspacesByProject(
     const isHomeRooted = homeDir !== null && projectPath === homeDir;
     const projectName = isHomeRooted
       ? "Home"
-      : projectPath.split("/").filter(Boolean).pop() || projectPath;
+      : basename(projectPath);
 
     if (!groups.has(projectPath)) {
       groups.set(projectPath, { name: projectName, path: projectPath, workspaces: [] });
@@ -316,9 +317,9 @@ export function groupWorkspacesByProject(
   }
   for (const g of result) {
     if ((nameCounts.get(g.projectName) || 0) > 1) {
-      const parts = g.projectPath.split("/").filter(Boolean);
-      if (parts.length >= 2) {
-        g.projectName = parts.slice(-2).join("/");
+      const tail = tailSegments(g.projectPath, 2);
+      if (tail.includes("/")) {
+        g.projectName = tail;
       }
     }
   }

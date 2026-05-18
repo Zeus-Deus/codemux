@@ -193,6 +193,31 @@ describe("project grouping", () => {
     expect(names).toContain("frontend");
     expect(names).toContain("backend");
   });
+
+  it("extracts the basename from Windows backslash paths", () => {
+    const workspaces = [
+      makeWs({ workspace_id: "ws-1", project_root: "C:\\Users\\muso4\\projects\\codemux" }),
+      makeWs({ workspace_id: "ws-2", project_root: "C:\\Users\\muso4\\projects\\codemux" }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, null);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0].projectName).toBe("codemux");
+    expect(groups[0].projectPath).toBe("C:\\Users\\muso4\\projects\\codemux");
+  });
+
+  it("disambiguates duplicate Windows project basenames", () => {
+    const workspaces = [
+      makeWs({ workspace_id: "ws-1", project_root: "C:\\Users\\muso4\\work\\app" }),
+      makeWs({ workspace_id: "ws-2", project_root: "C:\\Users\\muso4\\personal\\app" }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, null);
+
+    const names = groups.map((g) => g.projectName).sort();
+    expect(names).toEqual(["personal/app", "work/app"]);
+  });
 });
 
 describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {

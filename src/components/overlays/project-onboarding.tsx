@@ -27,6 +27,7 @@ import {
   Check,
   X,
 } from "lucide-react";
+import { basename } from "@/lib/path";
 import {
   Tooltip,
   TooltipContent,
@@ -270,7 +271,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
           null, // no agent preset — workspace opens empty
         );
 
-        const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
+        const pName = basename(projectDir);
         dbAddRecentProject(projectDir, pName).catch(console.error);
 
         removePendingWorkspace(tempId);
@@ -317,7 +318,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
       }
     }
     if (lastWsId) await activateWorkspace(lastWsId);
-    const pName = projectDir.split("/").filter(Boolean).pop() || projectDir;
+    const pName = basename(projectDir);
     dbAddRecentProject(projectDir, pName).catch(console.error);
     onComplete();
   };
@@ -330,7 +331,7 @@ export function ProjectOnboarding({ projectDir, tempWorkspaceId, onComplete, onC
     }
   };
 
-  const projectName = projectDir.split("/").filter(Boolean).pop() || "project";
+  const projectName = basename(projectDir) || "project";
 
   return (
     <div className="relative flex-1 h-full flex flex-col overflow-hidden bg-background">
