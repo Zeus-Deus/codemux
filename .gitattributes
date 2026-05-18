@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings even on Windows checkouts so the
+# bash that Tauri's beforeDevCommand spawns can execute them. Without
+# this, `core.autocrlf=true` rewrites every line ending to CRLF and
+# bash chokes on the stray \r.
+*.sh text eol=lf
