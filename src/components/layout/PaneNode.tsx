@@ -260,14 +260,14 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
             )}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
+              <SplitSquareHorizontal className="h-3.5 w-3.5" />
             </Button>
-            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
+              <SplitSquareVertical className="h-3.5 w-3.5" />
             </Button>
-            <Button variant="ghost" size="icon-xs" className="hover:bg-destructive/80" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
+              <X className="h-3.5 w-3.5" />
             </Button>
           </div>
         </header>
@@ -347,14 +347,14 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
             {node.title}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
+              <SplitSquareHorizontal className="h-3.5 w-3.5" />
             </Button>
-            <Button variant="ghost" size="icon-xs" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
+              <SplitSquareVertical className="h-3.5 w-3.5" />
             </Button>
-            <Button variant="ghost" size="icon-xs" className="hover:bg-destructive/80" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="h-3 w-3" />
+            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
+              <X className="h-3.5 w-3.5" />
             </Button>
           </div>
         </header>
