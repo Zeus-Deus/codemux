@@ -1,16 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { getVersion } from "@tauri-apps/api/app";
-import { openUrl } from "@tauri-apps/plugin-opener";
-import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import {
   PanelLeft,
-  Search,
-  Settings,
-  Keyboard,
-  BookOpen,
-  Bug,
-  Info,
-  LogOut,
   ChevronDown,
   ExternalLink,
 } from "lucide-react";
@@ -21,7 +11,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -31,147 +20,12 @@ import {
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { useUIStore } from "@/stores/ui-store";
-import {
-  useAppStore,
-  useActiveWorkspaceProjectRoot,
-  useActiveWorkspaceBranch,
-} from "@/stores/app-store";
+import { useAppStore } from "@/stores/app-store";
 import { detectEditors, openInEditor } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
 import type { EditorInfo } from "@/tauri/types";
-
-// ── Search Trigger ──
-
-function SearchTrigger() {
-  const { getKeysForAction } = useResolvedKeybinds();
-  const toggleCombo = getKeysForAction("commandPalette");
-  // Subscribe to the two primitive slices we actually use, not the
-  // full workspace object. The full object's reference churns on every
-  // backend tick (snapshot rebuild) and would re-render this header on
-  // every git poll / agent token / hook event.
-  const projectRoot = useActiveWorkspaceProjectRoot();
-  const branch = useActiveWorkspaceBranch();
-
-  const handleClick = useCallback(() => {
-    useUIStore.getState().toggleCommandPalette();
-  }, []);
-
-  const projectName = projectRoot
-    ? projectRoot.split(/[\\/]/).filter(Boolean).pop() ?? null
-    : null;
-  const label = projectName
-    ? branch
-      ? `Search ${projectName} - ${branch}`
-      : `Search ${projectName}`
-    : "Search...";
-
-  return (
-    <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-      <button
-        type="button"
-        onClick={handleClick}
-        className="pointer-events-auto flex items-center gap-2 h-6 px-2.5 rounded-md border border-border/50 bg-muted/50 text-muted-foreground text-xs transition-colors duration-150 hover:bg-muted hover:text-foreground cursor-pointer min-w-[240px] max-w-[420px]"
-      >
-        <Search className="h-3 w-3 shrink-0" />
-        <span className="truncate">{label}</span>
-        {toggleCombo && (
-          <kbd className="ml-auto shrink-0 text-[10px] text-muted-foreground/60 border border-border/40 rounded px-1 py-px">
-            {toggleCombo}
-          </kbd>
-        )}
-      </button>
-    </div>
-  );
-}
-
-function SettingsShortcutHint() {
-  const { getKeysForAction } = useResolvedKeybinds();
-  const keys = getKeysForAction("openSettings");
-  if (!keys) return null;
-  return <kbd className="ml-auto text-[10px] text-muted-foreground">{keys}</kbd>;
-}
-
-// ── App Menu ──
-
-function AppMenu() {
-  const setShowSettings = useUIStore((s) => s.setShowSettings);
-  const [version, setVersion] = useState<string | null>(null);
-
-  useEffect(() => {
-    getVersion().then(setVersion);
-  }, []);
-
-  return (
-    <DropdownMenu>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <DropdownMenuTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="App menu"
-              className="text-muted-foreground"
-            >
-              <Settings className="h-3.5 w-3.5" />
-            </Button>
-          </DropdownMenuTrigger>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" sideOffset={4}>
-          Menu
-        </TooltipContent>
-      </Tooltip>
-      <DropdownMenuContent align="end" className="w-52">
-        <DropdownMenuItem
-          onClick={() => setShowSettings(true)}
-        >
-          <Settings className="h-4 w-4" />
-          <span>Settings</span>
-          <SettingsShortcutHint />
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => setShowSettings(true, "shortcuts")}
-        >
-          <Keyboard className="h-4 w-4" />
-          <span>Keyboard Shortcuts</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          onClick={() => openUrl("https://docs.codemux.org/installation")}
-        >
-          <BookOpen className="h-4 w-4" />
-          <span>Documentation</span>
-          <ExternalLink className="ml-auto h-3 w-3 text-muted-foreground" />
-        </DropdownMenuItem>
-        <DropdownMenuItem
-          onClick={() => openUrl("https://github.com/Zeus-Deus/codemux/issues/new")}
-        >
-          <Bug className="h-4 w-4" />
-          <span>Report Issue</span>
-          <ExternalLink className="ml-auto h-3 w-3 text-muted-foreground" />
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem disabled>
-          <Info className="h-4 w-4" />
-          <span>Codemux {version ? `v${version}` : ""}</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem
-          onClick={() => {
-            import("@/stores/auth-store").then(({ useAuthStore }) =>
-              useAuthStore.getState().signOut(),
-            );
-          }}
-        >
-          <LogOut className="h-4 w-4" />
-          <span>Sign Out</span>
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
 
 // ── IDE Launcher ──
 
@@ -334,8 +188,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         </span>
       </div>
 
-      {/* Center — search trigger absolutely positioned */}
-      <SearchTrigger />
+      {/* Center — left intentionally empty so the title bar reads as
+          a calm drag region. Command palette is reachable from the
+          sidebar footer + its keyboard shortcut. */}
 
       {/* Right */}
       <div className="flex items-center gap-1.5 pr-0.5">
@@ -345,7 +200,6 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
             when disabled. */}
         <ResourceMonitor />
         <IdeLauncher />
-        <AppMenu />
         <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
         <WindowControls />
       </div>

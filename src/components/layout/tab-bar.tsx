@@ -220,7 +220,7 @@ export function TabBar({ workspace }: Props) {
   }
 
   return (
-    <div className="flex h-[52px] shrink-0 items-center border-b border-border bg-background">
+    <div className="flex h-[45px] shrink-0 items-center border-b border-border bg-background">
       <Tabs
         value={workspace.active_tab_id}
         onValueChange={handleTabChange}
