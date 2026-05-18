@@ -201,24 +201,166 @@ function SettingRow({ label, description, children }: {
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between py-4">
-      <div className="space-y-1 pr-8">
-        <p className="text-sm font-medium leading-none">{label}</p>
+    <div className="flex items-start justify-between gap-8 py-4">
+      <div className="space-y-1 min-w-0">
+        <p className="text-[13px] font-medium leading-none text-foreground">{label}</p>
         {description && (
-          <p className="text-sm text-muted-foreground">{description}</p>
+          <p className="text-[12px] text-muted-foreground/85 leading-relaxed">{description}</p>
         )}
       </div>
-      <div className="shrink-0">{children}</div>
+      <div className="shrink-0 pt-0.5">{children}</div>
     </div>
   );
 }
 
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
-    <div className="mb-6">
-      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-      <p className="text-sm text-muted-foreground mt-1">{description}</p>
+    <div className="mb-8">
+      <h2 className="text-[17px] font-semibold tracking-tight text-foreground">{title}</h2>
+      <p className="text-[13px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">{description}</p>
     </div>
+  );
+}
+
+/** In-section heading for grouped content (e.g. "AI Tools",
+ *  "Detected editors"). Distinct from SectionHeader (which titles
+ *  the whole panel) — lower visual weight, no max width, sits
+ *  immediately above a stack of rows or a card. */
+function SubsectionHeader({
+  title,
+  description,
+  action,
+  className,
+}: {
+  title: string;
+  description?: string;
+  action?: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
+      <div className="min-w-0">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+          {title}
+        </p>
+        {description && (
+          <p className="text-[12px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">
+            {description}
+          </p>
+        )}
+      </div>
+      {action && <div className="shrink-0">{action}</div>}
+    </div>
+  );
+}
+
+/** Section break — adds breathing room between subsections inside a
+ *  single settings page. First subsection gets no extra top margin. */
+function SectionGroup({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <section className={cn("mt-10 first:mt-0", className)}>{children}</section>
+  );
+}
+
+/** Calm grouped surface for things like environment-variable lists,
+ *  test-connection panels, info banners. Subtle border, very soft
+ *  bg — should never compete with content inside it. */
+function SettingsCard({
+  children,
+  className,
+}: {
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-lg border border-border/60 bg-muted/30 p-4",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+/** Form field with label + helper + content. Used by any section
+ *  that has free-form inputs (textareas, multi-input forms). Keeps
+ *  label/helper rhythm identical across Projects, Git AI agent
+ *  pickers, Hosts add-form, etc. */
+function FormField({
+  label,
+  helper,
+  caption,
+  htmlFor,
+  children,
+  className,
+}: {
+  label: string;
+  helper?: React.ReactNode;
+  caption?: React.ReactNode;
+  htmlFor?: string;
+  children: React.ReactNode;
+  className?: string;
+}) {
+  return (
+    <div className={cn("space-y-2", className)}>
+      <div className="space-y-1">
+        <label
+          htmlFor={htmlFor}
+          className="text-[13px] font-medium text-foreground leading-none block"
+        >
+          {label}
+        </label>
+        {helper && (
+          <p className="text-[12px] text-muted-foreground/85 leading-relaxed">
+            {helper}
+          </p>
+        )}
+      </div>
+      {children}
+      {caption && (
+        <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
+          {caption}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function SettingsNavItem({ icon: Icon, label, active, onClick }: {
+  icon: React.ElementType;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-7 rounded-md text-[13px] text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        active
+          ? "bg-muted text-foreground"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+      )}
+    >
+      <Icon
+        className={cn(
+          "h-3.5 w-3.5 shrink-0 transition-colors",
+          active
+            ? "text-foreground/80"
+            : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
+        )}
+      />
+      <span className="truncate">{label}</span>
+    </button>
   );
 }
 
@@ -314,10 +456,13 @@ function BrowserSection() {
             {clearing === "all" ? "Clearing..." : "Clear all data"}
           </Button>
         </SettingRow>
-        {message && (
-          <p className="text-sm text-muted-foreground pt-2">{message}</p>
-        )}
       </div>
+      {message && (
+        <SettingsCard className="mt-4 flex items-start gap-3 border-border/50 bg-muted/40">
+          <div className="size-1.5 rounded-full bg-success shrink-0 mt-1.5" />
+          <p className="text-[12px] text-muted-foreground/90 leading-relaxed">{message}</p>
+        </SettingsCard>
+      )}
     </div>
   );
 }
@@ -800,31 +945,6 @@ export function SettingsView() {
                       </SettingRow>
                     </>
                   )}
-                  {enableAgentChat && (
-                    <>
-                      <Separator />
-                      <div className="pt-4 pb-2">
-                        <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
-                          Skills sync
-                        </div>
-                        <SyncSection />
-                      </div>
-                    </>
-                  )}
-                  <Separator />
-                  <div className="pt-4">
-                    <Button
-                      variant="ghost"
-                      className="text-destructive hover:bg-destructive/10 hover:text-destructive gap-2"
-                      onClick={() => {
-                        signOut();
-                        setShowSettings(false);
-                      }}
-                    >
-                      <LogOut className="h-4 w-4" />
-                      Sign out
-                    </Button>
-                  </div>
                 </>
               ) : (
                 <div className="py-4 text-sm text-muted-foreground">
@@ -832,6 +952,39 @@ export function SettingsView() {
                 </div>
               )}
             </div>
+
+            {authUser && enableAgentChat && (
+              <SectionGroup>
+                <SubsectionHeader title="Skills sync" />
+                <SyncSection />
+              </SectionGroup>
+            )}
+
+            {authUser && (
+              <SectionGroup>
+                <SubsectionHeader title="Session" />
+                <SettingsCard className="flex items-center justify-between gap-4">
+                  <div className="min-w-0">
+                    <p className="text-[13px] font-medium text-foreground">Sign out of Codemux</p>
+                    <p className="text-[12px] text-muted-foreground/85 mt-0.5">
+                      You'll need to sign in again to sync settings and use cloud features.
+                    </p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="shrink-0 text-destructive border-destructive/30 hover:bg-destructive/10 hover:text-destructive hover:border-destructive/50 gap-1.5"
+                    onClick={() => {
+                      signOut();
+                      setShowSettings(false);
+                    }}
+                  >
+                    <LogOut className="h-3.5 w-3.5" />
+                    Sign out
+                  </Button>
+                </SettingsCard>
+              </SectionGroup>
+            )}
           </div>
         );
 
@@ -904,28 +1057,32 @@ export function SettingsView() {
                   </SelectContent>
                 </Select>
               </SettingRow>
-              {editors.length > 0 && (
-                <>
-                  <Separator />
-                  <div className="py-4">
-                    <p className="text-sm font-medium mb-3">Detected editors</p>
-                    <div className="space-y-2">
-                      {editors.map((ed) => (
-                        <div key={ed.id} className="flex items-center justify-between">
-                          <span className="flex items-center gap-2 text-sm">
-                            <EditorIcon id={ed.id} className="h-4 w-4" />
-                            {ed.name}
-                          </span>
-                          <code className="text-xs text-muted-foreground font-mono bg-muted px-2 py-0.5 rounded">
-                            {ed.command}
-                          </code>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              )}
             </div>
+
+            {editors.length > 0 && (
+              <SectionGroup>
+                <SubsectionHeader
+                  title="Detected editors"
+                  description="Editors found on this machine — selecting one above routes file opens to that command."
+                />
+                <SettingsCard className="divide-y divide-border/40 p-0">
+                  {editors.map((ed) => (
+                    <div
+                      key={ed.id}
+                      className="flex items-center justify-between gap-4 px-4 py-2.5"
+                    >
+                      <span className="flex items-center gap-2 text-[13px] text-foreground">
+                        <EditorIcon id={ed.id} className="h-4 w-4" />
+                        {ed.name}
+                      </span>
+                      <code className="text-[11px] text-muted-foreground/85 font-mono bg-background/60 px-2 py-0.5 rounded border border-border/40">
+                        {ed.command}
+                      </code>
+                    </div>
+                  ))}
+                </SettingsCard>
+              </SectionGroup>
+            )}
           </div>
         );
 
@@ -993,19 +1150,24 @@ export function SettingsView() {
                   />
                 </SettingRow>
               )}
-              <Separator />
+            </div>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Your presets"
+                description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
+              />
               {presetStore ? (
-                <div className="space-y-2 pt-2">
-                  <p className="text-xs text-muted-foreground mb-3">Drag the grip to reorder. Click a preset to edit.</p>
-                  <DndContext
-                    sensors={presetSensors}
-                    collisionDetection={closestCenter}
-                    onDragEnd={handlePresetDragEnd}
+                <DndContext
+                  sensors={presetSensors}
+                  collisionDetection={closestCenter}
+                  onDragEnd={handlePresetDragEnd}
+                >
+                  <SortableContext
+                    items={presetStore.presets.map((p) => p.id)}
+                    strategy={verticalListSortingStrategy}
                   >
-                    <SortableContext
-                      items={presetStore.presets.map((p) => p.id)}
-                      strategy={verticalListSortingStrategy}
-                    >
+                    <div className="space-y-1.5">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -1021,17 +1183,17 @@ export function SettingsView() {
                           }}
                         />
                       ))}
-                    </SortableContext>
-                  </DndContext>
-                </div>
+                    </div>
+                  </SortableContext>
+                </DndContext>
               ) : (
-                <p className="text-sm text-muted-foreground">Loading presets...</p>
+                <p className="text-[13px] text-muted-foreground">Loading presets…</p>
               )}
-            </div>
+            </SectionGroup>
 
-            <p className="text-xs text-muted-foreground mt-3 px-1">
+            <p className="text-[12px] text-muted-foreground/70 leading-relaxed mt-8">
               Agents in Codemux terminals automatically receive workspace context.{" "}
-              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground transition-colors">
+              <a href="https://docs.codemux.org/agent-awareness" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">
                 Learn how to configure it for your tools
               </a>
             </p>
@@ -1063,11 +1225,11 @@ export function SettingsView() {
               </SettingRow>
             </div>
 
-            <div className="mt-8">
-              <h3 className="text-sm font-medium mb-1">AI Tools</h3>
-              <p className="text-xs text-muted-foreground mb-4">
-                AI-assisted git workflows. Requires the Claude CLI.
-              </p>
+            <SectionGroup>
+              <SubsectionHeader
+                title="AI Tools"
+                description="AI-assisted git workflows. Requires the Claude CLI."
+              />
               <div className="space-y-1">
                 <SettingRow label="AI commit messages" description="Show the generate button next to the commit input.">
                   <Switch
@@ -1104,13 +1266,13 @@ export function SettingsView() {
                   />
                 </SettingRow>
               </div>
-            </div>
+            </SectionGroup>
 
-            <div className="mt-8">
-              <h3 className="text-sm font-medium mb-1">Merge Conflict Resolver</h3>
-              <p className="text-xs text-muted-foreground mb-4">
-                AI-powered merge conflict resolution. When conflicts are detected, the AI works on a temp branch and you review the diff before applying.
-              </p>
+            <SectionGroup>
+              <SubsectionHeader
+                title="Merge Conflict Resolver"
+                description="AI-powered merge conflict resolution. When conflicts are detected, the AI works on a temp branch and you review the diff before applying."
+              />
               <div className="space-y-1">
                 {/* One picker that sets BOTH `ai_resolver_cli` and
                     `ai_resolver_model`. Same component the agent-chat
@@ -1158,7 +1320,7 @@ export function SettingsView() {
                   </Select>
                 </SettingRow>
               </div>
-            </div>
+            </SectionGroup>
           </div>
         );
 
@@ -1231,7 +1393,15 @@ export function SettingsView() {
           </div>
         );
 
-      case "projects":
+      case "projects": {
+        const ENV_VARS: Array<[string, string]> = [
+          ["$CODEMUX_ROOT_PATH", "Main repo root"],
+          ["$CODEMUX_WORKSPACE_PATH", "Workspace / worktree directory"],
+          ["$CODEMUX_BRANCH", "Workspace branch name"],
+          ["$CODEMUX_PORT", "Allocated port for this workspace"],
+          ["$CODEMUX_WORKSPACE_NAME", "Workspace title"],
+          ["$CODEMUX_WORKSPACE_ID", "Workspace ID"],
+        ];
         return (
           <div>
             <SectionHeader
@@ -1239,89 +1409,110 @@ export function SettingsView() {
               description={`Automate your workspace lifecycle for ${projectName}. Changes are saved automatically.`}
             />
             {hasConfigFile && (
-              <div className="mb-4 rounded-md border border-border bg-muted/50 px-4 py-3 text-sm text-muted-foreground">
-                A <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">.codemux/config.json</code> file was found.
-                File-based configuration takes precedence over these settings.
-              </div>
-            )}
-            <div className="space-y-6">
-              <div>
-                <label className="text-sm font-medium">Worktree Includes</label>
-                <p className="text-sm text-muted-foreground mb-2">
-                  Files matching these patterns are copied from the main project into new worktrees. One pattern per line.
+              <SettingsCard className="mb-6 flex items-start gap-3 border-border/50 bg-muted/40">
+                <div className="size-1.5 rounded-full bg-warning shrink-0 mt-1.5" />
+                <p className="text-[12px] text-muted-foreground/90 leading-relaxed">
+                  A <code className="font-mono text-[11px] bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemux/config.json</code> file was found.
+                  File-based configuration takes precedence over these settings.
                 </p>
+              </SettingsCard>
+            )}
+
+            <div className="space-y-8">
+              <FormField
+                label="Worktree includes"
+                helper="Files matching these patterns are copied from the main project into new worktrees. One pattern per line."
+                caption={
+                  <>
+                    Create a <code className="font-mono text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file
+                    in your project root to share patterns with your team. When empty, defaults to{" "}
+                    <code className="font-mono text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
+                    <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline underline-offset-2 decoration-border hover:decoration-foreground hover:text-foreground transition-colors">Learn more</a>
+                  </>
+                }
+              >
                 {hasIncludeFile && (
-                  <div className="mb-2 rounded-md border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-                    This project has a <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.codemuxinclude</code> file — those patterns take priority over settings below.
-                  </div>
+                  <SettingsCard className="border-border/50 bg-muted/40 py-2.5 px-3 mb-2">
+                    <p className="text-[12px] text-muted-foreground/90 leading-relaxed">
+                      This project has a <code className="font-mono text-[11px] bg-background/60 border border-border/40 px-1.5 py-0.5 rounded">.codemuxinclude</code> file —
+                      those patterns take priority over the settings below.
+                    </p>
+                  </SettingsCard>
                 )}
                 <Textarea
-                  className="font-mono text-sm min-h-[80px]"
+                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
                   onBlur={saveProjectSettings}
                 />
-                <p className="text-xs text-muted-foreground mt-1.5">
-                  Create a <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.codemuxinclude</code> file
-                  in your project root to share patterns with your team.
-                  When empty, defaults to <code className="font-mono text-[11px] bg-muted px-1 py-0.5 rounded">.env .env.* .env.local</code>.{" "}
-                  <a href="https://docs.codemux.org" target="_blank" rel="noopener noreferrer" className="underline hover:text-foreground">Learn more</a>
-                </p>
-              </div>
-              <Separator />
-              <div>
-                <label className="text-sm font-medium">Setup</label>
-                <p className="text-sm text-muted-foreground mb-2">
-                  Runs when a new workspace is created. One command per line.
-                </p>
+              </FormField>
+
+              <FormField
+                label="Setup"
+                helper="Runs when a new workspace is created. One command per line."
+              >
                 <Textarea
-                  className="font-mono text-sm min-h-[80px]"
+                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
                   onChange={(e) => setSetupScripts(e.target.value)}
                   onBlur={saveProjectSettings}
                 />
-              </div>
-              <div>
-                <label className="text-sm font-medium">Teardown</label>
-                <p className="text-sm text-muted-foreground mb-2">
-                  Runs when a workspace is deleted. One command per line.
-                </p>
+              </FormField>
+
+              <FormField
+                label="Teardown"
+                helper="Runs when a workspace is deleted. One command per line."
+              >
                 <Textarea
-                  className="font-mono text-sm min-h-[80px]"
+                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
                   onChange={(e) => setTeardownScripts(e.target.value)}
                   onBlur={saveProjectSettings}
                 />
-              </div>
-              <div>
-                <label className="text-sm font-medium">Run</label>
-                <p className="text-sm text-muted-foreground mb-2">
-                  A command to start your dev server, triggered via <kbd className="text-xs bg-muted px-1 py-0.5 rounded border border-border">Ctrl+Shift+G</kbd>.
-                </p>
+              </FormField>
+
+              <FormField
+                label="Run"
+                helper={
+                  <>
+                    A command to start your dev server, triggered via{" "}
+                    <kbd className="text-[11px] bg-muted/60 border border-border/40 px-1.5 py-0.5 rounded font-mono">Ctrl+Shift+G</kbd>.
+                  </>
+                }
+              >
                 <Input
-                  className="font-mono text-sm"
+                  className="font-mono text-[12.5px] h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   onChange={(e) => setRunCommand(e.target.value)}
                   onBlur={saveProjectSettings}
                 />
-              </div>
-              <Separator />
-              <div className="text-sm text-muted-foreground space-y-1">
-                <p className="font-medium text-foreground">Environment variables</p>
-                <p><code className="font-mono text-xs">$CODEMUX_ROOT_PATH</code> — main repo root</p>
-                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_PATH</code> — workspace/worktree directory</p>
-                <p><code className="font-mono text-xs">$CODEMUX_BRANCH</code> — workspace branch name</p>
-                <p><code className="font-mono text-xs">$CODEMUX_PORT</code> — allocated port for this workspace</p>
-                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_NAME</code> — workspace title</p>
-                <p><code className="font-mono text-xs">$CODEMUX_WORKSPACE_ID</code> — workspace ID</p>
-              </div>
+              </FormField>
             </div>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Environment variables"
+                description="Available to all scripts above. Reference them with $NAME in commands."
+              />
+              <SettingsCard className="divide-y divide-border/40 p-0">
+                {ENV_VARS.map(([name, desc]) => (
+                  <div
+                    key={name}
+                    className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.5fr)] items-center gap-4 px-4 py-2"
+                  >
+                    <code className="font-mono text-[12px] text-foreground/90 truncate">{name}</code>
+                    <span className="text-[12px] text-muted-foreground/85 truncate">{desc}</span>
+                  </div>
+                ))}
+              </SettingsCard>
+            </SectionGroup>
           </div>
         );
+      }
 
       case "notifications":
         return (
@@ -1417,60 +1608,77 @@ export function SettingsView() {
     }
   };
 
+  // Resolve the human-readable label for the active nav row so the
+  // header can show "Settings › Section" — a quiet breadcrumb that
+  // tells the user where they are without taking visual weight away
+  // from the actual content.
+  const activeLabel = navGroups
+    .flatMap((g) => g.items)
+    .find((i) => i.id === activeSection)?.label ?? null;
+
   return (
     <div className="relative flex h-screen flex-col bg-background">
       <WindowChrome />
-      {/* Header — h-12 (48px) is taller than the 28px WindowChrome strip,
-          so the Back button's hit area sits below the controls and the
-          window controls retain a clear click target on the right. */}
-      <div className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4">
+      {/* Header. `WindowChrome` is an absolute 28px drag-region strip
+          with z-50 that overlays the top of the page; if header content
+          sits in y=0..28 the drag region eats its clicks. We give the
+          header `pt-7` (= 28px) so the back button and breadcrumb are
+          rendered ENTIRELY below the drag strip and their full hit area
+          stays clickable. The remaining `pb-2` keeps the bar visually
+          tight without growing the chrome unnecessarily. */}
+      <div className="flex shrink-0 items-center gap-2 border-b border-border px-3 pt-7 pb-2">
         <Button
           variant="ghost"
           size="icon-sm"
+          aria-label="Close settings"
+          className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
           onClick={() => setShowSettings(false)}
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <h1 className="text-sm font-semibold">Settings</h1>
+        <div className="flex items-center gap-2 text-[13px]">
+          <span className="font-medium text-foreground">Settings</span>
+          {activeLabel && (
+            <>
+              <span className="text-muted-foreground/40">/</span>
+              <span className="text-muted-foreground">{activeLabel}</span>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Body */}
       <div className="flex flex-1 min-h-0">
-        {/* Left nav */}
-        <nav className="w-52 shrink-0 border-r border-border p-3 space-y-4">
-          {navGroups.map((group) => (
-            <div key={group.label}>
-              <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
-                {group.label}
-              </p>
-              <div className="space-y-0.5">
-                {group.items.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <Button
+        {/* Left nav — refined-minimal pill rows matching the new
+            sidebar aesthetic: inset margins, soft muted hover, calm
+            type hierarchy. Group separation is whitespace alone (no
+            dividers) so the nav reads as one continuous list. */}
+        <nav className="w-52 shrink-0 border-r border-border py-4">
+          <div className="space-y-5">
+            {navGroups.map((group) => (
+              <div key={group.label}>
+                <p className="px-4 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+                  {group.label}
+                </p>
+                <div className="space-y-px px-2">
+                  {group.items.map((item) => (
+                    <SettingsNavItem
                       key={item.id}
-                      variant="ghost"
-                      className={cn(
-                        "w-full justify-start gap-2.5 px-3 py-2 h-auto text-sm",
-                        activeSection === item.id
-                          ? "bg-accent text-foreground font-medium"
-                          : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
-                      )}
+                      icon={item.icon}
+                      label={item.label}
+                      active={activeSection === item.id}
                       onClick={() => setActiveSection(item.id)}
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      {item.label}
-                    </Button>
-                  );
-                })}
+                    />
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </nav>
 
         {/* Content */}
         <ScrollArea className="flex-1 bg-card">
-          <div className="max-w-2xl p-8">
+          <div className="mx-auto max-w-3xl px-10 py-10">
             {renderSection()}
           </div>
         </ScrollArea>
@@ -1515,45 +1723,49 @@ function SortablePresetRow({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "group flex items-center gap-3 px-3 py-2 rounded-lg border cursor-pointer transition-colors duration-150",
+        "group/preset flex items-center gap-3 pl-1.5 pr-2 py-2 rounded-lg border cursor-pointer transition-colors duration-150",
         selected
-          ? "border-foreground/40 bg-foreground/5"
-          : "border-border/50 bg-card/50 hover:bg-accent/30",
+          ? "border-border bg-muted/60"
+          : "border-border/40 bg-card/40 hover:bg-muted/30 hover:border-border/60",
       )}
       onClick={onSelect}
     >
       <button
         type="button"
-        className="-ml-1 -mr-1 p-1 rounded hover:bg-accent/50 text-muted-foreground/40 hover:text-muted-foreground cursor-grab active:cursor-grabbing touch-none"
+        className="p-1 rounded text-muted-foreground/30 hover:text-muted-foreground hover:bg-muted/60 cursor-grab active:cursor-grabbing touch-none opacity-0 group-hover/preset:opacity-100 transition-opacity"
         aria-label="Drag to reorder"
         title="Drag to reorder"
         onClick={(e) => e.stopPropagation()}
         {...attributes}
         {...listeners}
       >
-        <GripVertical className="h-4 w-4" />
+        <GripVertical className="h-3.5 w-3.5" />
       </button>
-      <PresetIcon icon={preset.icon} className="h-5 w-5 shrink-0" />
+      <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
-          <span className="text-sm font-medium truncate">{preset.name}</span>
+          <span className="text-[13px] font-medium truncate text-foreground">{preset.name}</span>
           {preset.is_builtin && (
-            <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
+            <Badge variant="secondary" className="text-[9px] px-1.5 py-0 h-4 font-normal uppercase tracking-wider">
               built-in
             </Badge>
           )}
         </div>
         {preset.commands.length > 0 && (
-          <code className="text-xs text-muted-foreground font-mono truncate block mt-0.5">
+          <code className="text-[11px] text-muted-foreground/70 font-mono truncate block mt-0.5">
             {preset.commands[0]}
           </code>
         )}
       </div>
-      <div className="flex items-center gap-1 shrink-0">
+      <div className="flex items-center gap-0.5 shrink-0">
         <Button
           variant="ghost"
           size="icon-xs"
           title={preset.pinned ? "Unpin from bar" : "Pin to bar"}
+          className={cn(
+            "h-7 w-7 transition-opacity",
+            preset.pinned ? "opacity-100" : "opacity-60 group-hover/preset:opacity-100",
+          )}
           onClick={(e) => {
             e.stopPropagation();
             onTogglePin();
@@ -1570,7 +1782,7 @@ function SortablePresetRow({
             variant="ghost"
             size="icon-xs"
             title="Delete preset"
-            className="hover:bg-destructive/80"
+            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
             onClick={(e) => {
               e.stopPropagation();
               onDelete();
