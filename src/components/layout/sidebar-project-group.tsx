@@ -1,5 +1,7 @@
 import { useState, useEffect } from "react";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
+import { ProjectAvatar } from "@/components/ui/project-avatar";
+import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -23,7 +25,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard, Home } from "lucide-react";
+import { ChevronRight, Plus, Check, Loader2, AlertCircle, FolderOpen, Clipboard, Home, Image as ImageIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   dbGetUiState,
@@ -56,13 +58,6 @@ const PROJECT_COLORS = [
   { name: "Slate", value: "#64748b" },
 ];
 
-function hexToRgba(hex: string, alpha: number): string {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
 interface Props {
   projectName: string;
   projectPath: string;
@@ -86,6 +81,7 @@ export function SidebarProjectGroup({
 }: Props) {
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
@@ -98,6 +94,9 @@ export function SidebarProjectGroup({
     }).catch(() => {});
     dbGetUiState(`project.color:${projectPath}`).then((val) => {
       if (val) setCustomColor(val);
+    }).catch(() => {});
+    dbGetUiState(`project.image:${projectPath}`).then((val) => {
+      if (val) setImageUrl(val);
     }).catch(() => {});
   }, [projectPath]);
 
@@ -113,6 +112,18 @@ export function SidebarProjectGroup({
       dbSetUiState(`project.color:${projectPath}`, color).catch(console.error);
     } else {
       dbSetUiState(`project.color:${projectPath}`, "").catch(console.error);
+    }
+  };
+
+  const [showImageDialog, setShowImageDialog] = useState(false);
+
+  const handleSaveImage = (next: string | null) => {
+    if (!next) {
+      setImageUrl(null);
+      dbSetUiState(`project.image:${projectPath}`, "").catch(console.error);
+    } else {
+      setImageUrl(next);
+      dbSetUiState(`project.image:${projectPath}`, next).catch(console.error);
     }
   };
 
@@ -134,8 +145,6 @@ export function SidebarProjectGroup({
       return;
     }
 
-    // Lazy-creation path: open (or reuse) the single-slot project
-    // draft without materialising a workspace.
     if (enableLazyWorkspaceCreation) {
       const store = useChatDraftStore.getState();
       const draft = store.getOrCreateProjectDraft(projectPath);
@@ -154,11 +163,6 @@ export function SidebarProjectGroup({
   };
 
   const handleCloseProject = () => {
-    // Drop any client-side drafts targeting this project before
-    // tearing down its workspaces. Keeps the draft store from holding
-    // references to a project that is about to disappear from the
-    // sidebar. When the project being closed IS the Home group
-    // (projectPath === homeDir), home-target drafts are swept too.
     const homeDir = useAppStore.getState().homeDir;
     useChatDraftStore.getState().clearDraftsForProject(projectPath, homeDir);
     for (const ws of workspaces) {
@@ -171,65 +175,59 @@ export function SidebarProjectGroup({
     setShowCloseDialog(false);
   };
 
-  const hasColor = !!customColor;
-  const letter = projectName.charAt(0).toUpperCase();
-  // The Home group is the project-group that `groupWorkspacesByProject`
-  // labels "Home" when `project_root === homeDir`. Render a Home
-  // lucide icon in the avatar slot instead of the "H" letter so users
-  // don't mistake it for an actual project named "Home". Matching
-  // both fields (name and path) is defence against a user project
-  // literally called "Home" living outside $HOME.
   const homeDir = useHomeDir();
   const isHomeGroup = projectName === "Home" && projectPath === homeDir;
 
   return (
-    <div className="pt-1.5">
-      {/* Project header */}
+    <div className="pt-2.5">
       <ContextMenu>
         <ContextMenuTrigger asChild>
           <div
-            className="flex items-center w-full pl-3 pr-2 py-1.5 text-sm font-medium hover:bg-muted/50 transition-colors cursor-pointer"
+            className="group/proj relative flex items-center mx-1.5 pl-1.5 pr-2 py-1 text-sm font-medium hover:bg-muted/40 transition-colors cursor-pointer rounded-lg"
             draggable={!!onProjectDragStart}
             onDragStart={onProjectDragStart}
             data-project-header-path={projectPath}
+            onClick={handleToggle}
           >
-            {/* Letter avatar — neutral by default, colored only if user picks one.
-                The Home group renders a Home lucide icon instead of "H". */}
-            <div
-              className={cn(
-                "size-6 rounded flex items-center justify-center shrink-0 mr-2.5 text-xs font-medium border-[1.5px]",
-                !hasColor && "bg-muted text-muted-foreground border-border",
-              )}
-              style={hasColor ? {
-                borderColor: hexToRgba(customColor!, 0.6),
-                backgroundColor: hexToRgba(customColor!, 0.15),
-                color: customColor!,
-              } : undefined}
-            >
-              {isHomeGroup ? <Home className="h-3.5 w-3.5" /> : letter}
-            </div>
+            {/* Round avatar — image if set, else muted letter, else
+                colored letter when user picked a color. The Home group
+                renders a Home glyph instead of a letter. */}
+            {isHomeGroup ? (
+              <div className="size-5 rounded-full border border-border bg-muted flex items-center justify-center shrink-0 mr-2.5">
+                <Home className="h-3 w-3 text-muted-foreground" />
+              </div>
+            ) : (
+              <ProjectAvatar
+                name={projectName}
+                color={customColor}
+                imageUrl={imageUrl}
+                size="md"
+                shape="circle"
+                className="mr-2.5"
+              />
+            )}
 
-            <Button
-              variant="ghost"
-              className="flex-1 justify-start gap-1.5 min-w-0 text-left h-auto p-0 hover:bg-transparent dark:hover:bg-transparent"
-              onClick={handleToggle}
-            >
-              <span className="truncate text-foreground">{projectName}</span>
-              <span className="text-xs text-muted-foreground tabular-nums font-normal">
-                ({workspaces.length})
-              </span>
-            </Button>
+            <span className="flex-1 min-w-0 truncate text-foreground/90 text-[13px]">
+              {projectName}
+            </span>
 
+            {/* Count — visible at rest, fades on hover so the + can
+                take its slot without ever colliding. */}
+            <span className="text-[11px] text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
+              {workspaces.length}
+            </span>
+
+            {/* + button — hover-reveal */}
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  className="shrink-0 ml-1"
+                  className="absolute right-7 opacity-0 group-hover/proj:opacity-100 transition-opacity"
                   aria-label="New workspace"
                   onClick={handlePlusClick}
                 >
-                  <Plus className="h-4 w-4 text-muted-foreground" />
+                  <Plus className="h-3.5 w-3.5 text-muted-foreground" />
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" sideOffset={4} className="text-xs">
@@ -237,19 +235,13 @@ export function SidebarProjectGroup({
               </TooltipContent>
             </Tooltip>
 
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="shrink-0 ml-1"
-              onClick={(e) => { e.stopPropagation(); handleToggle(); }}
-            >
-              <ChevronRight
-                className={cn(
-                  "h-3.5 w-3.5 text-muted-foreground transition-transform duration-150",
-                  !collapsed && "rotate-90",
-                )}
-              />
-            </Button>
+            {/* Chevron stays visible as the only state cue */}
+            <ChevronRight
+              className={cn(
+                "h-3.5 w-3.5 text-muted-foreground/50 transition-transform duration-150 shrink-0",
+                !collapsed && "rotate-90",
+              )}
+            />
           </div>
         </ContextMenuTrigger>
         <ContextMenuContent>
@@ -260,6 +252,10 @@ export function SidebarProjectGroup({
           <ContextMenuItem onClick={handleCopyPath}>
             <Clipboard className="mr-2 h-3.5 w-3.5" />
             Copy Path
+          </ContextMenuItem>
+          <ContextMenuItem onClick={() => setShowImageDialog(true)}>
+            <ImageIcon className="mr-2 h-3.5 w-3.5" />
+            {imageUrl ? "Change image…" : "Set image…"}
           </ContextMenuItem>
           <ContextMenuSub>
             <ContextMenuSubTrigger>Change Color</ContextMenuSubTrigger>
@@ -291,7 +287,14 @@ export function SidebarProjectGroup({
         </ContextMenuContent>
       </ContextMenu>
 
-      {/* Close project confirmation dialog */}
+      <ProjectImageDialog
+        open={showImageDialog}
+        onOpenChange={setShowImageDialog}
+        projectName={projectName}
+        initialValue={imageUrl}
+        onSave={handleSaveImage}
+      />
+
       <Dialog open={showCloseDialog} onOpenChange={setShowCloseDialog}>
         <DialogContent showCloseButton={false} className="max-w-[340px]">
           <DialogHeader>
@@ -325,7 +328,6 @@ export function SidebarProjectGroup({
         </DialogContent>
       </Dialog>
 
-      {/* Workspace rows */}
       {!collapsed && workspaces.map((ws, idx) => (
         <div
           key={ws.workspace_id}
@@ -342,7 +344,6 @@ export function SidebarProjectGroup({
         </div>
       ))}
 
-      {/* Pending workspace entries */}
       {!collapsed && pendingWorkspaces.map((pw) => (
         <div
           key={pw.id}

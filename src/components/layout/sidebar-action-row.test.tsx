@@ -23,6 +23,8 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 }
 
 const setShowDialogMock = vi.fn();
+const setShowNewProjectScreenMock = vi.fn();
+const openProjectMock = vi.fn();
 let enableAgentChatFlag = false;
 let enableLazyFlag = false;
 
@@ -31,6 +33,7 @@ vi.mock("@/stores/ui-store", () => ({
     const state = {
       showNewWorkspaceDialog: false,
       setShowNewWorkspaceDialog: setShowDialogMock,
+      setShowNewProjectScreen: setShowNewProjectScreenMock,
     };
     return selector(state);
   }),
@@ -47,26 +50,37 @@ vi.mock("@/stores/feature-flags", () => ({
   }),
 }));
 
-import { SidebarHeader } from "./sidebar-header";
+vi.mock("@/hooks/use-project-actions", () => ({
+  useProjectActions: () => ({
+    openProject: openProjectMock,
+  }),
+}));
+
+import { SidebarActionRow } from "./sidebar-action-row";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 
-function renderHeader() {
+function renderRow() {
   const utils = render(
     <TooltipProvider>
       <SidebarProvider>
-        <SidebarHeader />
+        <SidebarActionRow />
       </SidebarProvider>
     </TooltipProvider>,
   );
-  const plus = utils.container.querySelector(
+  const newAgent = utils.container.querySelector(
     'button[aria-label="New agent"]',
   ) as HTMLElement;
-  return { ...utils, plus };
+  const addRepo = utils.container.querySelector(
+    'button[aria-label="Add repository"]',
+  ) as HTMLElement;
+  return { ...utils, newAgent, addRepo };
 }
 
-describe("SidebarHeader + button", () => {
+describe("SidebarActionRow — New agent button", () => {
   beforeEach(() => {
     setShowDialogMock.mockClear();
+    setShowNewProjectScreenMock.mockClear();
+    openProjectMock.mockClear();
     enableAgentChatFlag = false;
     enableLazyFlag = false;
     useChatDraftStore.setState({
@@ -79,33 +93,32 @@ describe("SidebarHeader + button", () => {
 
   it("agent_chat OFF + plain click → opens NewWorkspaceDialog", () => {
     enableAgentChatFlag = false;
-    const { plus } = renderHeader();
-    fireEvent.click(plus);
+    const { newAgent } = renderRow();
+    fireEvent.click(newAgent);
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
   });
 
   it("agent_chat OFF + Shift+click → opens NewWorkspaceDialog", () => {
     enableAgentChatFlag = false;
-    const { plus } = renderHeader();
-    fireEvent.click(plus, { shiftKey: true });
+    const { newAgent } = renderRow();
+    fireEvent.click(newAgent, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
   });
 
   it("agent_chat ON + lazy OFF + plain click → opens NewWorkspaceDialog (Home singleton retired)", () => {
     enableAgentChatFlag = true;
     enableLazyFlag = false;
-    const { plus } = renderHeader();
-    fireEvent.click(plus);
+    const { newAgent } = renderRow();
+    fireEvent.click(newAgent);
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
-    // Draft path must not fire when lazy flag is off.
     expect(useChatDraftStore.getState().activeDraftId).toBeNull();
   });
 
   it("agent_chat ON + Shift+click → opens NewWorkspaceDialog (regardless of lazy flag)", () => {
     enableAgentChatFlag = true;
     enableLazyFlag = true;
-    const { plus } = renderHeader();
-    fireEvent.click(plus, { shiftKey: true });
+    const { newAgent } = renderRow();
+    fireEvent.click(newAgent, { shiftKey: true });
     expect(setShowDialogMock).toHaveBeenCalledWith(true);
     expect(useChatDraftStore.getState().activeDraftId).toBeNull();
   });
@@ -114,8 +127,8 @@ describe("SidebarHeader + button", () => {
     it("lazy ON + plain click → creates home draft, sets it active, no dialog", () => {
       enableAgentChatFlag = true;
       enableLazyFlag = true;
-      const { plus } = renderHeader();
-      fireEvent.click(plus);
+      const { newAgent } = renderRow();
+      fireEvent.click(newAgent);
 
       const state = useChatDraftStore.getState();
       expect(state.activeHomeDraftId).not.toBeNull();
@@ -128,14 +141,29 @@ describe("SidebarHeader + button", () => {
     it("lazy ON + plain click reuses the existing home draft on a second click", () => {
       enableAgentChatFlag = true;
       enableLazyFlag = true;
-      const { plus } = renderHeader();
-      fireEvent.click(plus);
+      const { newAgent } = renderRow();
+      fireEvent.click(newAgent);
       const firstId = useChatDraftStore.getState().activeHomeDraftId;
-      fireEvent.click(plus);
+      fireEvent.click(newAgent);
       expect(useChatDraftStore.getState().activeHomeDraftId).toBe(firstId);
       expect(
         Object.keys(useChatDraftStore.getState().draftsById),
       ).toHaveLength(1);
     });
+  });
+});
+
+describe("SidebarActionRow — Add repository button", () => {
+  beforeEach(() => {
+    setShowDialogMock.mockClear();
+    setShowNewProjectScreenMock.mockClear();
+    openProjectMock.mockClear();
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+  });
+
+  it("renders an Add repository trigger button", () => {
+    const { addRepo } = renderRow();
+    expect(addRepo).not.toBeNull();
   });
 });
