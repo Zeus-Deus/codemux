@@ -201,24 +201,54 @@ function SettingRow({ label, description, children }: {
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between py-4">
-      <div className="space-y-1 pr-8">
-        <p className="text-sm font-medium leading-none">{label}</p>
+    <div className="flex items-start justify-between gap-8 py-4">
+      <div className="space-y-1 min-w-0">
+        <p className="text-[13px] font-medium leading-none text-foreground">{label}</p>
         {description && (
-          <p className="text-sm text-muted-foreground">{description}</p>
+          <p className="text-[12px] text-muted-foreground/85 leading-relaxed">{description}</p>
         )}
       </div>
-      <div className="shrink-0">{children}</div>
+      <div className="shrink-0 pt-0.5">{children}</div>
     </div>
   );
 }
 
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
-    <div className="mb-6">
-      <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-      <p className="text-sm text-muted-foreground mt-1">{description}</p>
+    <div className="mb-8">
+      <h2 className="text-[17px] font-semibold tracking-tight text-foreground">{title}</h2>
+      <p className="text-[13px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">{description}</p>
     </div>
+  );
+}
+
+function SettingsNavItem({ icon: Icon, label, active, onClick }: {
+  icon: React.ElementType;
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-7 rounded-md text-[13px] text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        active
+          ? "bg-muted text-foreground"
+          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+      )}
+    >
+      <Icon
+        className={cn(
+          "h-3.5 w-3.5 shrink-0 transition-colors",
+          active
+            ? "text-foreground/80"
+            : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
+        )}
+      />
+      <span className="truncate">{label}</span>
+    </button>
   );
 }
 
@@ -1417,60 +1447,73 @@ export function SettingsView() {
     }
   };
 
+  // Resolve the human-readable label for the active nav row so the
+  // header can show "Settings › Section" — a quiet breadcrumb that
+  // tells the user where they are without taking visual weight away
+  // from the actual content.
+  const activeLabel = navGroups
+    .flatMap((g) => g.items)
+    .find((i) => i.id === activeSection)?.label ?? null;
+
   return (
     <div className="relative flex h-screen flex-col bg-background">
       <WindowChrome />
       {/* Header — h-12 (48px) is taller than the 28px WindowChrome strip,
           so the Back button's hit area sits below the controls and the
           window controls retain a clear click target on the right. */}
-      <div className="flex h-12 shrink-0 items-center gap-3 border-b border-border px-4">
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
         <Button
           variant="ghost"
           size="icon-sm"
+          aria-label="Close settings"
+          className="text-muted-foreground hover:text-foreground hover:bg-muted/50"
           onClick={() => setShowSettings(false)}
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <h1 className="text-sm font-semibold">Settings</h1>
+        <div className="flex items-center gap-2 text-[13px]">
+          <span className="font-medium text-foreground">Settings</span>
+          {activeLabel && (
+            <>
+              <span className="text-muted-foreground/40">/</span>
+              <span className="text-muted-foreground">{activeLabel}</span>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Body */}
       <div className="flex flex-1 min-h-0">
-        {/* Left nav */}
-        <nav className="w-52 shrink-0 border-r border-border p-3 space-y-4">
-          {navGroups.map((group) => (
-            <div key={group.label}>
-              <p className="px-3 pb-1.5 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/70">
-                {group.label}
-              </p>
-              <div className="space-y-0.5">
-                {group.items.map((item) => {
-                  const Icon = item.icon;
-                  return (
-                    <Button
+        {/* Left nav — refined-minimal pill rows matching the new
+            sidebar aesthetic: inset margins, soft muted hover, calm
+            type hierarchy. Group separation is whitespace alone (no
+            dividers) so the nav reads as one continuous list. */}
+        <nav className="w-52 shrink-0 border-r border-border py-4">
+          <div className="space-y-5">
+            {navGroups.map((group) => (
+              <div key={group.label}>
+                <p className="px-4 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+                  {group.label}
+                </p>
+                <div className="space-y-px px-2">
+                  {group.items.map((item) => (
+                    <SettingsNavItem
                       key={item.id}
-                      variant="ghost"
-                      className={cn(
-                        "w-full justify-start gap-2.5 px-3 py-2 h-auto text-sm",
-                        activeSection === item.id
-                          ? "bg-accent text-foreground font-medium"
-                          : "text-muted-foreground hover:text-foreground hover:bg-accent/50",
-                      )}
+                      icon={item.icon}
+                      label={item.label}
+                      active={activeSection === item.id}
                       onClick={() => setActiveSection(item.id)}
-                    >
-                      <Icon className="h-4 w-4 shrink-0" />
-                      {item.label}
-                    </Button>
-                  );
-                })}
+                    />
+                  ))}
+                </div>
               </div>
-            </div>
-          ))}
+            ))}
+          </div>
         </nav>
 
         {/* Content */}
         <ScrollArea className="flex-1 bg-card">
-          <div className="max-w-2xl p-8">
+          <div className="mx-auto max-w-3xl px-10 py-10">
             {renderSection()}
           </div>
         </ScrollArea>
