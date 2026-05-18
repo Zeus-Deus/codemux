@@ -392,7 +392,7 @@ export function PresetBar({
             size="icon-xs"
             aria-label="Preset settings"
           >
-            <Settings className="h-3.5 w-3.5" />
+            <Settings className="size-4" />
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start" className="w-52">

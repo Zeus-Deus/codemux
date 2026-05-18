@@ -84,7 +84,7 @@ export function RunButton({ workspaceId }: RunButtonProps) {
             className={`gap-1 ${!isConfigured ? "text-muted-foreground" : ""}`}
             onClick={isConfigured ? handleRun : handleConfigure}
           >
-            <Play className="h-3 w-3" />
+            <Play className="size-3.5" />
             <span>{isConfigured ? "Run" : "Set Run"}</span>
             {shortcutBadge}
           </Button>
@@ -98,7 +98,7 @@ export function RunButton({ workspaceId }: RunButtonProps) {
       <Tooltip>
         <TooltipTrigger asChild>
           <Button variant="ghost" size="icon-xs" onClick={handleConfigure}>
-            <Settings className="h-3 w-3" />
+            <Settings className="size-4" />
           </Button>
         </TooltipTrigger>
         <TooltipContent side="bottom" sideOffset={4}>

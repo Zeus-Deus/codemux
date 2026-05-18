@@ -171,6 +171,20 @@ export function TabBar({ workspace }: Props) {
     setDropIndex(null);
   }, []);
 
+  // Clear the indicator when the cursor leaves the tab list. Without
+  // this it hangs at its last position whenever the user drags into
+  // the pane content area and back. relatedTarget is the element
+  // entered; only clear when leaving the subtree entirely.
+  const handleDragLeave = useCallback(
+    (e: React.DragEvent) => {
+      const listEl = tabListRef.current;
+      const next = e.relatedTarget as Node | null;
+      if (!listEl || (next && listEl.contains(next))) return;
+      setDropIndex(null);
+    },
+    [],
+  );
+
   // --- Context menu handlers ---
   const handleCloseOtherTabs = async (keepTabId: string) => {
     for (const tab of workspace.tabs) {
@@ -230,15 +244,21 @@ export function TabBar({ workspace }: Props) {
           ref={tabListRef}
           className="relative flex items-center h-full"
           onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onDrop={handleDrop}
           onDragEnd={handleDragEnd}
         >
-          {/* Drop indicator */}
+          {/* Drop indicator — vertical mirror of the sidebar's
+              leading-dot + thin neutral line. No accent color, so it
+              reads as a UI cue rather than an alert. */}
           {dragTabId && dropIndicatorLeft !== null && (
             <div
-              className="absolute top-1 bottom-1 w-0.5 bg-primary rounded-full z-30 pointer-events-none"
-              style={{ left: dropIndicatorLeft }}
-            />
+              className="absolute top-1 bottom-1 z-30 pointer-events-none flex flex-col items-center"
+              style={{ left: dropIndicatorLeft - 1, width: 2 }}
+            >
+              <div className="h-1.5 w-1.5 rounded-full bg-foreground/70 shrink-0 -mt-0.5" />
+              <div className="w-px flex-1 bg-foreground/40 rounded-full" />
+            </div>
           )}
           <TabsList variant="line" className="!h-full !p-0 gap-0">
             {workspace.tabs.map((tab, idx) => (
