@@ -548,7 +548,7 @@ async fn spawn_pty(
     // (on some shells) exit immediately, killing the session before a
     // single byte of prompt rendered. Expand here on the daemon side
     // where we know the local HOME.
-    let resolved_cwd = expand_tilde(&cwd);
+    let resolved_cwd = crate::project::expand_tilde(&cwd);
     let cwd_exists = std::path::Path::new(&resolved_cwd).exists();
     eprintln!(
         "[daemon::spawn] session={session_id} input_cwd={cwd:?} \
@@ -693,35 +693,6 @@ async fn spawn_pty(
     Ok(pid)
 }
 
-/// Expand a leading `~/` (or bare `~`) in a path-as-string into the
-/// process's `$HOME`. No-op for paths without a leading tilde or when
-/// `$HOME` is unset.
-///
-/// Why this lives on the daemon side: tunneled spawns from a remote
-/// workspace pass `~/.codemux/worktrees/<project>/<branch>` as cwd
-/// because the laptop side doesn't know the remote's `$HOME`. The
-/// daemon DOES know its own `$HOME`. Resolving here means the laptop
-/// stays portable and we avoid a round trip to ask "what's your HOME".
-fn expand_tilde(path: &str) -> String {
-    expand_tilde_with(path, std::env::var("HOME").ok().as_deref())
-}
-
-/// Pure-function core of `expand_tilde`, parameterized on `home` so
-/// unit tests don't have to mutate the process-wide `HOME` env var
-/// (which pollutes other tests that read $HOME — e.g. process_kill
-/// tests that compute paths from $HOME).
-fn expand_tilde_with(path: &str, home: Option<&str>) -> String {
-    if path == "~" {
-        return home.map(|h| h.to_string()).unwrap_or_else(|| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = home {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
-}
-
 #[cfg(unix)]
 fn kill_session_pid(pid: u32) {
     // Same single-SIGKILL killpg policy as the in-process path uses, for
@@ -742,70 +713,4 @@ fn kill_session_pid(pid: u32) {
 fn kill_session_pid(_pid: u32) {
     // Windows path TBD — TerminateProcess + JobObject. Tracked in
     // the windows-support follow-up; for the MVP we only run on Unix.
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // These tests exercise `expand_tilde_with`, the pure-function
-    // core that takes `home` as an argument — NOT `expand_tilde`,
-    // which reads $HOME globally. We deliberately don't touch
-    // `std::env::set_var("HOME", ...)` because that mutation is
-    // process-wide and pollutes any other test in the binary that
-    // reads $HOME (e.g. terminal::tests::process_kill — confirmed
-    // experimentally that env::set_var here caused 10 process_kill
-    // failures in the full-suite ordering).
-
-    #[test]
-    fn expand_tilde_slash_uses_home_env() {
-        assert_eq!(
-            expand_tilde_with(
-                "~/.codemux/worktrees/proj/branch",
-                Some("/fake/home"),
-            ),
-            "/fake/home/.codemux/worktrees/proj/branch"
-        );
-    }
-
-    #[test]
-    fn expand_tilde_bare_returns_home() {
-        assert_eq!(expand_tilde_with("~", Some("/another/home")), "/another/home");
-    }
-
-    #[test]
-    fn expand_tilde_absolute_path_unchanged() {
-        assert_eq!(
-            expand_tilde_with("/usr/local/bin", Some("/whatever")),
-            "/usr/local/bin"
-        );
-    }
-
-    #[test]
-    fn expand_tilde_relative_path_unchanged() {
-        assert_eq!(
-            expand_tilde_with("relative/path", Some("/whatever")),
-            "relative/path"
-        );
-    }
-
-    #[test]
-    fn expand_tilde_mid_path_tilde_unchanged() {
-        // We only handle a LEADING tilde — `foo/~/bar` is not a
-        // tilde-expansion form; treat it as a literal path.
-        assert_eq!(
-            expand_tilde_with("foo/~/bar", Some("/whatever")),
-            "foo/~/bar"
-        );
-    }
-
-    #[test]
-    fn expand_tilde_with_no_home_leaves_tilde_alone() {
-        // When $HOME isn't set on the actual remote daemon, the
-        // expansion is a no-op and the daemon's chdir would fail.
-        // Better to surface the failure than silently chdir
-        // somewhere unexpected.
-        assert_eq!(expand_tilde_with("~/foo", None), "~/foo");
-        assert_eq!(expand_tilde_with("~", None), "~");
-    }
 }

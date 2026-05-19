@@ -103,6 +103,9 @@ pub(crate) fn create_workspace_impl(
     db: &crate::database::DatabaseStore,
     cwd: Option<String>,
 ) -> Result<String, String> {
+    // A workspace cwd must be absolute so its terminals can `chdir` into it;
+    // a hand-typed `~` path would otherwise be stored verbatim.
+    let cwd = cwd.map(|path| crate::project::expand_tilde(&path));
     let workspace_id = match &cwd {
         Some(path) => state.create_workspace_at_path(PathBuf::from(path)),
         None => state.create_workspace(),
@@ -199,6 +202,10 @@ pub fn create_empty_workspace(
     cwd: String,
     skip_setup: Option<bool>,
 ) -> Result<String, String> {
+    // Defense-in-depth: a workspace cwd must always be an absolute path so
+    // every terminal it spawns can `chdir` into it. A literal `~` here would
+    // be stored verbatim and leave terminals stranded in `$HOME`.
+    let cwd = crate::project::expand_tilde(&cwd);
     let repo_path = PathBuf::from(&cwd);
     let workspace_id = state.create_empty_workspace_at_path(repo_path.clone());
 
