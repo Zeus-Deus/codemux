@@ -27,11 +27,13 @@ vi.mock("@/stores/ui-store", () => ({
 }));
 
 let mockAppState: Record<string, unknown> | null = null;
+let mockHomeDir: string | null = null;
 
 vi.mock("@/stores/app-store", () => ({
   useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) => {
-    return selector({ appState: mockAppState });
+    return selector({ appState: mockAppState, homeDir: mockHomeDir });
   }),
+  useHomeDir: vi.fn(() => mockHomeDir),
 }));
 
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
@@ -46,6 +48,7 @@ beforeEach(() => {
   mockDbGetUiState.mockResolvedValue(null);
   mockGetProjectScripts.mockResolvedValue(null);
   mockGetWorkspaceConfig.mockResolvedValue(null);
+  mockHomeDir = null;
   mockAppState = {
     active_workspace_id: "ws-1",
     workspaces: [
@@ -90,6 +93,28 @@ describe("SidebarSetupBanner", () => {
           workspace_id: "ws-1",
           project_root: null,
           worktree_path: "/tmp/wt-1",
+        },
+      ],
+    };
+    render(<SidebarSetupBanner />);
+    await flushPromises();
+    expect(screen.queryByText("Setup")).not.toBeInTheDocument();
+  });
+
+  it("hides for home-rooted workspaces (project_root === $HOME)", async () => {
+    // A "New agent" chat that materialises in the home dir creates a
+    // workspace whose project_root IS the home dir. The setup-scripts
+    // affordance is project-specific, so the banner must not render.
+    // Without the homeDir guard, the banner would treat /home/zeus as a
+    // project literally named "zeus".
+    mockHomeDir = "/home/zeus";
+    mockAppState = {
+      active_workspace_id: "ws-home",
+      workspaces: [
+        {
+          workspace_id: "ws-home",
+          project_root: "/home/zeus",
+          worktree_path: null,
         },
       ],
     };
