@@ -71,6 +71,42 @@ describe("chat-draft-store", () => {
       const second = useChatDraftStore.getState().getOrCreateHomeDraft();
       expect(second.draftId).not.toBe(first.draftId);
     });
+
+    it("defaults to `lockedToHome: false` for implicit (empty-state) calls", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.lockedToHome).toBe(false);
+    });
+
+    it("propagates `lockedToHome: true` for explicit New-agent calls", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(draft.lockedToHome).toBe(true);
+    });
+
+    it("does NOT reuse an implicit pristine draft when an explicit lockedToHome draft is requested", () => {
+      // The implicit empty-state path may have already minted a home
+      // draft whose target the mount-effect auto-seeded to an existing
+      // workspace. Reusing it for an explicit "New agent" click would
+      // defeat the lockedToHome promise — make sure a fresh draft is
+      // minted instead.
+      const implicit = useChatDraftStore.getState().getOrCreateHomeDraft();
+      const explicit = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(explicit.draftId).not.toBe(implicit.draftId);
+      expect(explicit.lockedToHome).toBe(true);
+    });
+
+    it("does reuse a pristine lockedToHome draft on repeated explicit clicks", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      const second = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(second.draftId).toBe(first.draftId);
+    });
   });
 
   describe("getOrCreateProjectDraft", () => {
@@ -224,7 +260,7 @@ describe("chat-draft-store", () => {
       const projectDraft = store.getOrCreateProjectDraft("/p");
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/p", "/home/zeus");
+        .clearDraftsForProject("/p", "/home/user");
       const state = useChatDraftStore.getState();
       expect(state.draftsById[projectDraft.draftId]).toBeUndefined();
       expect(state.draftsById[homeDraft.draftId]).toBeDefined();
@@ -242,7 +278,7 @@ describe("chat-draft-store", () => {
 
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/home/zeus", "/home/zeus");
+        .clearDraftsForProject("/home/user", "/home/user");
 
       const state = useChatDraftStore.getState();
       expect(state.draftsById[homeDraft.draftId]).toBeUndefined();
@@ -257,7 +293,7 @@ describe("chat-draft-store", () => {
       const homeDraft = store.getOrCreateHomeDraft();
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/home/zeus", null);
+        .clearDraftsForProject("/home/user", null);
       expect(
         useChatDraftStore.getState().draftsById[homeDraft.draftId],
       ).toBeDefined();

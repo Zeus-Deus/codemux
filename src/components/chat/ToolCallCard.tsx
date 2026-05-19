@@ -253,12 +253,23 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
         <ToolCallBlock content={null} text={inputText} />
       )}
       {!denying ? (
+        // Approval hierarchy:
+        //   • Allow         → primary affirmative (overlay-button token,
+        //                     same pattern as PlanProposalBlock's
+        //                     "Accept & execute" and PermissionRequest-
+        //                     Block's Allow).
+        //   • Allow always  → outline (still affirmative, but persistent
+        //                     scope; the dropdown caret signals the
+        //                     extra choice).
+        //   • Deny          → ghost-muted (passive; only takes focus if
+        //                     the user actively wants to refuse).
+        // No accent colour anywhere — the chat-ui skill keeps the
+        // conversation neutral.
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
-            variant="outline"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
             onClick={() => handleAllow("once")}
           >
             Allow
@@ -298,9 +309,9 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
           </DropdownMenu>
           <Button
             type="button"
-            variant="outline"
+            variant="ghost"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
             onClick={() => setDenying(true)}
           >
             Deny
@@ -315,27 +326,30 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
             className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-xs text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
             rows={2}
           />
+          {/* Destructive intent — the sole sanctioned use of --danger
+              in the conversation (chat-ui skill). Cancel drops to
+              ghost so Confirm-deny reads as the active choice. */}
           <div className="flex items-center gap-2">
             <Button
               type="button"
-              variant="outline"
+              variant="destructive"
               size="sm"
               className="h-7 px-3 text-xs"
+              onClick={confirmDeny}
+            >
+              Confirm deny
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");
               }}
             >
               Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 px-3 text-xs"
-              onClick={confirmDeny}
-            >
-              Confirm deny
             </Button>
           </div>
         </div>

@@ -1736,7 +1736,11 @@ export function Composer({
             // focus-within ring colour shift) so the compositor only
             // has work to do on those changes.
             "transition-[box-shadow,background-color]",
-            isDragging && "ring-2 ring-primary bg-primary/5",
+            // Drag-over uses a neutral foreground-tinted ring instead
+            // of the primary accent: the chat-ui skill reserves accent
+            // for the app shell, and the brightness shift alone is
+            // enough to confirm the drop target.
+            isDragging && "ring-2 ring-foreground/40 bg-foreground/[0.04]",
           )}
         >
           {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`

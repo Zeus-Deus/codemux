@@ -205,7 +205,9 @@ function SessionRow({ session, isActive, onSelect, onDelete }: SessionRowProps) 
       }}
       className={cn(
         "group/row flex items-center justify-between gap-2 pr-1",
-        isActive && "bg-accent/50",
+        // Active-row highlight stays neutral — the chat-ui skill
+        // reserves accent for the app shell, not in-pane surfaces.
+        isActive && "bg-muted/70 text-foreground",
       )}
       data-testid={`session-row-${session.thread_id}`}
     >

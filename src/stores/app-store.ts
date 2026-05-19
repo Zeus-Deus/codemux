@@ -276,7 +276,7 @@ export function resolveProjectRoot(ws: WorkspaceSnapshot): string {
  *
  * When `homeDir` is non-null, workspaces whose resolved project root
  * equals `homeDir` land in a dedicated group labelled "Home" (instead
- * of "zeus" or "home/zeus" from the path-basename rule). When
+ * of e.g. "user" or "home/user" from the path-basename rule). When
  * `homeDir` is null, grouping falls back to today's path-only rule.
  *
  * Under the Step 5 Home rework (Stage B+), `sidebar-workspace-list`

@@ -163,7 +163,14 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // than being mistaken for a real project. Runs once per draft: as
   // soon as the target flips away from "home" the guard short-circuits
   // every subsequent render, so the user's later picker changes stick.
+  //
+  // Skipped entirely when `draft.lockedToHome` is set — that flag is
+  // raised by the sidebar's explicit "New agent" button, whose tooltip
+  // promises "New chat in home directory". Honouring that beats
+  // mirroring the sidebar context when the user has explicitly asked
+  // for the home landing.
   useEffect(() => {
+    if (draft.lockedToHome) return;
     if (draft.target.kind !== "home") return;
     if (appHomeDir === null) return;
     if (!activeSidebarWorkspaceId || !activeSidebarProjectPath) return;
@@ -173,6 +180,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       workspaceId: activeSidebarWorkspaceId,
     });
   }, [
+    draft.lockedToHome,
     draft.target.kind,
     draft.draftId,
     activeSidebarWorkspaceId,
@@ -232,7 +240,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // appHomeDir selector might still be null on the very first tick)
     // we'd otherwise hit `createHomeRootedWorkspace` and mint a
     // duplicate workspace.
+    //
+    // Skipped when `lockedToHome` is set — same rationale as the
+    // mount-time effect: explicit "New agent" clicks must materialise
+    // in the home directory regardless of sidebar context.
     if (
+      !currentDraft.lockedToHome &&
       currentDraft.target.kind === "home" &&
       activeSidebarWorkspaceId !== null &&
       activeSidebarProjectPath !== null &&

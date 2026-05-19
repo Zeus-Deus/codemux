@@ -75,9 +75,14 @@ export function BashToolBody({ item, input }: BodyProps) {
         </div>
       )}
       {exitCode !== null && exitCode !== 0 && (
+        // Per chat-ui skill: errors inside a tool result may use
+        // --danger on the label itself, but the surrounding block
+        // stays neutral. Drop the filled chip and keep just the
+        // monospace text so the marker reads as inline metadata,
+        // not a status billboard.
         <span
           aria-label={`Exit code ${exitCode}`}
-          className="inline-flex items-center gap-1 rounded bg-destructive/10 px-2 py-0.5 font-mono text-[10.5px] text-destructive"
+          className="font-mono text-[10.5px] text-destructive/80"
         >
           exit {exitCode}
         </span>
@@ -237,13 +242,17 @@ export function EditToolBody({ item, input }: BodyProps) {
         <div className="font-mono text-[11.5px] text-foreground">{path}</div>
       )}
       {stats && (
+        // Neutral inside the chat pane per the chat-ui skill: diffs
+        // here are status, not semantic colour. The +/− glyph alone
+        // carries the meaning; the dedicated diff viewer elsewhere
+        // in the app handles colour.
         <p className="text-[11px] text-muted-foreground/80">
           {stats.added > 0 && (
-            <span className="text-emerald-500">+{stats.added}</span>
+            <span className="text-foreground/80">+{stats.added}</span>
           )}
           {stats.added > 0 && stats.removed > 0 && " "}
           {stats.removed > 0 && (
-            <span className="text-destructive/80">−{stats.removed}</span>
+            <span className="text-muted-foreground">−{stats.removed}</span>
           )}
           {(stats.added > 0 || stats.removed > 0) && " line"}
           {stats.added + stats.removed === 1 ? "" : "s"}

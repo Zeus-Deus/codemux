@@ -105,7 +105,9 @@ describe("Composer Stage 7 polish", () => {
       const { getByTestId } = renderControlled();
       const wrapper = getByTestId("composer-wrapper");
       expect(wrapper.getAttribute("data-dragging")).toBeNull();
-      expect(wrapper.className).not.toContain("ring-primary");
+      // Drag affordance uses a neutral foreground-tinted ring per the
+      // chat-ui skill (no accent inside the conversation).
+      expect(wrapper.className).not.toContain("ring-foreground/40");
     });
 
     it("flips data-dragging on dragenter with Files payload", () => {
@@ -115,7 +117,7 @@ describe("Composer Stage 7 polish", () => {
         dataTransfer: { types: ["Files"], files: [] },
       });
       expect(wrapper.getAttribute("data-dragging")).toBe("true");
-      expect(wrapper.className).toContain("ring-primary");
+      expect(wrapper.className).toContain("ring-foreground/40");
     });
 
     it("clears the dragging state on a matching dragleave", () => {

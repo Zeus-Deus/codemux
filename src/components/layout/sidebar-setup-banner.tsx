@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from "react";
 import { X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { useAppStore } from "@/stores/app-store";
+import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { useUIStore } from "@/stores/ui-store";
 import {
@@ -14,6 +14,7 @@ import {
 
 export function SidebarSetupBanner() {
   const appState = useAppStore((s) => s.appState);
+  const homeDir = useHomeDir();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
   const [dismissed, setDismissed] = useState(true); // default hidden
@@ -26,7 +27,17 @@ export function SidebarSetupBanner() {
     );
   }, [appState]);
 
-  const projectRoot = activeWorkspace?.project_root ?? null;
+  // A home-rooted workspace (`project_root === $HOME`) is the
+  // materialise target for a sidebar "New agent" chat that the user
+  // intentionally kept in the home directory. It is NOT a project, so
+  // any UI keyed on "this is a project" should treat it as project-less.
+  // Mirrors the same `(project_root ?? cwd) !== homeDir` distinction
+  // used by `useEnsureDraftWhenEmpty`.
+  const rawProjectRoot = activeWorkspace?.project_root ?? null;
+  const projectRoot =
+    rawProjectRoot !== null && homeDir !== null && rawProjectRoot === homeDir
+      ? null
+      : rawProjectRoot;
   const projectName = projectRoot ? basename(projectRoot) || "project" : null;
 
   // Check if there are any workspaces for this project

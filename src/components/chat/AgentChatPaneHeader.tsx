@@ -184,34 +184,40 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
         )}
       </div>
+      {/* Match the muted-at-rest / lift-on-hover dialect the rest of
+          the app's pane headers landed in c11a3fc + e96619e: 28px hit
+          target, 14px glyph, drop close to destructive-foreground when
+          its red hover bg kicks in. */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
         <Button
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
+          className="text-muted-foreground hover:text-foreground"
           onClick={() => handleSplit("horizontal")}
           aria-label="Split right"
           title="Split right"
         >
-          <SplitSquareHorizontal className="h-3 w-3" />
+          <SplitSquareHorizontal className="h-3.5 w-3.5" />
         </Button>
         <Button
           variant="ghost"
-          size="icon-xs"
+          size="icon-sm"
+          className="text-muted-foreground hover:text-foreground"
           onClick={() => handleSplit("vertical")}
           aria-label="Split down"
           title="Split down"
         >
-          <SplitSquareVertical className="h-3 w-3" />
+          <SplitSquareVertical className="h-3.5 w-3.5" />
         </Button>
         <Button
           variant="ghost"
-          size="icon-xs"
-          className="hover:bg-destructive/80"
+          size="icon-sm"
+          className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground"
           onClick={handleClose}
           aria-label="Close pane"
           title="Close pane"
         >
-          <X className="h-3 w-3" />
+          <X className="h-3.5 w-3.5" />
         </Button>
       </div>
     </header>
