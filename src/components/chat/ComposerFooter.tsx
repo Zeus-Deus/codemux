@@ -1,4 +1,4 @@
-import { ArrowUp, Monitor, Plus, Square } from "lucide-react";
+import { ArrowUp, Plus, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
@@ -158,12 +158,16 @@ export function ComposerFooter({
           onChange={onPermissionModeChange}
           disabled={controlsDisabled || modeIsActive}
         />
-        {/* Chat-on-remote is honest about its current capability:
-            the picker is here so the visual layout matches the
-            new-workspace dialog (Device pill alongside the other
-            session controls), but it's pinned to Local Device until
-            agent-chat-on-remote ships. Tooltip explains why. */}
-        <ChatDeviceLocalOnlyIndicator />
+        {/* Host (Local / Remote) is a *workspace* property, not a
+            chat-session property: pushing a workspace to a remote
+            via right-click ships every pane it contains together —
+            terminals, browsers, and the chat pane. A pill in this
+            row would sit next to per-session controls (model,
+            effort, permission) and teach the wrong mental model.
+            When agent-chat-on-remote ships, the natural place for
+            the DevicePicker is `DraftChatSurface`'s zone1Override
+            (alongside the project + worktree pickers) — that's where
+            "where will this materialize" decisions already live. */}
       </div>
       <div className="ml-auto">
         {streaming && showStopButton ? (
@@ -200,43 +204,3 @@ export function ComposerFooter({
   );
 }
 
-/**
- * Pinned "Local Device" indicator for the chat composer.
- *
- * Mirrors the visual shape of the new-workspace dialog's
- * `<DevicePicker>` pill (Monitor icon + label) so the chat surface
- * looks consistent with the workspace creation surface. The picker
- * is intentionally NOT interactive yet — chat-on-remote has open
- * design questions (session migration semantics, where the chat
- * sidecar runs, token streaming latency over SSH) that we haven't
- * answered. Shipping a working picker without answering them would
- * confuse the first user who picked a remote host and watched their
- * chat session NOT move.
- *
- * Tooltip explains the current state. When agent-chat-on-remote
- * ships, replace this with the real `<DevicePicker>` from
- * `@/components/hosts/device-picker`.
- */
-function ChatDeviceLocalOnlyIndicator() {
-  return (
-    <span
-      className={cn(
-        // Mirror the compound-picker pill silhouette (codemux-ui skill)
-        // so this read-only indicator visually belongs next to the
-        // model / reasoning / permission triggers instead of looking
-        // like a bordered input.
-        "inline-flex items-center gap-1.5 rounded-full bg-muted/60",
-        "px-2.5 py-1 text-xs text-muted-foreground",
-        "cursor-help select-none",
-      )}
-      title={
-        "Agent Chat sessions currently run locally regardless of " +
-        "workspace host. Remote agent chat is on the roadmap."
-      }
-      aria-label="Chat runs locally"
-    >
-      <Monitor className="h-3 w-3 shrink-0" />
-      <span>Local</span>
-    </span>
-  );
-}
