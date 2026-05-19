@@ -14,7 +14,7 @@
 | **2c** | Binary | New `[[bin]] codemux-remote` target. Slim CLI with `version` + `pty-daemon --socket` subcommands. Reuses `codemux_lib::pty_daemon::server::run` — same wire protocol as the in-app daemon. |
 | **2d** | SSH transport | `ssh::probe`, `ssh::bootstrap`, `ssh::tunnel` modules. Real `hosts_test_connection` (replaces the 2a stub). `hosts_bootstrap_install` Tauri command + consent modal in the Hosts pane. |
 
-What is **not** in 2d (deferred to a follow-up): the "Push workspace to host" action that actually rsyncs the worktree, spawns the tunnel, and reattaches the UI to the remote daemon. The plumbing for that exists now — `TunnelHandle::local_socket()` returns a path the existing `PtyDaemonClient::connect(&path)` dials unchanged — but wiring it into the workspace push/pull UX is its own UX surface.
+The "Push workspace to host" action that was originally deferred from 2d has since landed (`8c72b44`). The push flow rsyncs the worktree to the host, spawns the remote daemon, attaches the local UI through the SSH-forwarded socket, and synchronizes the **Claude conversation** across local/remote ends. New transport-side modules: `ssh::push`, `ssh::registry`, `ssh::tunnel_supervisor`.
 
 ## DevicePicker (2b)
 
@@ -143,24 +143,25 @@ The pane built in 2a now uses the real probe + bootstrap:
 
 All 22 new tests pass alongside the prior suite (1382 lib tests, 1721 frontend tests, no regressions; one pre-existing env-related lib failure unrelated to this change).
 
-## Follow-ups (not in 2b–2d)
+## Follow-ups (remaining after the push action landed)
 
 | | |
 |---|---|
 | Chat new-session DevicePicker wiring | Drop `<DevicePicker>` into the chat composer's entry surface. ~30 min. |
 | Workspace header badge | Subtle host name pill in workspace title for non-local workspaces. ~1 hour. |
 | Workspace list filter | "This device / All / per-host" dropdown matching superset's `V2WorkspacesHeader`. ~2 hours. |
-| "Push workspace to host" action | rsync + tunnel spawn + reattach UI. The transport is wired; this is the UX flow that strings it together. ~1 day. |
 | "Pull workspace back" action | Reverse of push. ~half day. |
 | Release skill update | Cross-compile + bundling for the four `codemux-remote` targets. Concrete diff in the release pipeline. ~half day. |
-| Auto-reconnect on tunnel drop | Currently the tunnel handle exits when SSH dies. A supervisor that auto-reconnects with backoff (1s→30s, watchdog) is the next layer up. Matches the pattern superset uses in `tunnel-client.ts`. |
+| Tunnel auto-reconnect polish | `ssh::tunnel_supervisor` is in place; tune the backoff (1s→30s, watchdog) and surface the reconnect state in the UI. |
+
+Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c72b44`) — rsync the worktree, spawn the remote daemon, attach the local UI through the SSH-forwarded socket, and synchronize the Claude conversation across local/remote ends.
 
 ## Important Touch Points
 
 - `src-tauri/src/state/state_impl.rs` — `WorkspaceSnapshot.host_id`, `set_workspace_host_id`.
 - `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`.
 - `src-tauri/src/bin/codemux_remote.rs` — slim binary entry point.
-- `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` — SSH transport.
+- `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor landed after 2d).
 - `src/components/hosts/device-picker.tsx` — shared pill component.
 - `src/components/overlays/new-workspace-dialog.tsx` — DevicePicker wired into bottom bar.
 - `src/components/settings/hosts-section.tsx` — uses real probe + bootstrap modal.

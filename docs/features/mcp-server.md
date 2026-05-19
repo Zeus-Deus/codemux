@@ -1,7 +1,7 @@
 # MCP Server
 
 - Purpose: Describe Codemux's two-sided MCP integration — Codemux as an
-  MCP **server** (exposing 29 control-plane tools to external agents)
+  MCP **server** (exposing 44 control-plane tools to external agents)
   AND as an MCP **host** (running user-installed MCP servers and
   forwarding their tools into agent-chat sessions).
 - Audience: Anyone working on agent integration, MCP tooling, or
@@ -17,8 +17,9 @@
 Codemux occupies both sides of the Model Context Protocol:
 
 1. **MCP server** (original role) — Codemux runs `codemux mcp`, a
-   JSON-RPC 2.0 server over stdio that exposes 29 tools (browser,
-   workspace, pane, git, notification) so external agents can drive
+   JSON-RPC 2.0 server over stdio that exposes 44 tools (browser,
+   workspace, pane, git, notification, terminal, app status, ports,
+   worktree create, presets, issues) so external agents can drive
    Codemux programmatically.
 2. **MCP host / client** (Step 9) — Codemux's agent-chat runtime
    discovers user-installed MCP servers from every supported
@@ -59,7 +60,13 @@ implementations as the Tauri command layer and CLI. Git tools shell out
 to `git` in the workspace directory. The workspace is resolved from
 `CODEMUX_WORKSPACE_ID` env var.
 
-### Tools (29)
+### Tools (44)
+
+The Phase 1 / 1.5 / 1.6 vexis-agent integration tools (terminal,
+workspace lifecycle, ports, worktree, presets, issues) are now
+checked into the registry. The test guard at
+`mcp_server.rs:1609` pins the count — bump it whenever a tool is
+added or removed.
 
 | Category | Count | Tools |
 |---|---|---|
@@ -67,10 +74,15 @@ to `git` in the workspace directory. The workspace is resolved from
 | Browser — Tier 2: CDP/Vision-based | 5 | `browser_click_at`, `browser_type_at`, `browser_scroll_at`, `browser_key_press`, `browser_drag` |
 | Browser — Tier 3: OS-level Input | 2 | `browser_click_os`, `browser_type_os` |
 | Browser — Info & Evaluation | 3 | `browser_get_styles`, `browser_wait`, `browser_evaluate` |
-| Workspace | 3 | `workspace_list`, `workspace_info`, `workspace_create` |
-| Pane | 3 | `pane_list`, `pane_split_right`, `pane_split_down` |
+| Browser — Viewport | 2 | `browser_viewport`, `browser_viewport_presets` |
+| Workspace | 4 | `workspace_list`, `workspace_info`, `workspace_create`, `workspace_open` (Phase 1), `workspace_close` (Phase 1.6) |
+| Pane | 4 | `pane_list`, `pane_split_right`, `pane_split_down`, `pane_close` (Phase 1.6) |
 | Notification | 1 | `notify` |
 | Git | 5 | `git_status`, `git_diff`, `git_stage`, `git_commit`, `git_push` |
+| Terminal | 2 | `terminal_write`, `terminal_read` (Phase 1) |
+| App / runtime | 2 | `app_status`, `port_list` (Phase 1) |
+| Worktree / presets | 3 | `worktree_create`, `preset_apply`, `preset_list` (Phase 1.5) |
+| Issues | 3 | `issue_list`, `issue_get`, `issue_link_workspace` (Phase 1.6) |
 
 ## Host side: cross-provider MCP runtime (Step 9)
 
@@ -125,7 +137,7 @@ parses the union, discovering servers users have configured anywhere.
 | `~/.cursor/mcp.json` | `CursorUser` | Cursor's format = Anthropic's |
 | `<project>/.cursor/mcp.json` | `CursorProject` |  |
 
-Codemux's own MCP server (the 29-tool one above) is **always-on**: a
+Codemux's own MCP server (the 44-tool one above) is **always-on**: a
 hardcoded entry in `codemux_self_config()` that's pinned to the top of
 the registry and not user-toggleable.
 
@@ -212,7 +224,7 @@ approval-store code; the prefix IS the discriminator.
 Settings → Editor & Workflow → MCP Servers.
 
 - **Codemux row**: pinned to top, "always on" badge, no toggle, shows
-  "Running, 29 tools" once primed.
+  "Running, 44 tools" once primed.
 - **User MCP rows**: grouped by source (`Claude · User`, `Cursor · User`,
   `Codemux · User`, etc.) with inline `Switch` toggles, live status
   badges, and "View tools" hover-reveal that opens
@@ -240,7 +252,7 @@ Settings, so toggling from either place is consistent. A bottom row
 ## What Works Today
 
 - Cross-provider MCP server runtime (Claude-side) — Stage 1–6 of Step 9.
-- Codemux's own MCP server with 29 tools (the original role, unchanged).
+- Codemux's own MCP server with 44 tools (the original role, expanded through the Phase 1 / 1.5 / 1.6 vexis-agent integration steps).
 - Discovery from Codemux / Claude / Cursor config paths with dedupe.
 - Lazy spawn on first chat session start (or Settings panel mount,
   whichever first), bounded await so chat-start isn't slowed by a
@@ -285,7 +297,7 @@ Settings, so toggling from either place is consistent. A bottom row
 
 ### Server side (original role)
 
-- `src-tauri/src/mcp_server.rs` — JSON-RPC server, 29-tool registry,
+- `src-tauri/src/mcp_server.rs` — JSON-RPC server, 44-tool registry,
   `upsert_mcp_config` config writer
 - `src-tauri/src/cli.rs` — `codemux mcp` CLI entry point
 - `src-tauri/src/agent_browser.rs` — DOM snapshot script used by
