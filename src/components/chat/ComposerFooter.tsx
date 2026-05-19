@@ -221,8 +221,12 @@ function ChatDeviceLocalOnlyIndicator() {
   return (
     <span
       className={cn(
-        "inline-flex h-7 items-center gap-1.5 rounded-md border border-border",
-        "bg-background px-2 text-xs text-foreground/60",
+        // Mirror the compound-picker pill silhouette (codemux-ui skill)
+        // so this read-only indicator visually belongs next to the
+        // model / reasoning / permission triggers instead of looking
+        // like a bordered input.
+        "inline-flex items-center gap-1.5 rounded-full bg-muted/60",
+        "px-2.5 py-1 text-xs text-muted-foreground",
         "cursor-help select-none",
       )}
       title={
@@ -231,7 +235,7 @@ function ChatDeviceLocalOnlyIndicator() {
       }
       aria-label="Chat runs locally"
     >
-      <Monitor className="size-3.5 shrink-0" />
+      <Monitor className="h-3 w-3 shrink-0" />
       <span>Local</span>
     </span>
   );

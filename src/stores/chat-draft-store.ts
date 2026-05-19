@@ -64,6 +64,20 @@ export interface ChatDraft {
   /** Last materialise-and-send error, surfaced as an inline retry
    *  affordance on the composer. Cleared on next successful send. */
   lastSendError: string | null;
+  /** When `true`, this draft was created by an explicit user action
+   *  (clicking the sidebar "New agent" button) and should NOT be
+   *  auto-redirected to the active project workspace by the mount-
+   *  time seed effect or the submit-time salvage in `DraftChatSurface`.
+   *
+   *  The auto-redirect exists to help the *implicit* empty-state
+   *  path (`useEnsureDraftWhenEmpty`) — it mirrors the sidebar context
+   *  so a fresh empty workspace lands on something useful. But for
+   *  explicit "New agent" clicks the tooltip promises "New chat in
+   *  home directory", so the redirect would lie to the user.
+   *
+   *  Optional + defaults to `false` so older persisted drafts
+   *  deserialize unchanged. */
+  lockedToHome?: boolean;
 }
 
 export interface ChatDraftStore {
@@ -74,7 +88,13 @@ export interface ChatDraftStore {
   activeDraftId: DraftId | null;
 
   // Slot lookup / creation
-  getOrCreateHomeDraft: () => ChatDraft;
+  /** Look up the singleton home draft, or create one. When called
+   *  with `{ lockedToHome: true }` (explicit "New agent" click from
+   *  the sidebar), any existing pristine home draft is discarded
+   *  and a freshly-flagged one returned — reusing a draft created
+   *  by the implicit empty-state path would let the auto-redirect
+   *  effect have already kicked in. */
+  getOrCreateHomeDraft: (opts?: { lockedToHome?: boolean }) => ChatDraft;
   getOrCreateProjectDraft: (projectPath: string) => ChatDraft;
 
   // Active-draft selection
@@ -166,7 +186,10 @@ function isReusableDraft(draft: ChatDraft | undefined): draft is ChatDraft {
   );
 }
 
-function makeDraft(target: DraftTarget): ChatDraft {
+function makeDraft(
+  target: DraftTarget,
+  opts: { lockedToHome?: boolean } = {},
+): ChatDraft {
   const provider: AgentChatProviderKind = "claude";
   // Fully-configure the draft from the capabilities store: default
   // model + its `default_effort` + its default context-window option
@@ -193,6 +216,7 @@ function makeDraft(target: DraftTarget): ChatDraft {
     materializedTo: null,
     promoting: false,
     lastSendError: null,
+    lockedToHome: opts.lockedToHome ?? false,
   };
 }
 
@@ -280,20 +304,27 @@ export const useChatDraftStore = create<ChatDraftStore>()(
       projectDraftIdByPath: {},
       activeDraftId: null,
 
-      getOrCreateHomeDraft: () => {
+      getOrCreateHomeDraft: (opts = {}) => {
         const state = get();
         const existingId = state.activeHomeDraftId;
         if (existingId) {
           const existing = state.draftsById[existingId];
-          // Reuse only when the draft is still pristine: never sent,
-          // never partially materialised, not stuck mid-flight.
-          // Anything else is "spent" — clicking + means the user wants
-          // a fresh chat, and reusing a stuck draft would render a
-          // permanently-greyed composer (Send disabled iff
-          // `draft.promoting`).
-          if (isReusableDraft(existing)) return existing;
+          // Reuse only when the draft is still pristine AND the
+          // requested `lockedToHome` flag matches the existing draft's
+          // flag. Mismatch → fall through to a fresh draft. This is
+          // why explicit "New agent" clicks always land on a clean
+          // home composer: the existing implicit home draft (if any)
+          // may have already been auto-seeded to an existing
+          // workspace by `DraftChatSurface`'s mount effect, and
+          // returning it would defeat the point of the explicit click.
+          if (
+            isReusableDraft(existing) &&
+            !!existing.lockedToHome === !!opts.lockedToHome
+          ) {
+            return existing;
+          }
         }
-        const draft = makeDraft({ kind: "home" });
+        const draft = makeDraft({ kind: "home" }, opts);
         set({
           draftsById: { ...state.draftsById, [draft.draftId]: draft },
           activeHomeDraftId: draft.draftId,

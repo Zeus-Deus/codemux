@@ -71,6 +71,42 @@ describe("chat-draft-store", () => {
       const second = useChatDraftStore.getState().getOrCreateHomeDraft();
       expect(second.draftId).not.toBe(first.draftId);
     });
+
+    it("defaults to `lockedToHome: false` for implicit (empty-state) calls", () => {
+      const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+      expect(draft.lockedToHome).toBe(false);
+    });
+
+    it("propagates `lockedToHome: true` for explicit New-agent calls", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(draft.lockedToHome).toBe(true);
+    });
+
+    it("does NOT reuse an implicit pristine draft when an explicit lockedToHome draft is requested", () => {
+      // The implicit empty-state path may have already minted a home
+      // draft whose target the mount-effect auto-seeded to an existing
+      // workspace. Reusing it for an explicit "New agent" click would
+      // defeat the lockedToHome promise — make sure a fresh draft is
+      // minted instead.
+      const implicit = useChatDraftStore.getState().getOrCreateHomeDraft();
+      const explicit = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(explicit.draftId).not.toBe(implicit.draftId);
+      expect(explicit.lockedToHome).toBe(true);
+    });
+
+    it("does reuse a pristine lockedToHome draft on repeated explicit clicks", () => {
+      const first = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      const second = useChatDraftStore
+        .getState()
+        .getOrCreateHomeDraft({ lockedToHome: true });
+      expect(second.draftId).toBe(first.draftId);
+    });
   });
 
   describe("getOrCreateProjectDraft", () => {

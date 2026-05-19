@@ -58,12 +58,16 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
         <ToolCallBlock content={null} text={inputText} />
       )}
       {!denying ? (
+        // Allow is the primary affirmative path, so promote it to the
+        // overlay-button token (bg-foreground text-background) — same
+        // pattern PlanProposalBlock's "Accept & execute" uses. Keeps
+        // the approval hierarchy obvious without reaching for accent
+        // colour inside the conversation.
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
-            variant="outline"
             size="sm"
-            className="h-7 px-3 text-xs"
+            className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
             onClick={allow}
           >
             Allow
@@ -73,18 +77,18 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             variant="outline"
             size="sm"
             className="h-7 px-3 text-xs"
-            onClick={() => setDenying(true)}
-          >
-            Deny
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            className="h-7 px-3 text-xs"
             onClick={allowSession}
           >
             Allow for session
+          </Button>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
+            onClick={() => setDenying(true)}
+          >
+            Deny
           </Button>
         </div>
       ) : (
@@ -96,27 +100,31 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
             className="w-full resize-none rounded-md bg-background px-2 py-1.5 text-xs text-foreground outline-none ring-1 ring-border focus:ring-muted-foreground/60"
             rows={2}
           />
+          {/* Confirm-deny is the sole sanctioned use of --danger in
+              the conversation per the chat-ui skill (destructive
+              confirmations via variant=destructive). Cancel drops to
+              ghost so the primary intent reads at a glance. */}
           <div className="flex items-center gap-2">
             <Button
               type="button"
-              variant="outline"
+              variant="destructive"
               size="sm"
               className="h-7 px-3 text-xs"
+              onClick={confirmDeny}
+            >
+              Confirm deny
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 px-3 text-xs text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setDenying(false);
                 setReason("");
               }}
             >
               Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              className="h-7 px-3 text-xs"
-              onClick={confirmDeny}
-            >
-              Confirm deny
             </Button>
           </div>
         </div>
