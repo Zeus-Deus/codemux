@@ -105,15 +105,15 @@ describe("SidebarSetupBanner", () => {
     // A "New agent" chat that materialises in the home dir creates a
     // workspace whose project_root IS the home dir. The setup-scripts
     // affordance is project-specific, so the banner must not render.
-    // Without the homeDir guard, the banner would treat /home/zeus as a
-    // project literally named "zeus".
-    mockHomeDir = "/home/zeus";
+    // Without the homeDir guard, the banner would treat $HOME as a
+    // project literally named after the user's home folder.
+    mockHomeDir = "/home/user";
     mockAppState = {
       active_workspace_id: "ws-home",
       workspaces: [
         {
           workspace_id: "ws-home",
-          project_root: "/home/zeus",
+          project_root: "/home/user",
           worktree_path: null,
         },
       ],

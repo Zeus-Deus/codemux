@@ -225,19 +225,21 @@ describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
     const workspaces = [
       makeWs({
         workspace_id: "ws-home",
-        cwd: "/home/zeus",
-        project_root: "/home/zeus",
+        cwd: "/home/user",
+        project_root: "/home/user",
       }),
       makeWs({
         workspace_id: "ws-proj",
-        cwd: "/home/zeus/projects/myapp",
-        project_root: "/home/zeus/projects/myapp",
+        cwd: "/home/user/projects/myapp",
+        project_root: "/home/user/projects/myapp",
       }),
     ];
 
     const groups = groupWorkspacesByProject(workspaces, null);
     const names = groups.map((g) => g.projectName).sort();
-    expect(names).toEqual(["myapp", "zeus"]);
+    // path-basename grouping derives "user" from the basename of
+    // "/home/user" — kept generic so this fixture stays portable.
+    expect(names).toEqual(["myapp", "user"]);
     // No "Home" group is produced when homeDir is unknown.
     expect(names).not.toContain("Home");
   });
@@ -246,20 +248,20 @@ describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
     const workspaces = [
       makeWs({
         workspace_id: "ws-home",
-        cwd: "/home/zeus",
-        project_root: "/home/zeus",
+        cwd: "/home/user",
+        project_root: "/home/user",
       }),
       makeWs({
         workspace_id: "ws-proj",
-        cwd: "/home/zeus/projects/myapp",
-        project_root: "/home/zeus/projects/myapp",
+        cwd: "/home/user/projects/myapp",
+        project_root: "/home/user/projects/myapp",
       }),
     ];
 
-    const groups = groupWorkspacesByProject(workspaces, "/home/zeus");
+    const groups = groupWorkspacesByProject(workspaces, "/home/user");
     const byName = new Map(groups.map((g) => [g.projectName, g]));
     expect(byName.has("Home")).toBe(true);
-    expect(byName.get("Home")!.projectPath).toBe("/home/zeus");
+    expect(byName.get("Home")!.projectPath).toBe("/home/user");
     expect(byName.get("Home")!.workspaces.map((w) => w.workspace_id)).toEqual([
       "ws-home",
     ]);
@@ -270,7 +272,7 @@ describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
   });
 
   it("returns an empty array for no workspaces, regardless of homeDir", () => {
-    expect(groupWorkspacesByProject([], "/home/zeus")).toEqual([]);
+    expect(groupWorkspacesByProject([], "/home/user")).toEqual([]);
     expect(groupWorkspacesByProject([], null)).toEqual([]);
   });
 
@@ -278,25 +280,25 @@ describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
     const workspaces = [
       makeWs({
         workspace_id: "ws-home-1",
-        cwd: "/home/zeus",
-        project_root: "/home/zeus",
+        cwd: "/home/user",
+        project_root: "/home/user",
         title: "Identity inquiry",
       }),
       makeWs({
         workspace_id: "ws-home-2",
-        cwd: "/home/zeus",
-        project_root: "/home/zeus",
+        cwd: "/home/user",
+        project_root: "/home/user",
         title: "Friendship inquiry",
       }),
       makeWs({
         workspace_id: "ws-home-3",
-        cwd: "/home/zeus",
-        project_root: "/home/zeus",
+        cwd: "/home/user",
+        project_root: "/home/user",
         title: "Dev env setup",
       }),
     ];
 
-    const groups = groupWorkspacesByProject(workspaces, "/home/zeus");
+    const groups = groupWorkspacesByProject(workspaces, "/home/user");
     expect(groups).toHaveLength(1);
     expect(groups[0].projectName).toBe("Home");
     expect(groups[0].workspaces.map((w) => w.workspace_id)).toEqual([
@@ -310,14 +312,14 @@ describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {
     const legacyHome = makeWs({
       workspace_id: "ws-legacy-home",
       workspace_type: "home",
-      cwd: "/home/zeus",
-      project_root: "/home/zeus",
+      cwd: "/home/user",
+      project_root: "/home/user",
     });
 
-    const groups = groupWorkspacesByProject([legacyHome], "/home/zeus");
+    const groups = groupWorkspacesByProject([legacyHome], "/home/user");
     expect(groups).toHaveLength(1);
     expect(groups[0].projectName).toBe("Home");
-    expect(groups[0].projectPath).toBe("/home/zeus");
+    expect(groups[0].projectPath).toBe("/home/user");
   });
 });
 
@@ -325,8 +327,8 @@ describe("useAppStore.setHomeDir", () => {
   it("writes and reads back the home dir", () => {
     useAppStore.setState({ homeDir: null });
     expect(useAppStore.getState().homeDir).toBeNull();
-    useAppStore.getState().setHomeDir("/home/zeus");
-    expect(useAppStore.getState().homeDir).toBe("/home/zeus");
+    useAppStore.getState().setHomeDir("/home/user");
+    expect(useAppStore.getState().homeDir).toBe("/home/user");
     // Reset so later test files don't inherit the value.
     useAppStore.setState({ homeDir: null });
   });

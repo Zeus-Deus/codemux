@@ -502,9 +502,9 @@ export function effectivePermissionMode(draft: ChatDraft): string {
  *  the time a user presses Enter.
  *
  *  The rename is best-effort: a failure here leaves the workspace
- *  with its default path-basename title (`"zeus"` on my box) rather
- *  than aborting the whole send. Matches the locked "no rollback on
- *  post-create failure" policy. */
+ *  with its default path-basename title (i.e. the basename of `$HOME`)
+ *  rather than aborting the whole send. Matches the locked "no
+ *  rollback on post-create failure" policy. */
 async function createHomeRootedWorkspace(firstMessage: string): Promise<string> {
   const homeDir = useAppStore.getState().homeDir;
   if (!homeDir) {

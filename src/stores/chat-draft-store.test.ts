@@ -260,7 +260,7 @@ describe("chat-draft-store", () => {
       const projectDraft = store.getOrCreateProjectDraft("/p");
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/p", "/home/zeus");
+        .clearDraftsForProject("/p", "/home/user");
       const state = useChatDraftStore.getState();
       expect(state.draftsById[projectDraft.draftId]).toBeUndefined();
       expect(state.draftsById[homeDraft.draftId]).toBeDefined();
@@ -278,7 +278,7 @@ describe("chat-draft-store", () => {
 
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/home/zeus", "/home/zeus");
+        .clearDraftsForProject("/home/user", "/home/user");
 
       const state = useChatDraftStore.getState();
       expect(state.draftsById[homeDraft.draftId]).toBeUndefined();
@@ -293,7 +293,7 @@ describe("chat-draft-store", () => {
       const homeDraft = store.getOrCreateHomeDraft();
       useChatDraftStore
         .getState()
-        .clearDraftsForProject("/home/zeus", null);
+        .clearDraftsForProject("/home/user", null);
       expect(
         useChatDraftStore.getState().draftsById[homeDraft.draftId],
       ).toBeDefined();
