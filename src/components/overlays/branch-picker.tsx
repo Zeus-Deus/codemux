@@ -57,6 +57,15 @@ interface BranchPickerProps {
   branchWorkspaceMap?: Map<string, string>;
   prBranches?: Set<string>;
   currentBranch?: string | null;
+  /**
+   * The repo's actual default branch (from `origin/HEAD`). Used to drive
+   * the "default" badge and Fork/Open primary-action heuristics. When
+   * omitted or `null` (caller hasn't resolved it yet, or doesn't pass it
+   * — e.g. project-onboarding), we fall back to the legacy
+   * `main`/`master` heuristic so the badge still renders for the common
+   * case.
+   */
+  defaultBranchName?: string | null;
   onOpenWorkspace?: (workspaceId: string) => void;
   onImportWorktree?: (path: string, branch: string) => void;
   onCreateOnCurrent?: () => void;
@@ -73,12 +82,22 @@ export function BranchPicker({
   branchWorkspaceMap = EMPTY_BRANCH_MAP,
   prBranches = EMPTY_PR_SET,
   currentBranch = null,
+  defaultBranchName = null,
   onOpenWorkspace,
   onImportWorktree,
   onCreateOnCurrent,
   onOpenExisting,
   isOpenMode,
 }: BranchPickerProps) {
+  // Centralized "is this the repo's default branch?" check. Prefers the
+  // caller-provided detected default (read from `origin/HEAD`) and falls
+  // back to the legacy hardcoded names when no detected value is
+  // available — keeps the badge/Fork-action useful for callers that
+  // haven't been wired up to `useDefaultBranch` yet.
+  const isDefaultBranch = (name: string): boolean => {
+    if (defaultBranchName) return name === defaultBranchName;
+    return name === "main" || name === "master";
+  };
   const [open, setOpen] = useState(false);
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
   const [search, setSearch] = useState("");
@@ -157,8 +176,8 @@ export function BranchPicker({
       return;
     }
 
-    // Default branch (main/master) — fork is the primary action
-    const isDefault = branch.name === "main" || branch.name === "master";
+    // Default branch — fork is the primary action
+    const isDefault = isDefaultBranch(branch.name);
     if (isDefault) {
       onSelectBase(branch.name);
       setOpen(false);
@@ -176,7 +195,7 @@ export function BranchPicker({
     branch: BranchDetail,
   ) => {
     e.stopPropagation();
-    const isDefault = branch.name === "main" || branch.name === "master";
+    const isDefault = isDefaultBranch(branch.name);
     const hasWorkspace = branchWorkspaceMap.has(branch.name);
     const hasWt = !!findWorktree(branch.name);
     // "Open" is only valid when the branch has no worktree yet
@@ -283,9 +302,7 @@ export function BranchPicker({
                       const hasOpenWorkspace = !!wsId;
                       const hasWorktree = !!wt;
                       const hasPr = prBranches.has(branch.name);
-                      const isDefault =
-                        branch.name === "main" ||
-                        branch.name === "master";
+                      const isDefault = isDefaultBranch(branch.name);
 
                       // Determine action labels based on branch state
                       const hasAnyWorktree = hasOpenWorkspace || hasWorktree;

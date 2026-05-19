@@ -1316,20 +1316,35 @@ pub fn git_init_repo(path: &Path) -> Result<String, String> {
 }
 
 pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, String> {
-    let output = if remote {
-        run_git(repo_path, &["branch", "-r", "--format=%(refname:short)"])?
-    } else {
-        run_git(repo_path, &["branch", "--format=%(refname:short)"])?
-    };
+    // We use `for-each-ref` with the FULL refname rather than `git branch
+    // --format=%(refname:short)`, because `:short` collapses
+    // `refs/remotes/<remote>/HEAD` to just `<remote>` (e.g. "origin",
+    // "upstream"). That ambiguous short form slips past any "contains HEAD"
+    // filter and surfaces in the picker as a phantom branch named after the
+    // remote — which then becomes the worktree directory name if selected.
+    // Filtering on the full refname's `/HEAD` suffix is unambiguous and
+    // works for every remote.
+    let pattern = if remote { "refs/remotes/" } else { "refs/heads/" };
+    let output = run_git(repo_path, &["for-each-ref", "--format=%(refname)", pattern])?;
     let branches: Vec<String> = output
         .lines()
         .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.contains("HEAD"))
+        .filter(|l| !l.is_empty() && !l.ends_with("/HEAD"))
         .map(|l| {
             if remote {
-                l.strip_prefix("origin/").unwrap_or(l).to_string()
+                // Strip `refs/remotes/origin/` for origin (preserves prior
+                // behavior of bare names), and `refs/remotes/` for any
+                // other remote (so e.g. `upstream/master` stays qualified
+                // and doesn't collide with origin's branches).
+                if let Some(rest) = l.strip_prefix("refs/remotes/origin/") {
+                    rest.to_string()
+                } else if let Some(rest) = l.strip_prefix("refs/remotes/") {
+                    rest.to_string()
+                } else {
+                    l.to_string()
+                }
             } else {
-                l.to_string()
+                l.strip_prefix("refs/heads/").unwrap_or(l).to_string()
             }
         })
         .collect();
@@ -1339,11 +1354,15 @@ pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, 
 pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>, String> {
     use std::collections::HashMap;
 
+    // Use full refnames so we can reliably detect and skip the
+    // `refs/remotes/origin/HEAD` symref. `%(refname:short)` collapses it to
+    // just `"origin"`, which silently leaks into the branch list and ends
+    // up as a worktree directory name if the user selects it.
     let output = run_git(
         repo_path,
         &[
             "for-each-ref",
-            "--format=%(refname:short)\t%(committerdate:unix)",
+            "--format=%(refname)\t%(committerdate:unix)",
             "refs/heads/",
             "refs/remotes/origin/",
         ],
@@ -1357,23 +1376,27 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
             continue;
         }
 
-        let (raw_name, timestamp_str) = match line.split_once('\t') {
+        let (refname, timestamp_str) = match line.split_once('\t') {
             Some(pair) => pair,
             None => continue,
         };
 
-        // Determine if local or remote ref
-        let is_remote = raw_name.starts_with("origin/");
-        let name = if is_remote {
-            raw_name.strip_prefix("origin/").unwrap_or(raw_name)
-        } else {
-            raw_name
-        };
-
-        // Skip HEAD pointers
-        if name.contains("HEAD") {
+        // Skip any `<remote>/HEAD` symref — they alias another branch and
+        // would otherwise dedupe-collide on an empty/short name.
+        if refname.ends_with("/HEAD") {
             continue;
         }
+
+        // Classify as local or remote and strip the namespace prefix.
+        let (name, is_remote) = if let Some(rest) = refname.strip_prefix("refs/heads/") {
+            (rest, false)
+        } else if let Some(rest) = refname.strip_prefix("refs/remotes/origin/") {
+            (rest, true)
+        } else {
+            // Anything outside refs/heads/ and refs/remotes/origin/ — the
+            // for-each-ref patterns shouldn't return these, but be defensive.
+            continue;
+        };
 
         let timestamp: i64 = timestamp_str.trim().parse().unwrap_or(0);
 
@@ -2318,6 +2341,51 @@ C  source.txt -> copy.txt";
         let remote_only = branches.iter().find(|b| b.name == "remote-only").expect("remote-only present");
         assert!(!remote_only.is_local, "should not be local");
         assert!(remote_only.is_remote, "should be remote");
+    }
+
+    /// Regression: `git for-each-ref --format=%(refname:short)` and
+    /// `git branch -r --format=%(refname:short)` both collapse
+    /// `refs/remotes/origin/HEAD` to literally `"origin"` (the unambiguous
+    /// short form of the symref's target's namespace). The old
+    /// `!name.contains("HEAD")` filter let that through, so the New
+    /// Workspace branch picker showed a phantom "origin" branch — and
+    /// selecting it created a worktree directory named `origin/`. Make sure
+    /// the new full-refname filter on `/HEAD` suffix excludes it from both
+    /// branch listing functions.
+    #[test]
+    fn test_list_branches_skips_remote_head_symref() {
+        let (_dir, local, _remote) = setup_test_repo_with_remote();
+
+        // Establish origin/HEAD as a symref (mirrors what `git clone` would
+        // do for a real remote — our test scaffolding doesn't set it
+        // automatically because it inits a bare repo first).
+        run_git(&local, &["remote", "set-head", "origin", "--auto"])
+            .expect("set origin/HEAD");
+
+        // Sanity: the symref should now exist.
+        let head = run_git(&local, &["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .expect("origin/HEAD exists");
+        assert!(
+            head.trim().starts_with("refs/remotes/origin/"),
+            "origin/HEAD should be a symref, got {head:?}"
+        );
+
+        // git_list_branches (remote=true) must not include "origin".
+        let remote_branches =
+            git_list_branches(&local, true).expect("list remote branches");
+        assert!(
+            !remote_branches.iter().any(|b| b == "origin"),
+            "remote branch list should not include phantom 'origin' entry, got {remote_branches:?}"
+        );
+
+        // git_list_branches_detailed must not include a branch named "origin".
+        let detailed =
+            git_list_branches_detailed(&local).expect("list detailed");
+        assert!(
+            !detailed.iter().any(|b| b.name == "origin"),
+            "detailed branch list should not include phantom 'origin' entry, got {:?}",
+            detailed.iter().map(|b| &b.name).collect::<Vec<_>>()
+        );
     }
 
     #[test]

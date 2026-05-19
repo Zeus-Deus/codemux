@@ -70,6 +70,12 @@ vi.mock("@/tauri/commands", () => ({
   // calls setWorkspaceHost when a non-local host is chosen.
   hostsList: vi.fn().mockResolvedValue([]),
   setWorkspaceHost: vi.fn().mockResolvedValue(undefined),
+  // Added when the dialog started seeding `baseBranch` from
+  // `useDefaultBranch(projectDir)`. The hook calls `getDefaultBranch`
+  // unconditionally on every project change — without a mock here, the
+  // module-level promise rejects with the Tauri `invoke` bridge being
+  // undefined under jsdom and crashes every dialog test.
+  getDefaultBranch: vi.fn().mockResolvedValue("main"),
 }));
 
 import {
@@ -82,7 +88,12 @@ import {
   generateBranchName,
   generateRandomBranchName,
   pasteClipboardImageToFile,
+  getDefaultBranch,
 } from "@/tauri/commands";
+import {
+  _defaultBranchCache,
+  _defaultBranchInFlight,
+} from "@/components/layout/default-branch-cache";
 
 // ── Helpers ──
 
@@ -163,6 +174,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   (checkIsGitRepo as Mock).mockResolvedValue(true);
   (listBranches as Mock).mockResolvedValue([]);
+  // useDefaultBranch keeps a module-level cache so the same project_root
+  // only fetches once per session. Clear it between tests so a previous
+  // case's resolved value doesn't pre-populate the next dialog and
+  // short-circuit the auto-adoption effect we want to exercise.
+  _defaultBranchCache.clear();
+  _defaultBranchInFlight.clear();
   useUIStore.setState({
     newWorkspaceProjectDir: null,
     pendingWorkspaces: [],
@@ -574,6 +591,90 @@ describe("Default base branch", () => {
     const branchPicker = within(dialog).getByText("main");
     expect(branchPicker).toBeInTheDocument();
     expect(within(dialog).queryByText("feature-pr-branch")).not.toBeInTheDocument();
+  });
+
+  // Regression: the user reported that opening the dialog on a repo whose
+  // default branch is `master` (not `main`) still showed `main` in the pill
+  // and then errored out on create. The fix is to seed `baseBranch` from
+  // `useDefaultBranch(projectDir)` instead of hardcoding "main". This test
+  // verifies the pill adopts whatever the backend detection returns.
+  it("seeds the base-branch pill from getDefaultBranch (master, not hardcoded main)", async () => {
+    setAppState("/path/to/project");
+    (getDefaultBranch as Mock).mockResolvedValue("master");
+
+    renderDialog(true);
+
+    // Wait for the async useDefaultBranch fetch to resolve and the effect
+    // to swap "main" → "master" on the pill.
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => {
+      expect(within(dialog).getByText("master")).toBeInTheDocument();
+    });
+    // And the placeholder "main" should be gone — otherwise the effect
+    // didn't actually run and the pill is just showing both somehow.
+    expect(within(dialog).queryByText("main")).not.toBeInTheDocument();
+  });
+
+  // Regression: same fix for any default branch name. Repos can have
+  // arbitrary defaults (e.g. `develop`, `trunk`). The hook returns
+  // whatever `git symbolic-ref refs/remotes/origin/HEAD` resolves to;
+  // the dialog must adopt it verbatim.
+  it("seeds the base-branch pill from getDefaultBranch (arbitrary name)", async () => {
+    setAppState("/path/to/project");
+    (getDefaultBranch as Mock).mockResolvedValue("develop");
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => {
+      expect(within(dialog).getByText("develop")).toBeInTheDocument();
+    });
+  });
+
+  // Regression: the detected default must not override an explicit user
+  // pick. If the user clicks the pill and picks `feature-x`, then the
+  // useDefaultBranch fetch resolves later, the picker should NOT clobber
+  // their pick back to the detected default.
+  it("does not override the pill once the user has manually picked a branch", async () => {
+    setAppState("/path/to/project");
+    // Make getDefaultBranch resolve slowly so we can pick first
+    let resolveDefault!: (v: string) => void;
+    (getDefaultBranch as Mock).mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveDefault = resolve;
+      }),
+    );
+    (listBranches as Mock).mockResolvedValue(["main", "master", "feature-x"]);
+    // Also seed the detailed list so the BranchPicker popover has options
+    const { listBranchesDetailed } = await import("@/tauri/commands");
+    (listBranchesDetailed as Mock).mockResolvedValue([
+      { name: "main", last_commit_unix: 1, is_local: true, is_remote: true },
+      { name: "master", last_commit_unix: 2, is_local: true, is_remote: true },
+      { name: "feature-x", last_commit_unix: 3, is_local: true, is_remote: false },
+    ]);
+
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+
+    // Open the pill and pick `feature-x`
+    const pillButton = within(dialog).getByText("main").closest("button")!;
+    fireEvent.click(pillButton);
+    const featureRow = await screen.findByText("feature-x");
+    fireEvent.click(featureRow);
+
+    // Confirm the pill switched to feature-x
+    await waitFor(() => {
+      expect(within(dialog).getByText("feature-x")).toBeInTheDocument();
+    });
+
+    // NOW let the detected default resolve. It must NOT clobber the user's pick.
+    resolveDefault("master");
+    // Give React a tick to settle any pending effects.
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(within(dialog).getByText("feature-x")).toBeInTheDocument();
+    expect(within(dialog).queryByText("master")).not.toBeInTheDocument();
   });
 });
 
