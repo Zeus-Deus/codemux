@@ -11,6 +11,9 @@ use std::path::Path;
 
 #[tauri::command]
 pub async fn check_is_git_repo(path: String) -> bool {
+    // Expand a leading `~` — the New Project / project-picker paths can be
+    // typed by hand, and `is_git_repo` does no shell-style expansion.
+    let path = crate::project::expand_tilde(&path);
     tokio::task::spawn_blocking(move || crate::git::is_git_repo(Path::new(&path)))
         .await
         .unwrap_or(false)
@@ -18,6 +21,7 @@ pub async fn check_is_git_repo(path: String) -> bool {
 
 #[tauri::command]
 pub async fn init_git_repo(path: String) -> Result<String, String> {
+    let path = crate::project::expand_tilde(&path);
     tokio::task::spawn_blocking(move || crate::git::git_init_repo(Path::new(&path)))
         .await
         .map_err(|e| format!("init_git_repo task join failed: {e}"))?
@@ -25,6 +29,12 @@ pub async fn init_git_repo(path: String) -> Result<String, String> {
 
 #[tauri::command]
 pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
+    // The New Project screen lets the user *type* the location (placeholder
+    // `~/Projects`). A literal `~` is never expanded by the filesystem, so
+    // without this `create_dir_all` would make a phantom directory named `~`
+    // under the process cwd and the workspace would store a broken `~/...`
+    // path that no terminal can `chdir` into.
+    let parent_dir = crate::project::expand_tilde(&parent_dir);
     tokio::task::spawn_blocking(move || {
         let repo_path = Path::new(&parent_dir).join(&name);
         std::fs::create_dir_all(&repo_path)
@@ -451,6 +461,11 @@ pub async fn resolve_conflicts_with_agent(
 #[tauri::command]
 pub async fn git_clone_repo(url: String, target_dir: String) -> Result<String, String> {
     use std::time::Duration;
+
+    // The clone target is built from a hand-typed location in the New Project
+    // screen; a literal `~` would clone into a phantom `~` directory under the
+    // process cwd. Expand it so the repo lands where the user expects.
+    let target_dir = crate::project::expand_tilde(&target_dir);
 
     let result = tokio::time::timeout(
         Duration::from_secs(120),
