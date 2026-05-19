@@ -38,6 +38,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
+import { useDefaultBranch } from "@/components/layout/default-branch-cache";
 import {
   listBranches,
   listBranchesDetailed,
@@ -126,6 +127,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     lastSelectedAgentId || "builtin-claude",
   );
   const [baseBranch, setBaseBranch] = useState("main");
+  // True once the user has manually picked a branch from the BranchPicker,
+  // so the `useDefaultBranch` effect below knows not to clobber their
+  // choice when the async detection resolves (or the user re-opens the
+  // dialog on the same project). Reset whenever the dialog is reopened or
+  // the project changes — see the open/projectDir effect below.
+  const userPickedBaseRef = useRef(false);
   const [attachments, setAttachments] = useState<string[]>([]);
   const [linkedIssue, setLinkedIssue] = useState<GitHubIssue | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = useState(false);
@@ -166,6 +173,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setPrompt("");
     setSelectedAgentId(lastSelectedAgentId || "builtin-claude");
     setBaseBranch("main");
+    // Re-allow auto-adoption of the detected default branch on each open.
+    userPickedBaseRef.current = false;
     setAttachments([]);
     setLinkedIssue(null);
     setIssuePickerOpen(false);
@@ -175,6 +184,34 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setHostId(null);
   }
   prevOpenRef.current = open;
+
+  // Resolve the repo's actual default branch (reads `origin/HEAD`, falls
+  // back to main/master existence). Returns `null` until the async fetch
+  // resolves and on detection failure; we keep "main" as the placeholder
+  // for that window so the pill still has something to render.
+  const detectedDefaultBranch = useDefaultBranch(projectDir || null);
+
+  // Adopt the detected default whenever it resolves for the current
+  // project, unless the user has explicitly picked a different branch
+  // from the picker. This fixes the "popup always says main even though
+  // the repo's default is master" UX bug, and prevents the create call
+  // from failing on repos whose default branch isn't named main.
+  useEffect(() => {
+    if (!open) return;
+    if (userPickedBaseRef.current) return;
+    if (!detectedDefaultBranch) return;
+    setBaseBranch(detectedDefaultBranch);
+  }, [open, detectedDefaultBranch]);
+
+  // Switching projects mid-dialog should re-arm auto-adoption so the new
+  // project's default branch wins over a stale pick from the previous
+  // project. Tracked separately from the open-reset above because
+  // projectDir can change without the dialog closing/reopening.
+  const prevProjectDirRef = useRef(projectDir);
+  if (prevProjectDirRef.current !== projectDir) {
+    userPickedBaseRef.current = false;
+    prevProjectDirRef.current = projectDir;
+  }
 
   // Load data when dialog opens or project changes
   useEffect(() => {
@@ -964,8 +1001,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               branchWorkspaceMap={branchWorkspaceMap}
               prBranches={prBranches}
               currentBranch={currentBranch}
+              defaultBranchName={detectedDefaultBranch}
               loading={branchesLoading}
               onSelectBase={(branch) => {
+                userPickedBaseRef.current = true;
                 setBaseBranch(branch);
                 setBranchMode("create_new");
                 setOpenExistingBranch(null);
