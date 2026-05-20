@@ -27,16 +27,22 @@ is a **registry only** (no cloud scheduler); each host runs its own
 
 ## Status
 
-Landed on this branch: the **Prerequisite refactor**, **Phase A**
-(reconciler), **Phase C** (`automations_sync`), **Phase D** (host
-routing + `codemux-remote scheduler` subcommand), and the testable part
-of **Phase E** (`automations::service` unit generators). All verified —
-43 automation unit tests, `cargo check` / `tsc` / `vitest` green.
+**Phases A–E are done.** Landed on this branch and verified:
 
-Still open: **Phase B** (the API server endpoints — a separate repo, not
-deployable from this branch); the **Phase E bootstrap wiring** (token
-provisioning + service registration, which needs Phase B's token
-endpoint and a real host); and **Phase F** (workspace lifecycle).
+- Prerequisite refactor, Phase A (reconciler), Phase C
+  (`automations_sync`), Phase D (host routing + `codemux-remote
+  scheduler`), Phase E (`automations::service` + the
+  `provision_scheduler` bootstrap wiring).
+- **Phase B is deployed to production** — `/api/automations` GET / POST
+  / PATCH / DELETE (+ `?hostServerId=` filter) on `api.codemux.org`,
+  backed by the `codemux_automations` table. 16 server tests; verified
+  end-to-end against the live API (signup → token → automation CRUD).
+- 43 Rust unit tests + 16 server tests; `cargo check` / `tsc` /
+  `vitest` green.
+
+Still open: **Phase F** (workspace lifecycle). One hardening note: the
+host scheduler currently uses a copy of the desktop's account token; a
+per-host scoped token would be a better blast-radius limit.
 
 ## Prerequisite refactor — de-couple the executor from Tauri
 

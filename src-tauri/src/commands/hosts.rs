@@ -248,13 +248,47 @@ pub async fn hosts_bootstrap_install(
         )
         .await;
         Ok(match outcome {
-            BootstrapResult::Installed { reported_version } => HostBootstrapResult {
-                ok: true,
-                message: format!(
-                    "codemux-remote v{reported_version} installed on {}",
-                    host.name
-                ),
-            },
+            BootstrapResult::Installed { reported_version } => {
+                // Best-effort: also provision the automation scheduler
+                // so the host can run automations. A failure here does
+                // NOT fail the install — push-workspace works without
+                // it, and not every host runs systemd. Skipped silently
+                // when the user is signed out or the host has not yet
+                // synced (no server id to identify it by).
+                let scheduler_note = match (
+                    crate::auth::load_token(&db).map(|(token, _)| token),
+                    host.server_id.clone(),
+                ) {
+                    (Some(token), Some(server_id)) => {
+                        match crate::ssh::bootstrap::provision_scheduler(
+                            &host.ssh_target,
+                            "~/.local/bin/codemux-remote",
+                            &token,
+                            &server_id,
+                            std::time::Duration::from_secs(30),
+                        )
+                        .await
+                        {
+                            Ok(()) => " · automation scheduler enabled".to_string(),
+                            Err(error) => {
+                                eprintln!(
+                                    "[codemux::hosts] scheduler provisioning failed: {error}"
+                                );
+                                " · (automation scheduler not enabled — see logs)"
+                                    .to_string()
+                            }
+                        }
+                    }
+                    _ => String::new(),
+                };
+                HostBootstrapResult {
+                    ok: true,
+                    message: format!(
+                        "codemux-remote v{reported_version} installed on {}{scheduler_note}",
+                        host.name
+                    ),
+                }
+            }
             BootstrapResult::BinaryNotBundled { wanted_target } => {
                 HostBootstrapResult {
                     ok: false,

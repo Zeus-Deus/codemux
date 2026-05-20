@@ -32,24 +32,19 @@ The host scheduler owns the agent session, so `succeeded`/`failed` are real term
 
 ## Active Priorities
 
-The feature works end-to-end on the local machine, and the Phase 2
-client work (sync, host routing, the remote scheduler, the reconciler)
-has landed — see *Already Landed*. What remains:
+Phase 2 (account sync + remote-host execution) is **done and deployed** —
+the `/api/automations` endpoints are live on `api.codemux.org`, the
+desktop syncs against them, and host bootstrap provisions the remote
+scheduler. See `docs/plans/automations-sync.md`. What remains:
 
-1. **API server endpoints.** `automations` / `automation_runs` tables
-   and `/api/automations*` REST endpoints, plus the per-host
-   scheduler-token endpoint, on the API server (separate repo). The
-   desktop sync client is finished and degrades gracefully (`404` =
-   skip) until these deploy.
-2. **Host bootstrap wiring.** `hosts_bootstrap_install` writes the
-   scheduler token and registers the `codemux-remote scheduler` service
-   (`automations::service` generates the units). Needs item 1 for the
-   token endpoint.
-3. **Workspace lifecycle.** `workspace_sync_from_host` (non-destructive
+1. **Workspace lifecycle.** `workspace_sync_from_host` (non-destructive
    mirror), an `automation_id` column on workspaces, and a
    `workspace_pull_back` guard for automation workspaces — Phase F in
    `docs/plans/automations-sync.md`.
-4. **Polish.** A one-shot `automation_run` MCP tool; the
+2. **Scoped scheduler tokens.** The host scheduler currently uses a copy
+   of the desktop's account token; a per-host scoped token would limit
+   blast radius if a host is compromised.
+3. **Polish.** A one-shot `automation_run` MCP tool; the
    `retention_limit` worktree prune; run completion/failure piped into
    the notification system (`docs/features/notifications.md`); a
    dedicated automation workspace icon.

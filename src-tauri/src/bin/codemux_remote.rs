@@ -177,6 +177,17 @@ async fn scheduler_loop() -> ExitCode {
              automations already in the local database"
         );
     }
+    // This host's own server id, written by the laptop's bootstrap.
+    // It scopes the account pull so this host only receives — and only
+    // runs — the automations routed to it.
+    let host_id = read_scheduler_host();
+    if token.is_some() && host_id.is_none() {
+        eprintln!(
+            "[codemux-remote] no host identity found; the account pull \
+             cannot be host-scoped — skipping it to avoid running other \
+             hosts' automations"
+        );
+    }
     eprintln!("[codemux-remote] automation scheduler started");
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
@@ -187,10 +198,14 @@ async fn scheduler_loop() -> ExitCode {
     loop {
         ticker.tick().await;
 
-        // Pull this host's automations from the account. A 404 (API
-        // not deployed yet) is treated as a harmless skip inside `pull`.
-        if let Some(token) = &token {
-            if let Err(error) = codemux_lib::automations_sync::pull(token, &db).await {
+        // Pull this host's automations from the account, scoped to
+        // this host's id. Only runs when both the token and the host
+        // identity are present — an unscoped pull would deliver other
+        // hosts' automations and run them here.
+        if let (Some(token), Some(host_id)) = (&token, &host_id) {
+            if let Err(error) =
+                codemux_lib::automations_sync::pull(token, &db, Some(host_id)).await
+            {
                 eprintln!("[codemux-remote] automation pull failed: {error}");
             }
         }
@@ -208,15 +223,27 @@ async fn scheduler_loop() -> ExitCode {
     }
 }
 
-/// Read the per-host scheduler token the laptop's bootstrap writes to
+/// Read the scheduler token the laptop's bootstrap writes to
 /// `~/.local/share/codemux/scheduler-token`. `None` when absent.
 #[cfg(unix)]
 fn read_scheduler_token() -> Option<String> {
-    let path = dirs::data_dir()?.join("codemux").join("scheduler-token");
+    read_scheduler_file("scheduler-token")
+}
+
+/// Read this host's own server id, written by bootstrap to
+/// `~/.local/share/codemux/scheduler-host`. `None` when absent.
+#[cfg(unix)]
+fn read_scheduler_host() -> Option<String> {
+    read_scheduler_file("scheduler-host")
+}
+
+#[cfg(unix)]
+fn read_scheduler_file(name: &str) -> Option<String> {
+    let path = dirs::data_dir()?.join("codemux").join(name);
     std::fs::read_to_string(path)
         .ok()
         .map(|contents| contents.trim().to_string())
-        .filter(|token| !token.is_empty())
+        .filter(|value| !value.is_empty())
 }
 
 // The pre-existing `#[cfg(not(unix))] fn run_daemon` stub used

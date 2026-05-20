@@ -89,36 +89,30 @@ layers still to come.
   startup (desktop and `codemux-remote`), so a crashed run can never
   pin its automation in `skipped_busy`.
 - **Account sync** — `automations_sync` pulls/pushes the automation
-  registry through the Codemux API (`/api/automations`), mirroring
-  `hosts_sync`: a fire-and-forget sync after every mutation, a startup
-  pull, and a pull on every scheduler tick. Host targeting crosses the
-  wire as the host's `server_id`. A `404` is treated as a harmless skip
-  so the client works before the endpoints are deployed.
+  registry through the Codemux API's live `/api/automations` endpoints,
+  mirroring `hosts_sync`: a fire-and-forget sync after every mutation, a
+  startup pull, and a pull on every scheduler tick. Host targeting
+  crosses the wire as the host's `server_id`; the remote scheduler pulls
+  host-scoped (`?hostServerId=`).
 - **Host routing** — `scheduler::tick` takes a `local_only` switch: the
   desktop runs only automations targeting this machine (`host_id IS
   NULL`); a `codemux-remote scheduler` runs the rest.
 - **`codemux-remote scheduler`** — a subcommand on the remote binary
   that runs the same reconcile + pull + tick + execute loop on an
-  always-on host.
-- **Persistent-service units** — `automations::service` generates the
-  systemd unit / launchd plist that keeps the remote scheduler alive
-  across reboots.
-- Unit coverage — 43 tests across the recurrence engine, scheduler
-  decision logic + tick loop + host routing, the fire executor, account
-  sync (mockito), the reconciler, the service-unit generators, and
-  database CRUD / dedup / run lifecycle.
+  always-on host. Host bootstrap provisions it: it writes the scheduler
+  token + host identity and registers a systemd user service (via
+  `automations::service`) with lingering, so it survives reboots.
+- Unit coverage — 43 Rust tests (recurrence, scheduler decision + tick +
+  host routing, the fire executor, account sync, the reconciler, the
+  service-unit generators, database CRUD / dedup / run lifecycle), plus
+  16 server tests for the `/api/automations` endpoints.
 
 ## Current Constraints
 
-- **The `/api/automations` endpoints are not deployed.** The sync
-  client is complete and degrades gracefully (`404` = skip), but until
-  the server side ships (separate API repo) the registry stays local to
-  one install and remote hosts receive no automations.
-- **The remote scheduler is not yet auto-installed.** The
-  `codemux-remote scheduler` subcommand and its service units exist,
-  but host bootstrap does not yet write the scheduler token or register
-  the service — that wiring waits on the API (it needs the token
-  endpoint). See `docs/plans/automations-sync.md` Phase E.
+- **Scheduler tokens are full account tokens.** The host bootstrap
+  copies the desktop's auth token to the host so its scheduler can call
+  the API. A per-host scoped token would limit blast radius if a host
+  is compromised — a future hardening.
 - **No run-now.** A one-shot `automation_run` tool is still deferred.
 - **No workspace lifecycle.** `workspace_sync_from_host` and the
   automation-workspace pull-back guard (`docs/plans/automations-sync.md`

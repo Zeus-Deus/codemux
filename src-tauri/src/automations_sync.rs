@@ -100,7 +100,7 @@ pub async fn try_sync_with_app(app: &tauri::AppHandle) -> Result<(), String> {
         None => return Ok(()),
     };
     let db_ref: &DatabaseStore = &db;
-    let pull_err = pull(&token, db_ref).await.err();
+    let pull_err = pull(&token, db_ref, None).await.err();
     let push_err = push(&token, db_ref).await.err();
     match (pull_err, push_err) {
         (None, None) => Ok(()),
@@ -122,11 +122,24 @@ fn valid_token(db: &DatabaseStore) -> Option<String> {
 /// Pull server automations into the local DB. Idempotent. A local row
 /// whose `server_id` is missing from the response was deleted on
 /// another device and is tombstoned locally.
-pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
+///
+/// `host_filter` scopes the pull to one host's automations (by host
+/// `server_id`): the desktop passes `None` and pulls the whole
+/// registry; a `codemux-remote scheduler` passes its own host id so it
+/// only receives — and therefore only runs — automations routed to it.
+pub async fn pull(
+    token: &str,
+    db: &DatabaseStore,
+    host_filter: Option<&str>,
+) -> Result<(), String> {
     let base = api_base_url();
     let client = reqwest::Client::new();
+    let mut url = format!("{base}/api/automations");
+    if let Some(host) = host_filter {
+        url.push_str(&format!("?hostServerId={}", urlencoding::encode(host)));
+    }
     let resp = client
-        .get(format!("{base}/api/automations"))
+        .get(&url)
         .header("Authorization", format!("Bearer {token}"))
         .send()
         .await
@@ -336,7 +349,7 @@ pub async fn sync_automations(token: &str, db: &DatabaseStore) -> Result<(), Str
         return Ok(());
     }
     let result = async {
-        pull(token, db).await?;
+        pull(token, db, None).await?;
         push(token, db).await?;
         Ok(())
     }
@@ -386,7 +399,7 @@ mod tests {
             .await;
 
         let db = init_test_database();
-        pull("token", &db).await.unwrap();
+        pull("token", &db, None).await.unwrap();
         mock.assert_async().await;
 
         let rows = db.list_automations();
@@ -408,7 +421,7 @@ mod tests {
             .create_async()
             .await;
         let db = init_test_database();
-        assert!(pull("token", &db).await.is_ok());
+        assert!(pull("token", &db, None).await.is_ok());
         std::env::remove_var("CODEMUX_API_URL");
     }
 
