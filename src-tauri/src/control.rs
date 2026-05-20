@@ -1265,6 +1265,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             )
             .map_err(|error| format!("Invalid automation input: {error}"))?;
             let view = crate::commands::automations::create_automation_impl(&db, input)?;
+            crate::commands::automations::schedule_automations_sync(app.clone());
             serde_json::to_value(view).map_err(|error| error.to_string())
         })(),
         "automation_update" => (|| -> Result<Value, String> {
@@ -1279,6 +1280,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             )
             .map_err(|error| format!("Invalid automation input: {error}"))?;
             let view = crate::commands::automations::update_automation_impl(&db, id, input)?;
+            crate::commands::automations::schedule_automations_sync(app.clone());
             serde_json::to_value(view).map_err(|error| error.to_string())
         })(),
         "automation_set_enabled" => (|| -> Result<Value, String> {
@@ -1295,6 +1297,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .ok_or("automation_set_enabled requires a boolean `enabled`")?;
             let view =
                 crate::commands::automations::set_automation_enabled_impl(&db, id, enabled)?;
+            crate::commands::automations::schedule_automations_sync(app.clone());
             serde_json::to_value(view).map_err(|error| error.to_string())
         })(),
         "automation_delete" => (|| -> Result<Value, String> {
@@ -1305,6 +1308,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .and_then(Value::as_i64)
                 .ok_or("automation_delete requires an integer `id`")?;
             crate::commands::automations::delete_automation_impl(&db, id)?;
+            crate::commands::automations::schedule_automations_sync(app.clone());
             Ok(serde_json::json!({ "deleted": id }))
         })(),
         "automation_runs" => (|| -> Result<Value, String> {

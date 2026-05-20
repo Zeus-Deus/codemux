@@ -39,6 +39,12 @@ layers still to come.
   an isolated git worktree, runs the agent headlessly with the prompt,
   and writes the terminal status back. The desktop scheduler task spawns
   one executor per fire.
+- **Sync** — `automations_sync` replicates the registry through the
+  Codemux API, the same dirty-flag / tombstone model as `hosts_sync`.
+  Only `automations` syncs; `automation_runs` stay per-device.
+- **Remote execution** — `codemux-remote scheduler` runs the identical
+  reconcile + tick + executor loop on an always-on host; host routing
+  keeps each scheduler to its own automations.
 - **Run history** — one `automation_runs` row per fire. The
   `UNIQUE(automation_id, scheduled_for)` constraint makes a re-delivered
   tick idempotent. Status flows `scheduled → running → succeeded |
@@ -78,31 +84,45 @@ layers still to come.
   `automation_delete`, `automation_pause`, `automation_resume`,
   `automation_runs`), each routed through the control socket to the same
   shared `commands::automations::*_impl` helpers the desktop uses.
-- Unit coverage — 35 tests across the recurrence engine, scheduler
-  decision logic + tick loop, the fire executor (agent-command mapping,
-  branch slugging, worktree creation against a real temp repo), and
+- **Stuck-run reconciler** — `reconcile_stale_runs` fails any run left
+  `running`/`scheduled` by a crash or quit; it runs at scheduler
+  startup (desktop and `codemux-remote`), so a crashed run can never
+  pin its automation in `skipped_busy`.
+- **Account sync** — `automations_sync` pulls/pushes the automation
+  registry through the Codemux API (`/api/automations`), mirroring
+  `hosts_sync`: a fire-and-forget sync after every mutation, a startup
+  pull, and a pull on every scheduler tick. Host targeting crosses the
+  wire as the host's `server_id`. A `404` is treated as a harmless skip
+  so the client works before the endpoints are deployed.
+- **Host routing** — `scheduler::tick` takes a `local_only` switch: the
+  desktop runs only automations targeting this machine (`host_id IS
+  NULL`); a `codemux-remote scheduler` runs the rest.
+- **`codemux-remote scheduler`** — a subcommand on the remote binary
+  that runs the same reconcile + pull + tick + execute loop on an
+  always-on host.
+- **Persistent-service units** — `automations::service` generates the
+  systemd unit / launchd plist that keeps the remote scheduler alive
+  across reboots.
+- Unit coverage — 43 tests across the recurrence engine, scheduler
+  decision logic + tick loop + host routing, the fire executor, account
+  sync (mockito), the reconciler, the service-unit generators, and
   database CRUD / dedup / run lifecycle.
 
 ## Current Constraints
 
-- **Host targeting is not yet routed.** The desktop scheduler executes
-  every fired automation locally regardless of `host_id`. Honouring a
-  remote `host_id` needs account sync + the `codemux-remote scheduler`
-  subcommand (below).
-- **No stuck-run reconciler.** If the app quits mid-run, that run stays
-  `running` and the overlap guard keeps the automation `skipped_busy`
-  until the row is cleared. A reconciler is tracked in the plan.
-- **No account sync yet.** Automations carry the `dirty` flag but
-  `automations_sync` and the `/api/automations` endpoints do not exist,
-  so the list is local to one install.
-- **Desktop-only scheduler.** The minute tick runs inside the desktop
-  app. The `codemux-remote scheduler` subcommand for always-on hosts is
-  not built — it is blocked on account sync (a remote host's database
-  has no automations until sync delivers them).
-- **No run-now.** A one-shot `automation_run` tool is deferred until a
-  fire can dispatch real work.
-- **`host_id` is unvalidated.** It is stored as a plain integer; nothing
-  yet checks the referenced host exists or is reachable.
+- **The `/api/automations` endpoints are not deployed.** The sync
+  client is complete and degrades gracefully (`404` = skip), but until
+  the server side ships (separate API repo) the registry stays local to
+  one install and remote hosts receive no automations.
+- **The remote scheduler is not yet auto-installed.** The
+  `codemux-remote scheduler` subcommand and its service units exist,
+  but host bootstrap does not yet write the scheduler token or register
+  the service — that wiring waits on the API (it needs the token
+  endpoint). See `docs/plans/automations-sync.md` Phase E.
+- **No run-now.** A one-shot `automation_run` tool is still deferred.
+- **No workspace lifecycle.** `workspace_sync_from_host` and the
+  automation-workspace pull-back guard (`docs/plans/automations-sync.md`
+  Phase F) are not built.
 
 ## Important Touch Points
 
@@ -114,12 +134,17 @@ layers still to come.
 - `src-tauri/src/automations/scheduler.rs` — `is_due` / `fire_key` /
   `tick`.
 - `src-tauri/src/automations/executor.rs` — worktree creation + agent
-  spawn for a fired run.
-- `src-tauri/src/commands/automations.rs` — shared `*_impl` helpers +
-  Tauri command wrappers.
+  spawn (`run_fire` / `apply_outcome`, Tauri-free; `execute_run` is the
+  desktop wrapper).
+- `src-tauri/src/automations/service.rs` — systemd / launchd unit
+  generation for the remote scheduler.
+- `src-tauri/src/automations_sync.rs` — account sync (pull / push).
+- `src-tauri/src/commands/automations.rs` — shared `*_impl` helpers,
+  Tauri command wrappers, `schedule_automations_sync`.
 - `src-tauri/src/control.rs` — `automation_*` control-socket handlers.
 - `src-tauri/src/mcp_server.rs` — the eight `automation_*` MCP tools.
-- `src-tauri/src/lib.rs` — the once-a-minute scheduler background task.
+- `src-tauri/src/bin/codemux_remote.rs` — the `scheduler` subcommand.
+- `src-tauri/src/lib.rs` — the once-a-minute desktop scheduler task.
 - `src/components/automations/automations-view.tsx` +
   `automations-section.tsx` — the full-screen Automations view.
 - `src/components/layout/sidebar-action-row.tsx` — the sidebar entry.

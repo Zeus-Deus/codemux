@@ -32,35 +32,27 @@ The host scheduler owns the agent session, so `succeeded`/`failed` are real term
 
 ## Active Priorities
 
-The feature works end-to-end on the local machine: define → schedule →
-tick → fire → worktree → agent run → terminal status → UI. Remaining
-work, in dependency order — items 1–5 are the "account sync + remote
-host" phase, broken down step-by-step in `docs/plans/automations-sync.md`:
+The feature works end-to-end on the local machine, and the Phase 2
+client work (sync, host routing, the remote scheduler, the reconciler)
+has landed — see *Already Landed*. What remains:
 
-1. **Stuck-run reconciler.** A run left `running` by an app quit keeps
-   its automation `skipped_busy` forever. Add a startup sweep that fails
-   runs whose `started_at` is older than a generous ceiling.
-2. **API schema + endpoints.** `automations` / `automation_runs` tables
-   on the API server; REST CRUD; per-host scoped-token issuance wired
-   into host bootstrap. Ownership checks (single-owner).
-3. **Account sync.** `automations_sync.rs` mirrored on `hosts_sync.rs`,
-   pushing the `dirty` rows the local schema already tracks. Background
-   sync after each mutation, like `commands::hosts`.
-4. **`codemux-remote scheduler` subcommand + host routing.** The same
-   `scheduler::tick` + `executor` as a persistent service on a remote
-   host; the desktop then runs only `host_id`-null automations and lets
-   the remote handle the rest. Blocked on account sync — a remote host
-   has no automations until sync delivers them.
-5. **Bootstrap changes.** `hosts_bootstrap_install` writes the scoped
-   token and registers the scheduler as a persistent service (systemd).
-6. **Workspace lifecycle commands.** New `workspace_sync_from_host`
-   (non-destructive mirror, reuses `ssh/push.rs` rsync helpers); an
-   `automation_id` column on workspaces; guard `workspace_pull_back` to
-   reject automation workspaces.
-7. **Polish.** A one-shot `automation_run` MCP tool; the
-   `retention_limit` worktree prune; wire run completion/failure into
-   the notification system (`docs/features/notifications.md`); dedicated
-   automation workspace icon; optional prompt version history.
+1. **API server endpoints.** `automations` / `automation_runs` tables
+   and `/api/automations*` REST endpoints, plus the per-host
+   scheduler-token endpoint, on the API server (separate repo). The
+   desktop sync client is finished and degrades gracefully (`404` =
+   skip) until these deploy.
+2. **Host bootstrap wiring.** `hosts_bootstrap_install` writes the
+   scheduler token and registers the `codemux-remote scheduler` service
+   (`automations::service` generates the units). Needs item 1 for the
+   token endpoint.
+3. **Workspace lifecycle.** `workspace_sync_from_host` (non-destructive
+   mirror), an `automation_id` column on workspaces, and a
+   `workspace_pull_back` guard for automation workspaces — Phase F in
+   `docs/plans/automations-sync.md`.
+4. **Polish.** A one-shot `automation_run` MCP tool; the
+   `retention_limit` worktree prune; run completion/failure piped into
+   the notification system (`docs/features/notifications.md`); a
+   dedicated automation workspace icon.
 
 ## Open Questions
 
@@ -112,11 +104,27 @@ Automations feature — local foundation, scheduler, and UI (this branch):
 - **Automations view** — a full-screen view opened from the left sidebar
   (under "New agent", above projects): create / edit / pause / resume /
   delete with a schedule builder and run-history view; a fire-event toast.
-- **Tests** — 35 unit tests (recurrence, scheduler decision + tick loop,
-  executor incl. worktree creation against a real temp repo, database
-  CRUD / dedup / run lifecycle) plus the existing frontend suite;
-  `cargo check` / `tsc` / `vitest` all green, apart from one pre-existing
-  unrelated `agent_browser` env test.
+- **Automations view** + sidebar entry (Phase 1).
+
+Phase 2 — account sync + remote-host execution (this branch):
+
+- **Stuck-run reconciler** — `reconcile_stale_runs`, run at every
+  scheduler startup.
+- **Account sync** — `automations_sync` (pull / push, host-identity
+  translation), wired into every mutation + the scheduler loop.
+- **Host routing** — `scheduler::tick`'s `local_only` switch.
+- **`codemux-remote scheduler`** — the remote-binary subcommand running
+  the reconcile + pull + tick + execute loop.
+- **Service units** — `automations::service` (systemd / launchd).
+- **Executor refactor** — `run_fire` / `apply_outcome` are Tauri-free so
+  the desktop and the remote share one code path.
+- **Tests** — 43 unit tests; `cargo check` / `tsc` / `vitest` all green,
+  apart from one pre-existing unrelated `agent_browser` env test.
+
+What is still open (see `docs/plans/automations-sync.md`): the
+`/api/automations` server endpoints (separate API repo); the host
+bootstrap writing a scheduler token + registering the service; and
+Phase F (workspace lifecycle).
 
 Pre-existing platform Automations builds on:
 

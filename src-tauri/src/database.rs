@@ -1128,6 +1128,167 @@ impl DatabaseStore {
         };
         rows.filter_map(|r| r.ok()).collect()
     }
+
+    /// Fail runs left in a non-terminal state by a crash or quit.
+    ///
+    /// A run is stale when it is still `scheduled` or `running` and its
+    /// `started_at` (or `created_at`, for a run that never started) is
+    /// older than `older_than` (an RFC 3339 timestamp). Without this a
+    /// crashed run would keep its automation permanently `skipped_busy`.
+    /// Returns the number of rows reconciled.
+    pub fn reconcile_stale_runs(&self, older_than: &str) -> usize {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automation_runs
+             SET status = 'failed',
+                 finished_at = datetime('now'),
+                 error = 'Run did not complete — process or app exited'
+             WHERE status IN ('scheduled', 'running')
+               AND COALESCE(started_at, created_at) < ?1",
+            params![older_than],
+        )
+        .unwrap_or(0)
+    }
+
+    // ── Automation account-sync helpers ──
+    //
+    // These mirror the `hosts` sync surface so `automations_sync` can
+    // be a near-copy of `hosts_sync`. Only the `automations` registry
+    // syncs; `automation_runs` are per-device history.
+
+    /// Every automation row for the local user, including soft-deleted
+    /// tombstones — the sync layer needs the tombstones to push.
+    pub fn list_automations_for_sync(&self) -> Vec<AutomationRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {AUTOMATION_COLUMNS} FROM automations WHERE user_id = 'local'"
+        )) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automations_for_sync prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_automation) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automations_for_sync query failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Automation rows with unpushed changes (`dirty = 1`).
+    pub fn list_dirty_automations(&self) -> Vec<AutomationRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {AUTOMATION_COLUMNS} FROM automations
+             WHERE user_id = 'local' AND dirty = 1"
+        )) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_dirty_automations prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_automation) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_dirty_automations query failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Clear `dirty` after a successful push; optionally stamp the
+    /// server-assigned id on the first upload.
+    pub fn mark_automation_synced(
+        &self,
+        id: i64,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(sid) = server_id {
+            conn.execute(
+                "UPDATE automations SET dirty = 0, server_id = ?1 WHERE id = ?2",
+                params![sid, id],
+            )
+        } else {
+            conn.execute("UPDATE automations SET dirty = 0 WHERE id = ?1", params![id])
+        }
+        .map_err(|e| format!("Failed to mark automation synced: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert a row received from the server, matched by `server_id`.
+    /// Always written `dirty = 0` (server rows are authoritative).
+    /// `next_run_at` / `last_run_at` are derived per-device and are not
+    /// carried over the wire, so a server upsert leaves them untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_automation_from_server(
+        &self,
+        server_id: &str,
+        name: &str,
+        prompt: &str,
+        agent: &str,
+        schedule: &str,
+        timezone: &str,
+        host_id: Option<i64>,
+        project_path: Option<&str>,
+        enabled: bool,
+        retention_limit: i64,
+        created_at: &str,
+        updated_at: &str,
+        deleted_at: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE automations
+                 SET name = ?1, prompt = ?2, agent = ?3, schedule = ?4,
+                     timezone = ?5, host_id = ?6, project_path = ?7,
+                     enabled = ?8, retention_limit = ?9, created_at = ?10,
+                     updated_at = ?11, deleted_at = ?12, dirty = 0
+                 WHERE user_id = 'local' AND server_id = ?13",
+                params![
+                    name, prompt, agent, schedule, timezone, host_id,
+                    project_path, enabled as i64, retention_limit,
+                    created_at, updated_at, deleted_at, server_id,
+                ],
+            )
+            .map_err(|e| format!("Failed to update automation from server: {e}"))?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO automations
+                    (user_id, server_id, name, prompt, agent, schedule,
+                     timezone, host_id, project_path, enabled,
+                     retention_limit, created_at, updated_at, deleted_at, dirty)
+                 VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ?11, ?12, ?13, 0)",
+                params![
+                    server_id, name, prompt, agent, schedule, timezone,
+                    host_id, project_path, enabled as i64, retention_limit,
+                    created_at, updated_at, deleted_at,
+                ],
+            )
+            .map_err(|e| format!("Failed to insert automation from server: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Hard-delete tombstones the server has confirmed removed. The
+    /// `automation_runs` FK cascade clears their history rows too.
+    pub fn purge_acknowledged_automation_deletes(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM automations WHERE deleted_at IS NOT NULL AND dirty = 0",
+            [],
+        )
+        .map_err(|e| format!("Failed to purge automation tombstones: {e}"))?;
+        Ok(())
+    }
 }
 
 fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRecord> {
@@ -3229,5 +3390,47 @@ mod tests {
                 "2026-01-01T09:00:00Z",
             ]
         );
+    }
+
+    #[test]
+    fn reconcile_stale_runs_fails_only_non_terminal_runs() {
+        let db = init_test_database();
+        let a = db.insert_automation(&sample_automation("Reconcile")).unwrap();
+        let scheduled = db
+            .record_automation_run(a.id, "scheduled", "2026-01-01T09:00:00Z", None, None)
+            .unwrap()
+            .unwrap();
+        let running = db
+            .record_automation_run(a.id, "running", "2026-01-01T10:00:00Z", None, None)
+            .unwrap()
+            .unwrap();
+        let done = db
+            .record_automation_run(a.id, "succeeded", "2026-01-01T11:00:00Z", None, None)
+            .unwrap()
+            .unwrap();
+
+        // A ceiling far in the future makes every run older than it.
+        let reconciled = db.reconcile_stale_runs("2999-01-01T00:00:00Z");
+        assert_eq!(reconciled, 2, "only the two non-terminal runs are stale");
+
+        let runs = db.list_automation_runs(a.id, 10);
+        let status = |id: i64| {
+            runs.iter().find(|r| r.id == id).unwrap().status.clone()
+        };
+        assert_eq!(status(scheduled.id), "failed");
+        assert_eq!(status(running.id), "failed");
+        assert_eq!(status(done.id), "succeeded", "terminal runs are untouched");
+    }
+
+    #[test]
+    fn reconcile_stale_runs_leaves_recent_runs_alone() {
+        let db = init_test_database();
+        let a = db.insert_automation(&sample_automation("Recent")).unwrap();
+        db.record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
+            .unwrap();
+        // A ceiling in the distant past — the run's created_at (now) is
+        // newer, so nothing is stale.
+        assert_eq!(db.reconcile_stale_runs("2000-01-01T00:00:00Z"), 0);
+        assert_eq!(db.list_automation_runs(a.id, 10)[0].status, "running");
     }
 }

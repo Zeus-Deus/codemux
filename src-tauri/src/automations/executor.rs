@@ -112,6 +112,14 @@ pub fn prepare_worktree(
     Ok(())
 }
 
+/// Terminal outcome of executing a fire — written to the run row by
+/// whichever scheduler owns the run.
+pub struct FireOutcome {
+    pub status: &'static str,
+    pub workspace_id: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Run a short DB operation without holding the Tauri `State` borrow
 /// across an await point.
 fn with_db<R>(handle: &AppHandle, f: impl FnOnce(&DatabaseStore) -> R) -> R {
@@ -119,7 +127,43 @@ fn with_db<R>(handle: &AppHandle, f: impl FnOnce(&DatabaseStore) -> R) -> R {
     f(&db)
 }
 
-/// Execute one fired run end-to-end and record its terminal status.
+/// Execute a fire — create the worktree, run the agent — and return the
+/// terminal outcome. Tauri-free, so both the desktop scheduler task and
+/// the `codemux-remote scheduler` loop call the same code.
+pub async fn run_fire(automation: &AutomationRecord) -> FireOutcome {
+    match run_inner(automation).await {
+        Ok(workdir) => FireOutcome {
+            status: "succeeded",
+            workspace_id: Some(workdir),
+            error: None,
+        },
+        Err((workdir, error)) => FireOutcome {
+            status: "failed",
+            workspace_id: workdir,
+            error: Some(error),
+        },
+    }
+}
+
+/// Write a [`FireOutcome`] to its run row. Shared by every scheduler.
+pub fn apply_outcome(db: &DatabaseStore, run_id: i64, outcome: &FireOutcome) {
+    if outcome.status == "failed" {
+        eprintln!(
+            "[codemux::automations] run {run_id} failed: {}",
+            outcome.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    let _ = db.finish_automation_run(
+        run_id,
+        outcome.status,
+        outcome.workspace_id.as_deref(),
+        outcome.error.as_deref(),
+    );
+}
+
+/// Desktop scheduler entry point: mark the run started, execute it, and
+/// record the outcome. The Tauri `State` borrow is re-acquired per DB
+/// touch via `with_db`, never held across the agent-process await.
 pub async fn execute_run(
     handle: AppHandle,
     automation: AutomationRecord,
@@ -128,30 +172,8 @@ pub async fn execute_run(
     with_db(&handle, |db| {
         let _ = db.mark_automation_run_started(run.id);
     });
-
-    match run_inner(&automation).await {
-        Ok(workdir) => {
-            with_db(&handle, |db| {
-                let _ = db.finish_automation_run(
-                    run.id,
-                    "succeeded",
-                    Some(workdir.as_str()),
-                    None,
-                );
-            });
-        }
-        Err((workdir, error)) => {
-            eprintln!("[codemux::automations] run {} failed: {error}", run.id);
-            with_db(&handle, |db| {
-                let _ = db.finish_automation_run(
-                    run.id,
-                    "failed",
-                    workdir.as_deref(),
-                    Some(error.as_str()),
-                );
-            });
-        }
-    }
+    let outcome = run_fire(&automation).await;
+    with_db(&handle, |db| apply_outcome(db, run.id, &outcome));
 }
 
 /// Fallible body of `execute_run`. On failure returns the workspace

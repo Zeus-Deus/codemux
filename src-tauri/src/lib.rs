@@ -14,6 +14,7 @@ pub mod agent_provider;
 pub mod ai;
 pub mod auth;
 pub mod automations;
+pub mod automations_sync;
 pub mod branch_name;
 pub mod json_rpc_child;
 pub mod mcp_server;
@@ -874,6 +875,28 @@ pub fn run() {
             // `codemux-remote scheduler` subcommand.
             let scheduler_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Recover runs orphaned by a previous crash or quit
+                // before the first tick — a run stuck `running` would
+                // otherwise keep its automation `skipped_busy` forever.
+                {
+                    let db: tauri::State<'_, database::DatabaseStore> =
+                        scheduler_handle.state();
+                    let ceiling = (chrono::Utc::now()
+                        - chrono::Duration::hours(6))
+                    .to_rfc3339();
+                    let reconciled = db.reconcile_stale_runs(&ceiling);
+                    if reconciled > 0 {
+                        eprintln!(
+                            "[codemux::scheduler] reconciled {reconciled} stale run(s)"
+                        );
+                    }
+                }
+                // Pull the automation registry from the account once at
+                // startup so this device sees automations created
+                // elsewhere.
+                commands::automations::schedule_automations_sync(
+                    scheduler_handle.clone(),
+                );
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
                     automations::scheduler::TICK_INTERVAL_SECS,
                 ));
@@ -883,6 +906,12 @@ pub fn run() {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
+                    // Pull registry changes from the user's other
+                    // devices on every tick so the local list stays
+                    // fresh; the in-progress guard collapses overlap.
+                    commands::automations::schedule_automations_sync(
+                        scheduler_handle.clone(),
+                    );
                     // Evaluate the schedule, then resolve each fired run
                     // to its automation. Both are short, synchronous DB
                     // touches scoped so the `State` borrow never crosses
@@ -893,7 +922,10 @@ pub fn run() {
                     )> = {
                         let db: tauri::State<'_, database::DatabaseStore> =
                             scheduler_handle.state();
-                        automations::scheduler::tick(&db, chrono::Utc::now())
+                        // `local_only = true`: the desktop runs only
+                        // automations targeting this machine; a
+                        // host-assigned automation is its host's job.
+                        automations::scheduler::tick(&db, chrono::Utc::now(), true)
                             .into_iter()
                             .filter_map(|run| {
                                 db.get_automation(run.automation_id)

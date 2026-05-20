@@ -18,3 +18,4 @@
 pub mod executor;
 pub mod recurrence;
 pub mod scheduler;
+pub mod service;

@@ -73,10 +73,22 @@ fn has_active_run(db: &DatabaseStore, automation_id: i64) -> bool {
 /// Returns the freshly-created `scheduled` runs — the caller (the
 /// executor) turns each into a workspace + agent. `skipped_busy` runs
 /// are recorded but not returned, as there is nothing to execute.
-pub fn tick(db: &DatabaseStore, now: DateTime<Utc>) -> Vec<AutomationRunRecord> {
+///
+/// `local_only` is the host-routing switch: the desktop scheduler
+/// passes `true` and runs only automations targeting this machine
+/// (`host_id IS NULL`) — a host-assigned automation is the job of that
+/// host's `codemux-remote scheduler`, which passes `false`.
+pub fn tick(
+    db: &DatabaseStore,
+    now: DateTime<Utc>,
+    local_only: bool,
+) -> Vec<AutomationRunRecord> {
     let mut fired = Vec::new();
 
     for automation in db.list_automations() {
+        if local_only && automation.host_id.is_some() {
+            continue;
+        }
         if !is_due(&automation, now) {
             continue;
         }
@@ -242,7 +254,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
         let a = insert_due(&db, Some("2026-01-02T09:00:00+00:00"));
 
-        let fired = tick(&db, now);
+        let fired = tick(&db, now, false);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].automation_id, a.id);
         assert_eq!(fired[0].status, "scheduled");
@@ -262,7 +274,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
         insert_due(&db, Some("2026-01-02T10:00:00+00:00"));
 
-        assert!(tick(&db, now).is_empty());
+        assert!(tick(&db, now, false).is_empty());
     }
 
     #[test]
@@ -271,10 +283,10 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
         let a = insert_due(&db, Some("2026-01-02T09:00:00+00:00"));
 
-        assert_eq!(tick(&db, now).len(), 1);
+        assert_eq!(tick(&db, now, false).len(), 1);
         // A second tick at the same instant: the schedule has advanced,
         // so nothing fires and no duplicate run is recorded.
-        assert!(tick(&db, now).is_empty());
+        assert!(tick(&db, now, false).is_empty());
         assert_eq!(db.list_automation_runs(a.id, 10).len(), 1);
     }
 
@@ -288,7 +300,7 @@ mod tests {
         db.record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
             .unwrap();
 
-        let fired = tick(&db, now);
+        let fired = tick(&db, now, false);
         // Overlap: nothing is handed to the executor...
         assert!(fired.is_empty());
         // ...but the skip is recorded for this minute.
@@ -303,7 +315,34 @@ mod tests {
         let a = insert_due(&db, Some("2026-01-02T09:00:00+00:00"));
         db.set_automation_enabled(a.id, false).unwrap();
 
-        assert!(tick(&db, now).is_empty());
+        assert!(tick(&db, now, false).is_empty());
         assert_eq!(db.list_automation_runs(a.id, 10).len(), 0);
+    }
+
+    #[test]
+    fn tick_local_only_skips_host_assigned_automations() {
+        let db = crate::database::init_test_database();
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
+        // An automation targeting a remote host (host_id = Some).
+        let a = db
+            .insert_automation(&crate::database::AutomationInput {
+                name: "Remote".to_string(),
+                prompt: "p".to_string(),
+                agent: "claude".to_string(),
+                schedule: "DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY".to_string(),
+                timezone: "UTC".to_string(),
+                host_id: Some(7),
+                project_path: None,
+                retention_limit: 10,
+            })
+            .unwrap();
+        db.set_automation_next_run(a.id, Some("2026-01-02T09:00:00+00:00"))
+            .unwrap();
+
+        // Desktop scheduler (`local_only = true`): host-assigned
+        // automation is skipped.
+        assert!(tick(&db, now, true).is_empty());
+        // Remote scheduler (`local_only = false`): it fires.
+        assert_eq!(tick(&db, now, false).len(), 1);
     }
 }

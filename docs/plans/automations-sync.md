@@ -25,6 +25,19 @@ The architecture is unchanged from `docs/plans/automations.md`: the API
 is a **registry only** (no cloud scheduler); each host runs its own
 `scheduler::tick` + `executor`.
 
+## Status
+
+Landed on this branch: the **Prerequisite refactor**, **Phase A**
+(reconciler), **Phase C** (`automations_sync`), **Phase D** (host
+routing + `codemux-remote scheduler` subcommand), and the testable part
+of **Phase E** (`automations::service` unit generators). All verified —
+43 automation unit tests, `cargo check` / `tsc` / `vitest` green.
+
+Still open: **Phase B** (the API server endpoints — a separate repo, not
+deployable from this branch); the **Phase E bootstrap wiring** (token
+provisioning + service registration, which needs Phase B's token
+endpoint and a real host); and **Phase F** (workspace lifecycle).
+
 ## Prerequisite refactor — de-couple the executor from Tauri
 
 `automations::executor::execute_run` currently takes a `tauri::AppHandle`
