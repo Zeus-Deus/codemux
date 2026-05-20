@@ -8,9 +8,9 @@
 
 ## Current Headline
 
-Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released version is `v0.5.0`.
+Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released version is `v0.5.2`.
 
-Since the last reindex pass the agent-chat surface (Step 6–12: chat pane, multi-provider picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) remains merged to `main` and Beta-gated; the **persistent PTY daemon** is now the default spawn path (every shell survives app close, the env-var escape hatch is the only off-switch), the **SSH workspace-push** action that was deferred in step 2d has landed (push a worktree to a user-owned host with Claude conversation sync), and the right sidebar + Settings panel have been redesigned to a **refined-minimal aesthetic** to match the rest of the app. The MCP server inventory has grown from 31 to **44 tools** across the Phase 1 / 1.5 / 1.6 vexis-agent integration steps.
+The headline addition since the `v0.5.0` reindex is **Automations** — named prompt + agent + RFC 5545 recurrence schedules that fire on a user-chosen host, create a fresh worktree per fire, run the agent headlessly, and record a real terminal status. Automations are account-synced across devices and surfaced in a first-class left-sidebar view; their eight `automation_*` tools bring the MCP server inventory to **52 tools**. The agent-chat surface (Step 6–12: chat pane, multi-provider picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) remains merged to `main` and Beta-gated; the **persistent PTY daemon** is the default spawn path (every shell survives app close, the env-var escape hatch is the only off-switch), the **SSH workspace-push** action that was deferred in step 2d has landed (push a worktree to a user-owned host with Claude conversation sync), and the right sidebar + Settings panel have been redesigned to a **refined-minimal aesthetic** to match the rest of the app. The MCP server inventory grew from 31 to 44 tools across the Phase 1 / 1.5 / 1.6 vexis-agent integration steps before Automations took it to 52.
 
 OpenFlow and the browser pane are still being hardened. OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
 
@@ -134,7 +134,7 @@ The repo structure is clean and domain-split:
 
 ### Infrastructure
 - Global overlay manager (single overlay at a time)
-- MCP server exposing **44 tools** via JSON-RPC 2.0 (browser tier 1/2/3 + info + viewport, workspace incl. open/close, pane incl. close, git, notification, terminal read/write, app_status, port_list, worktree_create, preset_apply/list, issue_list/get/link_workspace — Phase 1, 1.5, and 1.6 vexis-agent integration tools all merged)
+- MCP server exposing **52 tools** via JSON-RPC 2.0 (browser tier 1/2/3 + info + viewport, workspace incl. open/close, pane incl. close, git, notification, terminal read/write, app_status, port_list, worktree_create, preset_apply/list, issue_list/get/link_workspace, automation list/get/create/update/delete/pause/resume/runs — Phase 1/1.5/1.6 vexis-agent integration tools and the eight `automation_*` tools all merged)
 - CLI and socket control (Unix socket on Linux/macOS, named pipe on Windows). Control-endpoint errors now surface instead of being swallowed.
 - Per-workspace display isolation (X11/Wayland sandboxing for agent-spawned GUI apps — opt-in for human persona, default-on for agent persona)
 - Local project memory (`codemux memory show/set/add`, `codemux handoff`)
@@ -142,6 +142,14 @@ The repo structure is clean and domain-split:
 - Onboarding skip affordance + re-trap fix
 - Dev builds isolated from installed release (separate data dirs)
 - **Remote hosts + workspace push**: Settings → Hosts with real `hosts_test_connection` probe + `hosts_bootstrap_install` install flow, slim `codemux-remote` server binary (`[[bin]] codemux_remote.rs`), and SSH transport (`ssh::probe`/`bootstrap`/`tunnel`/`tunnel_supervisor`/`push`/`registry`) so a workspace can be pushed to a user-owned SSH host. Push synchronizes the worktree, spawns the remote daemon, attaches the local UI through an SSH-forwarded socket, and **syncs the Claude conversation** across local/remote ends. `WorkspaceSnapshot.host_id` + shared `<DevicePicker>` pill wires the host selection into the new-workspace dialog.
+
+### Automations
+- **Scheduled agent runs**: a named prompt + agent + RFC 5545 recurrence that fires on a user-chosen host. Each fire creates an isolated git worktree, runs the agent headlessly (`claude --print` / `codex exec`), and records a real `succeeded` / `failed` / `skipped_offline` / `skipped_busy` terminal status. Same-automation overlap is serialised; a per-minute `fire_key` keeps a double tick idempotent.
+- **Automations view**: a first-class destination opened from the left sidebar (under "New agent", above the project list) — list + detail pane for create / edit / pause / resume / delete, a frequency/time/weekday schedule builder with a raw RFC 5545 escape hatch, per-automation run history, and a per-row health dot driven by the last run.
+- **Account sync**: `automations_sync` replicates the registry through the live `/api/automations` endpoints with the same dirty-flag / tombstone model as `hosts_sync`, so every signed-in device sees the same list; `automation_runs` stay per-device.
+- **Host routing**: the desktop scheduler runs only `host_id IS NULL` automations; `codemux-remote scheduler` — a systemd user service provisioned at host bootstrap — runs host-targeted ones on an always-on machine. A stuck-run reconciler fails crashed runs at scheduler startup so a dead run can't pin its automation in `skipped_busy`.
+- **GitHub backbone**: a remote host obtains the project repo by cloning / fetching its git remote with the host's own credentials (no token injected); a per-repo `git ls-remote` preflight flags an unreachable repo at setup, not at the first fire.
+- Surface: seven `automations_*` Tauri commands + `automations_check_repo_access`, and eight `automation_*` MCP / control-socket tools. See `docs/features/automations.md`.
 
 ### Performance
 - High-frequency app-state emits coalesced into 16 ms windows
@@ -173,7 +181,7 @@ The repo structure is clean and domain-split:
 
 ## Windows Support
 
-Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.5.0`.
+Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.5.2`; in-app auto-update on Windows was fixed in `v0.5.1`.
 
 What's in place:
 

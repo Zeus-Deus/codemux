@@ -69,6 +69,7 @@ The Phase numbering above (1-18) is the original product roadmap. Step-numbered 
 
 ## Recently Completed
 
+- **Automations (`v0.5.2`).** Scheduled agent runs — a named prompt + agent + RFC 5545 recurrence that fires on a user-chosen host, creates a fresh git worktree per fire, runs the agent headlessly, and records a real `succeeded` / `failed` / `skipped_*` terminal status. Phase 1 shipped the local data model, recurrence engine, scheduler, executor, command surface, and a first-class left-sidebar Automations view. Phase 2 added account sync (`automations_sync` against the live `/api/automations` endpoints), host routing, a `codemux-remote scheduler` systemd service provisioned at host bootstrap, a stuck-run reconciler, and the Phase F GitHub-backbone repo transport (a remote host clones/fetches the project's git remote). Eight `automation_*` MCP tools. Feature doc: `docs/features/automations.md`; plans: `docs/plans/automations.md`, `docs/plans/automations-sync.md`; research: `docs/research/superset-automations.md`.
 - **Refined-minimal UI pass.** Sidebar redesigned (refined-minimal aesthetic), slim Changes panel + ADE-native right sidebar, settings panel aligned with shared primitives, title-bar menu consolidated into the sidebar footer, preset-bar icons + tab-bar drop indicator aligned, agent-chat composer polished (Local pill dropped, dev spawn button removed, sidebar "New agent" locked to home).
 - **Default-branch detection (`v0.5.0`).** Sidebar branch pill is seeded from `origin/HEAD` and follows live remote-branch changes; derivative-branch picker drops the phantom `origin/<name>` rows so a user can't pick a remote-only ref by accident.
 - **Per-worktree notification mute.** Right-click → "Mute notifications" on a sidebar workspace row toggles `notifications_muted`; muted state shows a bell-off icon and skips agent-completion notifications.
@@ -93,7 +94,7 @@ The Phase numbering above (1-18) is the original product roadmap. Step-numbered 
 - Auto-update system (AppImage / NSIS in-app update, toast notification)
 - Built-in file editor with CodeMirror, syntax highlighting, markdown preview
 - AI merge conflict resolver with temp-branch safety model
-- MCP server for agent self-orchestration (44 tools via JSON-RPC 2.0, expanded through Phase 1 / 1.5 / 1.6 vexis-agent integration steps)
+- MCP server for agent self-orchestration (52 tools via JSON-RPC 2.0, expanded through Phase 1 / 1.5 / 1.6 vexis-agent integration steps and the eight `automation_*` tools)
 - Settings panel (keyboard shortcuts, appearance, project scripts, beta features, sync, skills, MCP, permissions)
 - Auth system (GitHub OAuth, email/password, email verification, encrypted token storage)
 - Synced settings (per-user server-synced with offline cache)

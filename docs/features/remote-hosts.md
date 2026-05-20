@@ -61,7 +61,18 @@ codemux-remote version
 
 codemux-remote pty-daemon --socket /tmp/codemux-ptyd-<rand>.sock
   → binds the socket, runs the daemon server, never returns
+
+codemux-remote scheduler
+  → runs the Automations reconcile + pull + tick + execute loop on an
+    always-on host; never returns
 ```
+
+The `scheduler` subcommand was added by the Automations feature, not by
+2c. Host bootstrap provisions it — it writes the scheduler token + host
+identity and registers a systemd user service so it survives reboots.
+The scheduler loop, host routing, and service provisioning are owned by
+`docs/features/automations.md`; this doc only covers the binary and the
+SSH transport it shares.
 
 Cross-compile targets (CI work, not in this commit — flagged for the release skill):
 - `x86_64-unknown-linux-gnu` — most servers + home labs

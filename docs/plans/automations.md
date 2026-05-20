@@ -78,7 +78,7 @@ Implementation-time detail still to settle: token leak/rotation handling within 
 Automations feature — local foundation, scheduler, and UI (this branch):
 
 - **Data model** — `automations` + `automation_runs` tables (`database.rs`,
-  schema v5) with sync-ready `server_id` / `deleted_at` / `dirty` columns;
+  schema v6) with sync-ready `server_id` / `deleted_at` / `dirty` columns;
   records + full CRUD; idempotent per-minute run inserts; terminal run
   lifecycle.
 - **Recurrence engine** — `automations::recurrence` (RFC 5545 via the

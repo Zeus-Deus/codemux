@@ -198,13 +198,14 @@
 
 ## MCP Server (Codemux as server)
 
-- JSON-RPC 2.0 MCP server over stdio transport (**44 tools**)
+- JSON-RPC 2.0 MCP server over stdio transport (**52 tools**)
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace, pane, notification, and git tools for agent self-orchestration
 - Browser viewport presets (`browser_viewport`, `browser_viewport_presets`)
 - Phase 1 vexis-agent tools: `terminal_write`, `terminal_read`, `workspace_open`, `app_status`, `port_list`
 - Phase 1.5 vexis-agent tools: `worktree_create`, `preset_apply`, `preset_list`
 - Phase 1.6 vexis-agent lifecycle + issue tools: `workspace_close`, `pane_close`, `issue_list`, `issue_get`, `issue_link_workspace`
+- Automation tools: `automation_list`, `automation_get`, `automation_create`, `automation_update`, `automation_delete`, `automation_pause`, `automation_resume`, `automation_runs`
 - Auto-configuration for Claude Code and Claude Desktop
 - Launched via `codemux mcp`
 
@@ -302,6 +303,17 @@
 - Default-on, no setting; `CODEMUX_DISABLE_PTY_DAEMON=1` is the only escape hatch
 - Graceful fallback to in-process portable-pty at every error site; 3-failures-in-60s crash circuit breaker
 - Unix only (Linux + macOS); Windows still uses the in-process path until the named-pipe IPC is wired
+
+## Automations
+
+- Scheduled agent runs: a named prompt + agent + RFC 5545 (iCalendar) recurrence that fires on a user-chosen host
+- Each fire creates an isolated git worktree and runs the agent headlessly (`claude --print` / `codex exec`)
+- Real terminal status per run: `succeeded` / `failed` / `skipped_offline` / `skipped_busy`; same-automation overlap is serialised
+- First-class **Automations view** in the left sidebar: list + detail pane, frequency/time/weekday schedule builder (raw RFC 5545 escape hatch), per-automation run history, per-row health dot
+- Account-synced across devices via `automations_sync` against the live `/api/automations` endpoints; `automation_runs` stay per-device
+- Host routing: the desktop runs `host_id IS NULL` automations; `codemux-remote scheduler` (a systemd user service provisioned at host bootstrap) runs host-targeted ones; a stuck-run reconciler fails crashed runs at startup
+- GitHub backbone: a remote host clones/fetches the project's git remote with its own credentials; per-repo `git ls-remote` preflight flags an unreachable repo at setup
+- Surface: seven `automations_*` Tauri commands + `automations_check_repo_access`, eight `automation_*` MCP / control-socket tools
 
 ## CLI / Socket Control
 

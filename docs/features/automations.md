@@ -20,7 +20,7 @@ layers still to come.
 ## Current Model
 
 - **Persistence** — `automations` and `automation_runs` tables in the
-  local SQLite database (`database.rs`, schema v5). They carry the same
+  local SQLite database (`database.rs`, schema v6). They carry the same
   `server_id` / `deleted_at` / `dirty` columns as `hosts`, so the
   account-sync layer can be added with no migration.
 - **Recurrence** — an automation's `schedule` is a complete RFC 5545
@@ -78,7 +78,8 @@ layers still to come.
   hatch) and a per-automation run-history view.
 - Desktop command surface — `automations_list`, `automations_get`,
   `automations_create`, `automations_update`, `automations_set_enabled`,
-  `automations_delete`, `automations_runs`.
+  `automations_delete`, `automations_runs`, plus
+  `automations_check_repo_access` for the per-repo preflight probe.
 - Agent / MCP control surface — eight tools (`automation_list`,
   `automation_get`, `automation_create`, `automation_update`,
   `automation_delete`, `automation_pause`, `automation_resume`,
