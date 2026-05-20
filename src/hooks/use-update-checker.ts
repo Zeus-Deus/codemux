@@ -25,20 +25,31 @@ interface UpdateCheckerResult {
 const CHECK_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 const INITIAL_DELAY = 5000; // 5 seconds
 
-function isDismissed(version: string): boolean {
-  try {
-    return localStorage.getItem(`codemux-update-dismissed-${version}`) === "true";
-  } catch {
-    return false;
-  }
+/**
+ * Install formats whose updates the Tauri updater can download and apply
+ * in place. Everything else (deb/rpm/unknown) can only be pointed at the
+ * release page. Keep this in sync with `get_package_format` in
+ * `src-tauri/src/commands/update.rs`.
+ */
+const AUTO_UPDATABLE_FORMATS = new Set(["appimage", "nsis"]);
+
+export function canAutoUpdateFormat(format: string): boolean {
+  return AUTO_UPDATABLE_FORMATS.has(format);
 }
 
-function setDismissed(version: string) {
-  try {
-    localStorage.setItem(`codemux-update-dismissed-${version}`, "true");
-  } catch {
-    // localStorage unavailable
-  }
+/**
+ * Whether the update toast should be treated as dismissed for `version`.
+ *
+ * Dismissal is intentionally in-memory only (a ref, not localStorage), so
+ * "Later" hides the toast for the current session but it re-appears on the
+ * next app launch — and immediately if a newer version is published —
+ * until the user actually updates.
+ */
+export function isVersionDismissed(
+  dismissedVersion: string | null,
+  currentVersion: string,
+): boolean {
+  return dismissedVersion !== null && dismissedVersion === currentVersion;
 }
 
 export function useUpdateChecker(): UpdateCheckerResult {
@@ -51,6 +62,9 @@ export function useUpdateChecker(): UpdateCheckerResult {
   const updateRef = useRef<Update | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Version the user dismissed this session. Not persisted — resets on
+  // every launch so the update prompt keeps nagging until they update.
+  const dismissedVersionRef = useRef<string | null>(null);
 
   const doCheck = useCallback(async () => {
     try {
@@ -59,7 +73,9 @@ export function useUpdateChecker(): UpdateCheckerResult {
       if (update) {
         updateRef.current = update;
         setUpdateVersion(update.version);
-        setDismissedState(isDismissed(update.version));
+        setDismissedState(
+          isVersionDismissed(dismissedVersionRef.current, update.version),
+        );
         setState("update-available");
       } else {
         setState("idle");
@@ -74,7 +90,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
     if (import.meta.env.DEV) return;
 
     getPackageFormat()
-      .then((fmt) => setCanAutoUpdate(fmt === "appimage"))
+      .then((fmt) => setCanAutoUpdate(canAutoUpdateFormat(fmt)))
       .catch(() => setCanAutoUpdate(false));
 
     timeoutRef.current = setTimeout(() => {
@@ -133,9 +149,7 @@ export function useUpdateChecker(): UpdateCheckerResult {
   }, []);
 
   const dismiss = useCallback(() => {
-    if (updateVersion) {
-      setDismissed(updateVersion);
-    }
+    dismissedVersionRef.current = updateVersion;
     setDismissedState(true);
   }, [updateVersion]);
 
