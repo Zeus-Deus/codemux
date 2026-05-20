@@ -49,8 +49,9 @@ layers still to come.
   `UNIQUE(automation_id, scheduled_for)` constraint makes a re-delivered
   tick idempotent. Status flows `scheduled → running → succeeded |
   failed | skipped_offline | skipped_busy`. Run rows are kept
-  indefinitely; only host-side worktrees are pruned (per
-  `retention_limit`).
+  indefinitely. `retention_limit` (default 10) is stored and validated
+  per automation, but the host-side worktree prune that would honour it
+  is **not yet implemented** — every run's worktree currently persists.
 
 ## What Works Today
 
@@ -134,6 +135,10 @@ layers still to come.
   the API. A per-host scoped token would limit blast radius if a host
   is compromised — a future hardening.
 - **No run-now.** A one-shot `automation_run` tool is still deferred.
+- **Retention is not enforced yet.** `retention_limit` is stored and
+  validated but no prune runs, so old run worktrees accumulate on the
+  host. The worktree prune is tracked as Polish in
+  `docs/plans/automations.md`.
 - **The host needs its own GitHub credentials.** A remote host clones
   and the agent reads/writes GitHub using the host's own `git` + `gh`
   auth — Codemux injects no token (matching Superset). The preflight
