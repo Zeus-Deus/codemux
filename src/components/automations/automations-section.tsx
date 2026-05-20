@@ -31,12 +31,19 @@ import {
   automationsRuns,
   automationsSetEnabled,
   automationsUpdate,
+  dbGetRecentProjects,
   hostsList,
   type AutomationInput,
   type AutomationRunView,
   type AutomationView,
   type HostView,
 } from "@/tauri/commands";
+
+/** A repository the user has opened — the source for the project picker. */
+interface ProjectOption {
+  name: string;
+  path: string;
+}
 
 /**
  * The Automations management panel — rendered full-screen by
@@ -169,6 +176,9 @@ interface FormDraft {
   /** Raw schedule string — used when `rawMode` is on. */
   rawSchedule: string;
   rawMode: boolean;
+  /** True once the user has chosen "Other path…" in the project picker,
+   *  so the manual-path input stays open even while it is still empty. */
+  projectCustom: boolean;
 }
 
 function emptyDraft(): FormDraft {
@@ -183,6 +193,7 @@ function emptyDraft(): FormDraft {
     builder: { frequency: "DAILY", hour: 9, minute: 0, weekday: "MO" },
     rawSchedule: "",
     rawMode: false,
+    projectCustom: false,
   };
 }
 
@@ -199,6 +210,7 @@ function draftFromAutomation(a: AutomationView): FormDraft {
     builder: parsed ?? { frequency: "DAILY", hour: 9, minute: 0, weekday: "MO" },
     rawSchedule: a.schedule,
     rawMode: parsed === null,
+    projectCustom: false,
   };
 }
 
@@ -226,6 +238,8 @@ export function AutomationsSection() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
+  const [projects, setProjects] = useState<ProjectOption[]>([]);
+
   // `null` = not editing. A draft with no matching automation = create.
   const [draft, setDraft] = useState<FormDraft | null>(null);
   const [creating, setCreating] = useState(false);
@@ -233,12 +247,16 @@ export function AutomationsSection() {
   const reload = useCallback(async () => {
     setError(null);
     try {
-      const [fresh, freshHosts] = await Promise.all([
+      const [fresh, freshHosts, freshProjects] = await Promise.all([
         automationsList(),
         hostsList(),
+        dbGetRecentProjects(50),
       ]);
       setAutomations(fresh);
       setHosts(freshHosts);
+      setProjects(
+        freshProjects.map((p) => ({ name: p.name, path: p.path })),
+      );
       if (fresh.length > 0 && selectedId === null) {
         setSelectedId(fresh[0].id);
       } else if (fresh.length === 0) {
@@ -491,6 +509,7 @@ export function AutomationsSection() {
             draft={draft}
             setDraft={setDraft}
             hosts={hosts}
+            projects={projects}
             busy={busy}
             creating={creating || selected === null}
             onSave={handleSave}
@@ -744,6 +763,7 @@ function AutomationForm({
   draft,
   setDraft,
   hosts,
+  projects,
   busy,
   creating,
   onSave,
@@ -752,6 +772,7 @@ function AutomationForm({
   draft: FormDraft;
   setDraft: React.Dispatch<React.SetStateAction<FormDraft | null>>;
   hosts: HostView[];
+  projects: ProjectOption[];
   busy: boolean;
   creating: boolean;
   onSave: () => void;
@@ -763,6 +784,11 @@ function AutomationForm({
     setDraft((prev) =>
       prev ? { ...prev, builder: { ...prev.builder, ...next } } : prev,
     );
+
+  const canSave =
+    draft.name.trim() !== "" &&
+    draft.prompt.trim() !== "" &&
+    draft.projectPath.trim() !== "";
 
   return (
     <div className="space-y-5">
@@ -788,6 +814,8 @@ function AutomationForm({
           className="min-h-24 text-[13px]"
         />
       </Field>
+
+      <ProjectField draft={draft} patch={patch} projects={projects} />
 
       <div className="grid grid-cols-2 gap-4">
         <Field label="Agent">
@@ -851,16 +879,12 @@ function AutomationForm({
         </Field>
       </div>
 
-      <Field label="Project path" hint="Repository the run operates in (optional).">
-        <Input
-          value={draft.projectPath}
-          onChange={(e) => patch({ projectPath: e.target.value })}
-          placeholder="/home/you/code/my-repo"
-          className="h-9 text-[13px] font-mono"
-        />
-      </Field>
-
-      <div className="flex justify-end gap-1.5 pt-2 border-t border-border/40">
+      <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
+        {!canSave && (
+          <span className="mr-auto text-[11px] text-muted-foreground/60">
+            Name, prompt and project are required.
+          </span>
+        )}
         <Button
           type="button"
           variant="ghost"
@@ -877,7 +901,7 @@ function AutomationForm({
           variant="secondary"
           size="sm"
           className="h-8 gap-1.5 text-[12px]"
-          disabled={busy}
+          disabled={busy || !canSave}
           onClick={onSave}
         >
           {busy ? (
@@ -975,9 +999,9 @@ function ScheduleField({
       )}
 
       <div className="mt-1.5 flex items-center justify-between gap-3">
-        <code className="min-w-0 truncate text-[10.5px] text-muted-foreground/60 font-mono">
-          {composed.replace(/\n/g, " · ")}
-        </code>
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground/60">
+          Runs {describeSchedule(composed).toLowerCase()}
+        </span>
         <button
           type="button"
           className="shrink-0 text-[11px] text-muted-foreground/70 hover:text-foreground transition-colors"
@@ -992,6 +1016,63 @@ function ScheduleField({
           {draft.rawMode ? "Use builder" : "Edit raw"}
         </button>
       </div>
+    </Field>
+  );
+}
+
+/** The project picker — choose one of your opened repositories, or
+ *  fall back to a manual path. Solves the "why am I typing a path?"
+ *  confusion: you pick a project, the automation handles the worktree. */
+function ProjectField({
+  draft,
+  patch,
+  projects,
+}: {
+  draft: FormDraft;
+  patch: (next: Partial<FormDraft>) => void;
+  projects: ProjectOption[];
+}) {
+  const known = projects.some((p) => p.path === draft.projectPath);
+  // Custom mode: the user explicitly chose "Other path…", or we are
+  // editing an automation whose project is not in the recent list.
+  const custom = draft.projectCustom || (draft.projectPath !== "" && !known);
+  const selectValue = custom ? "__custom__" : known ? draft.projectPath : "";
+
+  return (
+    <Field
+      label="Project"
+      hint="The repository the agent works in. Each run gets a fresh worktree of it automatically — you don't set one up yourself."
+    >
+      <Select
+        value={selectValue || undefined}
+        onValueChange={(value) => {
+          if (value === "__custom__") {
+            patch({ projectCustom: true });
+          } else {
+            patch({ projectCustom: false, projectPath: value });
+          }
+        }}
+      >
+        <SelectTrigger className="h-9 text-[13px]">
+          <SelectValue placeholder="Choose a project…" />
+        </SelectTrigger>
+        <SelectContent>
+          {projects.map((project) => (
+            <SelectItem key={project.path} value={project.path}>
+              {project.name}
+            </SelectItem>
+          ))}
+          <SelectItem value="__custom__">Other path…</SelectItem>
+        </SelectContent>
+      </Select>
+      {custom && (
+        <Input
+          value={draft.projectPath}
+          onChange={(e) => patch({ projectPath: e.target.value })}
+          placeholder="/home/you/code/my-repo"
+          className="mt-1.5 h-9 text-[13px] font-mono"
+        />
+      )}
     </Field>
   );
 }
