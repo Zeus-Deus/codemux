@@ -18,8 +18,8 @@ Let a user define an Automation — a named prompt + agent + recurrence — that
 - **Edit propagation:** the remote binary polls the API. Auth is a per-host scoped token provisioned during the existing `hosts_bootstrap_install` flow. Edits made from any device (or via MCP) reach the host without the desktop needing to be online.
 - **Fire flow:** the scheduler creates a fresh workspace + worktree itself (deterministic, same code path as `workspace_push_to_host`), branch `slug-<timestamp>` off the project default branch, then spawns the chosen agent inside it with the prompt. The agent does not self-create the workspace via MCP — workspace creation is infrastructure.
 - **Offline:** host off → no tick → a `skipped_offline` run row is written on next boot. No cloud worker needed.
-- **Sidebar:** automation run-workspaces never auto-appear in the main project sidebar. They render only in the Automations panel. A sidebar entry appears only when the user explicitly syncs one in (mirrors how Superset gates the sidebar on per-device local state).
-- **Sync vs pull:** new `workspace_sync_from_host` action — a non-destructive host→local mirror; host stays canonical, `host_id` unchanged, automation keeps running. `workspace_pull_back` is hard-blocked for automation workspaces (UI hidden + command rejects, so an MCP caller cannot kill an automation either).
+- **Sidebar:** automation run-workspaces never auto-appear in the main project sidebar. They render only in the Automations panel. A sidebar entry appears only when the user explicitly brings one in.
+- **Remote-host repo transport:** GitHub (or any git remote) is the backbone — the host clones the project's remote with its own git credentials; runs produce branches the agent pushes; the desktop `git fetch`es a run's branch to bring it home. Detailed in `docs/plans/automations-sync.md` Phase F. (An earlier rsync/SSH-mirror idea was dropped — see that doc's "Design correction".)
 - **MCP:** full CRUD + run — 11 tools, mirroring Superset's surface.
 - **Run model:** fresh workspace per fire.
 - **Retention:** keep the last 10 *completed* run-workspaces per automation on the host (plus any currently-running one); auto-prune older worktrees. Never prune a run the user has synced locally. `automation_runs` log rows are kept regardless — history survives worktree pruning.
@@ -37,10 +37,13 @@ the `/api/automations` endpoints are live on `api.codemux.org`, the
 desktop syncs against them, and host bootstrap provisions the remote
 scheduler. See `docs/plans/automations-sync.md`. What remains:
 
-1. **Workspace lifecycle.** `workspace_sync_from_host` (non-destructive
-   mirror), an `automation_id` column on workspaces, and a
-   `workspace_pull_back` guard for automation workspaces — Phase F in
-   `docs/plans/automations-sync.md`.
+1. **Remote-host repo transport (the GitHub backbone).** A remote host
+   has no copy of the project repo yet — the last load-bearing piece of
+   remote-host automations. The host clones the project's git remote
+   with its own credentials; runs produce branches; a setup-time
+   GitHub-access preflight check warns if the host can't reach the repo.
+   Fully specced as Phase F in `docs/plans/automations-sync.md`.
+   ("This machine" automations need none of this and already work.)
 2. **Scoped scheduler tokens.** The host scheduler currently uses a copy
    of the desktop's account token; a per-host scoped token would limit
    blast radius if a host is compromised.
@@ -65,8 +68,8 @@ Implementation-time detail still to settle: token leak/rotation handling within 
 
 - `src-tauri/src/bin/codemux_remote.rs` — add the `scheduler` subcommand
 - `src-tauri/src/ssh/bootstrap.rs` — provision scoped token, register persistent service
-- `src-tauri/src/ssh/push.rs` — reuse rsync helpers for `workspace_sync_from_host`
-- `src-tauri/src/commands/hosts.rs` — `workspace_push_to_host`, `workspace_pull_back` (add guard), new `workspace_sync_from_host`
+- `src-tauri/src/automations/executor.rs` — host clone/fetch of the project remote before the worktree create (Phase F)
+- `src-tauri/src/commands/hosts.rs` — GitHub-access preflight in `hosts_test_connection` (Phase F)
 - `src-tauri/src/hosts_sync.rs` — pattern to mirror as new `src-tauri/src/automations_sync.rs`
 - `src-tauri/src/database.rs` — new `automations` / `automation_runs` tables, `automation_id` on workspaces
 - `src-tauri/src/mcp_server.rs` — register the 11 automation tools
@@ -116,10 +119,12 @@ Phase 2 — account sync + remote-host execution (this branch):
 - **Tests** — 43 unit tests; `cargo check` / `tsc` / `vitest` all green,
   apart from one pre-existing unrelated `agent_browser` env test.
 
-What is still open (see `docs/plans/automations-sync.md`): the
-`/api/automations` server endpoints (separate API repo); the host
-bootstrap writing a scheduler token + registering the service; and
-Phase F (workspace lifecycle).
+Account sync + remote scheduler also shipped since: the
+`/api/automations` endpoints are deployed on `api.codemux.org`, and
+host bootstrap provisions the scheduler token + service. What is still
+open (see `docs/plans/automations-sync.md`): Phase F — the
+GitHub-backbone repo transport that lets a remote host obtain the
+project repo.
 
 Pre-existing platform Automations builds on:
 

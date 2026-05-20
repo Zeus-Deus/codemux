@@ -40,9 +40,15 @@ is a **registry only** (no cloud scheduler); each host runs its own
 - 43 Rust unit tests + 16 server tests; `cargo check` / `tsc` /
   `vitest` green.
 
-Still open: **Phase F** (workspace lifecycle). One hardening note: the
-host scheduler currently uses a copy of the desktop's account token; a
-per-host scoped token would be a better blast-radius limit.
+Still open: **Phase F** — the GitHub-backbone repo transport. This is
+the last load-bearing piece for remote-host automations: a remote host
+has no copy of the project repo until F is built (D/E ship the
+scheduler and service, but not the repo). "This machine" automations
+do not need F and already work end-to-end.
+
+One hardening note: the host scheduler currently uses a copy of the
+desktop's account token; a per-host scoped token would be a better
+blast-radius limit.
 
 ## Prerequisite refactor — de-couple the executor from Tauri
 
@@ -167,25 +173,94 @@ Extend `ssh/bootstrap.rs` (`bootstrap_remote`, `bootstrap.rs:220-289`).
    to a `nohup` + manual note. Gate behind a consent prompt like the
    existing remote-binary install.
 
-## Phase F — Workspace lifecycle (later)
+## Phase F — Remote-host projects: the GitHub backbone
 
-Lower priority; lets a user view an automation's workspace locally
-without killing the automation.
+This phase makes a remote-host automation actually able to run — Phases
+D/E deliver the scheduler and service, but the host still has no copy of
+the project repo. It also corrects an earlier design dead-end.
 
-- `workspace_sync_from_host`: reuse `build_pull_rsync_argv` (`push.rs`)
-  **without `--delete`** and **without** clearing `host_id` — a
-  non-destructive mirror (research §6).
-- Add an `automation_id` column to workspaces; guard
-  `workspace_pull_back` to reject automation-owned workspaces at its top
-  (`hosts.rs:653`, before the `host_id` unwrap) so an MCP caller cannot
-  pull a running automation out from under itself.
-- A dedicated automation icon on these workspaces.
+### Design correction (supersedes earlier thinking)
+
+An earlier draft proposed seeding the host's repo by **rsyncing or
+`git push`-ing the project over the desktop↔host SSH link**, to avoid
+needing git credentials on the host. That is dropped. Reasoning:
+
+- The automations worth running — triage PRs, label issues, fix an
+  issue, weekly dependency bumps — all need the **agent** to read and
+  write GitHub at runtime (`gh issue list`, comment, push a branch,
+  `gh pr create`). So the host needs working git + `gh` credentials
+  **regardless** of how the repo arrived.
+- Given that, "the host clones the repo from its git remote" costs no
+  extra credential. The SSH-transport machinery solved a problem that
+  does not exist for the real use cases, while adding a bespoke
+  two-working-copies sync path. Dropped.
+- This also matches Superset: its host-service clones from
+  `repoCloneUrl` with the host's own git credentials and never injects
+  a token (`host-service/.../resolve-repo.ts:278-315`). Superset's
+  cloud GitHub App is for cloud PR-sync only and never reaches the
+  host or the agent.
+
+### The model
+
+GitHub (or any git remote) is the backbone. Both directions go through
+it; the host and the desktop are independent clones.
+
+1. **Project → remote URL.** A Codemux project is a local repo. At
+   automation-create time, resolve its remote with
+   `git -C <project> remote get-url origin` and store it on the
+   automation (a new `project_remote` column alongside `project_path`).
+   A project with no remote can only target **This machine**.
+2. **Host clone.** The `codemux-remote scheduler`, the first time it
+   needs a project, runs `git clone <project_remote>` into a host-local
+   path (e.g. `~/.codemux/automation-repos/<slug>`). Auth is the host's
+   own git credentials (SSH key / credential helper / `gh`) — Codemux
+   injects no token. Later runs `git fetch` and branch off fresh
+   `origin/<default>` (Superset's "locals are often stale" fix).
+3. **Host GitHub credentials = the host's own.** The agent inherits the
+   host shell's `git` + `gh` auth. Codemux does not build or manage a
+   GitHub App for the host side. Host prerequisites to document: `git`
+   with `user.name`/`user.email` set, git credentials/SSH for the
+   remote, and an authenticated `gh` for any issue/PR work.
+4. **Results travel as branches.** The agent commits to
+   `automation-<slug>-<timestamp>` and pushes it (and may `gh pr
+   create`). To bring a run home, the **desktop** `git fetch`es that
+   branch from the remote — the dev machine already has remote access —
+   and Codemux materialises it as a workspace in the project. No
+   rsync, no SSH mirror, no merge-on-pull: it is just a branch landing
+   next to the user's work, integrated on their terms.
+
+### What to build
+
+- **`project_remote` on `automations`** (local schema + the API table +
+  the sync wire format). Resolve it in `commands::automations` at
+  create/update from the chosen project.
+- **Host clone/fetch** in `automations::executor` (or a sibling): given
+  `project_remote`, ensure a host-local clone exists, `git fetch`, then
+  the existing worktree-create branches off `origin/<default>`. On the
+  desktop / "This machine" this step is a no-op — the repo is `project_path`.
+- **Preflight check** — the genuine improvement over Superset, which has
+  none. When a remote-host automation is created (and as part of
+  `hosts_test_connection`), probe the host over SSH for: `git` present +
+  identity configured; `gh` present + `gh auth status` OK; the
+  `project_remote` reachable. Surface a clear, actionable warning at
+  setup time ("This host can't reach `<repo>` — run `gh auth login` on
+  it, or add a deploy key"). Inform, do not hard-block: a local-only
+  automation can still run. Extends the existing `GhStatus` check.
+- **Run → branch/PR linkage** — add `branch` and `pr_url` to
+  `automation_runs`; the executor records the branch, and the agent's
+  `gh pr create` (if any) is captured. The Automations run-history list
+  then reads like a PR list. Superset has neither column — this is ours.
+- **"Pull this run home"** action on a run row — desktop-side
+  `git fetch` of the run's branch + materialise a workspace.
 
 ## Suggested sequencing
 
-A (reconciler) → B (API, server-side, can run in parallel) → C (client
-sync) → D (remote scheduler) → E (bootstrap). F any time after D.
-A is independent and worth landing on its own.
+A (reconciler) → B (API) → C (client sync) → D (remote scheduler) →
+E (bootstrap) → **F (GitHub backbone)**. A is independent. Note that
+**D + E without F cannot run a remote-host automation usefully** — the
+host has no repo until F — so F is not optional polish; it is the last
+load-bearing piece of the remote-host story. "This machine" automations
+need none of D/E/F and already work.
 
 ## Open questions
 
@@ -196,9 +271,16 @@ A is independent and worth landing on its own.
   automation) and/or prune server-side after N days.
 - Non-systemd / non-launchd hosts — is a `nohup` fallback acceptable for
   v1, or require systemd/launchd?
-- Does the remote scheduler need the desktop online at all? No — once
-  bootstrapped it polls the API directly. Confirm the token works
-  without an active SSH tunnel.
+- Should the executor append a standard "commit, push the branch, open
+  a PR" instruction to the agent prompt, or leave push/PR entirely to
+  the user's prompt (as Superset does)? Leaning: leave it to the prompt
+  for v1, but always record whatever branch/PR results.
+- Private-repo auth on the host — deploy key vs. fine-grained PAT vs.
+  the user's `gh` token. Codemux should not store these; the preflight
+  check just verifies one of them works.
+- A project with no git remote — confine it to "This machine", or also
+  allow a no-remote SSH-rsync fallback later? Leaning: This-machine-only
+  for now.
 
 ## Likely touch points
 
@@ -211,3 +293,7 @@ A is independent and worth landing on its own.
 - `src-tauri/src/ssh/bootstrap.rs` — token + service registration
 - `src-tauri/src/lib.rs` — startup reconcile, host-id routing
 - API repo — `/api/automations*` endpoints + scheduler-token
+- Phase F: `automations/executor.rs` — host clone/fetch before worktree;
+  `commands/automations.rs` — resolve `project_remote`; `commands/hosts.rs`
+  — GitHub-access preflight in `hosts_test_connection`; `database.rs` +
+  the API `automations` table — `project_remote`, run `branch` / `pr_url`

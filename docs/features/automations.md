@@ -114,9 +114,13 @@ layers still to come.
   the API. A per-host scoped token would limit blast radius if a host
   is compromised — a future hardening.
 - **No run-now.** A one-shot `automation_run` tool is still deferred.
-- **No workspace lifecycle.** `workspace_sync_from_host` and the
-  automation-workspace pull-back guard (`docs/plans/automations-sync.md`
-  Phase F) are not built.
+- **Remote-host automations cannot obtain the project repo yet.** An
+  automation on a separate host needs the repo *on that host*. The
+  GitHub-backbone transport — the host clones the project's git remote,
+  runs produce branches, a setup-time GitHub-access preflight check —
+  is specced as Phase F in `docs/plans/automations-sync.md` but not
+  built. **"This machine" automations are unaffected** — the repo and
+  the result branch are local.
 
 ## Important Touch Points
 
