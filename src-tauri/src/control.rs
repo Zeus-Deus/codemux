@@ -1237,6 +1237,96 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 Ok(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))
             })
         }
+        // ── Automations ──
+        //
+        // Agent / MCP control surface. Each arm delegates to the shared
+        // `commands::automations::*_impl` helpers so the validation and
+        // `next_run_at` bookkeeping match the desktop command surface
+        // exactly.
+        "automation_list" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            serde_json::to_value(crate::commands::automations::list_automations_impl(&db))
+                .map_err(|error| error.to_string())
+        })(),
+        "automation_get" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or("automation_get requires an integer `id`")?;
+            let view = crate::commands::automations::get_automation_impl(&db, id)?;
+            serde_json::to_value(view).map_err(|error| error.to_string())
+        })(),
+        "automation_create" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let input: crate::database::AutomationInput = serde_json::from_value(
+                request.params.get("input").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| format!("Invalid automation input: {error}"))?;
+            let view = crate::commands::automations::create_automation_impl(&db, input)?;
+            serde_json::to_value(view).map_err(|error| error.to_string())
+        })(),
+        "automation_update" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or("automation_update requires an integer `id`")?;
+            let input: crate::database::AutomationInput = serde_json::from_value(
+                request.params.get("input").cloned().unwrap_or(Value::Null),
+            )
+            .map_err(|error| format!("Invalid automation input: {error}"))?;
+            let view = crate::commands::automations::update_automation_impl(&db, id, input)?;
+            serde_json::to_value(view).map_err(|error| error.to_string())
+        })(),
+        "automation_set_enabled" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or("automation_set_enabled requires an integer `id`")?;
+            let enabled = request
+                .params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or("automation_set_enabled requires a boolean `enabled`")?;
+            let view =
+                crate::commands::automations::set_automation_enabled_impl(&db, id, enabled)?;
+            serde_json::to_value(view).map_err(|error| error.to_string())
+        })(),
+        "automation_delete" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let id = request
+                .params
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or("automation_delete requires an integer `id`")?;
+            crate::commands::automations::delete_automation_impl(&db, id)?;
+            Ok(serde_json::json!({ "deleted": id }))
+        })(),
+        "automation_runs" => (|| -> Result<Value, String> {
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let automation_id = request
+                .params
+                .get("automation_id")
+                .and_then(Value::as_i64)
+                .ok_or("automation_runs requires an integer `automation_id`")?;
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32);
+            let runs = crate::commands::automations::list_automation_runs_impl(
+                &db,
+                automation_id,
+                limit,
+            );
+            serde_json::to_value(serde_json::json!({ "runs": runs }))
+                .map_err(|error| error.to_string())
+        })(),
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 

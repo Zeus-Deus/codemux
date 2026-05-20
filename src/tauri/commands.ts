@@ -1595,6 +1595,79 @@ export const hostsTestConnection = (id: number) =>
 export const hostsBootstrapInstall = (id: number, uname: string) =>
   invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
 
+// ── Automations (scheduled agent runs) ──
+//
+// An automation is a named prompt + agent + recurrence. `schedule` is a
+// complete RFC 5545 iCalendar block (a DTSTART line plus one RRULE
+// line). `dirty` flags unpushed changes for a future account-sync.
+export interface AutomationView {
+  id: number;
+  server_id: string | null;
+  name: string;
+  prompt: string;
+  agent: string;
+  schedule: string;
+  timezone: string;
+  host_id: number | null;
+  project_path: string | null;
+  enabled: boolean;
+  retention_limit: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
+  dirty: boolean;
+}
+
+/** One fire of an automation (or a skipped fire). `status` is one of
+ *  `scheduled | running | succeeded | failed | skipped_offline |
+ *  skipped_busy`. */
+export interface AutomationRunView {
+  id: number;
+  automation_id: number;
+  status: string;
+  scheduled_for: string;
+  started_at: string | null;
+  finished_at: string | null;
+  host_id: number | null;
+  workspace_id: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+/** Editable fields of an automation, shared by create and update. */
+export interface AutomationInput {
+  name: string;
+  prompt: string;
+  agent: string;
+  schedule: string;
+  timezone: string;
+  host_id: number | null;
+  project_path: string | null;
+  retention_limit: number;
+}
+
+export const automationsList = () =>
+  invoke<AutomationView[]>("automations_list");
+
+export const automationsGet = (id: number) =>
+  invoke<AutomationView>("automations_get", { id });
+
+export const automationsCreate = (input: AutomationInput) =>
+  invoke<AutomationView>("automations_create", { input });
+
+export const automationsUpdate = (id: number, input: AutomationInput) =>
+  invoke<AutomationView>("automations_update", { id, input });
+
+export const automationsSetEnabled = (id: number, enabled: boolean) =>
+  invoke<AutomationView>("automations_set_enabled", { id, enabled });
+
+export const automationsDelete = (id: number) =>
+  invoke<void>("automations_delete", { id });
+
+export const automationsRuns = (automationId: number, limit?: number) =>
+  invoke<AutomationRunView[]>("automations_runs", { automationId, limit });
+
 export interface WorkspacePushOutcome {
   ok: boolean;
   message: string;

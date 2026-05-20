@@ -56,6 +56,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Session persistence: `docs/features/session-persistence.md`
 - Persistent agents (PTY daemon — now the default spawn path, no setting): `docs/features/persistent-agents.md`
 - Remote hosts (DevicePicker + codemux-remote + SSH transport + workspace push action): `docs/features/remote-hosts.md`
+- Automations (scheduled host-side agent runs): `docs/features/automations.md`; plan at `docs/plans/automations.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`

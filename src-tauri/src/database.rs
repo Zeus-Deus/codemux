@@ -1,10 +1,10 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -206,6 +206,77 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_hosts_dirty
             ON hosts(user_id, dirty)
             WHERE dirty = 1;
+
+        -- Automations — scheduled agent runs on a chosen host.
+        --
+        -- An automation is a named prompt + agent + recurrence. The
+        -- recurrence lives in `schedule` as a complete iCalendar block
+        -- (a DTSTART line plus one RRULE line, RFC 5545); `timezone`
+        -- holds the IANA zone for display. The host-side scheduler
+        -- (codemux-remote) reads `next_run_at` to decide when to fire.
+        --
+        -- `host_id` is a plain integer, NOT a foreign key: hosts are
+        -- soft-deleted then physically purged by the sync layer, and a
+        -- hard FK would block that purge. A dangling `host_id` is
+        -- surfaced to the user as a removed-host state rather than
+        -- corrupting the row.
+        --
+        -- `server_id` / `deleted_at` / `dirty` mirror the `hosts` table
+        -- so the account-sync layer (a future `automations_sync`) can
+        -- be added with no schema migration.
+        CREATE TABLE IF NOT EXISTS automations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT 'local',
+            server_id TEXT,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            agent TEXT NOT NULL DEFAULT 'claude',
+            schedule TEXT NOT NULL,
+            timezone TEXT NOT NULL DEFAULT 'UTC',
+            host_id INTEGER,
+            project_path TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            retention_limit INTEGER NOT NULL DEFAULT 10,
+            last_run_at TEXT,
+            next_run_at TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            deleted_at TEXT,
+            dirty INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(user_id, server_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_automations_user
+            ON automations(user_id, deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_automations_dirty
+            ON automations(user_id, dirty)
+            WHERE dirty = 1;
+
+        -- Automation runs — one row per fire (or skipped fire).
+        --
+        -- `UNIQUE(automation_id, scheduled_for)` is the idempotency key:
+        -- `scheduled_for` is floored to the minute by the caller, so a
+        -- re-delivered tick for the same minute is a no-op insert. Run
+        -- rows are kept indefinitely (history is cheap, text-only); only
+        -- the agent worktrees on the host are pruned, per the
+        -- automation's `retention_limit`.
+        CREATE TABLE IF NOT EXISTS automation_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            automation_id INTEGER NOT NULL
+                REFERENCES automations(id) ON DELETE CASCADE,
+            status TEXT NOT NULL DEFAULT 'scheduled',
+            scheduled_for TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            host_id INTEGER,
+            workspace_id TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(automation_id, scheduled_for)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
+            ON automation_runs(automation_id, scheduled_for DESC);
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -708,6 +779,393 @@ fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         updated_at: row.get(5)?,
         deleted_at: row.get(6)?,
         dirty: dirty_int != 0,
+    })
+}
+
+// ── Automations ──
+//
+// CRUD over the `automations` and `automation_runs` tables. Automations
+// reuse the soft-delete + `dirty` flag convention from `hosts` so the
+// account-sync layer can be bolted on later without a migration. Run
+// rows are append-only history and are never pruned here — only the
+// agent worktrees on the host are reclaimed, by the host scheduler.
+
+/// One scheduled automation: a named prompt + agent + recurrence that
+/// fires on a chosen host.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutomationRecord {
+    pub id: i64,
+    pub server_id: Option<String>,
+    pub name: String,
+    pub prompt: String,
+    pub agent: String,
+    /// Complete iCalendar recurrence block (DTSTART + RRULE, RFC 5545).
+    pub schedule: String,
+    /// IANA timezone name, for display.
+    pub timezone: String,
+    /// Target host row id, or `None` when not yet assigned.
+    pub host_id: Option<i64>,
+    /// Repository path the run operates in.
+    pub project_path: Option<String>,
+    pub enabled: bool,
+    /// How many completed run worktrees the host keeps before pruning.
+    pub retention_limit: i64,
+    pub last_run_at: Option<String>,
+    pub next_run_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
+    pub dirty: bool,
+}
+
+/// One fire of an automation (or a skipped fire).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutomationRunRecord {
+    pub id: i64,
+    pub automation_id: i64,
+    /// `scheduled` | `running` | `succeeded` | `failed`
+    /// | `skipped_offline` | `skipped_busy`.
+    pub status: String,
+    pub scheduled_for: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub host_id: Option<i64>,
+    pub workspace_id: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+}
+
+/// Editable fields of an automation, shared by create and update.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AutomationInput {
+    pub name: String,
+    pub prompt: String,
+    pub agent: String,
+    pub schedule: String,
+    pub timezone: String,
+    pub host_id: Option<i64>,
+    pub project_path: Option<String>,
+    pub retention_limit: i64,
+}
+
+const AUTOMATION_COLUMNS: &str = "id, server_id, name, prompt, agent, schedule, \
+     timezone, host_id, project_path, enabled, retention_limit, last_run_at, \
+     next_run_at, created_at, updated_at, deleted_at, dirty";
+
+const AUTOMATION_RUN_COLUMNS: &str = "id, automation_id, status, scheduled_for, \
+     started_at, finished_at, host_id, workspace_id, error, created_at";
+
+impl DatabaseStore {
+    /// Insert a new automation. Marked `dirty` so a future sync pushes it.
+    pub fn insert_automation(
+        &self,
+        input: &AutomationInput,
+    ) -> Result<AutomationRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO automations
+                (user_id, name, prompt, agent, schedule, timezone,
+                 host_id, project_path, retention_limit, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+            params![
+                input.name,
+                input.prompt,
+                input.agent,
+                input.schedule,
+                input.timezone,
+                input.host_id,
+                input.project_path,
+                input.retention_limit,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert automation: {e}"))?;
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            &format!("SELECT {AUTOMATION_COLUMNS} FROM automations WHERE id = ?1"),
+            params![id],
+            row_to_automation,
+        )
+        .map_err(|e| format!("Failed to re-read inserted automation: {e}"))
+    }
+
+    /// All non-deleted automations for the local user, name-sorted.
+    pub fn list_automations(&self) -> Vec<AutomationRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {AUTOMATION_COLUMNS} FROM automations
+             WHERE user_id = 'local' AND deleted_at IS NULL
+             ORDER BY name COLLATE NOCASE ASC"
+        )) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automations prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map([], row_to_automation) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automations query_map failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Fetch one automation by id. `None` if it does not exist or is
+    /// soft-deleted.
+    pub fn get_automation(&self, id: i64) -> Option<AutomationRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            &format!(
+                "SELECT {AUTOMATION_COLUMNS} FROM automations
+                 WHERE id = ?1 AND user_id = 'local' AND deleted_at IS NULL"
+            ),
+            params![id],
+            row_to_automation,
+        )
+        .optional()
+        .unwrap_or(None)
+    }
+
+    /// Update the editable fields of an automation. Marks it `dirty`.
+    pub fn update_automation(
+        &self,
+        id: i64,
+        input: &AutomationInput,
+    ) -> Result<AutomationRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "UPDATE automations
+                 SET name = ?1, prompt = ?2, agent = ?3, schedule = ?4,
+                     timezone = ?5, host_id = ?6, project_path = ?7,
+                     retention_limit = ?8, updated_at = datetime('now'),
+                     dirty = 1
+                 WHERE id = ?9 AND user_id = 'local' AND deleted_at IS NULL",
+                params![
+                    input.name,
+                    input.prompt,
+                    input.agent,
+                    input.schedule,
+                    input.timezone,
+                    input.host_id,
+                    input.project_path,
+                    input.retention_limit,
+                    id,
+                ],
+            )
+            .map_err(|e| format!("Failed to update automation: {e}"))?;
+        if affected == 0 {
+            return Err(format!("No automation with id {id}"));
+        }
+        conn.query_row(
+            &format!("SELECT {AUTOMATION_COLUMNS} FROM automations WHERE id = ?1"),
+            params![id],
+            row_to_automation,
+        )
+        .map_err(|e| format!("Failed to re-read updated automation: {e}"))
+    }
+
+    /// Pause or resume an automation.
+    pub fn set_automation_enabled(
+        &self,
+        id: i64,
+        enabled: bool,
+    ) -> Result<AutomationRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "UPDATE automations
+                 SET enabled = ?1, updated_at = datetime('now'), dirty = 1
+                 WHERE id = ?2 AND user_id = 'local' AND deleted_at IS NULL",
+                params![enabled as i64, id],
+            )
+            .map_err(|e| format!("Failed to set automation enabled: {e}"))?;
+        if affected == 0 {
+            return Err(format!("No automation with id {id}"));
+        }
+        conn.query_row(
+            &format!("SELECT {AUTOMATION_COLUMNS} FROM automations WHERE id = ?1"),
+            params![id],
+            row_to_automation,
+        )
+        .map_err(|e| format!("Failed to re-read automation: {e}"))
+    }
+
+    /// Record the computed next fire time. Scheduler bookkeeping — does
+    /// not mark the row `dirty` or bump `updated_at`, since it is
+    /// derived state, not a user edit.
+    pub fn set_automation_next_run(
+        &self,
+        id: i64,
+        next_run_at: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automations SET next_run_at = ?1 WHERE id = ?2",
+            params![next_run_at, id],
+        )
+        .map_err(|e| format!("Failed to set automation next_run_at: {e}"))?;
+        Ok(())
+    }
+
+    /// Soft-delete an automation: stamp `deleted_at` and mark `dirty` so
+    /// the tombstone syncs. Run-history rows are left intact.
+    pub fn delete_automation(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "UPDATE automations
+                 SET deleted_at = datetime('now'),
+                     updated_at = datetime('now'), dirty = 1
+                 WHERE id = ?1 AND user_id = 'local' AND deleted_at IS NULL",
+                params![id],
+            )
+            .map_err(|e| format!("Failed to soft-delete automation: {e}"))?;
+        if affected == 0 {
+            return Err(format!("No automation with id {id}"));
+        }
+        Ok(())
+    }
+
+    /// Insert a run row. `scheduled_for` must already be floored to the
+    /// minute by the caller; the `UNIQUE(automation_id, scheduled_for)`
+    /// constraint makes a re-delivered fire idempotent — returns
+    /// `Ok(None)` when a row for that minute already exists.
+    pub fn record_automation_run(
+        &self,
+        automation_id: i64,
+        status: &str,
+        scheduled_for: &str,
+        host_id: Option<i64>,
+        workspace_id: Option<&str>,
+    ) -> Result<Option<AutomationRunRecord>, String> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "INSERT INTO automation_runs
+                    (automation_id, status, scheduled_for, host_id, workspace_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(automation_id, scheduled_for) DO NOTHING",
+                params![automation_id, status, scheduled_for, host_id, workspace_id],
+            )
+            .map_err(|e| format!("Failed to record automation run: {e}"))?;
+        if affected == 0 {
+            return Ok(None);
+        }
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            &format!("SELECT {AUTOMATION_RUN_COLUMNS} FROM automation_runs WHERE id = ?1"),
+            params![id],
+            row_to_automation_run,
+        )
+        .map(Some)
+        .map_err(|e| format!("Failed to re-read automation run: {e}"))
+    }
+
+    /// Mark a run as started (the agent session is now live).
+    pub fn mark_automation_run_started(&self, run_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automation_runs
+             SET status = 'running', started_at = datetime('now')
+             WHERE id = ?1",
+            params![run_id],
+        )
+        .map_err(|e| format!("Failed to mark automation run started: {e}"))?;
+        Ok(())
+    }
+
+    /// Move a run to a terminal state. `workspace_id` is written only
+    /// when `Some`, so a late workspace id does not clobber an earlier
+    /// one.
+    pub fn finish_automation_run(
+        &self,
+        run_id: i64,
+        status: &str,
+        workspace_id: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE automation_runs
+             SET status = ?1,
+                 finished_at = datetime('now'),
+                 workspace_id = COALESCE(?2, workspace_id),
+                 error = ?3
+             WHERE id = ?4",
+            params![status, workspace_id, error, run_id],
+        )
+        .map_err(|e| format!("Failed to finish automation run: {e}"))?;
+        Ok(())
+    }
+
+    /// Recent runs for an automation, newest fire first.
+    pub fn list_automation_runs(
+        &self,
+        automation_id: i64,
+        limit: u32,
+    ) -> Vec<AutomationRunRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(&format!(
+            "SELECT {AUTOMATION_RUN_COLUMNS} FROM automation_runs
+             WHERE automation_id = ?1
+             ORDER BY scheduled_for DESC LIMIT ?2"
+        )) {
+            Ok(s) => s,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automation_runs prepare failed: {error}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![automation_id, limit], row_to_automation_run) {
+            Ok(r) => r,
+            Err(error) => {
+                eprintln!("[codemux::database] list_automation_runs query_map failed: {error}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+}
+
+fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRecord> {
+    let enabled_int: i64 = row.get(9)?;
+    let dirty_int: i64 = row.get(16)?;
+    Ok(AutomationRecord {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        name: row.get(2)?,
+        prompt: row.get(3)?,
+        agent: row.get(4)?,
+        schedule: row.get(5)?,
+        timezone: row.get(6)?,
+        host_id: row.get(7)?,
+        project_path: row.get(8)?,
+        enabled: enabled_int != 0,
+        retention_limit: row.get(10)?,
+        last_run_at: row.get(11)?,
+        next_run_at: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        deleted_at: row.get(15)?,
+        dirty: dirty_int != 0,
+    })
+}
+
+fn row_to_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRunRecord> {
+    Ok(AutomationRunRecord {
+        id: row.get(0)?,
+        automation_id: row.get(1)?,
+        status: row.get(2)?,
+        scheduled_for: row.get(3)?,
+        started_at: row.get(4)?,
+        finished_at: row.get(5)?,
+        host_id: row.get(6)?,
+        workspace_id: row.get(7)?,
+        error: row.get(8)?,
+        created_at: row.get(9)?,
     })
 }
 
@@ -2611,5 +3069,165 @@ mod tests {
             .collect();
         sids.sort();
         assert_eq!(sids, vec!["srv-desktop".to_string(), "srv-laptop".to_string()]);
+    }
+
+    // ── Automations ──
+
+    fn sample_automation(name: &str) -> AutomationInput {
+        AutomationInput {
+            name: name.to_string(),
+            prompt: "Triage open issues".to_string(),
+            agent: "claude".to_string(),
+            schedule: "DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY".to_string(),
+            timezone: "UTC".to_string(),
+            host_id: None,
+            project_path: Some("/home/user/repo".to_string()),
+            retention_limit: 10,
+        }
+    }
+
+    #[test]
+    fn automation_crud() {
+        let db = init_test_database();
+        assert_eq!(db.list_automations().len(), 0);
+
+        let created = db
+            .insert_automation(&sample_automation("Daily triage"))
+            .unwrap();
+        assert_eq!(created.name, "Daily triage");
+        assert!(created.enabled, "new automations default to enabled");
+        assert_eq!(created.retention_limit, 10);
+        assert!(created.dirty, "a fresh insert is dirty until synced");
+        assert!(
+            created.next_run_at.is_none(),
+            "next_run_at is derived state set by the command layer, not the insert"
+        );
+
+        let fetched = db.get_automation(created.id).unwrap();
+        assert_eq!(fetched.prompt, "Triage open issues");
+        assert_eq!(db.list_automations().len(), 1);
+
+        let mut edit = sample_automation("Daily triage");
+        edit.prompt = "Triage and label issues".to_string();
+        let updated = db.update_automation(created.id, &edit).unwrap();
+        assert_eq!(updated.prompt, "Triage and label issues");
+
+        // Soft-delete drops it from both `list` and `get`.
+        db.delete_automation(created.id).unwrap();
+        assert_eq!(db.list_automations().len(), 0);
+        assert!(db.get_automation(created.id).is_none());
+
+        // A soft-deleted automation can no longer be updated.
+        assert!(db.update_automation(created.id, &edit).is_err());
+    }
+
+    #[test]
+    fn automation_enabled_toggle() {
+        let db = init_test_database();
+        let a = db
+            .insert_automation(&sample_automation("Nightly build"))
+            .unwrap();
+        assert!(a.enabled);
+
+        let paused = db.set_automation_enabled(a.id, false).unwrap();
+        assert!(!paused.enabled);
+
+        let resumed = db.set_automation_enabled(a.id, true).unwrap();
+        assert!(resumed.enabled);
+    }
+
+    #[test]
+    fn automation_next_run_is_settable_and_clearable() {
+        let db = init_test_database();
+        let a = db
+            .insert_automation(&sample_automation("Weekly report"))
+            .unwrap();
+
+        db.set_automation_next_run(a.id, Some("2026-02-01T09:00:00+00:00"))
+            .unwrap();
+        assert_eq!(
+            db.get_automation(a.id).unwrap().next_run_at.as_deref(),
+            Some("2026-02-01T09:00:00+00:00")
+        );
+
+        db.set_automation_next_run(a.id, None).unwrap();
+        assert!(db.get_automation(a.id).unwrap().next_run_at.is_none());
+    }
+
+    #[test]
+    fn automation_run_insert_is_idempotent_per_minute() {
+        let db = init_test_database();
+        let a = db
+            .insert_automation(&sample_automation("Hourly sync"))
+            .unwrap();
+
+        let first = db
+            .record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
+            .unwrap();
+        assert!(first.is_some());
+
+        // A re-delivered fire for the same minute is a no-op.
+        let dup = db
+            .record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
+            .unwrap();
+        assert!(dup.is_none());
+
+        // A different minute is a distinct run.
+        let next = db
+            .record_automation_run(a.id, "running", "2026-01-01T10:00:00Z", None, None)
+            .unwrap();
+        assert!(next.is_some());
+
+        assert_eq!(db.list_automation_runs(a.id, 10).len(), 2);
+    }
+
+    #[test]
+    fn automation_run_lifecycle_reaches_a_terminal_state() {
+        let db = init_test_database();
+        let a = db
+            .insert_automation(&sample_automation("Deploy check"))
+            .unwrap();
+
+        let run = db
+            .record_automation_run(a.id, "scheduled", "2026-03-01T08:00:00Z", Some(1), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(run.status, "scheduled");
+        assert!(run.started_at.is_none());
+
+        db.mark_automation_run_started(run.id).unwrap();
+        db.finish_automation_run(run.id, "succeeded", Some("ws-42"), None)
+            .unwrap();
+
+        let runs = db.list_automation_runs(a.id, 10);
+        assert_eq!(runs.len(), 1);
+        let finished = &runs[0];
+        assert_eq!(finished.status, "succeeded");
+        assert!(finished.started_at.is_some());
+        assert!(finished.finished_at.is_some());
+        assert_eq!(finished.workspace_id.as_deref(), Some("ws-42"));
+    }
+
+    #[test]
+    fn automation_runs_are_listed_newest_fire_first() {
+        let db = init_test_database();
+        let a = db.insert_automation(&sample_automation("Ordering")).unwrap();
+        db.record_automation_run(a.id, "succeeded", "2026-01-01T09:00:00Z", None, None)
+            .unwrap();
+        db.record_automation_run(a.id, "succeeded", "2026-01-03T09:00:00Z", None, None)
+            .unwrap();
+        db.record_automation_run(a.id, "succeeded", "2026-01-02T09:00:00Z", None, None)
+            .unwrap();
+
+        let runs = db.list_automation_runs(a.id, 10);
+        let order: Vec<&str> = runs.iter().map(|r| r.scheduled_for.as_str()).collect();
+        assert_eq!(
+            order,
+            vec![
+                "2026-01-03T09:00:00Z",
+                "2026-01-02T09:00:00Z",
+                "2026-01-01T09:00:00Z",
+            ]
+        );
     }
 }

@@ -345,6 +345,108 @@ fn register_tools() -> Vec<McpTool> {
                 }
             }),
         },
+        // -- Automation tools --
+        McpTool {
+            name: "automation_list",
+            description: "List all automations (scheduled agent runs) for the signed-in user.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        McpTool {
+            name: "automation_get",
+            description: "Get a single automation by id, including its prompt and schedule.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Automation id" }
+                },
+                "required": ["id"]
+            }),
+        },
+        McpTool {
+            name: "automation_create",
+            description: "Create an automation: a named prompt + agent that runs on a schedule. The schedule is an RFC 5545 recurrence.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Short human-readable name" },
+                    "prompt": { "type": "string", "description": "The instruction the agent runs each time it fires" },
+                    "agent": { "type": "string", "description": "Agent to run, e.g. \"claude\" or \"codex\"" },
+                    "schedule": { "type": "string", "description": "RFC 5545 recurrence: a DTSTART line and one RRULE line joined by a newline, e.g. \"DTSTART:20260101T090000Z\\nRRULE:FREQ=DAILY\"" },
+                    "timezone": { "type": "string", "description": "IANA timezone name, e.g. \"America/New_York\". Defaults to \"UTC\"" },
+                    "host_id": { "type": "integer", "description": "Target host id (from the Hosts list). Optional — may be assigned later" },
+                    "project_path": { "type": "string", "description": "Absolute path of the repository the run operates in (optional)" },
+                    "retention_limit": { "type": "integer", "description": "How many completed run worktrees the host keeps (1-1000, default 10)" }
+                },
+                "required": ["name", "prompt", "agent", "schedule"]
+            }),
+        },
+        McpTool {
+            name: "automation_update",
+            description: "Update an existing automation. All editable fields must be supplied — this replaces them.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Automation id" },
+                    "name": { "type": "string" },
+                    "prompt": { "type": "string" },
+                    "agent": { "type": "string" },
+                    "schedule": { "type": "string", "description": "RFC 5545 recurrence (DTSTART + RRULE)" },
+                    "timezone": { "type": "string", "description": "IANA timezone name" },
+                    "host_id": { "type": "integer" },
+                    "project_path": { "type": "string" },
+                    "retention_limit": { "type": "integer" }
+                },
+                "required": ["id", "name", "prompt", "agent", "schedule"]
+            }),
+        },
+        McpTool {
+            name: "automation_delete",
+            description: "Delete an automation. Run history is retained.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Automation id" }
+                },
+                "required": ["id"]
+            }),
+        },
+        McpTool {
+            name: "automation_pause",
+            description: "Pause an automation so it stops firing until resumed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Automation id" }
+                },
+                "required": ["id"]
+            }),
+        },
+        McpTool {
+            name: "automation_resume",
+            description: "Resume a paused automation. The next fire time is recomputed from now, so no missed runs are replayed.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "Automation id" }
+                },
+                "required": ["id"]
+            }),
+        },
+        McpTool {
+            name: "automation_runs",
+            description: "List the run history of an automation, newest fire first.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "automation_id": { "type": "integer", "description": "Automation id" },
+                    "limit": { "type": "integer", "description": "Max rows to return (1-100, default 20)" }
+                },
+                "required": ["automation_id"]
+            }),
+        },
         // -- Pane tools --
         McpTool {
             name: "pane_list",
@@ -997,6 +1099,56 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             call_socket("create_workspace", params).await
         }
 
+        // -- Automation tools --
+        "automation_list" => call_socket("automation_list", json!({})).await,
+        "automation_get" => {
+            call_socket("automation_get", json!({ "id": arguments.get("id") })).await
+        }
+        "automation_create" => {
+            call_socket(
+                "automation_create",
+                json!({ "input": automation_input_from_args(&arguments) }),
+            )
+            .await
+        }
+        "automation_update" => {
+            call_socket(
+                "automation_update",
+                json!({
+                    "id": arguments.get("id"),
+                    "input": automation_input_from_args(&arguments),
+                }),
+            )
+            .await
+        }
+        "automation_delete" => {
+            call_socket("automation_delete", json!({ "id": arguments.get("id") })).await
+        }
+        "automation_pause" => {
+            call_socket(
+                "automation_set_enabled",
+                json!({ "id": arguments.get("id"), "enabled": false }),
+            )
+            .await
+        }
+        "automation_resume" => {
+            call_socket(
+                "automation_set_enabled",
+                json!({ "id": arguments.get("id"), "enabled": true }),
+            )
+            .await
+        }
+        "automation_runs" => {
+            call_socket(
+                "automation_runs",
+                json!({
+                    "automation_id": arguments.get("automation_id"),
+                    "limit": arguments.get("limit"),
+                }),
+            )
+            .await
+        }
+
         // -- Pane tools --
         "pane_list" => {
             call_socket("get_app_state", json!({})).await.map(|data| {
@@ -1265,6 +1417,30 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             }),
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Automation argument helper
+// ---------------------------------------------------------------------------
+
+/// Assemble the `AutomationInput` object the control socket expects from
+/// the flat arguments an MCP `automation_create` / `automation_update`
+/// call provides. Missing optional fields fall back to sensible
+/// defaults; the control handler runs the authoritative validation.
+fn automation_input_from_args(arguments: &Value) -> Value {
+    json!({
+        "name": arguments.get("name").and_then(Value::as_str).unwrap_or_default(),
+        "prompt": arguments.get("prompt").and_then(Value::as_str).unwrap_or_default(),
+        "agent": arguments.get("agent").and_then(Value::as_str).unwrap_or("claude"),
+        "schedule": arguments.get("schedule").and_then(Value::as_str).unwrap_or_default(),
+        "timezone": arguments.get("timezone").and_then(Value::as_str).unwrap_or("UTC"),
+        "host_id": arguments.get("host_id").and_then(Value::as_i64),
+        "project_path": arguments.get("project_path").and_then(Value::as_str),
+        "retention_limit": arguments
+            .get("retention_limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(10),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1603,10 +1779,10 @@ mod tests {
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
         // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
-        // issue tools: workspace_close, pane_close, issue_list,
-        // issue_get, issue_link_workspace. Keep this number in sync
-        // with register_tools() when adding new entries.
-        assert_eq!(tools.len(), 44);
+        // issue tools, then 44 → 52 with the eight automation tools.
+        // Keep this number in sync with register_tools() when adding
+        // new entries.
+        assert_eq!(tools.len(), 52);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
@@ -1614,6 +1790,10 @@ mod tests {
         assert!(names.contains(&"browser_screenshot"));
         assert!(names.contains(&"workspace_list"));
         assert!(names.contains(&"workspace_info"));
+        assert!(names.contains(&"automation_list"));
+        assert!(names.contains(&"automation_create"));
+        assert!(names.contains(&"automation_pause"));
+        assert!(names.contains(&"automation_runs"));
         assert!(names.contains(&"pane_list"));
         assert!(names.contains(&"notify"));
         assert!(names.contains(&"git_status"));
@@ -1749,11 +1929,10 @@ mod tests {
         let resp = dispatch(req).await.unwrap();
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        // Bumped from 39 → 44 with the Phase 1.6 lifecycle + issue
-        // tools (workspace_close, pane_close, issue_list, issue_get,
-        // issue_link_workspace). See tool_registry_has_all_tools for
-        // the canonical count.
-        assert_eq!(tools.len(), 44);
+        // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
+        // then 44 → 52 with the eight automation tools. See
+        // tool_registry_has_all_tools for the canonical count.
+        assert_eq!(tools.len(), 52);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

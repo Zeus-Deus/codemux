@@ -10,6 +10,7 @@ import type {
   ThemeColors,
   UserSettings,
 } from "./types";
+import type { AutomationRunView } from "./commands";
 
 export type EventCallback<T> = (payload: T) => void;
 
@@ -27,6 +28,11 @@ export const onTerminalStatus = (cb: EventCallback<TerminalStatusPayload>): Prom
 
 export const onSerializeTerminalBuffers = (cb: EventCallback<null>): Promise<UnlistenFn> =>
   listen<null>("serialize-terminal-buffers", () => cb(null));
+
+/** Fired by the automation scheduler each time a due automation
+ *  produces a run. The payload is the freshly-created run row. */
+export const onAutomationFire = (cb: EventCallback<AutomationRunView>): Promise<UnlistenFn> =>
+  listen<AutomationRunView>("automations://fire", (e) => cb(e.payload));
 
 export const emitScrollbackSerializationComplete = () =>
   emit("scrollback-serialization-complete");
