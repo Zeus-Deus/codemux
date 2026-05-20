@@ -8,9 +8,9 @@
 
 ## Current Headline
 
-Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released tag is `v0.2.5`.
+Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released version is `v0.5.0`.
 
-The biggest change since the last reindex pass is **Step 13 Beta Features**: the agent-chat surface (Step 6–12: chat pane, multi-provider model picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) is implemented and merged to `main` but **OFF by default**. Users opt in via Settings → Beta Features, which flips both `enable_agent_chat` and `enable_lazy_workspace_creation` together. The legacy main-branch experience (preset bar, terminal panes, empty-state splash) is preserved for users who don't opt in.
+Since the last reindex pass the agent-chat surface (Step 6–12: chat pane, multi-provider picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) remains merged to `main` and Beta-gated; the **persistent PTY daemon** is now the default spawn path (every shell survives app close, the env-var escape hatch is the only off-switch), the **SSH workspace-push** action that was deferred in step 2d has landed (push a worktree to a user-owned host with Claude conversation sync), and the right sidebar + Settings panel have been redesigned to a **refined-minimal aesthetic** to match the rest of the app. The MCP server inventory has grown from 31 to **44 tools** across the Phase 1 / 1.5 / 1.6 vexis-agent integration steps.
 
 OpenFlow and the browser pane are still being hardened. OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
 
@@ -30,6 +30,7 @@ The repo structure is clean and domain-split:
 - Pane splits, resize, drag-swap, close
 - **Terminal pane persistence across workspace switch**: xterm.js `Terminal` instance + PTY-output channel survive component unmount via the module-level cache in `src/components/terminal/terminal-cache.ts`. Workspace switches reparent the wrapper into a hidden parking node instead of disposing, so alt-screen TUIs (Claude Code, lazygit, btop, vim) keep rendering correctly on return. Disposal is driven by AppState diffs in `useTerminalCacheGc` so close-pane / close-tab / close-workspace / PTY-exit all reach `disposeTerminal`.
 - **Session persistence**: terminal scrollback save/restore across restarts (Windows-only backend backstop in `scrollback::flush_cache_to_disk`), adapter-based resume for CLI tools (Claude Code `--resume`/`--continue` via hook-captured session IDs)
+- **Persistent PTY daemon** (`pty_daemon::server` + `client` + `supervisor` + `manifest`): every shell spawn now routes through a detached `codemux pty-daemon` subprocess so agents survive app close. On relaunch the supervisor adopts the running daemon and reattaches live sessions. **Default-on**, no setting; `CODEMUX_DISABLE_PTY_DAEMON=1` is the only escape hatch. Graceful fallback to the in-process portable-pty path on every error site, plus a 3-failures-in-60s crash circuit breaker that disables the daemon path for the rest of the process lifetime. Unix only; Windows still uses the in-process path until the named-pipe IPC is wired.
 
 ### Git & GitHub
 - Git worktree-based workspaces (create from new/existing branch, import orphans, derivative-branch picker with recency)
@@ -37,6 +38,7 @@ The repo structure is clean and domain-split:
 - Full-pane diff viewer tab (unified/split layouts, section filters incl. `against_base`, hunk/file navigation, focus mode)
 - Review tab (renamed from PR tab, React Query refactor): PR creation, header, reviews, checks, deployments, merge controls
 - Sidebar PR status icon per workspace with stale-clearing on branch switch and DRAFT collapse
+- **Default-branch detection** drives the sidebar branch pill: seed from `origin/HEAD`, follow live remote-branch changes, and the derivative-branch picker drops the phantom `origin/<name>` rows so users never pick a remote-only ref by accident
 - "Checkout default branch" workspace action
 - Git sidebar enrichment (branch, ahead/behind, diff stats, PR badge) with non-blocking activate + visibility-based gate
 - Sidebar ahead/behind arrows refresh against fresh remote refs
@@ -83,6 +85,7 @@ The repo structure is clean and domain-split:
 - Workspace alerts with severity levels
 - Desktop notification toast + chime when an off-screen agent finishes
 - Notification sound playback wired on all three platforms (Linux: `paplay` + freedesktop `complete.oga`; macOS: `afplay` + Glass.aiff; Windows: PowerShell SystemSounds)
+- **Per-worktree mute** (`set_workspace_muted` + sidebar context-menu toggle): silences agent-completion notifications for a specific workspace without touching global sound state; muted state surfaces as a sidebar row icon
 
 ### Auth & sync
 - GitHub OAuth, email/password with email verification, encrypted token storage (AES-256-GCM, machine-bound key)
@@ -110,6 +113,8 @@ The repo structure is clean and domain-split:
 - Sans-serif chrome (DM Sans), monospace terminals
 - Terminal colors fully theme-reactive via CSS variables + MutationObserver
 - Fallback Tokyonight-inspired theme when Omarchy unavailable
+- **Refined-minimal sidebar redesign**: slim Changes panel + ADE-native right sidebar, consolidated title-bar menu into the sidebar footer, aligned preset-bar icons + tab-bar drop indicator, sidebar workspace rows redesigned with new hover/active states
+- **Refined-minimal Settings panel**: every section now uses shared primitives, back-button hit area widened, panel layout matches the sidebar aesthetic
 
 ### Agent Chat (Beta — opt-in via Settings → Beta Features)
 - Full multi-provider chat pane with streaming, approvals, mode pills (Ask / Allow always / Plan / Debug), and permission-mode restart
@@ -129,13 +134,14 @@ The repo structure is clean and domain-split:
 
 ### Infrastructure
 - Global overlay manager (single overlay at a time)
-- MCP server exposing 31 tools via JSON-RPC 2.0 (browser, workspace, pane, git, notification, viewport presets)
+- MCP server exposing **44 tools** via JSON-RPC 2.0 (browser tier 1/2/3 + info + viewport, workspace incl. open/close, pane incl. close, git, notification, terminal read/write, app_status, port_list, worktree_create, preset_apply/list, issue_list/get/link_workspace — Phase 1, 1.5, and 1.6 vexis-agent integration tools all merged)
 - CLI and socket control (Unix socket on Linux/macOS, named pipe on Windows). Control-endpoint errors now surface instead of being swallowed.
 - Per-workspace display isolation (X11/Wayland sandboxing for agent-spawned GUI apps — opt-in for human persona, default-on for agent persona)
 - Local project memory (`codemux memory show/set/add`, `codemux handoff`)
 - Auto-update via Tauri updater (Linux AppImage + Windows NSIS, signed with the same Ed25519 key, shared `latest.json`)
 - Onboarding skip affordance + re-trap fix
 - Dev builds isolated from installed release (separate data dirs)
+- **Remote hosts + workspace push**: Settings → Hosts with real `hosts_test_connection` probe + `hosts_bootstrap_install` install flow, slim `codemux-remote` server binary (`[[bin]] codemux_remote.rs`), and SSH transport (`ssh::probe`/`bootstrap`/`tunnel`/`tunnel_supervisor`/`push`/`registry`) so a workspace can be pushed to a user-owned SSH host. Push synchronizes the worktree, spawns the remote daemon, attaches the local UI through an SSH-forwarded socket, and **syncs the Claude conversation** across local/remote ends. `WorkspaceSnapshot.host_id` + shared `<DevicePicker>` pill wires the host selection into the new-workspace dialog.
 
 ### Performance
 - High-frequency app-state emits coalesced into 16 ms windows
@@ -167,7 +173,7 @@ The repo structure is clean and domain-split:
 
 ## Windows Support
 
-Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.2.5`.
+Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.5.0`.
 
 What's in place:
 

@@ -78,6 +78,10 @@ png = "0.17"
 # Cross-platform process + system metrics for the resource monitor.
 # Powers per-terminal CPU/memory aggregation in resource_metrics.rs.
 sysinfo = "0.33"
+# RFC 5545 recurrence-rule engine for the Automations feature. Parses
+# an iCalendar DTSTART+RRULE block and computes the next occurrence
+# with IANA-timezone / DST correctness. Used by automations::recurrence.
+rrule = "0.14"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

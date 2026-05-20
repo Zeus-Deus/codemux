@@ -13,6 +13,8 @@ pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;
 pub mod auth;
+pub mod automations;
+pub mod automations_sync;
 pub mod branch_name;
 pub mod json_rpc_child;
 pub mod mcp_server;
@@ -860,6 +862,99 @@ pub fn run() {
             // Errors are intentionally swallowed: repos without remotes,
             // transient offline state, and rejected creds are routine and
             // shouldn't pollute the log on every tick.
+
+            // ── Automation scheduler ──
+            //
+            // Evaluates the automation schedule once a minute.
+            // `automations::scheduler::tick` records a run row for every
+            // due automation and advances its `next_run_at`; each
+            // freshly-fired run is emitted as an `automations://fire`
+            // event so the frontend executor can create the workspace
+            // and start the agent. This is the desktop's scheduler —
+            // remote hosts run the same `tick` via the
+            // `codemux-remote scheduler` subcommand.
+            let scheduler_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Recover runs orphaned by a previous crash or quit
+                // before the first tick — a run stuck `running` would
+                // otherwise keep its automation `skipped_busy` forever.
+                {
+                    let db: tauri::State<'_, database::DatabaseStore> =
+                        scheduler_handle.state();
+                    let ceiling = (chrono::Utc::now()
+                        - chrono::Duration::hours(6))
+                    .to_rfc3339();
+                    let reconciled = db.reconcile_stale_runs(&ceiling);
+                    if reconciled > 0 {
+                        eprintln!(
+                            "[codemux::scheduler] reconciled {reconciled} stale run(s)"
+                        );
+                    }
+                }
+                // Pull the automation registry from the account once at
+                // startup so this device sees automations created
+                // elsewhere.
+                commands::automations::schedule_automations_sync(
+                    scheduler_handle.clone(),
+                );
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    automations::scheduler::TICK_INTERVAL_SECS,
+                ));
+                // `interval`'s first tick is immediate — consume it so
+                // the first real evaluation happens one interval in,
+                // after the app has settled.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    // Pull registry changes from the user's other
+                    // devices on every tick so the local list stays
+                    // fresh; the in-progress guard collapses overlap.
+                    commands::automations::schedule_automations_sync(
+                        scheduler_handle.clone(),
+                    );
+                    // Evaluate the schedule, then resolve each fired run
+                    // to its automation. Both are short, synchronous DB
+                    // touches scoped so the `State` borrow never crosses
+                    // an await.
+                    let fired: Vec<(
+                        database::AutomationRecord,
+                        database::AutomationRunRecord,
+                    )> = {
+                        let db: tauri::State<'_, database::DatabaseStore> =
+                            scheduler_handle.state();
+                        // `local_only = true`: the desktop runs only
+                        // automations targeting this machine; a
+                        // host-assigned automation is its host's job.
+                        automations::scheduler::tick(&db, chrono::Utc::now(), true)
+                            .into_iter()
+                            .filter_map(|run| {
+                                db.get_automation(run.automation_id)
+                                    .map(|automation| (automation, run))
+                            })
+                            .collect()
+                    };
+                    for (automation, run) in fired {
+                        // Surface the fire to any open window…
+                        if let Err(error) =
+                            scheduler_handle.emit("automations://fire", &run)
+                        {
+                            eprintln!(
+                                "[codemux::scheduler] failed to emit fire event: {error}"
+                            );
+                        }
+                        // …and execute it: create a worktree and run
+                        // the agent, recording the terminal status.
+                        tauri::async_runtime::spawn(
+                            automations::executor::execute_run(
+                                scheduler_handle.clone(),
+                                automation,
+                                run,
+                            ),
+                        );
+                    }
+                }
+            });
+
             let fetch_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const TICK_SECS: u64 = 60;
@@ -1457,6 +1552,14 @@ pub fn run() {
             commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,
+            commands::automations_list,
+            commands::automations_get,
+            commands::automations_create,
+            commands::automations_update,
+            commands::automations_set_enabled,
+            commands::automations_delete,
+            commands::automations_runs,
+            commands::automations_check_repo_access,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

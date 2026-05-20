@@ -1595,6 +1595,112 @@ export const hostsTestConnection = (id: number) =>
 export const hostsBootstrapInstall = (id: number, uname: string) =>
   invoke<HostBootstrapResult>("hosts_bootstrap_install", { id, uname });
 
+// ── Automations (scheduled agent runs) ──
+//
+// An automation is a named prompt + agent + recurrence. `schedule` is a
+// complete RFC 5545 iCalendar block (a DTSTART line plus one RRULE
+// line). `dirty` flags unpushed changes for a future account-sync.
+export interface AutomationView {
+  id: number;
+  server_id: string | null;
+  name: string;
+  prompt: string;
+  agent: string;
+  schedule: string;
+  timezone: string;
+  host_id: number | null;
+  project_path: string | null;
+  /** The project's git remote URL — how a remote host clones the repo.
+   *  Resolved server-side from the chosen project. */
+  project_remote: string | null;
+  enabled: boolean;
+  retention_limit: number;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  /** Status of the most recent run — drives the list health dot.
+   *  `null` until the automation has fired. */
+  last_run_status: string | null;
+  created_at: string;
+  updated_at: string;
+  dirty: boolean;
+}
+
+/** Result of probing whether a host can reach an automation's repo. */
+export interface RepoAccessResult {
+  ok: boolean;
+  message: string;
+}
+
+/** One fire of an automation (or a skipped fire). `status` is one of
+ *  `scheduled | running | succeeded | failed | skipped_offline |
+ *  skipped_busy`. */
+export interface AutomationRunView {
+  id: number;
+  automation_id: number;
+  status: string;
+  scheduled_for: string;
+  started_at: string | null;
+  finished_at: string | null;
+  host_id: number | null;
+  workspace_id: string | null;
+  /** The branch the run's worktree was created on. */
+  branch: string | null;
+  /** URL of the pull request the run opened, if any. */
+  pr_url: string | null;
+  error: string | null;
+  created_at: string;
+}
+
+/** Editable fields of an automation, shared by create and update.
+ *  `project_remote` is resolved server-side from `project_path`; the
+ *  UI may omit it. */
+export interface AutomationInput {
+  name: string;
+  prompt: string;
+  agent: string;
+  schedule: string;
+  timezone: string;
+  host_id: number | null;
+  project_path: string | null;
+  project_remote?: string | null;
+  retention_limit: number;
+}
+
+export const automationsList = () =>
+  invoke<AutomationView[]>("automations_list");
+
+export const automationsGet = (id: number) =>
+  invoke<AutomationView>("automations_get", { id });
+
+export const automationsCreate = (input: AutomationInput) =>
+  invoke<AutomationView>("automations_create", { input });
+
+export const automationsUpdate = (id: number, input: AutomationInput) =>
+  invoke<AutomationView>("automations_update", { id, input });
+
+export const automationsSetEnabled = (id: number, enabled: boolean) =>
+  invoke<AutomationView>("automations_set_enabled", { id, enabled });
+
+export const automationsDelete = (id: number) =>
+  invoke<void>("automations_delete", { id });
+
+export const automationsRuns = (automationId: number, limit?: number) =>
+  invoke<AutomationRunView[]>("automations_runs", { automationId, limit });
+
+/** Probe whether a host can reach a project's repo (a read-only
+ *  `git ls-remote`). `hostId` null = "This machine" (always reachable).
+ *  Pass `projectRemote` when known, else `projectPath` to resolve it. */
+export const automationsCheckRepoAccess = (
+  hostId: number | null,
+  projectPath: string | null,
+  projectRemote: string | null,
+) =>
+  invoke<RepoAccessResult>("automations_check_repo_access", {
+    hostId,
+    projectPath,
+    projectRemote,
+  });
+
 export interface WorkspacePushOutcome {
   ok: boolean;
   message: string;

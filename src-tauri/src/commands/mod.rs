@@ -1,6 +1,7 @@
 pub mod agent_chat;
 pub mod ai;
 pub mod auth;
+pub mod automations;
 pub mod branch_name;
 pub mod browser;
 pub mod database;
@@ -25,6 +26,7 @@ pub mod workspace;
 pub use agent_chat::*;
 pub use ai::*;
 pub use auth::*;
+pub use automations::*;
 pub use branch_name::*;
 pub use browser::*;
 pub use database::*;

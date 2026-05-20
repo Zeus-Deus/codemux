@@ -25,6 +25,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - `docs/features/*`: current subsystem capability and constraints
 - `docs/reference/*`: stable protocol and command references
 - `docs/plans/*`: active implementation notes and next steps
+- `docs/research/*`: supporting research feeding a specific plan in `docs/plans/`
 - `docs/archive/*`: superseded notes kept for context
 
 ## Current Entry Points
@@ -41,7 +42,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
-- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`
+- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
@@ -53,8 +54,9 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
-- Persistent agents (PTY daemon — step 1 of cloud push): `docs/features/persistent-agents.md`
-- Remote hosts (DevicePicker + codemux-remote + SSH transport — steps 2b/2c/2d of cloud push): `docs/features/remote-hosts.md`
+- Persistent agents (PTY daemon — now the default spawn path, no setting): `docs/features/persistent-agents.md`
+- Remote hosts (DevicePicker + codemux-remote + SSH transport + workspace push action): `docs/features/remote-hosts.md`
+- Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`
@@ -96,6 +98,7 @@ The maintained docs system now lives entirely in:
 - `docs/core/*`
 - `docs/features/*`
 - `docs/plans/*`
+- `docs/research/*`
 - `docs/reference/*`
 - `docs/archive/*`
 - `docs/templates/*` as helper starting points for new docs

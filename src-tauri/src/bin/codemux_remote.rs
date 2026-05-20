@@ -69,6 +69,11 @@ enum Command {
         #[arg(long)]
         socket: PathBuf,
     },
+    /// Run the automation scheduler: poll the account for this host's
+    /// automations, fire those that are due, and run the agent. Meant
+    /// to run as a persistent user service (systemd / launchd),
+    /// registered by the laptop's host bootstrap.
+    Scheduler,
     /// Print version info as JSON. The laptop's bootstrap probe uses
     /// this to confirm a working installation before attempting a
     /// daemon start.
@@ -92,6 +97,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Command::PtyDaemon { socket }) => run_daemon(socket),
+        Some(Command::Scheduler) => run_scheduler(),
     }
 }
 
@@ -120,6 +126,124 @@ fn run_daemon(socket: PathBuf) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Run the automation scheduler loop on this host.
+///
+/// Same `scheduler::tick` + `executor` the desktop runs, but driven
+/// against this host's own database with no Tauri runtime. Automations
+/// reach this host's database via `automations_sync::pull` (host-scoped
+/// by the bootstrap-provisioned token); until the account API is
+/// deployed the pull is a harmless 404 skip and the loop simply ticks
+/// whatever is already local.
+#[cfg(unix)]
+fn run_scheduler() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("[codemux-remote] tokio runtime: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    runtime.block_on(scheduler_loop())
+}
+
+#[cfg(unix)]
+async fn scheduler_loop() -> ExitCode {
+    use codemux_lib::automations::{executor, scheduler};
+
+    let db = match codemux_lib::database::init_database() {
+        Ok(db) => db,
+        Err(error) => {
+            eprintln!("[codemux-remote] database: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    // Recover runs orphaned by a previous crash before the first tick.
+    let ceiling = (chrono::Utc::now() - chrono::Duration::hours(6)).to_rfc3339();
+    let reconciled = db.reconcile_stale_runs(&ceiling);
+    if reconciled > 0 {
+        eprintln!("[codemux-remote] reconciled {reconciled} stale run(s)");
+    }
+
+    let token = read_scheduler_token();
+    if token.is_none() {
+        eprintln!(
+            "[codemux-remote] no scheduler token found; running only \
+             automations already in the local database"
+        );
+    }
+    // This host's own server id, written by the laptop's bootstrap.
+    // It scopes the account pull so this host only receives — and only
+    // runs — the automations routed to it.
+    let host_id = read_scheduler_host();
+    if token.is_some() && host_id.is_none() {
+        eprintln!(
+            "[codemux-remote] no host identity found; the account pull \
+             cannot be host-scoped — skipping it to avoid running other \
+             hosts' automations"
+        );
+    }
+    eprintln!("[codemux-remote] automation scheduler started");
+
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+        scheduler::TICK_INTERVAL_SECS,
+    ));
+    ticker.tick().await; // consume the immediate first tick
+
+    loop {
+        ticker.tick().await;
+
+        // Pull this host's automations from the account, scoped to
+        // this host's id. Only runs when both the token and the host
+        // identity are present — an unscoped pull would deliver other
+        // hosts' automations and run them here.
+        if let (Some(token), Some(host_id)) = (&token, &host_id) {
+            if let Err(error) =
+                codemux_lib::automations_sync::pull(token, &db, Some(host_id)).await
+            {
+                eprintln!("[codemux-remote] automation pull failed: {error}");
+            }
+        }
+
+        // `local_only = false`: a host scheduler runs every automation
+        // its database holds (the account query is already host-scoped).
+        let fired = scheduler::tick(&db, chrono::Utc::now(), false);
+        for run in fired {
+            if let Some(automation) = db.get_automation(run.automation_id) {
+                let _ = db.mark_automation_run_started(run.id);
+                let outcome = executor::run_fire(&automation).await;
+                executor::apply_outcome(&db, run.id, &outcome);
+            }
+        }
+    }
+}
+
+/// Read the scheduler token the laptop's bootstrap writes to
+/// `~/.local/share/codemux/scheduler-token`. `None` when absent.
+#[cfg(unix)]
+fn read_scheduler_token() -> Option<String> {
+    read_scheduler_file("scheduler-token")
+}
+
+/// Read this host's own server id, written by bootstrap to
+/// `~/.local/share/codemux/scheduler-host`. `None` when absent.
+#[cfg(unix)]
+fn read_scheduler_host() -> Option<String> {
+    read_scheduler_file("scheduler-host")
+}
+
+#[cfg(unix)]
+fn read_scheduler_file(name: &str) -> Option<String> {
+    let path = dirs::data_dir()?.join("codemux").join(name);
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|contents| contents.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 // The pre-existing `#[cfg(not(unix))] fn run_daemon` stub used

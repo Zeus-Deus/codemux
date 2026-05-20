@@ -6,6 +6,7 @@ import { useSkillsSync } from "@/hooks/use-skills-sync";
 import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
 import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
+import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { AppShell } from "@/components/layout/app-shell";
 import { Toaster } from "@/components/ui/sonner";
 import { UpdateToast } from "@/components/update/update-toast";
@@ -63,6 +64,7 @@ function App() {
   useEnsureDraftWhenEmpty();
   useTerminalCacheGc();
   useTerminalThemeSync();
+  useAutomationFireToast();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;

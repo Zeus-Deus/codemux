@@ -115,6 +115,8 @@
 - Desktop notifications via system notification daemon (notify-rust)
 - Desktop notification triggers window focus, raise, and Hyprland window manager integration
 - Notification sound toggle in sidebar footer
+- **Per-worktree mute** (right-click → "Mute notifications"): silences agent-completion notifications for one workspace; muted state shows a bell-off icon in the sidebar row
+- Agent status indicators (red/amber/green dots) light up for Claude, Codex, Gemini, OpenCode, and Pi sessions
 - Global toast notices for errors and status messages (bottom-right)
 
 ## Project Memory
@@ -196,10 +198,13 @@
 
 ## MCP Server (Codemux as server)
 
-- JSON-RPC 2.0 MCP server over stdio transport (31 tools)
+- JSON-RPC 2.0 MCP server over stdio transport (**44 tools**)
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace, pane, notification, and git tools for agent self-orchestration
 - Browser viewport presets (`browser_viewport`, `browser_viewport_presets`)
+- Phase 1 vexis-agent tools: `terminal_write`, `terminal_read`, `workspace_open`, `app_status`, `port_list`
+- Phase 1.5 vexis-agent tools: `worktree_create`, `preset_apply`, `preset_list`
+- Phase 1.6 vexis-agent lifecycle + issue tools: `workspace_close`, `pane_close`, `issue_list`, `issue_get`, `issue_link_workspace`
 - Auto-configuration for Claude Code and Claude Desktop
 - Launched via `codemux mcp`
 
@@ -281,6 +286,22 @@
 - Server-synced settings with offline cache
 - Workspace-level project config (setup/teardown scripts, worktree includes)
 - Beta Features section that flips the Step 13 agent-chat toggle (controls `enable_agent_chat` and `enable_lazy_workspace_creation` together)
+
+## Remote Hosts + Workspace Push
+
+- Settings → Hosts pane with SSH probe + bootstrap-install consent modal
+- Slim `codemux-remote` server binary (bundled per-target into the laptop app) installs to `~/.local/bin/` on the host
+- SSH transport: probe → bootstrap → tunnel → tunnel supervisor with auto-reconnect
+- `WorkspaceSnapshot.host_id` model + shared `<DevicePicker>` pill component wired into the new-workspace dialog
+- **Push workspace to host** action: rsync the worktree, spawn the remote daemon, attach the local UI through an SSH-forwarded socket, and sync the Claude conversation across local/remote ends
+
+## Persistent Agents
+
+- Every shell spawn runs inside a detached `codemux pty-daemon` subprocess so agents survive app close
+- Supervisor adopts the running daemon on relaunch and reattaches live sessions (alt-screen TUIs and CLI agents resume in-place)
+- Default-on, no setting; `CODEMUX_DISABLE_PTY_DAEMON=1` is the only escape hatch
+- Graceful fallback to in-process portable-pty at every error site; 3-failures-in-60s crash circuit breaker
+- Unix only (Linux + macOS); Windows still uses the in-process path until the named-pipe IPC is wired
 
 ## CLI / Socket Control
 

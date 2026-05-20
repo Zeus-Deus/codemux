@@ -345,6 +345,127 @@ async fn run_capture_with_timeout(
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
+/// Provision the automation scheduler on a freshly-bootstrapped host.
+///
+/// Writes the scheduler auth token + this host's server id, installs a
+/// systemd **user** service running `codemux-remote scheduler`, and
+/// enables it with lingering so it survives logout and reboots.
+///
+/// Best-effort by contract: the caller treats a failure as non-fatal —
+/// a host's push-workspace capability does not depend on the scheduler,
+/// and not every host runs systemd.
+pub async fn provision_scheduler(
+    ssh_target: &str,
+    remote_install_path: &str,
+    token: &str,
+    host_server_id: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    use crate::automations::service;
+
+    // Token + host-identity files. `umask 077` lands them 0600 — the
+    // token is account-bearing.
+    ssh_write_file(
+        ssh_target,
+        "~/.local/share/codemux/scheduler-token",
+        token,
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("writing scheduler token: {e}"))?;
+    ssh_write_file(
+        ssh_target,
+        "~/.local/share/codemux/scheduler-host",
+        host_server_id,
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("writing host identity: {e}"))?;
+
+    // systemd user unit. `~` in the install path becomes `%h` so the
+    // unit's ExecStart is an absolute path systemd will accept.
+    let exec_path = remote_install_path.replacen('~', "%h", 1);
+    let unit = service::systemd_unit(&exec_path);
+    ssh_write_file(
+        ssh_target,
+        &format!("~/.config/systemd/user/{}", service::SYSTEMD_UNIT_NAME),
+        &unit,
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("writing systemd unit: {e}"))?;
+
+    // Enable lingering (so the service runs without an active login)
+    // and start the unit.
+    run_with_timeout(
+        Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(ssh_target)
+            .arg(format!(
+                "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
+                 systemctl --user daemon-reload && \
+                 systemctl --user enable --now {}",
+                service::SYSTEMD_UNIT_NAME
+            )),
+        deadline,
+    )
+    .await
+    .map_err(|e| format!("enabling the scheduler service: {e}"))
+}
+
+/// `ssh <target> 'umask 077; mkdir -p <dir>; cat > <path>'` with
+/// `content` streamed over stdin so a secret never appears in an
+/// argv the host's process list could expose.
+async fn ssh_write_file(
+    ssh_target: &str,
+    remote_path: &str,
+    content: &str,
+    deadline: Duration,
+) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(ssh_target)
+        .arg(format!(
+            "umask 077 && mkdir -p \"$(dirname {p})\" && cat > {p}",
+            p = remote_path
+        ))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(content.as_bytes())
+            .await
+            .map_err(|e| format!("failed to stream content: {e}"))?;
+        // `stdin` drops here, closing the pipe so `cat` sees EOF.
+    }
+
+    let out = timeout(deadline, child.wait_with_output())
+        .await
+        .map_err(|_| "operation timed out".to_string())?
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("exit status {}", out.status)
+        } else {
+            stderr
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -69,6 +69,14 @@ The Phase numbering above (1-18) is the original product roadmap. Step-numbered 
 
 ## Recently Completed
 
+- **Refined-minimal UI pass.** Sidebar redesigned (refined-minimal aesthetic), slim Changes panel + ADE-native right sidebar, settings panel aligned with shared primitives, title-bar menu consolidated into the sidebar footer, preset-bar icons + tab-bar drop indicator aligned, agent-chat composer polished (Local pill dropped, dev spawn button removed, sidebar "New agent" locked to home).
+- **Default-branch detection (`v0.5.0`).** Sidebar branch pill is seeded from `origin/HEAD` and follows live remote-branch changes; derivative-branch picker drops the phantom `origin/<name>` rows so a user can't pick a remote-only ref by accident.
+- **Per-worktree notification mute.** Right-click → "Mute notifications" on a sidebar workspace row toggles `notifications_muted`; muted state shows a bell-off icon and skips agent-completion notifications.
+- **Title-bar resource monitor.** CPU/memory monitor in the title bar with accurate per-process counting (no longer counts threads as processes).
+- **Hooks: agent status across Codex / Gemini / OpenCode / Pi.** Status indicators (red/amber/green dots) now light up for every supported provider, not just Claude. Claude idle reminder is filtered out so it no longer raises a phantom stuck-red dot.
+- **SSH workspace push with Claude conversation sync (`v0.4.0`–`v0.5.0`).** The "push workspace to host" action that was deferred in step 2d has landed: rsync the worktree, spawn the remote daemon, attach the local UI through the SSH-forwarded socket, and sync the Claude conversation across local/remote ends. New `ssh::push`, `ssh::registry`, `ssh::tunnel_supervisor` modules.
+- **Persistent PTY daemon promoted to default.** Every shell now spawns inside `codemux pty-daemon`; the setting was removed (only the `CODEMUX_DISABLE_PTY_DAEMON=1` panic-button env var remains). Agents survive app close, the supervisor adopts the running daemon on relaunch, and the 3-failures-in-60s crash circuit breaker disables the daemon path safely on regression.
+- **MCP server Phase 1 / 1.5 / 1.6 (vexis-agent integration).** Added `terminal_write`, `terminal_read`, `workspace_open`, `app_status`, `port_list` (Phase 1); `worktree_create`, `preset_apply`, `preset_list` (Phase 1.5); `workspace_close`, `pane_close`, `issue_list`, `issue_get`, `issue_link_workspace` (Phase 1.6). Tool count went 31 → 44.
 - **Browser stream stability fix (LANDED).** Unified port keying around `workspace_id`, PID-tracked daemons (was port-tracked), atomic teardown, symmetric `TcpListener::bind` bind probe, reactive `stream_url` reconnect on the frontend. Eliminates the silent stream failure that appeared after multiple concurrent worktrees used the browser. Plan archived at `docs/archive/browser-stream-fix.md`.
 - **Browser viewport presets.** `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` resizes the actual viewport via CDP so CSS media queries fire and screenshots capture at the simulated dimensions. MCP exposes `browser_viewport` + `browser_viewport_presets`.
 - **Performance pass** (`v0.2.3`–`v0.2.4`): high-frequency app-state emits coalesced into 16ms windows, `transition-all` scoped, markdown view + workspace-tied components stop re-rendering on every backend tick, workspace-switch mount-time IPC roundtrips cut, editor file read + language module import parallelised, worktree-include listener no longer re-attaches every tick, primitive fingerprint for `ensure-draft-when-empty` effect, all git/gh shell-outs moved off the GTK main thread.
@@ -85,7 +93,7 @@ The Phase numbering above (1-18) is the original product roadmap. Step-numbered 
 - Auto-update system (AppImage / NSIS in-app update, toast notification)
 - Built-in file editor with CodeMirror, syntax highlighting, markdown preview
 - AI merge conflict resolver with temp-branch safety model
-- MCP server for agent self-orchestration (31 tools via JSON-RPC 2.0)
+- MCP server for agent self-orchestration (44 tools via JSON-RPC 2.0, expanded through Phase 1 / 1.5 / 1.6 vexis-agent integration steps)
 - Settings panel (keyboard shortcuts, appearance, project scripts, beta features, sync, skills, MCP, permissions)
 - Auth system (GitHub OAuth, email/password, email verification, encrypted token storage)
 - Synced settings (per-user server-synced with offline cache)
