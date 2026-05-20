@@ -110,9 +110,16 @@ layers still to come.
   the remote into `~/.codemux/automation-repos/`, branching off a
   freshly-fetched `origin/<default>`. A run records its branch and any
   PR URL, so run history reads like a PR list.
-- **GitHub-access preflight.** "Test connection" on a host also probes
-  `git` and `gh auth status`, so a host that can't reach GitHub is
-  flagged at setup, not at the first 9am run.
+- **Preflight checks.** Two layers, both informational (neither blocks):
+  "Test connection" on a host probes `git` + `gh auth status`; and the
+  New Automation form (plus the detail view) runs a per-repo
+  `git ls-remote` over SSH — the canonical "can this host reach *this*
+  repository" probe — with a "Check again" affordance. A host that
+  can't reach the repo is flagged at setup, not at the first 9am run.
+- **Health at a glance.** Each automation in the list carries a dot
+  driven by its most recent run — green healthy, amber if the last run
+  failed, grey when paused. A misconfigured host self-heals: fix its
+  credentials and the next run clears the dot, no button required.
 - Coverage — 1471 Rust unit tests (recurrence, scheduler + tick + host
   routing, the executor incl. real-git clone/fetch/worktree-base,
   account sync, reconciler, service units, the preflight probe, database

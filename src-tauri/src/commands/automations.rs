@@ -43,6 +43,9 @@ pub struct AutomationView {
     pub retention_limit: i64,
     pub last_run_at: Option<String>,
     pub next_run_at: Option<String>,
+    /// Status of the most recent run — drives the at-a-glance health
+    /// dot in the list. `None` until the automation has fired.
+    pub last_run_status: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub dirty: bool,
@@ -65,11 +68,21 @@ impl From<AutomationRecord> for AutomationView {
             retention_limit: r.retention_limit,
             last_run_at: r.last_run_at,
             next_run_at: r.next_run_at,
+            // Populated by `list_automations_impl`; a bare conversion
+            // has no run data.
+            last_run_status: None,
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,
         }
     }
+}
+
+/// Result of probing whether a host can reach an automation's repo.
+#[derive(Debug, Serialize)]
+pub struct RepoAccessResult {
+    pub ok: bool,
+    pub message: String,
 }
 
 /// Resolve a project's `origin` remote URL — the GitHub backbone a host
@@ -170,7 +183,21 @@ fn refresh_next_run(db: &DatabaseStore, id: i64, schedule: &str) -> Result<(), S
 // `#[tauri::command]` wrappers below are thin adapters over them.
 
 pub fn list_automations_impl(db: &DatabaseStore) -> Vec<AutomationView> {
-    db.list_automations().into_iter().map(Into::into).collect()
+    db.list_automations()
+        .into_iter()
+        .map(|record| {
+            // Stamp the latest run's status so the list can show a
+            // health dot without the frontend fetching per-row history.
+            let last_run_status = db
+                .list_automation_runs(record.id, 1)
+                .into_iter()
+                .next()
+                .map(|run| run.status);
+            let mut view: AutomationView = record.into();
+            view.last_run_status = last_run_status;
+            view
+        })
+        .collect()
 }
 
 pub fn get_automation_impl(db: &DatabaseStore, id: i64) -> Result<AutomationView, String> {
@@ -318,4 +345,142 @@ pub fn automations_runs(
     limit: Option<u32>,
 ) -> Vec<AutomationRunRecord> {
     list_automation_runs_impl(db.inner(), automation_id, limit)
+}
+
+// ── Repo-access preflight ──
+//
+// `git ls-remote` does a real authentication handshake against the
+// exact repo URL without cloning — the canonical "can this host reach
+// this repository" probe. It is read-only and remote-agnostic (works
+// for GitHub, GitLab, a private server).
+
+/// Marker the host-side probe echoes on a successful `git ls-remote`.
+const REPO_PROBE_MARKER: &str = "CODEMUX_LSREMOTE_OK";
+
+/// Whether the host-side probe output indicates success. Pure.
+fn interpret_repo_probe(stdout: &str) -> bool {
+    stdout.contains(REPO_PROBE_MARKER)
+}
+
+/// Check whether the automation's host can reach its project repo.
+///
+/// "This machine" always passes — it uses the local project directly.
+/// For a remote host this SSHes in and runs `git ls-remote`; a failure
+/// is reported (never thrown) so the form can warn without blocking.
+///
+/// The repo is identified by `project_remote` when known (the detail
+/// view has it), else resolved from `project_path` (the create form
+/// only has the path).
+#[tauri::command]
+pub async fn automations_check_repo_access(
+    db: State<'_, DatabaseStore>,
+    host_id: Option<i64>,
+    project_path: Option<String>,
+    project_remote: Option<String>,
+) -> Result<RepoAccessResult, String> {
+    let host_id = match host_id {
+        Some(id) => id,
+        None => {
+            return Ok(RepoAccessResult {
+                ok: true,
+                message: "Runs on this machine — the project is used directly."
+                    .to_string(),
+            })
+        }
+    };
+    let resolved = project_remote
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .or_else(|| {
+            project_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .and_then(resolve_project_remote)
+        });
+    let remote = match resolved {
+        Some(r) => r,
+        None => {
+            return Ok(RepoAccessResult {
+                ok: false,
+                message: "This project has no git remote, so it can only run \
+                          on this machine."
+                    .to_string(),
+            })
+        }
+    };
+    // The remote URL is interpolated into a single-quoted token in the
+    // host-side command; a `'` would break out of the quoting. No git
+    // URL contains one, so reject it rather than risk an injection.
+    if remote.contains('\'') {
+        return Ok(RepoAccessResult {
+            ok: false,
+            message: "The project's git remote URL contains an unexpected \
+                      character."
+                .to_string(),
+        });
+    }
+    let host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host not found: {host_id}"))?;
+
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        tokio::process::Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(&host.ssh_target)
+            .arg(format!(
+                "GIT_TERMINAL_PROMPT=0 git ls-remote --heads '{remote}' \
+                 >/dev/null 2>&1 && echo {REPO_PROBE_MARKER}"
+            ))
+            .output(),
+    )
+    .await;
+
+    match probe {
+        Ok(Ok(output)) if interpret_repo_probe(&String::from_utf8_lossy(&output.stdout)) => {
+            Ok(RepoAccessResult {
+                ok: true,
+                message: format!("{} can reach this repository.", host.name),
+            })
+        }
+        Ok(Ok(_)) => Ok(RepoAccessResult {
+            ok: false,
+            message: format!(
+                "{} can't reach this repository. Give it access — an SSH \
+                 deploy key, or a `gh auth login` with access to the repo — \
+                 then check again. You can still create the automation.",
+                host.name
+            ),
+        }),
+        Ok(Err(error)) => Ok(RepoAccessResult {
+            ok: false,
+            message: format!("Couldn't run the check: {error}"),
+        }),
+        Err(_) => Ok(RepoAccessResult {
+            ok: false,
+            message: format!("Timed out reaching {}.", host.name),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpret_repo_probe;
+
+    #[test]
+    fn repo_probe_succeeds_when_the_marker_is_present() {
+        assert!(interpret_repo_probe("CODEMUX_LSREMOTE_OK\n"));
+    }
+
+    #[test]
+    fn repo_probe_fails_on_empty_or_unmarked_output() {
+        assert!(!interpret_repo_probe(""));
+        assert!(!interpret_repo_probe("fatal: Authentication failed\n"));
+    }
 }

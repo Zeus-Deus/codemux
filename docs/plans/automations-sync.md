@@ -41,8 +41,12 @@ branch and verified:
   the project's git remote URL; the executor's `resolve_repo` uses the
   local path when present and otherwise clones / fetches the remote
   (`~/.codemux/automation-repos/`), branching off `origin/<default>`.
-  Runs record their branch + PR URL. "Test connection" probes the
-  host's `git` / `gh` (the preflight).
+  Runs record their branch + PR URL.
+- **Preflight.** "Test connection" probes the host's `git` / `gh`; the
+  New Automation form runs a per-repo `git ls-remote` over SSH so a host
+  that can't reach *this* repository is flagged at setup (non-blocking,
+  with "Check again"). The automation list shows a per-row health dot
+  from the last run's status; a fixed host self-heals on the next run.
 - 1471 Rust unit tests + 263 server tests; verified end-to-end against
   the live API (`project_remote` round-trip). `tsc` / `vitest` green.
 

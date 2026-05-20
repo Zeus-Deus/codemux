@@ -1559,6 +1559,7 @@ pub fn run() {
             commands::automations_set_enabled,
             commands::automations_delete,
             commands::automations_runs,
+            commands::automations_check_repo_access,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

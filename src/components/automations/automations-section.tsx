@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
+  automationsCheckRepoAccess,
   automationsCreate,
   automationsDelete,
   automationsList,
@@ -38,6 +39,7 @@ import {
   type AutomationRunView,
   type AutomationView,
   type HostView,
+  type RepoAccessResult,
 } from "@/tauri/commands";
 
 /** A repository the user has opened — the source for the project picker. */
@@ -446,12 +448,20 @@ export function AutomationsSection() {
                 >
                   <span
                     aria-hidden
-                    title={automation.enabled ? "Enabled" : "Paused"}
+                    title={
+                      !automation.enabled
+                        ? "Paused"
+                        : automation.last_run_status === "failed"
+                          ? "Last run failed"
+                          : "Enabled"
+                    }
                     className={cn(
                       "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors",
-                      automation.enabled
-                        ? "bg-success"
-                        : "bg-muted-foreground/40",
+                      !automation.enabled
+                        ? "bg-muted-foreground/40"
+                        : automation.last_run_status === "failed"
+                          ? "bg-warning"
+                          : "bg-success",
                     )}
                   />
                   <span className="min-w-0 flex-1">
@@ -595,6 +605,12 @@ function AutomationDetail({
           {describeSchedule(automation.schedule)} · {agentLabel} · {hostLabel}
         </p>
       </div>
+
+      <RepoAccessRow
+        hostId={automation.host_id}
+        projectPath={automation.project_path}
+        projectRemote={automation.project_remote}
+      />
 
       <div className="grid grid-cols-2 gap-3">
         <FactCard label="Next run" value={formatStamp(automation.next_run_at)} />
@@ -869,6 +885,12 @@ function AutomationForm({
         </Field>
       </div>
 
+      <RepoAccessRow
+        hostId={draft.hostId}
+        projectPath={draft.projectPath || null}
+        projectRemote={null}
+      />
+
       <ScheduleField draft={draft} patch={patch} patchBuilder={patchBuilder} />
 
       <div className="grid grid-cols-2 gap-4">
@@ -1088,6 +1110,83 @@ function ProjectField({
         />
       )}
     </Field>
+  );
+}
+
+/** Live "can this host reach the repo" status. Renders nothing for
+ *  "This machine" (the project is local — no access question). For a
+ *  remote host it probes on mount and offers a "Check again" link, so
+ *  the user fixes credentials and re-verifies without waiting for a
+ *  scheduled run. Never blocks — purely informational. */
+function RepoAccessRow({
+  hostId,
+  projectPath,
+  projectRemote,
+}: {
+  hostId: number | null;
+  projectPath: string | null;
+  projectRemote: string | null;
+}) {
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<RepoAccessResult | null>(null);
+
+  const check = useCallback(() => {
+    setChecking(true);
+    setResult(null);
+    automationsCheckRepoAccess(hostId, projectPath, projectRemote)
+      .then(setResult)
+      .catch((err) =>
+        setResult({
+          ok: false,
+          message: typeof err === "string" ? err : String(err),
+        }),
+      )
+      .finally(() => setChecking(false));
+  }, [hostId, projectPath, projectRemote]);
+
+  useEffect(() => {
+    check();
+  }, [check]);
+
+  // "This machine" uses the local project — no repo-access question.
+  if (hostId === null) return null;
+
+  return (
+    <div className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+      {checking ? (
+        <>
+          <Loader2 className="mt-0.5 size-3 shrink-0 animate-spin text-muted-foreground/60" />
+          <span className="text-muted-foreground/70">
+            Checking repository access…
+          </span>
+        </>
+      ) : result ? (
+        <>
+          <span
+            aria-hidden
+            className={cn(
+              "mt-1 size-1.5 shrink-0 rounded-full",
+              result.ok ? "bg-success" : "bg-warning",
+            )}
+          />
+          <span
+            className={cn(
+              "min-w-0",
+              result.ok ? "text-muted-foreground/75" : "text-warning",
+            )}
+          >
+            {result.message}
+          </span>
+          <button
+            type="button"
+            onClick={check}
+            className="ml-auto shrink-0 text-muted-foreground/60 hover:text-foreground transition-colors"
+          >
+            Check again
+          </button>
+        </>
+      ) : null}
+    </div>
   );
 }
 

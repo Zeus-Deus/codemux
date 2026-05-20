@@ -1617,9 +1617,18 @@ export interface AutomationView {
   retention_limit: number;
   last_run_at: string | null;
   next_run_at: string | null;
+  /** Status of the most recent run — drives the list health dot.
+   *  `null` until the automation has fired. */
+  last_run_status: string | null;
   created_at: string;
   updated_at: string;
   dirty: boolean;
+}
+
+/** Result of probing whether a host can reach an automation's repo. */
+export interface RepoAccessResult {
+  ok: boolean;
+  message: string;
 }
 
 /** One fire of an automation (or a skipped fire). `status` is one of
@@ -1677,6 +1686,20 @@ export const automationsDelete = (id: number) =>
 
 export const automationsRuns = (automationId: number, limit?: number) =>
   invoke<AutomationRunView[]>("automations_runs", { automationId, limit });
+
+/** Probe whether a host can reach a project's repo (a read-only
+ *  `git ls-remote`). `hostId` null = "This machine" (always reachable).
+ *  Pass `projectRemote` when known, else `projectPath` to resolve it. */
+export const automationsCheckRepoAccess = (
+  hostId: number | null,
+  projectPath: string | null,
+  projectRemote: string | null,
+) =>
+  invoke<RepoAccessResult>("automations_check_repo_access", {
+    hostId,
+    projectPath,
+    projectRemote,
+  });
 
 export interface WorkspacePushOutcome {
   ok: boolean;
