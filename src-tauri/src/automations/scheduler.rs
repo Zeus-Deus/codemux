@@ -134,10 +134,23 @@ pub fn tick(
                 }
             }
             Err(error) => {
+                // A schedule we can't parse must not leave `next_run_at`
+                // in the past — that would re-fire the automation on
+                // every tick. Clear it so the automation goes dormant
+                // instead of spamming runs once a minute.
                 eprintln!(
-                    "[codemux::scheduler] invalid schedule on automation {}: {error}",
+                    "[codemux::scheduler] invalid schedule on automation {}: {error} \
+                     — clearing next run so it stops re-firing",
                     automation.id
                 );
+                if let Err(clear_error) =
+                    db.set_automation_next_run(automation.id, None)
+                {
+                    eprintln!(
+                        "[codemux::scheduler] failed to clear next run for automation {}: {clear_error}",
+                        automation.id
+                    );
+                }
             }
         }
     }
@@ -289,6 +302,42 @@ mod tests {
         // A second tick at the same instant: the schedule has advanced,
         // so nothing fires and no duplicate run is recorded.
         assert!(tick(&db, now, false).is_empty());
+        assert_eq!(db.list_automation_runs(a.id, 10).len(), 1);
+    }
+
+    #[test]
+    fn tick_clears_next_run_on_an_unparseable_schedule() {
+        // A schedule the recurrence engine can't parse must not pin the
+        // automation at a past `next_run_at` — that would re-fire it on
+        // every tick, once a minute, forever. `tick` clears
+        // `next_run_at` instead, so the automation fires at most once
+        // and then goes dormant.
+        let db = crate::database::init_test_database();
+        let now = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
+        let a = db
+            .insert_automation(&crate::database::AutomationInput {
+                name: "Broken".to_string(),
+                prompt: "p".to_string(),
+                agent: "claude".to_string(),
+                schedule: "this is not a valid RRULE".to_string(),
+                timezone: "UTC".to_string(),
+                host_id: None,
+                project_path: None,
+                project_remote: None,
+                retention_limit: 10,
+            })
+            .unwrap();
+        db.set_automation_next_run(a.id, Some("2026-01-02T09:00:00+00:00"))
+            .unwrap();
+
+        // First tick fires the due slot, then fails to compute the next.
+        assert_eq!(tick(&db, now, false).len(), 1);
+        // `next_run_at` is cleared — the automation is now dormant.
+        assert!(db.get_automation(a.id).unwrap().next_run_at.is_none());
+
+        // A later tick must not fire it again — no runaway runs.
+        let later = Utc.with_ymd_and_hms(2026, 1, 2, 9, 1, 0).unwrap();
+        assert!(tick(&db, later, false).is_empty());
         assert_eq!(db.list_automation_runs(a.id, 10).len(), 1);
     }
 

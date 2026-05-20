@@ -1175,9 +1175,13 @@ impl DatabaseStore {
     ///
     /// A run is stale when it is still `scheduled` or `running` and its
     /// `started_at` (or `created_at`, for a run that never started) is
-    /// older than `older_than` (an RFC 3339 timestamp). Without this a
-    /// crashed run would keep its automation permanently `skipped_busy`.
-    /// Returns the number of rows reconciled.
+    /// older than `older_than`. Returns the number of rows reconciled.
+    ///
+    /// Both sides are wrapped in `datetime()`: `started_at` / `created_at`
+    /// are stored in SQLite's `'YYYY-MM-DD HH:MM:SS'` form while callers
+    /// pass an RFC 3339 ceiling — a raw string `<` would compare the
+    /// space against the `T` and mis-judge same-day runs. `datetime()`
+    /// normalises both formats before comparing.
     pub fn reconcile_stale_runs(&self, older_than: &str) -> usize {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -1186,7 +1190,7 @@ impl DatabaseStore {
                  finished_at = datetime('now'),
                  error = 'Run did not complete — process or app exited'
              WHERE status IN ('scheduled', 'running')
-               AND COALESCE(started_at, created_at) < ?1",
+               AND datetime(COALESCE(started_at, created_at)) < datetime(?1)",
             params![older_than],
         )
         .unwrap_or(0)
@@ -3492,6 +3496,29 @@ mod tests {
         // A ceiling in the distant past — the run's created_at (now) is
         // newer, so nothing is stale.
         assert_eq!(db.reconcile_stale_runs("2000-01-01T00:00:00Z"), 0);
+        assert_eq!(db.list_automation_runs(a.id, 10)[0].status, "running");
+    }
+
+    #[test]
+    fn reconcile_stale_runs_compares_mixed_timestamp_formats() {
+        // `created_at` is stored in SQLite's `'YYYY-MM-DD HH:MM:SS'`
+        // form, while the real callers pass an RFC 3339 ceiling
+        // (`now - 6h`). A raw string `<` would compare the space
+        // against the `T` at offset 10 and wrongly judge a run from
+        // earlier *today* as stale. The previous tests used year-2000
+        // and year-2999 ceilings, where the year differs first and
+        // hides the bug — this one uses a same-day ceiling so only
+        // correct `datetime()` normalisation passes it.
+        let db = init_test_database();
+        let a = db.insert_automation(&sample_automation("MixedFmt")).unwrap();
+        db.record_automation_run(a.id, "running", "2026-01-01T09:00:00Z", None, None)
+            .unwrap();
+        let ceiling = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(
+            db.reconcile_stale_runs(&ceiling),
+            0,
+            "a run created moments ago is newer than a ceiling one hour back"
+        );
         assert_eq!(db.list_automation_runs(a.id, 10)[0].status, "running");
     }
 }

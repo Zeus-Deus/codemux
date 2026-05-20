@@ -168,6 +168,25 @@ pub async fn pull(
             .host_server_id
             .as_ref()
             .and_then(|sid| server_to_local.get(sid).copied());
+
+        // The automation targets a remote host, but that host has not
+        // synced to this device yet, so we can't resolve its local id.
+        // Importing it now would store `host_id = NULL` — which the
+        // desktop scheduler reads as "this machine" and would run a
+        // remote-host automation locally. Skip it; a later sync (once
+        // the host row arrives) imports it correctly. Tombstones still
+        // fall through so a deletion always propagates.
+        if a.deleted_at.is_none()
+            && a.host_server_id.is_some()
+            && host_id.is_none()
+        {
+            eprintln!(
+                "[automations-sync] deferring {}: target host not synced yet",
+                a.id
+            );
+            continue;
+        }
+
         db.upsert_automation_from_server(
             &a.id,
             &a.name,
@@ -415,6 +434,43 @@ mod tests {
         assert_eq!(rows[0].name, "Nightly");
         assert_eq!(rows[0].server_id.as_deref(), Some("srv-1"));
         assert!(!rows[0].dirty, "server-sourced rows are clean");
+        std::env::remove_var("CODEMUX_API_URL");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn pull_defers_an_automation_whose_target_host_is_not_synced() {
+        // The automation targets a remote host, but that host has not
+        // synced to this device yet. Importing it would store
+        // `host_id = NULL`, which the desktop scheduler reads as "this
+        // machine" — it would run a remote-host automation on the
+        // wrong machine. Pull must skip it until the host row arrives.
+        let mut server = mockito::Server::new_async().await;
+        std::env::set_var("CODEMUX_API_URL", server.url());
+        let mock = server
+            .mock("GET", "/api/automations")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"automations":[{"id":"srv-2","name":"OnHost",
+                "prompt":"p","agent":"claude",
+                "schedule":"DTSTART:20260101T090000Z\nRRULE:FREQ=DAILY",
+                "timezone":"UTC","hostServerId":"host-srv-99","projectPath":null,
+                "enabled":true,"retentionLimit":10,
+                "createdAt":"2026-01-01T00:00:00Z",
+                "updatedAt":"2026-01-01T00:00:00Z","deletedAt":null}]}"#,
+            )
+            .create_async()
+            .await;
+
+        let db = init_test_database();
+        pull("token", &db, None).await.unwrap();
+        mock.assert_async().await;
+
+        assert!(
+            db.list_automations().is_empty(),
+            "an automation for an unknown host is deferred, not imported"
+        );
         std::env::remove_var("CODEMUX_API_URL");
     }
 
