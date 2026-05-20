@@ -48,7 +48,6 @@ import {
   BookOpen,
   Server,
   Sparkles,
-  CalendarClock,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -113,7 +112,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical } from "lucide-react";
 
-type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "automations" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -151,9 +150,6 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     // not a personal preference. Always visible (no flag gate) since
     // the underlying daemon is now standard built-in behavior.
     { id: "hosts", label: "Hosts", icon: Server },
-    // Automations — scheduled agent runs. Sits next to Hosts because an
-    // automation picks a host to run on; both are workflow decisions.
-    { id: "automations", label: "Automations", icon: CalendarClock },
     { id: "session_restore", label: "Session Restore", icon: RotateCcw },
   ];
 
@@ -186,14 +182,13 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "beta_features",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "git", "agent", "permissions", "skills", "mcp", "hosts", "automations",
-  "browser", "shortcuts", "notifications", "session_restore",
+  "git", "agent", "permissions", "skills", "mcp", "hosts", "browser",
+  "shortcuts", "notifications", "session_restore",
 ];
 
 import { KeybindEditor } from "./keybind-editor";
 import { BetaFeaturesSection } from "./beta-features-section";
 import { HostsSection } from "./hosts-section";
-import { AutomationsSection } from "./automations-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
@@ -1395,17 +1390,6 @@ export function SettingsView() {
               description="Remote machines you can push workspaces to. SSH credentials stay on your device — only the host name and SSH target sync across your devices."
             />
             <HostsSection />
-          </div>
-        );
-
-      case "automations":
-        return (
-          <div>
-            <SectionHeader
-              title="Automations"
-              description="Scheduled agent runs. An automation runs a prompt with an agent on a recurring schedule; each fire records a run you can review here."
-            />
-            <AutomationsSection />
           </div>
         );
 

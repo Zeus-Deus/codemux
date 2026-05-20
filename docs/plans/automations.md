@@ -34,7 +34,8 @@ The host scheduler owns the agent session, so `succeeded`/`failed` are real term
 
 The feature works end-to-end on the local machine: define → schedule →
 tick → fire → worktree → agent run → terminal status → UI. Remaining
-work, in dependency order:
+work, in dependency order — items 1–5 are the "account sync + remote
+host" phase, broken down step-by-step in `docs/plans/automations-sync.md`:
 
 1. **Stuck-run reconciler.** A run left `running` by an app quit keeps
    its automation `skipped_busy` forever. Add a startup sweep that fails
@@ -108,8 +109,9 @@ Automations feature — local foundation, scheduler, and UI (this branch):
 - **Desktop command surface** — seven `automations_*` Tauri commands.
 - **Agent / MCP control surface** — eight `automation_*` MCP tools routed
   through `control.rs` to shared `*_impl` helpers.
-- **Settings → Automations UI** — create / edit / pause / resume / delete
-  with a schedule builder and run-history view; a fire-event toast.
+- **Automations view** — a full-screen view opened from the left sidebar
+  (under "New agent", above projects): create / edit / pause / resume /
+  delete with a schedule builder and run-history view; a fire-event toast.
 - **Tests** — 35 unit tests (recurrence, scheduler decision + tick loop,
   executor incl. worktree creation against a real temp repo, database
   CRUD / dedup / run lifecycle) plus the existing frontend suite;

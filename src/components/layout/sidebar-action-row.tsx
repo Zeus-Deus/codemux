@@ -14,12 +14,13 @@ import {
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { Plus, FolderPlus, FolderOpen } from "lucide-react";
+import { Plus, FolderPlus, FolderOpen, CalendarClock } from "lucide-react";
 import { useProjectActions } from "@/hooks/use-project-actions";
 
 export function SidebarActionRow() {
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
+  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
     (s) => s.enableLazyWorkspaceCreation,
@@ -99,6 +100,22 @@ export function SidebarActionRow() {
           </DropdownMenuContent>
         </DropdownMenu>
       </div>
+
+      {/* Automations — a first-class destination under "New agent",
+          above the project list, matching where Codex and Superset
+          place it. Opens the full-screen Automations view. */}
+      <div className="px-2 pb-1.5">
+        <Button
+          variant="ghost"
+          aria-label="Automations"
+          className="w-full justify-start gap-2 h-8 px-2 text-[13px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+          onClick={() => setShowAutomations(true)}
+        >
+          <CalendarClock className="size-[18px]" />
+          <span>Automations</span>
+        </Button>
+      </div>
+
       <SidebarSeparator />
     </ShadcnSidebarHeader>
   );

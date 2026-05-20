@@ -64,7 +64,9 @@ layers still to come.
   agent headlessly with the prompt (`claude --print` / `codex exec`),
   and records the terminal `succeeded` / `failed` status plus the
   workspace path on the run row.
-- **Settings → Automations UI** — a sidebar list + detail pane to
+- **Automations view** — a first-class destination opened from the left
+  sidebar (under "New agent", above the project list — the same
+  placement Codex and Superset use). A sidebar list + detail pane to
   create, edit, pause/resume, and delete automations, with a
   frequency/time/weekday schedule builder (and a raw RFC 5545 escape
   hatch) and a per-automation run-history view.
@@ -118,7 +120,9 @@ layers still to come.
 - `src-tauri/src/control.rs` — `automation_*` control-socket handlers.
 - `src-tauri/src/mcp_server.rs` — the eight `automation_*` MCP tools.
 - `src-tauri/src/lib.rs` — the once-a-minute scheduler background task.
-- `src/components/settings/automations-section.tsx` — the Settings UI.
+- `src/components/automations/automations-view.tsx` +
+  `automations-section.tsx` — the full-screen Automations view.
+- `src/components/layout/sidebar-action-row.tsx` — the sidebar entry.
 - `src/hooks/use-automation-fire-toast.ts` — the fire-event toast.
 
 ## Notes

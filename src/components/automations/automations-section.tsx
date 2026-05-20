@@ -39,13 +39,14 @@ import {
 } from "@/tauri/commands";
 
 /**
- * Settings → Automations.
+ * The Automations management panel — rendered full-screen by
+ * `AutomationsView`, reached from the left sidebar.
  *
  * Scheduled agent runs: a named prompt + agent + recurrence that fires
- * on a chosen host. Mirrors the sidebar-list + detail-pane shape of the
- * Hosts section. The schedule is stored as a complete RFC 5545
- * iCalendar block; the builder below composes the common
- * hourly/daily/weekly cases, and a raw field handles anything else.
+ * on a chosen host. A sidebar-list + detail-pane layout. The schedule
+ * is stored as a complete RFC 5545 iCalendar block; the builder below
+ * composes the common hourly/daily/weekly cases, and a raw field
+ * handles anything else.
  */
 
 type Frequency = "HOURLY" | "DAILY" | "WEEKLY";

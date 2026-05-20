@@ -11,6 +11,7 @@ import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
+import { AutomationsView } from "@/components/automations/automations-view";
 import { CommandPalette } from "@/components/overlays/command-palette";
 import { NewProjectScreen } from "@/components/overlays/new-project-screen";
 import { FileSearchDialog } from "@/components/search/file-search-dialog";
@@ -30,6 +31,7 @@ export function AppShell() {
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
   const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const showSettings = useUIStore((s) => s.showSettings);
+  const showAutomations = useUIStore((s) => s.showAutomations);
   const showNewProjectScreen = useUIStore((s) => s.showNewProjectScreen);
   const commandPaletteOpen = useUIStore((s) => s.showCommandPalette);
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
@@ -58,6 +60,11 @@ export function AppShell() {
   // Full-screen settings — replaces entire app including sidebar
   if (showSettings) {
     return <SettingsView />;
+  }
+
+  // Full-screen Automations — a first-class destination, like Settings
+  if (showAutomations) {
+    return <AutomationsView />;
   }
 
   // Full-screen new project — replaces entire app including sidebar
