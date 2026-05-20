@@ -1610,6 +1610,9 @@ export interface AutomationView {
   timezone: string;
   host_id: number | null;
   project_path: string | null;
+  /** The project's git remote URL — how a remote host clones the repo.
+   *  Resolved server-side from the chosen project. */
+  project_remote: string | null;
   enabled: boolean;
   retention_limit: number;
   last_run_at: string | null;
@@ -1631,11 +1634,17 @@ export interface AutomationRunView {
   finished_at: string | null;
   host_id: number | null;
   workspace_id: string | null;
+  /** The branch the run's worktree was created on. */
+  branch: string | null;
+  /** URL of the pull request the run opened, if any. */
+  pr_url: string | null;
   error: string | null;
   created_at: string;
 }
 
-/** Editable fields of an automation, shared by create and update. */
+/** Editable fields of an automation, shared by create and update.
+ *  `project_remote` is resolved server-side from `project_path`; the
+ *  UI may omit it. */
 export interface AutomationInput {
   name: string;
   prompt: string;
@@ -1644,6 +1653,7 @@ export interface AutomationInput {
   timezone: string;
   host_id: number | null;
   project_path: string | null;
+  project_remote?: string | null;
   retention_limit: number;
 }
 

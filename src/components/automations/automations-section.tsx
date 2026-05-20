@@ -11,6 +11,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -736,11 +737,24 @@ function RunHistory({ automationId }: { automationId: number }) {
             <li
               key={run.id}
               title={run.error ?? undefined}
-              className="flex items-center gap-3 px-3 py-2"
+              className="flex items-center gap-2.5 px-3 py-2"
             >
-              <span className="font-mono text-[11.5px] tabular-nums text-muted-foreground/80">
+              <span className="shrink-0 font-mono text-[11.5px] tabular-nums text-muted-foreground/80">
                 {formatStamp(run.scheduled_for)}
               </span>
+              {run.pr_url ? (
+                <button
+                  type="button"
+                  onClick={() => void openUrl(run.pr_url as string)}
+                  className="min-w-0 truncate text-left text-[11px] text-foreground/70 hover:text-foreground hover:underline"
+                >
+                  Pull request ↗
+                </button>
+              ) : run.branch ? (
+                <span className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground/55">
+                  {run.branch}
+                </span>
+              ) : null}
               <span
                 className={cn(
                   "ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",

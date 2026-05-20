@@ -32,25 +32,21 @@ The host scheduler owns the agent session, so `succeeded`/`failed` are real term
 
 ## Active Priorities
 
-Phase 2 (account sync + remote-host execution) is **done and deployed** —
-the `/api/automations` endpoints are live on `api.codemux.org`, the
-desktop syncs against them, and host bootstrap provisions the remote
-scheduler. See `docs/plans/automations-sync.md`. What remains:
+Phase 2 (account sync + remote-host execution) is **done and deployed**,
+including the Phase F GitHub-backbone repo transport — the
+`/api/automations` endpoints are live on `api.codemux.org`, the desktop
+syncs against them, host bootstrap provisions the remote scheduler, and
+a remote host obtains the repo by cloning the project's git remote. See
+`docs/plans/automations-sync.md`. What remains is hardening and polish:
 
-1. **Remote-host repo transport (the GitHub backbone).** A remote host
-   has no copy of the project repo yet — the last load-bearing piece of
-   remote-host automations. The host clones the project's git remote
-   with its own credentials; runs produce branches; a setup-time
-   GitHub-access preflight check warns if the host can't reach the repo.
-   Fully specced as Phase F in `docs/plans/automations-sync.md`.
-   ("This machine" automations need none of this and already work.)
-2. **Scoped scheduler tokens.** The host scheduler currently uses a copy
+1. **Scoped scheduler tokens.** The host scheduler currently uses a copy
    of the desktop's account token; a per-host scoped token would limit
    blast radius if a host is compromised.
-3. **Polish.** A one-shot `automation_run` MCP tool; the
+2. **Polish.** A one-shot `automation_run` MCP tool; the
    `retention_limit` worktree prune; run completion/failure piped into
    the notification system (`docs/features/notifications.md`); a
-   dedicated automation workspace icon.
+   dedicated automation workspace icon; the desktop "pull this run's
+   branch home" action.
 
 ## Open Questions
 

@@ -119,6 +119,51 @@ pub fn set_workspace_host(
     Ok(())
 }
 
+/// Turn the host-side `git`/`gh` probe output into a human note for the
+/// connection-test message. Pure — unit-tested.
+///
+/// This is the automations preflight: an automation that triages PRs or
+/// issues needs the host to have `git` and an authenticated `gh`, so the
+/// "Test connection" result flags it up at setup time rather than at the
+/// first 9am run.
+fn interpret_github_probe(stdout: &str) -> String {
+    let git_ok = stdout.contains("GIT_OK");
+    let gh_ok = stdout.contains("GH_OK");
+    if !git_ok {
+        " · ⚠ git not found — automations on this host need git installed"
+            .to_string()
+    } else if !gh_ok {
+        " · ⚠ gh not signed in — run `gh auth login` on this host for \
+         PR/issue automations"
+            .to_string()
+    } else {
+        " · GitHub access ready".to_string()
+    }
+}
+
+/// SSH to the host and probe `git` + `gh` in one round-trip. Returns a
+/// note to append to the connection-test message, or an empty string if
+/// the probe itself could not run.
+#[cfg(unix)]
+async fn probe_host_github(ssh_target: &str) -> String {
+    let output = tokio::process::Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg(ssh_target)
+        .arg(
+            "git --version >/dev/null 2>&1 && echo GIT_OK; \
+             gh auth status >/dev/null 2>&1 && echo GH_OK",
+        )
+        .output()
+        .await;
+    match output {
+        Ok(out) => interpret_github_probe(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => String::new(),
+    }
+}
+
 /// Test whether the configured SSH target is reachable, and whether
 /// `codemux-remote` is already installed there.
 ///
@@ -155,17 +200,20 @@ pub async fn hosts_test_connection(
             ProbeOutcome::Reachable {
                 codemux_remote_version: Some(version),
                 uname,
-            } => HostTestResult {
-                ok: true,
-                message: format!(
-                    "Connected. codemux-remote v{version} is installed{}",
-                    uname
-                        .map(|u| format!(" ({u})"))
-                        .unwrap_or_default()
-                ),
-                needs_install: false,
-                uname: None,
-            },
+            } => {
+                // Automations preflight — flag a host that can't reach
+                // GitHub before an automation silently fails at run time.
+                let github_note = probe_host_github(&host.ssh_target).await;
+                HostTestResult {
+                    ok: true,
+                    message: format!(
+                        "Connected. codemux-remote v{version} is installed{}{github_note}",
+                        uname.map(|u| format!(" ({u})")).unwrap_or_default()
+                    ),
+                    needs_install: false,
+                    uname: None,
+                }
+            }
             ProbeOutcome::Reachable {
                 codemux_remote_version: None,
                 uname,
@@ -1218,5 +1266,38 @@ fn terminate_workspace_sessions(
             &pty_state.sessions,
             &sid,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpret_github_probe;
+
+    #[test]
+    fn github_probe_reports_ready_when_git_and_gh_are_present() {
+        let note = interpret_github_probe("GIT_OK\nGH_OK\n");
+        assert!(note.contains("ready"));
+        assert!(!note.contains("⚠"));
+    }
+
+    #[test]
+    fn github_probe_flags_missing_git() {
+        // No GIT_OK — git itself is absent.
+        let note = interpret_github_probe("GH_OK\n");
+        assert!(note.contains("⚠"));
+        assert!(note.contains("git"));
+    }
+
+    #[test]
+    fn github_probe_flags_unauthenticated_gh() {
+        // git is present but `gh auth status` failed.
+        let note = interpret_github_probe("GIT_OK\n");
+        assert!(note.contains("⚠"));
+        assert!(note.contains("gh auth login"));
+    }
+
+    #[test]
+    fn github_probe_flags_an_empty_probe_as_missing_git() {
+        assert!(interpret_github_probe("").contains("⚠"));
     }
 }

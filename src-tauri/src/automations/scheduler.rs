@@ -163,6 +163,7 @@ mod tests {
             timezone: "UTC".to_string(),
             host_id: None,
             project_path: None,
+            project_remote: None,
             enabled,
             retention_limit: 10,
             last_run_at: None,
@@ -241,6 +242,7 @@ mod tests {
                 timezone: "UTC".to_string(),
                 host_id: None,
                 project_path: None,
+                project_remote: None,
                 retention_limit: 10,
             })
             .unwrap();
@@ -333,6 +335,7 @@ mod tests {
                 timezone: "UTC".to_string(),
                 host_id: Some(7),
                 project_path: None,
+                project_remote: None,
                 retention_limit: 10,
             })
             .unwrap();

@@ -102,10 +102,22 @@ layers still to come.
   always-on host. Host bootstrap provisions it: it writes the scheduler
   token + host identity and registers a systemd user service (via
   `automations::service`) with lingering, so it survives reboots.
-- Unit coverage — 43 Rust tests (recurrence, scheduler decision + tick +
-  host routing, the fire executor, account sync, the reconciler, the
-  service-unit generators, database CRUD / dedup / run lifecycle), plus
-  16 server tests for the `/api/automations` endpoints.
+- **Remote-host repo transport (the GitHub backbone).** Each automation
+  carries the project's git remote URL, resolved from the chosen
+  project. The executor's `resolve_repo` uses the local `project_path`
+  when it is present (the desktop / "This machine" case, branching off
+  HEAD), and otherwise clones — or `git fetch`es an existing clone of —
+  the remote into `~/.codemux/automation-repos/`, branching off a
+  freshly-fetched `origin/<default>`. A run records its branch and any
+  PR URL, so run history reads like a PR list.
+- **GitHub-access preflight.** "Test connection" on a host also probes
+  `git` and `gh auth status`, so a host that can't reach GitHub is
+  flagged at setup, not at the first 9am run.
+- Coverage — 1471 Rust unit tests (recurrence, scheduler + tick + host
+  routing, the executor incl. real-git clone/fetch/worktree-base,
+  account sync, reconciler, service units, the preflight probe, database
+  CRUD / migration / run lifecycle) + 263 server tests for the
+  `/api/automations` endpoints; `tsc` / `vitest` green.
 
 ## Current Constraints
 
@@ -114,13 +126,10 @@ layers still to come.
   the API. A per-host scoped token would limit blast radius if a host
   is compromised — a future hardening.
 - **No run-now.** A one-shot `automation_run` tool is still deferred.
-- **Remote-host automations cannot obtain the project repo yet.** An
-  automation on a separate host needs the repo *on that host*. The
-  GitHub-backbone transport — the host clones the project's git remote,
-  runs produce branches, a setup-time GitHub-access preflight check —
-  is specced as Phase F in `docs/plans/automations-sync.md` but not
-  built. **"This machine" automations are unaffected** — the repo and
-  the result branch are local.
+- **The host needs its own GitHub credentials.** A remote host clones
+  and the agent reads/writes GitHub using the host's own `git` + `gh`
+  auth — Codemux injects no token (matching Superset). The preflight
+  flags a host that lacks them.
 
 ## Important Touch Points
 

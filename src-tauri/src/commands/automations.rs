@@ -38,6 +38,7 @@ pub struct AutomationView {
     pub timezone: String,
     pub host_id: Option<i64>,
     pub project_path: Option<String>,
+    pub project_remote: Option<String>,
     pub enabled: bool,
     pub retention_limit: i64,
     pub last_run_at: Option<String>,
@@ -59,6 +60,7 @@ impl From<AutomationRecord> for AutomationView {
             timezone: r.timezone,
             host_id: r.host_id,
             project_path: r.project_path,
+            project_remote: r.project_remote,
             enabled: r.enabled,
             retention_limit: r.retention_limit,
             last_run_at: r.last_run_at,
@@ -67,6 +69,27 @@ impl From<AutomationRecord> for AutomationView {
             updated_at: r.updated_at,
             dirty: r.dirty,
         }
+    }
+}
+
+/// Resolve a project's `origin` remote URL — the GitHub backbone a host
+/// without `project_path` clones from. `None` for a repo with no
+/// `origin` (such an automation can only run on "This machine").
+fn resolve_project_remote(project_path: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
     }
 }
 
@@ -81,6 +104,19 @@ fn clean_input(mut input: AutomationInput) -> Result<AutomationInput, String> {
         .project_path
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
+    // Resolve the project's git remote so a remote host can obtain the
+    // repo. An explicit caller-supplied value (e.g. from MCP) wins;
+    // otherwise derive it from the chosen project.
+    input.project_remote = input
+        .project_remote
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .or_else(|| {
+            input
+                .project_path
+                .as_deref()
+                .and_then(resolve_project_remote)
+        });
 
     if input.name.is_empty() {
         return Err("Automation name cannot be empty".into());

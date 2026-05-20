@@ -27,24 +27,24 @@ is a **registry only** (no cloud scheduler); each host runs its own
 
 ## Status
 
-**Phases A–E are done.** Landed on this branch and verified:
+**Phases A–F are done.** The feature works end-to-end. Landed on this
+branch and verified:
 
 - Prerequisite refactor, Phase A (reconciler), Phase C
   (`automations_sync`), Phase D (host routing + `codemux-remote
   scheduler`), Phase E (`automations::service` + the
   `provision_scheduler` bootstrap wiring).
 - **Phase B is deployed to production** — `/api/automations` GET / POST
-  / PATCH / DELETE (+ `?hostServerId=` filter) on `api.codemux.org`,
-  backed by the `codemux_automations` table. 16 server tests; verified
-  end-to-end against the live API (signup → token → automation CRUD).
-- 43 Rust unit tests + 16 server tests; `cargo check` / `tsc` /
-  `vitest` green.
-
-Still open: **Phase F** — the GitHub-backbone repo transport. This is
-the last load-bearing piece for remote-host automations: a remote host
-has no copy of the project repo until F is built (D/E ship the
-scheduler and service, but not the repo). "This machine" automations
-do not need F and already work end-to-end.
+  / PATCH / DELETE (+ `?hostServerId=` filter, + `project_remote`) on
+  `api.codemux.org`, backed by the `codemux_automations` table.
+- **Phase F — the GitHub backbone — is built.** Each automation carries
+  the project's git remote URL; the executor's `resolve_repo` uses the
+  local path when present and otherwise clones / fetches the remote
+  (`~/.codemux/automation-repos/`), branching off `origin/<default>`.
+  Runs record their branch + PR URL. "Test connection" probes the
+  host's `git` / `gh` (the preflight).
+- 1471 Rust unit tests + 263 server tests; verified end-to-end against
+  the live API (`project_remote` round-trip). `tsc` / `vitest` green.
 
 One hardening note: the host scheduler currently uses a copy of the
 desktop's account token; a per-host scoped token would be a better

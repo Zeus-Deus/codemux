@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -235,6 +235,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             timezone TEXT NOT NULL DEFAULT 'UTC',
             host_id INTEGER,
             project_path TEXT,
+            project_remote TEXT,
             enabled INTEGER NOT NULL DEFAULT 1,
             retention_limit INTEGER NOT NULL DEFAULT 10,
             last_run_at TEXT,
@@ -270,6 +271,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             finished_at TEXT,
             host_id INTEGER,
             workspace_id TEXT,
+            branch TEXT,
+            pr_url TEXT,
             error TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(automation_id, scheduled_for)
@@ -280,6 +283,24 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
+
+    // Additive column migrations. `CREATE TABLE IF NOT EXISTS` above is a
+    // no-op on a database that already has the table, so a column added
+    // to an existing table needs an explicit `ALTER TABLE`. Each is
+    // idempotent: on a fresh database the column is already present and
+    // SQLite returns a "duplicate column name" error, which we swallow.
+    for stmt in [
+        "ALTER TABLE automations ADD COLUMN project_remote TEXT",
+        "ALTER TABLE automation_runs ADD COLUMN branch TEXT",
+        "ALTER TABLE automation_runs ADD COLUMN pr_url TEXT",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(format!("Schema migration failed ({stmt}): {msg}"));
+            }
+        }
+    }
 
     // Set (or advance) schema version. `IF NOT EXISTS` on every CREATE
     // above means re-running this on a v1 DB silently adds the new
@@ -805,8 +826,12 @@ pub struct AutomationRecord {
     pub timezone: String,
     /// Target host row id, or `None` when not yet assigned.
     pub host_id: Option<i64>,
-    /// Repository path the run operates in.
+    /// Local path of the project repository (valid on the machine that
+    /// created the automation).
     pub project_path: Option<String>,
+    /// The project's git remote URL — how a host that lacks
+    /// `project_path` obtains the repo (it clones this).
+    pub project_remote: Option<String>,
     pub enabled: bool,
     /// How many completed run worktrees the host keeps before pruning.
     pub retention_limit: i64,
@@ -831,6 +856,10 @@ pub struct AutomationRunRecord {
     pub finished_at: Option<String>,
     pub host_id: Option<i64>,
     pub workspace_id: Option<String>,
+    /// The branch the run's worktree was created on.
+    pub branch: Option<String>,
+    /// URL of the pull request the run opened, if any.
+    pub pr_url: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
 }
@@ -845,15 +874,20 @@ pub struct AutomationInput {
     pub timezone: String,
     pub host_id: Option<i64>,
     pub project_path: Option<String>,
+    /// The project's git remote URL. The command layer resolves it from
+    /// the chosen project; callers may leave it `None`.
+    #[serde(default)]
+    pub project_remote: Option<String>,
     pub retention_limit: i64,
 }
 
 const AUTOMATION_COLUMNS: &str = "id, server_id, name, prompt, agent, schedule, \
-     timezone, host_id, project_path, enabled, retention_limit, last_run_at, \
-     next_run_at, created_at, updated_at, deleted_at, dirty";
+     timezone, host_id, project_path, project_remote, enabled, retention_limit, \
+     last_run_at, next_run_at, created_at, updated_at, deleted_at, dirty";
 
 const AUTOMATION_RUN_COLUMNS: &str = "id, automation_id, status, scheduled_for, \
-     started_at, finished_at, host_id, workspace_id, error, created_at";
+     started_at, finished_at, host_id, workspace_id, branch, pr_url, error, \
+     created_at";
 
 impl DatabaseStore {
     /// Insert a new automation. Marked `dirty` so a future sync pushes it.
@@ -865,8 +899,8 @@ impl DatabaseStore {
         conn.execute(
             "INSERT INTO automations
                 (user_id, name, prompt, agent, schedule, timezone,
-                 host_id, project_path, retention_limit, dirty)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
+                 host_id, project_path, project_remote, retention_limit, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 input.name,
                 input.prompt,
@@ -875,6 +909,7 @@ impl DatabaseStore {
                 input.timezone,
                 input.host_id,
                 input.project_path,
+                input.project_remote,
                 input.retention_limit,
             ],
         )
@@ -940,9 +975,9 @@ impl DatabaseStore {
                 "UPDATE automations
                  SET name = ?1, prompt = ?2, agent = ?3, schedule = ?4,
                      timezone = ?5, host_id = ?6, project_path = ?7,
-                     retention_limit = ?8, updated_at = datetime('now'),
-                     dirty = 1
-                 WHERE id = ?9 AND user_id = 'local' AND deleted_at IS NULL",
+                     project_remote = ?8, retention_limit = ?9,
+                     updated_at = datetime('now'), dirty = 1
+                 WHERE id = ?10 AND user_id = 'local' AND deleted_at IS NULL",
                 params![
                     input.name,
                     input.prompt,
@@ -951,6 +986,7 @@ impl DatabaseStore {
                     input.timezone,
                     input.host_id,
                     input.project_path,
+                    input.project_remote,
                     input.retention_limit,
                     id,
                 ],
@@ -1085,17 +1121,23 @@ impl DatabaseStore {
         run_id: i64,
         status: &str,
         workspace_id: Option<&str>,
+        branch: Option<&str>,
+        pr_url: Option<&str>,
         error: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
+        // `COALESCE` on workspace_id / branch / pr_url means a `None`
+        // never clobbers a value an earlier write already set.
         conn.execute(
             "UPDATE automation_runs
              SET status = ?1,
                  finished_at = datetime('now'),
                  workspace_id = COALESCE(?2, workspace_id),
-                 error = ?3
-             WHERE id = ?4",
-            params![status, workspace_id, error, run_id],
+                 branch = COALESCE(?3, branch),
+                 pr_url = COALESCE(?4, pr_url),
+                 error = ?5
+             WHERE id = ?6",
+            params![status, workspace_id, branch, pr_url, error, run_id],
         )
         .map_err(|e| format!("Failed to finish automation run: {e}"))?;
         Ok(())
@@ -1237,6 +1279,7 @@ impl DatabaseStore {
         timezone: &str,
         host_id: Option<i64>,
         project_path: Option<&str>,
+        project_remote: Option<&str>,
         enabled: bool,
         retention_limit: i64,
         created_at: &str,
@@ -1249,13 +1292,15 @@ impl DatabaseStore {
                 "UPDATE automations
                  SET name = ?1, prompt = ?2, agent = ?3, schedule = ?4,
                      timezone = ?5, host_id = ?6, project_path = ?7,
-                     enabled = ?8, retention_limit = ?9, created_at = ?10,
-                     updated_at = ?11, deleted_at = ?12, dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?13",
+                     project_remote = ?8, enabled = ?9, retention_limit = ?10,
+                     created_at = ?11, updated_at = ?12, deleted_at = ?13,
+                     dirty = 0
+                 WHERE user_id = 'local' AND server_id = ?14",
                 params![
                     name, prompt, agent, schedule, timezone, host_id,
-                    project_path, enabled as i64, retention_limit,
-                    created_at, updated_at, deleted_at, server_id,
+                    project_path, project_remote, enabled as i64,
+                    retention_limit, created_at, updated_at, deleted_at,
+                    server_id,
                 ],
             )
             .map_err(|e| format!("Failed to update automation from server: {e}"))?;
@@ -1263,14 +1308,15 @@ impl DatabaseStore {
             conn.execute(
                 "INSERT INTO automations
                     (user_id, server_id, name, prompt, agent, schedule,
-                     timezone, host_id, project_path, enabled,
-                     retention_limit, created_at, updated_at, deleted_at, dirty)
+                     timezone, host_id, project_path, project_remote,
+                     enabled, retention_limit, created_at, updated_at,
+                     deleted_at, dirty)
                  VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                         ?11, ?12, ?13, 0)",
+                         ?11, ?12, ?13, ?14, 0)",
                 params![
                     server_id, name, prompt, agent, schedule, timezone,
-                    host_id, project_path, enabled as i64, retention_limit,
-                    created_at, updated_at, deleted_at,
+                    host_id, project_path, project_remote, enabled as i64,
+                    retention_limit, created_at, updated_at, deleted_at,
                 ],
             )
             .map_err(|e| format!("Failed to insert automation from server: {e}"))?;
@@ -1292,8 +1338,8 @@ impl DatabaseStore {
 }
 
 fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationRecord> {
-    let enabled_int: i64 = row.get(9)?;
-    let dirty_int: i64 = row.get(16)?;
+    let enabled_int: i64 = row.get(10)?;
+    let dirty_int: i64 = row.get(17)?;
     Ok(AutomationRecord {
         id: row.get(0)?,
         server_id: row.get(1)?,
@@ -1304,13 +1350,14 @@ fn row_to_automation(row: &rusqlite::Row<'_>) -> rusqlite::Result<AutomationReco
         timezone: row.get(6)?,
         host_id: row.get(7)?,
         project_path: row.get(8)?,
+        project_remote: row.get(9)?,
         enabled: enabled_int != 0,
-        retention_limit: row.get(10)?,
-        last_run_at: row.get(11)?,
-        next_run_at: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
-        deleted_at: row.get(15)?,
+        retention_limit: row.get(11)?,
+        last_run_at: row.get(12)?,
+        next_run_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        deleted_at: row.get(16)?,
         dirty: dirty_int != 0,
     })
 }
@@ -1325,8 +1372,10 @@ fn row_to_automation_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<Automation
         finished_at: row.get(5)?,
         host_id: row.get(6)?,
         workspace_id: row.get(7)?,
-        error: row.get(8)?,
-        created_at: row.get(9)?,
+        branch: row.get(8)?,
+        pr_url: row.get(9)?,
+        error: row.get(10)?,
+        created_at: row.get(11)?,
     })
 }
 
@@ -3243,6 +3292,7 @@ mod tests {
             timezone: "UTC".to_string(),
             host_id: None,
             project_path: Some("/home/user/repo".to_string()),
+            project_remote: None,
             retention_limit: 10,
         }
     }
@@ -3357,8 +3407,15 @@ mod tests {
         assert!(run.started_at.is_none());
 
         db.mark_automation_run_started(run.id).unwrap();
-        db.finish_automation_run(run.id, "succeeded", Some("ws-42"), None)
-            .unwrap();
+        db.finish_automation_run(
+            run.id,
+            "succeeded",
+            Some("ws-42"),
+            Some("automation-deploy-check-20260301-080000"),
+            None,
+            None,
+        )
+        .unwrap();
 
         let runs = db.list_automation_runs(a.id, 10);
         assert_eq!(runs.len(), 1);
@@ -3367,6 +3424,10 @@ mod tests {
         assert!(finished.started_at.is_some());
         assert!(finished.finished_at.is_some());
         assert_eq!(finished.workspace_id.as_deref(), Some("ws-42"));
+        assert_eq!(
+            finished.branch.as_deref(),
+            Some("automation-deploy-check-20260301-080000")
+        );
     }
 
     #[test]

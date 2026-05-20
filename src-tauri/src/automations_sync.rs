@@ -35,6 +35,8 @@ pub struct ServerAutomation {
     pub host_server_id: Option<String>,
     #[serde(rename = "projectPath")]
     pub project_path: Option<String>,
+    #[serde(rename = "projectRemote", default)]
+    pub project_remote: Option<String>,
     pub enabled: bool,
     #[serde(rename = "retentionLimit")]
     pub retention_limit: i64,
@@ -67,6 +69,8 @@ struct AutomationUpsertBody<'a> {
     host_server_id: Option<String>,
     #[serde(rename = "projectPath")]
     project_path: Option<&'a str>,
+    #[serde(rename = "projectRemote")]
+    project_remote: Option<&'a str>,
     enabled: bool,
     #[serde(rename = "retentionLimit")]
     retention_limit: i64,
@@ -173,6 +177,7 @@ pub async fn pull(
             &a.timezone,
             host_id,
             a.project_path.as_deref(),
+            a.project_remote.as_deref(),
             a.enabled,
             a.retention_limit,
             &a.created_at,
@@ -198,6 +203,7 @@ pub async fn pull(
                     &row.timezone,
                     row.host_id,
                     row.project_path.as_deref(),
+                    row.project_remote.as_deref(),
                     row.enabled,
                     row.retention_limit,
                     &row.created_at,
@@ -255,6 +261,7 @@ fn upsert_body<'a>(
         timezone: &row.timezone,
         host_server_id: row.host_id.and_then(|id| local_to_server.get(&id).cloned()),
         project_path: row.project_path.as_deref(),
+        project_remote: row.project_remote.as_deref(),
         enabled: row.enabled,
         retention_limit: row.retention_limit,
     }
@@ -373,6 +380,7 @@ mod tests {
             timezone: "UTC".to_string(),
             host_id: None,
             project_path: Some("/repo".to_string()),
+            project_remote: None,
             retention_limit: 10,
         }
     }
