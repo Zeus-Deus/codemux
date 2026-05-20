@@ -355,6 +355,41 @@ export function AutomationsSection() {
     );
   }
 
+  // First run: no automations and not mid-create. A single inviting
+  // hero reads far better than an empty sidebar beside an empty pane.
+  if (automations.length === 0 && draft === null) {
+    return (
+      <div className="flex h-full min-h-[460px] items-center justify-center">
+        <div className="max-w-sm space-y-4 text-center">
+          <div className="mx-auto flex size-14 items-center justify-center rounded-2xl border border-border/50 bg-muted/40">
+            <CalendarClock className="size-6 text-muted-foreground/70" />
+          </div>
+          <div className="space-y-1.5">
+            <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
+              No automations yet
+            </h3>
+            <p className="text-[12.5px] leading-relaxed text-muted-foreground/80">
+              Run an agent on a schedule — triage issues each morning,
+              sweep stale branches nightly, post a weekly summary. It runs
+              on the host you choose, even with your laptop closed.
+            </p>
+          </div>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="h-8 gap-1.5 text-[12.5px]"
+            onClick={startCreate}
+          >
+            <Plus className="size-3.5" />
+            New automation
+          </Button>
+          {error && <p className="text-[12px] text-destructive">{error}</p>}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-[460px] gap-6">
       {/* Sidebar */}
@@ -374,40 +409,59 @@ export function AutomationsSection() {
           </div>
         )}
 
-        <ul className="space-y-px">
-          {automations.map((automation) => (
-            <li key={automation.id}>
-              <button
-                type="button"
-                onClick={() => {
-                  setSelectedId(automation.id);
-                  setDraft(null);
-                }}
-                className={cn(
-                  "group/row flex w-full items-center gap-2.5 rounded-md px-2.5 h-8 text-left text-[13px] transition-colors",
-                  selectedId === automation.id && draft === null
-                    ? "bg-muted text-foreground"
-                    : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
-                )}
-              >
-                <span
-                  aria-hidden
-                  title={automation.enabled ? "Enabled" : "Paused"}
+        <ul className="space-y-0.5">
+          {automations.map((automation) => {
+            const active = selectedId === automation.id && draft === null;
+            return (
+              <li key={automation.id}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedId(automation.id);
+                    setDraft(null);
+                  }}
                   className={cn(
-                    "size-1.5 shrink-0 rounded-full transition-colors",
-                    automation.enabled ? "bg-success" : "bg-muted-foreground/40",
+                    "group/row flex w-full items-start gap-2.5 rounded-md px-2.5 py-2 text-left transition-colors",
+                    active ? "bg-muted" : "hover:bg-muted/40",
                   )}
-                />
-                <span className="min-w-0 flex-1 truncate">{automation.name}</span>
-                {automation.dirty && (
+                >
                   <span
-                    title="Pending sync"
-                    className="size-1.5 shrink-0 rounded-full bg-warning"
+                    aria-hidden
+                    title={automation.enabled ? "Enabled" : "Paused"}
+                    className={cn(
+                      "mt-[5px] size-1.5 shrink-0 rounded-full transition-colors",
+                      automation.enabled
+                        ? "bg-success"
+                        : "bg-muted-foreground/40",
+                    )}
                   />
-                )}
-              </button>
-            </li>
-          ))}
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={cn(
+                          "min-w-0 flex-1 truncate text-[13px] transition-colors",
+                          active
+                            ? "text-foreground"
+                            : "text-muted-foreground group-hover/row:text-foreground",
+                        )}
+                      >
+                        {automation.name}
+                      </span>
+                      {automation.dirty && (
+                        <span
+                          title="Pending sync"
+                          className="size-1.5 shrink-0 rounded-full bg-warning"
+                        />
+                      )}
+                    </span>
+                    <span className="mt-0.5 block truncate text-[11px] text-muted-foreground/55">
+                      {describeSchedule(automation.schedule)}
+                    </span>
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
 
         <div className="mt-4 pt-4 border-t border-border/40">
@@ -490,6 +544,9 @@ function AutomationDetail({
       ? "This machine"
       : (hosts.find((h) => h.id === automation.host_id)?.name ??
         "Removed host");
+  const agentLabel =
+    AGENTS.find((a) => a.value === automation.agent)?.label ??
+    automation.agent;
 
   return (
     <div className="space-y-6">
@@ -515,8 +572,7 @@ function AutomationDetail({
           )}
         </div>
         <p className="text-[12px] text-muted-foreground/85">
-          {describeSchedule(automation.schedule)} · {automation.agent} ·{" "}
-          {hostLabel}
+          {describeSchedule(automation.schedule)} · {agentLabel} · {hostLabel}
         </p>
       </div>
 
@@ -606,13 +662,13 @@ function formatStamp(stamp: string | null): string {
 
 // ── Run history ──
 
-const RUN_STATUS_TONE: Record<string, string> = {
-  scheduled: "bg-muted-foreground/40",
-  running: "bg-warning",
-  succeeded: "bg-success",
-  failed: "bg-destructive",
-  skipped_offline: "bg-muted-foreground/40",
-  skipped_busy: "bg-muted-foreground/40",
+const RUN_STATUS_BADGE: Record<string, string> = {
+  scheduled: "bg-muted text-muted-foreground",
+  running: "bg-warning/15 text-warning",
+  succeeded: "bg-success/15 text-success",
+  failed: "bg-destructive/15 text-destructive",
+  skipped_offline: "bg-muted text-muted-foreground",
+  skipped_busy: "bg-muted text-muted-foreground",
 };
 
 function RunHistory({ automationId }: { automationId: number }) {
@@ -639,33 +695,39 @@ function RunHistory({ automationId }: { automationId: number }) {
 
   return (
     <div className="space-y-1.5">
-      <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
-        Run history
-      </p>
+      <div className="flex items-baseline justify-between">
+        <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
+          Run history
+        </p>
+        {runs.length > 0 && (
+          <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+            {runs.length}
+          </span>
+        )}
+      </div>
       {loading ? (
-        <p className="text-[12px] text-muted-foreground/70 py-2">Loading…</p>
+        <p className="py-2 text-[12px] text-muted-foreground/70">Loading…</p>
       ) : runs.length === 0 ? (
-        <p className="text-[12px] text-muted-foreground/70 py-2">
+        <p className="rounded-lg border border-dashed border-border/60 px-3 py-3 text-[12px] text-muted-foreground/70">
           No runs yet. The next fire will appear here.
         </p>
       ) : (
-        <ul className="rounded-lg border border-border/60 divide-y divide-border/40">
+        <ul className="overflow-hidden rounded-lg border border-border/60 divide-y divide-border/40">
           {runs.map((run) => (
             <li
               key={run.id}
-              className="flex items-center gap-2.5 px-3 py-2 text-[12px]"
+              title={run.error ?? undefined}
+              className="flex items-center gap-3 px-3 py-2"
             >
-              <span
-                aria-hidden
-                className={cn(
-                  "size-1.5 shrink-0 rounded-full",
-                  RUN_STATUS_TONE[run.status] ?? "bg-muted-foreground/40",
-                )}
-              />
-              <span className="font-mono text-[11.5px] text-muted-foreground/85 tabular-nums">
+              <span className="font-mono text-[11.5px] tabular-nums text-muted-foreground/80">
                 {formatStamp(run.scheduled_for)}
               </span>
-              <span className="ml-auto text-[11px] text-muted-foreground/75">
+              <span
+                className={cn(
+                  "ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",
+                  RUN_STATUS_BADGE[run.status] ?? "bg-muted text-muted-foreground",
+                )}
+              >
                 {run.status.replace(/_/g, " ")}
               </span>
             </li>

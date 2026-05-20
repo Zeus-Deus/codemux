@@ -47,13 +47,8 @@ export function AutomationsView() {
         </span>
       </div>
 
-      <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
-        <div className="mx-auto max-w-3xl">
-          <p className="mb-5 text-[12.5px] text-muted-foreground/85 leading-relaxed">
-            Scheduled agent runs. An automation runs a prompt with an agent
-            on a recurring schedule; each fire records a run you can review
-            here.
-          </p>
+      <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
+        <div className="mx-auto max-w-5xl">
           <AutomationsSection />
         </div>
       </div>
