@@ -9,6 +9,10 @@ import copilotIcon from "@/assets/preset-icons/copilot.svg";
 import mastracodeIcon from "@/assets/preset-icons/mastracode.svg";
 import piIcon from "@/assets/preset-icons/pi.svg";
 import cursorAgentIcon from "@/assets/preset-icons/cursor-agent.svg";
+import antigravityIcon from "@/assets/preset-icons/antigravity.svg";
+import ampIcon from "@/assets/preset-icons/amp.svg";
+import grokIcon from "@/assets/preset-icons/grok.svg";
+import factoryIcon from "@/assets/preset-icons/factory.svg";
 
 interface PresetIconProps {
   icon: string | null;
@@ -24,6 +28,10 @@ const ICON_MAP: Record<string, string> = {
   mastracode: mastracodeIcon,
   pi: piIcon,
   "cursor-agent": cursorAgentIcon,
+  antigravity: antigravityIcon,
+  amp: ampIcon,
+  grok: grokIcon,
+  factory: factoryIcon,
 };
 
 export function PresetIcon({ icon, className }: PresetIconProps) {

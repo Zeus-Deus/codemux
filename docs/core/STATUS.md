@@ -95,7 +95,7 @@ The repo structure is clean and domain-split:
 - Per-user synced settings with server sync, offline cache, and dirty flag
 
 ### Presets & launchers
-- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini, Pi, Shell)
+- Terminal presets with quick-launch bar (Claude Code, Codex, OpenCode, Gemini, Antigravity, Copilot, Cursor Agent, Amp, Grok, Droid, Mastracode, Pi, Shell, Chat Agent) — each agent preset launches in its CLI's skip-permissions/YOLO mode
 - Pin/unpin to control bar visibility
 - Auto-run on workspace creation or new tab
 - Partial-materialise recovery for preset DnD; new-tab preset launch
