@@ -379,10 +379,23 @@ export function PresetBar({
 
   const setShowSettings = useUIStore.getState().setShowSettings;
 
+  // Translate a vertical mouse-wheel delta into horizontal scrolling so
+  // the bar can be panned with a plain wheel when many pinned presets
+  // overflow a narrow window. `overflow-x: auto` only responds to
+  // horizontal wheel / trackpad input on its own (verified on the
+  // WebKit webview — a vertical wheel over the bar moved `scrollLeft`
+  // by 0). `deltaX` is left to that native horizontal-scroll path.
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (el.scrollWidth <= el.clientWidth || e.deltaY === 0) return;
+    el.scrollLeft += e.deltaY;
+  };
+
   return (
     <div
       className="flex items-center h-8 border-b border-border bg-background px-2 gap-0.5 shrink-0 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
+      onWheel={handleWheel}
     >
       {/* Settings gear */}
       <DropdownMenu>

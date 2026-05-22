@@ -147,6 +147,124 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
         },
+        // Antigravity CLI — Google's successor to Gemini CLI (binary
+        // `agy`). `--dangerously-skip-permissions` is the verified
+        // skip-permissions flag (confirmed from `agy --help`); there is
+        // no `--yolo` flag on the CLI despite some third-party docs.
+        TerminalPreset {
+            id: "builtin-antigravity".into(),
+            name: "Antigravity".into(),
+            description: Some("Launch Antigravity CLI agent (agy)".into()),
+            commands: vec!["agy --dangerously-skip-permissions".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("antigravity".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // GitHub Copilot CLI. `--allow-all` is documented as the
+        // equivalent of `--allow-all-tools --allow-all-paths
+        // --allow-all-urls` (full auto-approve).
+        TerminalPreset {
+            id: "builtin-copilot".into(),
+            name: "Copilot".into(),
+            description: Some("Launch GitHub Copilot CLI agent".into()),
+            commands: vec!["copilot --allow-all".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("copilot".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // Cursor Agent CLI. `--yolo` is the documented alias for
+        // `--force` ("Run Everything").
+        TerminalPreset {
+            id: "builtin-cursor-agent".into(),
+            name: "Cursor Agent".into(),
+            description: Some("Launch Cursor Agent CLI".into()),
+            commands: vec!["cursor-agent --yolo".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("cursor-agent".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // Amp (Sourcegraph). `--dangerously-allow-all` disables all
+        // command confirmation prompts.
+        TerminalPreset {
+            id: "builtin-amp".into(),
+            name: "Amp".into(),
+            description: Some("Launch Amp coding agent".into()),
+            commands: vec!["amp --dangerously-allow-all".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("amp".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // Grok CLI (xAI). `--always-approve` auto-approves all tool
+        // executions.
+        TerminalPreset {
+            id: "builtin-grok".into(),
+            name: "Grok".into(),
+            description: Some("Launch Grok CLI agent".into()),
+            commands: vec!["grok --always-approve".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("grok".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // Factory Droid. Interactive `droid` has no skip-permissions
+        // flag; full autonomy is set via a runtime settings file passed
+        // with `--settings`. `agent_context::inject_agent_context`
+        // rewrites the bare `droid` command to write that file and
+        // append `--settings` at launch (see its `droid` arm).
+        TerminalPreset {
+            id: "builtin-droid".into(),
+            name: "Droid".into(),
+            description: Some("Launch Factory Droid agent (full autonomy)".into()),
+            commands: vec!["droid".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("factory".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
+        // Mastracode (Mastra). YOLO mode (auto-approve all tool calls)
+        // is on by default for the interactive TUI — no launch flag.
+        TerminalPreset {
+            id: "builtin-mastracode".into(),
+            name: "Mastracode".into(),
+            description: Some("Launch Mastracode agent".into()),
+            commands: vec!["mastracode".into()],
+            working_directory: None,
+            launch_mode: LaunchMode::NewTab,
+            icon: Some("mastracode".into()),
+            pinned: true,
+            is_builtin: true,
+            auto_run_on_workspace: false,
+            auto_run_on_new_tab: false,
+            kind: PresetKind::Cli,
+        },
         TerminalPreset {
             id: "builtin-pi".into(),
             name: "Pi".into(),
@@ -325,6 +443,13 @@ mod tests {
             "builtin-codex",
             "builtin-opencode",
             "builtin-gemini",
+            "builtin-antigravity",
+            "builtin-copilot",
+            "builtin-cursor-agent",
+            "builtin-amp",
+            "builtin-grok",
+            "builtin-droid",
+            "builtin-mastracode",
             "builtin-pi",
             "builtin-shell",
         ] {
@@ -362,7 +487,7 @@ mod tests {
     #[test]
     fn default_store_has_all_builtins() {
         let store = default_store();
-        assert_eq!(store.presets.len(), 7);
+        assert_eq!(store.presets.len(), 14);
         assert!(store.bar_visible);
         assert!(store.presets.iter().all(|p| p.is_builtin));
     }
@@ -371,7 +496,7 @@ mod tests {
     fn load_presets_returns_defaults_on_missing_file() {
         let db = DatabaseStore::new_in_memory();
         let store = load_presets(&db);
-        assert_eq!(store.presets.len(), 7);
+        assert_eq!(store.presets.len(), 14);
         assert!(store.bar_visible);
     }
 
@@ -384,7 +509,7 @@ mod tests {
 
         let loaded = load_presets(&db);
         assert!(!loaded.bar_visible);
-        assert_eq!(loaded.presets.len(), 7);
+        assert_eq!(loaded.presets.len(), 14);
     }
 
     #[test]
@@ -397,7 +522,7 @@ mod tests {
 
         // Load should re-add missing builtins
         let loaded = load_presets(&db);
-        assert_eq!(loaded.presets.len(), 7);
+        assert_eq!(loaded.presets.len(), 14);
     }
 
     fn make_custom_preset(id: &str, name: &str) -> TerminalPreset {
@@ -512,14 +637,14 @@ mod tests {
         let mut store = default_store();
         store.presets.push(make_custom_preset("custom-1", "To Delete"));
         save_presets(&db, &store).unwrap();
-        assert_eq!(load_presets(&db).presets.len(), 8);
+        assert_eq!(load_presets(&db).presets.len(), 15);
 
         let mut loaded = load_presets(&db);
         loaded.presets.retain(|p| p.id != "custom-1");
         save_presets(&db, &loaded).unwrap();
 
         let reloaded = load_presets(&db);
-        assert_eq!(reloaded.presets.len(), 7); // only builtins remain
+        assert_eq!(reloaded.presets.len(), 14); // only builtins remain
         assert!(reloaded.presets.iter().all(|p| p.is_builtin));
     }
 
