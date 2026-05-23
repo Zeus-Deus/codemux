@@ -65,6 +65,7 @@ The repo structure is clean and domain-split:
 
 ### Workspace creation
 - Multi-step creation dialog with task description, branch selection, agent preset
+- **Model + reasoning selection before launch**: a model pill next to the agent picker. It appears for any preset whose command launches an already-modeled CLI (`claude` / `codex` / `opencode` / `gemini`) — detected from the command's binary token, so new presets light it up automatically. Models come from the same capability harvest as the Beta chat picker (OpenCode live-harvested; Claude/Codex maintained; Gemini a small static list); reasoning is `--effort` (Claude) / `-c model_reasoning_effort` (Codex); Claude also gets a context-window row (1M via the `[1m]` model-id suffix). The picker adapts: a flat list for short rosters, search + favorites + sub-provider grouping once the list is long. "Default" emits no flag, so untouched workspaces behave exactly as before. Backend injection lives in `agent_capability::apply_model_selection` (strips a baked-in flag so an explicit pick always wins) and is threaded through `apply_preset` / `create_worktree_workspace`.
 - AI-generated branch names from task description
 - GitHub issue / PR linking with branch auto-fill
 - **Paste clipboard images directly into the prompt input** (in addition to the existing file picker)

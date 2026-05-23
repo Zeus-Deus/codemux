@@ -34,7 +34,7 @@ Presets are stored in SQLite via the database layer. Six builtin presets ship by
 | Name | Command | Pinned |
 |------|---------|--------|
 | Claude Code | `claude --dangerously-skip-permissions` | yes |
-| Codex | `codex --full-auto` | yes |
+| Codex | `codex --dangerously-bypass-approvals-and-sandbox` | yes |
 | OpenCode | `opencode` | yes |
 | Gemini | `gemini --yolo` | yes |
 | Pi | `pi` | yes |

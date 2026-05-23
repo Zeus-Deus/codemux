@@ -65,7 +65,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Code indexing: `docs/features/code-indexing.md`
 - Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
-- Workspace creation: `docs/features/workspace-creation.md`
+- Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/plans/model-selection-before-launch.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`

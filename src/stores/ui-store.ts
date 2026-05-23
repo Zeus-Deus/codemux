@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { PendingWorkspace } from "@/tauri/types";
+import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
 
 export type RightPanelTab = "changes" | "files" | "review";
 
@@ -16,6 +16,10 @@ interface UIStore {
   showContentSearch: boolean;
   pendingWorkspaces: PendingWorkspace[];
   lastSelectedAgentId: string | null;
+  /** Last model + reasoning choice per agent family (`claude`, `codex`,
+   *  `opencode`, `gemini`), so reopening the New Workspace dialog
+   *  restores the user's pick instead of resetting to Default. */
+  lastModelSelections: Record<string, ModelSelection>;
   showCommandPalette: boolean;
   showCloneDialog: boolean;
   showNewProjectScreen: boolean;
@@ -37,6 +41,7 @@ interface UIStore {
   removePendingWorkspace: (id: string) => void;
   failPendingWorkspace: (id: string, error: string) => void;
   setLastSelectedAgentId: (id: string | null) => void;
+  setLastModelSelection: (family: string, selection: ModelSelection) => void;
   setShowCommandPalette: (show: boolean) => void;
   toggleCommandPalette: () => void;
   setShowCloneDialog: (show: boolean) => void;
@@ -59,6 +64,7 @@ export const useUIStore = create<UIStore>()(
       showContentSearch: false,
       pendingWorkspaces: [],
       lastSelectedAgentId: null,
+      lastModelSelections: {},
       showCommandPalette: false,
       showCloneDialog: false,
       showNewProjectScreen: false,
@@ -112,6 +118,11 @@ export const useUIStore = create<UIStore>()(
 
       setLastSelectedAgentId: (id) => set({ lastSelectedAgentId: id }),
 
+      setLastModelSelection: (family, selection) =>
+        set((s) => ({
+          lastModelSelections: { ...s.lastModelSelections, [family]: selection },
+        })),
+
       setShowCommandPalette: (show) => set({ showCommandPalette: show }),
       toggleCommandPalette: () => set((s) => ({ showCommandPalette: !s.showCommandPalette })),
 
@@ -135,6 +146,7 @@ export const useUIStore = create<UIStore>()(
         rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: state.rightPanelWidth,
         lastSelectedAgentId: state.lastSelectedAgentId,
+        lastModelSelections: state.lastModelSelections,
         hasSeenOnboarding: state.hasSeenOnboarding,
       }),
       // v0 → v1: the right-panel tab id `"pr"` was renamed to `"review"`

@@ -280,6 +280,7 @@ pub fn apply_preset(
     preset_id: String,
     override_mode: Option<String>,
     initial_prompt: Option<String>,
+    model_selection: Option<crate::agent_capability::ModelSelection>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -324,14 +325,23 @@ pub fn apply_preset(
         },
     };
 
-    // If preset has no commands (e.g. Shell preset), just create tab/split with no command
+    // If preset has no commands (e.g. Shell preset), just create tab/split with no command.
+    // The launch-time model selection (if any) is spliced into each command
+    // *before* agent-context injection so the Gemini env wrapper and the
+    // Claude/Codex `--system-prompt` suffix compose around it correctly.
     let commands = if preset.commands.is_empty() {
         vec![String::new()]
     } else {
         preset
             .commands
             .iter()
-            .map(|cmd| crate::agent_context::inject_agent_context(cmd, &workspace_id))
+            .map(|cmd| {
+                let cmd = crate::agent_capability::apply_model_selection(
+                    cmd,
+                    model_selection.as_ref(),
+                );
+                crate::agent_context::inject_agent_context(&cmd, &workspace_id)
+            })
             .collect()
     };
 

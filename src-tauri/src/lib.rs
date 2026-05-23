@@ -9,6 +9,7 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 #[cfg(not(debug_assertions))]
 pub const APP_DIR_NAME: &str = "codemux";
 
+pub mod agent_capability;
 pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;

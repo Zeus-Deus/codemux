@@ -607,6 +607,19 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             let preset_id = request.params.get("preset_id").and_then(Value::as_str).unwrap_or_default().to_string();
             let override_mode = request.params.get("override_mode").and_then(Value::as_str).map(String::from);
             let initial_prompt = request.params.get("initial_prompt").and_then(Value::as_str).map(String::from);
+            let model_selection = request
+                .params
+                .get("model_selection")
+                .cloned()
+                .and_then(|v| {
+                    serde_json::from_value(v)
+                        .map_err(|e| {
+                            eprintln!(
+                                "[control] apply_preset: ignoring malformed model_selection: {e}"
+                            )
+                        })
+                        .ok()
+                });
             crate::commands::presets::apply_preset(
                 app.clone(),
                 state,
@@ -616,6 +629,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 preset_id,
                 override_mode,
                 initial_prompt,
+                model_selection,
             )
             .map(|()| serde_json::json!({ "ok": true }))
         }
@@ -692,6 +706,19 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                     layout,
                     initial_prompt,
                     agent_preset_id,
+                    request
+                        .params
+                        .get("model_selection")
+                        .cloned()
+                        .and_then(|v| {
+                            serde_json::from_value(v)
+                                .map_err(|e| {
+                                    eprintln!(
+                                        "[control] create_worktree_workspace: ignoring malformed model_selection: {e}"
+                                    )
+                                })
+                                .ok()
+                        }),
                     pr_number,
                 )
                 .await

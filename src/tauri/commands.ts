@@ -3,6 +3,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 export { Channel };
 import type {
   AgentChatProviderKind,
+  ModelSelection,
   OpenCodeAvailability,
   OpenCodeProviderEntry,
   ProviderChatCapabilities,
@@ -405,6 +406,7 @@ export const createWorktreeWorkspace = (
   initialPrompt?: string | null,
   agentPresetId?: string | null,
   prNumber?: number | null,
+  modelSelection?: ModelSelection | null,
 ) =>
   invoke<string>("create_worktree_workspace", {
     repoPath,
@@ -414,6 +416,7 @@ export const createWorktreeWorkspace = (
     layout,
     initialPrompt: initialPrompt ?? null,
     agentPresetId: agentPresetId ?? null,
+    modelSelection: modelSelection ?? null,
     prNumber: prNumber ?? null,
   });
 
@@ -952,8 +955,15 @@ export const applyPreset = (
   presetId: string,
   overrideMode?: LaunchMode | "current_terminal" | "existing_panes",
   initialPrompt?: string | null,
+  modelSelection?: ModelSelection | null,
 ) =>
-  invoke("apply_preset", { workspaceId, presetId, overrideMode, initialPrompt });
+  invoke("apply_preset", {
+    workspaceId,
+    presetId,
+    overrideMode,
+    initialPrompt,
+    modelSelection: modelSelection ?? null,
+  });
 
 export const setPresetBarVisible = (visible: boolean) =>
   invoke("set_preset_bar_visible", { visible });

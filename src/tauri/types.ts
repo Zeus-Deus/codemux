@@ -607,6 +607,17 @@ export interface TabSnapshot {
 
 export type AgentChatProviderKind = "claude" | "codex" | "opencode";
 
+/** Launch-time model / reasoning / context choice for a CLI agent
+ *  preset. Every field is optional — `null` means "use the agent's own
+ *  default" and emits no flag. `context` is Claude-only (`"1m"` opts
+ *  into the 1M window). Mirrors the Rust `agent_capability::ModelSelection`
+ *  consumed by `apply_preset` / `create_worktree_workspace`. */
+export interface ModelSelection {
+  model: string | null;
+  reasoning: string | null;
+  context: string | null;
+}
+
 /** Step 12 Stage 1 — driver-equals-instance shim (`"claude"` /
  *  `"codex"` / `"opencode"`). v2 lifts this to a richer
  *  `(driver, instance)` map; today it round-trips with

@@ -348,12 +348,13 @@ pub async fn create_worktree_workspace(
     layout: String,
     initial_prompt: Option<String>,
     agent_preset_id: Option<String>,
+    model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
 ) -> Result<String, String> {
     create_worktree_workspace_impl(
         app, &state, &db, &pty_state, &presets,
         repo_path, branch, new_branch, base, layout,
-        initial_prompt, agent_preset_id, pr_number,
+        initial_prompt, agent_preset_id, model_selection, pr_number,
     )
     .await
 }
@@ -384,6 +385,7 @@ pub(crate) async fn create_worktree_workspace_impl(
     layout: String,
     initial_prompt: Option<String>,
     agent_preset_id: Option<String>,
+    model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
 ) -> Result<String, String> {
     let layout = match layout.as_str() {
@@ -469,7 +471,13 @@ pub(crate) async fn create_worktree_workspace_impl(
                 preset
                     .commands
                     .iter()
-                    .map(|cmd| crate::agent_context::inject_agent_context(cmd, &workspace_id.0))
+                    .map(|cmd| {
+                        let cmd = crate::agent_capability::apply_model_selection(
+                            cmd,
+                            model_selection.as_ref(),
+                        );
+                        crate::agent_context::inject_agent_context(&cmd, &workspace_id.0)
+                    })
                     .collect()
             };
 

@@ -109,7 +109,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             id: "builtin-codex".into(),
             name: "Codex".into(),
             description: Some("Launch OpenAI Codex agent".into()),
-            commands: vec!["codex --full-auto".into()],
+            commands: vec!["codex --dangerously-bypass-approvals-and-sandbox".into()],
             working_directory: None,
             launch_mode: LaunchMode::NewTab,
             icon: Some("codex".into()),
