@@ -20,16 +20,29 @@ Detected editors:
 
 | Command | Display Name | Windows Fallback Paths |
 |---------|-------------|---------------------|
-| `code` | VS Code | `Microsoft VS Code\Code.exe` |
+| `code` | VS Code | `Microsoft VS Code\Code.exe`, `Microsoft VS Code Insiders\Code - Insiders.exe` |
 | `cursor` | Cursor | `cursor\Cursor.exe` |
+| `windsurf` | Windsurf | `Windsurf\Windsurf.exe` |
+| `trae` | Trae | `Trae\Trae.exe` |
 | `codium` | VSCodium | `VSCodium\VSCodium.exe` |
 | `zed` | Zed | `Zed\Zed.exe` |
-| `idea` | IntelliJ IDEA | (PATH only — JetBrains Toolbox shims live on `PATH`) |
-| `goland` | GoLand | (PATH only) |
-| `webstorm` | WebStorm | (PATH only) |
+| `fleet` | Fleet | (PATH only — JetBrains Toolbox shim) |
+| `lapce` | Lapce | `Lapce\lapce.exe` |
+| `idea` | IntelliJ IDEA | (PATH only — JetBrains Toolbox shim) |
+| `pycharm` | PyCharm | (PATH only — JetBrains Toolbox shim) |
+| `phpstorm` | PhpStorm | (PATH only — JetBrains Toolbox shim) |
+| `webstorm` | WebStorm | (PATH only — JetBrains Toolbox shim) |
+| `goland` | GoLand | (PATH only — JetBrains Toolbox shim) |
+| `rubymine` | RubyMine | (PATH only — JetBrains Toolbox shim) |
+| `clion` | CLion | (PATH only — JetBrains Toolbox shim) |
+| `rider` | Rider | (PATH only — JetBrains Toolbox shim) |
+| `datagrip` | DataGrip | (PATH only — JetBrains Toolbox shim) |
+| `studio` | Android Studio | (PATH only — JetBrains Toolbox shim) |
 | `sublime_text` | Sublime Text | (PATH only) |
 
 The `EditorInfo.command` field stores the **full resolved path**, not just the command name, so `open_in_editor` can spawn the exact `.exe` we detected — important on Windows where PATH alone is unreliable for per-user installs.
+
+Editors without a dedicated icon asset (Windsurf, Trae, Fleet, Lapce, JetBrains family) render with a placeholder in the UI: JetBrains-family entries use the IntelliJ icon as a stand-in (consistent JetBrains visual language), other unmapped editors fall back to the generic Code2 lucide glyph. Adding per-product SVGs in `src/assets/editor-icons/` and wiring them into `src/components/icons/editor-icon.tsx` is a drop-in upgrade.
 
 ### Opening
 
