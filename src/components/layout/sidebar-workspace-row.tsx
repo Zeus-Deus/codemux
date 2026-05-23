@@ -3,12 +3,16 @@ import {
   ContextMenu,
   ContextMenuTrigger,
   ContextMenuContent,
+  ContextMenuGroup,
   ContextMenuItem,
+  ContextMenuLabel,
   ContextMenuSeparator,
   ContextMenuSub,
   ContextMenuSubTrigger,
   ContextMenuSubContent,
 } from "@/components/ui/context-menu";
+import { groupEditors } from "@/lib/editor-groups";
+import { EditorIcon } from "@/components/icons/editor-icon";
 import {
   Dialog,
   DialogContent,
@@ -324,19 +328,42 @@ export function WorkspaceContextMenuItems({
       </ContextMenuItem>
       {editors.length === 1 ? (
         <ContextMenuItem onClick={() => handleOpenInEditor(editors[0].id)}>
+          <EditorIcon id={editors[0].id} className="h-4 w-4" />
           Open in {editors[0].name}
         </ContextMenuItem>
       ) : editors.length > 1 ? (
-        <ContextMenuSub>
-          <ContextMenuSubTrigger>Open in editor</ContextMenuSubTrigger>
-          <ContextMenuSubContent>
-            {editors.map((editor) => (
-              <ContextMenuItem key={editor.id} onClick={() => handleOpenInEditor(editor.id)}>
-                {editor.name}
-              </ContextMenuItem>
-            ))}
-          </ContextMenuSubContent>
-        </ContextMenuSub>
+        (() => {
+          const groupedEditors = groupEditors(editors);
+          const showGroupLabels = groupedEditors.length > 1;
+          return (
+            <ContextMenuSub>
+              <ContextMenuSubTrigger>Open in editor</ContextMenuSubTrigger>
+              <ContextMenuSubContent>
+                {groupedEditors.map((group, groupIdx) => (
+                  // Same grouping pattern as the title-bar launcher —
+                  // render section labels between families when more
+                  // than one is installed, skip them when only one
+                  // family is present so a "VS Code family" header
+                  // doesn't dangle over a single entry.
+                  <ContextMenuGroup key={group.id}>
+                    {groupIdx > 0 && <ContextMenuSeparator />}
+                    {showGroupLabels && (
+                      <ContextMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                        {group.label}
+                      </ContextMenuLabel>
+                    )}
+                    {group.editors.map((editor) => (
+                      <ContextMenuItem key={editor.id} onClick={() => handleOpenInEditor(editor.id)}>
+                        <EditorIcon id={editor.id} className="h-4 w-4" />
+                        {editor.name}
+                      </ContextMenuItem>
+                    ))}
+                  </ContextMenuGroup>
+                ))}
+              </ContextMenuSubContent>
+            </ContextMenuSub>
+          );
+        })()
       ) : null}
       <ContextMenuItem
         onClick={handleCopyBranch}

@@ -1436,14 +1436,33 @@ pub struct EditorInfo {
 
 static DETECTED_EDITORS: OnceLock<Vec<EditorInfo>> = OnceLock::new();
 
+// Order matters: this is the order shown in the IDE launcher dropdown when
+// multiple editors are detected, and the first installed entry becomes the
+// auto-picked default on first run. Roughly: VS Code family → AI-first
+// editors → other modern GUI editors → JetBrains family → other GUI.
 const EDITOR_CANDIDATES: &[(&str, &str)] = &[
+    // VS Code family
     ("code", "VS Code"),
     ("cursor", "Cursor"),
+    ("windsurf", "Windsurf"),
+    ("trae", "Trae"),
     ("codium", "VSCodium"),
+    // Modern GUI editors
     ("zed", "Zed"),
+    ("fleet", "Fleet"),
+    ("lapce", "Lapce"),
+    // JetBrains family (shims installed by JetBrains Toolbox land on PATH)
     ("idea", "IntelliJ IDEA"),
-    ("goland", "GoLand"),
+    ("pycharm", "PyCharm"),
+    ("phpstorm", "PhpStorm"),
     ("webstorm", "WebStorm"),
+    ("goland", "GoLand"),
+    ("rubymine", "RubyMine"),
+    ("clion", "CLion"),
+    ("rider", "Rider"),
+    ("datagrip", "DataGrip"),
+    ("studio", "Android Studio"),
+    // Other
     ("sublime_text", "Sublime Text"),
 ];
 
@@ -1462,8 +1481,11 @@ const WINDOWS_EDITOR_FALLBACKS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cursor", &[r"cursor\Cursor.exe"]),
+    ("windsurf", &[r"Windsurf\Windsurf.exe"]),
+    ("trae", &[r"Trae\Trae.exe"]),
     ("codium", &[r"VSCodium\VSCodium.exe"]),
     ("zed", &[r"Zed\Zed.exe"]),
+    ("lapce", &[r"Lapce\lapce.exe"]),
 ];
 
 /// Resolve an editor command to an absolute path:

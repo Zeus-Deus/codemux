@@ -15,6 +15,11 @@ interface EditorIconProps {
   className?: string;
 }
 
+// Editors without dedicated icon assets fall back to the generic Code2
+// lucide glyph (see render below). JetBrains-family editors share the
+// IntelliJ icon as a placeholder until per-product art is added; they
+// all use the same red/gradient JetBrains visual language so this
+// reads as "JetBrains IDE" rather than as a wrong logo.
 const ICON_MAP: Record<string, string> = {
   code: vscodeIcon,
   codium: vscodiumIcon,
@@ -24,6 +29,15 @@ const ICON_MAP: Record<string, string> = {
   goland: golandIcon,
   webstorm: webstormIcon,
   sublime_text: sublimeIcon,
+  // JetBrains family placeholders
+  pycharm: intellijIcon,
+  phpstorm: intellijIcon,
+  rubymine: intellijIcon,
+  clion: intellijIcon,
+  rider: intellijIcon,
+  datagrip: intellijIcon,
+  fleet: intellijIcon,
+  studio: intellijIcon,
 };
 
 export function EditorIcon({ id, className }: EditorIconProps) {
