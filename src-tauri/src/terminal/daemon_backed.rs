@@ -26,6 +26,25 @@ use crate::state::AppStateStore;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
+/// Should `spawn_pty_for_session_via_daemon` synthesize a "relaunch this
+/// agent" command from the in-memory `original_command`?
+///
+/// True only when there's positive evidence the shell already had a prior
+/// agent run — either persisted scrollback metadata (`disk_meta_present`)
+/// or a captured agent session UUID (`claude_uuid_present`). Without one
+/// of those, this codepath is racing a fresh `apply_preset` call: the
+/// preset handler will write the exact same command via its own
+/// `write_command_when_ready`, so synthesizing here produces a duplicate
+/// write. The second write lands inside the just-started agent's input
+/// box — the Linux preset-leak bug. Windows isn't affected because the
+/// whole daemon path is `#[cfg(unix)]`-gated.
+pub(crate) fn should_synthesize_agent_relaunch(
+    disk_meta_present: bool,
+    claude_uuid_present: bool,
+) -> bool {
+    disk_meta_present || claude_uuid_present
+}
+
 /// Public entrypoint. Called from `spawn_pty_for_agent` when the
 /// `persistent_agents.enabled` setting is on. Returns an error if the
 /// daemon can't be reached, the spawn failed, or the attach failed —
@@ -527,17 +546,32 @@ pub async fn spawn_pty_for_session_via_daemon(
                 .find(|s| s.session_id.0 == session_id)
                 .and_then(|s| s.adapter_captures.get("claude_session_id"))
                 .cloned();
-            let cmd_opt = agent_binary.map(|bin| {
-                let mut parts = vec![bin];
-                if had_skip_perms {
-                    parts.push("--dangerously-skip-permissions".to_string());
-                }
-                if let Some(uuid) = claude_uuid.as_ref() {
-                    parts.push("--resume".to_string());
-                    parts.push(uuid.clone());
-                }
-                parts.join(" ")
-            });
+            // GATE: only synthesize a relaunch command when there's
+            // evidence this is genuinely a relaunch (persisted disk
+            // meta or a captured agent UUID). If neither is set we're
+            // racing a fresh `apply_preset` call that will write the
+            // command itself — synthesizing here would duplicate the
+            // write and leak the command into the agent's input box
+            // (the Linux preset-leak bug). See the local branch below
+            // for the full rationale.
+            let cmd_opt = if should_synthesize_agent_relaunch(
+                disk_meta.is_some(),
+                claude_uuid.is_some(),
+            ) {
+                agent_binary.map(|bin| {
+                    let mut parts = vec![bin];
+                    if had_skip_perms {
+                        parts.push("--dangerously-skip-permissions".to_string());
+                    }
+                    if let Some(uuid) = claude_uuid.as_ref() {
+                        parts.push("--resume".to_string());
+                        parts.push(uuid.clone());
+                    }
+                    parts.join(" ")
+                })
+            } else {
+                None
+            };
             if let Some(cmd) = cmd_opt {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote relaunch for {session_id}: \
@@ -548,11 +582,20 @@ pub async fn spawn_pty_for_session_via_daemon(
                     disk_meta.is_some(),
                 );
                 auto_resume_command = Some(cmd);
-            } else {
+            } else if should_synthesize_agent_relaunch(
+                disk_meta.is_some(),
+                claude_uuid.is_some(),
+            ) {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote respawn for {session_id} \
                      has no original_command (was a plain shell, or preset wasn't yet \
                      applied) — spawning bare bash"
+                );
+            } else {
+                eprintln!(
+                    "[codemux::terminal::daemon_backed] skipping remote in-memory synthesis \
+                     for {session_id}: no disk_meta and no captured agent UUID — treating as \
+                     a fresh preset launch (apply_preset owns the PTY write)"
                 );
             }
         } else {
@@ -612,25 +655,55 @@ pub async fn spawn_pty_for_session_via_daemon(
                     auto_resume_command = Some(resume_command);
                 }
             } else if let Some(bin) = agent_binary {
-                // No disk_meta (pull-back, fresh-after-preset, etc.)
-                // — synthesize from in-memory exactly like the remote
-                // path. This is what makes pull-back actually relaunch
-                // Claude with the just-synced conversation history.
-                let mut parts = vec![bin];
-                if had_skip_perms {
-                    parts.push("--dangerously-skip-permissions".to_string());
+                // No disk_meta + adapter pair — this branch is for
+                // pull-back (workspace migrated remote → local while
+                // an agent was running). We synthesize `<binary>
+                // [--dangerously-skip-permissions] [--resume <uuid>]`
+                // from in-memory state so the agent picks up where it
+                // left off on the local host.
+                //
+                // GATE: only synthesize when there is real evidence
+                // this is a *relaunch* — either a captured agent
+                // session UUID (claude_uuid) or persisted scrollback
+                // metadata (disk_meta). Otherwise this is a *fresh
+                // preset launch*, and `apply_preset` is about to
+                // write the exact same command via its own
+                // `write_command_when_ready` call (see
+                // commands/presets.rs::apply_preset → "new_tab"
+                // branch). Without this gate, both writes fire and
+                // the second one lands inside the just-started
+                // agent's input box — the user reported seeing
+                // `claude --dangerously-skip-permissions` typed into
+                // Claude Code's prompt right after launching the
+                // preset on Linux. Windows isn't affected because
+                // the entire daemon-backed path is `#[cfg(unix)]`
+                // and the in-process spawn has no synthesis logic.
+                if should_synthesize_agent_relaunch(
+                    disk_meta.is_some(),
+                    claude_uuid.is_some(),
+                ) {
+                    let mut parts = vec![bin];
+                    if had_skip_perms {
+                        parts.push("--dangerously-skip-permissions".to_string());
+                    }
+                    if let Some(uuid) = claude_uuid.as_ref() {
+                        parts.push("--resume".to_string());
+                        parts.push(uuid.clone());
+                    }
+                    let cmd = parts.join(" ");
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] local relaunch via in-memory for \
+                         {session_id}: {cmd} (skip_perms={had_skip_perms}, has_uuid={})",
+                        claude_uuid.is_some()
+                    );
+                    auto_resume_command = Some(cmd);
+                } else {
+                    eprintln!(
+                        "[codemux::terminal::daemon_backed] skipping in-memory synthesis for \
+                         {session_id}: no disk_meta and no captured agent UUID — treating as \
+                         a fresh preset launch (apply_preset owns the PTY write)"
+                    );
                 }
-                if let Some(uuid) = claude_uuid.as_ref() {
-                    parts.push("--resume".to_string());
-                    parts.push(uuid.clone());
-                }
-                let cmd = parts.join(" ");
-                eprintln!(
-                    "[codemux::terminal::daemon_backed] local relaunch via in-memory for \
-                     {session_id}: {cmd} (skip_perms={had_skip_perms}, has_uuid={})",
-                    claude_uuid.is_some()
-                );
-                auto_resume_command = Some(cmd);
             }
         }
     }
@@ -1148,4 +1221,74 @@ fn build_agent_env(
     }
 
     env
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_synthesize_agent_relaunch;
+
+    // These tests pin the gate that prevents the Linux preset-leak bug.
+    //
+    // Bug shape: clicking a CLI preset on Linux wrote the preset's
+    // command twice — once submitted to the shell (which launched the
+    // agent) and once typed into the just-started agent's input box.
+    // Root cause was that the daemon-backed spawn task synthesized a
+    // "relaunch the agent" command whenever the in-memory
+    // `original_command` was set, racing the `apply_preset` handler's
+    // own write_command_when_ready call. The gate below restricts that
+    // synthesis to genuine relaunches (pull-back, restart) where one of
+    // (disk_meta, captured agent UUID) is present. A fresh preset
+    // launch has neither, so it falls through to apply_preset's single
+    // write.
+    //
+    // Windows was unaffected because the entire daemon-backed path is
+    // `#[cfg(unix)]`-gated — the in-process spawn has no synthesis
+    // logic. So this is specifically a Linux/macOS regression.
+
+    #[test]
+    fn fresh_preset_launch_does_not_synthesize() {
+        // The exact case from the user's bug report: clicking the
+        // Claude Code preset in a fresh workspace. No prior session
+        // ever ran on this PTY → no disk_meta, no captured UUID.
+        // Synthesizing here would duplicate apply_preset's write.
+        assert!(
+            !should_synthesize_agent_relaunch(false, false),
+            "fresh preset launch (no disk meta, no UUID) must NOT \
+             synthesize — apply_preset owns the single write"
+        );
+    }
+
+    #[test]
+    fn restart_with_disk_meta_synthesizes() {
+        // App restart: scrollback meta was flushed to disk in a prior
+        // session. apply_preset is NOT being invoked — the daemon spawn
+        // task is the only thing that will write a command. Must
+        // synthesize so the agent relaunches.
+        assert!(
+            should_synthesize_agent_relaunch(true, false),
+            "respawn with disk meta but no UUID must synthesize so the \
+             agent restarts (e.g. non-Claude agents on app restart)"
+        );
+    }
+
+    #[test]
+    fn pullback_with_captured_uuid_synthesizes() {
+        // Pull-back from remote: scrollback meta hasn't flushed yet
+        // (user never closed), but the in-memory adapter captures hold
+        // Claude's session UUID. We want `claude --resume <uuid>` to
+        // fire on the local host so the conversation continues.
+        assert!(
+            should_synthesize_agent_relaunch(false, true),
+            "pull-back with captured Claude UUID must synthesize the \
+             --resume relaunch command"
+        );
+    }
+
+    #[test]
+    fn both_present_still_synthesizes() {
+        // Belt-and-suspenders: long-running session that's been used
+        // through both an app restart (disk meta) and a remote round-trip
+        // (UUID). Both signals say "this is a real relaunch."
+        assert!(should_synthesize_agent_relaunch(true, true));
+    }
 }
