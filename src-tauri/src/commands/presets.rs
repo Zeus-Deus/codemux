@@ -536,19 +536,60 @@ const PTY_COMMAND_TERMINATOR: &[u8] = b"\r";
 /// Only the raw command text + a carriage return are written — no
 /// serialization. See `PTY_COMMAND_TERMINATOR` for the rationale on
 /// why CR is used rather than LF.
+///
+/// IMPORTANT: command bytes and the terminator are combined into a
+/// SINGLE `write_all` call. See `build_pty_command_payload` for the
+/// "Linux phantom-prompt" regression this prevents.
 fn write_command_to_pty(
     sessions: &Arc<std::sync::Mutex<std::collections::HashMap<String, terminal::SessionRuntime>>>,
     session_id: &str,
     command: &str,
 ) {
+    let payload = build_pty_command_payload(command);
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
-            let _ = writer.write_all(command.as_bytes());
-            let _ = writer.write_all(PTY_COMMAND_TERMINATOR);
+            let _ = writer.write_all(&payload);
             let _ = writer.flush();
         }
     }
+}
+
+/// Concatenate `command` + the PTY command terminator into a single
+/// byte buffer suitable for one `write_all` call.
+///
+/// Why this exists as a discrete helper: the daemon-backed `Writer`
+/// implementation (`DaemonWriter` in `terminal/daemon_backed.rs`) is
+/// fire-and-forget. Each call to `Write::write` spawns its own Tokio
+/// task that round-trips a separate `Write` RPC to the PTY daemon —
+/// there is no FIFO between successive writes on the same handle.
+///
+/// The previous code wrote command bytes and the terminator in two
+/// separate `write_all` calls. On the daemon path, those became two
+/// independent async tasks that could land at the daemon's master fd
+/// in either order:
+///
+///   1. Command first, CR second → shell echoes `claude ...`, then
+///      receives CR → readline submits → preset launches. Correct.
+///   2. CR first, command second → shell receives CR on an empty
+///      line → submits nothing, redraws prompt → THEN the command
+///      bytes arrive and sit at the new prompt with no terminator.
+///      User sees the command text typed in the input but never
+///      executed; pressing Enter manually launches the preset. This
+///      was the "sometimes does nothing" bug after the writer-poll
+///      fix (the writer-poll fix uncovered it by removing the
+///      synthesis path's duplicate write that happened to fire later
+///      in lock-step order).
+///
+/// Combining into one buffer means a single `write_all` → single
+/// `Write::write` call → single spawn → single daemon RPC. The
+/// command and its terminator are atomic from the daemon's
+/// perspective; nothing can race them apart.
+fn build_pty_command_payload(command: &str) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(command.len() + PTY_COMMAND_TERMINATOR.len());
+    payload.extend_from_slice(command.as_bytes());
+    payload.extend_from_slice(PTY_COMMAND_TERMINATOR);
+    payload
 }
 
 /// Write a command to a newly-spawned PTY after the shell is ready.
@@ -577,14 +618,37 @@ fn wait_and_write_command(
     command: &str,
     settle_ms: u64,
 ) {
-    let overall_start = std::time::Instant::now();
-    let overall_timeout = std::time::Duration::from_secs(5);
-
-    // Phase 1: Poll until the PTY writer is available (shell process spawned).
+    // Phase 1: poll until the PTY writer is available (shell process spawned).
+    //
+    // This used to share a single 5-second budget with Phase 2's quiet-
+    // detection. That was fine for the in-process Windows spawn path
+    // (writer is set within milliseconds), but the Linux daemon-backed
+    // spawn can take longer: cold pty_daemon start, the SSH-tunneled
+    // round-trip for remote workspaces, the daemon's own list/spawn/
+    // attach handshake. When apply_preset called us right after
+    // `spawn_pty_for_session` returned (which only kicks off the
+    // async spawn — the writer isn't set until the spawn task lands),
+    // a slow spawn would starve Phase 1, the poll would hit the 5s
+    // wall before the writer appeared, and we'd return without
+    // writing anything. The user-visible symptom was "clicking a
+    // preset on Linux sometimes does nothing." Pre-fix, the bug was
+    // masked because the daemon-backed spawn ALSO synthesized a
+    // duplicate write that fired after the writer was set — every
+    // launch had a backup. With the Linux preset-leak fix gating
+    // that synthesis off for fresh preset launches (see
+    // daemon_backed.rs::should_synthesize_agent_relaunch), the
+    // apply_preset write is the only one, so its budget has to
+    // actually cover daemon spawn time.
+    //
+    // 15s comfortably covers a cold local daemon start (~1-3s
+    // observed) and a first-time SSH-tunneled remote spawn (~5-10s
+    // observed). Phase 2 keeps its own independent 5s budget below.
+    let writer_ready_timeout = std::time::Duration::from_secs(15);
+    let writer_poll_start = std::time::Instant::now();
     let mut writer_found = false;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(50));
-        if overall_start.elapsed() >= overall_timeout {
+        if writer_poll_start.elapsed() >= writer_ready_timeout {
             break;
         }
         let ready = {
@@ -601,7 +665,11 @@ fn wait_and_write_command(
     }
 
     if !writer_found {
-        eprintln!("[codemux::presets] Timeout waiting for PTY writer for session {session_id}");
+        eprintln!(
+            "[codemux::presets] Timeout waiting for PTY writer for session {session_id} \
+             after {:?}",
+            writer_poll_start.elapsed()
+        );
         return;
     }
 
@@ -632,7 +700,16 @@ fn wait_and_write_command(
         return;
     }
 
-    // Phase 2: Wait for shell output to arrive and then go quiet.
+    // Phase 2: wait for shell output to arrive and then go quiet.
+    //
+    // Independent 5s budget — does NOT share with Phase 1's writer
+    // timeout. A slow daemon spawn that ate most of a shared budget
+    // used to leave this phase with no time to detect quiet,
+    // forcing the writer to fire while the shell was still painting
+    // its prompt. Splitting the budgets means each phase gets its
+    // documented headroom regardless of the other's wall-clock.
+    let quiet_phase_timeout = std::time::Duration::from_secs(5);
+    let quiet_phase_start = std::time::Instant::now();
     let quiet_threshold = std::time::Duration::from_millis(settle_ms);
     let poll_interval = std::time::Duration::from_millis(30);
 
@@ -653,7 +730,7 @@ fn wait_and_write_command(
     loop {
         std::thread::sleep(poll_interval);
 
-        if overall_start.elapsed() >= overall_timeout {
+        if quiet_phase_start.elapsed() >= quiet_phase_timeout {
             break;
         }
 
@@ -679,28 +756,33 @@ fn wait_and_write_command(
 
     eprintln!(
         "[codemux::presets] Shell readiness for {session_id}: {detection_method} \
-         (output_chunks={snapshot_len}, elapsed={:?})",
-        overall_start.elapsed()
+         (output_chunks={snapshot_len}, quiet_phase_elapsed={:?}, \
+          total_elapsed={:?})",
+        quiet_phase_start.elapsed(),
+        writer_poll_start.elapsed()
     );
 
     // Write the plain command text followed by the PTY command
-    // terminator. See `PTY_COMMAND_TERMINATOR` for why this is CR
-    // (0x0D) and not LF (0x0A) — short version: PSReadLine on Windows
-    // only recognizes CR as the Enter keystroke, and Linux readline
-    // accepts CR too via its `C-m` → `accept-line` binding, so CR is
-    // the right byte on both platforms.
+    // terminator in a SINGLE `write_all` call. See
+    // `build_pty_command_payload` for why this MUST be one call (and
+    // not two): on the daemon-backed Linux path, separate `write_all`s
+    // race each other and can land the terminator before the command
+    // bytes, leaving the shell with the command typed at a fresh
+    // prompt waiting for a manual Enter. See `PTY_COMMAND_TERMINATOR`
+    // for why CR is the right terminator byte on both Linux and
+    // Windows.
+    let payload = build_pty_command_payload(&command_to_write);
     let mut guard = sessions.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(runtime) = guard.get_mut(session_id) {
         if let Some(writer) = runtime.writer.as_mut() {
-            let result_a = writer.write_all(command_to_write.as_bytes());
-            let result_b = writer.write_all(PTY_COMMAND_TERMINATOR);
-            let result_c = writer.flush();
+            let write_result = writer.write_all(&payload);
+            let flush_result = writer.flush();
             eprintln!(
                 "[codemux::presets] wrote preset/resume command to {session_id} \
-                 (write_ok={}, terminator_ok={}, flush_ok={}, cmd={command_to_write:?})",
-                result_a.is_ok(),
-                result_b.is_ok(),
-                result_c.is_ok(),
+                 (write_ok={}, flush_ok={}, payload_len={}, cmd={command_to_write:?})",
+                write_result.is_ok(),
+                flush_result.is_ok(),
+                payload.len(),
             );
         } else {
             eprintln!(
@@ -849,6 +931,78 @@ mod tests {
         assert_eq!(written, b"echo hello\r");
     }
 
+    /// `Write` impl that records every individual `write` call as a
+    /// separate byte vec. Lets tests assert how many syscalls happened
+    /// and what bytes each one carried — important for the daemon-
+    /// backed path where each `write` becomes its own async task and
+    /// the payload from a single `write` is what travels as one
+    /// network RPC.
+    struct RecordingWriter {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls.lock().unwrap().push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn build_payload_concatenates_command_and_cr() {
+        let payload = build_pty_command_payload("claude --dangerously-skip-permissions");
+        assert_eq!(
+            payload,
+            b"claude --dangerously-skip-permissions\r",
+            "payload must be `<command>\\r` so a single write_all \
+             call carries both atomically — see helper doc comment \
+             for why this prevents the Linux phantom-prompt race"
+        );
+    }
+
+    #[test]
+    fn write_command_to_pty_uses_single_write_call() {
+        // Regression test for the "preset launches sometimes, sometimes
+        // shows command typed but not executed" Linux bug. The fix
+        // routes the command + terminator through one buffer so the
+        // daemon-backed writer's per-call spawn dispatches a single
+        // RPC, preserving byte order at the daemon's master fd. If
+        // someone later "refactors" this back to two write_all calls,
+        // this test breaks loudly.
+        let sessions = make_sessions();
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        {
+            let mut guard = sessions.lock().unwrap();
+            let mut runtime = crate::terminal::SessionRuntime::new("sess");
+            runtime.writer = Some(Box::new(RecordingWriter {
+                calls: calls.clone(),
+            }));
+            guard.insert("sess".into(), runtime);
+        }
+
+        write_command_to_pty(&sessions, "sess", "claude --dangerously-skip-permissions");
+
+        let recorded = calls.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "command + terminator must reach the writer in exactly ONE \
+             write() call. Two calls would let the daemon-backed path's \
+             fire-and-forget Tokio spawn race them apart, producing the \
+             'command typed but not submitted' Linux bug. Got {} calls: {:?}",
+            recorded.len(),
+            recorded
+        );
+        assert_eq!(
+            &recorded[0][..],
+            b"claude --dangerously-skip-permissions\r"
+        );
+    }
+
     #[test]
     fn test_pty_command_terminator_is_carriage_return() {
         // Regression guard: the programmatic preset-injection path
@@ -900,29 +1054,39 @@ mod tests {
 
     #[test]
     fn test_hard_timeout() {
+        // Writer is present, so Phase 1 passes immediately. No output
+        // ever arrives, so Phase 2 must run its quiet-detection budget
+        // to completion. That budget is independent of Phase 1's
+        // writer-poll budget — Phase 2 alone should take ~5s here.
         let sessions = make_sessions();
         insert_session_with_writer(&sessions, "sess");
-        // No output will ever be produced — should hit the hard timeout
 
         let start = std::time::Instant::now();
         wait_and_write_command(&sessions, "sess", "timeout-cmd", 120);
         let elapsed = start.elapsed();
 
-        // Should have taken approximately 5s (the hard timeout)
         assert!(
             elapsed >= std::time::Duration::from_secs(4),
-            "should wait near full timeout, took {elapsed:?}"
+            "Phase 2 quiet-detection should run its full 5s budget, took {elapsed:?}"
         );
         assert!(
             elapsed < std::time::Duration::from_secs(7),
-            "should not exceed timeout significantly"
+            "Phase 2 budget is 5s independent of Phase 1; should NOT \
+             leak Phase 1's 15s window into total wall-clock here. \
+             Took {elapsed:?}"
         );
     }
 
     #[test]
     fn test_writer_not_found_timeout() {
+        // No writer ever appears — Phase 1 must wait its full
+        // writer-ready budget (15s) before bailing. Phase 2 is never
+        // reached. This test takes ~15s; the long wait is what gives
+        // a real daemon-backed Linux spawn (cold pty_daemon, remote
+        // SSH tunnel) enough room to land the writer before
+        // apply_preset gives up. See `wait_and_write_command` Phase 1
+        // comment for the regression history.
         let sessions = make_sessions();
-        // Session exists but with NO writer (simulates spawn failure)
         {
             let mut guard = sessions.lock().unwrap();
             guard.insert("no-writer".to_string(), SessionRuntime::new("no-writer"));
@@ -932,10 +1096,87 @@ mod tests {
         wait_and_write_command(&sessions, "no-writer", "cmd", 120);
         let elapsed = start.elapsed();
 
-        // Should timeout waiting for writer (~5s)
         assert!(
-            elapsed >= std::time::Duration::from_secs(4),
-            "should wait for writer timeout"
+            elapsed >= std::time::Duration::from_secs(14),
+            "Phase 1 should wait its full 15s writer-ready budget so \
+             slow daemon spawns aren't starved; took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "Phase 1 budget is 15s; should NOT exceed significantly. \
+             Took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_slow_writer_then_quiet_detected() {
+        // Regression test for the Linux preset-launch intermittence
+        // ("sometimes the preset launches, sometimes it doesn't").
+        // Simulates the daemon-backed spawn race: apply_preset spawns
+        // this poll thread immediately, but the writer doesn't land
+        // until well after the OLD 5s shared budget would have
+        // expired. With split per-phase budgets, Phase 1's 15s window
+        // covers the slow spawn, then Phase 2 detects shell quiet and
+        // the command actually gets written. Pre-fix this would hit
+        // the shared 5s wall, return without writing, and the preset
+        // would silently fail to launch.
+        let sessions = make_sessions();
+        // Insert the runtime stub the apply_preset path would see
+        // *before* the daemon spawn lands the writer.
+        {
+            let mut guard = sessions.lock().unwrap();
+            guard.insert(
+                "slow-spawn".to_string(),
+                SessionRuntime::new("slow-spawn"),
+            );
+        }
+
+        let sessions_for_producer = sessions.clone();
+        // Producer thread: after 7 seconds (well past the old 5s
+        // shared budget) install the writer + a bit of pending output
+        // (shell prompt) so Phase 2 can detect quiet and complete the
+        // write.
+        let producer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(7));
+            let mut guard = sessions_for_producer.lock().unwrap();
+            let runtime = guard.get_mut("slow-spawn").unwrap();
+            runtime.writer =
+                Some(Box::new(Vec::<u8>::new()) as Box<dyn Write + Send>);
+            runtime.pending_output.push_back(vec![b'$', b' ']);
+        });
+
+        let start = std::time::Instant::now();
+        // settle_ms = 80 so Phase 2's quiet detection fires quickly.
+        wait_and_write_command(&sessions, "slow-spawn", "echo hi", 80);
+        let elapsed = start.elapsed();
+        producer.join().unwrap();
+
+        // Must have waited for the writer (≥7s) but not the full
+        // 20s upper bound (Phase 1 15s + Phase 2 5s).
+        assert!(
+            elapsed >= std::time::Duration::from_secs(7),
+            "should have waited for the slow writer to land, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(12),
+            "Phase 2 should fire shortly after writer lands; total \
+             elapsed should be writer-land-time + a brief quiet \
+             window. Took {elapsed:?}"
+        );
+
+        // The write must have actually happened — that's the user-
+        // visible thing the regression broke.
+        let guard = sessions.lock().unwrap();
+        let runtime = guard.get("slow-spawn").unwrap();
+        let writer = runtime.writer.as_ref().unwrap();
+        let writer_ptr = writer.as_ref() as *const dyn Write as *const Vec<u8>;
+        let written = unsafe { &*writer_ptr };
+        assert_eq!(
+            written, b"echo hi\r",
+            "command must have been written after the writer became \
+             available — pre-fix the shared 5s budget timed out first \
+             and nothing was written, manifesting as 'preset click \
+             did nothing' on Linux"
         );
     }
 
