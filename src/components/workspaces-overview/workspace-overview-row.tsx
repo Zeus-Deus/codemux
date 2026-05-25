@@ -44,7 +44,7 @@ import {
 import { toast } from "@/lib/toast";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 
-import type { OverviewItem } from "./use-overview-items";
+import type { DivergenceInfo, OverviewItem } from "./use-overview-items";
 
 interface Props {
   item: OverviewItem;
@@ -58,6 +58,10 @@ interface Props {
    *  sibling-device (remote-kind) row. The section hoists this and
    *  opens the shared `PullToDeviceDialog`. */
   onRequestPull?: (item: Extract<OverviewItem, { kind: "remote" }>) => void;
+  /** Phase-4 divergence info — non-null when this row's git HEAD
+   *  differs from another row sharing the same (project_remote,
+   *  git_branch). Rendered as a warning chip in the title row. */
+  divergence?: DivergenceInfo | null;
 }
 
 /**
@@ -76,10 +80,15 @@ export function WorkspaceOverviewRow({
   isAttached,
   onAfterOpen,
   onRequestPull,
+  divergence,
 }: Props) {
   if (item.kind === "remote") {
     return (
-      <RemoteRow item={item} onRequestPull={onRequestPull ?? null} />
+      <RemoteRow
+        item={item}
+        onRequestPull={onRequestPull ?? null}
+        divergence={divergence ?? null}
+      />
     );
   }
   return (
@@ -87,7 +96,34 @@ export function WorkspaceOverviewRow({
       item={item}
       isAttached={isAttached}
       onAfterOpen={onAfterOpen}
+      divergence={divergence ?? null}
     />
+  );
+}
+
+/**
+ * Divergence chip — rendered in the row's title line when the
+ * same (project_remote, git_branch) has different HEADs across
+ * devices. Yellow, compact, with a tooltip pointing at the OTHER
+ * location so the user knows where the other commits live.
+ */
+function DivergenceChip({ info }: { info: DivergenceInfo }) {
+  return (
+    <span
+      title={`Diverged — different commits on ${info.otherLabel}. Push from one device to share, or pull to overwrite the other.`}
+      className="shrink-0 inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-amber-300"
+    >
+      <svg
+        viewBox="0 0 12 12"
+        width="9"
+        height="9"
+        aria-hidden
+        fill="currentColor"
+      >
+        <path d="M6 1.2L11.2 10.5H0.8L6 1.2zM5.3 4.8v2.4h1.4V4.8H5.3zM5.3 8v1.2h1.4V8H5.3z" />
+      </svg>
+      diverged
+    </span>
   );
 }
 
@@ -97,10 +133,12 @@ function LocalRow({
   item,
   isAttached,
   onAfterOpen,
+  divergence,
 }: {
   item: Extract<OverviewItem, { kind: "local" }>;
   isAttached: boolean;
   onAfterOpen: () => void;
+  divergence: DivergenceInfo | null;
 }) {
   const workspace = item.workspace;
   const sync = item.sync;
@@ -286,6 +324,7 @@ function LocalRow({
             >
               {workspace.title}
             </h4>
+            {divergence && <DivergenceChip info={divergence} />}
             {sync?.dirty && (
               <span
                 title="Pending sync to your account"
@@ -500,9 +539,11 @@ function LocalRow({
 function RemoteRow({
   item,
   onRequestPull,
+  divergence,
 }: {
   item: Extract<OverviewItem, { kind: "remote" }>;
   onRequestPull: ((item: Extract<OverviewItem, { kind: "remote" }>) => void) | null;
+  divergence: DivergenceInfo | null;
 }) {
   const row = item.sync;
   const branch = row.git_branch;
@@ -531,6 +572,7 @@ function RemoteRow({
             >
               {row.title}
             </h4>
+            {divergence && <DivergenceChip info={divergence} />}
             <span
               title="This workspace lives on another device of your account. Pull it down to interact with it here."
               className="shrink-0 rounded-full border border-sky-400/30 bg-sky-500/10 px-1.5 py-0 text-[10px] font-medium uppercase tracking-wider leading-[14px] text-sky-300"

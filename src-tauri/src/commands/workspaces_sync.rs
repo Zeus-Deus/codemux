@@ -31,6 +31,8 @@ pub struct WorkspaceSyncView {
     pub project_path: Option<String>,
     pub project_remote: Option<String>,
     pub git_branch: Option<String>,
+    /// Phase-4 divergence detection: HEAD sha at last reconcile.
+    pub git_head_sha: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// True when the row has unpushed changes. The UI shows a
@@ -49,6 +51,7 @@ impl From<WorkspaceSyncRecord> for WorkspaceSyncView {
             project_path: r.project_path,
             project_remote: r.project_remote,
             git_branch: r.git_branch,
+            git_head_sha: r.git_head_sha,
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,

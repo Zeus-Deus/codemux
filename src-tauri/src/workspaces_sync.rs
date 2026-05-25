@@ -68,6 +68,8 @@ pub struct ServerWorkspace {
     pub project_remote: Option<String>,
     #[serde(rename = "gitBranch")]
     pub git_branch: Option<String>,
+    #[serde(rename = "gitHeadSha", default)]
+    pub git_head_sha: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -97,6 +99,8 @@ struct WorkspaceUpsertBody<'a> {
     project_remote: Option<&'a str>,
     #[serde(rename = "gitBranch", skip_serializing_if = "Option::is_none")]
     git_branch: Option<&'a str>,
+    #[serde(rename = "gitHeadSha", skip_serializing_if = "Option::is_none")]
+    git_head_sha: Option<&'a str>,
 }
 
 /// Guard against concurrent sync attempts. Foreground sync + the
@@ -187,6 +191,7 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
             w.project_path.as_deref(),
             w.project_remote.as_deref(),
             w.git_branch.as_deref(),
+            w.git_head_sha.as_deref(),
             &w.created_at,
             &w.updated_at,
             w.deleted_at.as_deref(),
@@ -213,6 +218,7 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
                     local_row.project_path.as_deref(),
                     local_row.project_remote.as_deref(),
                     local_row.git_branch.as_deref(),
+                    local_row.git_head_sha.as_deref(),
                     &local_row.created_at,
                     &now,
                     Some(&now),
@@ -273,6 +279,7 @@ async fn push_insert(
         project_path: row.project_path.as_deref(),
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
+        git_head_sha: row.git_head_sha.as_deref(),
     };
     let resp = client
         .post(format!("{base}/api/workspaces"))
@@ -307,6 +314,7 @@ async fn push_update(
         project_path: row.project_path.as_deref(),
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
+        git_head_sha: row.git_head_sha.as_deref(),
     };
     let resp = client
         .patch(format!("{base}/api/workspaces/{server_id}"))
@@ -351,6 +359,31 @@ async fn push_delete(
     }
     db.mark_workspace_sync_synced(row.id, None)?;
     Ok(())
+}
+
+/// Read the workspace's git HEAD sha by shelling out to `git
+/// rev-parse HEAD` in the given directory. Returns None if git
+/// isn't installed, the directory isn't a git repo, or the repo
+/// has no commits yet. Cheap (single git process per workspace per
+/// reconcile, ~10ms each) so we don't cache.
+fn read_git_head_sha(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() || sha.len() > 200 {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 /// Reconcile the local `workspaces_sync` table against the current
@@ -431,12 +464,26 @@ pub fn reconcile_from_snapshot(
         let project_remote: Option<&str> = None;
         let git_branch = ws.git_branch.as_deref();
 
+        // Read the workspace's git HEAD sha so Phase-4 divergence
+        // detection can compare across devices. Best-effort: if
+        // git isn't installed, the workspace isn't a git repo, or
+        // it has no commits, we leave it as None. Use the
+        // worktree_path when set, else fall back to cwd.
+        let head_path = ws
+            .worktree_path
+            .as_deref()
+            .or(Some(ws.cwd.as_str()))
+            .unwrap_or("");
+        let git_head_sha: Option<String> = read_git_head_sha(head_path);
+        let git_head_sha_ref = git_head_sha.as_deref();
+
         if let Some(existing) = sync_by_wid.get(wid.as_str()) {
             let changed = existing.title != title
                 || existing.host_server_id.as_deref() != host_server_id.as_deref()
                 || existing.project_path.as_deref() != project_path
                 || existing.project_remote.as_deref() != project_remote
-                || existing.git_branch.as_deref() != git_branch;
+                || existing.git_branch.as_deref() != git_branch
+                || existing.git_head_sha.as_deref() != git_head_sha_ref;
             if changed {
                 if let Err(error) = db.update_workspace_sync_by_workspace_id(
                     &wid,
@@ -445,6 +492,7 @@ pub fn reconcile_from_snapshot(
                     project_path,
                     project_remote,
                     git_branch,
+                    git_head_sha_ref,
                 ) {
                     eprintln!(
                         "[workspaces-sync] update failed for {wid}: {error}"
@@ -458,6 +506,7 @@ pub fn reconcile_from_snapshot(
             project_path,
             project_remote,
             git_branch,
+            git_head_sha_ref,
         ) {
             // UNIQUE(workspace_id) collision shouldn't happen given
             // the index pass above — log and continue.
@@ -524,6 +573,7 @@ mod tests {
                 Some("/home/zeus/projects/alpha"),
                 Some("git@github.com:alpha/alpha.git"),
                 Some("main"),
+                Some("abc123"),
             )
             .expect("insert");
         assert!(row.dirty);
@@ -541,7 +591,7 @@ mod tests {
     fn update_marks_row_dirty_again() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-2", "before", None, None, None, None)
+            .insert_workspace_sync("workspace-2", "before", None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("42")).unwrap();
 
@@ -558,6 +608,7 @@ mod tests {
             None,
             None,
             Some("feature-x"),
+            Some("def456"),
         )
         .unwrap();
         let dirty = db.list_dirty_workspaces_sync();
@@ -572,7 +623,7 @@ mod tests {
     fn soft_delete_then_purge() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None)
+            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("100")).unwrap();
 
@@ -609,6 +660,7 @@ mod tests {
             Some("/srv/path"),
             Some("git@x:y.git"),
             Some("main"),
+            Some("aaa111"),
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
             None,
@@ -618,6 +670,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].server_id.as_deref(), Some("200"));
         assert_eq!(listed[0].title, "from-server");
+        assert_eq!(listed[0].git_head_sha.as_deref(), Some("aaa111"));
         assert!(!listed[0].dirty, "server-sourced rows must be clean");
 
         // Second call — same server_id but a new updated_at and new
@@ -629,6 +682,7 @@ mod tests {
             Some("/srv/path"),
             Some("git@x:y.git"),
             Some("dev"),
+            Some("bbb222"),
             "2026-01-01 00:00:00",
             "2026-01-02 00:00:00",
             None,
@@ -650,6 +704,7 @@ mod tests {
             "300",
             "discovered",
             Some("12"),
+            None,
             None,
             None,
             None,
@@ -678,6 +733,7 @@ mod tests {
             .insert_workspace_sync(
                 "workspace-99",
                 "ephemeral",
+                None,
                 None,
                 None,
                 None,

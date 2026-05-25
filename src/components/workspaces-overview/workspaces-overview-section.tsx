@@ -30,7 +30,13 @@ import { useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSyncView } from "@/tauri/commands";
 
 import { WorkspaceOverviewRow } from "./workspace-overview-row";
-import { useOverviewItems, type DeviceBucket, type OverviewItem } from "./use-overview-items";
+import {
+  detectDivergence,
+  useOverviewItems,
+  type DeviceBucket,
+  type DivergenceInfo,
+  type OverviewItem,
+} from "./use-overview-items";
 import { PullToDeviceDialog } from "./pull-to-device-dialog";
 import { WelcomeBanner } from "./welcome-banner";
 import { HowItWorksPopover } from "./how-it-works-popover";
@@ -150,6 +156,17 @@ export function WorkspacesOverviewSection() {
 
   // Unified item list — locals + sibling-device synced rows.
   const { items: allItems, hosts } = useOverviewItems();
+
+  // Phase-4 divergence detection: rows that share a project_remote
+  // and git_branch but have different HEADs get a warning chip.
+  const divergenceByKey = useMemo<Map<string, DivergenceInfo>>(() => {
+    const hostLabelFor = (hostServerId: string | null): string => {
+      if (!hostServerId) return "this device";
+      const h = hosts.find((host) => host.server_id === hostServerId);
+      return h?.name ?? "another device";
+    };
+    return detectDivergence(allItems, hostLabelFor);
+  }, [allItems, hosts]);
 
   // Pulse newly-appeared remote rows: when a sync tick brings in a
   // remote row this device hadn't seen before, briefly pulse it so
@@ -593,6 +610,7 @@ export function WorkspacesOverviewSection() {
                 hasAnySibling={allItems.some((i) => i.kind === "remote")}
                 registerRemoteRow={registerRemoteRow}
                 pulseKeys={pulseKeys}
+                divergenceByKey={divergenceByKey}
               />
             ))
           )}
@@ -620,6 +638,7 @@ function DeviceSection({
   hasAnySibling,
   registerRemoteRow,
   pulseKeys,
+  divergenceByKey,
 }: {
   bucket: DeviceBucket;
   activeWorkspaceId: string | null;
@@ -642,6 +661,10 @@ function DeviceSection({
    *  from the "Pull from another device" CTA scrolling to them, or
    *  from a sync tick bringing in a new sibling-device workspace. */
   pulseKeys: Set<string>;
+  /** Phase-4 divergence info, keyed by row identity. The row
+   *  component reads its own key (`local:<workspace_id>` or
+   *  `remote:<sync.id>`) and renders a warning chip when present. */
+  divergenceByKey: Map<string, DivergenceInfo>;
 }) {
   const isLocal = bucket.hostServerId === null;
   const hiddenByFilter = bucket.totalCount - bucket.items.length;
@@ -724,6 +747,13 @@ function DeviceSection({
                 }
                 onAfterOpen={onCloseOverview}
                 onRequestPull={onRequestPull}
+                divergence={
+                  divergenceByKey.get(
+                    it.kind === "local"
+                      ? `local:${it.workspace.workspace_id}`
+                      : `remote:${it.sync.id}`,
+                  ) ?? null
+                }
               />
             </li>
           ))}

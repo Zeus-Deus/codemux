@@ -348,6 +348,10 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
         "ALTER TABLE automation_runs ADD COLUMN branch TEXT",
         "ALTER TABLE automation_runs ADD COLUMN pr_url TEXT",
+        // Phase-4 divergence detection: workspace git HEAD sha so
+        // the overview can flag when the same project+branch
+        // exists on multiple devices with different HEADs.
+        "ALTER TABLE workspaces_sync ADD COLUMN git_head_sha TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -896,6 +900,13 @@ pub struct WorkspaceSyncRecord {
     pub project_path: Option<String>,
     pub project_remote: Option<String>,
     pub git_branch: Option<String>,
+    /// Workspace git HEAD sha at the last reconcile. Phase-4
+    /// divergence detection compares this across devices: when the
+    /// same (project_remote, git_branch) pair has different head
+    /// shas on multiple devices, the overview surfaces a warning
+    /// chip. None for new rows that haven't been reconciled yet,
+    /// or for rows whose worktree had no commits.
+    pub git_head_sha: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
@@ -914,13 +925,14 @@ impl DatabaseStore {
         project_path: Option<&str>,
         project_remote: Option<&str>,
         git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
     ) -> Result<WorkspaceSyncRecord, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspaces_sync
                 (user_id, workspace_id, title, host_server_id,
-                 project_path, project_remote, git_branch, dirty)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                 project_path, project_remote, git_branch, git_head_sha, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
             params![
                 workspace_id,
                 title,
@@ -928,13 +940,14 @@ impl DatabaseStore {
                 project_path,
                 project_remote,
                 git_branch,
+                git_head_sha,
             ],
         )
         .map_err(|e| format!("Failed to insert workspace sync row: {e}"))?;
         let id = conn.last_insert_rowid();
         conn.query_row(
             "SELECT id, server_id, workspace_id, title, host_server_id,
-                    project_path, project_remote, git_branch,
+                    project_path, project_remote, git_branch, git_head_sha,
                     created_at, updated_at, deleted_at, dirty
              FROM workspaces_sync WHERE id = ?1",
             params![id],
@@ -954,14 +967,15 @@ impl DatabaseStore {
         project_path: Option<&str>,
         project_remote: Option<&str>,
         git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workspaces_sync
              SET title = ?1, host_server_id = ?2, project_path = ?3,
-                 project_remote = ?4, git_branch = ?5,
+                 project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
                  updated_at = datetime('now'), dirty = 1
-             WHERE user_id = 'local' AND workspace_id = ?6
+             WHERE user_id = 'local' AND workspace_id = ?7
                AND deleted_at IS NULL",
             params![
                 title,
@@ -969,6 +983,7 @@ impl DatabaseStore {
                 project_path,
                 project_remote,
                 git_branch,
+                git_head_sha,
                 workspace_id,
             ],
         )
@@ -1004,7 +1019,7 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
-                    project_path, project_remote, git_branch,
+                    project_path, project_remote, git_branch, git_head_sha,
                     created_at, updated_at, deleted_at, dirty
              FROM workspaces_sync
              WHERE user_id = 'local' AND deleted_at IS NULL
@@ -1024,7 +1039,7 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
-                    project_path, project_remote, git_branch,
+                    project_path, project_remote, git_branch, git_head_sha,
                     created_at, updated_at, deleted_at, dirty
              FROM workspaces_sync
              WHERE user_id = 'local'",
@@ -1042,7 +1057,7 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
-                    project_path, project_remote, git_branch,
+                    project_path, project_remote, git_branch, git_head_sha,
                     created_at, updated_at, deleted_at, dirty
              FROM workspaces_sync
              WHERE user_id = 'local' AND dirty = 1",
@@ -1102,6 +1117,7 @@ impl DatabaseStore {
         project_path: Option<&str>,
         project_remote: Option<&str>,
         git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
         created_at: &str,
         updated_at: &str,
         deleted_at: Option<&str>,
@@ -1111,16 +1127,17 @@ impl DatabaseStore {
             .execute(
                 "UPDATE workspaces_sync
                  SET title = ?1, host_server_id = ?2, project_path = ?3,
-                     project_remote = ?4, git_branch = ?5,
-                     created_at = ?6, updated_at = ?7,
-                     deleted_at = ?8, dirty = 0
-                 WHERE user_id = 'local' AND server_id = ?9",
+                     project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
+                     created_at = ?7, updated_at = ?8,
+                     deleted_at = ?9, dirty = 0
+                 WHERE user_id = 'local' AND server_id = ?10",
                 params![
                     title,
                     host_server_id,
                     project_path,
                     project_remote,
                     git_branch,
+                    git_head_sha,
                     created_at,
                     updated_at,
                     deleted_at,
@@ -1132,9 +1149,9 @@ impl DatabaseStore {
             conn.execute(
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
-                     project_path, project_remote, git_branch,
+                     project_path, project_remote, git_branch, git_head_sha,
                      created_at, updated_at, deleted_at, dirty)
-                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
                 params![
                     server_id,
                     title,
@@ -1142,6 +1159,7 @@ impl DatabaseStore {
                     project_path,
                     project_remote,
                     git_branch,
+                    git_head_sha,
                     created_at,
                     updated_at,
                     deleted_at,
@@ -1174,7 +1192,7 @@ impl DatabaseStore {
 fn row_to_workspace_sync(
     row: &rusqlite::Row<'_>,
 ) -> rusqlite::Result<WorkspaceSyncRecord> {
-    let dirty_int: i64 = row.get(11)?;
+    let dirty_int: i64 = row.get(12)?;
     Ok(WorkspaceSyncRecord {
         id: row.get(0)?,
         server_id: row.get(1)?,
@@ -1184,9 +1202,10 @@ fn row_to_workspace_sync(
         project_path: row.get(5)?,
         project_remote: row.get(6)?,
         git_branch: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        deleted_at: row.get(10)?,
+        git_head_sha: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        deleted_at: row.get(11)?,
         dirty: dirty_int != 0,
     })
 }

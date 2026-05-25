@@ -1748,6 +1748,12 @@ export interface WorkspaceSyncView {
   project_path: string | null;
   project_remote: string | null;
   git_branch: string | null;
+  /** Phase-4 divergence detection: the workspace's git HEAD sha at
+   *  the last reconcile. Compared across rows in the overview to
+   *  detect when the same (project_remote, git_branch) has different
+   *  HEADs on multiple devices. Null when git isn't available or
+   *  the worktree has no commits yet. */
+  git_head_sha: string | null;
   created_at: string;
   updated_at: string;
   /** True iff the row has unpushed changes. UI surfaces this as a

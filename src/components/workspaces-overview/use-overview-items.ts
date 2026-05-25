@@ -46,6 +46,27 @@ export type OverviewItem =
     };
 
 /**
+ * Phase-4 divergence detection — when two or more rows in the
+ * overview share a `(project_remote, git_branch)` but have
+ * DIFFERENT `git_head_sha` values, those rows have diverged in git.
+ * The overview surfaces a warning chip on each diverged row so the
+ * user can tell at a glance that pushing from one device would
+ * overwrite the other's edits.
+ *
+ * Returned as a Map from sync-row id → divergence summary so the
+ * row component can render the chip without re-running the analysis.
+ */
+export interface DivergenceInfo {
+  /** Number of distinct `git_head_sha` values across all rows that
+   *  share the row's (project_remote, git_branch). Always ≥2 when
+   *  this entry exists. */
+  forks: number;
+  /** Human label for the OTHER location(s) — e.g. "macbook-air" or
+   *  "homedesk + 1 more". Used in the chip tooltip. */
+  otherLabel: string;
+}
+
+/**
  * One bucket the overview renders. Each unique host (including
  * "local") gets one bucket. Buckets keyed by `(hostServerId, hostId)`
  * — a remote bucket has hostId null on this device when the host
@@ -72,6 +93,73 @@ export interface DeviceBucket {
   /** Sort hint: locals first, then synced hosts in their
    *  configured order, orphan/removed at the end. */
   sortRank: number;
+}
+
+/**
+ * Detect git-HEAD divergence across the unified overview-item list.
+ * Two rows that share the same (project_remote, git_branch) but
+ * have different `git_head_sha` values are considered diverged. The
+ * UI surfaces a warning chip on each diverged row.
+ *
+ * Returns a Map keyed by the row's stable identity (`sync.id` for
+ * remote rows, `workspace.workspace_id` for local-with-sync rows).
+ * Rows with no `git_head_sha` are excluded — we can't determine
+ * divergence without a sha on both sides.
+ */
+export function detectDivergence(
+  items: OverviewItem[],
+  hostLabel: (hostServerId: string | null) => string,
+): Map<string, DivergenceInfo> {
+  // Group all rows by (project_remote, git_branch). A row contributes
+  // its sync data if available (remote items always have it; local
+  // items have it only after the first reconcile sync).
+  type Entry = {
+    key: string;
+    sha: string | null;
+    hostServerId: string | null;
+  };
+  const groups = new Map<string, Entry[]>();
+  for (const it of items) {
+    const sync = it.kind === "local" ? it.sync : it.sync;
+    if (!sync) continue;
+    if (!sync.project_remote || !sync.git_branch) continue;
+    const groupKey = `${sync.project_remote}::${sync.git_branch}`;
+    const rowKey =
+      it.kind === "local"
+        ? `local:${it.workspace.workspace_id}`
+        : `remote:${sync.id}`;
+    const list = groups.get(groupKey) ?? [];
+    list.push({
+      key: rowKey,
+      sha: sync.git_head_sha,
+      hostServerId: sync.host_server_id,
+    });
+    groups.set(groupKey, list);
+  }
+
+  // For each group with >=2 entries AND >=2 distinct shas, mark
+  // every entry in that group as diverged. Skip groups where any
+  // entry's sha is null (insufficient info).
+  const result = new Map<string, DivergenceInfo>();
+  for (const entries of groups.values()) {
+    if (entries.length < 2) continue;
+    const shas = new Set<string>();
+    for (const e of entries) {
+      if (e.sha) shas.add(e.sha);
+    }
+    if (shas.size < 2) continue;
+    for (const entry of entries) {
+      const others = entries.filter((e) => e.key !== entry.key);
+      const otherLabels = others.map((e) => hostLabel(e.hostServerId));
+      const distinctLabels = Array.from(new Set(otherLabels));
+      const label =
+        distinctLabels.length <= 1
+          ? distinctLabels[0] ?? "another device"
+          : `${distinctLabels[0]} + ${distinctLabels.length - 1} more`;
+      result.set(entry.key, { forks: shas.size, otherLabel: label });
+    }
+  }
+  return result;
 }
 
 /** Compose the unified overview-item list from the three sources. */

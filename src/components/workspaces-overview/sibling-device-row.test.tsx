@@ -43,6 +43,7 @@ function makeSyncRow(overrides?: Partial<WorkspaceSyncView>): WorkspaceSyncView 
     project_path: "/home/zeus/projects/codemux",
     project_remote: "git@github.com:Zeus-Deus/codemux.git",
     git_branch: "feature/cross-device",
+    git_head_sha: null,
     created_at: "2026-05-20T10:00:00Z",
     updated_at: "2026-05-20T10:00:00Z",
     dirty: false,
