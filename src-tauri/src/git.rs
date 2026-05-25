@@ -125,6 +125,120 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// Clone a remote repository into `target_dir`. Used by cross-device
+/// workspace adoption when a sibling-device workspace has no shared
+/// host — we clone the git remote and create a fresh worktree at the
+/// branch.
+///
+/// `target_dir` must NOT already exist (git clone refuses if the
+/// target dir is non-empty). Caller is expected to compute a unique
+/// target like `~/.codemux/projects/<basename>` and bail with a
+/// structured error if it collides.
+///
+/// Returns the absolute path of the cloned repo on success.
+///
+/// SSH credentials and any git auth (token, key) live in the user's
+/// `~/.gitconfig` / `~/.ssh` / `~/.netrc` — this helper inherits
+/// them implicitly via the spawned git process. We never marshal
+/// credentials through this layer.
+pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> {
+    if remote_url.trim().is_empty() {
+        return Err("git_clone: remote_url cannot be empty".into());
+    }
+    if target_dir.exists() {
+        // Don't clobber — caller should have picked a fresh path.
+        return Err(format!(
+            "git_clone: target directory already exists: {}",
+            target_dir.display()
+        ));
+    }
+    #[cfg(test)]
+    {
+        // Test hook — short-circuit BEFORE spawning git so unit
+        // tests don't need network or git installed. Real callers
+        // never hit this because they pass non-test markers.
+        if remote_url.starts_with("test://") {
+            return Ok(target_dir.to_string_lossy().to_string());
+        }
+    }
+    let parent = target_dir.parent().ok_or_else(|| {
+        format!(
+            "git_clone: target path has no parent directory: {}",
+            target_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!("git_clone: failed to create parent {}: {e}", parent.display())
+    })?;
+    let target_str = target_dir.to_string_lossy().to_string();
+    // Use `--no-checkout` so the worktree-add we'll do next chooses
+    // the right branch — clone's default checkout of the remote's
+    // HEAD branch is wasted work for our flow.
+    let output = Command::new("git")
+        .args(["clone", "--no-checkout", remote_url, &target_str])
+        .current_dir(parent)
+        .output()
+        .map_err(|e| format!("git_clone: failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Best-effort cleanup so a half-cloned dir doesn't poison
+        // the next attempt.
+        let _ = std::fs::remove_dir_all(target_dir);
+        return Err(format!(
+            "git clone failed: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(target_str)
+}
+
+#[cfg(test)]
+mod git_clone_input_validation {
+    use super::git_clone;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rejects_empty_remote_url() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = git_clone("", &dir).unwrap_err();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_remote_url() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-ws");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = git_clone("   \t  ", &dir).unwrap_err();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_when_target_dir_already_exists() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-exists");
+        // Create the directory so the precondition fires.
+        std::fs::create_dir_all(&dir).expect("set up test dir");
+        let err = git_clone("test://foo", &dir).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_well_formed_input_via_test_hook() {
+        // Uses the `test://` short-circuit so we don't need git or
+        // network on the CI runner. The hook returns success
+        // BEFORE doing any disk I/O — that's the point: the test
+        // only exercises the precondition checks above it (empty
+        // url, existing target), then yields a deterministic
+        // success that proves both checks let valid input through.
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-ok-fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = git_clone("test://foo/bar.git", &dir).unwrap();
+        assert_eq!(PathBuf::from(result), dir);
+    }
+}
+
 /// Run git and return (stdout, stderr, success) regardless of exit code.
 fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
     let output = Command::new("git")

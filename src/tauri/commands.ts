@@ -1803,3 +1803,15 @@ export const workspacesAdoptionPreview = (serverId: string) =>
 
 export const workspacesAdoptSynced = (serverId: string) =>
   invoke<AdoptOutcome>("workspaces_adopt_synced", { serverId });
+
+/** Phase-3 clone-fallback adoption: when the sibling-device workspace
+ *  has no shared host (`host_server_id` is null), this clones the
+ *  `project_remote` git URL and creates a worktree at the branch.
+ *
+ *  Important: this creates a NEW local workspace with its own fresh
+ *  `server_id` — it does NOT link to the original sibling row. Both
+ *  devices end up with independent copies that share a git remote.
+ *  The user has been warned about uncommitted-work loss via the
+ *  dialog before reaching this. */
+export const workspacesAdoptViaClone = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_via_clone", { serverId });

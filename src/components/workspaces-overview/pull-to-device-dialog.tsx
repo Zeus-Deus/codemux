@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 
 import {
+  AlertTriangle,
   ArrowDownToLine,
   ChevronDown,
   ChevronRight,
   Cloud,
+  GitBranch,
   Loader2,
   Settings2,
 } from "lucide-react";
@@ -27,6 +29,7 @@ import {
   workspacePushToHost,
   workspacesAdoptionPreview,
   workspacesAdoptSynced,
+  workspacesAdoptViaClone,
   type AdoptionPreview,
   type WorkspaceSyncView,
 } from "@/tauri/commands";
@@ -129,41 +132,66 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     };
   }, [open, serverId]);
 
+  // Adoption mode is decided by the preview — host-backed when
+  // possible, clone-fallback when the workspace has no shared host
+  // but does have a project_remote.
+  const isCloneMode =
+    !!preview && !preview.can_host_adopt && preview.can_clone_adopt;
+
   const handleSubmit = useCallback(async () => {
     if (!syncRow || !serverId || !preview) return;
     setSubmitting(true);
     // Optimistic: signal the in-flight state immediately so the
     // sidebar + overview show a spinner the moment the dialog
     // closes. We don't have a local workspace id yet (the shell is
-    // created inside `workspaces_adopt_synced`), so we key the
-    // in-flight signal on the server id prefixed to avoid colliding
-    // with real workspace ids.
+    // created inside the adopt command), so we key the in-flight
+    // signal on the server id prefixed to avoid colliding with real
+    // workspace ids.
     const inFlightKey = `pending-adopt-${serverId}`;
     setPushPullInFlight(inFlightKey);
     onOpenChange(false);
 
     try {
+      // Two distinct paths with different success-toast shapes:
+      // - host-backed: rsync from a shared host; Undo = push back
+      //   to that host (data-safety guardrail).
+      // - clone: git clone + worktree-add; no Undo (independent
+      //   copy is now its own thing).
+      if (isCloneMode) {
+        const result = await workspacesAdoptViaClone(serverId);
+        markFirstPullSeen();
+        void refreshSync();
+        toast.success(`Cloned ${syncRow.title} to this device`, {
+          description:
+            "Independent copy created. Commit and push to share changes with your other device.",
+          action: {
+            label: "Open",
+            onClick: () => {
+              setShowWorkspacesOverview(false);
+              void activateWorkspace(result.workspace_id);
+            },
+          },
+        });
+        return;
+      }
+
+      // Host-backed branch ↓
       const result = await workspacesAdoptSynced(serverId);
       markFirstPullSeen();
-      // Nudge the synced-rows cache so the row migrates from
-      // sibling-device to local in the overview without waiting
-      // for the 5s polling tick.
       void refreshSync();
 
       // Resolve the local hosts.id matching the host we just
-      // pulled from — needed to drive the "Undo = push back" flow.
-      // The hosts cache is populated by the overview before the
-      // dialog ever opens, so this lookup is synchronous.
+      // pulled from — needed for the Undo = push-back flow. The
+      // hosts cache is populated by the overview before the dialog
+      // ever opens, so this lookup is synchronous.
       const sourceHostServerId = syncRow.host_server_id;
       const sourceHost = sourceHostServerId
         ? hosts.find((h) => h.server_id === sourceHostServerId)
         : null;
 
       if (sourceHost) {
-        // Push-back as Undo: data-safety guardrail. If the user
-        // realises within 10s that they pulled the wrong workspace
-        // (or didn't mean to), one click sends it back to where
-        // it came from. Same rsync machinery as a manual push.
+        // Push-back as Undo: data-safety guardrail. Wrong pull is
+        // one click from recovery within 10s.
         toast.undoable({
           message: `Pulled ${syncRow.title} to this device`,
           description: preview.host_label
@@ -176,7 +204,9 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             );
             void refreshSync();
             if (undoResult.ok) {
-              toast.success(`Sent ${syncRow.title} back to ${sourceHost.name}`);
+              toast.success(
+                `Sent ${syncRow.title} back to ${sourceHost.name}`,
+              );
             } else {
               toast.error("Push back failed", {
                 description: undoResult.message,
@@ -185,14 +215,13 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
           },
         });
       } else {
-        // No source host known on this device — fall back to the
-        // plain success toast. The user can still push manually
-        // from the workspace menu.
+        // No source host known on this device (race: it was
+        // deleted between pull start and finish). Plain success
+        // toast — no Undo target available.
         toast.success(`Pulled ${syncRow.title} to this device`, {
-          description:
-            preview.host_label
-              ? `From ${preview.host_label}.`
-              : result.message,
+          description: preview.host_label
+            ? `From ${preview.host_label}.`
+            : result.message,
           action: {
             label: "Open",
             onClick: () => {
@@ -224,6 +253,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     syncRow,
     serverId,
     preview,
+    isCloneMode,
     setPushPullInFlight,
     onOpenChange,
     refreshSync,
@@ -277,16 +307,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             </div>
           ) : alreadyAdopted ? (
             <AlreadyAdoptedBlock onOpen={handleOpenExisting} />
-          ) : !preview.host_configured ? (
-            <HostNotConfiguredBlock
-              hostServerId={syncRow.host_server_id}
-              onClose={() => onOpenChange(false)}
-            />
-          ) : !preview.can_host_adopt ? (
-            <CloneFallbackComingSoonBlock />
-          ) : preview.is_path_in_use ? (
-            <PathInUseBlock path={preview.suggested_path} />
-          ) : (
+          ) : preview.can_host_adopt && !preview.is_path_in_use ? (
             <HostBackedAdoptionForm
               syncRow={syncRow}
               preview={preview}
@@ -295,6 +316,19 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                 setDisclosureOpen((open) => !open)
               }
             />
+          ) : preview.can_host_adopt && preview.is_path_in_use ? (
+            <PathInUseBlock path={preview.suggested_path} />
+          ) : preview.can_clone_adopt && !preview.is_path_in_use ? (
+            <CloneFallbackBlock syncRow={syncRow} preview={preview} />
+          ) : preview.can_clone_adopt && preview.is_path_in_use ? (
+            <PathInUseBlock path={preview.suggested_path} />
+          ) : !preview.host_configured && syncRow.host_server_id ? (
+            <HostNotConfiguredBlock
+              hostServerId={syncRow.host_server_id}
+              onClose={() => onOpenChange(false)}
+            />
+          ) : (
+            <NoOptionsBlock />
           )}
 
           <div className="flex justify-end gap-2 pt-1 border-t border-border/40">
@@ -309,9 +343,8 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             </Button>
             {preview &&
               !alreadyAdopted &&
-              preview.host_configured &&
-              preview.can_host_adopt &&
-              !preview.is_path_in_use && (
+              !preview.is_path_in_use &&
+              (preview.can_host_adopt || isCloneMode) && (
                 <Button
                   variant="secondary"
                   size="sm"
@@ -324,7 +357,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
                   ) : (
                     <ArrowDownToLine className="size-3" />
                   )}
-                  Pull workspace
+                  {isCloneMode ? "Clone and open" : "Pull workspace"}
                 </Button>
               )}
           </div>
@@ -450,13 +483,65 @@ function HostNotConfiguredBlock({
   );
 }
 
-function CloneFallbackComingSoonBlock() {
+function CloneFallbackBlock({
+  syncRow,
+  preview,
+}: {
+  syncRow: WorkspaceSyncView;
+  preview: AdoptionPreview;
+}) {
+  return (
+    <>
+      <p className="text-[12px] text-muted-foreground/85 leading-relaxed">
+        This workspace lives only on another device (no shared host).
+        We'll clone it from git.
+      </p>
+
+      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12.5px] space-y-1.5">
+        <SummaryRow label="Clone from">
+          <span className="font-mono text-[11.5px] break-all">
+            {syncRow.project_remote ?? "—"}
+          </span>
+        </SummaryRow>
+        <SummaryRow
+          label="Branch"
+          icon={<GitBranch className="size-3 text-muted-foreground/70" />}
+        >
+          <span className="font-mono text-[11.5px]">
+            {syncRow.git_branch ?? "main"}
+          </span>
+        </SummaryRow>
+        <SummaryRow label="Will land">
+          <span className="font-mono text-[11px] text-muted-foreground/80 break-all">
+            {preview.suggested_path}
+          </span>
+        </SummaryRow>
+      </dl>
+
+      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11.5px] text-warning/90 leading-relaxed">
+        <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
+        <div>
+          <p className="font-medium text-warning">
+            Uncommitted work on the other device will NOT come over.
+          </p>
+          <p className="text-warning/80">
+            Only committed history clones. If you want the in-flight
+            edits, open the other device first and commit (or push
+            the workspace to a shared device instead, then pull from
+            here).
+          </p>
+        </div>
+      </div>
+    </>
+  );
+}
+
+function NoOptionsBlock() {
   return (
     <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12px] text-muted-foreground/85 leading-relaxed">
-      This workspace lives only on another device (no shared host).
-      Cloning from the git remote is coming in a follow-up — for now,
-      open the other device and push this workspace to one of your
-      devices, then pull it from there.
+      We don't have a way to bring this workspace over yet — no shared
+      host, no git remote URL. Open the device it lives on and push
+      it to a shared device first, then pull from here.
     </div>
   );
 }

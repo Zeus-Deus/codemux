@@ -430,3 +430,229 @@ pub async fn workspaces_adopt_synced(
         message: pull_outcome.message,
     })
 }
+
+/// Adopt a sibling-device workspace into this device via the
+/// clone-from-git fallback path. Used when the sync row has no
+/// `host_server_id` (the workspace lives only on another device of
+/// the user, never pushed to a shared host).
+///
+/// Semantics differ from `workspaces_adopt_synced` (Phase 2) in one
+/// important way: this creates a NEW local workspace with its own
+/// fresh `server_id` (the reconcile push assigns one). The
+/// sibling-device's existing sync row is left alone. Result: both
+/// devices independently own a workspace at the same git remote +
+/// branch. They share a git remote but live as two registry
+/// entries.
+///
+/// This semantics tradeoff is the right answer because rsync is not
+/// available (no shared host), so the two devices genuinely have
+/// independent copies. Phase-4's divergence detection (TBD) handles
+/// the "now what?" question when their HEADs diverge.
+///
+/// Flow:
+///   1. Look up the sync row by `server_id`, validate it has
+///      `project_remote` set (clone is impossible without a URL).
+///   2. Refuse if the sync row already has `workspace_id` set on
+///      this device — that's the host-backed adoption's idempotent
+///      path, not ours.
+///   3. Compute target paths: project at `~/.codemux/projects/<basename>`,
+///      worktree at `~/.codemux/worktrees/<basename>/<branch>`.
+///   4. Bail if either path is in use (caller already saw the
+///      preview's `is_path_in_use` flag, so this is defence-in-
+///      depth).
+///   5. `git clone --no-checkout` into the project path.
+///   6. `git worktree add` for the branch into the worktree path —
+///      reuse `git_create_worktree` so PR-ref + branch-fetch logic
+///      is unchanged.
+///   7. Create a brand-new local workspace (NOT linked to the
+///      sync row). The next reconcile push will assign it a fresh
+///      `server_id`.
+///   8. Return the new local id.
+///
+/// Failure mode: any git failure leaves the target dir cleaned up
+/// (see `git_clone`'s rollback). No partial workspace shell is
+/// created until both clone + worktree-add succeed.
+#[tauri::command]
+pub async fn workspaces_adopt_via_clone(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // Validate + compute paths in a sync scope (no awaits).
+    let (project_remote, project_path, worktree_path, branch, title) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency / safety: refuse if the row is already linked
+        // to a local workspace on this device. That row should be
+        // adopted via the host-backed path, not cloned again.
+        if row.workspace_id.is_some() {
+            return Err(format!(
+                "This workspace is already adopted on this device as {}",
+                row.workspace_id.unwrap()
+            ));
+        }
+
+        let project_remote = row.project_remote.as_deref().ok_or_else(|| {
+            "no_project_remote: this workspace has no git remote URL \
+             recorded, so it can't be cloned. Open the device it \
+             lives on and push it to a shared device first."
+                .to_string()
+        })?;
+
+        let project_name = row
+            .project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .or_else(|| extract_project_name_from_remote(project_remote))
+            // Final fallback if we can't infer a name from anywhere.
+            .unwrap_or_else(|| "workspace".to_string());
+
+        let branch = row
+            .git_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+
+        // Project goes under ~/.codemux/projects/<basename>. We
+        // deliberately avoid colliding with user-managed paths like
+        // ~/projects/<basename>.
+        let home = dirs::home_dir()
+            .ok_or_else(|| "home directory unavailable".to_string())?;
+        let project_path = home
+            .join(".codemux")
+            .join("projects")
+            .join(&project_name);
+        // Worktree path matches the canonical layout push/pull use,
+        // so a future push to a shared host lands at the same
+        // remote path another device would.
+        let conv = crate::ssh::conventional_remote_path(&project_name, &branch);
+        let conv_str = conv.to_string_lossy().to_string();
+        let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
+            home.join(rest)
+        } else {
+            std::path::PathBuf::from(&conv_str)
+        };
+
+        // Path collision check against live workspaces. Defence-in-
+        // depth — the preview already showed this; bailing here
+        // catches races.
+        let snapshot = app_state.snapshot();
+        let collision = snapshot.workspaces.iter().any(|w| {
+            let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+            p == worktree_path.to_string_lossy().as_ref()
+        });
+        if collision {
+            return Err(format!(
+                "path_in_use: A different workspace is already using \
+                 {}.",
+                worktree_path.display()
+            ));
+        }
+
+        (
+            project_remote.to_string(),
+            project_path,
+            worktree_path,
+            branch,
+            row.title.clone(),
+        )
+    };
+
+    // Step 5+6: clone + worktree-add, both off the main async
+    // thread via spawn_blocking — git operations can take seconds.
+    let project_path_str = project_path.to_string_lossy().to_string();
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    let branch_clone = branch.clone();
+    let project_path_clone = project_path.clone();
+    let clone_result = tokio::task::spawn_blocking(move || {
+        // Phase 1: clone the bare-ish project (no checkout —
+        // worktree-add picks the right branch).
+        crate::git::git_clone(&project_remote, &project_path_clone)?;
+        // Phase 2: add the worktree at the requested branch.
+        crate::git::git_create_worktree(
+            project_path_clone.as_path(),
+            &branch_clone,
+            // `new_branch=false` — we want the existing branch from
+            // the remote, not a new one.
+            false,
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("git_clone join failed: {e}"))?;
+
+    let worktree_actual_path = clone_result.map_err(|e| {
+        // Roll back the cloned project dir on failure so a retry
+        // starts clean.
+        let _ = std::fs::remove_dir_all(&project_path);
+        e
+    })?;
+
+    // Step 7: register a brand-new local workspace pointing at the
+    // freshly-cloned worktree. Crucially we do NOT link to the
+    // existing sync row — the next reconcile push will create a
+    // fresh server-side entry for this device's copy.
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let workspace_id = app_state.create_synced_workspace_shell(
+        title,
+        // host_id = -1 sentinel doesn't exist; we use a different
+        // helper that creates a local-only workspace. Since
+        // create_synced_workspace_shell expects host_id and we
+        // don't want that here, fall back to manually setting it
+        // via the closest existing helper.
+        0,
+        Some(project_path_str.clone()),
+        worktree_actual_path.clone(),
+        Some(branch.clone()),
+    );
+    // Clear host_id since this is a local clone (not a remote pull).
+    app_state.set_workspace_host_id(&workspace_id.0, None)?;
+
+    // Nudge sync so the server learns about the new workspace.
+    if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] post-clone-adopt sync failed (will retry): {e}"
+        );
+    }
+
+    Ok(AdoptOutcome {
+        workspace_id: workspace_id.0,
+        worktree_path: worktree_actual_path,
+        message: format!(
+            "Cloned to {} and added worktree at {}",
+            project_path_str, worktree_path_str
+        ),
+    })
+}
+
+/// Best-effort: extract a project name from a git remote URL when
+/// the synced row doesn't carry an explicit `project_path`. Handles
+/// the common cases:
+///   - https://host/owner/name.git → "name"
+///   - git@host:owner/name.git    → "name"
+///   - git@host:owner/name        → "name"
+/// Returns None if no recognisable basename is present.
+fn extract_project_name_from_remote(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let after_slash_or_colon = trimmed
+        .rsplit(|c: char| c == '/' || c == ':')
+        .next()
+        .unwrap_or(trimmed);
+    let stripped = after_slash_or_colon
+        .strip_suffix(".git")
+        .unwrap_or(after_slash_or_colon);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}

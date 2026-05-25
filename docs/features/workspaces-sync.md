@@ -128,7 +128,10 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 
 ## Current Constraints
 
-- **Host-backed adoption works; clone-from-git adoption is deferred.** The "Pull to this device" menu item is live for any sibling-device row whose `host_server_id` resolves to a configured local host (the 80% path — works via `workspaces_adopt_synced` + the existing `workspace_pull_back_impl`). When the row has no shared host (`host_server_id IS NULL`), the dialog tells the user "open the other device and push to a shared host first" — the git-clone fallback ships in a follow-up.
+- **Host-backed adoption + clone fallback both work.** The "Pull to this device" menu item is live for every sibling-device row. The dialog renders the right variant automatically:
+  - **Host-backed** (row's `host_server_id` resolves to a configured local host): rsyncs from the host via `workspaces_adopt_synced` + the existing `workspace_pull_back_impl`. The adopted workspace replaces the original on that host (single-source-of-truth model).
+  - **Clone fallback** (row has `project_remote` but no shared host): `workspaces_adopt_via_clone` runs `git clone --no-checkout` into `~/.codemux/projects/<basename>`, then `git worktree add` at the branch, and registers a fresh local workspace. Crucially this creates a NEW server_id (does NOT link to the original sibling row) — both devices end up with independent copies sharing a git remote. The dialog warns about uncommitted-work loss before the user confirms.
+  - **Neither** (no host, no remote): dialog tells the user to push from the other device first.
 
 ## Safety guardrails (Phase 4)
 

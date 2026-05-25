@@ -16,15 +16,28 @@ const mockPreview = vi.fn<
   (serverId: string) => Promise<AdoptionPreview>
 >();
 const mockAdopt = vi.fn<(serverId: string) => Promise<unknown>>();
+const mockAdoptClone = vi.fn<(serverId: string) => Promise<unknown>>();
 const mockActivate = vi.fn();
+const mockPushToHost = vi.fn();
 
 vi.mock("@/tauri/commands", () => ({
   workspacesAdoptionPreview: (id: string) => mockPreview(id),
   workspacesAdoptSynced: (id: string) => mockAdopt(id),
+  workspacesAdoptViaClone: (id: string) => mockAdoptClone(id),
+  workspacePushToHost: (...args: unknown[]) => {
+    mockPushToHost(...args);
+    return Promise.resolve({ ok: true, message: "" });
+  },
   activateWorkspace: (id: string) => {
     mockActivate(id);
     return Promise.resolve();
   },
+}));
+
+vi.mock("@/stores/hosts-store", () => ({
+  useHostsStore: vi.fn((selector: (s: unknown) => unknown) =>
+    selector({ hosts: [] }),
+  ),
 }));
 
 vi.mock("@/stores/app-store", () => ({
@@ -111,7 +124,9 @@ describe("PullToDeviceDialog", () => {
   beforeEach(() => {
     mockPreview.mockReset();
     mockAdopt.mockReset();
+    mockAdoptClone.mockReset();
     mockActivate.mockReset();
+    mockPushToHost.mockReset();
   });
 
   it("does not render when syncRow is null", () => {
@@ -149,10 +164,14 @@ describe("PullToDeviceDialog", () => {
     expect(screen.queryByText("Pull workspace")).toBeInTheDocument();
   });
 
-  it("renders 'configure the device first' when host isn't on this device", async () => {
+  it("renders 'configure the device first' when host isn't on this device and no clone fallback applies", async () => {
     mockPreview.mockResolvedValue(
       makePreview({
         can_host_adopt: false,
+        // Force clone-fallback OFF so the host-not-configured block
+        // is the variant rendered (the dialog now picks clone over
+        // host-not-configured when project_remote is set).
+        can_clone_adopt: false,
         host_configured: false,
         host_label: null,
       }),
@@ -257,5 +276,92 @@ describe("PullToDeviceDialog", () => {
     expect(screen.queryByText(/Copies the workspace files from/i)).toBeNull();
     // The toggle is still there.
     expect(screen.getByText("What this does")).toBeInTheDocument();
+  });
+
+  // ── Phase-3 clone-fallback variant ───────────────────────────
+
+  it("renders the clone-fallback variant when no shared host but project_remote is set", async () => {
+    mockPreview.mockResolvedValue(
+      makePreview({
+        can_host_adopt: false,
+        can_clone_adopt: true,
+        host_configured: false,
+        host_label: null,
+      }),
+    );
+    render(
+      <PullToDeviceDialog
+        syncRow={makeSyncRow({ host_server_id: null })}
+        onOpenChange={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/We'll clone it from git/i),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(
+        /Uncommitted work on the other device will NOT come over/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Clone and open")).toBeInTheDocument();
+  });
+
+  it("calls workspacesAdoptViaClone (not workspacesAdoptSynced) when submitting in clone mode", async () => {
+    mockPreview.mockResolvedValue(
+      makePreview({
+        can_host_adopt: false,
+        can_clone_adopt: true,
+        host_configured: false,
+        host_label: null,
+      }),
+    );
+    mockAdoptClone.mockResolvedValue({
+      workspace_id: "workspace-cloned",
+      worktree_path: "/home/zeus/.codemux/worktrees/codemux/feature-x",
+      message: "Cloned",
+    });
+    render(
+      <PullToDeviceDialog
+        syncRow={makeSyncRow({ host_server_id: null })}
+        onOpenChange={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByText("Clone and open")).toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByText("Clone and open"));
+    await waitFor(() =>
+      expect(mockAdoptClone).toHaveBeenCalledWith("42"),
+    );
+    expect(mockAdopt).not.toHaveBeenCalled();
+  });
+
+  it("renders the no-options block when neither host_configured nor can_clone_adopt", async () => {
+    mockPreview.mockResolvedValue(
+      makePreview({
+        can_host_adopt: false,
+        can_clone_adopt: false,
+        host_configured: false,
+        host_label: null,
+      }),
+    );
+    render(
+      <PullToDeviceDialog
+        syncRow={makeSyncRow({
+          host_server_id: null,
+          project_remote: null,
+        })}
+        onOpenChange={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/no shared host, no git remote URL/i),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("Pull workspace")).toBeNull();
+    expect(screen.queryByText("Clone and open")).toBeNull();
   });
 });
