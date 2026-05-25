@@ -94,6 +94,7 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 - "Removed host" orphan bucket prevents workspaces from silently disappearing when a host row is deleted.
 - One push/pull spinner per workspace, shared with the sidebar.
 - Live agent status (working / needs-input / ready-to-review) reflected on every row in real time — same source as the sidebar's `StatusIndicator`, no polling.
+- First-run welcome banner (`WelcomeBanner` component) with three state-aware variants — brand-new (no devices, no siblings, with `Add a device` CTA), device-configured (nudges first push), has-siblings (counts visible cross-device workspaces with pull instructions). Dismissable; persists in localStorage and never re-shows.
 
 ## Current Constraints
 

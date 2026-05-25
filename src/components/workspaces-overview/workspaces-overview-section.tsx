@@ -30,6 +30,7 @@ import type { WorkspaceSyncView } from "@/tauri/commands";
 import { WorkspaceOverviewRow } from "./workspace-overview-row";
 import { useOverviewItems, type DeviceBucket, type OverviewItem } from "./use-overview-items";
 import { PullToDeviceDialog } from "./pull-to-device-dialog";
+import { WelcomeBanner } from "./welcome-banner";
 
 /**
  * The Workspaces overview body — rendered full-screen by
@@ -470,6 +471,15 @@ export function WorkspacesOverviewSection() {
 
       {/* Body */}
       <div className="flex-1 min-h-0 overflow-y-auto px-6 py-6">
+        <WelcomeBanner
+          deviceCount={hosts.length}
+          siblingWorkspaceCount={
+            allItems.filter((it) => it.kind === "remote").length
+          }
+          localWorkspaceCount={
+            allItems.filter((it) => it.kind === "local").length
+          }
+        />
         <div className="mx-auto max-w-6xl space-y-8">
           {buckets.length === 0 ? (
             <EmptyFilters onClear={clearFilters} />
