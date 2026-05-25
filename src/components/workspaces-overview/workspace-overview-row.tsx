@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useState } from "react";
+import { startTransition, useCallback, useEffect, useState } from "react";
 
 import {
   ArrowDownLeft,
@@ -168,6 +168,34 @@ function LocalRow({
   const [busy, setBusy] = useState(false);
   const isRemote = item.hostServerId !== null;
   const isWorktree = !!workspace.worktree_path;
+
+  // Phase-4d elapsed-time indicator: when a push/pull takes longer
+  // than ~2s, surface "12s elapsed" so the user knows it's working
+  // (not stalled). Updates once per second via setInterval, only
+  // while in-flight, so idle rows pay no re-render cost.
+  const startedAt = useAppStore(
+    (s) =>
+      s.workspacePushPullInFlight === workspace.workspace_id
+        ? s.workspacePushPullStartedAt
+        : null,
+  );
+  const [elapsedSec, setElapsedSec] = useState<number | null>(null);
+  useEffect(() => {
+    if (startedAt === null) {
+      setElapsedSec(null);
+      return;
+    }
+    const tick = () => {
+      const ms = Date.now() - startedAt;
+      // Only surface once we've been waiting >2s, otherwise the
+      // user is just seeing the spinner and the number would be a
+      // visual jitter for fast operations.
+      setElapsedSec(ms < 2_000 ? null : Math.floor(ms / 1_000));
+    };
+    tick();
+    const id = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(id);
+  }, [startedAt]);
 
   const handleOpen = useCallback(() => {
     if (inFlight) return;
@@ -375,10 +403,22 @@ function LocalRow({
         >
           {showingInFlight ? (
             <span
-              aria-label="Working"
-              className="flex size-7 items-center justify-center text-muted-foreground"
+              aria-label={
+                elapsedSec !== null
+                  ? `Working — ${elapsedSec}s elapsed`
+                  : "Working"
+              }
+              className="flex items-center gap-1.5 text-muted-foreground"
             >
               <Loader2 className="size-3.5 animate-spin" />
+              {elapsedSec !== null && (
+                <span
+                  title="Push and pull use rsync over SSH — large workspaces can take a while. Stay on this page; you'll see a toast when it's done."
+                  className="rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                >
+                  {elapsedSec}s
+                </span>
+              )}
             </span>
           ) : (
             <DropdownMenu>

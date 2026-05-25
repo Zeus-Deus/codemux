@@ -586,6 +586,32 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const isPushOrPullInFlight = useAppStore(
     (s) => s.workspacePushPullInFlight === workspace.workspace_id,
   );
+  // Phase-4d elapsed-time signal: when an in-flight push/pull
+  // crosses 2 seconds, show a small "12s" pill so the user knows
+  // the operation is still working. Identical math to the overview
+  // row — see workspace-overview-row.tsx LocalRow for the rationale.
+  const inFlightStartedAt = useAppStore(
+    (s) =>
+      s.workspacePushPullInFlight === workspace.workspace_id
+        ? s.workspacePushPullStartedAt
+        : null,
+  );
+  const [sidebarElapsedSec, setSidebarElapsedSec] = useState<number | null>(
+    null,
+  );
+  useEffect(() => {
+    if (inFlightStartedAt === null) {
+      setSidebarElapsedSec(null);
+      return;
+    }
+    const tick = () => {
+      const ms = Date.now() - inFlightStartedAt;
+      setSidebarElapsedSec(ms < 2_000 ? null : Math.floor(ms / 1_000));
+    };
+    tick();
+    const id = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(id);
+  }, [inFlightStartedAt]);
   const icon = isPushOrPullInFlight ? (
     <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
@@ -655,11 +681,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   {workspace.title}
                 </span>
 
+                {sidebarElapsedSec !== null && (
+                  <span
+                    title="Push/pull in progress — large workspaces can take a while."
+                    className="shrink-0 ml-auto rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                  >
+                    {sidebarElapsedSec}s
+                  </span>
+                )}
                 {workspace.notification_count > 0 && (
                   <Badge
                     variant="outline"
                     className={cn(
-                      "shrink-0 ml-auto text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
+                      "shrink-0 text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
+                      sidebarElapsedSec === null && "ml-auto",
                       canDelete && "transition-opacity group-hover/row:opacity-0",
                     )}
                   >
