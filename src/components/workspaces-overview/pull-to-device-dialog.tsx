@@ -24,11 +24,13 @@ import { useUIStore } from "@/stores/ui-store";
 import { useWorkspacesSyncStore } from "@/stores/workspaces-sync-store";
 import {
   activateWorkspace,
+  workspacePushToHost,
   workspacesAdoptionPreview,
   workspacesAdoptSynced,
   type AdoptionPreview,
   type WorkspaceSyncView,
 } from "@/tauri/commands";
+import { useHostsStore } from "@/stores/hosts-store";
 
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
@@ -93,6 +95,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     (s) => s.setWorkspacePushPullInFlight,
   );
   const refreshSync = useWorkspacesSyncStore((s) => s.refresh);
+  const hosts = useHostsStore((s) => s.hosts);
 
   const [preview, setPreview] = useState<AdoptionPreview | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -146,19 +149,59 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
       // sibling-device to local in the overview without waiting
       // for the 5s polling tick.
       void refreshSync();
-      toast.success(`Pulled ${syncRow.title} to this device`, {
-        description:
-          preview.host_label
-            ? `From ${preview.host_label}. The copy on ${preview.host_label} stays in place — push back from this device whenever you want.`
+
+      // Resolve the local hosts.id matching the host we just
+      // pulled from — needed to drive the "Undo = push back" flow.
+      // The hosts cache is populated by the overview before the
+      // dialog ever opens, so this lookup is synchronous.
+      const sourceHostServerId = syncRow.host_server_id;
+      const sourceHost = sourceHostServerId
+        ? hosts.find((h) => h.server_id === sourceHostServerId)
+        : null;
+
+      if (sourceHost) {
+        // Push-back as Undo: data-safety guardrail. If the user
+        // realises within 10s that they pulled the wrong workspace
+        // (or didn't mean to), one click sends it back to where
+        // it came from. Same rsync machinery as a manual push.
+        toast.undoable({
+          message: `Pulled ${syncRow.title} to this device`,
+          description: preview.host_label
+            ? `From ${preview.host_label}. Tap Undo within 10s to send it back.`
             : result.message,
-        action: {
-          label: "Open",
-          onClick: () => {
-            setShowWorkspacesOverview(false);
-            void activateWorkspace(result.workspace_id);
+          onUndo: async () => {
+            const undoResult = await workspacePushToHost(
+              result.workspace_id,
+              sourceHost.id,
+            );
+            void refreshSync();
+            if (undoResult.ok) {
+              toast.success(`Sent ${syncRow.title} back to ${sourceHost.name}`);
+            } else {
+              toast.error("Push back failed", {
+                description: undoResult.message,
+              });
+            }
           },
-        },
-      });
+        });
+      } else {
+        // No source host known on this device — fall back to the
+        // plain success toast. The user can still push manually
+        // from the workspace menu.
+        toast.success(`Pulled ${syncRow.title} to this device`, {
+          description:
+            preview.host_label
+              ? `From ${preview.host_label}.`
+              : result.message,
+          action: {
+            label: "Open",
+            onClick: () => {
+              setShowWorkspacesOverview(false);
+              void activateWorkspace(result.workspace_id);
+            },
+          },
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // Decode our structured-error prefixes so the toast is
@@ -185,6 +228,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     onOpenChange,
     refreshSync,
     setShowWorkspacesOverview,
+    hosts,
   ]);
 
   // ── Open-existing-on-already-adopted short-circuit ────────────

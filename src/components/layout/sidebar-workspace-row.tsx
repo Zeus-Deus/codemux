@@ -55,6 +55,10 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { useHosts } from "@/stores/hosts-store";
+import {
+  ConfirmPushDialog,
+  shouldSkipPushConfirm,
+} from "@/components/overlays/confirm-push-dialog";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -216,9 +220,14 @@ function RemoveWorkspaceDialog({
 export function WorkspaceContextMenuItems({
   workspace,
   onRemoveRequest,
+  onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
   onRemoveRequest: () => void;
+  /** Called when the user clicks a host in the "Move to host…"
+   *  submenu. Opens the Phase-4 confirmation dialog unless the
+   *  user previously set "Don't ask again for this host". */
+  onRequestPushConfirm?: (host: HostView) => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const isWorktree = !!workspace.worktree_path;
@@ -246,8 +255,25 @@ export function WorkspaceContextMenuItems({
         host.id,
       );
       if (result.ok) {
-        toast.success(`Pushed to ${host.name}`, {
-          description: result.message,
+        // Push success → offer Undo = pull back. Same machinery
+        // the workspace's "Pull back to this device" item runs,
+        // wrapped so a misclick within 10s is one tap away from
+        // recovery. Data-safety guardrail for Phase 4.
+        toast.undoable({
+          message: `Pushed to ${host.name}`,
+          description: "Tap Undo within 10s to pull it back.",
+          onUndo: async () => {
+            const undoResult = await workspacePullBack(
+              workspace.workspace_id,
+            );
+            if (undoResult.ok) {
+              toast.success(`Pulled back from ${host.name}`);
+            } else {
+              toast.error("Pull back failed", {
+                description: undoResult.message,
+              });
+            }
+          },
         });
       } else {
         toast.error(`Push to ${host.name} failed`, {
@@ -264,12 +290,40 @@ export function WorkspaceContextMenuItems({
 
   const handlePullBack = async () => {
     setPushPullInFlight(workspace.workspace_id);
+    // Capture the source host id BEFORE the pull clears it on the
+    // workspace, so the undo closure knows where to push back to.
+    const sourceHostId = workspace.host_id;
+    const sourceHost = sourceHostId
+      ? hosts.find((h) => h.id === sourceHostId)
+      : null;
     try {
       const result = await workspacePullBack(workspace.workspace_id);
       if (result.ok) {
-        toast.success("Pulled back to this device", {
-          description: result.message,
-        });
+        if (sourceHost) {
+          toast.undoable({
+            message: "Pulled back to this device",
+            description: `From ${sourceHost.name}. Tap Undo within 10s to send it back.`,
+            onUndo: async () => {
+              const undoResult = await workspacePushToHost(
+                workspace.workspace_id,
+                sourceHost.id,
+              );
+              if (undoResult.ok) {
+                toast.success(`Pushed back to ${sourceHost.name}`);
+              } else {
+                toast.error("Push back failed", {
+                  description: undoResult.message,
+                });
+              }
+            },
+          });
+        } else {
+          // Source host disappeared (deleted between push and
+          // pull) — no undo possible, plain success.
+          toast.success("Pulled back to this device", {
+            description: result.message,
+          });
+        }
       } else {
         toast.error("Pull back failed", {
           description: result.message,
@@ -402,7 +456,20 @@ export function WorkspaceContextMenuItems({
             {hosts.map((host) => (
               <ContextMenuItem
                 key={host.id}
-                onClick={() => void handleMoveToHost(host)}
+                onClick={() => {
+                  // Phase-4 confirmation gate. If the user clicked
+                  // "Don't ask again for X" previously, skip the
+                  // dialog and push immediately — otherwise hoist
+                  // to the parent to open the confirm modal.
+                  if (
+                    onRequestPushConfirm &&
+                    !shouldSkipPushConfirm(host.id)
+                  ) {
+                    onRequestPushConfirm(host);
+                  } else {
+                    void handleMoveToHost(host);
+                  }
+                }}
               >
                 {host.name}
               </ContextMenuItem>
@@ -449,6 +516,56 @@ function AsciiSpinner() {
 
 export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const [showRemoveDialog, setShowRemoveDialog] = useState(false);
+  // Phase-4 push confirmation: holds the host the user just picked
+  // from the "Move to host…" submenu, so the dialog can render its
+  // summary + handle the actual push on confirm.
+  const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(
+    null,
+  );
+  const setPushPullInFlight = useAppStore(
+    (s) => s.setWorkspacePushPullInFlight,
+  );
+
+  const performPushToHost = async (host: HostView) => {
+    setPushPullInFlight(workspace.workspace_id);
+    try {
+      const result = await workspacePushToHost(
+        workspace.workspace_id,
+        host.id,
+      );
+      if (result.ok) {
+        // Undo = pull back. Same machinery as the workspace's
+        // "Pull back to this device" item; gives users a 10s
+        // escape hatch (Phase-4 safety guardrail).
+        toast.undoable({
+          message: `Pushed to ${host.name}`,
+          description: "Tap Undo within 10s to pull it back.",
+          onUndo: async () => {
+            const undoResult = await workspacePullBack(
+              workspace.workspace_id,
+            );
+            if (undoResult.ok) {
+              toast.success(`Pulled back from ${host.name}`);
+            } else {
+              toast.error("Pull back failed", {
+                description: undoResult.message,
+              });
+            }
+          },
+        });
+      } else {
+        toast.error(`Push to ${host.name} failed`, {
+          description: result.message,
+        });
+      }
+    } catch (err) {
+      toast.error("Push failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setPushPullInFlight(null);
+    }
+  };
 
   const workspaceStatus: ActivePaneStatus | null = useAppStore((s) => {
     if (!s.appState) return null;
@@ -662,12 +779,26 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
         <WorkspaceContextMenuItems
           workspace={workspace}
           onRemoveRequest={() => setShowRemoveDialog(true)}
+          onRequestPushConfirm={(host) => setPendingPushHost(host)}
         />
       </ContextMenu>
       <RemoveWorkspaceDialog
         workspace={workspace}
         open={showRemoveDialog}
         onOpenChange={setShowRemoveDialog}
+      />
+      <ConfirmPushDialog
+        open={pendingPushHost !== null}
+        workspaceTitle={workspace.title}
+        host={pendingPushHost}
+        onConfirm={() => {
+          if (pendingPushHost) {
+            void performPushToHost(pendingPushHost);
+          }
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingPushHost(null);
+        }}
       />
     </>
   );

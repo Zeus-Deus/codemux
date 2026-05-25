@@ -129,6 +129,17 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 ## Current Constraints
 
 - **Host-backed adoption works; clone-from-git adoption is deferred.** The "Pull to this device" menu item is live for any sibling-device row whose `host_server_id` resolves to a configured local host (the 80% path — works via `workspaces_adopt_synced` + the existing `workspace_pull_back_impl`). When the row has no shared host (`host_server_id IS NULL`), the dialog tells the user "open the other device and push to a shared host first" — the git-clone fallback ships in a follow-up.
+
+## Safety guardrails (Phase 4)
+
+Every push, pull, and adopt action now has two safety nets that make accidents recoverable:
+
+- **Confirm-before-push.** Right-clicking a workspace → `Move to host → <device>` no longer fires the rsync immediately. Instead, `ConfirmPushDialog` opens with the workspace title, the destination, and a 3-bullet explanation of what's about to happen ("Copies files to <host>", "Live editing location moves", "You can pull it back anytime"). Power users who want the old single-tap behaviour can tick "Don't ask again for <host>" — the choice persists per-device in localStorage. The dialog is at `src/components/overlays/confirm-push-dialog.tsx`.
+- **Undo for 10 seconds** on every successful push, pull, and adoption. The success toast carries an `Undo` button that fires the reverse action (push ↔ pull). Double-click-guarded so the reverse only runs once. Reverse-action failure surfaces as a follow-up error toast. Implementation: `fireUndoable` in `src/lib/toast.ts`.
+
+Wired at three call sites:
+- `sidebar-workspace-row.tsx` — sidebar context menu's push and pull-back items both go through the undo path.
+- `pull-to-device-dialog.tsx` — cross-device adoption shows Undo = push back to the source host, so a wrong "Pull to this device" click is recoverable.
 - **No "Sync now" UI button.** The command exists but no UI affordance triggers it yet — the 30s loop covers steady-state use. Easy add when wanted.
 - **No optimistic UI.** Local mutations show up in the overview immediately (because app_state is reactive), but the cross-device propagation has the 30s latency. Acceptable for v1; could be tightened later by hooking sync triggers into each mutation site.
 - **Last-write-wins, no conflict UI.** If two devices edit the same workspace simultaneously, the later push overwrites. Same model as hosts and automations.
