@@ -54,6 +54,10 @@ interface Props {
   /** Called after a successful "Open" — the overview should close so
    *  the user lands on the workspace they picked. */
   onAfterOpen: () => void;
+  /** Called when the user clicks "Pull to this device" on a
+   *  sibling-device (remote-kind) row. The section hoists this and
+   *  opens the shared `PullToDeviceDialog`. */
+  onRequestPull?: (item: Extract<OverviewItem, { kind: "remote" }>) => void;
 }
 
 /**
@@ -67,9 +71,16 @@ interface Props {
  *    sibling-device row + metadata). The "Pending sync" pill on
  *    local rows surfaces the row's `dirty` flag.
  */
-export function WorkspaceOverviewRow({ item, isAttached, onAfterOpen }: Props) {
+export function WorkspaceOverviewRow({
+  item,
+  isAttached,
+  onAfterOpen,
+  onRequestPull,
+}: Props) {
   if (item.kind === "remote") {
-    return <RemoteRow item={item} onAfterOpen={onAfterOpen} />;
+    return (
+      <RemoteRow item={item} onRequestPull={onRequestPull ?? null} />
+    );
   }
   return (
     <LocalRow
@@ -488,12 +499,14 @@ function LocalRow({
 
 function RemoteRow({
   item,
+  onRequestPull,
 }: {
   item: Extract<OverviewItem, { kind: "remote" }>;
-  onAfterOpen: () => void;
+  onRequestPull: ((item: Extract<OverviewItem, { kind: "remote" }>) => void) | null;
 }) {
   const row = item.sync;
   const branch = row.git_branch;
+  const canRequestPull = onRequestPull !== null;
 
   return (
     <div
@@ -560,13 +573,22 @@ function RemoteRow({
               <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
                 Lives on another device
               </DropdownMenuLabel>
-              <DropdownMenuItem
-                disabled
-                title="Adopting workspaces from sibling devices is coming in a follow-up. For now this view is read-only."
-              >
-                <CloudOff className="mr-2 size-3.5" />
-                Pull to this device (coming soon)
-              </DropdownMenuItem>
+              {canRequestPull ? (
+                <DropdownMenuItem
+                  onClick={() => onRequestPull?.(item)}
+                >
+                  <ArrowDownLeft className="mr-2 size-3.5" />
+                  Pull to this device…
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem
+                  disabled
+                  title="Pulling sibling-device workspaces is unavailable here."
+                >
+                  <CloudOff className="mr-2 size-3.5" />
+                  Pull to this device (unavailable)
+                </DropdownMenuItem>
+              )}
               <DropdownMenuSeparator />
               <DropdownMenuItem
                 disabled={!branch}

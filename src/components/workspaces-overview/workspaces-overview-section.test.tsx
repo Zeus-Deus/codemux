@@ -68,6 +68,18 @@ vi.mock("@/stores/workspaces-sync-store", () => ({
     error: null,
     refresh: () => Promise.resolve(),
   }),
+  // The pull-to-device dialog (mounted by the section) reads
+  // `refresh` from the underlying store to nudge a sync after a
+  // successful adoption.
+  useWorkspacesSyncStore: vi.fn((selector: (s: unknown) => unknown) =>
+    selector({
+      rows: [],
+      loading: false,
+      loaded: true,
+      error: null,
+      refresh: () => Promise.resolve(),
+    }),
+  ),
 }));
 
 vi.mock("@/stores/ui-store", () => ({

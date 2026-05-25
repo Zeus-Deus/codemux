@@ -25,8 +25,11 @@ import { useAppStore } from "@/stores/app-store";
 import { useHostsStore } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
 
+import type { WorkspaceSyncView } from "@/tauri/commands";
+
 import { WorkspaceOverviewRow } from "./workspace-overview-row";
 import { useOverviewItems, type DeviceBucket, type OverviewItem } from "./use-overview-items";
+import { PullToDeviceDialog } from "./pull-to-device-dialog";
 
 /**
  * The Workspaces overview body — rendered full-screen by
@@ -72,6 +75,18 @@ export function WorkspacesOverviewSection() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [createdWithin, setCreatedWithin] = useState<CreatedWithin>("all");
   const [sortBy, setSortBy] = useState<SortBy>("recent");
+
+  // Cross-device adoption dialog state — hoisted here so any
+  // sibling-device row's `⋯ → Pull to this device` opens the same
+  // shared modal. Holds the sync row whose adoption is in progress;
+  // null = closed.
+  const [pullRow, setPullRow] = useState<WorkspaceSyncView | null>(null);
+  const handleRequestPull = useCallback(
+    (item: Extract<OverviewItem, { kind: "remote" }>) => {
+      setPullRow(item.sync);
+    },
+    [],
+  );
 
   // Eagerly load hosts so device-bucket labels resolve immediately.
   useEffect(() => {
@@ -465,11 +480,19 @@ export function WorkspacesOverviewSection() {
                 bucket={bucket}
                 activeWorkspaceId={activeWorkspaceId}
                 onCloseOverview={() => setShowWorkspacesOverview(false)}
+                onRequestPull={handleRequestPull}
               />
             ))
           )}
         </div>
       </div>
+
+      <PullToDeviceDialog
+        syncRow={pullRow}
+        onOpenChange={(open) => {
+          if (!open) setPullRow(null);
+        }}
+      />
     </div>
   );
 }
@@ -480,10 +503,14 @@ function DeviceSection({
   bucket,
   activeWorkspaceId,
   onCloseOverview,
+  onRequestPull,
 }: {
   bucket: DeviceBucket;
   activeWorkspaceId: string | null;
   onCloseOverview: () => void;
+  onRequestPull: (
+    item: Extract<OverviewItem, { kind: "remote" }>,
+  ) => void;
 }) {
   const isLocal = bucket.hostServerId === null;
   const hiddenByFilter = bucket.totalCount - bucket.items.length;
@@ -552,6 +579,7 @@ function DeviceSection({
                   it.workspace.workspace_id === activeWorkspaceId
                 }
                 onAfterOpen={onCloseOverview}
+                onRequestPull={onRequestPull}
               />
             </li>
           ))}

@@ -1763,3 +1763,43 @@ export const workspacesSyncList = () =>
  *  now" affordance. Returns Ok even if the user isn't signed in. */
 export const workspacesSyncNow = () =>
   invoke<void>("workspaces_sync_now");
+
+// ── Cross-device adoption (Phase 2) ──
+//
+// "Adoption" = take a workspace that lives on another device of your
+// account and materialize a local copy on THIS device. Two paths:
+//   - host-backed (this PR): when the workspace lives on a host you
+//     also have configured locally, rsync from the host
+//   - clone (future): when there's no shared host, git-clone from
+//     `project_remote`
+//
+// The frontend opens the Pull-to-this-device dialog with
+// `workspacesAdoptionPreview` (so it knows which variant to render
+// without race conditions), then calls `workspacesAdoptSynced` on
+// confirm.
+
+export interface AdoptionPreview {
+  can_host_adopt: boolean;
+  can_clone_adopt: boolean;
+  host_configured: boolean;
+  host_label: string | null;
+  project_already_cloned_at: string | null;
+  suggested_path: string;
+  is_path_in_use: boolean;
+  /** When the sync row is already linked to a local workspace, this
+   *  carries that local id so the UI can offer "Open existing" instead
+   *  of re-running the adoption flow. */
+  already_adopted_workspace_id: string | null;
+}
+
+export interface AdoptOutcome {
+  workspace_id: string;
+  worktree_path: string;
+  message: string;
+}
+
+export const workspacesAdoptionPreview = (serverId: string) =>
+  invoke<AdoptionPreview>("workspaces_adoption_preview", { serverId });
+
+export const workspacesAdoptSynced = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_synced", { serverId });

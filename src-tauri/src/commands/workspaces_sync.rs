@@ -101,3 +101,332 @@ pub async fn workspaces_sync_now(
     }
     crate::workspaces_sync::try_sync_with_app(&app).await
 }
+
+// ─── Cross-device adoption ──────────────────────────────────────
+//
+// "Adoption" is the act of taking a workspace that exists on another
+// device of the same account and materialising a local copy of it
+// on this device. The synced row in `workspaces_sync` already carries
+// the metadata (title, host_server_id, project_path, branch); the
+// adoption flow's job is to:
+//
+//   1. Validate the user actually CAN adopt (host configured,
+//      target path free, etc.).
+//   2. Create a local workspace shell.
+//   3. Link the sync row to the new local workspace_id.
+//   4. Drive the existing pull-back rsync to populate the files.
+//
+// Two adoption paths exist:
+//   - **Host-backed** (`host_server_id` is set on the sync row): the
+//     workspace lives on a host this device knows about; we rsync
+//     from that host. Implemented in `workspaces_adopt_synced` below.
+//   - **Clone fallback** (`host_server_id` is null, no shared host):
+//     the workspace lives on a sibling device only; we'd need to
+//     `git clone` the project_remote into a fresh worktree. Tracked
+//     for Phase 3, not yet implemented.
+
+/// Snapshot of "can we adopt this synced workspace, and how?". The
+/// frontend calls this when the Pull dialog opens so it can decide
+/// which variant to render (host-backed vs clone fallback) and
+/// surface the suggested target path without a second round-trip.
+///
+/// Field semantics:
+/// - `can_host_adopt`: true when the sync row's `host_server_id`
+///   resolves to a configured local host. The headline pull path.
+/// - `can_clone_adopt`: true when the sync row has a `project_remote`
+///   set. Reserved for Phase 3; this command surfaces the flag so
+///   the dialog can hint at the option even before it ships.
+/// - `host_configured`: same as `can_host_adopt` but separately
+///   named so the dialog can show "Configure your host first" copy
+///   when the row HAS a host_server_id but this device doesn't know
+///   it yet.
+/// - `host_label`: friendly name to render in the dialog summary
+///   (`"From devbox"`). Null when no host applies.
+/// - `project_already_cloned_at`: Phase-3 hint. Always None today.
+/// - `suggested_path`: the canonical local worktree path the rsync
+///   will land at. Pre-computed so the dialog can show it.
+/// - `is_path_in_use`: when the suggested path already belongs to a
+///   different local workspace. Bare-flag for now; the eventual
+///   dialog UX offers `pickFolderDialog()` to choose an alternate.
+/// - `already_adopted_workspace_id`: short-circuit — if the user
+///   clicks Pull on a row they've already adopted, the dialog can
+///   skip itself and just open the existing workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptionPreview {
+    pub can_host_adopt: bool,
+    pub can_clone_adopt: bool,
+    pub host_configured: bool,
+    pub host_label: Option<String>,
+    pub project_already_cloned_at: Option<String>,
+    pub suggested_path: String,
+    pub is_path_in_use: bool,
+    pub already_adopted_workspace_id: Option<String>,
+}
+
+/// Successful adoption result. The frontend uses `workspace_id` to
+/// navigate to the newly-adopted workspace (or to surface a "Open
+/// workspace" CTA in the success toast).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptOutcome {
+    pub workspace_id: String,
+    pub worktree_path: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn workspaces_adoption_preview(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptionPreview, String> {
+    let db: tauri::State<'_, DatabaseStore> = app.state();
+    let app_state: tauri::State<'_, crate::state::AppStateStore> =
+        app.state();
+
+    // Locate the synced row by its server-assigned id.
+    let row = db
+        .list_workspaces_sync_for_sync()
+        .into_iter()
+        .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+        .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+    // Host resolution: synced row carries `host_server_id`; we map
+    // it to our local hosts row via the matching `hosts.server_id`.
+    let (host_configured, host_label, local_host_id) = match row
+        .host_server_id
+        .as_deref()
+    {
+        Some(hsid) => {
+            let local_host = db
+                .list_hosts()
+                .into_iter()
+                .find(|h| h.server_id.as_deref() == Some(hsid));
+            match local_host {
+                Some(h) => (true, Some(h.name.clone()), Some(h.id)),
+                None => (false, None, None),
+            }
+        }
+        None => (false, None, None),
+    };
+
+    // Phase-3 placeholder: clone adoption is unimplemented for now.
+    let can_clone_adopt = row.project_remote.is_some();
+
+    // Compute the canonical local worktree path. Reuses the same
+    // helper that pushes use, so a workspace pushed from this device
+    // and adopted on another lands at structurally identical paths
+    // on both sides.
+    let project_name = row
+        .project_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+    let branch = row.git_branch.as_deref().unwrap_or("main");
+    let conv = crate::ssh::conventional_remote_path(project_name, branch);
+    let conv_str = conv.to_string_lossy().to_string();
+    // The conventional path uses `~/` — expand for the local check.
+    let suggested_path = if let Some(rest) = conv_str.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(rest).to_string_lossy().to_string())
+            .unwrap_or(conv_str.clone())
+    } else {
+        conv_str.clone()
+    };
+
+    // Detect path conflict against other live workspaces.
+    let snapshot = app_state.snapshot();
+    let is_path_in_use = snapshot.workspaces.iter().any(|w| {
+        let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+        p == suggested_path.as_str()
+            && row
+                .workspace_id
+                .as_deref()
+                .map_or(true, |adopted| w.workspace_id.0 != adopted)
+    });
+
+    let already_adopted_workspace_id = row.workspace_id.clone();
+
+    Ok(AdoptionPreview {
+        can_host_adopt: host_configured && local_host_id.is_some(),
+        can_clone_adopt,
+        host_configured,
+        host_label,
+        project_already_cloned_at: None,
+        suggested_path,
+        is_path_in_use,
+        already_adopted_workspace_id,
+    })
+}
+
+/// Adopt a sibling-device workspace into this device via the
+/// host-backed rsync path.
+///
+/// Flow:
+///   1. Look up the sync row by `server_id`.
+///   2. Idempotency: if the row already has a local `workspace_id`,
+///      return early with that id (no work to do; the user clicked
+///      Pull on something already adopted).
+///   3. Resolve `host_server_id` → local `hosts.id`. Fail with a
+///      structured error if the host isn't on this device.
+///   4. Compute the canonical local worktree path.
+///   5. Bail if the path conflicts with a different workspace.
+///   6. Create the local workspace shell with host_id pre-set
+///      (`create_synced_workspace_shell`).
+///   7. Link the sync row to the new local id
+///      (`link_workspace_sync_to_local`).
+///   8. Drive `workspace_pull_back_impl` — the exact same machinery
+///      a manual pull-back uses. This rsyncs the remote worktree to
+///      the local path, clears `host_id` on success, tears down the
+///      SSH tunnel, respawns any PTY sessions locally.
+///   9. Trigger a reconcile + sync push so the server learns the
+///      workspace is now also on this device (and `host_server_id`
+///      goes back to null because pull-back cleared it).
+///
+/// On pull-back failure the local shell is left in place with
+/// `host_id` still set. The overview will render it under the host
+/// bucket with the spinner and the user can retry via the regular
+/// "Pull back to this device" action — the recovery path is the
+/// same as a failed manual pull.
+#[tauri::command]
+pub async fn workspaces_adopt_synced(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
+    // State<'_> guard is dropped before we await anything (Tauri's
+    // State is not Send across awaits).
+    let (workspace_id, worktree_path) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency: if we've already adopted this row, return
+        // the existing local workspace id rather than creating a
+        // duplicate shell. The caller can then `activate_workspace`
+        // on the returned id.
+        if let Some(existing) = row.workspace_id.as_deref() {
+            // Surface whether the workspace still exists in app_state
+            // (it may have been closed locally even though the sync
+            // row remembers the link). If gone, we fall through to
+            // adoption again.
+            let snapshot = app_state.snapshot();
+            if snapshot
+                .workspaces
+                .iter()
+                .any(|w| w.workspace_id.0 == existing)
+            {
+                let worktree = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == existing)
+                    .and_then(|w| w.worktree_path.clone().or_else(|| Some(w.cwd.clone())))
+                    .unwrap_or_default();
+                return Ok(AdoptOutcome {
+                    workspace_id: existing.to_string(),
+                    worktree_path: worktree,
+                    message: "Workspace already adopted on this device.".into(),
+                });
+            }
+        }
+
+        // Resolve host_server_id → local hosts.id.
+        let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+            "This workspace has no host; clone-based adoption is not \
+             implemented yet (Phase 3 of the workspaces-sync rollout)."
+                .to_string()
+        })?;
+        let local_host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.server_id.as_deref() == Some(host_server_id))
+            .ok_or_else(|| {
+                format!(
+                    "host_not_configured: The host this workspace lives on \
+                     (host_server_id={host_server_id}) is not configured on \
+                     this device yet. Add it in Settings → Devices."
+                )
+            })?;
+
+        // Compute canonical local path.
+        let project_name = row
+            .project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace");
+        let branch = row.git_branch.as_deref().unwrap_or("main");
+        let conv = crate::ssh::conventional_remote_path(project_name, branch);
+        let conv_str = conv.to_string_lossy().to_string();
+        let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
+            dirs::home_dir()
+                .map(|h| h.join(rest).to_string_lossy().to_string())
+                .unwrap_or(conv_str.clone())
+        } else {
+            conv_str.clone()
+        };
+
+        // Path collision check — refuse to clobber a workspace that
+        // already lives here.
+        let snapshot = app_state.snapshot();
+        let collision = snapshot.workspaces.iter().any(|w| {
+            let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+            p == worktree_path.as_str()
+        });
+        if collision {
+            return Err(format!(
+                "path_in_use: A different workspace is already using \
+                 {worktree_path}. Close it first or choose another path."
+            ));
+        }
+
+        // Create the local shell. host_id is set so the upcoming
+        // pull-back call routes to the right host.
+        let workspace_id = app_state.create_synced_workspace_shell(
+            row.title.clone(),
+            local_host.id,
+            row.project_path.clone(),
+            worktree_path.clone(),
+            row.git_branch.clone(),
+        );
+        let workspace_id_str = workspace_id.0.clone();
+
+        // Link the sync row to the new local id so subsequent
+        // reconciles keep them paired and the row renders as a
+        // local entry instead of "lives on another device".
+        db.link_workspace_sync_to_local(&server_id, &workspace_id_str)?;
+
+        (workspace_id_str, worktree_path)
+    };
+
+    // Step 8: drive the existing pull-back machinery. `_impl` takes
+    // only `AppHandle` and resolves DB/state internally, so we can
+    // await freely without juggling `tauri::State<'_>` guards
+    // (which are not Send across awaits).
+    let pull_outcome = crate::commands::hosts::workspace_pull_back_impl(
+        app.clone(),
+        workspace_id.clone(),
+    )
+    .await?;
+
+    // Step 9: nudge the reconcile so the server learns the workspace
+    // is now also on this device. Failures here are non-fatal — the
+    // background loop will catch up within 30s.
+    if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] post-adopt sync failed (will retry on next \
+             background tick): {e}"
+        );
+    }
+
+    Ok(AdoptOutcome {
+        workspace_id,
+        worktree_path,
+        message: pull_outcome.message,
+    })
+}

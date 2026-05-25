@@ -97,6 +97,8 @@ So a workspace mutation propagates to other devices within ~30 seconds. A `works
 
 - `workspaces_sync_list` → `Vec<WorkspaceSyncView>` — what the overview reads
 - `workspaces_sync_now` → `Result<(), String>` — force an immediate pull+push pass
+- `workspaces_adoption_preview(server_id)` → `AdoptionPreview` — dialog opens with this; surfaces `can_host_adopt`, `can_clone_adopt`, `host_configured`, `host_label`, `suggested_path`, `is_path_in_use`, `already_adopted_workspace_id` so the modal can pick the right variant without race conditions
+- `workspaces_adopt_synced(server_id)` → `AdoptOutcome` — host-backed cross-device adoption: creates a local workspace shell with `host_id` set, links the sync row, then drives the existing `workspace_pull_back_impl` to rsync the worktree from the host. Idempotent (re-running on an already-adopted row returns the existing local workspace id). Clone-fallback path for `host_server_id IS NULL` rows is deferred to a follow-up.
 
 ### UI integration
 
@@ -126,7 +128,7 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 
 ## Current Constraints
 
-- **No adoption flow yet.** Sibling-device rows are read-only — you can see them and read their metadata, but the "Pull to this device" menu item is disabled with a "coming soon" tooltip. Adoption requires creating a local `app_state.workspaces` shell and triggering an rsync from the host, which has nuanced semantics (does pulling clear the host_server_id? does it create a divergence?) that we want to settle before shipping the action. Follow-up: see the `Pull to this device` issue once filed.
+- **Host-backed adoption works; clone-from-git adoption is deferred.** The "Pull to this device" menu item is live for any sibling-device row whose `host_server_id` resolves to a configured local host (the 80% path — works via `workspaces_adopt_synced` + the existing `workspace_pull_back_impl`). When the row has no shared host (`host_server_id IS NULL`), the dialog tells the user "open the other device and push to a shared host first" — the git-clone fallback ships in a follow-up.
 - **No "Sync now" UI button.** The command exists but no UI affordance triggers it yet — the 30s loop covers steady-state use. Easy add when wanted.
 - **No optimistic UI.** Local mutations show up in the overview immediately (because app_state is reactive), but the cross-device propagation has the 30s latency. Acceptable for v1; could be tightened later by hooking sync triggers into each mutation site.
 - **Last-write-wins, no conflict UI.** If two devices edit the same workspace simultaneously, the later push overwrites. Same model as hosts and automations.
@@ -137,7 +139,10 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 ### Local (Codemux desktop)
 - `src-tauri/src/database.rs` — `workspaces_sync` table + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`).
 - `src-tauri/src/workspaces_sync.rs` — sync module: `pull`, `push`, `try_sync_with_app`, `sync_workspaces`, `reconcile_from_snapshot`, `ServerWorkspace` wire type.
-- `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`.
+- `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`, `workspaces_adoption_preview`, `workspaces_adopt_synced`.
+- `src-tauri/src/commands/hosts.rs` — `workspace_pull_back_impl` (extracted from the `#[tauri::command]` wrapper so the adoption flow can call the rsync machinery without going back through Tauri IPC).
+- `src-tauri/src/state/state_impl.rs` — `create_synced_workspace_shell` helper that adoption uses to create a workspace pre-stamped with `host_id` and the target `worktree_path` before rsync runs.
+- `src/components/workspaces-overview/pull-to-device-dialog.tsx` — adoption dialog with the four-variant body (host-backed form, host-not-configured, path-in-use, already-adopted) and the "What this does" disclosure that pre-expands on first pull.
 - `src-tauri/src/lib.rs` — registers the 30s background sync loop in the Tauri setup block, plus the two commands in the invoke handler.
 - `src/tauri/commands.ts` — `WorkspaceSyncView` TS type + `workspacesSyncList` + `workspacesSyncNow` bindings.
 - `src/stores/workspaces-sync-store.ts` — Zustand store + `useWorkspacesSync` hook. Polls every 5s while a subscriber is mounted.
