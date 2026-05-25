@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  ArrowDownToLine,
   Cloud,
   Filter,
   Folder,
@@ -8,6 +9,7 @@ import {
   Loader2,
   Plus,
   Search,
+  Server,
   X,
 } from "lucide-react";
 
@@ -31,6 +33,7 @@ import { WorkspaceOverviewRow } from "./workspace-overview-row";
 import { useOverviewItems, type DeviceBucket, type OverviewItem } from "./use-overview-items";
 import { PullToDeviceDialog } from "./pull-to-device-dialog";
 import { WelcomeBanner } from "./welcome-banner";
+import { HowItWorksPopover } from "./how-it-works-popover";
 
 /**
  * The Workspaces overview body — rendered full-screen by
@@ -68,6 +71,7 @@ export function WorkspacesOverviewSection() {
   const setShowWorkspacesOverview = useUIStore(
     (s) => s.setShowWorkspacesOverview,
   );
+  const setShowSettings = useUIStore((s) => s.setShowSettings);
 
   // Filters
   const [search, setSearch] = useState("");
@@ -89,6 +93,56 @@ export function WorkspacesOverviewSection() {
     [],
   );
 
+  // Scroll-to-first-remote machinery — the empty local bucket's
+  // "Pull from another device" CTA scrolls the overview to the
+  // first remote row and asks the row to pulse for 2 seconds. The
+  // ref-by-key map is populated by the row component on mount.
+  const remoteRowRefs = useRef<Map<string, HTMLElement>>(new Map());
+  // Set of remote row keys that should currently render the
+  // pulse-attention animation. Cleared per-key on a timer so the
+  // class re-renders accept new entries (e.g. another new sibling
+  // syncing in while the previous one is still pulsing).
+  const [pulseKeys, setPulseKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const triggerPulse = useCallback((key: string) => {
+    setPulseKeys((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+    window.setTimeout(() => {
+      setPulseKeys((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }, 1800);
+  }, []);
+  const registerRemoteRow = useCallback(
+    (key: string, el: HTMLElement | null) => {
+      if (el) remoteRowRefs.current.set(key, el);
+      else remoteRowRefs.current.delete(key);
+    },
+    [],
+  );
+  const handleScrollToFirstRemote = useCallback(() => {
+    // Find the first remote row in render order (Map preserves
+    // insertion order, which matches DeviceSection's render order
+    // — locals first, then hosts in user order).
+    const firstKey = Array.from(remoteRowRefs.current.keys()).find((k) =>
+      k.startsWith("remote:"),
+    );
+    if (!firstKey) return;
+    const el = remoteRowRefs.current.get(firstKey);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    triggerPulse(firstKey);
+  }, [triggerPulse]);
+
+  // "Newly-appeared sibling-device row" detection lives further
+  // down, after `allItems` is in scope (declared by useOverviewItems).
+  const prevRemoteKeysRef = useRef<Set<string> | null>(null);
+
   // Eagerly load hosts so device-bucket labels resolve immediately.
   useEffect(() => {
     void initHosts();
@@ -96,6 +150,28 @@ export function WorkspacesOverviewSection() {
 
   // Unified item list — locals + sibling-device synced rows.
   const { items: allItems, hosts } = useOverviewItems();
+
+  // Pulse newly-appeared remote rows: when a sync tick brings in a
+  // remote row this device hadn't seen before, briefly pulse it so
+  // the user notices new content. Initial mount primes the ref
+  // WITHOUT pulsing, otherwise every row would flash on first open
+  // of the overview, which would defeat the affordance.
+  useEffect(() => {
+    const currentKeys = new Set(
+      allItems
+        .filter((it): it is Extract<OverviewItem, { kind: "remote" }> =>
+          it.kind === "remote",
+        )
+        .map((it) => it.key),
+    );
+    const prev = prevRemoteKeysRef.current;
+    if (prev !== null) {
+      for (const key of currentKeys) {
+        if (!prev.has(key)) triggerPulse(key);
+      }
+    }
+    prevRemoteKeysRef.current = currentKeys;
+  }, [allItems, triggerPulse]);
 
   // Project picker options — every distinct project path the
   // overview can see, regardless of whether it's local or remote.
@@ -439,33 +515,55 @@ export function WorkspacesOverviewSection() {
         </div>
       </div>
 
-      {/* Result count + new-workspace shortcut */}
+      {/* Result count + how-it-works + new-workspace shortcut */}
       <div className="shrink-0 border-b border-border/40 px-6 py-2">
         <div className="mx-auto flex max-w-6xl items-center justify-between gap-3">
-          <p className="text-[11.5px] text-muted-foreground/70 tabular-nums">
-            {totalShown === totalAll
-              ? `${totalAll} ${totalAll === 1 ? "workspace" : "workspaces"}`
-              : `${totalShown} of ${totalAll} shown`}
-            {hosts.length > 0 && (
-              <span className="ml-2 text-muted-foreground/50">
-                · {hosts.length}{" "}
-                {hosts.length === 1 ? "device" : "devices"} configured
-              </span>
-            )}
-          </p>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7 gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
-            onClick={() => {
-              setShowWorkspacesOverview(false);
-              setShowNewWorkspaceDialog(true);
-            }}
-          >
-            <Plus className="size-3.5" />
-            New workspace
-          </Button>
+          <div className="flex items-center gap-1.5">
+            <p className="text-[11.5px] text-muted-foreground/70 tabular-nums">
+              {totalShown === totalAll
+                ? `${totalAll} ${totalAll === 1 ? "workspace" : "workspaces"}`
+                : `${totalShown} of ${totalAll} shown`}
+              {hosts.length > 0 && (
+                <span className="ml-2 text-muted-foreground/50">
+                  · {hosts.length}{" "}
+                  {hosts.length === 1 ? "device" : "devices"} configured
+                </span>
+              )}
+            </p>
+            <HowItWorksPopover />
+          </div>
+          <div className="flex items-center gap-1.5">
+            {/* Add Device is intentionally surfaced here as well as
+                in Settings — a brand-new user who's just signed in
+                shouldn't have to hunt through Settings to find the
+                primary "make this useful" action. */}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                setShowWorkspacesOverview(false);
+                setShowSettings(true, "hosts");
+              }}
+            >
+              <Server className="size-3.5" />
+              Add device
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-7 gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                setShowWorkspacesOverview(false);
+                setShowNewWorkspaceDialog(true);
+              }}
+            >
+              <Plus className="size-3.5" />
+              New workspace
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -491,6 +589,10 @@ export function WorkspacesOverviewSection() {
                 activeWorkspaceId={activeWorkspaceId}
                 onCloseOverview={() => setShowWorkspacesOverview(false)}
                 onRequestPull={handleRequestPull}
+                onScrollToFirstRemote={handleScrollToFirstRemote}
+                hasAnySibling={allItems.some((i) => i.kind === "remote")}
+                registerRemoteRow={registerRemoteRow}
+                pulseKeys={pulseKeys}
               />
             ))
           )}
@@ -514,6 +616,10 @@ function DeviceSection({
   activeWorkspaceId,
   onCloseOverview,
   onRequestPull,
+  onScrollToFirstRemote,
+  hasAnySibling,
+  registerRemoteRow,
+  pulseKeys,
 }: {
   bucket: DeviceBucket;
   activeWorkspaceId: string | null;
@@ -521,6 +627,21 @@ function DeviceSection({
   onRequestPull: (
     item: Extract<OverviewItem, { kind: "remote" }>,
   ) => void;
+  /** Trigger the "Pull from another device" CTA: scroll the overview
+   *  to the first sibling-device row and briefly pulse it. */
+  onScrollToFirstRemote: () => void;
+  /** True when the overview contains at least one sibling-device
+   *  row — drives whether the "Pull from another device" CTA shows
+   *  in an empty local bucket. */
+  hasAnySibling: boolean;
+  /** Per-row ref registration so the parent can scrollIntoView a
+   *  specific remote row when the user clicks "Pull from another
+   *  device" in an empty bucket. */
+  registerRemoteRow: (key: string, el: HTMLElement | null) => void;
+  /** Set of remote-row keys that should currently pulse — either
+   *  from the "Pull from another device" CTA scrolling to them, or
+   *  from a sync tick bringing in a new sibling-device workspace. */
+  pulseKeys: Set<string>;
 }) {
   const isLocal = bucket.hostServerId === null;
   const hiddenByFilter = bucket.totalCount - bucket.items.length;
@@ -571,17 +692,30 @@ function DeviceSection({
       </header>
 
       {bucket.items.length === 0 ? (
-        <p className="rounded-md border border-dashed border-border/40 px-3 py-4 text-center text-[12px] text-muted-foreground/60">
-          {hiddenByFilter > 0
-            ? "Every workspace on this device is hidden by the current filter."
-            : isLocal
-              ? "No workspaces on this device."
-              : "No workspaces have been pushed to this host yet."}
-        </p>
+        <EmptyBucketCTA
+          isLocal={isLocal}
+          hiddenByFilter={hiddenByFilter}
+          hasAnySibling={hasAnySibling}
+          bucketLabel={bucket.label}
+          onScrollToFirstRemote={onScrollToFirstRemote}
+          onCloseOverview={onCloseOverview}
+        />
       ) : (
         <ul className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
           {bucket.items.map((it) => (
-            <li key={it.key}>
+            <li
+              key={it.key}
+              ref={
+                it.kind === "remote"
+                  ? (el) => registerRemoteRow(it.key, el)
+                  : undefined
+              }
+              className={cn(
+                it.kind === "remote" && pulseKeys.has(it.key)
+                  ? "cm-pulse-attention"
+                  : null,
+              )}
+            >
               <WorkspaceOverviewRow
                 item={it}
                 isAttached={
@@ -596,6 +730,105 @@ function DeviceSection({
         </ul>
       )}
     </section>
+  );
+}
+
+/**
+ * Empty-bucket CTA — the row of action chips that renders inside a
+ * device section whose item list is currently empty. Lives here
+ * (rather than in DeviceSection inline) so the local vs remote vs
+ * "everything filtered out" variants have a single readable place.
+ */
+function EmptyBucketCTA({
+  isLocal,
+  hiddenByFilter,
+  hasAnySibling,
+  bucketLabel,
+  onScrollToFirstRemote,
+  onCloseOverview,
+}: {
+  isLocal: boolean;
+  hiddenByFilter: number;
+  hasAnySibling: boolean;
+  bucketLabel: string;
+  onScrollToFirstRemote: () => void;
+  onCloseOverview: () => void;
+}) {
+  const setShowNewWorkspaceDialog = useUIStore(
+    (s) => s.setShowNewWorkspaceDialog,
+  );
+  const setShowWorkspacesOverview = useUIStore(
+    (s) => s.setShowWorkspacesOverview,
+  );
+
+  // Filtered-out state — single sentence, no CTAs (the global
+  // "Clear filters" affordance already lives in the filter bar).
+  if (hiddenByFilter > 0) {
+    return (
+      <p className="rounded-md border border-dashed border-border/40 px-3 py-4 text-center text-[12px] text-muted-foreground/60">
+        Every workspace in {bucketLabel} is hidden by the current
+        filter.
+      </p>
+    );
+  }
+
+  // Local-bucket empty state — offer New workspace + Pull from
+  // another device (when siblings exist) as the two natural next
+  // actions a brand-new device has.
+  if (isLocal) {
+    return (
+      <div className="rounded-lg border border-dashed border-border/50 bg-muted/20 px-4 py-5 text-center space-y-3">
+        <p className="text-[12.5px] text-muted-foreground/85">
+          No workspaces on this device yet.
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            className="h-7 gap-1.5 px-3 text-[12px]"
+            onClick={() => {
+              setShowWorkspacesOverview(false);
+              onCloseOverview();
+              setShowNewWorkspaceDialog(true);
+            }}
+          >
+            <Plus className="size-3" />
+            New workspace
+          </Button>
+          {hasAnySibling && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 gap-1.5 px-3 text-[12px]"
+              onClick={onScrollToFirstRemote}
+            >
+              <ArrowDownToLine className="size-3" />
+              Pull from another device
+            </Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Remote-bucket empty state — device has been added but nothing
+  // has been pushed there yet. The clearest next step is opening
+  // an existing workspace and pushing it from the context menu;
+  // we frame the empty state with a hint rather than try to
+  // construct a "push" CTA (which needs a workspace pre-selected).
+  return (
+    <div className="rounded-lg border border-dashed border-border/50 bg-muted/20 px-4 py-5 text-center space-y-2">
+      <p className="text-[12.5px] text-muted-foreground/85">
+        No workspaces pushed to {bucketLabel} yet.
+      </p>
+      <p className="text-[11px] text-muted-foreground/65 leading-relaxed">
+        Right-click any local workspace →{" "}
+        <span className="font-medium">Move to {bucketLabel}</span> to
+        send it here. You can pull it back from any device anytime.
+      </p>
+    </div>
   );
 }
 

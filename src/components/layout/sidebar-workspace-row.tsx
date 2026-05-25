@@ -451,7 +451,7 @@ export function WorkspaceContextMenuItems({
         </ContextMenuItem>
       ) : hosts.length > 0 ? (
         <ContextMenuSub>
-          <ContextMenuSubTrigger>Move to host…</ContextMenuSubTrigger>
+          <ContextMenuSubTrigger>Move to device…</ContextMenuSubTrigger>
           <ContextMenuSubContent>
             {hosts.map((host) => (
               <ContextMenuItem
@@ -479,9 +479,9 @@ export function WorkspaceContextMenuItems({
       ) : (
         <ContextMenuItem
           disabled
-          title="Add hosts in Settings → Hosts to push workspaces"
+          title="Add a device in Settings → Devices to push workspaces"
         >
-          Move to host… (no hosts configured)
+          Move to device… (no devices configured)
         </ContextMenuItem>
       )}
 

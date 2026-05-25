@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import {
+  Cloud,
+  Cpu,
+  Laptop,
   Loader2,
   Pencil,
   Plus,
@@ -42,6 +45,48 @@ import { useHostsStore } from "@/stores/hosts-store";
  * returns a "not implemented yet" message in 2a. The component is
  * already structured around the eventual real probe.
  */
+/**
+ * The "kind" the user picks from the chips in Add Device. Drives only
+ * the placeholder hints on the form below — never stored, never sent
+ * to the server. The point is to make a first-time user understand
+ * that their home machine counts just as much as a paid VPS.
+ */
+type DeviceKind = "home" | "always-on" | "cloud";
+
+const DEVICE_KINDS: Array<{
+  id: DeviceKind;
+  label: string;
+  icon: typeof Laptop;
+  namePlaceholder: string;
+  sshPlaceholder: string;
+  hint: string;
+}> = [
+  {
+    id: "home",
+    label: "Home desktop",
+    icon: Laptop,
+    namePlaceholder: "home-mac",
+    sshPlaceholder: "you@192.168.1.10",
+    hint: "Already SSH into it from this device? You're set — paste the same user@host string you use in your terminal.",
+  },
+  {
+    id: "always-on",
+    label: "Always-on box",
+    icon: Cpu,
+    namePlaceholder: "pi",
+    sshPlaceholder: "pi@raspberrypi.local",
+    hint: "Best for keeping work running after you close your laptop. Pi, mini-PC, NAS, anything reachable over SSH.",
+  },
+  {
+    id: "cloud",
+    label: "Cloud server",
+    icon: Cloud,
+    namePlaceholder: "vps-fra",
+    sshPlaceholder: "ubuntu@5.5.5.5",
+    hint: "Anything ssh accepts. Your keys + config in ~/.ssh/ are used as-is.",
+  },
+];
+
 export function HostsSection() {
   const [hosts, setHosts] = useState<HostView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -49,6 +94,10 @@ export function HostsSection() {
   const [error, setError] = useState<string | null>(null);
 
   // Add-host form draft. `null` means the form isn't open.
+  // The "kind" the user picked from the chips. Drives the placeholder
+  // hints in the form — purely cosmetic, never stored or pushed.
+  // Reset to `null` whenever the draft is closed.
+  const [draftKind, setDraftKind] = useState<DeviceKind | null>(null);
   const [draft, setDraft] = useState<{ name: string; ssh_target: string } | null>(
     null,
   );
@@ -104,7 +153,7 @@ export function HostsSection() {
     const name = draft.name.trim();
     const sshTarget = draft.ssh_target.trim();
     if (!name || !sshTarget) {
-      setError("Host name and SSH target are both required.");
+      setError("Device name and SSH target are both required.");
       return;
     }
     try {
@@ -139,7 +188,7 @@ export function HostsSection() {
     const name = editDraft.name.trim();
     const sshTarget = editDraft.ssh_target.trim();
     if (!name || !sshTarget) {
-      setError("Host name and SSH target are both required.");
+      setError("Device name and SSH target are both required.");
       return;
     }
     try {
@@ -161,7 +210,7 @@ export function HostsSection() {
 
   const handleDelete = useCallback(async (host: HostView) => {
     const confirmed = window.confirm(
-      `Remove "${host.name}" from your hosts? Your SSH config and keys are not affected.`,
+      `Remove "${host.name}" from your devices? Your SSH config and keys are not affected.`,
     );
     if (!confirmed) return;
     try {
@@ -316,13 +365,56 @@ export function HostsSection() {
         <div className="mt-4 pt-4 border-t border-border/40">
           {draft ? (
             <div className="space-y-3 rounded-lg border border-border/60 bg-muted/30 p-3">
+              {/* Device-kind chips. Picking one pre-fills the
+                  placeholder hints in the form below — cosmetic
+                  only, never stored. Helps a first-time user
+                  understand "device" works for their home Mac just
+                  as well as a cloud VPS. */}
+              <div className="space-y-1.5">
+                <Label className="text-[11px] text-muted-foreground/85 font-normal">
+                  What kind of device?
+                </Label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {DEVICE_KINDS.map((kind) => (
+                    <button
+                      key={kind.id}
+                      type="button"
+                      onClick={() => setDraftKind(kind.id)}
+                      className={cn(
+                        "flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors",
+                        draftKind === kind.id
+                          ? "border-sky-500/40 bg-sky-500/10 text-foreground"
+                          : "border-border/60 bg-background/40 text-muted-foreground hover:border-border hover:bg-muted/30 hover:text-foreground",
+                      )}
+                    >
+                      <kind.icon
+                        className={cn(
+                          "size-4",
+                          draftKind === kind.id
+                            ? "text-sky-400"
+                            : "text-muted-foreground/70",
+                        )}
+                      />
+                      <span className="text-[10.5px] font-medium leading-tight">
+                        {kind.label}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
               <div className="space-y-1.5">
                 <Label htmlFor="host-add-name" className="text-[11px] text-muted-foreground/85 font-normal">
                   Name
                 </Label>
                 <Input
                   id="host-add-name"
-                  placeholder="homelab"
+                  placeholder={
+                    draftKind
+                      ? DEVICE_KINDS.find((k) => k.id === draftKind)
+                          ?.namePlaceholder ?? "homelab"
+                      : "homelab"
+                  }
                   value={draft.name}
                   onChange={(e) =>
                     setDraft({ ...draft, name: e.target.value })
@@ -337,7 +429,12 @@ export function HostsSection() {
                 </Label>
                 <Input
                   id="host-add-target"
-                  placeholder="user@host"
+                  placeholder={
+                    draftKind
+                      ? DEVICE_KINDS.find((k) => k.id === draftKind)
+                          ?.sshPlaceholder ?? "user@host"
+                      : "user@host"
+                  }
                   value={draft.ssh_target}
                   onChange={(e) =>
                     setDraft({ ...draft, ssh_target: e.target.value })
@@ -345,8 +442,9 @@ export function HostsSection() {
                   className="h-8 text-[13px] font-mono"
                 />
                 <p className="text-[11px] text-muted-foreground/70 leading-relaxed">
-                  Anything <code className="font-mono text-[10.5px]">ssh</code> accepts.
-                  Your keys + config in <code className="font-mono text-[10.5px]">~/.ssh/</code> are used as-is.
+                  {draftKind
+                    ? DEVICE_KINDS.find((k) => k.id === draftKind)?.hint
+                    : "Anything ssh accepts. Your keys + config in ~/.ssh/ are used as-is."}
                 </p>
               </div>
               <div className="flex justify-end gap-1.5 pt-1">
@@ -357,6 +455,7 @@ export function HostsSection() {
                   className="h-7 px-3 text-[12px]"
                   onClick={() => {
                     setDraft(null);
+                    setDraftKind(null);
                     setError(null);
                   }}
                 >
@@ -379,10 +478,13 @@ export function HostsSection() {
               variant="ghost"
               size="sm"
               className="w-full justify-start gap-2 h-8 px-2.5 text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/40 border border-dashed border-border/60"
-              onClick={() => setDraft({ name: "", ssh_target: "" })}
+              onClick={() => {
+                setDraft({ name: "", ssh_target: "" });
+                setDraftKind(null);
+              }}
             >
               <Plus className="size-3.5" />
-              Add host
+              Add device
             </Button>
           )}
 

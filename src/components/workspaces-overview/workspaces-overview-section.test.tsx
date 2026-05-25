@@ -297,7 +297,7 @@ describe("WorkspacesOverviewSection", () => {
     fireEvent.change(search, { target: { value: "zzzz-not-real" } });
 
     expect(
-      getByText(/every workspace on this device is hidden/i),
+      getByText(/every workspace in This device is hidden/i),
     ).toBeInTheDocument();
     // The bucket header is still there so the user can see which
     // device the filtered rows belong to.

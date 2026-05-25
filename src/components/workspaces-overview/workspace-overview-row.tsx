@@ -391,16 +391,16 @@ function LocalRow({
                 ) : hosts.length === 0 ? (
                   <DropdownMenuItem
                     disabled
-                    title="Add hosts in Settings → Hosts to push workspaces"
+                    title="Add a device in Settings → Devices to push workspaces"
                   >
                     <ArrowUpRight className="mr-2 size-3.5" />
-                    Push to host…
+                    Push to device…
                   </DropdownMenuItem>
                 ) : (
                   <DropdownMenuSub>
                     <DropdownMenuSubTrigger>
                       <ArrowUpRight className="mr-2 size-3.5" />
-                      Push to host…
+                      Push to device…
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent className="min-w-[200px]">
                       <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
