@@ -66,6 +66,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
 - Workspace creation: `docs/features/workspace-creation.md`
+- Workspaces overview (full-screen device-grouped list with filters + push/pull actions): `docs/features/workspaces-overview.md`
+- Workspaces sync (cross-device workspace registry powering the overview's sibling-device rows): `docs/features/workspaces-sync.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`

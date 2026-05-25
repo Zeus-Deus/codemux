@@ -1728,3 +1728,38 @@ export const workspacePullBack = (workspaceId: string) =>
  *  the assignment (back to local). */
 export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
   invoke<void>("set_workspace_host", { workspaceId, hostId });
+
+// ── Workspaces sync (cross-device workspace registry) ──
+//
+// One row per workspace this user owns, across every device they
+// have signed in with. Rows whose `workspace_id` is set match a
+// local `WorkspaceSnapshot`; rows whose `workspace_id` is null live
+// only on a sibling device (the UI offers a "Pull to this device"
+// affordance for those).
+//
+// `host_server_id` matches `HostView.server_id`; the local host
+// `id` is unrelated and not portable across devices.
+export interface WorkspaceSyncView {
+  id: number;
+  server_id: string | null;
+  workspace_id: string | null;
+  title: string;
+  host_server_id: string | null;
+  project_path: string | null;
+  project_remote: string | null;
+  git_branch: string | null;
+  created_at: string;
+  updated_at: string;
+  /** True iff the row has unpushed changes. UI surfaces this as a
+   *  "Pending sync" pill the same way Automations does. */
+  dirty: boolean;
+}
+
+export const workspacesSyncList = () =>
+  invoke<WorkspaceSyncView[]>("workspaces_sync_list");
+
+/** Force an immediate pull + push pass. The background loop runs
+ *  every 30s; use this only when the user explicitly hits a "Sync
+ *  now" affordance. Returns Ok even if the user isn't signed in. */
+export const workspacesSyncNow = () =>
+  invoke<void>("workspaces_sync_now");
