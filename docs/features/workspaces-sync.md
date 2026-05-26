@@ -23,6 +23,7 @@ What syncs:
 - `project_path` — informational only; the originating device's path-on-disk
 - `project_remote` — git remote URL; other devices use it to know how to clone the project if/when they adopt
 - `git_branch` — current branch
+- `git_head_sha` — current HEAD commit SHA on the workspace's branch (Phase 4c). Optional, ≤200 chars. Powers cross-device divergence detection: when two devices have clone-adopted the same workspace and their `git_head_sha` values differ, both rows render an amber `diverged` chip.
 - `created_at`, `updated_at`, `deleted_at` — standard sync timestamps
 
 What does NOT sync (per-device runtime state):
@@ -121,9 +122,9 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 
 ## What Works Today
 
-- Server: full GET/POST/PATCH/DELETE at `/api/workspaces`, deployed and live at `https://api.codemux.org/api/workspaces`. 33 endpoint tests pass; 296 total server tests pass.
-- Local sync: pull, push, reconcile, soft-delete tombstones, idempotent server-side upsert. 6 module tests pass.
-- UI: synced rows render in the Workspaces overview under the correct device bucket. The "Pending sync" pill surfaces dirty state. Sibling-device rows render with a distinct dashed border and a "lives on another device" pill.
+- Server: full GET/POST/PATCH/DELETE at `/api/workspaces`, deployed and live at `https://api.codemux.org/api/workspaces`. 36 endpoint tests pass (`gitHeadSha` round-trip coverage added in Phase 4c); full server suite at 299/299.
+- Local sync: pull, push, reconcile, soft-delete tombstones, idempotent server-side upsert.
+- UI: synced rows render in the Workspaces overview under the correct device bucket. The "Pending sync" pill surfaces dirty state. Sibling-device rows render with a distinct dashed border and a "lives on another device" pill. Phase 4c divergence chip flags HEAD divergence on every affected row.
 - Cadence: 30-second background loop. `workspaces_sync_now` for forced sync.
 
 ## Current Constraints
@@ -151,7 +152,7 @@ Wired at three call sites:
 ## Important Touch Points
 
 ### Local (Codemux desktop)
-- `src-tauri/src/database.rs` — `workspaces_sync` table + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`).
+- `src-tauri/src/database.rs` — `workspaces_sync` table (additive `git_head_sha TEXT` migration added in Phase 4c) + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`).
 - `src-tauri/src/workspaces_sync.rs` — sync module: `pull`, `push`, `try_sync_with_app`, `sync_workspaces`, `reconcile_from_snapshot`, `ServerWorkspace` wire type.
 - `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`, `workspaces_adoption_preview`, `workspaces_adopt_synced`.
 - `src-tauri/src/commands/hosts.rs` — `workspace_pull_back_impl` (extracted from the `#[tauri::command]` wrapper so the adoption flow can call the rsync machinery without going back through Tauri IPC).

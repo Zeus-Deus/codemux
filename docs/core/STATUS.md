@@ -8,9 +8,9 @@
 
 ## Current Headline
 
-Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released version is `v0.5.2`.
+Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. Latest released version is `v0.6.1`.
 
-The headline addition since the `v0.5.0` reindex is **Automations** — named prompt + agent + RFC 5545 recurrence schedules that fire on a user-chosen host, create a fresh worktree per fire, run the agent headlessly, and record a real terminal status. Automations are account-synced across devices and surfaced in a first-class left-sidebar view; their eight `automation_*` tools bring the MCP server inventory to **52 tools**. The agent-chat surface (Step 6–12: chat pane, multi-provider picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) remains merged to `main` and Beta-gated; the **persistent PTY daemon** is the default spawn path (every shell survives app close, the env-var escape hatch is the only off-switch), the **SSH workspace-push** action that was deferred in step 2d has landed (push a worktree to a user-owned host with Claude conversation sync), and the right sidebar + Settings panel have been redesigned to a **refined-minimal aesthetic** to match the rest of the app. The MCP server inventory grew from 31 to 44 tools across the Phase 1 / 1.5 / 1.6 vexis-agent integration steps before Automations took it to 52.
+The headline additions since the `v0.5.2` reindex are the **account-wide Workspaces overview + cross-device workspaces sync** (full-screen device-grouped list with filters, push/pull/adopt actions, host-backed adoption, clone-from-git adoption fallback, confirm-before-push + 10-second undo safety guardrails, cross-device git-HEAD divergence chips, elapsed-time pill while a push or pull is in flight, first-run welcome banner, "how it works" popover) and **seven new agent presets** (Antigravity, Copilot, Cursor Agent, Amp, Grok, Droid, Mastracode) shipped in `v0.6.0`. The earlier `v0.5.x` headline — **Automations**, account-synced scheduled agent runs with eight `automation_*` MCP tools (bringing the inventory to **52 tools**) — remains daily-drivable. The agent-chat surface (Step 6–12: chat pane, multi-provider picker, skills sync, attachments, mode pills, slash commands, plan proposals, MCP host runtime, …) remains merged to `main` and Beta-gated; the **persistent PTY daemon** is the default spawn path (every shell survives app close, the env-var escape hatch is the only off-switch), the **SSH workspace-push** action that was deferred in step 2d has landed (push a worktree to a user-owned host with Claude conversation sync), and the right sidebar + Settings panel have been redesigned to a **refined-minimal aesthetic** to match the rest of the app. The MCP server inventory grew from 31 to 44 tools across the Phase 1 / 1.5 / 1.6 vexis-agent integration steps before Automations took it to 52.
 
 OpenFlow and the browser pane are still being hardened. OpenFlow is intentionally disabled on Windows until the bash-wrapper rewrite lands.
 
@@ -74,6 +74,16 @@ The repo structure is clean and domain-split:
 - Derivative-branch picker (icons, recency, worktree tab)
 - Lazy workspace creation (Beta-gated): sidebar-plus and boot-into-Home open a client-side chat draft instead of eagerly materialising a workspace; the draft is promoted on first message send
 
+### Workspaces overview & cross-device sync
+- **Account-wide Workspaces overview** (`v0.6.1`): full-screen overlay opened from the sidebar (`Workspaces` button under `Automations`) listing every workspace this account tracks — local + every host pushed-to + every sibling device on the same account. Filters (search, project, device, status, sort), per-row actions (open, copy branch, rename, push to any host, pull back, delete), agent-state status dots shared with the sidebar, hover-reveal action menu.
+- **Cross-device workspaces sync**: `workspaces_sync.rs` mirror of `hosts_sync` / `automations_sync` — every create / rename / push / pull / delete propagates through `/api/workspaces` on the shared API server (Postgres `codemux_workspaces`) on a 30s loop, scoped per-user via Better Auth bearer tokens. Sibling-device rows render as dashed cards in the right bucket.
+- **Sibling-device adoption** (Phase 3): "Pull to this device" on any sibling row — host-backed via the existing `workspace_pull_back_impl` rsync flow when both devices share a configured host, clone-from-git fallback for rows that have a `project_remote` but no shared host (creates a fresh server_id; both devices end up with independent copies sharing the git remote).
+- **Safety guardrails** (Phase 4): every push gates through `ConfirmPushDialog` with a per-host "don't ask again" affordance; every successful push, pull, and adoption surfaces a 10-second `Undo` toast that fires the reverse action.
+- **Cross-device divergence detection** (Phase 4c): `git_head_sha` syncs through the API; when the same workspace exists on multiple devices via clone-adoption and their HEADs diverge, both rows show an amber `diverged` chip with a tooltip suggesting push or pull to share.
+- **Elapsed-time indicator** (Phase 4d): when a push or pull takes longer than 2s, a compact `12s` pill appears next to the spinner in both the sidebar row and the overview row so the user knows the operation hasn't stalled. Powered by `workspacePushPullStartedAt` in `app-store`.
+- **First-run welcome banner** (Phase 5): three state-aware variants (brand-new, device-configured, has-siblings) — dismissable, persisted in localStorage, never re-shows. Bundled with the "how it works" popover off the overview header.
+- **PR-state sidebar icon swap**: when a worktree workspace has a PR, the sidebar row's leading icon becomes the PR-state-colored icon (open=green, merged=purple, closed=red, draft=gray) and the trailing duplicate PR pill is gone. Click opens the PR on GitHub.
+
 ### Search & navigation
 - Keyword search (Ctrl+Shift+F via rg) and file name search (Ctrl+Shift+P via fd)
 - Command palette (Ctrl+K, fuzzy search across all actions)
@@ -105,7 +115,7 @@ The repo structure is clean and domain-split:
 ### File tooling
 - File tree panel (right sidebar, lazy-loaded, `.gitignore`-aware, opens in built-in editor or external editor)
 - Built-in file editor with CodeMirror 6, syntax highlighting for 20+ languages, markdown preview (image loading in markdown and as standalone files)
-- IDE integration (detect editors, open workspace, Ctrl+Shift+E). On Windows, `find_editors()` uses the `which::which()` Rust crate plus `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code / Cursor / VSCodium / Zed; JetBrains stays PATH-only.
+- IDE integration: detect up to 19 editors and open the workspace from the title-bar launcher or workspace context menu. Launcher and submenu partition entries into labelled sections (VS Code family / Modern editors / JetBrains / Other) when more than one family is detected. On Windows, `find_editors()` uses the `which::which()` Rust crate plus `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` fallbacks for VS Code / Cursor / VSCodium / Zed / Windsurf / Trae / Lapce; JetBrains stays PATH-only via Toolbox shims.
 - Port detection (auto-scan, sidebar display, open in browser). Windows path filters system processes (`svchost.exe`, `System`, `lsass.exe`, etc.) so the sidebar doesn't surface 16+ kernel-owned ports.
 
 ### Theming
@@ -181,7 +191,7 @@ The repo structure is clean and domain-split:
 
 ## Windows Support
 
-Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.5.2`; in-app auto-update on Windows was fixed in `v0.5.1`.
+Windows support shipped in `v0.1.20` and `v0.1.21` and has been hardened progressively through every subsequent release. Latest published Windows binaries (NSIS `.exe` installer + auto-update via the shared `latest.json`) ship on `v0.6.1`; in-app auto-update on Windows was fixed in `v0.5.1`.
 
 What's in place:
 

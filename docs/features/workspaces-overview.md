@@ -86,19 +86,23 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 ## What Works Today
 
 - Sidebar button under Automations opens the full-screen overview; Escape and back button close it.
-- Every workspace this device tracks is listed, grouped by device.
+- Every workspace this device tracks is listed, grouped by device — plus every sibling-device workspace on the same account via cross-device sync (see `docs/features/workspaces-sync.md`).
 - Pushed workspaces visibly migrate to the matching device bucket once the push succeeds.
 - Filters: search (title / branch / project), project, device, status, sort.
 - Per-row actions: open, copy branch, rename, push to any configured host, pull back, delete.
+- **Sibling-device adoption** (Phase 3): `Pull to this device` on any sibling row goes through `PullToDeviceDialog` and picks the right variant automatically — host-backed (rsync via the shared host) or clone-from-git fallback (git clone + worktree add).
+- **Confirm-before-push + undo** (Phase 4a–b): every push opens `ConfirmPushDialog` (per-host "don't ask again" persists in localStorage); every successful push, pull, and adoption surfaces a 10-second `Undo` toast that fires the reverse action.
+- **Cross-device divergence chip** (Phase 4c): an amber `diverged` chip appears in the title line when the same workspace exists on multiple devices via clone-adoption and their git HEADs diverge. Tooltip suggests push or pull to reconcile.
+- **Elapsed-time pill** (Phase 4d): when a push or pull takes longer than ~2s, a compact `12s` pill renders next to the spinner so the user knows the operation is still working.
 - Empty states for "no workspaces yet" (offers `New workspace`) and "filters hide everything" (offers `Clear filters`).
 - "Removed host" orphan bucket prevents workspaces from silently disappearing when a host row is deleted.
-- One push/pull spinner per workspace, shared with the sidebar.
+- One push/pull spinner per workspace, shared with the sidebar — and `workspacePushPullStartedAt` drives the elapsed-time pill in both surfaces.
 - Live agent status (working / needs-input / ready-to-review) reflected on every row in real time — same source as the sidebar's `StatusIndicator`, no polling.
 - First-run welcome banner (`WelcomeBanner` component) with three state-aware variants — brand-new (no devices, no siblings, with `Add a device` CTA), device-configured (nudges first push), has-siblings (counts visible cross-device workspaces with pull instructions). Dismissable; persists in localStorage and never re-shows.
+- "How it works" popover (`HowItWorksPopover`) off the overview header explains the local/host/sibling buckets at a glance.
 
 ## Current Constraints
 
-- **Sibling-device adoption is deferred.** The overview SHOWS workspaces from other devices of the same account (via the cross-device workspace sync — see `docs/features/workspaces-sync.md`). The "Pull to this device" action on sibling rows is disabled in v1; the affordance is visible with a "coming soon" tooltip and will land in a follow-up. Until then, sibling-device rows are read-only — you can see them and their metadata, but you adopt them by visiting the device they live on.
 - **No created-at field** on `WorkspaceSnapshot` yet, so the "Created within" time filter UI is intentionally **not** rendered — would be misleading without the data. The `Recently active` sort uses a proxy (notification count + dirty-git heuristic + name tie-break) until a real `last_active_at` is plumbed through.
 - **No bulk actions.** Push N workspaces in one go isn't supported; each row pushes individually.
 - **Window-prompt rename.** Matches the sidebar context menu; if/when that switches to an inline edit the overview should follow.
@@ -108,17 +112,24 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 
 - `src/components/workspaces-overview/workspaces-overview-view.tsx` — full-screen overlay shell (WindowChrome + back button + Escape).
 - `src/components/workspaces-overview/workspaces-overview-section.tsx` — filter bar, device bucketing, sort.
-- `src/components/workspaces-overview/workspace-overview-row.tsx` — card component + action menu + push/pull wiring.
+- `src/components/workspaces-overview/workspace-overview-row.tsx` — card component + action menu + push/pull wiring + `DivergenceChip` + elapsed-time pill.
+- `src/components/workspaces-overview/pull-to-device-dialog.tsx` — sibling-device adoption dialog (host-backed + clone-from-git variants).
+- `src/components/workspaces-overview/welcome-banner.tsx` — first-run banner with three state-aware variants.
+- `src/components/workspaces-overview/how-it-works-popover.tsx` — overview-header explainer popover.
+- `src/components/workspaces-overview/use-overview-items.ts` — merges local + synced rows into the unified `OverviewItem[]`; computes `DivergenceInfo`.
+- `src/components/overlays/confirm-push-dialog.tsx` — per-host "don't ask again" confirm-before-push dialog (also wired into the sidebar context menu).
+- `src/lib/toast.ts` — `fireUndoable` powers the 10-second `Undo` toast on push / pull / adopt.
 - `src/components/layout/sidebar-action-row.tsx` — sidebar entry point.
 - `src/components/layout/app-shell.tsx` — overlay mount.
 - `src/stores/ui-store.ts` — `showWorkspacesOverview` boolean + setter.
-- `src/stores/app-store.ts` — `workspaces`, `active_workspace_id`, `workspacePushPullInFlight`, `groupWorkspacesByProject`.
+- `src/stores/app-store.ts` — `workspaces`, `active_workspace_id`, `workspacePushPullInFlight`, `workspacePushPullStartedAt`, `groupWorkspacesByProject`.
 - `src/stores/hosts-store.ts` — shared `useHostsStore` cache.
-- `src/tauri/commands.ts` — `workspacePushToHost`, `workspacePullBack`, `activateWorkspace`, `renameWorkspace`, `closeWorkspace`, `closeWorkspaceWithWorktree`.
+- `src/stores/workspaces-sync-store.ts` — sibling-device rows (sync mirror).
+- `src/tauri/commands.ts` — `workspacePushToHost`, `workspacePullBack`, `workspacesAdoptSynced`, `workspacesAdoptViaClone`, `activateWorkspace`, `renameWorkspace`, `closeWorkspace`, `closeWorkspaceWithWorktree`.
 - `src/tauri/types.ts` — `WorkspaceSnapshot.host_id` (the field the overview keys off).
 
 ## Notes
 
-- The overview is read-only with regard to the workspace data model — it does not introduce new persistence, new Tauri commands, or new sync paths. Every action it surfaces was already shipping in the sidebar context menu; the overview just makes them discoverable from one place.
-- When cross-device workspace sync ships, the only change here should be that `useAppStore.workspaces` includes the synced remote rows. The bucketing already groups by `host_id` correctly, so no UI rework is expected.
+- The local "open / push / pull / delete / rename" actions reuse the sidebar context menu's Tauri commands; the overview just makes them discoverable from one place. The Phase 3 sibling-device adoption added two new commands (`workspaces_adopt_synced` for host-backed adoption, `workspaces_adopt_via_clone` for the clone-from-git fallback) that the overview's `PullToDeviceDialog` is the primary consumer of.
+- Cross-device workspaces sync is now live (see `docs/features/workspaces-sync.md`). `useOverviewItems` merges live `WorkspaceSnapshot` rows and `WorkspaceSyncView` sibling rows into a single `OverviewItem[]`; bucketing is by `host_server_id` so the same host shows up in the same bucket on every device.
 - Status colors and density follow `docs/features/automations.md`'s reference implementation so the two pane types feel like the same family.
