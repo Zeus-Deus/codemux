@@ -409,6 +409,38 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
         manifest_value.secret.len()
     );
 
+    // Best-effort: register `codemux-remote mcp` in known agent
+    // MCP configs (~/.claude.json, ~/.vexis/mcp-servers.yaml) so
+    // any agent CLI the user runs on this host already knows about
+    // Codemux without manual config edits. Runs on every daemon
+    // start because it's idempotent — if the entries are already
+    // correct, no writes happen.
+    //
+    // The function we call is defensive: malformed config files
+    // are logged and skipped, never overwritten. Missing
+    // agent-specific dirs (~/.vexis nonexistent) are skipped
+    // silently — we never create an opt-in we weren't asked for.
+    let exec_path = std::env::current_exe()
+        .unwrap_or_else(|_| std::path::PathBuf::from("codemux-remote"));
+    let report = codemux_lib::remote::mcp_register::ensure_codemux_in_agent_configs(&exec_path);
+    if !report.modified.is_empty() {
+        eprintln!(
+            "[codemux-remote] auto-registered codemux MCP in: {}",
+            report
+                .modified
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for (path, reason) in &report.failed {
+        eprintln!(
+            "[codemux-remote] could not register in {} (skipped): {reason}",
+            path.display()
+        );
+    }
+
     let started_at = manifest_value.started_at.clone();
     let secret = manifest_value.secret.clone();
 
