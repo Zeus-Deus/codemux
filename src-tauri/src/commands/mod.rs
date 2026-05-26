@@ -22,6 +22,7 @@ pub mod skills_sync;
 pub mod update;
 pub mod virtual_display;
 pub mod workspace;
+pub mod workspaces_sync;
 
 pub use agent_chat::*;
 pub use ai::*;
@@ -47,6 +48,7 @@ pub use skills_sync::*;
 pub use update::*;
 pub use virtual_display::*;
 pub use workspace::*;
+pub use workspaces_sync::*;
 
 use crate::indexing::{
     rebuild_index,

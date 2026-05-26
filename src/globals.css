@@ -272,3 +272,38 @@ body.pane-resizing iframe {
   40% { opacity: 0.9; }
 }
 
+/* Workspaces overview "pulse a row to draw attention" effect.
+ *
+ * Triggered when:
+ *   - The user clicks "Pull from another device" in an empty local
+ *     bucket and we scroll to + flash the first sibling row.
+ *   - A sibling-device workspace newly appears after a sync tick
+ *     (so the user notices the cross-device update).
+ *
+ * Uses a ring + scale combination rather than the more common
+ * opacity-only pulse — opacity flashes read as "loading" to most
+ * users, while ring+scale reads as "look here, something new".
+ * The ring colour is sky-400 to match the existing sibling-device
+ * accent in the overview. Two iterations × 800ms gives enough
+ * dwell time to notice without becoming annoying. */
+@keyframes cm-pulse-attention {
+  0% {
+    box-shadow: 0 0 0 0 rgb(56 189 248 / 0.55);
+    transform: scale(1);
+  }
+  50% {
+    box-shadow: 0 0 0 8px rgb(56 189 248 / 0);
+    transform: scale(1.015);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgb(56 189 248 / 0);
+    transform: scale(1);
+  }
+}
+
+.cm-pulse-attention {
+  animation: cm-pulse-attention 800ms ease-out 2;
+  /* Keep the rounding so the box-shadow tracks the row's corners. */
+  border-radius: var(--radius, 0.625rem);
+}
+

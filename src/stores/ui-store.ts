@@ -12,6 +12,7 @@ interface UIStore {
   showSettings: boolean;
   settingsSection: string | null;
   showAutomations: boolean;
+  showWorkspacesOverview: boolean;
   showFileSearch: boolean;
   showContentSearch: boolean;
   pendingWorkspaces: PendingWorkspace[];
@@ -31,6 +32,7 @@ interface UIStore {
   setShowNewWorkspaceDialog: (show: boolean, projectDir?: string | null) => void;
   setShowSettings: (show: boolean, section?: string | null) => void;
   setShowAutomations: (show: boolean) => void;
+  setShowWorkspacesOverview: (show: boolean) => void;
   setShowFileSearch: (show: boolean) => void;
   setShowContentSearch: (show: boolean) => void;
   addPendingWorkspace: (pw: PendingWorkspace) => void;
@@ -55,6 +57,7 @@ export const useUIStore = create<UIStore>()(
       showSettings: false,
       settingsSection: null,
       showAutomations: false,
+      showWorkspacesOverview: false,
       showFileSearch: false,
       showContentSearch: false,
       pendingWorkspaces: [],
@@ -92,6 +95,7 @@ export const useUIStore = create<UIStore>()(
 
       setShowSettings: (show, section = null) => set({ showSettings: show, settingsSection: show ? (section ?? null) : null }),
       setShowAutomations: (show) => set({ showAutomations: show }),
+      setShowWorkspacesOverview: (show) => set({ showWorkspacesOverview: show }),
       setShowFileSearch: (show) => set({ showFileSearch: show }),
       setShowContentSearch: (show) => set({ showContentSearch: show }),
 

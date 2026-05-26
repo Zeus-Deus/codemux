@@ -1728,3 +1728,96 @@ export const workspacePullBack = (workspaceId: string) =>
  *  the assignment (back to local). */
 export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
   invoke<void>("set_workspace_host", { workspaceId, hostId });
+
+// ── Workspaces sync (cross-device workspace registry) ──
+//
+// One row per workspace this user owns, across every device they
+// have signed in with. Rows whose `workspace_id` is set match a
+// local `WorkspaceSnapshot`; rows whose `workspace_id` is null live
+// only on a sibling device (the UI offers a "Pull to this device"
+// affordance for those).
+//
+// `host_server_id` matches `HostView.server_id`; the local host
+// `id` is unrelated and not portable across devices.
+export interface WorkspaceSyncView {
+  id: number;
+  server_id: string | null;
+  workspace_id: string | null;
+  title: string;
+  host_server_id: string | null;
+  project_path: string | null;
+  project_remote: string | null;
+  git_branch: string | null;
+  /** Phase-4 divergence detection: the workspace's git HEAD sha at
+   *  the last reconcile. Compared across rows in the overview to
+   *  detect when the same (project_remote, git_branch) has different
+   *  HEADs on multiple devices. Null when git isn't available or
+   *  the worktree has no commits yet. */
+  git_head_sha: string | null;
+  created_at: string;
+  updated_at: string;
+  /** True iff the row has unpushed changes. UI surfaces this as a
+   *  "Pending sync" pill the same way Automations does. */
+  dirty: boolean;
+}
+
+export const workspacesSyncList = () =>
+  invoke<WorkspaceSyncView[]>("workspaces_sync_list");
+
+/** Force an immediate pull + push pass. The background loop runs
+ *  every 30s; use this only when the user explicitly hits a "Sync
+ *  now" affordance. Returns Ok even if the user isn't signed in. */
+export const workspacesSyncNow = () =>
+  invoke<void>("workspaces_sync_now");
+
+// ── Cross-device adoption (Phase 2) ──
+//
+// "Adoption" = take a workspace that lives on another device of your
+// account and materialize a local copy on THIS device. Two paths:
+//   - host-backed (this PR): when the workspace lives on a host you
+//     also have configured locally, rsync from the host
+//   - clone (future): when there's no shared host, git-clone from
+//     `project_remote`
+//
+// The frontend opens the Pull-to-this-device dialog with
+// `workspacesAdoptionPreview` (so it knows which variant to render
+// without race conditions), then calls `workspacesAdoptSynced` on
+// confirm.
+
+export interface AdoptionPreview {
+  can_host_adopt: boolean;
+  can_clone_adopt: boolean;
+  host_configured: boolean;
+  host_label: string | null;
+  project_already_cloned_at: string | null;
+  suggested_path: string;
+  is_path_in_use: boolean;
+  /** When the sync row is already linked to a local workspace, this
+   *  carries that local id so the UI can offer "Open existing" instead
+   *  of re-running the adoption flow. */
+  already_adopted_workspace_id: string | null;
+}
+
+export interface AdoptOutcome {
+  workspace_id: string;
+  worktree_path: string;
+  message: string;
+}
+
+export const workspacesAdoptionPreview = (serverId: string) =>
+  invoke<AdoptionPreview>("workspaces_adoption_preview", { serverId });
+
+export const workspacesAdoptSynced = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_synced", { serverId });
+
+/** Phase-3 clone-fallback adoption: when the sibling-device workspace
+ *  has no shared host (`host_server_id` is null), this clones the
+ *  `project_remote` git URL and creates a worktree at the branch.
+ *
+ *  Important: this creates a NEW local workspace with its own fresh
+ *  `server_id` — it does NOT link to the original sibling row. Both
+ *  devices end up with independent copies that share a git remote.
+ *  The user has been warned about uncommitted-work loss via the
+ *  dialog before reaching this. */
+export const workspacesAdoptViaClone = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_via_clone", { serverId });
