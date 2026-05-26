@@ -47,6 +47,8 @@ pub mod project;
 // module from any code path).
 #[cfg(unix)]
 pub mod pty_daemon;
+#[cfg(unix)]
+pub mod remote;
 // SSH transport for the cloud-push feature. Unix-only — relies on
 // the system `ssh` + `scp` binaries (with the user's existing
 // `~/.ssh/config`, agent, and known_hosts).

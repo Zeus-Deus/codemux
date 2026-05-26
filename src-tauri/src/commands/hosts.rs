@@ -329,10 +329,34 @@ pub async fn hosts_bootstrap_install(
                     }
                     _ => String::new(),
                 };
+
+                // Always provision the headless `serve` daemon. Unlike
+                // the scheduler this needs no auth token or server id —
+                // it's a per-host local control plane. After this
+                // returns successfully, an MCP-capable agent on the host
+                // can use `codemux-remote mcp` without any manual setup.
+                // Same best-effort contract: a failure logs and is
+                // surfaced in the result message, doesn't fail bootstrap.
+                let serve_note = match crate::ssh::bootstrap::provision_serve(
+                    &host.ssh_target,
+                    "~/.local/bin/codemux-remote",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                {
+                    Ok(()) => " · MCP control plane enabled".to_string(),
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::hosts] serve provisioning failed: {error}"
+                        );
+                        " · (MCP control plane not enabled — see logs)".to_string()
+                    }
+                };
+
                 HostBootstrapResult {
                     ok: true,
                     message: format!(
-                        "codemux-remote v{reported_version} installed on {}{scheduler_note}",
+                        "codemux-remote v{reported_version} installed on {}{scheduler_note}{serve_note}",
                         host.name
                     ),
                 }

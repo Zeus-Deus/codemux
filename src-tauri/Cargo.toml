@@ -82,6 +82,14 @@ sysinfo = "0.33"
 # an iCalendar DTSTART+RRULE block and computes the next occurrence
 # with IANA-timezone / DST correctness. Used by automations::recurrence.
 rrule = "0.14"
+# Axum HTTP server for the new `codemux-remote serve` headless control
+# endpoint. Loopback-only by default (127.0.0.1), bearer-token auth via
+# a manifest file. The transport choice (HTTP+bearer over loopback,
+# tunnelled via SSH when remote) is the v1 design constraint that lets
+# us drop in an optional cloud relay later without changing the daemon.
+# See docs/plans/mcp-on-remote.md.
+axum = "0.7"
+tower = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

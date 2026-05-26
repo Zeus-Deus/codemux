@@ -220,13 +220,69 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
         cmd.arg(arg);
     }
     let result = run_capture_with_timeout(&mut cmd, opts.step_timeout).await;
-    match result {
+    let pushed = match result {
         Ok(stdout) => PushResult::Pushed {
             remote_path: opts.remote_path.to_string(),
             rsync_summary: trim_rsync_output(&stdout),
         },
-        Err(reason) => PushResult::RsyncFailed { reason },
+        Err(reason) => return PushResult::RsyncFailed { reason },
+    };
+
+    // Best-effort: drop a `.mcp.json` into the pushed workspace dir so
+    // an agent CLI (Claude Code, Codex, Gemini, …) launched on the
+    // remote inside this workspace auto-discovers Codemux via
+    // `codemux-remote mcp`. This mirrors the desktop's per-workspace
+    // `.mcp.json` pattern (`mcp_server::upsert_mcp_config`).
+    //
+    // A failure here does NOT roll back the push — the user's files
+    // are already on the remote, and the daemon itself doesn't need
+    // .mcp.json. The agent on the remote can still be configured by
+    // hand. We log so the host pane can show a soft warning later.
+    if let Err(error) = crate::ssh::bootstrap::provision_workspace_mcp_config(
+        opts.ssh_target,
+        opts.remote_path,
+        "~/.local/bin/codemux-remote",
+        opts.step_timeout,
+    )
+    .await
+    {
+        eprintln!(
+            "[codemux::ssh::push] .mcp.json provisioning failed for {}: {error}",
+            opts.remote_path
+        );
     }
+
+    // Best-effort: register the pushed workspace in the remote
+    // daemon's registry so it shows up in `workspace_list` from any
+    // MCP-aware agent on the host. If the daemon isn't running yet
+    // (host hates systemd, bootstrap was skipped, …) this fails
+    // silently — the user can still register manually via the agent.
+    //
+    // Branch + project_root aren't known at this layer; the push UI
+    // can pass them later by extending PushOptions. v1 just registers
+    // by path so the workspace at least exists in the registry.
+    let workspace_name = std::path::Path::new(opts.remote_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    if let Err(error) = crate::ssh::bootstrap::register_workspace_on_remote(
+        opts.ssh_target,
+        "~/.local/bin/codemux-remote",
+        opts.remote_path,
+        workspace_name.as_deref(),
+        None,
+        None,
+        opts.step_timeout,
+    )
+    .await
+    {
+        eprintln!(
+            "[codemux::ssh::push] workspace register failed for {}: {error}",
+            opts.remote_path
+        );
+    }
+
+    pushed
 }
 
 /// Pull the worktree back from the remote host.

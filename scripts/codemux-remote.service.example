@@ -1,0 +1,42 @@
+# systemd user unit for `codemux-remote serve`.
+#
+# Install:
+#   1. Copy this file to ~/.config/systemd/user/codemux-remote.service
+#      (edit ExecStart to point at the path where you installed the
+#      binary — usually ~/.local/bin/codemux-remote after the desktop's
+#      bootstrap step has copied it over).
+#   2. `loginctl enable-linger $USER` — lets the daemon survive ssh
+#      logouts and run across reboots without an active session.
+#   3. `systemctl --user daemon-reload`
+#   4. `systemctl --user enable --now codemux-remote.service`
+#
+# Health check after install:
+#   codemux-remote serve status
+#
+# Logs:
+#   journalctl --user -u codemux-remote -f
+
+[Unit]
+Description=Codemux headless daemon (MCP control plane for agents on this host)
+Documentation=https://codemux.org
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust the path to wherever you installed the binary. The desktop's
+# bootstrap step writes it to ~/.local/bin/codemux-remote by default.
+ExecStart=%h/.local/bin/codemux-remote serve
+# Default state dir is ~/.local/share/codemux-remote; explicit here
+# so a misconfigured $XDG_DATA_HOME doesn't surprise you.
+Environment=XDG_DATA_HOME=%h/.local/share
+# Restart on crash but back off so a wedge doesn't spin the CPU.
+Restart=on-failure
+RestartSec=5s
+# Tame the journal: keep stderr (where the daemon logs) but discard
+# stdout (which the daemon doesn't use).
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=default.target
