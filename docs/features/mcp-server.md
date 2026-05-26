@@ -34,7 +34,7 @@ but live in separate modules: `src-tauri/src/mcp_server.rs` for the
 server, `src-tauri/src/mcp/` plus `sidecar/claude-agent/src/mcp-bridge.ts`
 for the host runtime.
 
-## Server side: `codemux mcp`
+## Server side: `codemux mcp` (desktop)
 
 ### Transport
 
@@ -42,6 +42,19 @@ for the host runtime.
 - **Protocol version**: `2024-11-05`
 - **Launch**: `codemux mcp` starts the server; agents connect via their
   MCP client config
+
+> **Headless variant**: `codemux-remote mcp` is a sibling binary that
+> ships a smaller 11-tool catalog (no panes, no browser) and forwards
+> over HTTP+bearer to a local `codemux-remote serve` daemon instead of
+> the desktop's Unix-socket control transport. Same wire protocol,
+> different tool set, different control transport. The desktop's push
+> flow auto-registers it into user-level agent configs on the host
+> (`~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`)
+> on every `serve` startup. See `docs/features/remote-hosts.md` for
+> the daemon, manifest, auth, and provisioning details, and
+> `docs/plans/mcp-on-remote.md` for the design rationale and the
+> deferred desktop-side steps (extract `codemux_core`, pull-workspace
+> UI, `--host` CLI flag, migrate desktop transport to HTTP+manifest).
 
 ### Auto-Configuration
 

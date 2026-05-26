@@ -158,9 +158,12 @@ daemon. None of those four costs anything today.
 The desktop's push flow does the following automatically, so the user
 never has to know about manifests, secrets, or systemd:
 
-1. **Binary install.** `ssh::bootstrap::bootstrap_remote` scp's the
+1. **Binary install.** `ssh::bootstrap::bootstrap_remote` uploads the
    matching `codemux-remote-<target>` to `~/.local/bin/codemux-remote`
-   and chmods it. Skipped if `version` already returns the right value.
+   and chmods it. Upload uses a `ssh ... 'cat > <path>'` pipeline
+   instead of `scp` because OpenSSH 9+ broke tilde-expansion in
+   `scp` destination paths; piping through stdin sidesteps the issue
+   entirely. Skipped if `version` already returns the right value.
 2. **`serve` systemd unit.** `ssh::bootstrap::provision_serve` writes
    `~/.config/systemd/user/codemux-remote.service`, runs
    `loginctl enable-linger` so it survives logout, and
@@ -182,6 +185,57 @@ never has to know about manifests, secrets, or systemd:
 Net effect: user clicks "Push workspace to host" once, gets back a
 working MCP control plane on the remote without ever having to know
 the words "manifest" or "systemd."
+
+### User-level MCP auto-register (`remote/mcp_register.rs`)
+
+Per-workspace `.mcp.json` only covers directories the user pushed.
+For repos cloned directly on the host, ad-hoc scratch dirs, and
+services running in arbitrary places, an agent CLI needs a
+**user-level** (not per-workspace) MCP config that names
+`codemux-remote` as a server. `codemux-remote serve` writes that
+once on every startup, idempotently, into every supported agent
+config it finds present on the host:
+
+| Path | Format |
+|---|---|
+| `~/.claude.json` (top-level `mcpServers`) | Claude Code |
+| `~/.codex/config.toml` (`[mcp_servers.codemux]`) | Codex |
+| `~/.cursor/mcp.json` (top-level `mcpServers`) | Cursor |
+
+Safety contract:
+
+1. **Idempotent.** If the codemux entry is already present (same
+   command + args), the file is left untouched.
+2. **Atomic.** Writes go through a sibling `.tmp` file + rename, so
+   a crash mid-write can never leave the user's agent config in a
+   half-baked state.
+3. **No corruption.** Unparseable files (broken JSON/TOML) are
+   logged and skipped — never overwritten.
+4. **Skip missing tools.** A user who doesn't have Claude Code
+   won't have `~/.claude.json`; we don't create directories the
+   user never opted into.
+
+### Background host-upgrade poller (`hosts_upgrade.rs`)
+
+Users don't think about "upgrading a helper binary on a remote
+host." They think "I updated Codemux." So `hosts_upgrade::spawn` is
+called once during app setup (~5 s after `setup` so the UI is
+responsive first) and walks every registered SSH host:
+
+1. `probe_host` → returns the host's installed `codemux-remote`
+   version (or "not installed").
+2. If that version differs from `env!("CARGO_PKG_VERSION")`,
+   `bootstrap_remote` re-uploads the bundled binary (same code path
+   the Install button uses) and `provision_serve` re-applies the
+   systemd unit. `provision_serve` is idempotent so a host that's
+   already up to date pays only one SSH version probe.
+3. Best-effort by design — offline host, flaky tunnel, missing
+   bundled-binary target — any of these log and move on; the task
+   never fails the app.
+
+Consent was implicitly granted the first time the user bootstrapped
+the host; re-uploading a newer version of the same binary to the
+same location is not a meaningful trust escalation.
 
 ### Controlling the daemon from your phone (Tailscale)
 
@@ -305,13 +359,17 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 
 - `src-tauri/src/state/state_impl.rs` — `WorkspaceSnapshot.host_id`, `set_workspace_host_id`.
 - `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`.
-- `src-tauri/src/bin/codemux_remote.rs` — slim binary entry point.
-- `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor landed after 2d).
+- `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`. Unix-only — Windows builds a no-op stub.
+- `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (11-tool catalog), `config.rs` (state-dir resolution).
+- `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor + zero-touch provisioning of the `serve` daemon).
+- `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start.
 - `src/components/hosts/device-picker.tsx` — shared pill component.
 - `src/components/overlays/new-workspace-dialog.tsx` — DevicePicker wired into bottom bar.
 - `src/components/settings/hosts-section.tsx` — uses real probe + bootstrap modal.
 - `src/tauri/commands.ts` — new bindings: `setWorkspaceHost`, `hostsBootstrapInstall`, `HostBootstrapResult`.
-- `Cargo.toml` — new `[[bin]] codemux-remote`.
+- `Cargo.toml` — `[[bin]] codemux-remote`; embedded `axum`, `tower`, `rusqlite`, `portable-pty` for the headless daemon.
+- `scripts/codemux-remote.service.example` — sample systemd user unit (used both by manual install and `provision_serve`).
+- `src-tauri/tests/codemux_remote_serve_mcp.rs` — 8 end-to-end tests covering the full HTTP roundtrip, the MCP stdio roundtrip, auth required, singleton check, status JSON, missing-daemon error path, PTY echo.
 
 ## Troubleshooting
 

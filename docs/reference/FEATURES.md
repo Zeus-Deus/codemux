@@ -249,10 +249,11 @@
 
 ## IDE Integration
 
-- Auto-detect installed editors (VS Code, Cursor, VSCodium, Zed, IntelliJ, GoLand, WebStorm, Sublime Text)
-- Title bar launcher button with default editor and dropdown for all detected editors
-- Workspace context menu "Open in Editor" entry
+- Auto-detect 19 installed editors across four families: **VS Code family** (VS Code, Cursor, VSCodium), **Modern editors** (Zed, Windsurf, Trae, Fleet, Lapce), **JetBrains** (IntelliJ IDEA, PyCharm, PhpStorm, WebStorm, GoLand, RubyMine, CLion, Rider, DataGrip, Android Studio), and **Other** (Sublime Text)
+- Title bar launcher button with default editor and dropdown partitioned into labelled sections (section headers only render when more than one family is detected)
+- Workspace context menu "Open in Editor" entry (same family grouping)
 - Default editor preference synced across devices
+- On Windows, detection falls back to `%LOCALAPPDATA%\Programs` / `%ProgramFiles%` paths when `PATH` lookup misses (VS Code / Cursor / VSCodium / Zed / Windsurf / Trae / Lapce); JetBrains stays PATH-only via Toolbox shims
 
 ## File Tree
 
@@ -291,10 +292,21 @@
 ## Remote Hosts + Workspace Push
 
 - Settings → Hosts pane with SSH probe + bootstrap-install consent modal
-- Slim `codemux-remote` server binary (bundled per-target into the laptop app) installs to `~/.local/bin/` on the host
+- Full `codemux-remote` server binary (bundled per-target into the laptop app) installs to `~/.local/bin/` on the host; upload uses an `ssh-cat` pipeline to dodge OpenSSH 9+'s broken scp tilde-expansion
 - SSH transport: probe → bootstrap → tunnel → tunnel supervisor with auto-reconnect
 - `WorkspaceSnapshot.host_id` model + shared `<DevicePicker>` pill component wired into the new-workspace dialog
-- **Push workspace to host** action: rsync the worktree, spawn the remote daemon, attach the local UI through an SSH-forwarded socket, and sync the Claude conversation across local/remote ends
+- **Push workspace to host** action (zero-touch): rsync the worktree, spawn the remote daemon, install + start a systemd user unit, drop a per-workspace `.mcp.json`, register the workspace in the daemon's registry, attach the local UI through an SSH-forwarded socket, and sync the Claude conversation across local/remote ends
+- **Background `hosts_upgrade` poller**: ~5 s after every app start, silently re-bootstraps any host whose `codemux-remote` version differs from the bundled binary
+
+## MCP-on-Remote (Headless Codemux Daemon)
+
+- `codemux-remote serve` runs an axum HTTP server on loopback with a bearer-token manifest at `<state-dir>/manifest.json` (mode `0600`)
+- 11-tool stdio MCP catalog (smaller than the desktop's 52 — no panes, no browser, no global notifications): `workspace_{create,list,info,update,close}`, `terminal_{spawn,write,read,list,close}`, `app_status`
+- `codemux-remote mcp` bridges agent CLIs on the host to the daemon over HTTP — drop-in MCP server entry for Claude Code / Codex / Cursor on the remote
+- On every `serve` startup, idempotently writes a `codemux` MCP entry into every supported user-level agent config it finds (`~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`)
+- `Identity` enum on every dispatch carries `Local` today and reserves `Cloud { user_id, org_id, role }` for a future optional paid-tier relay — purely additive
+- Process supervision via systemd user unit (provisioned at host bootstrap) with `Restart=on-failure` and `loginctl enable-linger`
+- Unix-only; Windows build is a no-op stub
 
 ## Persistent Agents
 
