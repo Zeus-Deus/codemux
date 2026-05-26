@@ -39,7 +39,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { PrStatusIcon, humanizePrState, prStatusToneClass } from "@/components/github/pr-status-icon";
+import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
   activateWorkspace,
   checkoutDefaultBranchInWorkspace,
@@ -586,6 +586,19 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const isPushOrPullInFlight = useAppStore(
     (s) => s.workspacePushPullInFlight === workspace.workspace_id,
   );
+
+  // When a worktree workspace has a PR, the leading icon doubles as
+  // the PR-state indicator (open=green, merged=purple, closed=red,
+  // draft=gray) and becomes a clickable button that opens the PR URL.
+  // The PR number rides in the tooltip on hover; there's no trailing
+  // pill, since that would duplicate the same signal.
+  const isWorktreeRow =
+    !isPushOrPullInFlight &&
+    !isRemote &&
+    !isPrimary &&
+    workspace.workspace_type !== "open_flow";
+  const showWorkspaceIconAsPr = isWorktreeRow && !!workspace.pr_state;
+
   // Phase-4d elapsed-time signal: when an in-flight push/pull
   // crosses 2 seconds, show a small "12s" pill so the user knows
   // the operation is still working. Identical math to the overview
@@ -620,13 +633,13 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     <Workflow className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
   ) : isPrimary ? (
     <Laptop className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+  ) : showWorkspaceIconAsPr ? (
+    <PrStatusIcon state={workspace.pr_state} size={3.5} />
   ) : (
     <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
   );
 
-  const showPrIcon = !!workspace.pr_state && workspaceStatus !== "working";
   const prHumanState = humanizePrState(workspace.pr_state);
-  const prToneCls = prStatusToneClass(workspace.pr_state);
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (workspace.pr_url) {
@@ -652,13 +665,50 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               isActive && "bg-muted",
             )}
           >
-            {/* Icon column — size-5 to subordinate to project avatar */}
+            {/* Icon column — size-5 to subordinate to project avatar.
+                When a worktree workspace has a PR, the icon turns into a
+                PR-state-colored button that opens the PR URL on click. */}
             <div className="relative size-5 flex items-center justify-center shrink-0 mr-2">
               {workspaceStatus === "working" ? (
                 <AsciiSpinner />
               ) : (
                 <>
-                  {icon}
+                  {showWorkspaceIconAsPr ? (
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          onClick={handlePrClick}
+                          disabled={!workspace.pr_url}
+                          aria-label={
+                            workspace.pr_number
+                              ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
+                              : `Open pull request on GitHub — ${prHumanState ?? ""}`
+                          }
+                          className={cn(
+                            "inline-flex items-center justify-center rounded transition-opacity",
+                            workspace.pr_url ? "hover:opacity-70" : "cursor-not-allowed opacity-60",
+                          )}
+                        >
+                          {icon}
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                        {prHumanState ? `${prHumanState} PR` : "Pull request"}
+                        {workspace.pr_number ? ` #${workspace.pr_number}` : ""}
+                        {workspace.pr_url ? " — click to open" : ""}
+                      </TooltipContent>
+                    </Tooltip>
+                  ) : (
+                    icon
+                  )}
+                  {/* StatusIndicator is rendered as a sibling of the
+                      icon/button and positioned absolutely relative to
+                      the parent `relative size-5` div, so the agent-state
+                      dots (working amber/pulsing, review green, permission
+                      red/pulsing) still overlay the top-right corner of
+                      the icon column regardless of whether the icon is
+                      the plain branch icon or the new PR-state icon. */}
                   {workspaceStatus && (
                     <StatusIndicator
                       status={workspaceStatus}
@@ -740,9 +790,12 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     </span>
                   )}
 
-                  {/* Indicator cluster — muted bell, linked issue, PR.
-                      Only renders when at least one is present. */}
-                  {(workspace.linked_issue || showPrIcon || workspace.notifications_muted) && (
+                  {/* Indicator cluster — muted bell + linked issue.
+                      The PR signal moved entirely to the leading icon
+                      column (colored icon + tooltip with "#39 — click
+                      to open"), so this trailing slot no longer carries
+                      a PR number. */}
+                  {(workspace.linked_issue || workspace.notifications_muted) && (
                     <div className={cn(
                       "flex items-center gap-1 shrink-0",
                       !hasDiff && "ml-auto",
@@ -765,30 +818,6 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                           workspaceId={workspace.workspace_id}
                           issue={workspace.linked_issue}
                         />
-                      )}
-                      {showPrIcon && (
-                        <button
-                          type="button"
-                          onClick={handlePrClick}
-                          disabled={!workspace.pr_url}
-                          aria-label={
-                            workspace.pr_number
-                              ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
-                              : `Open pull request on GitHub — ${prHumanState ?? ""}`
-                          }
-                          className={cn(
-                            "inline-flex items-center gap-0.5 rounded-full px-1.5 py-px transition-opacity",
-                            prToneCls,
-                            workspace.pr_url ? "hover:opacity-80" : "cursor-not-allowed opacity-60",
-                          )}
-                        >
-                          <PrStatusIcon state={workspace.pr_state} size={3} />
-                          {workspace.pr_number && (
-                            <span className="text-[10px] tabular-nums text-muted-foreground/60">
-                              #{workspace.pr_number}
-                            </span>
-                          )}
-                        </button>
                       )}
                     </div>
                   )}

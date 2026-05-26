@@ -8,6 +8,11 @@ const setShowNewWorkspaceDialogMock = vi.fn();
 let enableAgentChatFlag = false;
 let enableLazyFlag = false;
 
+const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: (...args: unknown[]) => mockOpenUrl(...args),
+}));
+
 // Mock Tauri commands
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
@@ -328,6 +333,122 @@ describe("SidebarWorkspaceRow", () => {
     );
     const branchIcon = container.querySelector("svg.lucide-git-branch");
     expect(branchIcon).toBeInTheDocument();
+  });
+
+  // ── PR-state icon replaces the GitBranch icon ──
+  //
+  // When a worktree workspace has a pull request, the leading icon turns
+  // into the PR-state-colored icon so the row carries the open/merged/
+  // closed signal at its leading edge. The right cluster keeps just the
+  // muted "#39" number.
+
+  it("shows GitPullRequest icon (not GitBranch) when the worktree has an open PR", () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: "OPEN",
+      pr_number: 39,
+      pr_url: "https://github.com/u/r/pull/39",
+    });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+    // PrStatusIcon for "open" renders the GitPullRequest lucide icon.
+    expect(container.querySelector("svg.lucide-git-pull-request")).toBeInTheDocument();
+    // The plain branch icon is replaced.
+    expect(container.querySelector("svg.lucide-git-branch")).toBeNull();
+  });
+
+  it("shows GitMerge icon when the worktree's PR is merged", () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: "MERGED",
+      pr_number: 39,
+      pr_url: "https://github.com/u/r/pull/39",
+    });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+    expect(container.querySelector("svg.lucide-git-merge")).toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-git-branch")).toBeNull();
+  });
+
+  it("shows the closed PR icon when the worktree's PR is closed", () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: "CLOSED",
+      pr_number: 39,
+      pr_url: "https://github.com/u/r/pull/39",
+    });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+    expect(container.querySelector("svg.lucide-git-pull-request-closed")).toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-git-branch")).toBeNull();
+  });
+
+  it("opens the PR URL when the leading PR icon is clicked (stops propagation, does not activate workspace)", () => {
+    mockOpenUrl.mockClear();
+    (activateWorkspace as ReturnType<typeof vi.fn>).mockClear();
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: "OPEN",
+      pr_number: 39,
+      pr_url: "https://github.com/u/r/pull/39",
+    });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+    const btn = container.querySelector("button[aria-label*='Open PR #39']");
+    expect(btn).not.toBeNull();
+    fireEvent.click(btn!);
+    expect(mockOpenUrl).toHaveBeenCalledWith("https://github.com/u/r/pull/39");
+    // The icon click must NOT activate the workspace — that's reserved
+    // for the rest of the row.
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("does NOT render the PR number in the trailing cluster (PR signal is fully on the leading icon)", () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: "OPEN",
+      pr_number: 39,
+      pr_url: "https://github.com/u/r/pull/39",
+    });
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+    // The "#39" duplicate is gone — the leading icon's tooltip already
+    // carries the PR number, so showing it again in the row's trailing
+    // slot is redundant noise.
+    expect(container.textContent).not.toContain("#39");
+    // The only PR aria-label belongs to the leading icon button in the
+    // icon column — the old colored-pill button is gone.
+    const prButtons = container.querySelectorAll("button[aria-label*='Open PR']");
+    expect(prButtons.length).toBe(1);
+  });
+
+  it("falls back to GitBranch when the worktree has no PR", () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.worktrees/feature",
+      pr_state: null,
+      pr_number: null,
+      pr_url: null,
+    });
+    const { container } = render(
+      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+    );
+    expect(container.querySelector("svg.lucide-git-branch")).toBeInTheDocument();
+    expect(container.querySelector("svg.lucide-git-pull-request")).toBeNull();
   });
 
   it("hides remove button for primary checkout (Hide-only via right-click)", () => {
