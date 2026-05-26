@@ -410,6 +410,13 @@ pub async fn provision_serve(
     .await
     .map_err(|e| format!("writing serve systemd unit: {e}"))?;
 
+    // `enable + restart` (not `enable --now`) is intentional: it makes
+    // this function correct for both first install AND upgrade. On
+    // first install, restart of an inactive unit is identical to
+    // start. On upgrade, the running daemon is killed and respawned
+    // from the new binary on disk — without this, an upgraded binary
+    // wouldn't take effect until the next host reboot or manual
+    // `systemctl --user restart`.
     run_with_timeout(
         Command::new("ssh")
             .arg("-o")
@@ -420,8 +427,9 @@ pub async fn provision_serve(
             .arg(format!(
                 "loginctl enable-linger \"$USER\" >/dev/null 2>&1; \
                  systemctl --user daemon-reload && \
-                 systemctl --user enable --now {}",
-                service::SERVE_SYSTEMD_UNIT_NAME
+                 systemctl --user enable {unit} && \
+                 systemctl --user restart {unit}",
+                unit = service::SERVE_SYSTEMD_UNIT_NAME
             )),
         deadline,
     )

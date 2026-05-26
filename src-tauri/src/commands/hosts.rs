@@ -204,14 +204,37 @@ pub async fn hosts_test_connection(
                 // Automations preflight — flag a host that can't reach
                 // GitHub before an automation silently fails at run time.
                 let github_note = probe_host_github(&host.ssh_target).await;
-                HostTestResult {
-                    ok: true,
-                    message: format!(
-                        "Connected. codemux-remote v{version} is installed{}{github_note}",
-                        uname.map(|u| format!(" ({u})")).unwrap_or_default()
-                    ),
-                    needs_install: false,
-                    uname: None,
+
+                // Version-aware upgrade detection: if the host's
+                // codemux-remote is older than the one bundled with
+                // this Codemux, surface it as `needs_install: true`
+                // so the UI shows the Install button (which then
+                // re-uploads + restarts via the same path as a fresh
+                // install). Without this, an upgraded Codemux would
+                // silently keep using stale codemux-remote on every
+                // host the user never explicitly pushed to.
+                let our_version = env!("CARGO_PKG_VERSION");
+                let upgrade_available = version != our_version;
+                let uname_suffix = uname.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
+                if upgrade_available {
+                    HostTestResult {
+                        ok: true,
+                        message: format!(
+                            "codemux-remote v{version} on host, v{our_version} bundled — \
+                             Install to upgrade{uname_suffix}{github_note}"
+                        ),
+                        needs_install: true,
+                        uname,
+                    }
+                } else {
+                    HostTestResult {
+                        ok: true,
+                        message: format!(
+                            "Connected. codemux-remote v{version} is installed{uname_suffix}{github_note}"
+                        ),
+                        needs_install: false,
+                        uname: None,
+                    }
                 }
             }
             ProbeOutcome::Reachable {
@@ -1213,10 +1236,13 @@ async fn ensure_remote_binary_current(
         return Err("uname probe returned empty string".into());
     }
 
-    // Step 3: kill any running daemon. Otherwise the freshly-bootstrapped
+    // Step 3: kill any running pty-daemon. Otherwise the freshly-bootstrapped
     // binary won't actually be used until the next SSH-spawn cycle, and
     // a stale daemon still bound to the workspace's Unix socket would
-    // make that next spawn fail with "address in use."
+    // make that next spawn fail with "address in use." The narrow `-f`
+    // pattern only matches the SSH-spawned pty-daemon — user-launched
+    // `codemux-remote mcp` or `serve` invocations are spared. `serve`
+    // is restarted via systemctl in step 5 instead.
     let _ = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -1225,28 +1251,62 @@ async fn ensure_remote_binary_current(
         .status()
         .await;
 
-    // Step 4: bootstrap (scp + chmod + verify).
+    // Step 4: bootstrap (upload binary + verify version).
     use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
-    match bootstrap_remote(
+    let outcome = bootstrap_remote(
         BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
     )
-    .await
-    {
+    .await;
+    match outcome {
         BootstrapResult::Installed { reported_version } => {
             eprintln!(
                 "[hosts] bootstrapped {} → codemux-remote {reported_version}",
                 host.name
             );
-            Ok(())
         }
-        BootstrapResult::BinaryNotBundled { wanted_target } => Err(format!(
-            "this Codemux build doesn't include a codemux-remote for {wanted_target}"
-        )),
-        BootstrapResult::UploadFailed { reason } => Err(format!("upload: {reason}")),
+        BootstrapResult::BinaryNotBundled { wanted_target } => {
+            return Err(format!(
+                "this Codemux build doesn't include a codemux-remote for {wanted_target}"
+            ));
+        }
+        BootstrapResult::UploadFailed { reason } => {
+            return Err(format!("upload: {reason}"));
+        }
         BootstrapResult::PostInstallProbeFailed { reason } => {
-            Err(format!("verify: {reason}"))
+            return Err(format!("verify: {reason}"));
         }
     }
+
+    // Step 5: re-provision the headless `serve` daemon. This is
+    // idempotent — it rewrites the systemd unit (so a unit-content
+    // change in this Codemux version takes effect immediately), runs
+    // daemon-reload, and **restarts** the unit (not just `enable
+    // --now` — restart kills the old process so the new binary on
+    // disk actually starts running). If we skipped this, an upgraded
+    // codemux-remote on disk would coexist with an old `serve`
+    // process in memory until the next host reboot, which would
+    // confuse anyone debugging "why doesn't my new MCP tool show up
+    // after I updated Codemux."
+    //
+    // Best-effort: a failure here doesn't fail the upgrade. The
+    // binary is current; the user can `systemctl --user restart
+    // codemux-remote` themselves if needed.
+    if let Err(error) = crate::ssh::bootstrap::provision_serve(
+        &host.ssh_target,
+        "~/.local/bin/codemux-remote",
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        eprintln!(
+            "[hosts] re-provisioning serve on {} after upgrade failed (continuing): {error}",
+            host.name
+        );
+    } else {
+        eprintln!("[hosts] re-provisioned codemux-remote.service on {}", host.name);
+    }
+
+    Ok(())
 }
 
 /// Terminate every PTY session belonging to the given workspace.
