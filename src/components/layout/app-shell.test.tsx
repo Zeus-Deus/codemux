@@ -10,6 +10,8 @@ let appStateReady = true;
 let settingsLoaded = true;
 let syncedLoading = false;
 let showSettingsFlag = false;
+let showAutomationsFlag = false;
+let showWorkspacesOverviewFlag = false;
 let showNewProjectScreenFlag = false;
 let commandPaletteOpenFlag = false;
 
@@ -30,6 +32,14 @@ vi.mock("./empty-state", () => ({
 }));
 vi.mock("@/components/settings/settings-view", () => ({
   SettingsView: () => <div data-testid="settings-view" />,
+}));
+vi.mock("@/components/automations/automations-view", () => ({
+  AutomationsView: () => <div data-testid="automations-view" />,
+}));
+vi.mock("@/components/workspaces-overview/workspaces-overview-view", () => ({
+  WorkspacesOverviewView: () => (
+    <div data-testid="workspaces-overview-view" />
+  ),
 }));
 vi.mock("@/components/overlays/command-palette", () => ({
   CommandPalette: () => null,
@@ -90,6 +100,8 @@ vi.mock("@/stores/ui-store", () => ({
     vi.fn((selector: (s: unknown) => unknown) =>
       selector({
         showSettings: showSettingsFlag,
+        showAutomations: showAutomationsFlag,
+        showWorkspacesOverview: showWorkspacesOverviewFlag,
         showNewProjectScreen: showNewProjectScreenFlag,
         showCommandPalette: commandPaletteOpenFlag,
         setShowCommandPalette: vi.fn(),
@@ -132,6 +144,8 @@ describe("AppShell rendering gates", () => {
     settingsLoaded = true;
     syncedLoading = false;
     showSettingsFlag = false;
+    showAutomationsFlag = false;
+    showWorkspacesOverviewFlag = false;
     showNewProjectScreenFlag = false;
     commandPaletteOpenFlag = false;
   });
@@ -172,5 +186,24 @@ describe("AppShell rendering gates", () => {
     const { getByTestId, queryByTestId } = render(<AppShell />);
     expect(getByTestId("workspace-main")).toBeInTheDocument();
     expect(queryByTestId("empty-state")).toBeNull();
+  });
+
+  it("renders the Workspaces overview when its UI-store flag is set", () => {
+    hasWorkspacesFlag = true;
+    showWorkspacesOverviewFlag = true;
+    const { getByTestId, queryByTestId } = render(<AppShell />);
+    expect(getByTestId("workspaces-overview-view")).toBeInTheDocument();
+    // The shell early-returns the overlay so neither the regular
+    // workspace pane nor the empty state should render alongside it.
+    expect(queryByTestId("workspace-main")).toBeNull();
+    expect(queryByTestId("empty-state")).toBeNull();
+  });
+
+  it("prefers Settings over the Workspaces overview when both flags are set", () => {
+    showSettingsFlag = true;
+    showWorkspacesOverviewFlag = true;
+    const { getByTestId, queryByTestId } = render(<AppShell />);
+    expect(getByTestId("settings-view")).toBeInTheDocument();
+    expect(queryByTestId("workspaces-overview-view")).toBeNull();
   });
 });

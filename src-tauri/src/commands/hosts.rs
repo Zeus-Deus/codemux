@@ -722,24 +722,58 @@ pub async fn workspace_push_to_host(
 #[tauri::command]
 pub async fn workspace_pull_back(
     app: tauri::AppHandle,
-    db: tauri::State<'_, DatabaseStore>,
+    _db: tauri::State<'_, DatabaseStore>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
+    workspace_pull_back_impl(app, workspace_id).await
+}
+
+/// Internal entry point for the pull-back machinery. Extracted from
+/// the `#[tauri::command]` wrapper so other Rust code paths (notably
+/// the cross-device adoption flow in
+/// `commands::workspaces_sync::workspaces_adopt_synced`) can drive
+/// the same rsync + tunnel-teardown + session-respawn pipeline
+/// without going back out through the Tauri IPC layer.
+///
+/// Takes only `app` and looks up both `DatabaseStore` and
+/// `AppStateStore` internally — this avoids the `tauri::State<'_>`
+/// lifetime trap where the guard cannot cross an `.await`.
+///
+/// Semantics: requires the local workspace to already exist with
+/// `host_id` set; rsyncs the remote worktree to the local
+/// `worktree_path` (or `cwd` fallback); clears `host_id` on success;
+/// tears down the SSH tunnel; respawns each pane's PTY locally.
+pub async fn workspace_pull_back_impl(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<WorkspacePullOutcome, String> {
+    // Resolve State guards in a tight pre-await scope and capture
+    // owned values so the State guards drop before any `.await`
+    // (they are not Send).
+    let (host, ws_clone) = {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let snapshot = app_state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?
+            .clone();
+        let host_id = ws
+            .host_id
+            .ok_or_else(|| "Workspace is already local.".to_string())?;
+        let host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+        (host, ws)
+    };
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-    let snapshot = app_state.snapshot();
-    let ws = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)
-        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    let host_id = ws
-        .host_id
-        .ok_or_else(|| "Workspace is already local.".to_string())?;
-    let host = db
-        .list_hosts()
-        .into_iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+    // Rename for compatibility with the original function body below
+    // (which references `ws` and `host`).
+    let ws = &ws_clone;
 
     let local_worktree = match ws.worktree_path.as_ref() {
         Some(p) => std::path::PathBuf::from(p),

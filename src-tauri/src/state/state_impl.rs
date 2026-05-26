@@ -796,6 +796,78 @@ impl AppStateStore {
         workspace_id
     }
 
+    /// Create a workspace shell that will receive its files from an
+    /// upcoming `workspace_pull_back` call. Differs from
+    /// `create_workspace_at_path` and `create_empty_workspace_at_path`
+    /// in three ways:
+    ///
+    /// 1. No git operations run — the rsync from the remote will
+    ///    populate the worktree directory; running `git worktree add`
+    ///    here would just create files rsync would have to clobber.
+    /// 2. `host_id` is set up front, because the caller already knows
+    ///    which device the workspace is being pulled from and the
+    ///    pull-back path keys off `host_id` to find the remote.
+    /// 3. `worktree_path` is set to a path that doesn't exist yet —
+    ///    rsync creates it. This is the entire point of the helper.
+    ///
+    /// Used by `workspaces_adopt_synced` (cross-device adoption) where
+    /// we're materialising a workspace another device of the same
+    /// account already created and pushed to a host. After this
+    /// returns, the caller is expected to immediately call the
+    /// existing `workspace_pull_back` machinery to fetch the files.
+    pub fn create_synced_workspace_shell(
+        &self,
+        title: String,
+        host_id: i64,
+        project_root: Option<String>,
+        worktree_path: String,
+        git_branch: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            // `cwd` mirrors `worktree_path` for adopted workspaces —
+            // when the user opens the workspace, terminals get
+            // spawned in the worktree directory, same as a
+            // freshly-created worktree workspace.
+            cwd: worktree_path.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: Some(worktree_path),
+            project_root,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: vec![],
+            // Critical: host_id is set so the pull-back call that
+            // follows knows which device to rsync from. It will be
+            // cleared to None on successful pull.
+            host_id: Some(host_id),
+        });
+
+        // We deliberately do NOT set this as the active workspace.
+        // The user clicked "Pull to this device" from the overview;
+        // they should land back in the overview when the pull
+        // completes, not in a half-populated pane tree. The frontend
+        // can navigate explicitly on success if it wants.
+        workspace_id
+    }
+
     pub fn create_workspace_with_layout(
         &self,
         cwd_path: PathBuf,
@@ -4440,6 +4512,77 @@ mod tests {
         assert_eq!(
             snapshot.active_workspace_id, workspace_id,
             "Empty layout still activates the new workspace (parity with other variants)",
+        );
+    }
+
+    #[test]
+    fn create_synced_workspace_shell_sets_host_id_and_worktree_path() {
+        // The shell is what cross-device adoption creates BEFORE the
+        // rsync runs — host_id must be pre-set (the upcoming
+        // workspace_pull_back routes off it), worktree_path must be
+        // the empty target the rsync will populate, and no tabs /
+        // surfaces / sessions get allocated (the user hasn't opened
+        // panes yet — they will after the pull completes).
+        let store = AppStateStore::default();
+        let workspace_id = store.create_synced_workspace_shell(
+            "codemux/feature-x".into(),
+            42, // local hosts.id
+            Some("/home/zeus/projects/codemux".into()),
+            "/home/zeus/.codemux/worktrees/codemux/feature-x".into(),
+            Some("feature-x".into()),
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .expect("shell must be registered");
+        assert_eq!(workspace.title, "codemux/feature-x");
+        assert_eq!(workspace.host_id, Some(42));
+        assert_eq!(
+            workspace.worktree_path.as_deref(),
+            Some("/home/zeus/.codemux/worktrees/codemux/feature-x"),
+        );
+        // cwd mirrors worktree_path so terminals spawn in the right
+        // place once the pull completes.
+        assert_eq!(
+            workspace.cwd,
+            "/home/zeus/.codemux/worktrees/codemux/feature-x",
+        );
+        assert_eq!(
+            workspace.project_root.as_deref(),
+            Some("/home/zeus/projects/codemux"),
+        );
+        assert_eq!(workspace.git_branch.as_deref(), Some("feature-x"));
+        assert!(
+            workspace.surfaces.is_empty(),
+            "Shell must have no surfaces — rsync populates the worktree, panes come later",
+        );
+        assert!(
+            workspace.tabs.is_empty(),
+            "Shell must have no tabs",
+        );
+    }
+
+    #[test]
+    fn create_synced_workspace_shell_does_not_activate_workspace() {
+        // The user clicked Pull from the Workspaces overview; they
+        // should land back in the overview when the pull completes,
+        // NOT in a half-populated workspace. Activation is the
+        // frontend's call via the success toast's "Open" action.
+        let store = AppStateStore::default();
+        let prior_active = store.snapshot().active_workspace_id.clone();
+        let _ = store.create_synced_workspace_shell(
+            "shell".into(),
+            1,
+            None,
+            "/tmp/shell".into(),
+            None,
+        );
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.active_workspace_id, prior_active,
+            "Shell creation must not steal the active workspace slot",
         );
     }
 

@@ -55,6 +55,10 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { useHosts } from "@/stores/hosts-store";
+import {
+  ConfirmPushDialog,
+  shouldSkipPushConfirm,
+} from "@/components/overlays/confirm-push-dialog";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -216,9 +220,14 @@ function RemoveWorkspaceDialog({
 export function WorkspaceContextMenuItems({
   workspace,
   onRemoveRequest,
+  onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
   onRemoveRequest: () => void;
+  /** Called when the user clicks a host in the "Move to host…"
+   *  submenu. Opens the Phase-4 confirmation dialog unless the
+   *  user previously set "Don't ask again for this host". */
+  onRequestPushConfirm?: (host: HostView) => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const isWorktree = !!workspace.worktree_path;
@@ -246,8 +255,25 @@ export function WorkspaceContextMenuItems({
         host.id,
       );
       if (result.ok) {
-        toast.success(`Pushed to ${host.name}`, {
-          description: result.message,
+        // Push success → offer Undo = pull back. Same machinery
+        // the workspace's "Pull back to this device" item runs,
+        // wrapped so a misclick within 10s is one tap away from
+        // recovery. Data-safety guardrail for Phase 4.
+        toast.undoable({
+          message: `Pushed to ${host.name}`,
+          description: "Tap Undo within 10s to pull it back.",
+          onUndo: async () => {
+            const undoResult = await workspacePullBack(
+              workspace.workspace_id,
+            );
+            if (undoResult.ok) {
+              toast.success(`Pulled back from ${host.name}`);
+            } else {
+              toast.error("Pull back failed", {
+                description: undoResult.message,
+              });
+            }
+          },
         });
       } else {
         toast.error(`Push to ${host.name} failed`, {
@@ -264,12 +290,40 @@ export function WorkspaceContextMenuItems({
 
   const handlePullBack = async () => {
     setPushPullInFlight(workspace.workspace_id);
+    // Capture the source host id BEFORE the pull clears it on the
+    // workspace, so the undo closure knows where to push back to.
+    const sourceHostId = workspace.host_id;
+    const sourceHost = sourceHostId
+      ? hosts.find((h) => h.id === sourceHostId)
+      : null;
     try {
       const result = await workspacePullBack(workspace.workspace_id);
       if (result.ok) {
-        toast.success("Pulled back to this device", {
-          description: result.message,
-        });
+        if (sourceHost) {
+          toast.undoable({
+            message: "Pulled back to this device",
+            description: `From ${sourceHost.name}. Tap Undo within 10s to send it back.`,
+            onUndo: async () => {
+              const undoResult = await workspacePushToHost(
+                workspace.workspace_id,
+                sourceHost.id,
+              );
+              if (undoResult.ok) {
+                toast.success(`Pushed back to ${sourceHost.name}`);
+              } else {
+                toast.error("Push back failed", {
+                  description: undoResult.message,
+                });
+              }
+            },
+          });
+        } else {
+          // Source host disappeared (deleted between push and
+          // pull) — no undo possible, plain success.
+          toast.success("Pulled back to this device", {
+            description: result.message,
+          });
+        }
       } else {
         toast.error("Pull back failed", {
           description: result.message,
@@ -397,12 +451,25 @@ export function WorkspaceContextMenuItems({
         </ContextMenuItem>
       ) : hosts.length > 0 ? (
         <ContextMenuSub>
-          <ContextMenuSubTrigger>Move to host…</ContextMenuSubTrigger>
+          <ContextMenuSubTrigger>Move to device…</ContextMenuSubTrigger>
           <ContextMenuSubContent>
             {hosts.map((host) => (
               <ContextMenuItem
                 key={host.id}
-                onClick={() => void handleMoveToHost(host)}
+                onClick={() => {
+                  // Phase-4 confirmation gate. If the user clicked
+                  // "Don't ask again for X" previously, skip the
+                  // dialog and push immediately — otherwise hoist
+                  // to the parent to open the confirm modal.
+                  if (
+                    onRequestPushConfirm &&
+                    !shouldSkipPushConfirm(host.id)
+                  ) {
+                    onRequestPushConfirm(host);
+                  } else {
+                    void handleMoveToHost(host);
+                  }
+                }}
               >
                 {host.name}
               </ContextMenuItem>
@@ -412,9 +479,9 @@ export function WorkspaceContextMenuItems({
       ) : (
         <ContextMenuItem
           disabled
-          title="Add hosts in Settings → Hosts to push workspaces"
+          title="Add a device in Settings → Devices to push workspaces"
         >
-          Move to host… (no hosts configured)
+          Move to device… (no devices configured)
         </ContextMenuItem>
       )}
 
@@ -449,6 +516,56 @@ function AsciiSpinner() {
 
 export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const [showRemoveDialog, setShowRemoveDialog] = useState(false);
+  // Phase-4 push confirmation: holds the host the user just picked
+  // from the "Move to host…" submenu, so the dialog can render its
+  // summary + handle the actual push on confirm.
+  const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(
+    null,
+  );
+  const setPushPullInFlight = useAppStore(
+    (s) => s.setWorkspacePushPullInFlight,
+  );
+
+  const performPushToHost = async (host: HostView) => {
+    setPushPullInFlight(workspace.workspace_id);
+    try {
+      const result = await workspacePushToHost(
+        workspace.workspace_id,
+        host.id,
+      );
+      if (result.ok) {
+        // Undo = pull back. Same machinery as the workspace's
+        // "Pull back to this device" item; gives users a 10s
+        // escape hatch (Phase-4 safety guardrail).
+        toast.undoable({
+          message: `Pushed to ${host.name}`,
+          description: "Tap Undo within 10s to pull it back.",
+          onUndo: async () => {
+            const undoResult = await workspacePullBack(
+              workspace.workspace_id,
+            );
+            if (undoResult.ok) {
+              toast.success(`Pulled back from ${host.name}`);
+            } else {
+              toast.error("Pull back failed", {
+                description: undoResult.message,
+              });
+            }
+          },
+        });
+      } else {
+        toast.error(`Push to ${host.name} failed`, {
+          description: result.message,
+        });
+      }
+    } catch (err) {
+      toast.error("Push failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setPushPullInFlight(null);
+    }
+  };
 
   const workspaceStatus: ActivePaneStatus | null = useAppStore((s) => {
     if (!s.appState) return null;
@@ -470,11 +587,11 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     (s) => s.workspacePushPullInFlight === workspace.workspace_id,
   );
 
-  // When a worktree workspace has a PR, the leading icon doubles as the
-  // PR-state indicator (open=green, merged=purple, closed=red, draft=gray)
-  // and becomes a clickable button that opens the PR URL. The right-side
-  // cluster keeps just the muted "#39" number so the row carries the state
-  // signal at its leading edge without duplicating the icon.
+  // When a worktree workspace has a PR, the leading icon doubles as
+  // the PR-state indicator (open=green, merged=purple, closed=red,
+  // draft=gray) and becomes a clickable button that opens the PR URL.
+  // The PR number rides in the tooltip on hover; there's no trailing
+  // pill, since that would duplicate the same signal.
   const isWorktreeRow =
     !isPushOrPullInFlight &&
     !isRemote &&
@@ -482,6 +599,32 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     workspace.workspace_type !== "open_flow";
   const showWorkspaceIconAsPr = isWorktreeRow && !!workspace.pr_state;
 
+  // Phase-4d elapsed-time signal: when an in-flight push/pull
+  // crosses 2 seconds, show a small "12s" pill so the user knows
+  // the operation is still working. Identical math to the overview
+  // row — see workspace-overview-row.tsx LocalRow for the rationale.
+  const inFlightStartedAt = useAppStore(
+    (s) =>
+      s.workspacePushPullInFlight === workspace.workspace_id
+        ? s.workspacePushPullStartedAt
+        : null,
+  );
+  const [sidebarElapsedSec, setSidebarElapsedSec] = useState<number | null>(
+    null,
+  );
+  useEffect(() => {
+    if (inFlightStartedAt === null) {
+      setSidebarElapsedSec(null);
+      return;
+    }
+    const tick = () => {
+      const ms = Date.now() - inFlightStartedAt;
+      setSidebarElapsedSec(ms < 2_000 ? null : Math.floor(ms / 1_000));
+    };
+    tick();
+    const id = window.setInterval(tick, 1_000);
+    return () => window.clearInterval(id);
+  }, [inFlightStartedAt]);
   const icon = isPushOrPullInFlight ? (
     <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
@@ -588,11 +731,20 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   {workspace.title}
                 </span>
 
+                {sidebarElapsedSec !== null && (
+                  <span
+                    title="Push/pull in progress — large workspaces can take a while."
+                    className="shrink-0 ml-auto rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                  >
+                    {sidebarElapsedSec}s
+                  </span>
+                )}
                 {workspace.notification_count > 0 && (
                   <Badge
                     variant="outline"
                     className={cn(
-                      "shrink-0 ml-auto text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
+                      "shrink-0 text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
+                      sidebarElapsedSec === null && "ml-auto",
                       canDelete && "transition-opacity group-hover/row:opacity-0",
                     )}
                   >
@@ -691,12 +843,26 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
         <WorkspaceContextMenuItems
           workspace={workspace}
           onRemoveRequest={() => setShowRemoveDialog(true)}
+          onRequestPushConfirm={(host) => setPendingPushHost(host)}
         />
       </ContextMenu>
       <RemoveWorkspaceDialog
         workspace={workspace}
         open={showRemoveDialog}
         onOpenChange={setShowRemoveDialog}
+      />
+      <ConfirmPushDialog
+        open={pendingPushHost !== null}
+        workspaceTitle={workspace.title}
+        host={pendingPushHost}
+        onConfirm={() => {
+          if (pendingPushHost) {
+            void performPushToHost(pendingPushHost);
+          }
+        }}
+        onOpenChange={(open) => {
+          if (!open) setPendingPushHost(null);
+        }}
       />
     </>
   );
