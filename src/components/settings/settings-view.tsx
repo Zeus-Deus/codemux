@@ -149,7 +149,7 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     // because picking which machine to run on is a workflow decision,
     // not a personal preference. Always visible (no flag gate) since
     // the underlying daemon is now standard built-in behavior.
-    { id: "hosts", label: "Hosts", icon: Server },
+    { id: "hosts", label: "Devices", icon: Server },
     { id: "session_restore", label: "Session Restore", icon: RotateCcw },
   ];
 
@@ -1386,8 +1386,8 @@ export function SettingsView() {
         return (
           <div>
             <SectionHeader
-              title="Hosts"
-              description="Remote machines you can push workspaces to. SSH credentials stay on your device — only the host name and SSH target sync across your devices."
+              title="Devices"
+              description="Any machine you can SSH into — a home desktop, an always-on box, a cloud server. Push a workspace to any device, pull it back from any device. SSH credentials stay on your machine; only the device name and SSH target sync across your account."
             />
             <HostsSection />
           </div>

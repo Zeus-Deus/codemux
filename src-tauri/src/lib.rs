@@ -60,6 +60,8 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+pub mod workspace_paths;
+pub mod workspaces_sync;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -1217,6 +1219,48 @@ pub fn run() {
                 }
             });
 
+            // Workspaces sync loop — mirror the local workspace list
+            // into the `workspaces_sync` SQLite table, then push/pull
+            // against /api/workspaces. Runs every 30 seconds so cross-
+            // device visibility is eventually consistent within that
+            // window without each individual workspace mutation having
+            // to call out to the sync layer. The reconcile step
+            // (snapshot → workspaces_sync) is cheap (a diff over a
+            // small list); the push/pull only fires when there are
+            // dirty rows OR the server has new rows to advertise.
+            //
+            // Failure mode: any reconcile or sync error is logged and
+            // the loop continues. The dirty flag stays set so the
+            // next tick re-tries.
+            let sync_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Small initial delay so we don't fight startup IO.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                loop {
+                    let app_state: tauri::State<'_, state::AppStateStore> =
+                        sync_handle.state();
+                    let db: tauri::State<'_, database::DatabaseStore> =
+                        sync_handle.state();
+                    let snapshot = app_state.snapshot();
+                    if let Err(error) = workspaces_sync::reconcile_from_snapshot(
+                        db.inner(),
+                        &snapshot,
+                    ) {
+                        eprintln!(
+                            "[codemux::workspaces-sync] reconcile failed: {error}"
+                        );
+                    }
+                    if let Err(error) =
+                        workspaces_sync::try_sync_with_app(&sync_handle).await
+                    {
+                        eprintln!(
+                            "[codemux::workspaces-sync] background sync failed: {error}"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
+
             // Window lifecycle breadcrumbs: this lets us tell whether a second process
             // actually reached window creation or if it exited early.
             #[cfg(debug_assertions)]
@@ -1560,6 +1604,11 @@ pub fn run() {
             commands::automations_delete,
             commands::automations_runs,
             commands::automations_check_repo_access,
+            commands::workspaces_sync_list,
+            commands::workspaces_sync_now,
+            commands::workspaces_adoption_preview,
+            commands::workspaces_adopt_synced,
+            commands::workspaces_adopt_via_clone,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

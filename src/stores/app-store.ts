@@ -21,6 +21,11 @@ interface AppStore {
    *  running. Set by the workspace context menu's Move/Pull handlers
    *  and cleared in the completion callback (success or failure). */
   workspacePushPullInFlight: string | null;
+  /** Timestamp (Date.now()) when the current push/pull started. Used
+   *  by the overview row to render an "elapsed Ns" label when an
+   *  operation takes longer than ~2 seconds (Phase-4d signal). Null
+   *  when no operation is in flight. */
+  workspacePushPullStartedAt: number | null;
   setAppState: (snapshot: AppStateSnapshot) => void;
   setHomeDir: (homeDir: string) => void;
   setWorkspacePushPullInFlight: (workspaceId: string | null) => void;
@@ -30,10 +35,16 @@ export const useAppStore = create<AppStore>((set) => ({
   appState: null,
   homeDir: null,
   workspacePushPullInFlight: null,
+  workspacePushPullStartedAt: null,
   setAppState: (snapshot) => set({ appState: snapshot }),
   setHomeDir: (homeDir) => set({ homeDir }),
+  // Pair the workspace id with a start timestamp so "elapsed" can
+  // be computed at render time. Null clears both.
   setWorkspacePushPullInFlight: (workspaceId) =>
-    set({ workspacePushPullInFlight: workspaceId }),
+    set({
+      workspacePushPullInFlight: workspaceId,
+      workspacePushPullStartedAt: workspaceId === null ? null : Date.now(),
+    }),
 }));
 
 // Derived selectors

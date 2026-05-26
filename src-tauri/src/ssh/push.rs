@@ -24,7 +24,7 @@
 #![cfg(unix)]
 
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -422,24 +422,11 @@ pub fn claude_project_dir_name(absolute_path: &std::path::Path) -> String {
         .collect()
 }
 
-pub fn conventional_remote_path(project_name: &str, branch: &str) -> PathBuf {
-    fn sanitize(s: &str) -> String {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                c
-            } else {
-                '-'
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string()
-    }
-    let p = sanitize(project_name);
-    let b = sanitize(branch);
-    let p = if p.is_empty() { "workspace".to_string() } else { p };
-    let b = if b.is_empty() { "main".to_string() } else { b };
-    PathBuf::from(format!("~/.codemux/worktrees/{p}/{b}"))
-}
+/// Cross-platform — see `crate::workspace_paths::conventional_remote_path`.
+/// Kept as a Unix-side re-export so existing call sites compile
+/// unchanged. Windows builds reach the underlying function through
+/// `crate::workspace_paths` directly.
+pub use crate::workspace_paths::conventional_remote_path;
 
 #[cfg(test)]
 mod tests {
