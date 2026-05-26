@@ -60,6 +60,7 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+pub mod workspace_paths;
 pub mod workspaces_sync;
 pub mod state;
 pub mod hooks;

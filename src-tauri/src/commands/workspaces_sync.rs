@@ -225,7 +225,7 @@ pub fn workspaces_adoption_preview(
         .and_then(|n| n.to_str())
         .unwrap_or("workspace");
     let branch = row.git_branch.as_deref().unwrap_or("main");
-    let conv = crate::ssh::conventional_remote_path(project_name, branch);
+    let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
     let conv_str = conv.to_string_lossy().to_string();
     // The conventional path uses `~/` — expand for the local check.
     let suggested_path = if let Some(rest) = conv_str.strip_prefix("~/") {
@@ -364,7 +364,7 @@ pub async fn workspaces_adopt_synced(
             .and_then(|n| n.to_str())
             .unwrap_or("workspace");
         let branch = row.git_branch.as_deref().unwrap_or("main");
-        let conv = crate::ssh::conventional_remote_path(project_name, branch);
+        let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
         let conv_str = conv.to_string_lossy().to_string();
         let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
             dirs::home_dir()
@@ -536,7 +536,7 @@ pub async fn workspaces_adopt_via_clone(
         // Worktree path matches the canonical layout push/pull use,
         // so a future push to a shared host lands at the same
         // remote path another device would.
-        let conv = crate::ssh::conventional_remote_path(&project_name, &branch);
+        let conv = crate::workspace_paths::conventional_remote_path(&project_name, &branch);
         let conv_str = conv.to_string_lossy().to_string();
         let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
             home.join(rest)
