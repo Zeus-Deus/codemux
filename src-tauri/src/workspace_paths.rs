@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 /// The canonical worktree path layout used by push, pull, and
 /// adoption across every platform:
 ///
-///     ~/.codemux/worktrees/<project>/<branch>
+/// ```text
+/// ~/.codemux/worktrees/<project>/<branch>
+/// ```
 ///
 /// Sanitises both segments to ASCII-alphanumeric + `_`, `-`, `.` —
 /// anything else becomes `-`. Empty inputs default to `workspace`
