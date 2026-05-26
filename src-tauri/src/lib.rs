@@ -47,6 +47,8 @@ pub mod project;
 // module from any code path).
 #[cfg(unix)]
 pub mod pty_daemon;
+#[cfg(unix)]
+pub mod remote;
 // SSH transport for the cloud-push feature. Unix-only — relies on
 // the system `ssh` + `scp` binaries (with the user's existing
 // `~/.ssh/config`, agent, and known_hosts).
@@ -60,6 +62,8 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+#[cfg(unix)]
+pub mod hosts_upgrade;
 pub mod workspace_paths;
 pub mod workspaces_sync;
 pub mod state;
@@ -593,6 +597,20 @@ pub fn run() {
             }
 
             control::spawn_control_server(app.handle().clone());
+
+            // Background host-upgrade poller. ~5s after app setup it
+            // walks every registered SSH host, version-checks its
+            // codemux-remote against the one this build ships, and
+            // silently re-bootstraps any host that's behind. So when
+            // the user updates Codemux on the desktop, their hosts
+            // catch up on their own — no Test/Push click required.
+            // Safe to run on every app start: cheap when versions
+            // match (one SSH probe), idempotent re-provision on
+            // upgrade, never installs codemux-remote where it isn't
+            // already present (that still requires the Install
+            // button's consent).
+            #[cfg(unix)]
+            crate::hosts_upgrade::spawn(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar from Tauri's resource
             // dir and pin the path via env var so the adapter (which has no

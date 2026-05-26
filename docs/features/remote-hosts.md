@@ -50,22 +50,156 @@ Wiring **deferred** to a follow-up (small UX work, no architectural risk):
 - Workspace header badge for non-local workspaces.
 - Workspace list filter dropdown.
 
-## `codemux-remote` slim binary (2c)
+## `codemux-remote` binary
 
-`src-tauri/src/bin/codemux_remote.rs`. New `[[bin]]` target in `Cargo.toml`. Same `codemux_lib` crate, no UI deps.
+`src-tauri/src/bin/codemux_remote.rs`. `[[bin]]` target in `src-tauri/Cargo.toml`. Same `codemux_lib` crate, no UI deps.
 
 CLI:
 ```
 codemux-remote version
-  → {"name":"codemux-remote","version":"0.3.1","protocol_version":1}
+  → {"name":"codemux-remote","version":"<v>","protocol_version":1}
 
 codemux-remote pty-daemon --socket /tmp/codemux-ptyd-<rand>.sock
-  → binds the socket, runs the daemon server, never returns
+  → binds the Unix socket the laptop's "Push workspace" tunnel uses,
+    runs the PTY daemon server, never returns.
 
 codemux-remote scheduler
   → runs the Automations reconcile + pull + tick + execute loop on an
-    always-on host; never returns
+    always-on host; never returns.
+
+codemux-remote serve [--port <n>] [--state-dir <path>]
+  → runs the headless Codemux daemon: axum HTTP server on 127.0.0.1
+    with bearer-token auth (manifest at <state-dir>/manifest.json,
+    mode 0600). Tracks workspaces in <state-dir>/codemux.db. Survives
+    SIGTERM/SIGINT cleanly (manifest is removed on shutdown). v1
+    listens loopback-only; the desktop tunnels in over SSH.
+
+codemux-remote serve status [--state-dir <path>]
+  → prints {endpoint, pid, started_at, host_id, alive} as JSON.
+    Exit 0 if alive, exit 1 otherwise.
+
+codemux-remote serve stop [--state-dir <path>]
+  → SIGTERM the running daemon (pid read from manifest).
+
+codemux-remote mcp [--state-dir <path>]
+  → stdio JSON-RPC MCP server. Reads <state-dir>/manifest.json for the
+    daemon's endpoint + secret, then bridges agent CLI tool calls to
+    the daemon's HTTP API. Configure your CLI agent with:
+    {"command": "codemux-remote", "args": ["mcp"]}
 ```
+
+### `serve` mode overview
+
+The `serve` subcommand is the headless equivalent of running the
+desktop Codemux app on this host — an MCP-aware agent on this machine
+can drive Codemux locally without any UI. Module layout:
+
+- `src-tauri/src/remote/manifest.rs` — manifest read/write, pid liveness.
+- `src-tauri/src/remote/auth.rs` — bearer-token axum middleware,
+  attaches `Identity::Local` to the request.
+- `src-tauri/src/remote/identity.rs` — `Identity::Local | Cloud{…}`.
+  v1 only ever produces `Local`; the `Cloud` variant is here so a
+  future optional relay layer can forward verified identity without
+  changing handler signatures.
+- `src-tauri/src/remote/workspace.rs` — SQLite workspace registry
+  with nullable `owner_id` column for future relay use.
+- `src-tauri/src/remote/pty.rs` — minimal portable-pty wrapper with
+  per-terminal ring buffer.
+- `src-tauri/src/remote/server.rs` — axum routes (`/health`,
+  `/tools/list`, `/tools/call`).
+- `src-tauri/src/remote/mcp.rs` — stdio MCP server.
+- `src-tauri/src/remote/tools/mod.rs` — 11-tool catalog.
+
+Headless tool surface (advertised via `tools/list`):
+
+| Tool | Purpose |
+|---|---|
+| `workspace_create` | Register a new workspace. |
+| `workspace_list` | All workspaces, newest first. |
+| `workspace_info` | One workspace by id. |
+| `workspace_update` | Mutate name/branch/notes. |
+| `workspace_close` | Remove from registry. |
+| `terminal_spawn` | Spawn a shell PTY. |
+| `terminal_write` | Write bytes to PTY stdin. |
+| `terminal_read` | Read accumulated PTY output. |
+| `terminal_list` | List open PTYs. |
+| `terminal_close` | SIGHUP the shell. |
+| `app_status` | Daemon version, uptime, counts. |
+
+Deliberately *not* in the headless surface: `pane_*`, `browser_*`
+(no UI on a headless host).
+
+### Process supervision
+
+Sample systemd user unit at `scripts/codemux-remote.service.example`.
+Install:
+
+```
+cp scripts/codemux-remote.service.example ~/.config/systemd/user/codemux-remote.service
+loginctl enable-linger $USER
+systemctl --user daemon-reload
+systemctl --user enable --now codemux-remote.service
+```
+
+`Restart=on-failure`, `StandardError=journal`, `loginctl enable-linger`
+so the daemon survives ssh logouts and reboots.
+
+### Designing for a future optional cloud relay
+
+`docs/plans/mcp-on-remote.md` details the four design choices baked
+into v1 so that a paid-tier cloud relay (team collaboration, "control
+from phone without SSH") can be added later as a purely additive
+feature, not a rewrite: HTTP transport + bearer-token, `Identity`
+passthrough, nullable `owner_id`, no Better-Auth coupling in the
+daemon. None of those four costs anything today.
+
+### Auto-provisioning on push (the "it just works" flow)
+
+The desktop's push flow does the following automatically, so the user
+never has to know about manifests, secrets, or systemd:
+
+1. **Binary install.** `ssh::bootstrap::bootstrap_remote` scp's the
+   matching `codemux-remote-<target>` to `~/.local/bin/codemux-remote`
+   and chmods it. Skipped if `version` already returns the right value.
+2. **`serve` systemd unit.** `ssh::bootstrap::provision_serve` writes
+   `~/.config/systemd/user/codemux-remote.service`, runs
+   `loginctl enable-linger` so it survives logout, and
+   `systemctl --user enable --now codemux-remote`. The daemon binds an
+   ephemeral loopback port and writes its manifest under
+   `~/.local/share/codemux-remote/`.
+3. **`.mcp.json` in the pushed workspace.** `ssh::push::push_workspace`
+   drops a `.mcp.json` into the rsynced workspace directory pointing
+   `codemux` at `codemux-remote mcp`. Any CLI agent (Claude Code,
+   Codex, Gemini) launched in that directory on the host auto-discovers
+   Codemux as an MCP server with zero further config.
+4. **Workspace registration.** After rsync,
+   `ssh::bootstrap::register_workspace_on_remote` runs `codemux-remote
+   workspace register --path ... --name ... --branch ...` on the host
+   via SSH. That command talks to the local daemon over loopback HTTP
+   and inserts the workspace into its registry, so it shows in
+   `workspace_list` from any MCP-aware agent on the host.
+
+Net effect: user clicks "Push workspace to host" once, gets back a
+working MCP control plane on the remote without ever having to know
+the words "manifest" or "systemd."
+
+### Controlling the daemon from your phone (Tailscale)
+
+v1's transport is SSH-only — there is no cloud relay. The cleanest
+way to drive your home/VPS Codemux daemon from a phone today is
+**Tailscale**:
+
+1. Install Tailscale on both the host running `codemux-remote serve`
+   and your phone (Tailscale has iOS and Android apps).
+2. Both devices join the same tailnet.
+3. From any agent app on the phone that can SSH (or any web shell
+   pointed at the host's tailnet name), `ssh <host>` works without
+   any port forwarding or DDNS.
+
+This costs nothing, works today, and is what we recommend until the
+optional cloud relay (paid tier) ships. The relay would replace the
+SSH-from-phone requirement, not the Tailscale-or-similar mesh — some
+users will always prefer mesh VPN over a hosted relay for privacy.
 
 The `scheduler` subcommand was added by the Automations feature, not by
 2c. Host bootstrap provisions it — it writes the scheduler token + host
