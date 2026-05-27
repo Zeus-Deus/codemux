@@ -281,6 +281,23 @@ describe("WorkspacesOverviewSection", () => {
     expect(getByText("lost-and-found")).toBeInTheDocument();
   });
 
+  it("shows a configured host's bucket even when no workspaces live on it yet", () => {
+    // Regression for the "I added a device, it doesn't show up in the
+    // overview until I push a workspace" bug. The host has a server_id
+    // (i.e. it's synced cross-device), there are no workspaces on it,
+    // and there's a local workspace so the local bucket is non-empty.
+    // The configured-host bucket must still render — otherwise the
+    // user has no way to discover the device from the overview, nor
+    // any obvious target to push to.
+    mockHosts = [makeHost(7, "pandora")];
+    mockWorkspaces = [
+      makeWorkspace({ workspace_id: "local-1", title: "alpha" }),
+    ];
+    const { getByText } = render(<WorkspacesOverviewSection />);
+    expect(getByText("This device")).toBeInTheDocument();
+    expect(getByText("pandora")).toBeInTheDocument();
+  });
+
   it("renders the bucket-level 'all hidden by filter' message when filters hide every workspace in a known device bucket", () => {
     // Intentional: when the user has a bucket they recognise but
     // every row in it is filtered out, the bucket stays visible

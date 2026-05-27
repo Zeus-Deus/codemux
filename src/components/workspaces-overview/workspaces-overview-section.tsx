@@ -352,9 +352,23 @@ export function WorkspacesOverviewSection() {
       bucket.items.sort(sorter);
     }
 
-    // Hide buckets that have neither items nor any unfiltered rows.
+    // Keep configured-host buckets (localHostId != null) even when
+    // empty — matches the intent stated above at the pre-create step:
+    // a device the user has set up should be visible in the overview
+    // the moment it's configured, not only after the first workspace
+    // lands on it. Without this, an empty pandora bucket gets created
+    // and then immediately stripped here, which is why the user only
+    // ever saw "This device" until they pushed a workspace.
+    //
+    // Orphan buckets (localHostId == null, hostServerId != null) and
+    // the special "local" bucket still follow the items/totalCount
+    // rule so the overview doesn't render a dangling "This device"
+    // row when the user has zero workspaces and zero remote rows.
     return Array.from(byKey.values())
-      .filter((b) => b.items.length > 0 || b.totalCount > 0)
+      .filter(
+        (b) =>
+          b.localHostId !== null || b.items.length > 0 || b.totalCount > 0,
+      )
       .sort((a, b) => a.sortRank - b.sortRank);
   }, [allItems, filtered, hosts, sortBy, activeWorkspaceId]);
 
