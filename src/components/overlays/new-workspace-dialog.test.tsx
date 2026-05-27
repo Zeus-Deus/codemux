@@ -737,10 +737,19 @@ describe("Clipboard image paste", () => {
 
     // The chip renders the trailing filename component (the existing
     // attachment-strip logic lifts it via `.split("/").pop()`).
-    await waitFor(() => {
-      const chips = within(dialog).getAllByText("paste-xyz.png");
-      expect(chips.length).toBeGreaterThan(0);
-    });
+    //
+    // The default 1000ms waitFor isn't enough on a busy Windows CI
+    // runner: paste → await mock → setAttachments → React commit can
+    // stretch past a second when the runner is under load. The fail
+    // mode was Windows-only (Linux/macOS resolved well under 100ms),
+    // so we widen the budget rather than pushing on a real bug.
+    await waitFor(
+      () => {
+        const chips = within(dialog).getAllByText("paste-xyz.png");
+        expect(chips.length).toBeGreaterThan(0);
+      },
+      { timeout: 5000 },
+    );
   });
 
   it("stays silent when the OS clipboard has no image", async () => {

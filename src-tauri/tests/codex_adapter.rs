@@ -205,7 +205,7 @@ async fn starts_session_and_reports_ready() {
         evs
     });
 
-    let session = provider.start_session(start_input("t-ready")).await.unwrap();
+    let session = start_session_resilient(&provider, start_input("t-ready")).await.unwrap();
     assert_eq!(session.thread_id.0, "t-ready");
     assert!(matches!(session.status, SessionStatus::Ready));
 
@@ -233,7 +233,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-seq")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-seq")).await.unwrap();
     let mut stream = provider.event_stream();
 
     provider
@@ -292,7 +292,7 @@ async fn thread_resume_with_recoverable_error_falls_back_to_start() {
 
     let mut input = start_input("t-resume");
     input.resume_cursor = Some(json!({"threadId":"old-thread"}));
-    let session = provider.start_session(input).await.unwrap();
+    let session = start_session_resilient(&provider, input).await.unwrap();
     assert!(matches!(session.status, SessionStatus::Ready));
 
     // Look for the RuntimeWarning on the stream.
@@ -326,7 +326,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-unk")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-unk")).await.unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -372,7 +372,7 @@ async fn command_approval_request_roundtrip() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-ap")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-ap")).await.unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -428,7 +428,7 @@ async fn command_approval_deny_roundtrip() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-deny")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-deny")).await.unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -476,7 +476,7 @@ async fn interrupt_turn_sends_turn_interrupt() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-int")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-int")).await.unwrap();
     let res = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-int".into()),
@@ -510,7 +510,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-mm")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-mm")).await.unwrap();
     provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-mm".into()),
@@ -535,7 +535,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_permission_mode_returns_validation_error() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-perm")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-perm")).await.unwrap();
     let err = provider
         .set_permission_mode(ThreadId("t-perm".into()), "acceptEdits".into())
         .await
@@ -547,7 +547,7 @@ async fn set_permission_mode_returns_validation_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_model_updates_session_state() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-model")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-model")).await.unwrap();
     provider
         .set_model(ThreadId("t-model".into()), "opus-4-7".into())
         .await
@@ -571,7 +571,7 @@ async fn set_model_updates_session_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_session_removes_from_list_and_closes_child() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-close")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-close")).await.unwrap();
     assert_eq!(provider.list_sessions().await.unwrap().len(), 1);
     provider
         .stop_session(ThreadId("t-close".into()))
@@ -583,7 +583,7 @@ async fn stop_session_removes_from_list_and_closes_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_session_is_idempotent() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-idem")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-idem")).await.unwrap();
     provider.stop_session(ThreadId("t-idem".into())).await.unwrap();
     let err = provider
         .stop_session(ThreadId("t-idem".into()))
@@ -612,8 +612,8 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_start_session_returns_validation_error() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-dup")).await.unwrap();
-    let err = provider.start_session(start_input("t-dup")).await.unwrap_err();
+    start_session_resilient(&provider, start_input("t-dup")).await.unwrap();
+    let err = start_session_resilient(&provider, start_input("t-dup")).await.unwrap_err();
     assert!(matches!(err, ProviderError::ValidationError { .. }));
     provider.stop_session(ThreadId("t-dup".into())).await.ok();
 }
@@ -624,7 +624,7 @@ async fn child_process_crash_emits_error_state() {
     // acknowledged.
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_EXIT_AFTER", "turn/start")]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-crash")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
     // turn/start will succeed then the fixture exits.
     let _ = provider
@@ -666,7 +666,7 @@ async fn concurrent_send_turn_returns_validation_error() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-busy")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-busy")).await.unwrap();
     provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
@@ -701,7 +701,7 @@ async fn multiple_concurrent_sessions_are_isolated() {
     for i in 0..3 {
         let p = Arc::clone(&provider);
         handles.push(tokio::spawn(async move {
-            p.start_session(start_input(&format!("t-iso-{i}"))).await
+            start_session_resilient(&p, start_input(&format!("t-iso-{i}"))).await
         }));
     }
     for h in handles {
@@ -723,7 +723,7 @@ async fn event_stream_subscribers_each_receive_events() {
     let provider = provider_with_fixture();
     let mut a = provider.event_stream();
     let mut b = provider.event_stream();
-    provider.start_session(start_input("t-sub")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-sub")).await.unwrap();
     let got_a = timeout(Duration::from_secs(2), a.next()).await.unwrap();
     let got_b = timeout(Duration::from_secs(2), b.next()).await.unwrap();
     assert!(got_a.is_some());
@@ -734,7 +734,7 @@ async fn event_stream_subscribers_each_receive_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_subscriber_does_not_get_old_events() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-late")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-late")).await.unwrap();
     // Wait for the first burst of events to pass.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -755,7 +755,7 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-fail")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-fail")).await.unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -807,6 +807,37 @@ fn write_bash_script(_prefix: &str, body: &str) -> ScriptFile {
     ScriptFile { _dir: dir, path }
 }
 
+/// Start a session, retrying transient ETXTBSY ("Text file busy")
+/// failures from the kernel.
+///
+/// Why this exists: cargo runs tests in parallel inside one binary,
+/// and tokio's `Command::spawn` falls back to fork+exec on Linux when
+/// it can't use `posix_spawn`. If another test's `File::create` for
+/// its own wrapper script is in-flight at the moment we fork, the
+/// child inherits that write fd briefly; then our `execve()` of OUR
+/// wrapper sees a non-zero `i_writecount` on the inode (the kernel
+/// doesn't distinguish "this exec target" from "any open writer
+/// across all fds the child inherited") and rejects with ETXTBSY.
+/// The race window is microseconds, but it's real and shows up under
+/// CI load. A small retry loop sidesteps it without changing
+/// production code.
+async fn start_session_resilient(
+    provider: &CodexAgentProvider,
+    input: StartSessionInput,
+) -> Result<codemux_lib::agent_provider::ProviderSession, ProviderError> {
+    for _ in 0..10 {
+        match provider.start_session(input.clone()).await {
+            Ok(s) => return Ok(s),
+            Err(e) if format!("{e:?}").contains("Text file busy") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    provider.start_session(input).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_probe_installed_returns_version_when_codex_works() {
     let wrapper = write_bash_script(
@@ -838,7 +869,9 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
     );
     let helper = write_bash_script("codex-bogus-", &body);
     let provider = provider_with_fixture_and_binary(helper.to_path_buf());
-    provider.start_session(start_input("t-bogus")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-bogus"))
+        .await
+        .unwrap();
     // Adapter should still work after the spurious id.
     provider
         .send_turn(SendTurnInput {
@@ -857,7 +890,7 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_provider_shuts_down_sessions() {
     let provider = provider_with_fixture();
-    provider.start_session(start_input("t-drop")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-drop")).await.unwrap();
     let sessions = provider.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
     drop(provider);
@@ -899,7 +932,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
         ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    provider.start_session(start_input("t-race")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-race")).await.unwrap();
     // Start a turn that will emit events mid-flight, then stop quickly.
     provider
         .send_turn(SendTurnInput {
