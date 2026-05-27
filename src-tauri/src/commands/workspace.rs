@@ -696,12 +696,44 @@ pub(crate) async fn close_workspace_with_worktree_impl(
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
 
+    // Reconcile the sync mirror BEFORE the optimistic emit so the
+    // workspaces overview sees the soft-delete in the same tick that
+    // app_state loses the workspace. Without this, the orphan
+    // `workspaces_sync` row (whose `workspace_id` no longer maps to a
+    // live snapshot) is classified as a sibling-device workspace by
+    // `useOverviewItems` and renders with the "other device" badge for
+    // up to ~30 s, until the background reconcile loop catches up.
+    // Errors here are non-fatal: the close itself already succeeded,
+    // and the background tick will retry the reconcile + push.
+    {
+        let snapshot = state.snapshot();
+        if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(
+            db,
+            &snapshot,
+        ) {
+            eprintln!(
+                "[workspaces-sync] reconcile after close failed (will \
+                 retry on next background tick): {error}"
+            );
+        }
+    }
+
     // Optimistic emit: the workspace is gone from in-memory state. Push the
     // update to the frontend NOW so the sidebar row disappears immediately,
     // even when the filesystem cleanup below takes seconds (large worktrees,
     // slow disk). A second emit at the end of the command picks up any
     // session/agent-chat fan-out the cleanup triggers.
     crate::state::emit_app_state(&app);
+
+    // Best-effort push of the soft-delete to the server so sibling
+    // devices learn the workspace is gone immediately instead of
+    // waiting for the 30 s background tick. Non-fatal on failure.
+    if let Err(error) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] sync after close failed (will retry on \
+             next background tick): {error}"
+        );
+    }
 
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
@@ -968,11 +1000,40 @@ pub async fn close_workspace(
 
     let result = state.close_workspace(&workspace_id)?;
 
+    // Reconcile the sync mirror BEFORE the optimistic emit — see the
+    // matching block in `close_workspace_with_worktree_impl` for the
+    // full reasoning. In short: without this, the orphan
+    // `workspaces_sync` row mis-renders as a sibling-device workspace
+    // in the overview until the 30 s background tick. Non-fatal on
+    // failure.
+    {
+        let snapshot = state.snapshot();
+        if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(
+            db.inner(),
+            &snapshot,
+        ) {
+            eprintln!(
+                "[workspaces-sync] reconcile after close failed (will \
+                 retry on next background tick): {error}"
+            );
+        }
+    }
+
     // Optimistic emit: the workspace is gone from in-memory state. Push the
     // update to the frontend NOW so the sidebar row disappears immediately,
     // even if a PTY shutdown or agent-chat thread takes a moment to wind
     // down. A second emit at the end of the command picks up any fan-out.
     crate::state::emit_app_state(&app);
+
+    // Best-effort push of the soft-delete to the server so sibling
+    // devices learn the workspace is gone immediately instead of
+    // waiting for the 30 s background tick. Non-fatal on failure.
+    if let Err(error) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] sync after close failed (will retry on \
+             next background tick): {error}"
+        );
+    }
 
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
