@@ -237,10 +237,20 @@ export function useOverviewItems(): {
 
     // 2) Every sync row with NO local workspace counterpart is a
     //    sibling-device workspace. Render as "remote".
+    //
+    //    Defense in depth: a row whose `workspace_id` IS set (non-null)
+    //    used to map to a local workspace on this device — it's not a
+    //    sibling-device row, it's a self-orphan from a workspace that
+    //    was just closed and whose `workspaces_sync` soft-delete hasn't
+    //    reached this snapshot yet (the close path's reconcile + sync
+    //    runs before the next emit, but if it ever fails, the
+    //    background tick is still ~30 s away). Skipping these rows here
+    //    keeps the closed workspace from briefly appearing as
+    //    "lives on another device" in the overview. True sibling-device
+    //    rows always have `workspace_id === null` until adopted.
     for (const row of syncRows) {
       if (consumedSyncIds.has(row.id)) continue;
-      // Rows we haven't adopted locally — workspace_id is null OR
-      // it referenced a local id we no longer have.
+      if (row.workspace_id !== null) continue;
       result.push({
         kind: "remote",
         key: `remote:${row.server_id ?? row.id}`,

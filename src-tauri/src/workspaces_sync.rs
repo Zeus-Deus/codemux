@@ -722,6 +722,168 @@ mod tests {
         assert_eq!(listed[0].workspace_id.as_deref(), Some("workspace-42"));
     }
 
+    // ── reconcile_from_snapshot regression guards ───────────────
+    //
+    // These exercise the full reconcile bridge, not just the DB
+    // mutations underneath. The motivating regression is the close
+    // path: when a workspace is closed locally, the `workspaces_sync`
+    // row MUST be soft-deleted in the same tick so the overview
+    // doesn't briefly render the closed workspace as "lives on
+    // another device" (see use-overview-items.ts step 2).
+
+    fn make_ws(id: &str, title: &str) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId(id.to_string()),
+            title: title.to_string(),
+            workspace_type: WorkspaceType::Standard,
+            cwd: "/tmp".into(),
+            git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: None,
+            worktree_path: None,
+            project_root: None,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            tabs: Vec::new(),
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: Vec::new(),
+            host_id: None,
+        }
+    }
+
+    fn make_snapshot(
+        workspaces: Vec<crate::state::WorkspaceSnapshot>,
+    ) -> crate::state::AppStateSnapshot {
+        use crate::state::*;
+        let active = workspaces
+            .first()
+            .map(|w| w.workspace_id.clone())
+            .unwrap_or_else(|| WorkspaceId(String::new()));
+        AppStateSnapshot {
+            schema_version: 1,
+            active_workspace_id: active,
+            workspaces,
+            terminal_sessions: Vec::new(),
+            browser_sessions: Vec::new(),
+            agent_browser_sessions: Vec::new(),
+            notifications: Vec::new(),
+            detected_ports: Vec::new(),
+            pane_statuses: std::collections::HashMap::new(),
+            persistence: PersistenceSchema {
+                schema_version: 1,
+                stores_layout_metadata: true,
+                stores_terminal_metadata: true,
+                stores_live_process_state: false,
+            },
+            config: CodemuxConfigSnapshot {
+                config_version: 1,
+                default_shell: None,
+                theme_source: "system".into(),
+                linux_first: false,
+                notification_sound_enabled: false,
+                ai_commit_message_enabled: false,
+                ai_commit_message_cli: None,
+                ai_commit_message_model: None,
+                ai_resolver_enabled: false,
+                ai_resolver_cli: None,
+                ai_resolver_model: None,
+                ai_resolver_strategy: "smart_merge".into(),
+            },
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_inserts_row_for_new_workspace() {
+        let db = fresh_db();
+        let snapshot = make_snapshot(vec![make_ws("workspace-A", "alpha")]);
+
+        super::reconcile_from_snapshot(&db, &snapshot).unwrap();
+
+        let list = db.list_workspaces_sync();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].workspace_id.as_deref(), Some("workspace-A"));
+        assert_eq!(list[0].title, "alpha");
+        assert!(list[0].dirty, "freshly inserted row must be dirty");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_soft_deletes_row_when_workspace_closed() {
+        // The regression guard for the "closed workspace briefly appears
+        // as 'lives on another device'" bug. When a local workspace is
+        // closed, the close path now calls reconcile_from_snapshot
+        // immediately, which must soft-delete the orphan sync row so
+        // the overview no longer treats it as a sibling-device row.
+        let db = fresh_db();
+
+        // First reconcile: workspace exists, row gets inserted.
+        let with_ws =
+            make_snapshot(vec![make_ws("workspace-doomed", "to-be-closed")]);
+        super::reconcile_from_snapshot(&db, &with_ws).unwrap();
+        assert_eq!(db.list_workspaces_sync().len(), 1);
+
+        // Simulate close: snapshot no longer contains the workspace.
+        let empty = make_snapshot(Vec::new());
+        super::reconcile_from_snapshot(&db, &empty).unwrap();
+
+        // The sync row must be soft-deleted: invisible to list(),
+        // visible (with deleted_at + dirty) to list_for_sync() so the
+        // next push can DELETE it on the server.
+        assert_eq!(
+            db.list_workspaces_sync().len(),
+            0,
+            "list_workspaces_sync must hide the soft-deleted row so \
+             useOverviewItems can't classify it as a sibling-device row"
+        );
+        let all = db.list_workspaces_sync_for_sync();
+        assert_eq!(all.len(), 1);
+        assert!(all[0].deleted_at.is_some());
+        assert!(all[0].dirty, "soft-delete must mark the row dirty for push");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_preserves_pulled_only_rows() {
+        // Sibling-device rows arrive via pull and have `workspace_id IS
+        // NULL`. Reconcile must NEVER touch them — they have no
+        // app_state counterpart by design. Otherwise closing a local
+        // workspace could accidentally soft-delete a sibling row.
+        let db = fresh_db();
+        db.upsert_workspace_sync_from_server(
+            "srv-99",
+            "from-sibling",
+            Some("host-7"),
+            Some("/sibling/path"),
+            None,
+            Some("main"),
+            None,
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:00:00",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.list_workspaces_sync().len(), 1);
+
+        let empty = make_snapshot(Vec::new());
+        super::reconcile_from_snapshot(&db, &empty).unwrap();
+
+        let after = db.list_workspaces_sync();
+        assert_eq!(after.len(), 1, "pulled-only sibling row must survive");
+        assert!(after[0].workspace_id.is_none());
+        assert_eq!(after[0].title, "from-sibling");
+    }
+
     #[test]
     #[serial]
     fn delete_a_row_that_never_synced_is_a_local_no_op() {
