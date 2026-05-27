@@ -78,9 +78,22 @@ pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
         // `codemux-remote version` if available. The remote-side
         // `printf` separates the two with a sentinel so the laptop
         // can split.
+        //
+        // The `$HOME/.local/bin/codemux-remote` fallback exists because
+        // bootstrap installs there, but a non-interactive SSH shell
+        // (which is what `ssh user@host 'cmd'` runs) typically does NOT
+        // source `~/.profile` — so `~/.local/bin` is missing from PATH
+        // on most distros (Arch, Ubuntu, Debian, Fedora). Without the
+        // fallback, `command -v` returns nothing immediately after a
+        // successful install and the UI re-shows the install button on
+        // every subsequent "Test connection" press. Mirrors the same
+        // fix applied in `commands::hosts::ensure_remote_binary_current`
+        // and the supervisor's tunnel-spawn command.
         "printf 'UNAME: ' ; uname -sm ; \
          if command -v codemux-remote >/dev/null 2>&1 ; then \
            printf 'CMR: ' ; codemux-remote version ; \
+         elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
+           printf 'CMR: ' ; \"$HOME/.local/bin/codemux-remote\" version ; \
          else \
            printf 'CMR: NOT_INSTALLED\\n' ; \
          fi"
@@ -183,6 +196,37 @@ mod tests {
         // The remote command must be the LAST positional arg.
         assert!(argv.last().unwrap().contains("uname -sm"));
         assert!(argv.last().unwrap().contains("codemux-remote"));
+    }
+
+    #[test]
+    fn build_probe_argv_falls_back_to_home_local_bin() {
+        // Bootstrap installs to ~/.local/bin/codemux-remote, but a
+        // non-interactive ssh shell typically doesn't have that dir on
+        // PATH (it's added by ~/.profile, which only login shells
+        // source). Without an explicit fallback, `command -v` returns
+        // nothing immediately after a successful install and the UI
+        // re-shows the install button on every "Test" press.
+        //
+        // Lock in BOTH the PATH lookup AND the absolute-path fallback
+        // so a future refactor doesn't silently drop either branch.
+        let argv = build_probe_argv("zeus@10.0.0.5", 8);
+        let cmd = argv.last().unwrap();
+        assert!(
+            cmd.contains("command -v codemux-remote"),
+            "PATH lookup must remain (fast path when binary is on PATH)"
+        );
+        assert!(
+            cmd.contains("$HOME/.local/bin/codemux-remote"),
+            "absolute-path fallback must remain (covers the common case \
+             where ~/.local/bin isn't on the non-interactive PATH)"
+        );
+        // The fallback must run the binary, not just stat it — otherwise
+        // we'd report "installed" for a 0-byte file or a half-uploaded
+        // binary that doesn't actually execute.
+        assert!(
+            cmd.contains("\"$HOME/.local/bin/codemux-remote\" version"),
+            "fallback must invoke the binary's version subcommand"
+        );
     }
 
     #[test]
