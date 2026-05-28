@@ -32,7 +32,7 @@ Before this feature the sidebar only showed workspaces grouped by project on the
 - Result-count row underneath with a `New workspace` shortcut.
 - Body groups workspaces into **device sections**, in this order:
   1. `This device` (the local bucket — emerald accent + custom laptop glyph)
-  2. Each configured host in the order they appear in `Settings → Hosts` (sky-blue accent + cloud icon)
+  2. Each configured host in the order they appear in `Settings → Hosts` (sky-blue accent + cloud icon). **Configured-host buckets stay visible even when empty** — a device the user has set up shows in the overview the moment it's added, not only after the first workspace lands on it. The local `This device` bucket and any "Removed host" orphan bucket still follow the items-or-totalCount rule so a brand-new account with zero rows doesn't render a dangling header.
   3. Any `Removed host` orphan section, if a workspace still references a deleted host id (so rows never silently disappear)
 - Each device section header shows the host name + ssh target, a workspace count, and a "filtered" pill if any of the bucket's workspaces are hidden by the active filter.
 - Workspaces render as compact two-column cards (single column under `md`): status dot · title · project name · branch · git stats · hover-reveal action menu.
@@ -90,7 +90,8 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 - Pushed workspaces visibly migrate to the matching device bucket once the push succeeds.
 - Filters: search (title / branch / project), project, device, status, sort.
 - Per-row actions: open, copy branch, rename, push to any configured host, pull back, delete.
-- **Sibling-device adoption** (Phase 3): `Pull to this device` on any sibling row goes through `PullToDeviceDialog` and picks the right variant automatically — host-backed (rsync via the shared host) or clone-from-git fallback (git clone + worktree add).
+- **Sibling-device adoption** (Phase 3): `Pull to this device` on any sibling row goes through `PullToDeviceDialog` and picks the right variant automatically — host-backed (rsync via the shared host), clone-from-git fallback (git clone + worktree add), already-adopted (offers Open instead), or **`SameBranchProjectBlock`** when another local workspace already matches `(basename(project_path), git_branch)` of the remote row (offers "Open the existing workspace" and hides Pull so a pull can't silently clobber work in flight).
+- **Asymmetric auto-publish from `codemux-remote` hosts**: workspaces an agent creates directly on a host via the MCP `workspace_create` tool surface in the overview within ~90 s without an explicit push, courtesy of the `hosts_inventory` poller — see `docs/features/workspaces-sync.md` § "Asymmetric publish model" for the full design.
 - **Confirm-before-push + undo** (Phase 4a–b): every push opens `ConfirmPushDialog` (per-host "don't ask again" persists in localStorage); every successful push, pull, and adoption surfaces a 10-second `Undo` toast that fires the reverse action.
 - **Cross-device divergence chip** (Phase 4c): an amber `diverged` chip appears in the title line when the same workspace exists on multiple devices via clone-adoption and their git HEADs diverge. Tooltip suggests push or pull to reconcile.
 - **Elapsed-time pill** (Phase 4d): when a push or pull takes longer than ~2s, a compact `12s` pill renders next to the spinner so the user knows the operation is still working.
