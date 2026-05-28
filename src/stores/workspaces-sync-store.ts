@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { create } from "zustand";
 
 import { workspacesSyncList, type WorkspaceSyncView } from "@/tauri/commands";
@@ -16,10 +17,15 @@ import { workspacesSyncList, type WorkspaceSyncView } from "@/tauri/commands";
  * just reads what Rust has already mirrored.
  *
  * Refresh model:
- * - `init()` kicks off the first read on first hook subscription.
+ * - `useWorkspacesSync()` mount fires a fresh `refresh()` so reopening
+ *   the overview always reflects rows the background `hosts_inventory`
+ *   poller (or a peer device's sync push) inserted in the meantime.
  * - A foreground refresh runs every 5 seconds while at least one
  *   subscriber is mounted (the overview is one).
  * - `refresh()` is exposed for "Sync now" affordances.
+ * - `init()` is a passive imperative entry-point retained for
+ *   non-React callers — it short-circuits once the first load has
+ *   resolved, so it's safe to call from anywhere.
  *
  * Falls back to an empty list on error — never throws, so the UI
  * never breaks when the user is signed out or the DB momentarily
@@ -87,23 +93,31 @@ function ensurePolling() {
 }
 
 /** Hook for components that just want the rows. Auto-inits on first
- *  call and ref-counts to drive the polling interval — when no
+ *  call and ref-counts to drive the 5 s polling interval — when no
  *  subscriber is mounted, the poll skips so we don't wake the Rust
- *  side unnecessarily. */
+ *  side unnecessarily.
+ *
+ *  Subscriber lifecycle is managed via a `useEffect`: mount
+ *  increments the global counter, kicks a fresh `refresh()` (so
+ *  re-opening the overview always reflects rows the background
+ *  `hosts_inventory` poller or a peer device inserted while the
+ *  overview was closed — `init()` no-ops after the first call), and
+ *  arms the polling interval; unmount decrements. Strict Mode's
+ *  double-mount cleanly increments/decrements in pairs, so the
+ *  counter stays accurate. */
 export function useWorkspacesSync(): WorkspaceSyncView[] {
   const rows = useWorkspacesSyncStore((s) => s.rows);
-  const loaded = useWorkspacesSyncStore((s) => s.loaded);
-  const init = useWorkspacesSyncStore((s) => s.init);
-  if (!loaded) {
-    void init();
-  }
-  // Ref-count + polling: incremented on first render, decremented on
-  // unmount via the `useEffect` cleanup in `useEffectfulSubscription`.
-  // We don't use React hooks here for the ref-count because the
-  // pattern needs to work outside React's normal lifecycle (the
-  // store survives Strict Mode double-mount cleanly via the global
-  // `subscriberCount`).
-  ensurePolling();
+  const refresh = useWorkspacesSyncStore((s) => s.refresh);
+
+  useEffect(() => {
+    incrementWorkspacesSyncSubscribers();
+    void refresh();
+    ensurePolling();
+    return () => {
+      decrementWorkspacesSyncSubscribers();
+    };
+  }, [refresh]);
+
   return rows;
 }
 
