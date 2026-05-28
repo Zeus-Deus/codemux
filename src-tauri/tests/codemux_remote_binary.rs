@@ -161,3 +161,117 @@ async fn daemon_subcommand_accepts_client_connections() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// `codemux-remote workspace list` reads the daemon's SQLite registry
+/// directly and prints a stable JSON envelope on stdout. The desktop's
+/// host-inventory poller invokes this over SSH on a recurring cadence,
+/// so the shape is a wire contract: keep this test in lockstep with
+/// any change to the JSON envelope.
+///
+/// We exercise three properties:
+/// 1. An empty registry produces `{"host_id":"…","workspaces":[]}`
+///    (no panic, no error exit, no extra noise on stdout).
+/// 2. A non-empty registry round-trips every documented field of
+///    `remote::workspace::Workspace` (id, name, path, branch,
+///    project_root, origin_host_id, owner_id null, notes null,
+///    created_at, updated_at) — these are exactly the fields the
+///    desktop reconcile pass consumes, and a silent omission would
+///    surface as missing data in the overview.
+/// 3. The implementation works against an arbitrary `--state-dir` so
+///    tests + SSH calls into per-user state dirs don't collide.
+#[test]
+fn workspace_list_subcommand_prints_inventory_json() {
+    let bin = binary_path();
+    if !bin.exists() {
+        return;
+    }
+    let tmp = TempDir::new().unwrap();
+    let state_dir = tmp.path().join("state");
+
+    // 1. Empty state-dir → empty workspaces array but valid envelope.
+    let empty = Command::new(&bin)
+        .args([
+            "workspace",
+            "list",
+            "--state-dir",
+        ])
+        .arg(&state_dir)
+        .output()
+        .expect("invoke binary");
+    assert!(
+        empty.status.success(),
+        "workspace list (empty) failed: stderr={}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    let stdout = String::from_utf8(empty.stdout).expect("utf-8 stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON envelope");
+    assert!(parsed["host_id"].is_string(), "host_id must be a string");
+    assert!(parsed["workspaces"].is_array(), "workspaces must be an array");
+    assert_eq!(
+        parsed["workspaces"].as_array().unwrap().len(),
+        0,
+        "fresh state dir must return an empty workspaces array"
+    );
+
+    // 2. Seed the registry by opening WorkspaceStore directly and
+    // creating one workspace, then re-run the CLI and assert the
+    // round-trip.
+    {
+        use codemux_lib::remote::{config, workspace::WorkspaceStore};
+        let store = WorkspaceStore::open(
+            &config::database_path(&state_dir),
+            "fixture-host".into(),
+            config::workspaces_root(&state_dir),
+        )
+        .expect("open store");
+        let ws = store
+            .create(
+                Some("inventory-test".into()),
+                "/srv/inventory-test".into(),
+                Some("feature/inventory".into()),
+                Some("/srv/origin".into()),
+            )
+            .expect("create workspace");
+        assert!(!ws.id.is_empty());
+    }
+
+    let populated = Command::new(&bin)
+        .args([
+            "workspace",
+            "list",
+            "--state-dir",
+        ])
+        .arg(&state_dir)
+        .output()
+        .expect("invoke binary");
+    assert!(
+        populated.status.success(),
+        "workspace list (populated) failed: stderr={}",
+        String::from_utf8_lossy(&populated.stderr)
+    );
+    let stdout = String::from_utf8(populated.stdout).expect("utf-8 stdout");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("valid JSON envelope");
+    let workspaces = parsed["workspaces"]
+        .as_array()
+        .expect("workspaces is an array");
+    assert_eq!(workspaces.len(), 1, "exactly the workspace we just created");
+    let w = &workspaces[0];
+    assert!(w["id"].is_string(), "id must be a string (UUID)");
+    assert_eq!(w["name"], "inventory-test");
+    assert_eq!(w["path"], "/srv/inventory-test");
+    assert_eq!(w["branch"], "feature/inventory");
+    assert_eq!(w["project_root"], "/srv/origin");
+    assert_eq!(
+        w["origin_host_id"], "fixture-host",
+        "origin_host_id round-trips through the registry"
+    );
+    assert!(
+        w["owner_id"].is_null(),
+        "owner_id is null in v1 (reserved for cloud relay)"
+    );
+    assert!(w["notes"].is_null(), "notes is null until the desktop attaches some");
+    assert!(w["created_at"].is_string());
+    assert!(w["updated_at"].is_string());
+}

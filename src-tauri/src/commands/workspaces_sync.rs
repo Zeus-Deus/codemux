@@ -154,6 +154,16 @@ pub async fn workspaces_sync_now(
 /// - `already_adopted_workspace_id`: short-circuit — if the user
 ///   clicks Pull on a row they've already adopted, the dialog can
 ///   skip itself and just open the existing workspace.
+/// - `same_branch_project_exists_at`: stronger conflict guard than
+///   `is_path_in_use`. Set to the local `workspace_id` of any other
+///   workspace this device has open whose `(basename(project_path),
+///   git_branch)` matches the row being previewed. That tuple is the
+///   cross-device identity for "same branch of the same project,"
+///   even when the two devices store the repo at different absolute
+///   paths. Pulling on top of such a row would silently create a
+///   parallel copy of work the user is already doing — so the dialog
+///   disables Pull and points at the existing workspace instead. Null
+///   when no conflict is detected.
 #[derive(Debug, Clone, Serialize)]
 pub struct AdoptionPreview {
     pub can_host_adopt: bool,
@@ -164,6 +174,7 @@ pub struct AdoptionPreview {
     pub suggested_path: String,
     pub is_path_in_use: bool,
     pub already_adopted_workspace_id: Option<String>,
+    pub same_branch_project_exists_at: Option<String>,
 }
 
 /// Successful adoption result. The frontend uses `workspace_id` to
@@ -249,6 +260,25 @@ pub fn workspaces_adoption_preview(
 
     let already_adopted_workspace_id = row.workspace_id.clone();
 
+    // Cross-machine same-branch-same-project guard. The dialog uses
+    // this to disable Pull and point the user at the existing local
+    // workspace instead of silently creating a parallel copy of work
+    // they're already doing on this device.
+    //
+    // We identify "same project" by the project_path basename (the
+    // closest cross-machine identity we have without git remote URL
+    // round-tripping — both devices may store the repo at different
+    // absolute paths). "Same branch" is straightforward via
+    // git_branch.
+    //
+    // Skip when the previewed row is itself the local one (already
+    // adopted) — that's the `already_adopted_workspace_id` short-
+    // circuit's job, not this guard's.
+    let same_branch_project_exists_at = detect_same_branch_project_conflict(
+        &db,
+        &row,
+    );
+
     Ok(AdoptionPreview {
         can_host_adopt: host_configured && local_host_id.is_some(),
         can_clone_adopt,
@@ -258,7 +288,60 @@ pub fn workspaces_adoption_preview(
         suggested_path,
         is_path_in_use,
         already_adopted_workspace_id,
+        same_branch_project_exists_at,
     })
+}
+
+/// Walk every local sync row this device has a `workspace_id` for
+/// and find one whose `(basename(project_path), git_branch)` matches
+/// the previewed remote row. Returns the matching local workspace_id,
+/// or None.
+///
+/// The basename match is deliberate — across two devices the same git
+/// repo will almost always be checked out at paths that share a final
+/// segment (`~/projects/foo` here, `/home/deus/projects/foo` there).
+/// Comparing the full path would miss this almost every time. False
+/// positives are bounded: the user would have to maintain two
+/// repositories on this device with the same basename and the same
+/// branch, both with `project_path` recorded — extremely rare in
+/// practice.
+fn detect_same_branch_project_conflict(
+    db: &DatabaseStore,
+    previewed: &WorkspaceSyncRecord,
+) -> Option<String> {
+    let previewed_branch = previewed.git_branch.as_deref()?;
+    let previewed_basename = previewed
+        .project_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())?;
+
+    for r in db.list_workspaces_sync() {
+        // Only compare against rows that DO correspond to a local
+        // workspace (workspace_id IS NOT NULL). Sibling-device rows
+        // are not "this device has it already" — skip them.
+        let Some(local_wid) = r.workspace_id.as_deref() else {
+            continue;
+        };
+        // Don't flag the previewed row's own local copy.
+        if previewed.workspace_id.as_deref() == Some(local_wid) {
+            continue;
+        }
+        // Branch + project basename must both match.
+        if r.git_branch.as_deref() != Some(previewed_branch) {
+            continue;
+        }
+        let local_basename = r
+            .project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str());
+        if local_basename != Some(previewed_basename) {
+            continue;
+        }
+        return Some(local_wid.to_string());
+    }
+    None
 }
 
 /// Adopt a sibling-device workspace into this device via the
@@ -635,6 +718,198 @@ pub async fn workspaces_adopt_via_clone(
             project_path_str, worktree_path_str
         ),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::DatabaseStore;
+    use serial_test::serial;
+
+    // ── detect_same_branch_project_conflict ────────────────────
+    //
+    // Guards the cross-machine "Pull would clobber work I'm already
+    // doing locally on the same branch" check. The detection is
+    // deliberately basename-based because two devices almost never
+    // store the same repo at the same absolute path.
+
+    fn insert_local(
+        db: &DatabaseStore,
+        workspace_id: &str,
+        project_path: Option<&str>,
+        branch: Option<&str>,
+    ) {
+        db.insert_workspace_sync(
+            workspace_id,
+            "local-side",
+            None,
+            project_path,
+            None,
+            branch,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn make_remote_row(
+        project_path: Option<&str>,
+        branch: Option<&str>,
+        adopted_as: Option<&str>,
+    ) -> WorkspaceSyncRecord {
+        WorkspaceSyncRecord {
+            id: 0,
+            server_id: Some("srv-x".into()),
+            workspace_id: adopted_as.map(|s| s.into()),
+            title: "remote-side".into(),
+            host_server_id: Some("pandora".into()),
+            project_path: project_path.map(|s| s.into()),
+            project_remote: None,
+            git_branch: branch.map(|s| s.into()),
+            git_head_sha: None,
+            origin_uid: Some("uuid-1".into()),
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            deleted_at: None,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_matches_on_basename_and_branch() {
+        let db = DatabaseStore::new_in_memory();
+        // Same project name as the remote, same branch, different
+        // absolute path (the realistic cross-device case).
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        let hit = detect_same_branch_project_conflict(&db, &remote);
+        assert_eq!(
+            hit.as_deref(),
+            Some("workspace-local"),
+            "matching basename + matching branch must surface the local workspace id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_mismatched_branch() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("main"),
+        );
+        // Same project, different branch → not a conflict; two
+        // branches can legitimately exist as separate worktrees.
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_mismatched_basename() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/different-repo"),
+            Some("feature/x"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_the_rows_own_local_copy() {
+        // If the remote row was already adopted on this device,
+        // there's a local row that matches (basename, branch).
+        // That match is not a conflict — the `already_adopted_*`
+        // short-circuit is the right surface for it.
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            Some("workspace-local"),
+        );
+        assert!(
+            detect_same_branch_project_conflict(&db, &remote).is_none(),
+            "the row's own adopted copy must not flag as a conflict"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_sibling_only_rows() {
+        // Another sibling-device row with the same basename + branch
+        // is NOT a "this device already has it" conflict — it lives
+        // somewhere else. Skip rows without a local workspace_id.
+        let db = DatabaseStore::new_in_memory();
+        // A sibling-only row pulled from the cloud.
+        db.upsert_workspace_sync_from_server(
+            "srv-other-sibling",
+            "another-sibling",
+            Some("other-host"),
+            Some("/home/eve/projects/my-repo"),
+            None,
+            Some("feature/x"),
+            None,
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:00:00",
+            None,
+        )
+        .unwrap();
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_returns_none_when_previewed_row_lacks_branch_or_path() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+        // Missing branch.
+        let no_branch =
+            make_remote_row(Some("/home/deus/projects/my-repo"), None, None);
+        assert!(detect_same_branch_project_conflict(&db, &no_branch).is_none());
+        // Missing path.
+        let no_path = make_remote_row(None, Some("feature/x"), None);
+        assert!(detect_same_branch_project_conflict(&db, &no_path).is_none());
+    }
 }
 
 /// Best-effort: extract a project name from a git remote URL when

@@ -276,6 +276,26 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     void activateWorkspace(alreadyAdopted);
   }, [alreadyAdopted, onOpenChange, setShowWorkspacesOverview]);
 
+  // ── Cross-machine same-branch-same-project guard ──────────────
+  //
+  // The user clicked Pull on a row whose `(project basename,
+  // git_branch)` matches a workspace already open on this device.
+  // That's the strong "you're already doing this work" signal — show
+  // the existing workspace and let them open it, rather than silently
+  // creating a parallel copy. Layered AFTER `alreadyAdopted` so an
+  // already-adopted row gets the simpler "Open it" copy; this block
+  // is for "you have a DIFFERENT local workspace that's logically
+  // the same."
+  const sameBranchConflict =
+    preview?.same_branch_project_exists_at ?? null;
+
+  const handleOpenSameBranchConflict = useCallback(() => {
+    if (!sameBranchConflict) return;
+    onOpenChange(false);
+    setShowWorkspacesOverview(false);
+    void activateWorkspace(sameBranchConflict);
+  }, [sameBranchConflict, onOpenChange, setShowWorkspacesOverview]);
+
   if (!syncRow) return null;
 
   return (
@@ -307,6 +327,10 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             </div>
           ) : alreadyAdopted ? (
             <AlreadyAdoptedBlock onOpen={handleOpenExisting} />
+          ) : sameBranchConflict ? (
+            <SameBranchProjectBlock
+              onOpenExisting={handleOpenSameBranchConflict}
+            />
           ) : preview.can_host_adopt && !preview.is_path_in_use ? (
             <HostBackedAdoptionForm
               syncRow={syncRow}
@@ -343,6 +367,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
             </Button>
             {preview &&
               !alreadyAdopted &&
+              !sameBranchConflict &&
               !preview.is_path_in_use &&
               (preview.can_host_adopt || isCloneMode) && (
                 <Button
@@ -557,6 +582,38 @@ function PathInUseBlock({ path }: { path: string }) {
         Close that workspace first, or wait for the upcoming "choose
         different path" picker.
       </p>
+    </div>
+  );
+}
+
+function SameBranchProjectBlock({
+  onOpenExisting,
+}: {
+  onOpenExisting: () => void;
+}) {
+  // Quieter than PathInUseBlock (which is a destructive error
+  // state — "this path is occupied"), softer than AlreadyAdoptedBlock
+  // (which says "you literally pulled this same row before"). This
+  // is "you have a logically-equivalent workspace open — same
+  // branch of the same project — just at a different path."
+  return (
+    <div className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12px] text-muted-foreground/85 leading-relaxed space-y-2">
+      <p>
+        You already have this branch open on this device, just at a
+        different path.
+      </p>
+      <p className="text-muted-foreground/65">
+        Pulling would create a parallel copy of work you're already
+        doing. Open the existing workspace instead.
+      </p>
+      <Button
+        variant="secondary"
+        size="sm"
+        className="h-7 px-2.5 text-[11.5px]"
+        onClick={onOpenExisting}
+      >
+        Open the existing workspace
+      </Button>
     </div>
   );
 }

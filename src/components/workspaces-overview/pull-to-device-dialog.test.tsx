@@ -107,6 +107,7 @@ function makePreview(
     suggested_path: "/home/zeus/.codemux/worktrees/codemux/feature-x",
     is_path_in_use: false,
     already_adopted_workspace_id: null,
+    same_branch_project_exists_at: null,
     ...overrides,
   };
 }
@@ -206,6 +207,40 @@ describe("PullToDeviceDialog", () => {
       expect(screen.getByText(/already using/i)).toBeInTheDocument(),
     );
     expect(screen.queryByText("Pull workspace")).toBeNull();
+  });
+
+  it("blocks Pull and points at the existing workspace when same branch+project is already open here", async () => {
+    // The cross-machine conflict guard: another local workspace on
+    // this device is already on the same branch of (heuristically)
+    // the same project. Pulling would silently create a parallel
+    // copy of work — so the dialog must NOT show the Pull button and
+    // must offer to open the existing local workspace instead.
+    mockPreview.mockResolvedValue(
+      makePreview({
+        same_branch_project_exists_at: "workspace-local-77",
+      }),
+    );
+    render(
+      <PullToDeviceDialog
+        syncRow={makeSyncRow()}
+        onOpenChange={() => {}}
+      />,
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/already have this branch open on this device/i),
+      ).toBeInTheDocument(),
+    );
+    // The "create parallel copy" warning must be present — that's the
+    // user-facing explanation for why Pull is gone.
+    expect(
+      screen.getByText(/create a parallel copy of work/i),
+    ).toBeInTheDocument();
+    // Pull button is hidden.
+    expect(screen.queryByText("Pull workspace")).toBeNull();
+    // Clicking "Open the existing workspace" activates the local one.
+    fireEvent.click(screen.getByText("Open the existing workspace"));
+    expect(mockActivate).toHaveBeenCalledWith("workspace-local-77");
   });
 
   it("offers 'Open it' when the row is already adopted on this device", async () => {
