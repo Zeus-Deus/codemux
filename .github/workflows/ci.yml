@@ -37,6 +37,30 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Free disk space (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        # GitHub-hosted Ubuntu runners ship with ~14 GB free on /. Our
+        # job restores a Rust target cache, runs `cargo check` and
+        # `cargo test` (each round of which adds GB to target/), installs
+        # node_modules, builds the frontend, and `bun install`s the
+        # sidecar — that comfortably exceeds 14 GB and has produced
+        # post-merge CI failures with "No space left on device" during
+        # `cargo test` (see PR #44 and PR #46 merge runs).
+        #
+        # Removing the preinstalled toolchains we never touch (Android
+        # SDK ~12 GB, .NET ~1.6 GB, Haskell GHC ~5 GB, CodeQL ~5 GB,
+        # cached Docker images ~3 GB) frees ~25 GB in <30 s and avoids
+        # pinning a third-party action. Windows runners have ~150 GB
+        # free and don't need this.
+        shell: bash
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          df -h /
+
       - name: Install Linux system dependencies
         if: matrix.os == 'ubuntu-latest'
         run: |
