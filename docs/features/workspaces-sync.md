@@ -126,6 +126,52 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 - Local sync: pull, push, reconcile, soft-delete tombstones, idempotent server-side upsert.
 - UI: synced rows render in the Workspaces overview under the correct device bucket. The "Pending sync" pill surfaces dirty state. Sibling-device rows render with a distinct dashed border and a "lives on another device" pill. Phase 4c divergence chip flags HEAD divergence on every affected row.
 - Cadence: 30-second background loop. `workspaces_sync_now` for forced sync.
+- **Asymmetric auto-publish from `codemux-remote` hosts**: every configured host's workspace registry is polled over SSH every ~60 s and reconciled into `workspaces_sync` as sibling-only rows (workspace_id NULL, dirty=1). The existing push tick then uploads them, so a workspace an agent creates on a host via the MCP `workspace_create` tool surfaces in every dev device's overview within ~90 s — no explicit push from the laptop required. Pull-conflict guard refuses to clobber a local workspace already on the same branch of the same project. Detailed model and design rationale in the **Asymmetric publish model** section below.
+
+## Asymmetric publish model (auto-publish from remote hosts)
+
+The synced field set above is symmetric — every device publishes its own workspaces and pulls everyone else's. That symmetry breaks down for **headless hosts** running `codemux-remote serve`: they have a workspace registry (the daemon's SQLite at `<state_dir>/codemux.db`), but no logged-in Codemux account, no Better Auth token, and no path to call `/api/workspaces` themselves. Workspaces created directly on the host (e.g. by an agent calling the `workspace_create` MCP tool overnight) used to be invisible to every dev device until someone explicitly pushed them — defeating the point of asking the agent to start work in the first place.
+
+The fix is a deliberately asymmetric model:
+
+| Role | Behaviour | Why |
+|---|---|---|
+| Codemux **app** (laptop/desktop) | Manual push/pull stays exactly as it was. Nothing about the workspace lifecycle changes. | Preserves the "close laptop, continue in cloud" flow + user agency over what leaves their dev device. |
+| Codemux **remote** daemon (server) | Every dev device polls the host's inventory and republishes new workspaces to the cloud on its behalf. | Servers are always-on, SSH-reachable, and exist to be used as hosts — broadcasting their registry is the unsurprising default. Dev devices remain in charge of polling so the daemon never needs an auth credential. |
+
+### Mechanics
+
+1. **CLI exposed by the host.** `codemux-remote workspace list [--state-dir <path>]` reads the daemon's SQLite registry directly (no running daemon required) and prints `{"host_id": "<gethostname>", "workspaces": [<Workspace>...]}` on stdout. Implementation in `src-tauri/src/bin/codemux_remote.rs::run_workspace_list`. Stable contract — the desktop's parser depends on the shape.
+2. **Desktop poller.** `src-tauri/src/hosts_inventory.rs::spawn` starts a background task ~12 s after app setup and runs forever on a 60 s cadence. For each configured host with a `server_id`:
+   - Probe via `ssh::probe::probe_host` (re-uses the same `~/.local/bin/codemux-remote` PATH fallback the test-connection flow uses).
+   - SSH and run `codemux-remote workspace list` (also with the PATH fallback — see `build_inventory_argv`).
+   - Parse the JSON envelope.
+   - Reconcile: per inventory row, INSERT a sibling-only sync row (workspace_id NULL, `host_server_id = host.server_id`, `origin_uid = workspace.id` (UUID), dirty=1) or UPDATE in place if `(host_server_id, origin_uid)` already exists. Disappeared rows get soft-deleted.
+3. **Cloud push** (existing). The 30 s `workspaces_sync::push` tick walks every dirty row including these sibling-only ones, POSTs to `/api/workspaces`, and stamps the assigned `server_id`. Other devices pull and render them under the host's bucket. Same code path as a manual push — no new API surface.
+
+### Identity contract for remote-discovered rows
+
+| Column | Value | Purpose |
+|---|---|---|
+| `workspace_id` | `NULL` | Marker for "lives elsewhere, not adopted here." Sibling-row rendering. |
+| `host_server_id` | host's `server_id` | Bucket the row under the right host in the overview. |
+| `origin_uid` | remote daemon's UUID | Dedupes repeated polls — re-discovering the same UUID UPDATEs in place instead of inserting again. **Local-only column**: not in the cloud schema. |
+| `server_id` | assigned by first `push()` | Cross-device identity. After this exists, other devices see the row via cloud pull. |
+| `dirty` | `1` on insert / on field change | Triggers the next push tick. |
+
+The `origin_uid` column is additive (`ALTER TABLE workspaces_sync ADD COLUMN origin_uid TEXT`) and only ever set by the inventory reconcile path. Local-pushed workspaces and cloud-pulled sibling rows leave it null.
+
+### Pull-conflict guard
+
+The Pull-to-this-device dialog now refuses to clobber a workspace the user's already working on. `AdoptionPreview.same_branch_project_exists_at` is set to the local workspace_id when **another local workspace** on this device matches `(basename(project_path), git_branch)` with the previewed remote row. The dialog renders `SameBranchProjectBlock` with an "Open the existing workspace" CTA and hides the Pull button.
+
+Why basename and not full path: across two devices the same repo will almost always be checked out at different absolute paths (`~/projects/foo` here, `/home/deus/projects/foo` there). Full-path comparison would miss the conflict every time. False positives are bounded — the user would need two distinct projects with the same basename AND the same branch on the same device.
+
+### Known limitations (v1)
+
+- **Cross-device race for the same host workspace.** `origin_uid` is local-only. If Device A and Device B both poll Pandora between cloud pulls, both will publish a row for the same physical workspace and the overview will briefly show two entries. They converge on the next pull tick because the second device sees the first device's cloud row (with matching `host_server_id`, `project_remote`, `git_branch`). Single-device users — the common case today — never hit this. Permanent fix is a server-side `origin_uid` column with a unique partial index; tracked but not in scope.
+- **`project_remote` not available.** The remote daemon's schema doesn't carry the originating git remote URL, so remote-discovered rows have `project_remote = null`. Other devices can still adopt via the host-backed (rsync) path; the clone fallback isn't available for these rows.
+- **Hosts without a `server_id` are skipped silently.** Until the host record itself has synced (`hosts_sync` pushes it and gets a cloud id), the poller can't tag inventory rows with a stable cross-device host identity. The first cycle after the host syncs picks them up.
 
 ## Current Constraints
 
@@ -152,7 +198,10 @@ Wired at three call sites:
 ## Important Touch Points
 
 ### Local (Codemux desktop)
-- `src-tauri/src/database.rs` — `workspaces_sync` table (additive `git_head_sha TEXT` migration added in Phase 4c) + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`).
+- `src-tauri/src/database.rs` — `workspaces_sync` table (additive `git_head_sha TEXT` migration in Phase 4c, additive `origin_uid TEXT` migration for the asymmetric publish flow) + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`). Remote-discovered helpers: `insert_remote_discovered_workspace_sync`, `update_remote_discovered_workspace_sync`, `find_workspace_sync_by_host_and_origin_uid`, `list_remote_discovered_for_host`, `soft_delete_remote_discovered_workspace_sync_by_id`.
+- `src-tauri/src/hosts_inventory.rs` — background poller for the asymmetric publish flow. `spawn(app)` wired from `lib.rs` setup; per-host cycle runs `probe_host` + `fetch_inventory` + `reconcile_host_inventory`. `build_inventory_argv` locks in the SSH flags + `~/.local/bin/codemux-remote` fallback. `PollStats` captures inserted/updated/soft_deleted per cycle.
+- `src-tauri/src/bin/codemux_remote.rs::run_workspace_list` — `workspace list` CLI subcommand the desktop invokes over SSH. Reads the daemon's SQLite directly, no HTTP, no running daemon required.
+- `src-tauri/src/commands/workspaces_sync.rs::detect_same_branch_project_conflict` — pull-conflict guard; populates `AdoptionPreview.same_branch_project_exists_at`.
 - `src-tauri/src/workspaces_sync.rs` — sync module: `pull`, `push`, `try_sync_with_app`, `sync_workspaces`, `reconcile_from_snapshot`, `ServerWorkspace` wire type.
 - `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`, `workspaces_adoption_preview`, `workspaces_adopt_synced`.
 - `src-tauri/src/commands/hosts.rs` — `workspace_pull_back_impl` (extracted from the `#[tauri::command]` wrapper so the adoption flow can call the rsync machinery without going back through Tauri IPC).

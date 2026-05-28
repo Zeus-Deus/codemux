@@ -884,6 +884,196 @@ mod tests {
         assert_eq!(after[0].title, "from-sibling");
     }
 
+    // ── Host-inventory auto-publish helpers ─────────────────────
+    //
+    // These guard the contract that the inventory reconcile relies
+    // on: `(host_server_id, origin_uid)` is a stable identity that
+    // dedupes across repeated polls; the rest of the fields can
+    // change in place without losing the cloud `server_id` once it's
+    // been assigned by the first push.
+
+    #[test]
+    #[serial]
+    fn insert_remote_discovered_row_is_dirty_and_carries_origin_uid() {
+        let db = fresh_db();
+        let row = db
+            .insert_remote_discovered_workspace_sync(
+                "host-1",
+                "uuid-abc",
+                "discovered-on-host",
+                Some("/srv/discovered"),
+                Some("git@github.com:user/repo.git"),
+                Some("main"),
+            )
+            .expect("insert remote-discovered");
+        assert!(row.workspace_id.is_none(), "remote-discovered rows must have NULL workspace_id");
+        assert!(row.server_id.is_none(), "no cloud server_id until first push");
+        assert!(row.dirty, "row must be dirty so push uploads it");
+        assert_eq!(row.host_server_id.as_deref(), Some("host-1"));
+        assert_eq!(row.origin_uid.as_deref(), Some("uuid-abc"));
+        assert_eq!(row.title, "discovered-on-host");
+
+        // The lookup function returns this row when queried by
+        // (host, uid) and rejects mismatching pairs.
+        let found = db.find_workspace_sync_by_host_and_origin_uid("host-1", "uuid-abc");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, row.id);
+
+        assert!(
+            db.find_workspace_sync_by_host_and_origin_uid("host-1", "uuid-other").is_none(),
+            "wrong uid on the same host must not match"
+        );
+        assert!(
+            db.find_workspace_sync_by_host_and_origin_uid("host-other", "uuid-abc").is_none(),
+            "same uid on a different host must not match — UUIDs are only \
+             unique within a single host's registry"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn update_remote_discovered_keeps_server_id_and_marks_dirty() {
+        // The poll reconcile must update mutable fields in place
+        // without dropping the cloud `server_id` the first push
+        // assigned — otherwise other devices would see a brand-new
+        // workspace appear every poll cycle instead of seeing the
+        // existing one update.
+        let db = fresh_db();
+        let row = db
+            .insert_remote_discovered_workspace_sync(
+                "host-7",
+                "uuid-zeta",
+                "first-title",
+                None,
+                None,
+                Some("main"),
+            )
+            .unwrap();
+        // Simulate the first push assigning a cloud server_id.
+        db.mark_workspace_sync_synced(row.id, Some("9001")).unwrap();
+        let after_push = db
+            .find_workspace_sync_by_host_and_origin_uid("host-7", "uuid-zeta")
+            .unwrap();
+        assert_eq!(after_push.server_id.as_deref(), Some("9001"));
+        assert!(!after_push.dirty);
+
+        db.update_remote_discovered_workspace_sync(
+            row.id,
+            "renamed-on-host",
+            Some("/srv/new"),
+            Some("git@github.com:user/repo.git"),
+            Some("feature/x"),
+        )
+        .unwrap();
+
+        let after_update = db
+            .find_workspace_sync_by_host_and_origin_uid("host-7", "uuid-zeta")
+            .unwrap();
+        assert_eq!(after_update.title, "renamed-on-host");
+        assert_eq!(after_update.git_branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            after_update.server_id.as_deref(),
+            Some("9001"),
+            "cloud server_id must survive a remote-discovered update"
+        );
+        assert!(
+            after_update.dirty,
+            "update must mark the row dirty so push propagates the change"
+        );
+        assert_eq!(
+            after_update.host_server_id.as_deref(),
+            Some("host-7"),
+            "host_server_id is identity — must not move on update"
+        );
+        assert_eq!(
+            after_update.origin_uid.as_deref(),
+            Some("uuid-zeta"),
+            "origin_uid is identity — must not move on update"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn list_remote_discovered_for_host_is_scoped() {
+        let db = fresh_db();
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-1", "a1", None, None, None)
+            .unwrap();
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-2", "a2", None, None, None)
+            .unwrap();
+        db.insert_remote_discovered_workspace_sync("host-B", "uid-3", "b1", None, None, None)
+            .unwrap();
+        // A local-on-this-device row with no origin_uid must not
+        // appear in the host scope, even if it carries the same
+        // host_server_id (e.g. a workspace pushed from this device).
+        db.insert_workspace_sync(
+            "workspace-local",
+            "local-pushed",
+            Some("host-A"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let a = db.list_remote_discovered_for_host("host-A");
+        assert_eq!(a.len(), 2, "scoped to host A and only origin_uid IS NOT NULL");
+        let titles: Vec<&str> = a.iter().map(|r| r.title.as_str()).collect();
+        assert!(titles.contains(&"a1") && titles.contains(&"a2"));
+
+        let b = db.list_remote_discovered_for_host("host-B");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].title, "b1");
+
+        let empty = db.list_remote_discovered_for_host("host-nonexistent");
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn soft_delete_remote_discovered_marks_dirty_and_hides_from_overview() {
+        let db = fresh_db();
+        let row = db
+            .insert_remote_discovered_workspace_sync(
+                "host-Z",
+                "uid-doomed",
+                "to-be-deleted",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        db.mark_workspace_sync_synced(row.id, Some("5555")).unwrap();
+        assert_eq!(db.list_remote_discovered_for_host("host-Z").len(), 1);
+        assert_eq!(db.list_workspaces_sync().len(), 1);
+
+        db.soft_delete_remote_discovered_workspace_sync_by_id(row.id)
+            .unwrap();
+
+        assert_eq!(
+            db.list_remote_discovered_for_host("host-Z").len(),
+            0,
+            "soft-deleted rows must drop out of the per-host live list"
+        );
+        assert_eq!(
+            db.list_workspaces_sync().len(),
+            0,
+            "overview must hide soft-deleted remote-discovered rows immediately"
+        );
+        let tombstone = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.id == row.id)
+            .expect("tombstone row still present in *_for_sync");
+        assert!(tombstone.deleted_at.is_some());
+        assert!(tombstone.dirty, "tombstone must be dirty so push DELETEs the cloud row");
+        assert_eq!(
+            tombstone.server_id.as_deref(),
+            Some("5555"),
+            "cloud server_id must survive the soft-delete so push knows the target"
+        );
+    }
+
     #[test]
     #[serial]
     fn delete_a_row_that_never_synced_is_a_local_no_op() {

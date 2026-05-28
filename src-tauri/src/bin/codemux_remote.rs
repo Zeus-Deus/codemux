@@ -130,6 +130,24 @@ enum WorkspaceSubcommand {
         #[arg(long, default_value = "10")]
         connect_timeout_secs: u64,
     },
+    /// Print every workspace in the daemon's SQLite registry as JSON
+    /// on stdout. Reads the database directly — no running daemon is
+    /// required. The desktop's host-inventory poller invokes this
+    /// over SSH so workspaces created on the host (via MCP tools or
+    /// the desktop's push flow) become visible across the user's
+    /// account without an explicit push from each device.
+    ///
+    /// Stable contract: stdout is exactly one JSON object of shape
+    /// `{"host_id":"<gethostname>","workspaces":[<Workspace>,...]}`,
+    /// where each Workspace matches `remote::workspace::Workspace`.
+    /// Stderr is unused on success; non-zero exit means the registry
+    /// could not be opened.
+    List {
+        /// State directory of the daemon. Defaults to the same path
+        /// `serve` defaults to.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 #[cfg(unix)]
@@ -207,6 +225,7 @@ fn main() -> ExitCode {
                 state_dir,
                 connect_timeout_secs,
             ),
+            WorkspaceSubcommand::List { state_dir } => run_workspace_list(state_dir),
         },
     }
 }
@@ -677,5 +696,52 @@ fn run_workspace_register(
         .cloned()
         .unwrap_or(payload);
     println!("{}", workspace);
+    ExitCode::SUCCESS
+}
+
+/// Implementation for `codemux-remote workspace list`. Opens the
+/// daemon's SQLite registry directly (no HTTP, no running daemon
+/// required) and prints `{"host_id":"...","workspaces":[...]}` to
+/// stdout.
+///
+/// Used by the desktop's host-inventory poller: every ~60 seconds the
+/// desktop SSHes into every configured host and runs this command, then
+/// reconciles the result into its own `workspaces_sync` table so the
+/// account-wide overview surfaces host-side workspaces without each
+/// device having to push from itself.
+///
+/// We open the store read-only as far as workspaces go — we never call
+/// `create`, so the `host_id` and `workspaces_root` args to
+/// `WorkspaceStore::open` are only used to materialise the schema on
+/// first run (and to create the workspaces root, which is harmless).
+#[cfg(unix)]
+fn run_workspace_list(state_dir_arg: Option<PathBuf>) -> ExitCode {
+    use codemux_lib::remote::{config, manifest, workspace::WorkspaceStore};
+
+    let state_dir = resolve_state_dir(state_dir_arg);
+    let host_id = manifest::current_host_id();
+    let store = match WorkspaceStore::open(
+        &config::database_path(&state_dir),
+        host_id.clone(),
+        config::workspaces_root(&state_dir),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[codemux-remote] open workspace store at {}: {e}", state_dir.display());
+            return ExitCode::from(1);
+        }
+    };
+    let workspaces = match store.list() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("[codemux-remote] list workspaces: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let payload = serde_json::json!({
+        "host_id": host_id,
+        "workspaces": workspaces,
+    });
+    println!("{}", payload);
     ExitCode::SUCCESS
 }

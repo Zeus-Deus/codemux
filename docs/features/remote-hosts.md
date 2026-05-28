@@ -86,6 +86,21 @@ codemux-remote mcp [--state-dir <path>]
     daemon's endpoint + secret, then bridges agent CLI tool calls to
     the daemon's HTTP API. Configure your CLI agent with:
     {"command": "codemux-remote", "args": ["mcp"]}
+
+codemux-remote workspace list [--state-dir <path>]
+  → Print {"host_id":"<gethostname>","workspaces":[<Workspace>...]}
+    to stdout. Reads the daemon's SQLite registry directly — works
+    even when the daemon isn't running. Invoked over SSH by the
+    desktop's host-inventory poller every ~60 s so workspaces
+    created on the host (e.g. by an agent via the MCP
+    `workspace_create` tool) auto-publish to the user's cloud
+    registry without a manual push. See
+    docs/features/workspaces-sync.md § "Asymmetric publish model".
+
+codemux-remote workspace register --path <path> [--name <n>]
+                                 [--branch <b>] [--project-root <p>]
+  → POSTs `workspace_create` to the running daemon and prints the
+    new workspace JSON. Used by the desktop's push flow over SSH.
 ```
 
 ### `serve` mode overview
@@ -214,6 +229,20 @@ Safety contract:
 4. **Skip missing tools.** A user who doesn't have Claude Code
    won't have `~/.claude.json`; we don't create directories the
    user never opted into.
+
+### Background host-inventory poller (`hosts_inventory.rs`)
+
+Asymmetric companion to the upgrade poller. Where `hosts_upgrade` keeps each host's `codemux-remote` binary at the desktop's version, `hosts_inventory` keeps each host's *workspace registry* visible to the user's account — without an explicit push from any dev device.
+
+Run cadence: 60 s, starting ~12 s after app setup (let `hosts_upgrade` finish first so the registry shape is consistent). Per host with a `server_id`:
+
+1. `ssh::probe::probe_host` — skip offline / not-installed hosts.
+2. SSH and run `codemux-remote workspace list` (with the same `~/.local/bin/codemux-remote` PATH fallback the probe uses — non-interactive SSH on Arch/Ubuntu/Fedora doesn't source `~/.profile`).
+3. `parse_inventory_json` + `reconcile_host_inventory` → insert/update/soft-delete sibling-only rows in `workspaces_sync` keyed by `(host_server_id, origin_uid)`.
+
+The next `workspaces_sync::push` tick (30 s) uploads dirty rows to the cloud, so other devices see new host-side workspaces within ~90 s. See `docs/features/workspaces-sync.md` § *Asymmetric publish model* for the full design rationale, identity contract, and known limitations.
+
+The `codemux-remote workspace list` CLI subcommand the desktop invokes lives at `src-tauri/src/bin/codemux_remote.rs::run_workspace_list`. It reads the daemon's SQLite directly so the inventory poll works even when the daemon isn't running.
 
 ### Background host-upgrade poller (`hosts_upgrade.rs`)
 

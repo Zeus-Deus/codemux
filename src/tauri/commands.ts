@@ -1796,6 +1796,14 @@ export interface AdoptionPreview {
    *  carries that local id so the UI can offer "Open existing" instead
    *  of re-running the adoption flow. */
   already_adopted_workspace_id: string | null;
+  /** Cross-machine "same branch of the same project" conflict guard.
+   *  When set, another local workspace on THIS device is already on
+   *  the same branch of (heuristically) the same project — matched by
+   *  `(basename(project_path), git_branch)`. Pulling would silently
+   *  create a parallel copy of work the user's already doing, so the
+   *  dialog disables Pull and points at the existing local workspace.
+   *  Null when no conflict was detected. */
+  same_branch_project_exists_at: string | null;
 }
 
 export interface AdoptOutcome {

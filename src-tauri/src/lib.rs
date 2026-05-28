@@ -64,6 +64,7 @@ pub mod settings_sync;
 pub mod hosts_sync;
 #[cfg(unix)]
 pub mod hosts_upgrade;
+pub mod hosts_inventory;
 pub mod workspace_paths;
 pub mod workspaces_sync;
 pub mod state;
@@ -611,6 +612,20 @@ pub fn run() {
             // button's consent).
             #[cfg(unix)]
             crate::hosts_upgrade::spawn(app.handle().clone());
+
+            // Background host-inventory poller. Asymmetric companion
+            // to the upgrade loop: where the upgrade loop keeps the
+            // remote `codemux-remote` binary at the right version,
+            // this loop keeps the remote daemon's *workspace registry*
+            // visible to the user's account. Without it, a workspace
+            // an agent creates on a host (via the MCP `workspace_create`
+            // tool) never appears in any dev device's overview because
+            // no laptop ever pushed it. See `docs/features/workspaces-sync.md`
+            // for the "asymmetric publish" model: codemux-remote hosts
+            // auto-publish, codemux-app dev devices keep their existing
+            // explicit push/pull.
+            #[cfg(unix)]
+            crate::hosts_inventory::spawn(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar from Tauri's resource
             // dir and pin the path via env var so the adapter (which has no
