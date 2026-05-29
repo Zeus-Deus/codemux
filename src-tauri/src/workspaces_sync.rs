@@ -992,6 +992,7 @@ mod tests {
                 Some("main"),
                 Some("proj-uid-1"),
                 Some("worktree"),
+                Some("/srv/discovered/wt"),
             )
             .expect("insert remote-discovered");
         assert!(row.workspace_id.is_none(), "remote-discovered rows must have NULL workspace_id");
@@ -1039,6 +1040,7 @@ mod tests {
                 Some("main"),
                 None,
                 None,
+                None,
             )
             .unwrap();
         // Simulate the first push assigning a cloud server_id.
@@ -1057,6 +1059,7 @@ mod tests {
             Some("feature/x"),
             Some("proj-uid-z"),
             Some("main"),
+            Some("/srv/new/wt"),
         )
         .unwrap();
 
@@ -1090,11 +1093,11 @@ mod tests {
     #[serial]
     fn list_remote_discovered_for_host_is_scoped() {
         let db = fresh_db();
-        db.insert_remote_discovered_workspace_sync("host-A", "uid-1", "a1", None, None, None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-1", "a1", None, None, None, None, None, None)
             .unwrap();
-        db.insert_remote_discovered_workspace_sync("host-A", "uid-2", "a2", None, None, None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-2", "a2", None, None, None, None, None, None)
             .unwrap();
-        db.insert_remote_discovered_workspace_sync("host-B", "uid-3", "b1", None, None, None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-B", "uid-3", "b1", None, None, None, None, None, None)
             .unwrap();
         // A local-on-this-device row with no origin_uid must not
         // appear in the host scope, even if it carries the same
@@ -1134,6 +1137,7 @@ mod tests {
                 "host-Z",
                 "uid-doomed",
                 "to-be-deleted",
+                None,
                 None,
                 None,
                 None,

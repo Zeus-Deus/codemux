@@ -797,7 +797,7 @@ pub async fn workspace_pull_back_impl(
     // Resolve State guards in a tight pre-await scope and capture
     // owned values so the State guards drop before any `.await`
     // (they are not Send).
-    let (host, ws_clone) = {
+    let (host, ws_clone, origin_path) = {
         let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let snapshot = app_state.snapshot();
@@ -815,7 +815,20 @@ pub async fn workspace_pull_back_impl(
             .into_iter()
             .find(|h| h.id == host_id)
             .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
-        (host, ws)
+        // The authoritative remote source path. For a workspace an agent
+        // CREATED on the host, this is its real on-host path (e.g.
+        // `/home/deus/projects/passpage`) — which is NOT the
+        // `~/.codemux/worktrees/<project>/<branch>` convention the desktop
+        // uses for workspaces it PUSHED. Pulling from the wrong (assumed)
+        // path is exactly what produced empty worktrees. Falls back to the
+        // convention when the sync row has no recorded origin path (the
+        // pushed-workspace case, where the two coincide).
+        let origin_path = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.workspace_id.as_deref() == Some(workspace_id.as_str()))
+            .and_then(|r| r.origin_path);
+        (host, ws, origin_path)
     };
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
     // Rename for compatibility with the original function body below
@@ -840,9 +853,16 @@ pub async fn workspace_pull_back_impl(
 
     #[cfg(unix)]
     {
-        let remote_path =
-            crate::ssh::conventional_remote_path(&project_name, &branch);
-        let remote_path_str = remote_path.to_string_lossy().to_string();
+        // Prefer the workspace's REAL recorded path on the host
+        // (`origin_path`, set by the inventory poller from the daemon
+        // registry). Only reconstruct the conventional path when we have
+        // no recorded origin — i.e. a workspace this device pushed, where
+        // the remote path IS the conventional one.
+        let remote_path_str = origin_path.clone().unwrap_or_else(|| {
+            crate::ssh::conventional_remote_path(&project_name, &branch)
+                .to_string_lossy()
+                .to_string()
+        });
         let opts = crate::ssh::PullOptions::new(
             &host.ssh_target,
             &remote_path_str,
@@ -976,7 +996,7 @@ pub async fn workspace_pull_back_impl(
     }
     #[cfg(not(unix))]
     {
-        let _ = (local_worktree, project_name, branch, host);
+        let _ = (local_worktree, project_name, branch, host, origin_path);
         Ok(WorkspacePullOutcome {
             ok: false,
             message: "SSH transport is Unix-only for now.".into(),
