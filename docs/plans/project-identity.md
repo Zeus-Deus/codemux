@@ -37,10 +37,10 @@ Every checkout of the same remote, on any host or device, computes the **same** 
 4. **Local SQLite** — `database.rs`: add `project_uid`, `project_name`, `workspace_kind` to `workspaces_sync` via the ALTER loop (append-only, read at the highest positional indices to avoid the `row_to_workspace_sync` off-by-one footgun). Extend `WorkspaceSyncRecord` + every CRUD SELECT/INSERT/UPDATE + the remote-discovered helpers. These are **local-only columns for now** (like `origin_uid`) — `upsert_workspace_sync_from_server` must NOT clobber them, so they survive cloud pulls until Phase 2 makes the cloud authoritative.
 5. **Command + UI** — `WorkspaceSyncView` (Rust + `src/tauri/commands.ts`) exposes the three fields. The overview groups remote rows by `project_uid` (falling back to the existing name grouping) and renders a `main`/`worktree` badge. `detect_same_branch_project_conflict` upgrades from `(basename(project_path), git_branch)` to `(project_uid, git_branch)` when uid is present.
 
-### Phase 2 — desktop-local first-class uid + cloud round-trip (follow-up)
+### Phase 2 — desktop-local first-class uid (DONE) + cloud round-trip (remaining)
 
-6. Add `project_uid` + `workspace_kind` to `WorkspaceSnapshot`, stamp in every `commands/workspace.rs` create path, thread through `reconcile_from_snapshot`. Unifies local + remote grouping under one uid path (today local rows group by the UI's deterministic key, remote rows by the synced uid — they converge by value but Phase 2 makes it first-class).
-7. **External `codemux-api` repo** (cannot be edited/tested from here): add optional `project_uid`/`project_name`/`workspace_kind` columns to `codemux_workspaces` + validation + round-trip tests, mirror in `preload.ts`. With deterministic uid this is an optimization (lets pulled rows carry uid directly instead of recomputing from `project_remote`), not a correctness requirement.
+6. ~~Add `project_uid` + `workspace_kind` to `WorkspaceSnapshot`, stamp at create, thread through `reconcile_from_snapshot`.~~ **Done** — stamped in `set_workspace_project_root` (the single choke point every create path calls; git remote computed outside the lock), threaded into the local `workspaces_sync` columns, and the pull-conflict guard now matches exactly on `project_uid`. Local UI grouping uses `project_uid` as its `projectKey`.
+7. **Remaining — external `codemux-api` repo** (cannot be edited/tested from here): add optional `project_uid`/`project_name`/`workspace_kind` columns to `codemux_workspaces` + validation + round-trip tests, mirror in `preload.ts`. Today the local columns are not synced to the cloud, so a row pulled on another device has `project_uid = null` there and falls back to path/name grouping. With deterministic uid this is an optimization (a pulled row could recompute uid from the synced `project_remote`), not a correctness requirement.
 
 ### Phase 3 — first-class projects table (optional)
 
@@ -71,6 +71,7 @@ Every checkout of the same remote, on any host or device, computes the **same** 
   - Local SQLite — `workspaces_sync.project_uid`/`workspace_kind` columns (additive ALTER, local-only; `upsert_workspace_sync_from_server` leaves them untouched). `WorkspaceSyncView` (Rust + TS) exposes them.
   - UI — overview groups by stable `projectKey` (`project_uid` preferred) and renders a `main`/`worktree` badge. Conflict guard upgraded to exact `project_uid` match with basename fallback.
   - Tests: Rust unit (identity, daemon create/sweep/migration, poller threading) + a real-binary e2e (`tests/codemux_remote_inventory.rs::cli_to_reconcile_propagates_project_identity`: real git repo → compiled `codemux-remote workspace list` → parse → reconcile). Frontend: `projectKey`/grouping/kind-badge tests. All green.
+- **Phase 2 (local side) — complete:** `WorkspaceSnapshot.project_uid`/`workspace_kind` (Rust + TS), stamped in `set_workspace_project_root` (git remote computed outside the lock), threaded through `reconcile_from_snapshot` → `insert/update_workspace_sync` into local-only `workspaces_sync` columns, pull-conflict guard upgraded to exact `project_uid` match, local UI `projectKey` uses `project_uid`. Tests: `set_workspace_project_root_stamps_project_identity`, `reconcile_threads_project_identity_from_snapshot`. Remaining Phase 2 = the cloud round-trip (external repo).
 
 ## Notes
 

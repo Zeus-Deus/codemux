@@ -351,6 +351,18 @@ pub struct WorkspaceSnapshot {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub project_root: Option<String>,
+    /// Stable, deterministic project identity — `UUIDv5(canonical git
+    /// remote ?? project_root)`, see `crate::project_identity`. Stamped
+    /// at create time (when `project_root` is set). Shared by a repo's
+    /// main checkout and its worktrees, and identical on every device
+    /// that has the same repo. Additive; old persisted state
+    /// deserializes as `None`.
+    #[serde(default)]
+    pub project_uid: Option<String>,
+    /// `"main"` (repo root checkout) | `"worktree"` (per-branch git
+    /// worktree). Derived from `worktree_path` at create time.
+    #[serde(default)]
+    pub workspace_kind: Option<String>,
     #[serde(default)]
     pub pr_number: Option<u32>,
     #[serde(default)]
@@ -649,6 +661,8 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -775,6 +789,8 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -843,6 +859,12 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: Some(worktree_path),
             project_root,
+            // Adoption lands at a worktree-style path; project_uid is
+            // stamped when the project root is (re)resolved on this
+            // device. The synced row already carries the cross-device
+            // identity from the poller.
+            project_uid: None,
+            workspace_kind: Some("worktree".into()),
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -945,6 +967,8 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -1332,13 +1356,34 @@ impl AppStateStore {
     }
 
     pub fn set_workspace_project_root(&self, workspace_id: &str, project_root: String) {
+        // Compute the deterministic project_uid OUTSIDE the lock — the
+        // git remote lookup spawns a subprocess and we don't want to
+        // hold the state mutex across it. Uses the canonical remote when
+        // the repo has one (so it converges with the same repo on other
+        // devices/hosts), else the project-root path. Matches the daemon
+        // (`remote::workspace::create`) so a host copy and a local copy
+        // of the same repo share a project_uid.
+        let remote =
+            crate::project_identity::git_canonical_remote(std::path::Path::new(&project_root));
+        let project_uid =
+            crate::project_identity::project_uid_for(remote.as_deref(), &project_root);
+
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
             .workspaces
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
         {
+            // kind: a worktree has worktree_path set (the per-branch
+            // checkout); otherwise this is the repo root (main).
+            let kind = if workspace.worktree_path.is_some() {
+                "worktree"
+            } else {
+                "main"
+            };
             workspace.project_root = Some(project_root);
+            workspace.project_uid = Some(project_uid);
+            workspace.workspace_kind = Some(kind.to_string());
         }
     }
 
@@ -3239,6 +3284,8 @@ fn default_app_state() -> AppStateSnapshot {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -4354,6 +4401,33 @@ mod tests {
         let fallback = store.close_terminal_session(&created.0).unwrap();
         assert_eq!(fallback.0, first_active.0);
         assert_eq!(store.snapshot().terminal_sessions.len(), 1);
+    }
+
+    #[test]
+    fn set_workspace_project_root_stamps_project_identity() {
+        let store = AppStateStore::default();
+        let wid = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-identity-test"),
+            WorkspacePresetLayout::Single,
+        );
+
+        store.set_workspace_project_root(&wid.0, "/tmp/codemux-identity-test".into());
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        // No worktree_path on a layout workspace → it's the root (main).
+        assert_eq!(w.workspace_kind.as_deref(), Some("main"));
+        // Deterministic uid: this path isn't a git repo, so it falls
+        // back to the path-based identity the helper computes.
+        let expected = crate::project_identity::project_uid_for(
+            None,
+            "/tmp/codemux-identity-test",
+        );
+        assert_eq!(
+            w.project_uid.as_deref(),
+            Some(expected.as_str()),
+            "project_uid must be stamped deterministically at create"
+        );
     }
 
     #[test]

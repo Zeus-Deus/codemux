@@ -463,6 +463,13 @@ pub fn reconcile_from_snapshot(
         // updating.
         let project_remote: Option<&str> = None;
         let git_branch = ws.git_branch.as_deref();
+        // First-class project identity, stamped on the snapshot at
+        // create time (`set_workspace_project_root`). Local-only sync
+        // columns for now (cloud doesn't carry them yet); they let the
+        // overview group by project_uid and the pull-conflict guard
+        // match exactly.
+        let project_uid = ws.project_uid.as_deref();
+        let workspace_kind = ws.workspace_kind.as_deref();
 
         // Read the workspace's git HEAD sha so Phase-4 divergence
         // detection can compare across devices. Best-effort: if
@@ -483,7 +490,9 @@ pub fn reconcile_from_snapshot(
                 || existing.project_path.as_deref() != project_path
                 || existing.project_remote.as_deref() != project_remote
                 || existing.git_branch.as_deref() != git_branch
-                || existing.git_head_sha.as_deref() != git_head_sha_ref;
+                || existing.git_head_sha.as_deref() != git_head_sha_ref
+                || existing.project_uid.as_deref() != project_uid
+                || existing.workspace_kind.as_deref() != workspace_kind;
             if changed {
                 if let Err(error) = db.update_workspace_sync_by_workspace_id(
                     &wid,
@@ -493,6 +502,8 @@ pub fn reconcile_from_snapshot(
                     project_remote,
                     git_branch,
                     git_head_sha_ref,
+                    project_uid,
+                    workspace_kind,
                 ) {
                     eprintln!(
                         "[workspaces-sync] update failed for {wid}: {error}"
@@ -507,6 +518,8 @@ pub fn reconcile_from_snapshot(
             project_remote,
             git_branch,
             git_head_sha_ref,
+            project_uid,
+            workspace_kind,
         ) {
             // UNIQUE(workspace_id) collision shouldn't happen given
             // the index pass above — log and continue.
@@ -574,11 +587,15 @@ mod tests {
                 Some("git@github.com:alpha/alpha.git"),
                 Some("main"),
                 Some("abc123"),
+                Some("uid-alpha"),
+                Some("main"),
             )
             .expect("insert");
         assert!(row.dirty);
         assert!(row.server_id.is_none());
         assert_eq!(row.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(row.project_uid.as_deref(), Some("uid-alpha"));
+        assert_eq!(row.workspace_kind.as_deref(), Some("main"));
         assert_eq!(row.title, "alpha");
 
         let list = db.list_workspaces_sync();
@@ -591,7 +608,7 @@ mod tests {
     fn update_marks_row_dirty_again() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-2", "before", None, None, None, None, None)
+            .insert_workspace_sync("workspace-2", "before", None, None, None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("42")).unwrap();
 
@@ -609,6 +626,8 @@ mod tests {
             None,
             Some("feature-x"),
             Some("def456"),
+            None,
+            None,
         )
         .unwrap();
         let dirty = db.list_dirty_workspaces_sync();
@@ -623,7 +642,7 @@ mod tests {
     fn soft_delete_then_purge() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None, None)
+            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("100")).unwrap();
 
@@ -748,6 +767,8 @@ mod tests {
             latest_agent_state: None,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -815,6 +836,40 @@ mod tests {
         assert_eq!(list[0].workspace_id.as_deref(), Some("workspace-A"));
         assert_eq!(list[0].title, "alpha");
         assert!(list[0].dirty, "freshly inserted row must be dirty");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_threads_project_identity_from_snapshot() {
+        // A local workspace stamped with project_uid + workspace_kind
+        // (by `set_workspace_project_root` at create) must carry those
+        // onto its sync row, so the overview groups by project and the
+        // pull-conflict guard can match exactly.
+        let db = fresh_db();
+        let mut ws = make_ws("workspace-P", "passpage");
+        ws.project_root = Some("/home/agent/projects/passpage".into());
+        ws.project_uid = Some("uid-passpage".into());
+        ws.workspace_kind = Some("main".into());
+        let snapshot = make_snapshot(vec![ws]);
+
+        super::reconcile_from_snapshot(&db, &snapshot).unwrap();
+
+        let row = &db.list_workspaces_sync()[0];
+        assert_eq!(row.project_uid.as_deref(), Some("uid-passpage"));
+        assert_eq!(row.workspace_kind.as_deref(), Some("main"));
+
+        // Idempotent: an identical reconcile must not re-dirty the row
+        // (otherwise every tick would burn a cloud PATCH).
+        db.mark_workspace_sync_synced(row.id, Some("cloud-1")).unwrap();
+        let mut ws2 = make_ws("workspace-P", "passpage");
+        ws2.project_root = Some("/home/agent/projects/passpage".into());
+        ws2.project_uid = Some("uid-passpage".into());
+        ws2.workspace_kind = Some("main".into());
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![ws2])).unwrap();
+        assert!(
+            !db.list_workspaces_sync()[0].dirty,
+            "unchanged identity must not re-mark the row dirty"
+        );
     }
 
     #[test]
@@ -1021,6 +1076,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
 
@@ -1095,6 +1152,8 @@ mod tests {
             .insert_workspace_sync(
                 "workspace-99",
                 "ephemeral",
+                None,
+                None,
                 None,
                 None,
                 None,

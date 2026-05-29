@@ -787,6 +787,8 @@ mod tests {
             None,
             branch,
             None,
+            None,
+            None,
         )
         .unwrap();
     }

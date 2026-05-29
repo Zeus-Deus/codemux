@@ -253,9 +253,9 @@ export function useOverviewItems(): {
         hostServerId,
         projectName: proj?.name ?? null,
         projectPath: proj?.path ?? null,
-        // Local snapshots don't carry project_uid yet (Phase 2), so the
-        // path is the stable per-device key.
-        projectKey: proj?.path ?? proj?.name ?? null,
+        // Prefer the stamped project_uid (converges with the same repo
+        // elsewhere); fall back to the project path/name.
+        projectKey: ws.project_uid ?? proj?.path ?? proj?.name ?? null,
       });
     }
 

@@ -99,6 +99,25 @@ pub fn project_uid_for(remote: Option<&str>, project_root: &str) -> String {
     project_uid(&key)
 }
 
+/// Best-effort canonical git remote for a directory: runs
+/// `git -C <dir> config --get remote.origin.url` and canonicalises the
+/// result. Returns `None` if the dir isn't a repo, has no origin, or
+/// git is unavailable. Keeps the pure functions above pure — this is
+/// the one impure helper, used by create paths to derive identity.
+pub fn git_canonical_remote(dir: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout);
+    canonical_remote(url.trim())
+}
+
 /// `main` (the repo root checkout — `.git` is a directory) vs
 /// `worktree` (`.git` is a file pointing at the parent repo). When the
 /// path doesn't exist or has no `.git`, default to `main`: a plain

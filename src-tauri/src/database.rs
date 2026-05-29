@@ -963,13 +963,16 @@ impl DatabaseStore {
         project_remote: Option<&str>,
         git_branch: Option<&str>,
         git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<WorkspaceSyncRecord, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspaces_sync
                 (user_id, workspace_id, title, host_server_id,
-                 project_path, project_remote, git_branch, git_head_sha, dirty)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                 project_path, project_remote, git_branch, git_head_sha,
+                 project_uid, workspace_kind, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 workspace_id,
                 title,
@@ -978,6 +981,8 @@ impl DatabaseStore {
                 project_remote,
                 git_branch,
                 git_head_sha,
+                project_uid,
+                workspace_kind,
             ],
         )
         .map_err(|e| format!("Failed to insert workspace sync row: {e}"))?;
@@ -1005,14 +1010,17 @@ impl DatabaseStore {
         project_remote: Option<&str>,
         git_branch: Option<&str>,
         git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workspaces_sync
              SET title = ?1, host_server_id = ?2, project_path = ?3,
                  project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
+                 project_uid = ?7, workspace_kind = ?8,
                  updated_at = datetime('now'), dirty = 1
-             WHERE user_id = 'local' AND workspace_id = ?7
+             WHERE user_id = 'local' AND workspace_id = ?9
                AND deleted_at IS NULL",
             params![
                 title,
@@ -1021,6 +1029,8 @@ impl DatabaseStore {
                 project_remote,
                 git_branch,
                 git_head_sha,
+                project_uid,
+                workspace_kind,
                 workspace_id,
             ],
         )
