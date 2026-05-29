@@ -70,6 +70,10 @@ pub struct ServerWorkspace {
     pub git_branch: Option<String>,
     #[serde(rename = "gitHeadSha", default)]
     pub git_head_sha: Option<String>,
+    #[serde(rename = "projectUid", default)]
+    pub project_uid: Option<String>,
+    #[serde(rename = "workspaceKind", default)]
+    pub workspace_kind: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -101,6 +105,10 @@ struct WorkspaceUpsertBody<'a> {
     git_branch: Option<&'a str>,
     #[serde(rename = "gitHeadSha", skip_serializing_if = "Option::is_none")]
     git_head_sha: Option<&'a str>,
+    #[serde(rename = "projectUid", skip_serializing_if = "Option::is_none")]
+    project_uid: Option<&'a str>,
+    #[serde(rename = "workspaceKind", skip_serializing_if = "Option::is_none")]
+    workspace_kind: Option<&'a str>,
 }
 
 /// Guard against concurrent sync attempts. Foreground sync + the
@@ -195,6 +203,8 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
             &w.created_at,
             &w.updated_at,
             w.deleted_at.as_deref(),
+            w.project_uid.as_deref(),
+            w.workspace_kind.as_deref(),
         )?;
     }
 
@@ -222,6 +232,8 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
                     &local_row.created_at,
                     &now,
                     Some(&now),
+                    local_row.project_uid.as_deref(),
+                    local_row.workspace_kind.as_deref(),
                 )?;
             }
         }
@@ -280,6 +292,8 @@ async fn push_insert(
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
         git_head_sha: row.git_head_sha.as_deref(),
+        project_uid: row.project_uid.as_deref(),
+        workspace_kind: row.workspace_kind.as_deref(),
     };
     let resp = client
         .post(format!("{base}/api/workspaces"))
@@ -315,6 +329,8 @@ async fn push_update(
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
         git_head_sha: row.git_head_sha.as_deref(),
+        project_uid: row.project_uid.as_deref(),
+        workspace_kind: row.workspace_kind.as_deref(),
     };
     let resp = client
         .patch(format!("{base}/api/workspaces/{server_id}"))
@@ -683,6 +699,8 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
             None,
+            Some("uid-200"),
+            Some("main"),
         )
         .unwrap();
         let listed = db.list_workspaces_sync();
@@ -690,6 +708,8 @@ mod tests {
         assert_eq!(listed[0].server_id.as_deref(), Some("200"));
         assert_eq!(listed[0].title, "from-server");
         assert_eq!(listed[0].git_head_sha.as_deref(), Some("aaa111"));
+        assert_eq!(listed[0].project_uid.as_deref(), Some("uid-200"));
+        assert_eq!(listed[0].workspace_kind.as_deref(), Some("main"));
         assert!(!listed[0].dirty, "server-sourced rows must be clean");
 
         // Second call — same server_id but a new updated_at and new
@@ -705,12 +725,19 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-02 00:00:00",
             None,
+            Some("uid-200"),
+            Some("worktree"),
         )
         .unwrap();
         let listed = db.list_workspaces_sync();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "renamed-server-side");
         assert_eq!(listed[0].git_branch.as_deref(), Some("dev"));
+        assert_eq!(
+            listed[0].workspace_kind.as_deref(),
+            Some("worktree"),
+            "server pull updates workspace_kind in place"
+        );
     }
 
     #[test]
@@ -729,6 +756,8 @@ mod tests {
             None,
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -925,6 +954,8 @@ mod tests {
             None,
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
+            None,
+            None,
             None,
         )
         .unwrap();

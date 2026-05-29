@@ -926,6 +926,8 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
             None,
+            None,
+            None,
         )
         .unwrap();
         let remote = make_remote_row(

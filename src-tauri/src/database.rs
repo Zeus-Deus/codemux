@@ -1168,6 +1168,8 @@ impl DatabaseStore {
         created_at: &str,
         updated_at: &str,
         deleted_at: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let updated = conn
@@ -1176,7 +1178,8 @@ impl DatabaseStore {
                  SET title = ?1, host_server_id = ?2, project_path = ?3,
                      project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
                      created_at = ?7, updated_at = ?8,
-                     deleted_at = ?9, dirty = 0
+                     deleted_at = ?9, project_uid = ?11, workspace_kind = ?12,
+                     dirty = 0
                  WHERE user_id = 'local' AND server_id = ?10",
                 params![
                     title,
@@ -1189,6 +1192,8 @@ impl DatabaseStore {
                     updated_at,
                     deleted_at,
                     server_id,
+                    project_uid,
+                    workspace_kind,
                 ],
             )
             .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
@@ -1197,8 +1202,10 @@ impl DatabaseStore {
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
                      project_path, project_remote, git_branch, git_head_sha,
-                     created_at, updated_at, deleted_at, dirty)
-                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+                     created_at, updated_at, deleted_at,
+                     project_uid, workspace_kind, dirty)
+                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ?11, ?12, 0)",
                 params![
                     server_id,
                     title,
@@ -1210,6 +1217,8 @@ impl DatabaseStore {
                     created_at,
                     updated_at,
                     deleted_at,
+                    project_uid,
+                    workspace_kind,
                 ],
             )
             .map_err(|e| format!("Failed to insert workspace sync from server: {e}"))?;
