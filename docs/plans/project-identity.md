@@ -42,7 +42,13 @@ Every checkout of the same remote, on any host or device, computes the **same** 
 6. ~~Add `project_uid` + `workspace_kind` to `WorkspaceSnapshot`, stamp at create, thread through `reconcile_from_snapshot`.~~ **Done** — stamped in `set_workspace_project_root` (the single choke point every create path calls; git remote computed outside the lock), threaded into the local `workspaces_sync` columns, and the pull-conflict guard now matches exactly on `project_uid`. Local UI grouping uses `project_uid` as its `projectKey`.
 7. **Remaining — external `codemux-api` repo** (cannot be edited/tested from here): add optional `project_uid`/`project_name`/`workspace_kind` columns to `codemux_workspaces` + validation + round-trip tests, mirror in `preload.ts`. Today the local columns are not synced to the cloud, so a row pulled on another device has `project_uid = null` there and falls back to path/name grouping. With deterministic uid this is an optimization (a pulled row could recompute uid from the synced `project_remote`), not a correctness requirement.
 
-### Phase 2 cloud — concrete plan (codemux-api, VPS-verified)
+### Phase 2 cloud — DONE (deployed + verified on the VPS)
+
+Shipped: `codemux_workspaces` gained `project_uid` / `project_name` / `workspace_kind` (additive `ADD COLUMN IF NOT EXISTS`, mirroring `git_head_sha`), threaded through the GET/POST/PATCH handlers + `parseWorkspaceBody` validation (`workspaceKind ∈ {main,worktree}`), mirrored in `preload.ts`, with 4 round-trip tests. Deployed via `docker compose up -d --build api`. **303 server tests pass; the 44 production rows were untouched; container healthy; no errors in logs.** Desktop side: `ServerWorkspace` + `WorkspaceUpsertBody` carry the fields; `push_insert`/`push_update` send them; `upsert_workspace_sync_from_server` now persists them (server-authoritative on pull). Timestamped `.bak-<ts>` copies of the 3 server source files were left in `~/codemux-api/api/src/` as a code-rollback safety net (harmless to the build/test globs); the pre-change DB snapshot is `backups/codemux_20260529_144518.sql.gz`.
+
+The original concrete plan (kept for reference):
+
+#### Concrete plan (codemux-api, VPS-verified)
 
 Verified live on the VPS (`~/codemux-api`, `ssh work@78.47.192.173`): `codemux_workspaces` exists with 44 rows; daily 3am backups healthy; `git_head_sha` was added via `ALTER TABLE … ADD COLUMN IF NOT EXISTS` — this change mirrors it exactly. **100% additive, no data loss, no destructive ops.**
 
