@@ -24,6 +24,9 @@ What syncs:
 - `project_remote` — git remote URL; other devices use it to know how to clone the project if/when they adopt
 - `git_branch` — current branch
 - `git_head_sha` — current HEAD commit SHA on the workspace's branch (Phase 4c). Optional, ≤200 chars. Powers cross-device divergence detection: when two devices have clone-adopted the same workspace and their `git_head_sha` values differ, both rows render an amber `diverged` chip.
+- `project_uid` — deterministic `UUIDv5(canonical git remote ?? project_root)` (project-identity Phase 2 cloud). Stable across devices/hosts; the overview groups by it and the pull-conflict guard matches on it. Server-authoritative on pull.
+- `project_name` — display name for the project (basename-derived at the source). Server-authoritative on pull.
+- `workspace_kind` — `main` (repo root checkout) | `worktree` (per-branch worktree). Renders as a badge on sibling rows. Server-authoritative on pull.
 - `created_at`, `updated_at`, `deleted_at` — standard sync timestamps
 
 What does NOT sync (per-device runtime state):
@@ -122,7 +125,7 @@ Bucketing is by `host_server_id`, so the same host shows up under the same bucke
 
 ## What Works Today
 
-- Server: full GET/POST/PATCH/DELETE at `/api/workspaces`, deployed and live at `https://api.codemux.org/api/workspaces`. 36 endpoint tests pass (`gitHeadSha` round-trip coverage added in Phase 4c); full server suite at 299/299.
+- Server: full GET/POST/PATCH/DELETE at `/api/workspaces`, deployed and live at `https://api.codemux.org/api/workspaces`. Endpoint tests cover `gitHeadSha` (Phase 4c) and the `projectUid` / `projectName` / `workspaceKind` round-trip (Phase 2 cloud, 4 added); full server suite at 303/303.
 - Local sync: pull, push, reconcile, soft-delete tombstones, idempotent server-side upsert.
 - UI: synced rows render in the Workspaces overview under the correct device bucket. The "Pending sync" pill surfaces dirty state. Sibling-device rows render with a distinct dashed border and a "lives on another device" pill. Phase 4c divergence chip flags HEAD divergence on every affected row.
 - Cadence: 30-second background loop. `workspaces_sync_now` for forced sync.
@@ -157,7 +160,9 @@ Important: the daemon `workspace_create` tool is **registration-only** — it do
 
 #### First-class project identity (Phase 1)
 
-Beyond `project_root`, the daemon now stamps a stable, deterministic **`project_uid`** (`UUIDv5(canonical git remote ?? project_root)`), a **`project_name`**, a **`kind`** (`main` | `worktree`), and the canonical **`repo_remote`** at create time, and an idempotent boot sweep backfills them onto pre-existing rows. These ride the `workspace list` wire envelope; the poller threads `project_uid` + `workspace_kind` into new local-only `workspaces_sync` columns and finally populates `project_remote` for remote-discovered rows. The overview groups by `project_uid` and labels `kind`. Full design + phasing in `docs/plans/project-identity.md`. The cloud schema does not carry these yet (Phase 2, external `codemux-api` repo), so — like `origin_uid` — `upsert_workspace_sync_from_server` leaves the local columns untouched on pull; deterministic uids mean cross-device grouping still converges via the synced `project_remote`.
+Beyond `project_root`, the daemon now stamps a stable, deterministic **`project_uid`** (`UUIDv5(canonical git remote ?? project_root)`), a **`project_name`**, a **`kind`** (`main` | `worktree`), and the canonical **`repo_remote`** at create time, and an idempotent boot sweep backfills them onto pre-existing rows. These ride the `workspace list` wire envelope; the poller threads `project_uid` + `workspace_kind` into `workspaces_sync` columns and finally populates `project_remote` for remote-discovered rows. The overview groups by `project_uid` and labels `kind`. Full design + phasing in `docs/plans/project-identity.md`.
+
+The cloud schema now carries these (Phase 2 cloud round-trip — deployed + verified on the VPS): `codemux_workspaces` gained `project_uid` / `project_name` / `workspace_kind` via additive `ADD COLUMN IF NOT EXISTS` (mirroring `git_head_sha`), threaded through the GET/POST/PATCH handlers + `parseWorkspaceBody` validation (`workspaceKind ∈ {main,worktree}`). The desktop `ServerWorkspace` + `WorkspaceUpsertBody` carry the fields, `push_insert`/`push_update` send them, and `upsert_workspace_sync_from_server` now persists them — so unlike the local-only `origin_uid`, `project_uid`/`project_name`/`workspace_kind` are **server-authoritative on pull**: a row pulled on another device arrives already carrying its uid. Deterministic uids mean grouping also converges via the synced `project_remote` for any older/null-uid rows.
 3. **Cloud push** (existing). The 30 s `workspaces_sync::push` tick walks every dirty row including these sibling-only ones, POSTs to `/api/workspaces`, and stamps the assigned `server_id`. Other devices pull and render them under the host's bucket. Same code path as a manual push — no new API surface.
 
 ### Identity contract for remote-discovered rows
@@ -181,7 +186,7 @@ Why basename and not full path: across two devices the same repo will almost alw
 ### Known limitations (v1)
 
 - **Cross-device race for the same host workspace.** `origin_uid` is local-only. If Device A and Device B both poll Pandora between cloud pulls, both will publish a row for the same physical workspace and the overview will briefly show two entries. They converge on the next pull tick because the second device sees the first device's cloud row (with matching `host_server_id`, `project_remote`, `git_branch`). Single-device users — the common case today — never hit this. Permanent fix is a server-side `origin_uid` column with a unique partial index; tracked but not in scope.
-- **`project_remote` not available.** The remote daemon's schema doesn't carry the originating git remote URL, so remote-discovered rows have `project_remote = null`. Other devices can still adopt via the host-backed (rsync) path; the clone fallback isn't available for these rows.
+- **`project_remote` only when the host project has a resolvable remote.** Project-identity Phase 1 made the daemon stamp the canonical `repo_remote` at create time and the poller thread it into `project_remote` for remote-discovered rows (previously hardcoded null). So a host workspace whose project has a git remote now carries `project_remote` — the clone-from-git fallback works for it. A host project with no remote (or one the daemon couldn't resolve) still leaves `project_remote = null` and is adoptable only via the host-backed (rsync) path.
 - **Hosts without a `server_id` are skipped silently.** Until the host record itself has synced (`hosts_sync` pushes it and gets a cloud id), the poller can't tag inventory rows with a stable cross-device host identity. The first cycle after the host syncs picks them up.
 
 ## Current Constraints
@@ -209,7 +214,7 @@ Wired at three call sites:
 ## Important Touch Points
 
 ### Local (Codemux desktop)
-- `src-tauri/src/database.rs` — `workspaces_sync` table (additive `git_head_sha TEXT` migration in Phase 4c, additive `origin_uid TEXT` migration for the asymmetric publish flow) + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`). Remote-discovered helpers: `insert_remote_discovered_workspace_sync`, `update_remote_discovered_workspace_sync`, `find_workspace_sync_by_host_and_origin_uid`, `list_remote_discovered_for_host`, `soft_delete_remote_discovered_workspace_sync_by_id`.
+- `src-tauri/src/database.rs` — `workspaces_sync` table (additive `git_head_sha TEXT` migration in Phase 4c, additive `origin_uid TEXT` migration for the asymmetric publish flow, additive `project_uid TEXT` + `workspace_kind TEXT` migrations for first-class project identity) + `WorkspaceSyncRecord` struct + CRUD impls (`insert_workspace_sync`, `update_workspace_sync_by_workspace_id`, `soft_delete_workspace_sync_by_workspace_id`, `list_workspaces_sync`, `list_workspaces_sync_for_sync`, `list_dirty_workspaces_sync`, `mark_workspace_sync_synced`, `upsert_workspace_sync_from_server`, `purge_acknowledged_workspace_sync_deletes`, `link_workspace_sync_to_local`). Remote-discovered helpers: `insert_remote_discovered_workspace_sync`, `update_remote_discovered_workspace_sync`, `find_workspace_sync_by_host_and_origin_uid`, `list_remote_discovered_for_host`, `soft_delete_remote_discovered_workspace_sync_by_id`.
 - `src-tauri/src/hosts_inventory.rs` — background poller for the asymmetric publish flow. `spawn(app)` wired from `lib.rs` setup; per-host cycle runs `probe_host` + `fetch_inventory` + `reconcile_host_inventory`. `build_inventory_argv` locks in the SSH flags + `~/.local/bin/codemux-remote` fallback. `PollStats` captures inserted/updated/soft_deleted per cycle.
 - `src-tauri/src/bin/codemux_remote.rs::run_workspace_list` — `workspace list` CLI subcommand the desktop invokes over SSH. Reads the daemon's SQLite directly, no HTTP, no running daemon required.
 - `src-tauri/src/commands/workspaces_sync.rs::detect_same_branch_project_conflict` — pull-conflict guard; populates `AdoptionPreview.same_branch_project_exists_at`.
@@ -228,7 +233,7 @@ Wired at three call sites:
 ### Server (codemux-api on the VPS)
 - `~/codemux-api/api/src/index.ts` — `codemux_workspaces` table DDL (under "Codemux workspaces table" comment block) + four endpoints (GET/POST/PATCH/DELETE `/api/workspaces`).
 - `~/codemux-api/api/src/tests/preload.ts` — mirror of the DDL so prod-to-test schema parity holds.
-- `~/codemux-api/api/src/tests/workspaces.test.ts` — 33 tests covering auth, validation, isolation, product boundary, soft-delete, per-user cap.
+- `~/codemux-api/api/src/tests/workspaces.test.ts` — tests covering auth, validation, isolation, product boundary, soft-delete, per-user cap, the `gitHeadSha` round-trip, and the `projectUid` / `projectName` / `workspaceKind` round-trip (POST→GET + PATCH).
 
 ## Notes
 

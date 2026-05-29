@@ -364,11 +364,11 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // Deterministic `UUIDv5(canonical remote ?? project_root)` so a
         // project's main checkout + worktrees group together and the
         // same repo converges across hosts/devices. `workspace_kind` is
-        // 'main' | 'worktree'. Local-only for now (the cloud schema
-        // doesn't carry them yet) — set by the host-inventory poller
-        // from the daemon's registry; `upsert_workspace_sync_from_server`
-        // intentionally leaves them untouched so a cloud pull can't
-        // clobber them, exactly like `origin_uid`.
+        // 'main' | 'worktree'. Set locally by the host-inventory poller
+        // and `set_workspace_project_root`, and — unlike `origin_uid` —
+        // server-authoritative on pull: the cloud `codemux_workspaces`
+        // schema now carries both, so `upsert_workspace_sync_from_server`
+        // persists them from the server row.
         "ALTER TABLE workspaces_sync ADD COLUMN project_uid TEXT",
         "ALTER TABLE workspaces_sync ADD COLUMN workspace_kind TEXT",
     ] {
