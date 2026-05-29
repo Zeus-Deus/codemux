@@ -105,6 +105,16 @@ pub fn project_uid_for(remote: Option<&str>, project_root: &str) -> String {
 /// git is unavailable. Keeps the pure functions above pure — this is
 /// the one impure helper, used by create paths to derive identity.
 pub fn git_canonical_remote(dir: &Path) -> Option<String> {
+    // Cheap gate before spawning a subprocess: a dir with no `.git`
+    // (the common case for not-yet-materialised or test paths) can't
+    // have a remote. Spawning `git` only to have it fail is needless
+    // overhead — and on Windows, where process spawns are slow, doing
+    // it for every create call pushes the test suite over CI's time
+    // budget. `.exists()` covers both a `.git` dir (main checkout) and
+    // a `.git` file (worktree).
+    if !dir.join(".git").exists() {
+        return None;
+    }
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)

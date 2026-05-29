@@ -479,6 +479,13 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<Workspace, WorkspaceError
 /// `None` on any failure (not a repo, no origin, git missing) — the
 /// project still gets a path-based identity.
 fn git_remote_origin_url(dir: &str) -> Option<String> {
+    // Cheap gate: skip the subprocess entirely when the dir has no
+    // `.git` (not-yet-materialised registrations and the many fake
+    // test paths). Spawning git just to have it fail is wasted time —
+    // and on Windows it's slow enough to blow the CI time budget.
+    if !std::path::Path::new(dir).join(".git").exists() {
+        return None;
+    }
     let out = std::process::Command::new("git")
         .args(["-C", dir, "config", "--get", "remote.origin.url"])
         .output()
