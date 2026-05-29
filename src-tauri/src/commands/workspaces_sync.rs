@@ -33,6 +33,14 @@ pub struct WorkspaceSyncView {
     pub git_branch: Option<String>,
     /// Phase-4 divergence detection: HEAD sha at last reconcile.
     pub git_head_sha: Option<String>,
+    /// Deterministic project identity (`UUIDv5`); see
+    /// `crate::project_identity`. The overview groups workspaces that
+    /// share this so a project's main checkout and its worktrees read
+    /// as one project. May be null on rows that haven't been stamped
+    /// (e.g. pulled from a sibling device pre-Phase-2).
+    pub project_uid: Option<String>,
+    /// `"main"` | `"worktree"` — the overview renders a kind badge.
+    pub workspace_kind: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// True when the row has unpushed changes. The UI shows a
@@ -52,6 +60,8 @@ impl From<WorkspaceSyncRecord> for WorkspaceSyncView {
             project_remote: r.project_remote,
             git_branch: r.git_branch,
             git_head_sha: r.git_head_sha,
+            project_uid: r.project_uid,
+            workspace_kind: r.workspace_kind,
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,
@@ -229,12 +239,20 @@ pub fn workspaces_adoption_preview(
     // helper that pushes use, so a workspace pushed from this device
     // and adopted on another lands at structurally identical paths
     // on both sides.
+    // Prefer the project_path basename; fall back to the workspace
+    // title when the originating host never recorded a project root
+    // (e.g. a root/main checkout created via the MCP `workspace_create`
+    // tool). The title is always present, so a synced workspace never
+    // collapses to the generic `~/.codemux/worktrees/workspace/<branch>`
+    // landing path. `conventional_remote_path` still guards the empty
+    // case as a last resort.
     let project_name = row
         .project_path
         .as_deref()
         .and_then(|p| std::path::Path::new(p).file_name())
         .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
+        .filter(|n| !n.is_empty())
+        .unwrap_or(row.title.as_str());
     let branch = row.git_branch.as_deref().unwrap_or("main");
     let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
     let conv_str = conv.to_string_lossy().to_string();
@@ -310,11 +328,21 @@ fn detect_same_branch_project_conflict(
     previewed: &WorkspaceSyncRecord,
 ) -> Option<String> {
     let previewed_branch = previewed.git_branch.as_deref()?;
+    // Prefer the stable, deterministic project_uid when the previewed
+    // row carries one (Phase 1 of the project-identity work). It's an
+    // exact identity — no false positives from two unrelated repos that
+    // happen to share a basename, and no false negatives when the same
+    // repo lives at different paths on two devices. Fall back to the
+    // legacy `basename(project_path)` heuristic for rows that predate
+    // project_uid.
     let previewed_basename = previewed
         .project_path
         .as_deref()
         .and_then(|p| std::path::Path::new(p).file_name())
-        .and_then(|n| n.to_str())?;
+        .and_then(|n| n.to_str());
+    if previewed.project_uid.is_none() && previewed_basename.is_none() {
+        return None;
+    }
 
     for r in db.list_workspaces_sync() {
         // Only compare against rows that DO correspond to a local
@@ -327,16 +355,24 @@ fn detect_same_branch_project_conflict(
         if previewed.workspace_id.as_deref() == Some(local_wid) {
             continue;
         }
-        // Branch + project basename must both match.
+        // Branch must match in all cases.
         if r.git_branch.as_deref() != Some(previewed_branch) {
             continue;
         }
-        let local_basename = r
-            .project_path
-            .as_deref()
-            .and_then(|p| std::path::Path::new(p).file_name())
-            .and_then(|n| n.to_str());
-        if local_basename != Some(previewed_basename) {
+        // Same project: exact project_uid when both sides have one,
+        // otherwise the basename fallback.
+        let same_project = match (previewed.project_uid.as_deref(), r.project_uid.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => {
+                let local_basename = r
+                    .project_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str());
+                previewed_basename.is_some() && local_basename == previewed_basename
+            }
+        };
+        if !same_project {
             continue;
         }
         return Some(local_wid.to_string());
@@ -439,13 +475,17 @@ pub async fn workspaces_adopt_synced(
                 )
             })?;
 
-        // Compute canonical local path.
+        // Compute canonical local path. Mirrors the suggested_path
+        // logic in `workspaces_adoption_preview` exactly — including the
+        // title fallback — so the path the dialog previews is the path
+        // adoption actually lands at.
         let project_name = row
             .project_path
             .as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or("workspace");
+            .filter(|n| !n.is_empty())
+            .unwrap_or(row.title.as_str());
         let branch = row.git_branch.as_deref().unwrap_or("main");
         let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
         let conv_str = conv.to_string_lossy().to_string();
@@ -747,6 +787,8 @@ mod tests {
             None,
             branch,
             None,
+            None,
+            None,
         )
         .unwrap();
     }
@@ -767,6 +809,8 @@ mod tests {
             git_branch: branch.map(|s| s.into()),
             git_head_sha: None,
             origin_uid: Some("uuid-1".into()),
+            project_uid: None,
+            workspace_kind: None,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             deleted_at: None,
@@ -881,6 +925,8 @@ mod tests {
             None,
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
+            None,
+            None,
             None,
         )
         .unwrap();

@@ -161,6 +161,89 @@ fn cli_to_reconcile_round_trip_publishes_remote_workspaces() {
 }
 
 #[test]
+fn cli_to_reconcile_propagates_project_identity() {
+    // The full project-identity chain through the REAL binary: a repo
+    // with a git origin → daemon stamps deterministic project_uid +
+    // canonical repo_remote + kind at create → `workspace list` emits
+    // them → parser reads them → reconcile lands them on the sync row.
+    // This is the desktop overview's source of "group by project +
+    // label main/worktree".
+    let bin = binary_path();
+    if !bin.exists() {
+        return;
+    }
+
+    // Real git repo with an origin remote so the daemon can canonicalise
+    // a remote and derive a deterministic uid from it.
+    let repo_tmp = TempDir::new().unwrap();
+    let repo = repo_tmp.path().join("passpage");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .expect("spawn git")
+            .status
+            .success();
+        assert!(ok, "git {args:?} failed");
+    };
+    git(&["init", "-q"]);
+    git(&["remote", "add", "origin", "git@github.com:acme/passpage.git"]);
+
+    let state_tmp = TempDir::new().unwrap();
+    let state_dir = state_tmp.path();
+    let expected_uid = {
+        let store = WorkspaceStore::open(
+            &config::database_path(state_dir),
+            "test-host".into(),
+            config::workspaces_root(state_dir),
+        )
+        .unwrap();
+        // No project_root passed — the daemon derives identity from the
+        // repo path itself (the agent-created-a-root-project case).
+        let ws = store
+            .create(
+                Some("passpage".into()),
+                repo.display().to_string(),
+                Some("main".into()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(ws.kind.as_deref(), Some("main"));
+        assert_eq!(
+            ws.repo_remote.as_deref(),
+            Some("github.com/acme/passpage"),
+            "daemon must canonicalise the git origin remote"
+        );
+        ws.project_uid.expect("daemon must stamp a project_uid")
+    };
+
+    // Through the real `workspace list` binary.
+    let stdout = run_workspace_list(state_dir);
+    let parsed = parse_inventory_json(&stdout).unwrap();
+    assert_eq!(parsed.workspaces.len(), 1);
+    let w = &parsed.workspaces[0];
+    assert_eq!(w.project_uid.as_deref(), Some(expected_uid.as_str()));
+    assert_eq!(w.kind.as_deref(), Some("main"));
+    assert_eq!(w.repo_remote.as_deref(), Some("github.com/acme/passpage"));
+
+    // Into the desktop sync mirror.
+    let desktop_db = DatabaseStore::new_in_memory();
+    reconcile_host_inventory(&desktop_db, "host-pandora", &parsed);
+    let rows = desktop_db.list_remote_discovered_for_host("host-pandora");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].project_uid.as_deref(), Some(expected_uid.as_str()));
+    assert_eq!(rows[0].workspace_kind.as_deref(), Some("main"));
+    assert_eq!(
+        rows[0].project_remote.as_deref(),
+        Some("github.com/acme/passpage"),
+        "project_remote is now populated for remote-discovered rows"
+    );
+}
+
+#[test]
 fn cli_to_reconcile_is_idempotent_across_polls() {
     // Steady-state property: if the host's registry didn't change,
     // a second reconcile must produce zero inserts/updates/soft-

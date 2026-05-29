@@ -419,6 +419,16 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
     )
     .map_err(|e| format!("workspace store: {e}"))?;
 
+    // Idempotent: backfill first-class project identity (project_uid /
+    // name / kind / remote) onto any rows registered before those
+    // columns existed. Does real work only once, right after an
+    // upgrade; a no-op on every subsequent boot.
+    match workspaces.sweep_backfill_identity() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[codemux-remote] backfilled project identity for {n} workspace(s)"),
+        Err(e) => eprintln!("[codemux-remote] project-identity backfill skipped: {e}"),
+    }
+
     let manifest_value = manifest::Manifest::new(endpoint.clone(), host_id);
     let manifest_path = config::manifest_path(&state_dir);
     manifest::write(&manifest_path, &manifest_value)?;

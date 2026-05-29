@@ -70,6 +70,10 @@ pub struct ServerWorkspace {
     pub git_branch: Option<String>,
     #[serde(rename = "gitHeadSha", default)]
     pub git_head_sha: Option<String>,
+    #[serde(rename = "projectUid", default)]
+    pub project_uid: Option<String>,
+    #[serde(rename = "workspaceKind", default)]
+    pub workspace_kind: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
     #[serde(rename = "updatedAt")]
@@ -101,6 +105,10 @@ struct WorkspaceUpsertBody<'a> {
     git_branch: Option<&'a str>,
     #[serde(rename = "gitHeadSha", skip_serializing_if = "Option::is_none")]
     git_head_sha: Option<&'a str>,
+    #[serde(rename = "projectUid", skip_serializing_if = "Option::is_none")]
+    project_uid: Option<&'a str>,
+    #[serde(rename = "workspaceKind", skip_serializing_if = "Option::is_none")]
+    workspace_kind: Option<&'a str>,
 }
 
 /// Guard against concurrent sync attempts. Foreground sync + the
@@ -195,6 +203,8 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
             &w.created_at,
             &w.updated_at,
             w.deleted_at.as_deref(),
+            w.project_uid.as_deref(),
+            w.workspace_kind.as_deref(),
         )?;
     }
 
@@ -222,6 +232,8 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
                     &local_row.created_at,
                     &now,
                     Some(&now),
+                    local_row.project_uid.as_deref(),
+                    local_row.workspace_kind.as_deref(),
                 )?;
             }
         }
@@ -280,6 +292,8 @@ async fn push_insert(
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
         git_head_sha: row.git_head_sha.as_deref(),
+        project_uid: row.project_uid.as_deref(),
+        workspace_kind: row.workspace_kind.as_deref(),
     };
     let resp = client
         .post(format!("{base}/api/workspaces"))
@@ -315,6 +329,8 @@ async fn push_update(
         project_remote: row.project_remote.as_deref(),
         git_branch: row.git_branch.as_deref(),
         git_head_sha: row.git_head_sha.as_deref(),
+        project_uid: row.project_uid.as_deref(),
+        workspace_kind: row.workspace_kind.as_deref(),
     };
     let resp = client
         .patch(format!("{base}/api/workspaces/{server_id}"))
@@ -463,6 +479,13 @@ pub fn reconcile_from_snapshot(
         // updating.
         let project_remote: Option<&str> = None;
         let git_branch = ws.git_branch.as_deref();
+        // First-class project identity, stamped on the snapshot at
+        // create time (`set_workspace_project_root`). Local-only sync
+        // columns for now (cloud doesn't carry them yet); they let the
+        // overview group by project_uid and the pull-conflict guard
+        // match exactly.
+        let project_uid = ws.project_uid.as_deref();
+        let workspace_kind = ws.workspace_kind.as_deref();
 
         // Read the workspace's git HEAD sha so Phase-4 divergence
         // detection can compare across devices. Best-effort: if
@@ -483,7 +506,9 @@ pub fn reconcile_from_snapshot(
                 || existing.project_path.as_deref() != project_path
                 || existing.project_remote.as_deref() != project_remote
                 || existing.git_branch.as_deref() != git_branch
-                || existing.git_head_sha.as_deref() != git_head_sha_ref;
+                || existing.git_head_sha.as_deref() != git_head_sha_ref
+                || existing.project_uid.as_deref() != project_uid
+                || existing.workspace_kind.as_deref() != workspace_kind;
             if changed {
                 if let Err(error) = db.update_workspace_sync_by_workspace_id(
                     &wid,
@@ -493,6 +518,8 @@ pub fn reconcile_from_snapshot(
                     project_remote,
                     git_branch,
                     git_head_sha_ref,
+                    project_uid,
+                    workspace_kind,
                 ) {
                     eprintln!(
                         "[workspaces-sync] update failed for {wid}: {error}"
@@ -507,6 +534,8 @@ pub fn reconcile_from_snapshot(
             project_remote,
             git_branch,
             git_head_sha_ref,
+            project_uid,
+            workspace_kind,
         ) {
             // UNIQUE(workspace_id) collision shouldn't happen given
             // the index pass above — log and continue.
@@ -574,11 +603,15 @@ mod tests {
                 Some("git@github.com:alpha/alpha.git"),
                 Some("main"),
                 Some("abc123"),
+                Some("uid-alpha"),
+                Some("main"),
             )
             .expect("insert");
         assert!(row.dirty);
         assert!(row.server_id.is_none());
         assert_eq!(row.workspace_id.as_deref(), Some("workspace-1"));
+        assert_eq!(row.project_uid.as_deref(), Some("uid-alpha"));
+        assert_eq!(row.workspace_kind.as_deref(), Some("main"));
         assert_eq!(row.title, "alpha");
 
         let list = db.list_workspaces_sync();
@@ -591,7 +624,7 @@ mod tests {
     fn update_marks_row_dirty_again() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-2", "before", None, None, None, None, None)
+            .insert_workspace_sync("workspace-2", "before", None, None, None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("42")).unwrap();
 
@@ -609,6 +642,8 @@ mod tests {
             None,
             Some("feature-x"),
             Some("def456"),
+            None,
+            None,
         )
         .unwrap();
         let dirty = db.list_dirty_workspaces_sync();
@@ -623,7 +658,7 @@ mod tests {
     fn soft_delete_then_purge() {
         let db = fresh_db();
         let row = db
-            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None, None)
+            .insert_workspace_sync("workspace-3", "doomed", None, None, None, None, None, None, None)
             .unwrap();
         db.mark_workspace_sync_synced(row.id, Some("100")).unwrap();
 
@@ -664,6 +699,8 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
             None,
+            Some("uid-200"),
+            Some("main"),
         )
         .unwrap();
         let listed = db.list_workspaces_sync();
@@ -671,6 +708,8 @@ mod tests {
         assert_eq!(listed[0].server_id.as_deref(), Some("200"));
         assert_eq!(listed[0].title, "from-server");
         assert_eq!(listed[0].git_head_sha.as_deref(), Some("aaa111"));
+        assert_eq!(listed[0].project_uid.as_deref(), Some("uid-200"));
+        assert_eq!(listed[0].workspace_kind.as_deref(), Some("main"));
         assert!(!listed[0].dirty, "server-sourced rows must be clean");
 
         // Second call — same server_id but a new updated_at and new
@@ -686,12 +725,19 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-02 00:00:00",
             None,
+            Some("uid-200"),
+            Some("worktree"),
         )
         .unwrap();
         let listed = db.list_workspaces_sync();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title, "renamed-server-side");
         assert_eq!(listed[0].git_branch.as_deref(), Some("dev"));
+        assert_eq!(
+            listed[0].workspace_kind.as_deref(),
+            Some("worktree"),
+            "server pull updates workspace_kind in place"
+        );
     }
 
     #[test]
@@ -710,6 +756,8 @@ mod tests {
             None,
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
+            None,
+            None,
             None,
         )
         .unwrap();
@@ -748,6 +796,8 @@ mod tests {
             latest_agent_state: None,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -819,6 +869,40 @@ mod tests {
 
     #[test]
     #[serial]
+    fn reconcile_threads_project_identity_from_snapshot() {
+        // A local workspace stamped with project_uid + workspace_kind
+        // (by `set_workspace_project_root` at create) must carry those
+        // onto its sync row, so the overview groups by project and the
+        // pull-conflict guard can match exactly.
+        let db = fresh_db();
+        let mut ws = make_ws("workspace-P", "passpage");
+        ws.project_root = Some("/home/agent/projects/passpage".into());
+        ws.project_uid = Some("uid-passpage".into());
+        ws.workspace_kind = Some("main".into());
+        let snapshot = make_snapshot(vec![ws]);
+
+        super::reconcile_from_snapshot(&db, &snapshot).unwrap();
+
+        let row = &db.list_workspaces_sync()[0];
+        assert_eq!(row.project_uid.as_deref(), Some("uid-passpage"));
+        assert_eq!(row.workspace_kind.as_deref(), Some("main"));
+
+        // Idempotent: an identical reconcile must not re-dirty the row
+        // (otherwise every tick would burn a cloud PATCH).
+        db.mark_workspace_sync_synced(row.id, Some("cloud-1")).unwrap();
+        let mut ws2 = make_ws("workspace-P", "passpage");
+        ws2.project_root = Some("/home/agent/projects/passpage".into());
+        ws2.project_uid = Some("uid-passpage".into());
+        ws2.workspace_kind = Some("main".into());
+        super::reconcile_from_snapshot(&db, &make_snapshot(vec![ws2])).unwrap();
+        assert!(
+            !db.list_workspaces_sync()[0].dirty,
+            "unchanged identity must not re-mark the row dirty"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn reconcile_soft_deletes_row_when_workspace_closed() {
         // The regression guard for the "closed workspace briefly appears
         // as 'lives on another device'" bug. When a local workspace is
@@ -871,6 +955,8 @@ mod tests {
             "2026-01-01 00:00:00",
             "2026-01-01 00:00:00",
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(db.list_workspaces_sync().len(), 1);
@@ -904,6 +990,8 @@ mod tests {
                 Some("/srv/discovered"),
                 Some("git@github.com:user/repo.git"),
                 Some("main"),
+                Some("proj-uid-1"),
+                Some("worktree"),
             )
             .expect("insert remote-discovered");
         assert!(row.workspace_id.is_none(), "remote-discovered rows must have NULL workspace_id");
@@ -912,6 +1000,8 @@ mod tests {
         assert_eq!(row.host_server_id.as_deref(), Some("host-1"));
         assert_eq!(row.origin_uid.as_deref(), Some("uuid-abc"));
         assert_eq!(row.title, "discovered-on-host");
+        assert_eq!(row.project_uid.as_deref(), Some("proj-uid-1"));
+        assert_eq!(row.workspace_kind.as_deref(), Some("worktree"));
 
         // The lookup function returns this row when queried by
         // (host, uid) and rejects mismatching pairs.
@@ -947,6 +1037,8 @@ mod tests {
                 None,
                 None,
                 Some("main"),
+                None,
+                None,
             )
             .unwrap();
         // Simulate the first push assigning a cloud server_id.
@@ -963,6 +1055,8 @@ mod tests {
             Some("/srv/new"),
             Some("git@github.com:user/repo.git"),
             Some("feature/x"),
+            Some("proj-uid-z"),
+            Some("main"),
         )
         .unwrap();
 
@@ -996,11 +1090,11 @@ mod tests {
     #[serial]
     fn list_remote_discovered_for_host_is_scoped() {
         let db = fresh_db();
-        db.insert_remote_discovered_workspace_sync("host-A", "uid-1", "a1", None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-1", "a1", None, None, None, None, None)
             .unwrap();
-        db.insert_remote_discovered_workspace_sync("host-A", "uid-2", "a2", None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-A", "uid-2", "a2", None, None, None, None, None)
             .unwrap();
-        db.insert_remote_discovered_workspace_sync("host-B", "uid-3", "b1", None, None, None)
+        db.insert_remote_discovered_workspace_sync("host-B", "uid-3", "b1", None, None, None, None, None)
             .unwrap();
         // A local-on-this-device row with no origin_uid must not
         // appear in the host scope, even if it carries the same
@@ -1009,6 +1103,8 @@ mod tests {
             "workspace-local",
             "local-pushed",
             Some("host-A"),
+            None,
+            None,
             None,
             None,
             None,
@@ -1038,6 +1134,8 @@ mod tests {
                 "host-Z",
                 "uid-doomed",
                 "to-be-deleted",
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -1085,6 +1183,8 @@ mod tests {
             .insert_workspace_sync(
                 "workspace-99",
                 "ephemeral",
+                None,
+                None,
                 None,
                 None,
                 None,

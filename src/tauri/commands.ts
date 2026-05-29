@@ -1754,6 +1754,14 @@ export interface WorkspaceSyncView {
    *  HEADs on multiple devices. Null when git isn't available or
    *  the worktree has no commits yet. */
   git_head_sha: string | null;
+  /** Deterministic project identity (UUIDv5 of the canonical remote or
+   *  project root). Workspaces sharing this belong to the same project
+   *  — the overview groups by it so a repo's main checkout and its
+   *  worktrees cluster together. Null on rows not yet stamped. */
+  project_uid: string | null;
+  /** "main" (repo root checkout) | "worktree" (per-branch worktree).
+   *  Rendered as a small badge in the overview. */
+  workspace_kind: string | null;
   created_at: string;
   updated_at: string;
   /** True iff the row has unpushed changes. UI surfaces this as a

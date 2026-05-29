@@ -44,6 +44,8 @@ function makeSyncRow(overrides?: Partial<WorkspaceSyncView>): WorkspaceSyncView 
     project_remote: "git@github.com:Zeus-Deus/codemux.git",
     git_branch: "feature/cross-device",
     git_head_sha: null,
+    project_uid: null,
+    workspace_kind: null,
     created_at: "2026-05-20T10:00:00Z",
     updated_at: "2026-05-20T10:00:00Z",
     dirty: false,
@@ -62,6 +64,7 @@ function remoteItem(overrides?: Partial<WorkspaceSyncView>): OverviewItem {
       ? sync.project_path.split("/").filter(Boolean).slice(-1)[0] ?? null
       : null,
     projectPath: sync.project_path,
+    projectKey: sync.project_uid ?? sync.project_path,
   };
 }
 
@@ -83,6 +86,28 @@ describe("WorkspaceOverviewRow (sibling-device branch)", () => {
     expect(getByText(/not on this device/i)).toBeInTheDocument();
     // Project name derived from project_path basename.
     expect(getByText("codemux")).toBeInTheDocument();
+  });
+
+  it("renders a 'worktree' kind badge when the row is typed", () => {
+    const { getByText } = render(
+      <WorkspaceOverviewRow
+        item={remoteItem({ workspace_kind: "worktree" })}
+        isAttached={false}
+        onAfterOpen={() => {}}
+      />,
+    );
+    expect(getByText("worktree")).toBeInTheDocument();
+  });
+
+  it("renders a 'main' kind badge for the root checkout", () => {
+    const { getByText } = render(
+      <WorkspaceOverviewRow
+        item={remoteItem({ workspace_kind: "main" })}
+        isAttached={false}
+        onAfterOpen={() => {}}
+      />,
+    );
+    expect(getByText("main")).toBeInTheDocument();
   });
 
   it("renders the branch on the bottom row", () => {

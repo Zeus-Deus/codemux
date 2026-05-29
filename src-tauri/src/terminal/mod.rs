@@ -4054,6 +4054,8 @@ mod tests {
             latest_agent_state: None,
             worktree_path: worktree_path.map(String::from),
             project_root: project_root.map(String::from),
+            project_uid: None,
+            workspace_kind: None,
             pr_number: None,
             pr_state: None,
             pr_url: None,

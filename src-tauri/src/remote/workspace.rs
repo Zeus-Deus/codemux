@@ -37,6 +37,26 @@ pub struct Workspace {
     /// an existing repo (so we know where it was cloned/worktreed
     /// from). May be `None` for blank workspaces.
     pub project_root: Option<String>,
+    /// Stable, deterministic project identity — `UUIDv5(canonical
+    /// remote ?? project_root)`. Shared by a project's main checkout
+    /// and all its worktrees, and identical on every host/device that
+    /// has the same repo, so the desktop can group siblings without
+    /// coordination. See `crate::project_identity`.
+    #[serde(default)]
+    pub project_uid: Option<String>,
+    /// Human-readable project name (basename of `project_root`).
+    #[serde(default)]
+    pub project_name: Option<String>,
+    /// `"main"` for the repo root checkout, `"worktree"` for a
+    /// per-branch git worktree. Lets the desktop label and group
+    /// without inferring from path shape.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Canonical git remote (`canonical_remote(...)`) when the repo has
+    /// one. Null for local-only repos. Lets other devices converge on
+    /// the same `project_uid` for an independently-cloned copy.
+    #[serde(default)]
+    pub repo_remote: Option<String>,
     /// RFC 3339 UTC timestamp.
     pub created_at: String,
     /// RFC 3339 UTC timestamp.
@@ -144,12 +164,60 @@ impl WorkspaceStore {
         let id = Uuid::new_v4().to_string();
         let resolved_name = name.unwrap_or_else(|| basename(&path));
 
+        // Stamp a project identity at the moment of record creation,
+        // mirroring every desktop create path (`commands/workspace.rs`).
+        // The `workspace_create` MCP tool only receives `project_root`
+        // for worktrees; a plain root/main checkout an agent builds on
+        // this host arrives with `project_root = None`, which used to
+        // leave the workspace with a blank project name on every dev
+        // device. Deriving it here — the git root of the workspace's
+        // own directory, or the directory itself when it isn't (yet) a
+        // repo — guarantees a non-null `project_root` at the source, so
+        // the cross-device registry never carries an anonymous row.
+        // `find_git_root` follows a worktree's `.git` pointer back to
+        // the parent repo, so a worktree resolves to its project root
+        // (not the per-branch dir), exactly as the desktop does.
+        let project_root = project_root.or_else(|| {
+            let p = std::path::Path::new(&path);
+            let derived = if p.exists() {
+                crate::config::workspace_config::find_git_root(p)
+            } else {
+                None
+            };
+            Some(
+                derived
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| path.clone()),
+            )
+        });
+
+        // Derive the first-class project identity (see
+        // `crate::project_identity`). The canonical remote (when the
+        // repo has one) makes the uid converge with copies of the same
+        // repo on other hosts/devices; otherwise it falls back to the
+        // project-root path. `kind` distinguishes the root checkout
+        // from a per-branch worktree.
+        let repo_remote = project_root
+            .as_deref()
+            .and_then(git_remote_origin_url)
+            .as_deref()
+            .and_then(crate::project_identity::canonical_remote);
+        let project_uid = project_root.as_deref().map(|pr| {
+            crate::project_identity::project_uid_for(repo_remote.as_deref(), pr)
+        });
+        let project_name = project_root.as_deref().map(basename);
+        let kind = Some(crate::project_identity::derive_kind(std::path::Path::new(&path)).to_string());
+
         let ws = Workspace {
             id: id.clone(),
             name: resolved_name,
             path,
             branch,
             project_root,
+            project_uid,
+            project_name,
+            kind,
+            repo_remote,
             created_at: now.clone(),
             updated_at: now,
             owner_id: None,
@@ -161,8 +229,9 @@ impl WorkspaceStore {
         conn.execute(
             "INSERT INTO workspaces (
                 id, name, path, branch, project_root,
-                created_at, updated_at, owner_id, origin_host_id, notes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                created_at, updated_at, owner_id, origin_host_id, notes,
+                project_uid, project_name, kind, repo_remote
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 ws.id,
                 ws.name,
@@ -174,6 +243,10 @@ impl WorkspaceStore {
                 ws.owner_id,
                 ws.origin_host_id,
                 ws.notes,
+                ws.project_uid,
+                ws.project_name,
+                ws.kind,
+                ws.repo_remote,
             ],
         )
         .map_err(|e| WorkspaceError::Db(e.to_string()))?;
@@ -185,7 +258,8 @@ impl WorkspaceStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, path, branch, project_root,
-                        created_at, updated_at, owner_id, origin_host_id, notes
+                        created_at, updated_at, owner_id, origin_host_id, notes,
+                        project_uid, project_name, kind, repo_remote
                  FROM workspaces WHERE id = ?1",
             )
             .map_err(|e| WorkspaceError::Db(e.to_string()))?;
@@ -206,7 +280,8 @@ impl WorkspaceStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, path, branch, project_root,
-                        created_at, updated_at, owner_id, origin_host_id, notes
+                        created_at, updated_at, owner_id, origin_host_id, notes,
+                        project_uid, project_name, kind, repo_remote
                  FROM workspaces
                  ORDER BY created_at DESC",
             )
@@ -282,6 +357,47 @@ impl WorkspaceStore {
         .map_err(|e| WorkspaceError::Db(e.to_string()))?;
         Ok(ws)
     }
+
+    /// Idempotent startup normalization: backfill the project-identity
+    /// columns (`project_uid`, `project_name`, `kind`, `repo_remote`)
+    /// for rows created before those columns existed. Safe to run on
+    /// every daemon boot — it only touches rows whose identity is still
+    /// missing, so it does real work exactly once after an upgrade.
+    /// Returns the number of rows updated. Mirrors Superset's
+    /// `runMainWorkspaceSweep` (the "no anonymous / no
+    /// worktrees-without-a-root" guarantee), adapted to our registry.
+    pub fn sweep_backfill_identity(&self) -> Result<usize, WorkspaceError> {
+        // Snapshot the rows first (this drops the lock), then update.
+        let rows = self.list()?;
+        let mut updated = 0usize;
+        let conn = self.conn.lock().unwrap();
+        for ws in rows {
+            if ws.project_uid.is_some() && ws.kind.is_some() {
+                continue;
+            }
+            let project_root = ws.project_root.clone().unwrap_or_else(|| ws.path.clone());
+            let repo_remote = git_remote_origin_url(&project_root)
+                .as_deref()
+                .and_then(crate::project_identity::canonical_remote);
+            let project_uid = Some(crate::project_identity::project_uid_for(
+                repo_remote.as_deref(),
+                &project_root,
+            ));
+            let project_name = Some(basename(&project_root));
+            let kind = Some(
+                crate::project_identity::derive_kind(std::path::Path::new(&ws.path)).to_string(),
+            );
+            conn.execute(
+                "UPDATE workspaces
+                 SET project_uid = ?2, project_name = ?3, kind = ?4, repo_remote = ?5
+                 WHERE id = ?1",
+                rusqlite::params![ws.id, project_uid, project_name, kind, repo_remote],
+            )
+            .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
 }
 
 fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
@@ -297,13 +413,43 @@ fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
             updated_at      TEXT NOT NULL,
             owner_id        TEXT,            -- nullable; populated by future cloud relay
             origin_host_id  TEXT NOT NULL,
-            notes           TEXT
+            notes           TEXT,
+            project_uid     TEXT,            -- deterministic project identity (UUIDv5)
+            project_name    TEXT,
+            kind            TEXT,            -- 'main' | 'worktree'
+            repo_remote     TEXT             -- canonical git remote, null for local-only
         );
         CREATE INDEX IF NOT EXISTS idx_workspaces_origin
             ON workspaces (origin_host_id);
         CREATE INDEX IF NOT EXISTS idx_workspaces_owner
             ON workspaces (owner_id);
         ",
+    )
+    .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+
+    // Additive column migrations for DBs created before the first-class
+    // project-identity columns existed. The daemon DB lives on user
+    // machines and `CREATE TABLE IF NOT EXISTS` is a no-op on an
+    // existing table, so columns added later need explicit, idempotent
+    // ALTERs — mirroring the desktop's `database.rs` migration loop. A
+    // re-run yields "duplicate column name", which we swallow.
+    for stmt in [
+        "ALTER TABLE workspaces ADD COLUMN project_uid TEXT",
+        "ALTER TABLE workspaces ADD COLUMN project_name TEXT",
+        "ALTER TABLE workspaces ADD COLUMN kind TEXT",
+        "ALTER TABLE workspaces ADD COLUMN repo_remote TEXT",
+    ] {
+        if let Err(e) = conn.execute(stmt, []) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column name") {
+                return Err(WorkspaceError::Db(format!("migration failed ({stmt}): {msg}")));
+            }
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_workspaces_project_uid
+            ON workspaces (project_uid);",
     )
     .map_err(|e| WorkspaceError::Db(e.to_string()))?;
     Ok(())
@@ -322,7 +468,37 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<Workspace, WorkspaceError
         owner_id: map(7).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         origin_host_id: row.get::<_, String>(8).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         notes: map(9).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        project_uid: map(10).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        project_name: map(11).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        kind: map(12).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        repo_remote: map(13).map_err(|e| WorkspaceError::Db(e.to_string()))?,
     })
+}
+
+/// Best-effort `git remote get-url origin` for a repo dir. Returns
+/// `None` on any failure (not a repo, no origin, git missing) — the
+/// project still gets a path-based identity.
+fn git_remote_origin_url(dir: &str) -> Option<String> {
+    // Cheap gate: skip the subprocess entirely when the dir has no
+    // `.git` (not-yet-materialised registrations and the many fake
+    // test paths). Spawning git just to have it fail is wasted time —
+    // and on Windows it's slow enough to blow the CI time budget.
+    if !std::path::Path::new(dir).join(".git").exists() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .args(["-C", dir, "config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        None
+    } else {
+        Some(url)
+    }
 }
 
 fn basename(path: &str) -> String {
@@ -342,6 +518,120 @@ mod tests {
         let db_path = dir.path().join("codemux.db");
         let ws_root = dir.path().join("workspaces");
         WorkspaceStore::open(&db_path, "test-host".into(), ws_root).unwrap()
+    }
+
+    #[test]
+    fn create_stamps_project_identity_and_kind() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+
+        // A root checkout (real .git dir, no remote → path-based uid).
+        let repo = dir.path().join("passpage");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_str = repo.display().to_string();
+
+        let ws = store
+            .create(None, repo_str.clone(), Some("main".into()), None)
+            .unwrap();
+
+        assert_eq!(ws.kind.as_deref(), Some("main"));
+        assert_eq!(ws.project_name.as_deref(), Some("passpage"));
+        assert_eq!(ws.repo_remote, None, "no origin remote in this temp repo");
+        let expected_uid =
+            crate::project_identity::project_uid_for(None, &repo_str);
+        assert_eq!(ws.project_uid.as_deref(), Some(expected_uid.as_str()));
+
+        // Round-trips through get/list (column order intact).
+        assert_eq!(store.get(&ws.id).unwrap().project_uid, ws.project_uid);
+        assert_eq!(store.list().unwrap()[0].kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn create_marks_worktree_kind_and_shares_uid_with_main() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+
+        // Main checkout.
+        let repo = dir.path().join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let main = store
+            .create(None, repo.display().to_string(), Some("main".into()), None)
+            .unwrap();
+
+        // A worktree: .git is a FILE; project_root passed = the parent
+        // repo (as the desktop worktree-create path does).
+        let wt = dir.path().join("wt-feature");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /app/.git/worktrees/feature\n").unwrap();
+        let worktree = store
+            .create(
+                Some("feature".into()),
+                wt.display().to_string(),
+                Some("feature".into()),
+                Some(repo.display().to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(main.kind.as_deref(), Some("main"));
+        assert_eq!(worktree.kind.as_deref(), Some("worktree"));
+        assert_eq!(
+            main.project_uid, worktree.project_uid,
+            "main + worktree of the same repo share a project_uid"
+        );
+    }
+
+    #[test]
+    fn sweep_backfills_legacy_rows_and_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+
+        // Simulate a legacy row: insert directly with NULL identity
+        // columns (as a pre-migration `create` would have).
+        let repo = dir.path().join("legacy");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_str = repo.display().to_string();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (id, name, path, branch, project_root,
+                    created_at, updated_at, owner_id, origin_host_id, notes)
+                 VALUES ('legacy-1', 'legacy', ?1, 'main', ?1,
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', NULL, 'test-host', NULL)",
+                rusqlite::params![repo_str],
+            )
+            .unwrap();
+        }
+
+        let before = store.get("legacy-1").unwrap();
+        assert_eq!(before.project_uid, None, "legacy row has no identity yet");
+
+        let updated = store.sweep_backfill_identity().unwrap();
+        assert_eq!(updated, 1);
+
+        let after = store.get("legacy-1").unwrap();
+        assert_eq!(after.kind.as_deref(), Some("main"));
+        assert_eq!(after.project_name.as_deref(), Some("legacy"));
+        assert!(after.project_uid.is_some());
+
+        // Idempotent: a second sweep touches nothing.
+        assert_eq!(store.sweep_backfill_identity().unwrap(), 0);
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_reopen() {
+        // Opening an existing DB again must not fail on the ALTER loop
+        // (duplicate column) — the daemon DB upgrade path.
+        let dir = TempDir::new().unwrap();
+        {
+            let _ = open_store(&dir);
+        }
+        let store = open_store(&dir); // re-open: ALTERs already applied
+        let repo = dir.path().join("r");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let ws = store
+            .create(None, repo.display().to_string(), None, None)
+            .unwrap();
+        assert!(ws.project_uid.is_some());
     }
 
     #[test]
@@ -386,6 +676,67 @@ mod tests {
         let store = open_store(&dir);
         let ws = store.create(None, "/tmp/my-cool-repo".into(), None, None).unwrap();
         assert_eq!(ws.name, "my-cool-repo");
+    }
+
+    #[test]
+    fn create_derives_project_root_from_git_root_when_omitted() {
+        // A root/main project an agent builds (e.g. `git init`) and then
+        // registers via `workspace_create` WITHOUT passing project_root
+        // must still carry a project identity. The daemon derives it
+        // from the path's git root so the cross-device registry never
+        // gets an anonymous row (the blank-project-name bug).
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+
+        let repo = dir.path().join("passpage");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_str = repo.display().to_string();
+
+        let ws = store
+            .create(None, repo_str.clone(), Some("main".into()), None)
+            .unwrap();
+
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some(repo_str.as_str()),
+            "project_root must be derived from the path's git root"
+        );
+    }
+
+    #[test]
+    fn create_falls_back_to_path_when_no_git_root() {
+        // A registered path that isn't (yet) a git repo still gets a
+        // non-null project_root: the path itself. Never blank.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let missing = dir.path().join("not-a-repo");
+        let missing_str = missing.display().to_string();
+
+        let ws = store.create(None, missing_str.clone(), None, None).unwrap();
+
+        assert_eq!(ws.project_root.as_deref(), Some(missing_str.as_str()));
+    }
+
+    #[test]
+    fn create_preserves_explicit_project_root_for_worktrees() {
+        // The worktree case: when the caller DOES pass project_root
+        // (pointing at the parent repo), it wins — we must not overwrite
+        // it with the worktree's own directory.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let ws = store
+            .create(
+                Some("ui-polish".into()),
+                "/home/agent/.codemux/worktrees/passpage/ui-polish".into(),
+                Some("ui-polish-v1".into()),
+                Some("/home/agent/projects/passpage".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some("/home/agent/projects/passpage"),
+            "an explicitly-passed project_root (the parent repo) must be preserved"
+        );
     }
 
     #[test]

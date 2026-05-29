@@ -360,6 +360,17 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // workspace UUID?" Always null for rows that originated on
         // this device or arrived purely via cloud pull.
         "ALTER TABLE workspaces_sync ADD COLUMN origin_uid TEXT",
+        // First-class project identity (see `project_identity.rs`).
+        // Deterministic `UUIDv5(canonical remote ?? project_root)` so a
+        // project's main checkout + worktrees group together and the
+        // same repo converges across hosts/devices. `workspace_kind` is
+        // 'main' | 'worktree'. Local-only for now (the cloud schema
+        // doesn't carry them yet) — set by the host-inventory poller
+        // from the daemon's registry; `upsert_workspace_sync_from_server`
+        // intentionally leaves them untouched so a cloud pull can't
+        // clobber them, exactly like `origin_uid`.
+        "ALTER TABLE workspaces_sync ADD COLUMN project_uid TEXT",
+        "ALTER TABLE workspaces_sync ADD COLUMN workspace_kind TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -924,6 +935,15 @@ pub struct WorkspaceSyncRecord {
     /// or arrived purely via cloud pull (the cloud schema does not
     /// carry `origin_uid` today).
     pub origin_uid: Option<String>,
+    /// Deterministic project identity (`UUIDv5`), see
+    /// `crate::project_identity`. Local-only column today: set by the
+    /// host-inventory poller from the daemon registry; null for rows
+    /// that arrived purely via cloud pull or originated locally before
+    /// Phase 2 stamps `WorkspaceSnapshot`.
+    pub project_uid: Option<String>,
+    /// `"main"` | `"worktree"`. Local-only column, same lifecycle as
+    /// `project_uid`.
+    pub workspace_kind: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub deleted_at: Option<String>,
@@ -943,13 +963,16 @@ impl DatabaseStore {
         project_remote: Option<&str>,
         git_branch: Option<&str>,
         git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<WorkspaceSyncRecord, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspaces_sync
                 (user_id, workspace_id, title, host_server_id,
-                 project_path, project_remote, git_branch, git_head_sha, dirty)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
+                 project_path, project_remote, git_branch, git_head_sha,
+                 project_uid, workspace_kind, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
             params![
                 workspace_id,
                 title,
@@ -958,6 +981,8 @@ impl DatabaseStore {
                 project_remote,
                 git_branch,
                 git_head_sha,
+                project_uid,
+                workspace_kind,
             ],
         )
         .map_err(|e| format!("Failed to insert workspace sync row: {e}"))?;
@@ -965,7 +990,7 @@ impl DatabaseStore {
         conn.query_row(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync WHERE id = ?1",
             params![id],
             row_to_workspace_sync,
@@ -985,14 +1010,17 @@ impl DatabaseStore {
         project_remote: Option<&str>,
         git_branch: Option<&str>,
         git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workspaces_sync
              SET title = ?1, host_server_id = ?2, project_path = ?3,
                  project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
+                 project_uid = ?7, workspace_kind = ?8,
                  updated_at = datetime('now'), dirty = 1
-             WHERE user_id = 'local' AND workspace_id = ?7
+             WHERE user_id = 'local' AND workspace_id = ?9
                AND deleted_at IS NULL",
             params![
                 title,
@@ -1001,6 +1029,8 @@ impl DatabaseStore {
                 project_remote,
                 git_branch,
                 git_head_sha,
+                project_uid,
+                workspace_kind,
                 workspace_id,
             ],
         )
@@ -1037,7 +1067,7 @@ impl DatabaseStore {
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync
              WHERE user_id = 'local' AND deleted_at IS NULL
              ORDER BY updated_at DESC",
@@ -1057,7 +1087,7 @@ impl DatabaseStore {
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync
              WHERE user_id = 'local'",
         ) {
@@ -1075,7 +1105,7 @@ impl DatabaseStore {
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync
              WHERE user_id = 'local' AND dirty = 1",
         ) {
@@ -1138,6 +1168,8 @@ impl DatabaseStore {
         created_at: &str,
         updated_at: &str,
         deleted_at: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         let updated = conn
@@ -1146,7 +1178,8 @@ impl DatabaseStore {
                  SET title = ?1, host_server_id = ?2, project_path = ?3,
                      project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
                      created_at = ?7, updated_at = ?8,
-                     deleted_at = ?9, dirty = 0
+                     deleted_at = ?9, project_uid = ?11, workspace_kind = ?12,
+                     dirty = 0
                  WHERE user_id = 'local' AND server_id = ?10",
                 params![
                     title,
@@ -1159,6 +1192,8 @@ impl DatabaseStore {
                     updated_at,
                     deleted_at,
                     server_id,
+                    project_uid,
+                    workspace_kind,
                 ],
             )
             .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
@@ -1167,8 +1202,10 @@ impl DatabaseStore {
                 "INSERT INTO workspaces_sync
                     (user_id, server_id, workspace_id, title, host_server_id,
                      project_path, project_remote, git_branch, git_head_sha,
-                     created_at, updated_at, deleted_at, dirty)
-                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+                     created_at, updated_at, deleted_at,
+                     project_uid, workspace_kind, dirty)
+                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ?11, ?12, 0)",
                 params![
                     server_id,
                     title,
@@ -1180,6 +1217,8 @@ impl DatabaseStore {
                     created_at,
                     updated_at,
                     deleted_at,
+                    project_uid,
+                    workspace_kind,
                 ],
             )
             .map_err(|e| format!("Failed to insert workspace sync from server: {e}"))?;
@@ -1252,7 +1291,8 @@ impl DatabaseStore {
             .prepare(
                 "SELECT id, server_id, workspace_id, title, host_server_id,
                         project_path, project_remote, git_branch, git_head_sha,
-                        created_at, updated_at, deleted_at, dirty, origin_uid
+                        created_at, updated_at, deleted_at, dirty, origin_uid,
+                        project_uid, workspace_kind
                  FROM workspaces_sync
                  WHERE user_id = 'local'
                    AND host_server_id = ?1
@@ -1280,13 +1320,16 @@ impl DatabaseStore {
         project_path: Option<&str>,
         project_remote: Option<&str>,
         git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<WorkspaceSyncRecord, String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO workspaces_sync
                 (user_id, workspace_id, title, host_server_id,
-                 project_path, project_remote, git_branch, origin_uid, dirty)
-             VALUES ('local', NULL, ?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                 project_path, project_remote, git_branch, origin_uid,
+                 project_uid, workspace_kind, dirty)
+             VALUES ('local', NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
             params![
                 title,
                 host_server_id,
@@ -1294,6 +1337,8 @@ impl DatabaseStore {
                 project_remote,
                 git_branch,
                 origin_uid,
+                project_uid,
+                workspace_kind,
             ],
         )
         .map_err(|e| format!("Failed to insert remote-discovered workspace sync row: {e}"))?;
@@ -1301,7 +1346,7 @@ impl DatabaseStore {
         conn.query_row(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync WHERE id = ?1",
             params![id],
             row_to_workspace_sync,
@@ -1324,15 +1369,26 @@ impl DatabaseStore {
         project_path: Option<&str>,
         project_remote: Option<&str>,
         git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE workspaces_sync
              SET title = ?1, project_path = ?2,
                  project_remote = ?3, git_branch = ?4,
+                 project_uid = ?5, workspace_kind = ?6,
                  updated_at = datetime('now'), dirty = 1
-             WHERE id = ?5 AND deleted_at IS NULL",
-            params![title, project_path, project_remote, git_branch, id],
+             WHERE id = ?7 AND deleted_at IS NULL",
+            params![
+                title,
+                project_path,
+                project_remote,
+                git_branch,
+                project_uid,
+                workspace_kind,
+                id
+            ],
         )
         .map_err(|e| format!("Failed to update remote-discovered row: {e}"))?;
         Ok(())
@@ -1351,7 +1407,7 @@ impl DatabaseStore {
         let mut stmt = match conn.prepare(
             "SELECT id, server_id, workspace_id, title, host_server_id,
                     project_path, project_remote, git_branch, git_head_sha,
-                    created_at, updated_at, deleted_at, dirty, origin_uid
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind
              FROM workspaces_sync
              WHERE user_id = 'local'
                AND host_server_id = ?1
@@ -1408,6 +1464,8 @@ fn row_to_workspace_sync(
         deleted_at: row.get(11)?,
         dirty: dirty_int != 0,
         origin_uid: row.get(13)?,
+        project_uid: row.get(14)?,
+        workspace_kind: row.get(15)?,
     })
 }
 

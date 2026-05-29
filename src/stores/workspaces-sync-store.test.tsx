@@ -38,6 +38,8 @@ function makeRow(
     project_remote: partial.project_remote ?? null,
     git_branch: partial.git_branch ?? null,
     git_head_sha: partial.git_head_sha ?? null,
+    project_uid: partial.project_uid ?? null,
+    workspace_kind: partial.workspace_kind ?? null,
     created_at: partial.created_at ?? "2026-01-01T00:00:00Z",
     updated_at: partial.updated_at ?? "2026-01-01T00:00:00Z",
     dirty: partial.dirty ?? false,

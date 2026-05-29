@@ -738,42 +738,165 @@ function DeviceSection({
           onCloseOverview={onCloseOverview}
         />
       ) : (
-        <ul className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
-          {bucket.items.map((it) => (
-            <li
-              key={it.key}
-              ref={
-                it.kind === "remote"
-                  ? (el) => registerRemoteRow(it.key, el)
-                  : undefined
-              }
-              className={cn(
-                it.kind === "remote" && pulseKeys.has(it.key)
-                  ? "cm-pulse-attention"
-                  : null,
+        (() => {
+          // Within a device, cluster workspaces that belong to the same
+          // project so siblings (e.g. a repo's root checkout + its
+          // worktrees) visibly read as one project rather than as
+          // unrelated cards. Only projects with 2+ workspaces get a
+          // header; lone workspaces fall through to a plain grid so a
+          // device full of one-off projects isn't littered with
+          // single-item headers.
+          const { clustered, rest } = partitionByProject(bucket.items);
+          const rowGridProps = {
+            activeWorkspaceId,
+            onCloseOverview,
+            onRequestPull,
+            registerRemoteRow,
+            pulseKeys,
+            divergenceByKey,
+          };
+          if (clustered.length === 0) {
+            return <RowGrid items={bucket.items} {...rowGridProps} />;
+          }
+          return (
+            <div className="space-y-4">
+              {clustered.map((group) => (
+                <div key={group.key} className="space-y-1.5">
+                  <ProjectGroupHeader
+                    name={group.name}
+                    count={group.items.length}
+                  />
+                  <RowGrid items={group.items} {...rowGridProps} />
+                </div>
+              ))}
+              {rest.length > 0 && (
+                <RowGrid items={rest} {...rowGridProps} />
               )}
-            >
-              <WorkspaceOverviewRow
-                item={it}
-                isAttached={
-                  it.kind === "local" &&
-                  it.workspace.workspace_id === activeWorkspaceId
-                }
-                onAfterOpen={onCloseOverview}
-                onRequestPull={onRequestPull}
-                divergence={
-                  divergenceByKey.get(
-                    it.kind === "local"
-                      ? `local:${it.workspace.workspace_id}`
-                      : `remote:${it.sync.id}`,
-                  ) ?? null
-                }
-              />
-            </li>
-          ))}
-        </ul>
+            </div>
+          );
+        })()
       )}
     </section>
+  );
+}
+
+/**
+ * Split a bucket's items into same-project clusters (2+ workspaces
+ * sharing a project name) plus the leftover singletons. Items keep
+ * their incoming sort order within each group; `rest` is filtered
+ * from the original list so its order is preserved too. Project
+ * identity is the stable `projectKey` (the deterministic `project_uid`
+ * when known, else the project path/name), so a root checkout and its
+ * worktrees — which carry different paths but the same project_uid —
+ * cluster together, while two unrelated repos that merely share a
+ * basename do not. Falls back to the project name when no key exists.
+ */
+function partitionByProject(items: OverviewItem[]): {
+  clustered: { key: string; name: string; items: OverviewItem[] }[];
+  rest: OverviewItem[];
+} {
+  const groups = new Map<string, { name: string; items: OverviewItem[] }>();
+  for (const it of items) {
+    const name = it.projectName;
+    if (!name) continue;
+    const key = (it.projectKey ?? name).toLowerCase();
+    const g = groups.get(key);
+    if (g) g.items.push(it);
+    else groups.set(key, { name, items: [it] });
+  }
+
+  const clustered: { key: string; name: string; items: OverviewItem[] }[] = [];
+  const clusteredKeys = new Set<string>();
+  for (const [key, g] of groups) {
+    if (g.items.length >= 2) {
+      clustered.push({ key, name: g.name, items: g.items });
+      clusteredKeys.add(key);
+    }
+  }
+  clustered.sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+  );
+
+  const rest = items.filter((it) => {
+    const name = it.projectName;
+    if (!name) return true;
+    return !clusteredKeys.has((it.projectKey ?? name).toLowerCase());
+  });
+
+  return { clustered, rest };
+}
+
+/** Subtle caption above a same-project cluster inside a device bucket. */
+function ProjectGroupHeader({
+  name,
+  count,
+}: {
+  name: string;
+  count: number;
+}) {
+  return (
+    <div className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/70">
+      <Folder className="size-3 text-muted-foreground/50" aria-hidden />
+      <span className="truncate font-medium text-foreground/75">{name}</span>
+      <span className="tabular-nums text-muted-foreground/45">{count}</span>
+    </div>
+  );
+}
+
+/** The 2-up responsive grid of workspace cards shared by every
+ *  project cluster and the leftover-singletons grid. */
+function RowGrid({
+  items,
+  activeWorkspaceId,
+  onCloseOverview,
+  onRequestPull,
+  registerRemoteRow,
+  pulseKeys,
+  divergenceByKey,
+}: {
+  items: OverviewItem[];
+  activeWorkspaceId: string | null;
+  onCloseOverview: () => void;
+  onRequestPull: (item: Extract<OverviewItem, { kind: "remote" }>) => void;
+  registerRemoteRow: (key: string, el: HTMLElement | null) => void;
+  pulseKeys: Set<string>;
+  divergenceByKey: Map<string, DivergenceInfo>;
+}) {
+  return (
+    <ul className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
+      {items.map((it) => (
+        <li
+          key={it.key}
+          ref={
+            it.kind === "remote"
+              ? (el) => registerRemoteRow(it.key, el)
+              : undefined
+          }
+          className={cn(
+            it.kind === "remote" && pulseKeys.has(it.key)
+              ? "cm-pulse-attention"
+              : null,
+          )}
+        >
+          <WorkspaceOverviewRow
+            item={it}
+            isAttached={
+              it.kind === "local" &&
+              it.workspace.workspace_id === activeWorkspaceId
+            }
+            onAfterOpen={onCloseOverview}
+            onRequestPull={onRequestPull}
+            divergence={
+              divergenceByKey.get(
+                it.kind === "local"
+                  ? `local:${it.workspace.workspace_id}`
+                  : `remote:${it.sync.id}`,
+              ) ?? null
+            }
+          />
+        </li>
+      ))}
+    </ul>
   );
 }
 

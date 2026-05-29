@@ -756,6 +756,13 @@ export interface WorkspaceSnapshot {
   latest_agent_state: string | null;
   worktree_path: string | null;
   project_root: string | null;
+  /** Deterministic project identity (UUIDv5 of canonical remote or
+   *  project root); stamped at create. Optional — older snapshots
+   *  persisted without it. */
+  project_uid?: string | null;
+  /** "main" (repo root checkout) | "worktree". Optional for the same
+   *  reason. */
+  workspace_kind?: string | null;
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;

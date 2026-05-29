@@ -35,6 +35,11 @@ export type OverviewItem =
        *  project_root (rare). */
       projectName: string | null;
       projectPath: string | null;
+      /** Stable grouping identity. Prefers the deterministic
+       *  `project_uid` when known, else the project path/name, so the
+       *  overview clusters a project's workspaces precisely (a repo's
+       *  main checkout + worktrees) instead of by name heuristic. */
+      projectKey: string | null;
     }
   | {
       kind: "remote";
@@ -43,6 +48,7 @@ export type OverviewItem =
       hostServerId: string | null;
       projectName: string | null;
       projectPath: string | null;
+      projectKey: string | null;
     };
 
 /**
@@ -93,6 +99,21 @@ export interface DeviceBucket {
   /** Sort hint: locals first, then synced hosts in their
    *  configured order, orphan/removed at the end. */
   sortRank: number;
+}
+
+/**
+ * Project name for a synced (sibling-device) row. Prefers the
+ * `project_path` basename; falls back to the workspace `title` when
+ * the originating host never recorded a project root — e.g. a plain
+ * root/main checkout created via the MCP `workspace_create` tool,
+ * which only stamps `project_root` for worktrees. `title` is always
+ * present, so a sibling row never renders a bare "—" for its project.
+ */
+export function remoteProjectName(row: WorkspaceSyncView): string | null {
+  const fromPath = row.project_path
+    ? row.project_path.split("/").filter(Boolean).slice(-1)[0] ?? null
+    : null;
+  return fromPath ?? (row.title.trim() || null);
 }
 
 /**
@@ -232,6 +253,9 @@ export function useOverviewItems(): {
         hostServerId,
         projectName: proj?.name ?? null,
         projectPath: proj?.path ?? null,
+        // Prefer the stamped project_uid (converges with the same repo
+        // elsewhere); fall back to the project path/name.
+        projectKey: ws.project_uid ?? proj?.path ?? proj?.name ?? null,
       });
     }
 
@@ -256,10 +280,11 @@ export function useOverviewItems(): {
         key: `remote:${row.server_id ?? row.id}`,
         sync: row,
         hostServerId: row.host_server_id,
-        projectName: row.project_path
-          ? row.project_path.split("/").filter(Boolean).slice(-1)[0] ?? null
-          : null,
+        projectName: remoteProjectName(row),
         projectPath: row.project_path,
+        // Prefer the deterministic project_uid so workspaces of the
+        // same repo on a host cluster exactly; fall back to path/name.
+        projectKey: row.project_uid ?? row.project_path ?? remoteProjectName(row),
       });
     }
 

@@ -39,14 +39,14 @@ pub fn catalog() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "workspace_create",
-            description: "Create a new workspace on this host. Records it in the daemon's registry. Returns the new workspace's id and metadata. v1 does not materialise a worktree on disk — pass `path` to an existing directory you've prepared (or any path you want recorded).",
+            description: "Create a new workspace on this host. Records it in the daemon's registry. Returns the new workspace's id and metadata. This does not materialise files on disk — create the project folder first (e.g. `git clone`/`git init` via the terminal tools), then register it here by passing its `path`.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "Human-readable label. Defaults to basename of path." },
                     "path": { "type": "string", "description": "Absolute path to the working directory." },
                     "branch": { "type": "string", "description": "Git branch (optional)." },
-                    "project_root": { "type": "string", "description": "Originating repo root if this is a worktree (optional)." }
+                    "project_root": { "type": "string", "description": "Originating repo root. Optional: pass it only for a worktree (point at the parent repo). For a normal project checkout, leave it unset — the daemon derives it from `path`'s git root so the workspace always carries a project identity." }
                 },
                 "required": ["path"],
                 "additionalProperties": false

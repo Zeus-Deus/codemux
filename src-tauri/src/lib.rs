@@ -66,6 +66,7 @@ pub mod hosts_sync;
 pub mod hosts_upgrade;
 pub mod hosts_inventory;
 pub mod workspace_paths;
+pub mod project_identity;
 pub mod workspaces_sync;
 pub mod state;
 pub mod hooks;
