@@ -389,6 +389,11 @@ pub fn reconcile_host_inventory(
         let project_uid = ws.project_uid.as_deref();
         let workspace_kind = ws.kind.as_deref();
         let branch = ws.branch.as_deref();
+        // The workspace's REAL absolute path on the host. Unlike
+        // `project_path` (which collapses to the project root for a
+        // worktree), this is the authoritative rsync source for pulling
+        // the workspace back. Always present — it's the daemon's `path`.
+        let origin_path = Some(ws.path.as_str());
 
         if let Some(existing) = local_by_uid.get(&ws.id) {
             // Only push an UPDATE when something actually changed —
@@ -399,7 +404,8 @@ pub fn reconcile_host_inventory(
                 || existing.project_remote.as_deref() != project_remote
                 || existing.git_branch.as_deref() != branch
                 || existing.project_uid.as_deref() != project_uid
-                || existing.workspace_kind.as_deref() != workspace_kind;
+                || existing.workspace_kind.as_deref() != workspace_kind
+                || existing.origin_path.as_deref() != origin_path;
             if changed {
                 if let Err(e) = db.update_remote_discovered_workspace_sync(
                     existing.id,
@@ -409,6 +415,7 @@ pub fn reconcile_host_inventory(
                     branch,
                     project_uid,
                     workspace_kind,
+                    origin_path,
                 ) {
                     eprintln!(
                         "[hosts_inventory] update failed for {host_server_id}/{}: {e}",
@@ -427,6 +434,7 @@ pub fn reconcile_host_inventory(
             branch,
             project_uid,
             workspace_kind,
+            origin_path,
         ) {
             eprintln!(
                 "[hosts_inventory] insert failed for {host_server_id}/{}: {e}",
@@ -727,6 +735,52 @@ mod tests {
             Some("/home/agent/projects/passpage"),
             "project_root must win over the worktree path basename"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_records_real_origin_path_distinct_from_project_path() {
+        // The crux of the empty-pull bug: a worktree's `project_path`
+        // collapses to the PARENT repo, but the pull must rsync from the
+        // worktree's OWN on-host path. `origin_path` carries that real
+        // path verbatim so pull-back never reconstructs a wrong location.
+        let db = fresh_db();
+        let mut ws = make_remote("uid-wt", "passpage-ui-polish", Some("ui-polish-v1"));
+        ws.project_root = Some("/home/deus/projects/passpage".into());
+        ws.path = "/home/deus/projects/passpage-ui-polish".into();
+        let envelope = make_envelope(vec![ws]);
+
+        reconcile_host_inventory(&db, "host-3", &envelope);
+
+        let rows = db.list_remote_discovered_for_host("host-3");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].origin_path.as_deref(),
+            Some("/home/deus/projects/passpage-ui-polish"),
+            "origin_path must be the workspace's REAL on-host path (the rsync source)"
+        );
+        assert_eq!(
+            rows[0].project_path.as_deref(),
+            Some("/home/deus/projects/passpage"),
+            "project_path stays the parent repo — distinct from origin_path"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_updates_origin_path_when_host_path_changes() {
+        // A daemon that re-homes a workspace (rare, but possible) must
+        // update origin_path in place — otherwise pull-back keeps using
+        // the stale source.
+        let db = fresh_db();
+        let mut ws = make_remote("uid-move", "proj", Some("main"));
+        ws.path = "/srv/old/proj".into();
+        reconcile_host_inventory(&db, "host-4", &make_envelope(vec![ws.clone()]));
+        ws.path = "/srv/new/proj".into();
+        let stats = reconcile_host_inventory(&db, "host-4", &make_envelope(vec![ws]));
+        assert_eq!(stats.updated, 1, "changed origin_path should trigger an update");
+        let rows = db.list_remote_discovered_for_host("host-4");
+        assert_eq!(rows[0].origin_path.as_deref(), Some("/srv/new/proj"));
     }
 
     #[test]

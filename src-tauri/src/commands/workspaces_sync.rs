@@ -414,6 +414,25 @@ pub async fn workspaces_adopt_synced(
     app: tauri::AppHandle,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
+    // A `worktree` row can't be pulled as a standalone directory: its
+    // `.git` is a gitfile pointing at a parent repo that doesn't exist
+    // on this device, so a bare rsync of the worktree dir lands with
+    // broken git. Adopt the PARENT repo (rsync incl. `.git`) and
+    // recreate the linked worktree locally instead. `main`/standard
+    // rows fall through to the single-dir pull below.
+    let is_worktree = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        db.list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .and_then(|r| r.workspace_kind)
+            .as_deref()
+            == Some("worktree")
+    };
+    if is_worktree {
+        return adopt_worktree_via_repo_rsync(app, server_id).await;
+    }
+
     // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
     // State<'_> guard is dropped before we await anything (Tauri's
     // State is not Send across awaits).
@@ -555,6 +574,193 @@ pub async fn workspaces_adopt_synced(
         worktree_path,
         message: pull_outcome.message,
     })
+}
+
+/// Adopt a `worktree` row by materialising its PARENT repo locally and
+/// recreating the linked worktree — the "whole-repo + recreate" model.
+///
+/// Why not just rsync the worktree dir: a worktree's `.git` is a gitfile
+/// pointing at `<parent>/.git/worktrees/<name>`, a path that only exists
+/// on the originating host. Copied alone it's a broken repo. And the
+/// parent may be a **local-only** repo (no remote), so we can't clone it
+/// — rsync is the only way to get the objects + branch refs.
+///
+/// Flow (mirrors `workspaces_adopt_via_clone`, but the source is an SSH
+/// host path instead of a git remote URL):
+///   1. Resolve the row + host; idempotent short-circuit if already adopted.
+///   2. rsync the parent repo (incl. `.git`) from `project_path` on the
+///      host into `~/.codemux/projects/<repo>` — skipped if a local repo
+///      is already there (adopting a second worktree of the same project).
+///   3. `git worktree prune` (drops the host's stale worktree entries),
+///      then `git worktree add` for the branch into the canonical
+///      `~/.codemux/worktrees/<repo>/<branch>` path.
+///   4. Register a local workspace pointing at the recreated worktree and
+///      link the sync row.
+async fn adopt_worktree_via_repo_rsync(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // ── resolve row + host + paths (no awaits) ──
+    let (host, remote_repo_path, local_project_path, branch, title) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency: already adopted and still live → return it.
+        if let Some(existing) = row.workspace_id.as_deref() {
+            let snapshot = app_state.snapshot();
+            if let Some(w) = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == existing)
+            {
+                let worktree = w
+                    .worktree_path
+                    .clone()
+                    .unwrap_or_else(|| w.cwd.clone());
+                return Ok(AdoptOutcome {
+                    workspace_id: existing.to_string(),
+                    worktree_path: worktree,
+                    message: "Workspace already adopted on this device.".into(),
+                });
+            }
+        }
+
+        let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+            "This workspace has no host; clone-based adoption is not \
+             implemented yet (Phase 3 of the workspaces-sync rollout)."
+                .to_string()
+        })?;
+        let local_host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.server_id.as_deref() == Some(host_server_id))
+            .ok_or_else(|| {
+                format!(
+                    "host_not_configured: The host this workspace lives on \
+                     (host_server_id={host_server_id}) is not configured on \
+                     this device yet. Add it in Settings → Devices."
+                )
+            })?;
+
+        // For a worktree row, `project_path` is the PARENT repo's path on
+        // the host (the reconcile maps it from the daemon's project_root).
+        // That is the rsync source — NOT `origin_path` (the worktree dir).
+        let remote_repo_path = row.project_path.clone().ok_or_else(|| {
+            "no_parent_repo: this worktree has no recorded parent repo path \
+             on the host, so it can't be reconstructed. Re-poll the host or \
+             adopt its main checkout first."
+                .to_string()
+        })?;
+        let project_name = std::path::Path::new(&remote_repo_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| row.title.clone());
+        let branch = row.git_branch.clone().unwrap_or_else(|| "main".to_string());
+        let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_string())?;
+        let local_project_path = home.join(".codemux").join("projects").join(&project_name);
+
+        (
+            local_host,
+            remote_repo_path,
+            local_project_path,
+            branch,
+            row.title.clone(),
+        )
+    };
+
+    #[cfg(unix)]
+    {
+        // ── 2. rsync the parent repo (incl .git) unless already present ──
+        let already_local = local_project_path.join(".git").exists();
+        if !already_local {
+            if let Err(e) = std::fs::create_dir_all(&local_project_path) {
+                return Err(format!(
+                    "could not create local project dir {}: {e}",
+                    local_project_path.display()
+                ));
+            }
+            let opts = crate::ssh::PullOptions::new(
+                &host.ssh_target,
+                &remote_repo_path,
+                &local_project_path,
+            );
+            match crate::ssh::pull_workspace_back(opts).await {
+                crate::ssh::PullResult::Pulled { .. } => {}
+                crate::ssh::PullResult::RemoteNotFound { path } => {
+                    let _ = std::fs::remove_dir_all(&local_project_path);
+                    return Err(format!(
+                        "Remote repo not found at {path}. The host may have been \
+                         wiped or the project moved."
+                    ));
+                }
+                crate::ssh::PullResult::RsyncFailed { reason } => {
+                    return Err(format!("rsync failed: {reason}"));
+                }
+                crate::ssh::PullResult::HostUnreachable { reason } => {
+                    return Err(format!("Host unreachable: {reason}"));
+                }
+            }
+        }
+
+        // ── 3. prune stale host worktrees + recreate the branch locally ──
+        let repo_for_blocking = local_project_path.clone();
+        let branch_for_blocking = branch.clone();
+        let worktree_actual_path = tokio::task::spawn_blocking(move || {
+            crate::git::git_recreate_worktree_for_adopted_repo(
+                &repo_for_blocking,
+                &branch_for_blocking,
+            )
+        })
+        .await
+        .map_err(|e| format!("worktree recreate join failed: {e}"))??;
+
+        // ── 4. register a local workspace + link the sync row ──
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let local_project_str = local_project_path.to_string_lossy().to_string();
+        let workspace_id = app_state.create_synced_workspace_shell(
+            title,
+            host.id,
+            Some(local_project_str.clone()),
+            worktree_actual_path.clone(),
+            Some(branch.clone()),
+        );
+        // It's local right away (the files are already on disk) — clear
+        // host_id so panes spawn against the local pty-daemon.
+        app_state.set_workspace_host_id(&workspace_id.0, None)?;
+        db.link_workspace_sync_to_local(&server_id, &workspace_id.0)?;
+        drop(app_state);
+        drop(db);
+
+        if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+            eprintln!(
+                "[workspaces-sync] post-adopt (worktree) sync failed (will retry): {e}"
+            );
+        }
+        crate::state::emit_app_state(&app);
+
+        Ok(AdoptOutcome {
+            workspace_id: workspace_id.0,
+            worktree_path: worktree_actual_path,
+            message: format!(
+                "Adopted worktree: synced repo to {local_project_str} and \
+                 recreated the '{branch}' worktree."
+            ),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, remote_repo_path, local_project_path, branch, title);
+        Err("SSH transport is Unix-only for now.".into())
+    }
 }
 
 /// Adopt a sibling-device workspace into this device via the
@@ -811,6 +1017,7 @@ mod tests {
             origin_uid: Some("uuid-1".into()),
             project_uid: None,
             workspace_kind: None,
+            origin_path: project_path.map(|s| s.into()),
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             deleted_at: None,

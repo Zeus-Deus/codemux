@@ -53,6 +53,22 @@ pub fn catalog() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "worktree_create",
+            description: "Create a git worktree + register a Codemux workspace in one call — the headless equivalent of the desktop's worktree_create. Runs `git worktree add` under ~/.codemux/worktrees/<repo>/<branch> and records the resulting workspace. Use this (NOT workspace_create) to fork a branch off an existing git repo on this host. For a brand-new project, first `git init` a folder (e.g. via terminal_spawn/terminal_write), then call this against it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string", "description": "Absolute path to the existing git repository root to fork from." },
+                    "branch": { "type": "string", "description": "Branch name for the worktree (kebab-case recommended)." },
+                    "new_branch": { "type": "boolean", "description": "Create a new branch (true, default) or attach an existing local branch (false)." },
+                    "base": { "type": "string", "description": "Base ref for a new branch (e.g. \"main\"). Defaults to the repo's current HEAD." },
+                    "name": { "type": "string", "description": "Human-readable workspace label. Defaults to the worktree dir basename." }
+                },
+                "required": ["repo_path", "branch"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
             name: "workspace_list",
             description: "List every workspace registered with this daemon, newest first.",
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
@@ -187,6 +203,7 @@ pub fn dispatch(
 ) -> ToolResult {
     match name {
         "workspace_create" => workspace_create(params, workspaces),
+        "worktree_create" => worktree_create(params, workspaces),
         "workspace_list" => workspace_list(workspaces),
         "workspace_info" => workspace_info(params, workspaces),
         "workspace_update" => workspace_update(params, workspaces),
@@ -214,6 +231,51 @@ fn workspace_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
     let ws = store
         .create(input.name, input.path, input.branch, input.project_root)
+        .map_err(workspace_err)?;
+    Ok(json!({ "workspace": ws }))
+}
+
+#[derive(Debug, Deserialize)]
+struct WorktreeCreateInput {
+    repo_path: String,
+    branch: String,
+    #[serde(default)]
+    new_branch: Option<bool>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
+    let input: WorktreeCreateInput =
+        serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
+
+    // The daemon process owns HOME; resolve the worktree root against it
+    // so a new worktree lands at the same `~/.codemux/worktrees/...`
+    // location the desktop uses.
+    let home = dirs::home_dir()
+        .ok_or_else(|| ToolError::internal("could not resolve home directory"))?;
+
+    let created = super::git::create_worktree(
+        &home,
+        std::path::Path::new(&input.repo_path),
+        &input.branch,
+        input.new_branch.unwrap_or(true),
+        input.base.as_deref(),
+    )
+    .map_err(ToolError::invalid)?;
+
+    // Register the worktree as a workspace. `project_root` is the parent
+    // repo (so the daemon stamps the shared project_uid + `worktree`
+    // kind), exactly as the desktop worktree-create path does.
+    let ws = store
+        .create(
+            input.name,
+            created.worktree_path.to_string_lossy().to_string(),
+            Some(created.branch),
+            Some(created.repo_root.to_string_lossy().to_string()),
+        )
         .map_err(workspace_err)?;
     Ok(json!({ "workspace": ws }))
 }
@@ -361,4 +423,111 @@ fn pty_err(e: super::pty::PtyError) -> ToolError {
 #[allow(dead_code)] // Workspace type re-exported only so external callers can name it
 pub fn _workspace_typename() -> &'static str {
     std::any::type_name::<Workspace>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn open_store(dir: &TempDir) -> WorkspaceStore {
+        WorkspaceStore::open(
+            &dir.path().join("codemux.db"),
+            "test-host".into(),
+            dir.path().join("workspaces"),
+        )
+        .unwrap()
+    }
+
+    fn init_repo(dir: &std::path::Path) {
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["init", "--initial-branch=main"]);
+        run(&["config", "user.email", "t@e.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::write(dir.join("f.txt"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_create_dispatch_registers_worktree_workspace() {
+        // The handler resolves HOME via dirs::home_dir(); point it at a
+        // temp dir for the duration of this (serialized) test so the
+        // worktree lands somewhere disposable.
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let store_dir = TempDir::new().unwrap();
+        let store = open_store(&store_dir);
+
+        let params = json!({
+            "repo_path": repo.path().to_string_lossy(),
+            "branch": "feature/login",
+            "base": "main"
+        });
+        let out = worktree_create(&params, &store).expect("worktree_create");
+        let ws = &out["workspace"];
+
+        // Registered as a worktree of the repo, with a populated checkout
+        // under ~/.codemux/worktrees/<repo>/<branch>.
+        assert_eq!(ws["kind"], "worktree");
+        // The git branch name is preserved verbatim; only the on-disk
+        // path segment is sanitized (`feature/login` → `feature-login`).
+        assert_eq!(ws["branch"], "feature/login");
+        let path = ws["path"].as_str().unwrap();
+        assert!(path.contains("/.codemux/worktrees/"), "path: {path}");
+        assert!(path.ends_with("/feature-login"), "sanitized path segment: {path}");
+        assert!(std::path::Path::new(path).join("f.txt").exists(), "checkout populated");
+        assert_eq!(
+            ws["project_root"].as_str().unwrap(),
+            repo.path().to_string_lossy()
+        );
+        // main + worktree of the same local repo share a project_uid.
+        assert!(ws["project_uid"].is_string());
+
+        // restore HOME
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_create_dispatch_rejects_non_repo() {
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let not_repo = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+        let store = open_store(&store_dir);
+        let params = json!({ "repo_path": not_repo.path().to_string_lossy(), "branch": "x" });
+        let err = worktree_create(&params, &store).unwrap_err();
+        assert_eq!(err.kind, "invalid_input");
+        assert!(err.message.contains("not a git repository"));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 }

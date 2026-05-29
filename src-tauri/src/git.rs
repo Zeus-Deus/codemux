@@ -1667,6 +1667,33 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
     path_matches(&current_path) && current_branch.as_deref() == Some(&expected_branch_ref)
 }
 
+/// Recreate a worktree for an EXISTING branch inside a repo that was
+/// copied from another machine (e.g. rsynced from a `codemux-remote`
+/// host during worktree adoption).
+///
+/// Such a repo carries the host's worktree admin entries under
+/// `.git/worktrees/<name>/`, each pointing at an absolute path that
+/// doesn't exist on this machine. Left in place, those stale entries
+/// make git think the branch is "already checked out" and refuse a
+/// fresh `git worktree add`. We `git worktree prune` first (drops every
+/// registration whose path is gone — which is all of them, since they
+/// reference the source machine), then add a clean local worktree for
+/// the branch via `git_create_worktree`.
+///
+/// Returns the local worktree path. The branch must already exist in
+/// the repo (it came over with the rsync); we attach it, never create.
+pub fn git_recreate_worktree_for_adopted_repo(
+    repo_path: &Path,
+    branch: &str,
+) -> Result<String, String> {
+    // Prune stale worktree registrations inherited from the source
+    // machine. Permissive: a fresh clone with no worktrees is a no-op,
+    // and any failure here shouldn't block the add (which will surface
+    // its own clear error if the state is genuinely broken).
+    let _ = run_git_permissive(repo_path, &["worktree", "prune"]);
+    git_create_worktree(repo_path, branch, false, None, None)
+}
+
 pub fn git_create_worktree(
     repo_path: &Path,
     branch: &str,
@@ -2196,6 +2223,42 @@ C  source.txt -> copy.txt";
 
         let branches_after = git_list_branches(&repo, false).expect("list branches after");
         assert!(!branches_after.contains(&"feature-test".to_string()), "branch should be deleted");
+    }
+
+    #[test]
+    fn test_recreate_worktree_for_adopted_repo_prunes_stale_host_entry() {
+        // Simulate a repo rsynced from a codemux-remote host during
+        // worktree adoption: it carries a worktree admin entry for the
+        // branch, but that entry points at the HOST's path, which does
+        // not exist on this machine. A naive `git worktree add` for the
+        // branch then fails ("already used by worktree"). The recreate
+        // helper must prune the stale entry and add a clean local one.
+        let (_dir, repo) = setup_test_repo();
+        // A branch that "came over with the rsync".
+        run_git(&repo, &["branch", "adopted-feature"]).expect("create branch");
+        // A worktree at a path we then delete → stale, prunable, and it
+        // holds the branch "checked out" until pruned.
+        let ghost = _dir.path().join("ghost-host-worktree");
+        run_git(
+            &repo,
+            &["worktree", "add", &ghost.to_string_lossy(), "adopted-feature"],
+        )
+        .expect("add ghost worktree");
+        std::fs::remove_dir_all(&ghost).expect("delete ghost worktree dir");
+
+        // Recreate: prunes the ghost, adds a clean local worktree.
+        let wt_path = git_recreate_worktree_for_adopted_repo(&repo, "adopted-feature")
+            .expect("recreate worktree for adopted repo");
+        let wt = PathBuf::from(&wt_path);
+        assert!(wt.exists(), "recreated worktree dir should exist");
+        assert!(wt.join(".git").is_file(), "should be a linked worktree (.git file)");
+
+        // It's attached to the right branch.
+        let current = run_git_permissive(&wt, &["branch", "--show-current"]);
+        assert_eq!(current.trim(), "adopted-feature");
+
+        // Cleanup so we don't leave a worktree under the real ~/.codemux.
+        let _ = git_remove_worktree(&wt, Some("adopted-feature"), true);
     }
 
     #[test]
