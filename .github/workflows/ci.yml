@@ -2,9 +2,14 @@ name: CI
 
 on:
   push:
+    # Only main here — feature branches are covered by the `pull_request`
+    # trigger below. Previously this also listed "feature/**", which meant a
+    # PR from a feature branch ran the whole matrix TWICE for the same commit
+    # (once for the branch push, once for the PR). Keeping just `main` gives us
+    # exactly one run per PR plus one post-merge run on main, with no loss of
+    # coverage: every change is still gated on its PR and re-verified on main.
     branches:
       - main
-      - "feature/**"
   pull_request:
     branches:
       - main
@@ -15,8 +20,75 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check:
-    name: check (${{ matrix.os }})
+  # ---------------------------------------------------------------------------
+  # Lightweight JS + sidecar checks. These need neither the Rust toolchain, the
+  # Linux GTK/WebKit system libraries, nor the staged sidecar binaries, so they
+  # run as a separate job IN PARALLEL with `rust` below. Splitting them off
+  # takes the frontend typecheck/tests and the sidecar checks off the critical
+  # path — previously they ran serially before `cargo test` and added several
+  # minutes to every run. Coverage is unchanged: both jobs run the full
+  # ubuntu + windows matrix.
+  # ---------------------------------------------------------------------------
+  web-checks:
+    name: web-checks (${{ matrix.os }})
+    strategy:
+      # Never fail-fast — we always want to see both Linux and Windows results,
+      # even if one platform regresses.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          # Node 22 for the project's npm scripts. The action itself is on
+          # @v5 (Node 24 runtime) so it won't trip GitHub's Node-20-actions
+          # deprecation that takes effect 2026-06-02.
+          # See: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+          node-version: 22
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Sidecar ToS boundary check
+        # Static check that forbids the sidecar from reading Claude
+        # credential files, hitting Anthropic URLs directly, spawning
+        # the `claude` binary outside the auth-probe allowlist, or
+        # peeking at ANTHROPIC_* / CLAUDE_CODE_OAUTH_TOKEN env vars.
+        # This is a hard CI gate so a violation can never slip in.
+        shell: bash
+        run: cd sidecar/claude-agent && bun run check-tos
+
+      - name: Sidecar unit tests
+        shell: bash
+        run: cd sidecar/claude-agent && bun install --frozen-lockfile && bun test
+
+      - name: TypeScript typecheck
+        run: npm run check
+
+      - name: Frontend tests
+        run: npm run test
+
+  # ---------------------------------------------------------------------------
+  # Heavy Rust job: this is the critical path. tauri-build validates
+  # `externalBin`/`bundle.resources` at compile time, so every sidecar binary
+  # must be staged and the frontend `dist/` must exist before `cargo check` /
+  # `cargo test`. That work lives here (and only here).
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust (${{ matrix.os }})
     strategy:
       # Never fail-fast — we always want to see both Linux and Windows
       # results, even if one platform regresses. Masking a Windows-only
@@ -201,29 +273,10 @@ jobs:
             chmod +x "$DEST" 2>/dev/null || true
           fi
 
-      - name: Sidecar ToS boundary check
-        # Static check that forbids the sidecar from reading Claude
-        # credential files, hitting Anthropic URLs directly, spawning
-        # the `claude` binary outside the auth-probe allowlist, or
-        # peeking at ANTHROPIC_* / CLAUDE_CODE_OAUTH_TOKEN env vars.
-        # This is a hard CI gate so a violation can never slip in.
-        shell: bash
-        run: cd sidecar/claude-agent && bun run check-tos
-
-      - name: Sidecar unit tests
-        shell: bash
-        run: cd sidecar/claude-agent && bun install --frozen-lockfile && bun test
-
       - name: Build frontend
         # `frontendDist: "../dist"` in tauri.conf.json means tauri-build
         # wants `dist/` to exist at compile time — build the frontend first.
         run: npm run build
-
-      - name: TypeScript typecheck
-        run: npm run check
-
-      - name: Frontend tests
-        run: npm run test
 
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
