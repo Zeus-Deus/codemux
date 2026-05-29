@@ -301,6 +301,16 @@ pub struct RemoteWorkspace {
     pub path: String,
     pub branch: Option<String>,
     pub project_root: Option<String>,
+    /// First-class project identity from the daemon registry (see
+    /// `crate::project_identity`). Older daemons won't send these;
+    /// serde defaults them to `None`, so the poller degrades to the
+    /// path-based fallback below.
+    #[serde(default)]
+    pub project_uid: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub repo_remote: Option<String>,
     // `owner_id`, `origin_host_id`, `notes`, `created_at`,
     // `updated_at` are accepted by serde but not used by the
     // reconcile — they live on the remote daemon and have no
@@ -371,7 +381,13 @@ pub fn reconcile_host_inventory(
             .project_root
             .as_deref()
             .or(Some(ws.path.as_str()));
-        let project_remote: Option<&str> = None; // not in the remote schema today
+        // The daemon now reports a canonical git remote (Phase 1 of the
+        // project-identity work); older daemons send null. This finally
+        // populates `project_remote` for remote-discovered rows, which
+        // used to be hardcoded null.
+        let project_remote = ws.repo_remote.as_deref();
+        let project_uid = ws.project_uid.as_deref();
+        let workspace_kind = ws.kind.as_deref();
         let branch = ws.branch.as_deref();
 
         if let Some(existing) = local_by_uid.get(&ws.id) {
@@ -381,7 +397,9 @@ pub fn reconcile_host_inventory(
             let changed = existing.title != ws.name
                 || existing.project_path.as_deref() != project_path
                 || existing.project_remote.as_deref() != project_remote
-                || existing.git_branch.as_deref() != branch;
+                || existing.git_branch.as_deref() != branch
+                || existing.project_uid.as_deref() != project_uid
+                || existing.workspace_kind.as_deref() != workspace_kind;
             if changed {
                 if let Err(e) = db.update_remote_discovered_workspace_sync(
                     existing.id,
@@ -389,6 +407,8 @@ pub fn reconcile_host_inventory(
                     project_path,
                     project_remote,
                     branch,
+                    project_uid,
+                    workspace_kind,
                 ) {
                     eprintln!(
                         "[hosts_inventory] update failed for {host_server_id}/{}: {e}",
@@ -405,6 +425,8 @@ pub fn reconcile_host_inventory(
             project_path,
             project_remote,
             branch,
+            project_uid,
+            workspace_kind,
         ) {
             eprintln!(
                 "[hosts_inventory] insert failed for {host_server_id}/{}: {e}",
@@ -456,6 +478,9 @@ mod tests {
             path: format!("/srv/{name}"),
             branch: branch.map(|s| s.into()),
             project_root: Some("/srv/origin".into()),
+            project_uid: Some("uid-origin".into()),
+            kind: Some("worktree".into()),
+            repo_remote: Some("github.com/acme/origin".into()),
         }
     }
 
@@ -560,6 +585,94 @@ mod tests {
             assert!(r.server_id.is_none(), "no cloud id until first push");
             assert!(r.dirty);
             assert_eq!(r.host_server_id.as_deref(), Some("host-99"));
+        }
+    }
+
+    #[test]
+    fn parse_inventory_json_reads_project_identity_fields() {
+        // The daemon's `workspace list` now emits project_uid /
+        // project_name / kind / repo_remote. The poller's parser must
+        // read them (and still tolerate their absence — see the
+        // round-trip test above, whose payload omits them).
+        let stdout = r#"{
+          "host_id": "pandora",
+          "workspaces": [
+            {
+              "id": "uid-1",
+              "name": "app",
+              "path": "/home/agent/projects/app",
+              "branch": "main",
+              "project_root": "/home/agent/projects/app",
+              "project_uid": "0f9a-deterministic",
+              "project_name": "app",
+              "kind": "main",
+              "repo_remote": "github.com/acme/app"
+            }
+          ]
+        }"#;
+        let w = &parse_inventory_json(stdout).unwrap().workspaces[0];
+        assert_eq!(w.project_uid.as_deref(), Some("0f9a-deterministic"));
+        assert_eq!(w.kind.as_deref(), Some("main"));
+        assert_eq!(w.repo_remote.as_deref(), Some("github.com/acme/app"));
+    }
+
+    #[test]
+    #[serial]
+    fn e2e_daemon_to_sync_row_carries_project_identity() {
+        // End-to-end across the wire: a workspace the daemon created
+        // (with first-class identity) → JSON envelope → poller parse →
+        // reconcile → local sync row. The desktop overview then groups
+        // by project_uid and labels the kind.
+        let daemon_json = r#"{
+          "host_id": "pandora",
+          "workspaces": [
+            {
+              "id": "wt-uid",
+              "name": "ui-polish",
+              "path": "/home/agent/.codemux/worktrees/passpage/ui-polish",
+              "branch": "ui-polish-v1",
+              "project_root": "/home/agent/projects/passpage",
+              "project_uid": "shared-passpage-uid",
+              "project_name": "passpage",
+              "kind": "worktree",
+              "repo_remote": "github.com/acme/passpage"
+            },
+            {
+              "id": "main-uid",
+              "name": "passpage",
+              "path": "/home/agent/projects/passpage",
+              "branch": "main",
+              "project_root": "/home/agent/projects/passpage",
+              "project_uid": "shared-passpage-uid",
+              "project_name": "passpage",
+              "kind": "main",
+              "repo_remote": "github.com/acme/passpage"
+            }
+          ]
+        }"#;
+        let envelope = parse_inventory_json(daemon_json).unwrap();
+
+        let db = fresh_db();
+        let stats = reconcile_host_inventory(&db, "pandora", &envelope);
+        assert_eq!(stats.inserted, 2);
+
+        let rows = db.list_remote_discovered_for_host("pandora");
+        assert_eq!(rows.len(), 2);
+
+        // Both rows landed with the SAME project_uid → the overview
+        // clusters them as one project, across main + worktree.
+        let uids: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.project_uid.clone()).collect();
+        assert_eq!(uids.len(), 1, "main + worktree share one project_uid");
+        assert!(uids.contains("shared-passpage-uid"));
+
+        // kind is preserved per row; project_remote is now populated
+        // (it used to be hardcoded null for remote-discovered rows).
+        let kinds: std::collections::HashSet<_> =
+            rows.iter().filter_map(|r| r.workspace_kind.clone()).collect();
+        assert!(kinds.contains("main") && kinds.contains("worktree"));
+        for r in &rows {
+            assert_eq!(r.project_remote.as_deref(), Some("github.com/acme/passpage"));
         }
     }
 

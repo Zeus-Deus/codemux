@@ -100,6 +100,8 @@ function makeSync(
     project_remote: partial.project_remote ?? null,
     git_branch: partial.git_branch ?? null,
     git_head_sha: partial.git_head_sha ?? null,
+    project_uid: partial.project_uid ?? null,
+    workspace_kind: partial.workspace_kind ?? null,
     created_at: partial.created_at ?? "2026-01-01T00:00:00Z",
     updated_at: partial.updated_at ?? "2026-01-01T00:00:00Z",
     dirty: partial.dirty ?? false,
@@ -261,6 +263,26 @@ describe("useOverviewItems", () => {
 
     // project_path basename wins over the title when present.
     expect(result.current.items[0]?.projectName).toBe("passpage");
+  });
+
+  it("uses project_uid as the remote item's projectKey when present", () => {
+    mockSyncRows = [
+      makeSync({
+        id: 40,
+        workspace_id: null,
+        title: "app-feature",
+        project_path: "/home/agent/.codemux/worktrees/app/feature",
+        project_uid: "uid-shared-123",
+        workspace_kind: "worktree",
+        host_server_id: "srv-host-7",
+      }),
+    ];
+
+    const { result } = renderHook(() => useOverviewItems());
+
+    const item = result.current.items[0];
+    // Grouping key is the stable uid, not the (worktree) path basename.
+    expect(item?.projectKey).toBe("uid-shared-123");
   });
 
   it("resolves hostServerId on a local item via the hosts table when no sync row exists yet", () => {

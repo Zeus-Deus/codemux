@@ -785,10 +785,11 @@ function DeviceSection({
  * sharing a project name) plus the leftover singletons. Items keep
  * their incoming sort order within each group; `rest` is filtered
  * from the original list so its order is preserved too. Project
- * identity is the (case-insensitive) project NAME — within a single
- * device the basename is a reliable cross-workspace project key, and
- * it lets a root checkout and its worktrees (which carry different
- * `project_path`s but the same project) cluster together.
+ * identity is the stable `projectKey` (the deterministic `project_uid`
+ * when known, else the project path/name), so a root checkout and its
+ * worktrees — which carry different paths but the same project_uid —
+ * cluster together, while two unrelated repos that merely share a
+ * basename do not. Falls back to the project name when no key exists.
  */
 function partitionByProject(items: OverviewItem[]): {
   clustered: { key: string; name: string; items: OverviewItem[] }[];
@@ -798,7 +799,7 @@ function partitionByProject(items: OverviewItem[]): {
   for (const it of items) {
     const name = it.projectName;
     if (!name) continue;
-    const key = name.toLowerCase();
+    const key = (it.projectKey ?? name).toLowerCase();
     const g = groups.get(key);
     if (g) g.items.push(it);
     else groups.set(key, { name, items: [it] });
@@ -819,7 +820,7 @@ function partitionByProject(items: OverviewItem[]): {
   const rest = items.filter((it) => {
     const name = it.projectName;
     if (!name) return true;
-    return !clusteredKeys.has(name.toLowerCase());
+    return !clusteredKeys.has((it.projectKey ?? name).toLowerCase());
   });
 
   return { clustered, rest };

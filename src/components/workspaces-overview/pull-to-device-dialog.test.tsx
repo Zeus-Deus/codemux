@@ -88,6 +88,8 @@ function makeSyncRow(
     project_remote: "git@github.com:Zeus-Deus/codemux.git",
     git_branch: "feature-x",
     git_head_sha: null,
+    project_uid: null,
+    workspace_kind: null,
     created_at: "2026-05-20T10:00:00Z",
     updated_at: "2026-05-20T10:00:00Z",
     dirty: false,

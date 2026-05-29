@@ -613,6 +613,18 @@ function RemoteRow({
               {row.title}
             </h4>
             {divergence && <DivergenceChip info={divergence} />}
+            {row.workspace_kind && (
+              <span
+                title={
+                  row.workspace_kind === "worktree"
+                    ? "A git worktree — a per-branch checkout of the project."
+                    : "The project's main (root) checkout."
+                }
+                className="shrink-0 rounded-full bg-muted/50 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-muted-foreground/80"
+              >
+                {row.workspace_kind}
+              </span>
+            )}
             <span
               title="This workspace lives on another device of your account. Pull it down to interact with it here."
               className="shrink-0 rounded-full border border-sky-400/30 bg-sky-500/10 px-1.5 py-0 text-[10px] font-medium uppercase tracking-wider leading-[14px] text-sky-300"

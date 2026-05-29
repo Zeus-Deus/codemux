@@ -35,6 +35,11 @@ export type OverviewItem =
        *  project_root (rare). */
       projectName: string | null;
       projectPath: string | null;
+      /** Stable grouping identity. Prefers the deterministic
+       *  `project_uid` when known, else the project path/name, so the
+       *  overview clusters a project's workspaces precisely (a repo's
+       *  main checkout + worktrees) instead of by name heuristic. */
+      projectKey: string | null;
     }
   | {
       kind: "remote";
@@ -43,6 +48,7 @@ export type OverviewItem =
       hostServerId: string | null;
       projectName: string | null;
       projectPath: string | null;
+      projectKey: string | null;
     };
 
 /**
@@ -247,6 +253,9 @@ export function useOverviewItems(): {
         hostServerId,
         projectName: proj?.name ?? null,
         projectPath: proj?.path ?? null,
+        // Local snapshots don't carry project_uid yet (Phase 2), so the
+        // path is the stable per-device key.
+        projectKey: proj?.path ?? proj?.name ?? null,
       });
     }
 
@@ -273,6 +282,9 @@ export function useOverviewItems(): {
         hostServerId: row.host_server_id,
         projectName: remoteProjectName(row),
         projectPath: row.project_path,
+        // Prefer the deterministic project_uid so workspaces of the
+        // same repo on a host cluster exactly; fall back to path/name.
+        projectKey: row.project_uid ?? row.project_path ?? remoteProjectName(row),
       });
     }
 
