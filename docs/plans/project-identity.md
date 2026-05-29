@@ -42,6 +42,27 @@ Every checkout of the same remote, on any host or device, computes the **same** 
 6. ~~Add `project_uid` + `workspace_kind` to `WorkspaceSnapshot`, stamp at create, thread through `reconcile_from_snapshot`.~~ **Done** — stamped in `set_workspace_project_root` (the single choke point every create path calls; git remote computed outside the lock), threaded into the local `workspaces_sync` columns, and the pull-conflict guard now matches exactly on `project_uid`. Local UI grouping uses `project_uid` as its `projectKey`.
 7. **Remaining — external `codemux-api` repo** (cannot be edited/tested from here): add optional `project_uid`/`project_name`/`workspace_kind` columns to `codemux_workspaces` + validation + round-trip tests, mirror in `preload.ts`. Today the local columns are not synced to the cloud, so a row pulled on another device has `project_uid = null` there and falls back to path/name grouping. With deterministic uid this is an optimization (a pulled row could recompute uid from the synced `project_remote`), not a correctness requirement.
 
+### Phase 2 cloud — concrete plan (codemux-api, VPS-verified)
+
+Verified live on the VPS (`~/codemux-api`, `ssh work@78.47.192.173`): `codemux_workspaces` exists with 44 rows; daily 3am backups healthy; `git_head_sha` was added via `ALTER TABLE … ADD COLUMN IF NOT EXISTS` — this change mirrors it exactly. **100% additive, no data loss, no destructive ops.**
+
+**Safety first**: run `~/codemux-api/backup.sh` (manual snapshot) before deploying. Additive nullable columns mean the 44 rows are untouched; old desktop clients ignore unknown GET fields and simply don't send the new ones on POST (→ null). Rollback = revert code + rebuild; the 3 nullable columns can stay harmlessly.
+
+**Server changes — `~/codemux-api/api/src/index.ts`** (mirror in `api/src/tests/preload.ts`):
+1. DDL: in the startup CREATE block (after the `git_head_sha` ALTER, ~line 260) append:
+   `ALTER TABLE codemux_workspaces ADD COLUMN IF NOT EXISTS project_uid TEXT;` + `project_name TEXT;` + `workspace_kind TEXT;`
+2. `WorkspaceFields` + `parseWorkspaceBody` (~2447): add `optionalString` for `projectUid` (≤200), `projectName` (≤500), `workspaceKind` (≤20; optionally assert ∈ {`main`,`worktree`}).
+3. `rowToWorkspace` (~2423): add `projectUid`/`projectName`/`workspaceKind` = `row.* ?? null`.
+4. GET SELECT (~2515), POST INSERT cols+VALUES+RETURNING+params (~2570), PATCH SET+RETURNING+params (~2626): add the 3 columns to each.
+5. `api/src/tests/workspaces.test.ts`: add POST→GET and PATCH round-trip assertions for the 3 fields (mirror the `gitHeadSha` tests).
+
+**Desktop changes — this repo** (`src-tauri/src/workspaces_sync.rs` + `database.rs`):
+6. `ServerWorkspace` wire type + `WorkspaceUpsertBody`: add `projectUid`/`projectName`/`workspaceKind` (serde camelCase; `skip_serializing_if` on the body).
+7. `push_insert`/`push_update`: include the 3.
+8. `pull` → `upsert_workspace_sync_from_server`: add the 3 params and SET them — **flip `project_uid`/`workspace_kind` from "leave untouched" to server-authoritative on pull** (so a row pulled on another device gets the uid). Update the `workspaces-sync.md` "local-only" note accordingly.
+
+**Deploy order**: server first (`docker compose up -d --build api`; it applies the DDL on startup), run `docker compose exec api bun test` (must stay green), confirm GET still serves the 44 rows; *then* ship the desktop change. Server is backward-compatible with the current desktop in between.
+
 ### Phase 3 — first-class projects table (optional)
 
 8. A `projects` table (local + cloud) keyed by `project_uid` for project-level metadata (name override, color, image, settings), replacing the path-keyed `ui_state`/`recent_projects` scheme so per-project UI state survives path changes and syncs across devices.
