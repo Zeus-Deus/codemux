@@ -35,6 +35,8 @@ import {
 } from "@/tauri/commands";
 import { useHostsStore } from "@/stores/hosts-store";
 
+import { remoteProjectName } from "./use-overview-items";
+
 interface Props {
   /** The synced row the user wants to adopt. Null = dialog closed. */
   syncRow: WorkspaceSyncView | null;
@@ -415,10 +417,7 @@ function HostBackedAdoptionForm({
           {preview.host_label ?? "—"}
         </SummaryRow>
         <SummaryRow label="Project">
-          {syncRow.project_path
-            ? syncRow.project_path.split("/").filter(Boolean).slice(-1)[0] ??
-              "—"
-            : "—"}
+          {remoteProjectName(syncRow) ?? "—"}
         </SummaryRow>
         <SummaryRow label="Branch">
           <span className="font-mono text-[11.5px]">

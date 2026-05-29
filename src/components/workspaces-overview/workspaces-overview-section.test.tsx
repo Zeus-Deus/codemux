@@ -223,6 +223,58 @@ describe("WorkspacesOverviewSection", () => {
     expect(ids).toContain("remote-1");
   });
 
+  it("clusters two+ workspaces of the same project under a project header", () => {
+    // Two workspaces sharing a project (same project_root basename
+    // 'passpage') should render a 'passpage' group header so the user
+    // sees they belong together — the core UX gap this fixes. Titles
+    // differ from the project name, so 'passpage' in the DOM can only
+    // come from the group header (the row stub renders titles).
+    mockWorkspaces = [
+      makeWorkspace({
+        workspace_id: "ws-root",
+        title: "main checkout",
+        project_root: "/home/test/passpage",
+      }),
+      makeWorkspace({
+        workspace_id: "ws-wt",
+        title: "ui-polish worktree",
+        project_root: "/home/test/passpage",
+      }),
+    ];
+    const { getByText } = render(<WorkspacesOverviewSection />);
+
+    // The cluster header.
+    expect(getByText("passpage")).toBeInTheDocument();
+    // Both workspaces still render.
+    expect(getByText("main checkout")).toBeInTheDocument();
+    expect(getByText("ui-polish worktree")).toBeInTheDocument();
+  });
+
+  it("does not render project headers for one-off projects", () => {
+    // Distinct projects (one workspace each) stay in a flat grid with
+    // no per-project header — avoids cluttering a device full of
+    // unrelated projects. The project names never appear (rows render
+    // titles only), so their absence proves no header was emitted.
+    mockWorkspaces = [
+      makeWorkspace({
+        workspace_id: "ws-a",
+        title: "alpha-title",
+        project_root: "/home/test/proj-a",
+      }),
+      makeWorkspace({
+        workspace_id: "ws-b",
+        title: "beta-title",
+        project_root: "/home/test/proj-b",
+      }),
+    ];
+    const { getByText, queryByText } = render(<WorkspacesOverviewSection />);
+
+    expect(getByText("alpha-title")).toBeInTheDocument();
+    expect(getByText("beta-title")).toBeInTheDocument();
+    expect(queryByText("proj-a")).toBeNull();
+    expect(queryByText("proj-b")).toBeNull();
+  });
+
   it("marks the active workspace as attached", () => {
     mockActiveWorkspaceId = "local-1";
     mockWorkspaces = [

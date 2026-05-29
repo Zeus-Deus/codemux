@@ -356,7 +356,21 @@ pub fn reconcile_host_inventory(
         // remote daemon's schema has to "where this workspace
         // came from." Better than nothing for the UI's "open in
         // file manager" affordance.
-        let project_path = ws.project_root.as_deref();
+        //
+        // Fallback: a host workspace created via the `workspace_create`
+        // MCP tool only records `project_root` when it's a worktree of
+        // an origin repo. A plain root/main checkout leaves it null,
+        // which used to leave the overview row with an empty project
+        // name and the pull dialog with a generic
+        // `~/.codemux/worktrees/workspace/main` landing path. For a
+        // root checkout the workspace's own working dir (`path`) IS the
+        // project root, so its basename is the project name — fall back
+        // to it so every remote-discovered workspace surfaces a
+        // meaningful project.
+        let project_path = ws
+            .project_root
+            .as_deref()
+            .or(Some(ws.path.as_str()));
         let project_remote: Option<&str> = None; // not in the remote schema today
         let branch = ws.branch.as_deref();
 
@@ -547,6 +561,59 @@ mod tests {
             assert!(r.dirty);
             assert_eq!(r.host_server_id.as_deref(), Some("host-99"));
         }
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_falls_back_to_path_when_project_root_is_missing() {
+        // A root/main checkout created via the `workspace_create` MCP
+        // tool has no `project_root` (that field is only stamped for
+        // worktrees). Before the fallback, its sync row got a null
+        // project_path, which surfaced as an empty project name and a
+        // generic `~/.codemux/worktrees/workspace/<branch>` landing path
+        // in the overview + pull dialog. The reconcile now uses the
+        // workspace's own `path` as the project_path so a meaningful
+        // project name survives.
+        let db = fresh_db();
+        let mut ws = make_remote("uid-root", "passpage", Some("main"));
+        ws.project_root = None;
+        ws.path = "/home/agent/projects/passpage".into();
+        let envelope = make_envelope(vec![ws]);
+
+        reconcile_host_inventory(&db, "host-1", &envelope);
+
+        let rows = db.list_remote_discovered_for_host("host-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].project_path.as_deref(),
+            Some("/home/agent/projects/passpage"),
+            "missing project_root must fall back to the workspace path so the \
+             overview can derive the 'passpage' project name"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_prefers_project_root_over_path_for_worktrees() {
+        // When the host DID record a project_root (the worktree case)
+        // it stays authoritative — a worktree's own path basename is
+        // the BRANCH, not the project, so falling back to it would
+        // mislabel the project. Locks in the precedence.
+        let db = fresh_db();
+        let mut ws =
+            make_remote("uid-wt", "passpage-ui-polish", Some("ui-polish-v1"));
+        ws.project_root = Some("/home/agent/projects/passpage".into());
+        ws.path = "/home/agent/.codemux/worktrees/passpage/ui-polish-v1".into();
+        let envelope = make_envelope(vec![ws]);
+
+        reconcile_host_inventory(&db, "host-2", &envelope);
+
+        let rows = db.list_remote_discovered_for_host("host-2");
+        assert_eq!(
+            rows[0].project_path.as_deref(),
+            Some("/home/agent/projects/passpage"),
+            "project_root must win over the worktree path basename"
+        );
     }
 
     #[test]

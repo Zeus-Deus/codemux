@@ -144,6 +144,33 @@ impl WorkspaceStore {
         let id = Uuid::new_v4().to_string();
         let resolved_name = name.unwrap_or_else(|| basename(&path));
 
+        // Stamp a project identity at the moment of record creation,
+        // mirroring every desktop create path (`commands/workspace.rs`).
+        // The `workspace_create` MCP tool only receives `project_root`
+        // for worktrees; a plain root/main checkout an agent builds on
+        // this host arrives with `project_root = None`, which used to
+        // leave the workspace with a blank project name on every dev
+        // device. Deriving it here — the git root of the workspace's
+        // own directory, or the directory itself when it isn't (yet) a
+        // repo — guarantees a non-null `project_root` at the source, so
+        // the cross-device registry never carries an anonymous row.
+        // `find_git_root` follows a worktree's `.git` pointer back to
+        // the parent repo, so a worktree resolves to its project root
+        // (not the per-branch dir), exactly as the desktop does.
+        let project_root = project_root.or_else(|| {
+            let p = std::path::Path::new(&path);
+            let derived = if p.exists() {
+                crate::config::workspace_config::find_git_root(p)
+            } else {
+                None
+            };
+            Some(
+                derived
+                    .map(|root| root.display().to_string())
+                    .unwrap_or_else(|| path.clone()),
+            )
+        });
+
         let ws = Workspace {
             id: id.clone(),
             name: resolved_name,
@@ -386,6 +413,67 @@ mod tests {
         let store = open_store(&dir);
         let ws = store.create(None, "/tmp/my-cool-repo".into(), None, None).unwrap();
         assert_eq!(ws.name, "my-cool-repo");
+    }
+
+    #[test]
+    fn create_derives_project_root_from_git_root_when_omitted() {
+        // A root/main project an agent builds (e.g. `git init`) and then
+        // registers via `workspace_create` WITHOUT passing project_root
+        // must still carry a project identity. The daemon derives it
+        // from the path's git root so the cross-device registry never
+        // gets an anonymous row (the blank-project-name bug).
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+
+        let repo = dir.path().join("passpage");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_str = repo.display().to_string();
+
+        let ws = store
+            .create(None, repo_str.clone(), Some("main".into()), None)
+            .unwrap();
+
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some(repo_str.as_str()),
+            "project_root must be derived from the path's git root"
+        );
+    }
+
+    #[test]
+    fn create_falls_back_to_path_when_no_git_root() {
+        // A registered path that isn't (yet) a git repo still gets a
+        // non-null project_root: the path itself. Never blank.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let missing = dir.path().join("not-a-repo");
+        let missing_str = missing.display().to_string();
+
+        let ws = store.create(None, missing_str.clone(), None, None).unwrap();
+
+        assert_eq!(ws.project_root.as_deref(), Some(missing_str.as_str()));
+    }
+
+    #[test]
+    fn create_preserves_explicit_project_root_for_worktrees() {
+        // The worktree case: when the caller DOES pass project_root
+        // (pointing at the parent repo), it wins — we must not overwrite
+        // it with the worktree's own directory.
+        let dir = TempDir::new().unwrap();
+        let store = open_store(&dir);
+        let ws = store
+            .create(
+                Some("ui-polish".into()),
+                "/home/agent/.codemux/worktrees/passpage/ui-polish".into(),
+                Some("ui-polish-v1".into()),
+                Some("/home/agent/projects/passpage".into()),
+            )
+            .unwrap();
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some("/home/agent/projects/passpage"),
+            "an explicitly-passed project_root (the parent repo) must be preserved"
+        );
     }
 
     #[test]

@@ -96,6 +96,21 @@ export interface DeviceBucket {
 }
 
 /**
+ * Project name for a synced (sibling-device) row. Prefers the
+ * `project_path` basename; falls back to the workspace `title` when
+ * the originating host never recorded a project root — e.g. a plain
+ * root/main checkout created via the MCP `workspace_create` tool,
+ * which only stamps `project_root` for worktrees. `title` is always
+ * present, so a sibling row never renders a bare "—" for its project.
+ */
+export function remoteProjectName(row: WorkspaceSyncView): string | null {
+  const fromPath = row.project_path
+    ? row.project_path.split("/").filter(Boolean).slice(-1)[0] ?? null
+    : null;
+  return fromPath ?? (row.title.trim() || null);
+}
+
+/**
  * Detect git-HEAD divergence across the unified overview-item list.
  * Two rows that share the same (project_remote, git_branch) but
  * have different `git_head_sha` values are considered diverged. The
@@ -256,9 +271,7 @@ export function useOverviewItems(): {
         key: `remote:${row.server_id ?? row.id}`,
         sync: row,
         hostServerId: row.host_server_id,
-        projectName: row.project_path
-          ? row.project_path.split("/").filter(Boolean).slice(-1)[0] ?? null
-          : null,
+        projectName: remoteProjectName(row),
         projectPath: row.project_path,
       });
     }

@@ -147,6 +147,13 @@ The fix is a deliberately asymmetric model:
    - SSH and run `codemux-remote workspace list` (also with the PATH fallback — see `build_inventory_argv`).
    - Parse the JSON envelope.
    - Reconcile: per inventory row, INSERT a sibling-only sync row (workspace_id NULL, `host_server_id = host.server_id`, `origin_uid = workspace.id` (UUID), dirty=1) or UPDATE in place if `(host_server_id, origin_uid)` already exists. Disappeared rows get soft-deleted.
+   - **`project_path` derivation.** The sync row's `project_path` is set to the host workspace's `project_root` when present, else falls back to the workspace's own `path`. For a non-worktree checkout the workspace `path`'s basename *is* the project name, so the fallback recovers it; worktrees keep `project_root` (whose basename is the project, not the branch). See `hosts_inventory.rs::reconcile_host_inventory`. **This is now a backstop, not the primary fix** — see the source-side stamp below.
+
+#### Source-side project identity (where it's actually fixed)
+
+The blank-project-name bug for agent-/host-created workspaces is fixed at the *source*, mirroring how every desktop create path already behaves (`commands/workspace.rs` resolves `find_git_root(cwd).unwrap_or(cwd)`). The headless daemon's `WorkspaceStore::create` (`src-tauri/src/remote/workspace.rs`) now derives `project_root` when the caller (the `workspace_create` MCP tool) omits it: the git root of the workspace's `path`, or the path itself when it isn't a repo. So a workspace an agent registers on a host always carries a project identity at the moment of record creation — `codemux-remote workspace list` reports it, the cloud row gets it, and every consumer benefits.
+
+Important: the daemon `workspace_create` tool is **registration-only** — it does not create a worktree (or any files). An agent building a new project does the git work itself (`git clone`/`git init` via the terminal tools) into a **regular folder**, then registers that path. Worktrees are only for additional branches; the daemon never puts a root/main checkout inside `~/.codemux/worktrees/`. The earlier symptom was purely the missing `project_root` metadata, not a misplaced checkout.
 3. **Cloud push** (existing). The 30 s `workspaces_sync::push` tick walks every dirty row including these sibling-only ones, POSTs to `/api/workspaces`, and stamps the assigned `server_id`. Other devices pull and render them under the host's bucket. Same code path as a manual push — no new API surface.
 
 ### Identity contract for remote-discovered rows

@@ -229,12 +229,20 @@ pub fn workspaces_adoption_preview(
     // helper that pushes use, so a workspace pushed from this device
     // and adopted on another lands at structurally identical paths
     // on both sides.
+    // Prefer the project_path basename; fall back to the workspace
+    // title when the originating host never recorded a project root
+    // (e.g. a root/main checkout created via the MCP `workspace_create`
+    // tool). The title is always present, so a synced workspace never
+    // collapses to the generic `~/.codemux/worktrees/workspace/<branch>`
+    // landing path. `conventional_remote_path` still guards the empty
+    // case as a last resort.
     let project_name = row
         .project_path
         .as_deref()
         .and_then(|p| std::path::Path::new(p).file_name())
         .and_then(|n| n.to_str())
-        .unwrap_or("workspace");
+        .filter(|n| !n.is_empty())
+        .unwrap_or(row.title.as_str());
     let branch = row.git_branch.as_deref().unwrap_or("main");
     let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
     let conv_str = conv.to_string_lossy().to_string();
@@ -439,13 +447,17 @@ pub async fn workspaces_adopt_synced(
                 )
             })?;
 
-        // Compute canonical local path.
+        // Compute canonical local path. Mirrors the suggested_path
+        // logic in `workspaces_adoption_preview` exactly — including the
+        // title fallback — so the path the dialog previews is the path
+        // adoption actually lands at.
         let project_name = row
             .project_path
             .as_deref()
             .and_then(|p| std::path::Path::new(p).file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or("workspace");
+            .filter(|n| !n.is_empty())
+            .unwrap_or(row.title.as_str());
         let branch = row.git_branch.as_deref().unwrap_or("main");
         let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
         let conv_str = conv.to_string_lossy().to_string();
