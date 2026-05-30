@@ -975,6 +975,16 @@ export const clearAgentStatus = (sessionId: string) =>
 export const detachPtyOutput = (sessionId: string) =>
   invoke("detach_pty_output", { sessionId });
 
+/** Terminal output flow control: pause the daemon's PTY read loop when the
+ *  renderer's xterm write queue is backed up by a fast producer. No-op for
+ *  in-process sessions. See `pause_pty_output` in terminal/mod.rs. */
+export const pausePtyOutput = (sessionId: string) =>
+  invoke("pause_pty_output", { sessionId });
+
+/** Resume the daemon's PTY read loop once the write queue has drained. */
+export const resumePtyOutput = (sessionId: string) =>
+  invoke("resume_pty_output", { sessionId });
+
 export const attachPtyOutput = (
   sessionId: string,
   channel: Channel<unknown>,

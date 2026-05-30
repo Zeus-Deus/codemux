@@ -2084,6 +2084,70 @@ pub fn detach_pty_output(
     Ok(())
 }
 
+/// Pause the daemon's PTY read loop for a session (terminal output flow
+/// control). The renderer calls this when a fast producer outruns its xterm
+/// write queue; pausing makes the child block on `write()` once the kernel
+/// PTY buffer fills — real backpressure instead of an ever-growing renderer
+/// queue.
+///
+/// In-process (non-daemon) sessions are a deliberate no-op: they keep
+/// today's behavior exactly, so this can never regress the fallback path.
+/// The daemon side fail-safes (resume on attach/close + a max-park backstop)
+/// guarantee a paused PTY always self-heals even if the matching resume is
+/// never delivered.
+#[tauri::command]
+pub fn pause_pty_output(
+    terminal_state: State<'_, PtyState>,
+    session_id: String,
+) -> Result<(), String> {
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, true);
+    Ok(())
+}
+
+/// Resume the daemon's PTY read loop for a session. See `pause_pty_output`.
+/// Idempotent and a no-op for in-process sessions.
+#[tauri::command]
+pub fn resume_pty_output(
+    terminal_state: State<'_, PtyState>,
+    session_id: String,
+) -> Result<(), String> {
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, false);
+    Ok(())
+}
+
+/// Route a flow-control pause/resume to the daemon that owns `session_id`.
+/// Fire-and-forget (mirrors `DaemonWriter`): flow control is advisory and
+/// not latency-sensitive, and a failure (e.g. the session just exited) is
+/// benign. No-op when the session has no daemon client (in-process path).
+fn set_pty_flow_paused(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    paused: bool,
+) {
+    #[cfg(unix)]
+    {
+        let client = with_existing_session_runtime(sessions, session_id, |runtime| {
+            runtime.daemon_client.clone()
+        })
+        .flatten();
+        if let Some(client) = client {
+            let session_id = session_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = client.set_flow_paused(session_id.clone(), paused).await {
+                    eprintln!(
+                        "[codemux::terminal] flow-control set_flow_paused(paused={paused}) \
+                         for {session_id} failed (benign if the session just exited): {error}"
+                    );
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sessions, session_id, paused);
+    }
+}
+
 #[tauri::command]
 pub fn write_to_pty(
     terminal_state: State<'_, PtyState>,

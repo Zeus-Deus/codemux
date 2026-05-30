@@ -1500,6 +1500,8 @@ pub fn run() {
             terminal::get_terminal_status,
             terminal::attach_pty_output,
             terminal::detach_pty_output,
+            terminal::pause_pty_output,
+            terminal::resume_pty_output,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,

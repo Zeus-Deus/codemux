@@ -349,3 +349,169 @@ async fn second_client_sees_session_from_first() {
     sleep(Duration::from_millis(100)).await;
     let _ = unsafe { libc::kill(pid_from_first as i32, libc::SIGKILL) };
 }
+
+// ── Terminal output flow control ──
+
+/// Drain everything currently buffered on `rx` until it goes quiet for
+/// `quiet` (no new bytes), or `max` elapses. Used to flush in-flight output
+/// (broadcast channel + socket + client mpsc) before measuring a steady
+/// state.
+async fn drain_until_quiet(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    quiet: Duration,
+    max: Duration,
+) {
+    let hard_deadline = tokio::time::Instant::now() + max;
+    loop {
+        if tokio::time::Instant::now() >= hard_deadline {
+            break;
+        }
+        match tokio::time::timeout(quiet, rx.recv()).await {
+            Ok(Some(_)) => continue, // got bytes — keep draining
+            Ok(None) => break,       // channel closed
+            Err(_) => break,         // quiet window with no bytes
+        }
+    }
+}
+
+/// Count bytes received on `rx` over `dur`.
+async fn count_bytes_for(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    dur: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + dur;
+    let mut total = 0usize;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match tokio::time::timeout(deadline - now, rx.recv()).await {
+            Ok(Some(chunk)) => total += chunk.len(),
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    total
+}
+
+/// The headline flow-control test: pausing a session stops the daemon from
+/// draining the PTY (so a flooding child blocks on write), and resuming lets
+/// output flow again. `yes` is the flood source — it writes "y\n" forever and
+/// blocks once the kernel PTY buffer fills behind a paused reader.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_flow_paused_stops_and_resumes_output() {
+    let tmp = TempDir::new().unwrap();
+    let (_socket, client) = boot_daemon(&tmp).await;
+
+    let session_id = "flow-control-test".to_string();
+    client
+        .spawn(
+            session_id.clone(),
+            "ws-flow".to_string(),
+            vec!["yes".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
+            vec![],
+            24,
+            80,
+        )
+        .await
+        .expect("spawn yes");
+
+    let mut rx = client.attach(session_id.clone()).await.expect("attach");
+
+    // Phase 1 — flowing. `yes` floods; we should see plenty quickly.
+    let flowing = count_bytes_for(&mut rx, Duration::from_millis(300)).await;
+    assert!(
+        flowing > 50_000,
+        "expected a flood of output while flowing, got only {flowing} bytes"
+    );
+
+    // Pause, then flush whatever was already in flight (broadcast + socket +
+    // client mpsc) so we measure the steady paused state, not the backlog.
+    client
+        .set_flow_paused(session_id.clone(), true)
+        .await
+        .expect("pause");
+    drain_until_quiet(
+        &mut rx,
+        Duration::from_millis(250),
+        Duration::from_secs(4),
+    )
+    .await;
+
+    // Phase 2 — paused. The read thread is parked, the kernel PTY buffer is
+    // full, and `yes` is blocked on write, so essentially nothing new arrives.
+    // (FLOW_MAX_PARK is 10s, well beyond this window, so the backstop can't
+    // fire and mask a broken pause.)
+    let while_paused = count_bytes_for(&mut rx, Duration::from_millis(500)).await;
+    assert!(
+        while_paused < 8192,
+        "expected ~no output while paused, got {while_paused} bytes (pause not honoured?)"
+    );
+
+    // Phase 3 — resumed. Output must flow again.
+    client
+        .set_flow_paused(session_id.clone(), false)
+        .await
+        .expect("resume");
+    let after_resume = count_bytes_for(&mut rx, Duration::from_millis(300)).await;
+    assert!(
+        after_resume > 50_000,
+        "expected output to resume flooding, got only {after_resume} bytes"
+    );
+
+    client.close(session_id).await.expect("close");
+}
+
+/// A fresh `Attach` must clear a stale pause — the fail-safe that prevents a
+/// crashed client from leaving a PTY wedged forever. We pause, drop the
+/// client (simulating a crash without a resume), reconnect, re-attach, and
+/// confirm output flows again.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_clears_a_stale_flow_pause() {
+    let tmp = TempDir::new().unwrap();
+    let (socket_path, client) = boot_daemon(&tmp).await;
+
+    let session_id = "flow-attach-reset".to_string();
+    client
+        .spawn(
+            session_id.clone(),
+            "ws-flow2".to_string(),
+            vec!["yes".to_string()],
+            std::env::temp_dir().to_string_lossy().to_string(),
+            vec![],
+            24,
+            80,
+        )
+        .await
+        .expect("spawn yes");
+
+    {
+        let mut rx = client.attach(session_id.clone()).await.expect("attach 1");
+        // Confirm it's flowing, then pause and abandon the connection.
+        let flowing = count_bytes_for(&mut rx, Duration::from_millis(200)).await;
+        assert!(flowing > 0, "expected output before pause");
+        client
+            .set_flow_paused(session_id.clone(), true)
+            .await
+            .expect("pause");
+    }
+    // Drop the first client entirely — a crashed app that never resumed.
+    drop(client);
+    sleep(Duration::from_millis(150)).await;
+
+    // Reconnect and re-attach. The daemon clears flow_paused on Attach, so
+    // output must flow despite the earlier pause never being released.
+    let client2 = PtyDaemonClient::connect(&socket_path)
+        .await
+        .expect("reconnect");
+    let mut rx2 = client2.attach(session_id.clone()).await.expect("attach 2");
+    let after_reattach = count_bytes_for(&mut rx2, Duration::from_millis(400)).await;
+    assert!(
+        after_reattach > 50_000,
+        "attach must clear a stale pause; got only {after_reattach} bytes"
+    );
+
+    client2.close(session_id).await.expect("close");
+}

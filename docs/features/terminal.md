@@ -36,6 +36,7 @@ Disposal is driven by `useTerminalCacheGc` in `src/hooks/use-terminal-cache-gc.t
 - working directory set to workspace root on creation
 - comm log support for OpenFlow agent communication tracking
 - ANSI code stripping for log capture
+- **output flow control (backpressure)**: a fast producer (`yes`, `cat huge-file`, a verbose build, a runaway agent) can outrun xterm's parser. The renderer drains PTY bytes through `pumpWrites` one chunk per macrotask (so the main thread stays responsive — see `terminal-cache.ts`), but under a *sustained* visible flood the un-drained `writeQueue` would grow without bound. Flow control caps it: when the queued byte count crosses a HIGH watermark (16 MiB) the renderer calls `pause_pty_output`, which (on the daemon spawn path) tells the daemon to stop draining the PTY master fd — the kernel PTY buffer fills and the child blocks on `write()`, real backpressure to the producer. It resumes (`resume_pty_output`) once the queue drains below LOW (4 MiB). Without this, the daemon's broadcast channel would silently drop frames under lag, corrupting the rendered terminal until a redraw. **In-process (non-daemon) sessions treat pause/resume as a no-op** and keep their prior behavior. **Fail-safes** (so a dropped resume can never wedge a PTY): the daemon clears the paused flag on every `Attach` and on `Close`, plus a 10 s max-park backstop in the read loop; the renderer also resumes on detach/park so a backgrounded daemon agent is never left blocked. Wire protocol bumped to v2 (`SetFlowPaused`)
 - session close kills the PTY child and its entire process group via a single `killpg(pid, SIGKILL)` through the central `terminate_pty_session` helper, so closing a pane/tab/workspace also tears down any Claude CLI, MCP server, or rust-analyzer the shell spawned. `portable-pty`'s Unix spawn path calls `setsid()`, so the shell is a process-group leader and `killpg` reaches its children. A previous version did SIGTERM → 200ms grace → SIGKILL; that grace window is exactly the adversarial case for PID recycling (the shell handles SIGTERM and exits in ~50ms, the kernel reuses the PID for an unrelated process, our SIGKILL lands on the wrong process group), so the current code goes straight to SIGKILL and collapses the race to microseconds. `impl Drop for SessionRuntime` is a safety net that kills the tree with a warning if the normal close path is ever skipped.
 
 ## Windows-Specific Notes
@@ -54,7 +55,9 @@ Note: terminal scrollback is saved and restored across app restarts. See `docs/f
 
 ## Important Touch Points
 
-- `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks, dropped-chunk observability counter
+- `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks, dropped-chunk observability counter, `pause_pty_output` / `resume_pty_output` flow-control commands
+- `src-tauri/src/pty_daemon/{protocol,client,server}.rs` — `SetFlowPaused` wire request + per-session `flow_paused` flag gating the daemon read loop (with `Attach`/`Close`/max-park fail-safes)
+- `src/components/terminal/terminal-cache.ts` — `writeQueueBytes` accounting + HIGH/LOW watermark pause/resume in the channel callback and `pumpWrites`
 - `src-tauri/src/commands/workspace.rs` — `create_terminal_session`, `write_to_pty`, `resize_pty`, `attach_pty_output`
 - `src/components/terminal/TerminalPane.tsx` — DOM-attach wrapper, ResizeObserver, focus, status overlay, custom key handler
 - `src/components/terminal/terminal-cache.ts` — module-level Terminal cache, parking node, attach/detach/dispose API

@@ -36,6 +36,8 @@ import {
   writeToPty,
   attachPtyOutput,
   detachPtyOutput,
+  pausePtyOutput,
+  resumePtyOutput,
   getTerminalScrollback,
   cacheTerminalScrollback,
   uncacheTerminalScrollback,
@@ -53,6 +55,30 @@ import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer"
 import { suppressQueryResponses } from "./query-suppression";
 
 const PARKING_NODE_ID = "codemux-terminal-parking";
+
+/**
+ * Terminal output flow control watermarks.
+ *
+ * `writeQueue` holds PTY bytes received over IPC but not yet handed to xterm
+ * (the throttled `pumpWrites` drains ~one chunk per macrotask to keep the
+ * main thread responsive). Under a sustained flood — `yes`, `cat huge-file`,
+ * a verbose build, a runaway agent — a fast producer outruns that drain and
+ * the queue would grow without bound, ballooning renderer memory.
+ *
+ * When the queued byte count crosses HIGH we ask the backend to pause the
+ * PTY read loop; the child then blocks on `write()` once the kernel PTY
+ * buffer fills (real backpressure to the producer). We resume once the queue
+ * drains below LOW. The watermarks are deliberately generous so ordinary
+ * bursts and the multi-MB reattach-replay (already spread out by the pump)
+ * never trip backpressure — only genuine floods do.
+ *
+ * Backpressure is enforced only on the daemon spawn path; in-process sessions
+ * treat pause/resume as a no-op and keep their prior behavior. The backend
+ * carries its own fail-safes (resume on attach/close + a max-park backstop)
+ * so a dropped resume can never wedge a PTY.
+ */
+const FLOW_HIGH_WATERMARK_BYTES = 16 * 1024 * 1024; // 16 MiB
+const FLOW_LOW_WATERMARK_BYTES = 4 * 1024 * 1024; // 4 MiB
 
 /**
  * One shared TextDecoder for every channel callback for every session.
@@ -118,6 +144,15 @@ export interface CachedTerminal {
    *  parses thousands of IPC payloads + xterm escape sequences in one
    *  go and freezes hard with input dead until parsing finishes. */
   writeQueue: Uint8Array[];
+  /** Running total of `writeQueue` chunk byte lengths. Kept in lockstep with
+   *  the queue (push adds, pump-drain subtracts, dispose resets) so the
+   *  flow-control watermark check is O(1) instead of summing the queue. */
+  writeQueueBytes: number;
+  /** True when we've asked the backend to pause this session's PTY read loop
+   *  because `writeQueueBytes` crossed the HIGH watermark. Cleared when the
+   *  queue drains below LOW, or on detach/dispose (so a parked pane never
+   *  leaves a background agent blocked on write). */
+  flowPaused: boolean;
   /** True while `pumpWrites` is iterating. Re-entrant pump kicks become
    *  no-ops; the running pump picks up newly queued chunks on its next
    *  iteration. */
@@ -285,6 +320,8 @@ function createCachedTerminal(
     kittyStack: [],
     kittyLevel: 0,
     writeQueue: [],
+    writeQueueBytes: 0,
+    flowPaused: false,
     writePumpRunning: false,
     cleanups: [],
   };
@@ -350,12 +387,56 @@ async function pumpWrites(entry: CachedTerminal): Promise<void> {
     while (entry.writeQueue.length > 0 && !entry.disposed) {
       const next = entry.writeQueue.shift();
       if (!next) continue;
+      // The chunk leaves our queue here; account for it before writing so
+      // the flow-control watermark reflects only bytes still waiting on us.
+      entry.writeQueueBytes -= next.length;
+      if (entry.writeQueueBytes < 0) entry.writeQueueBytes = 0;
       entry.terminal.write(next);
+      maybeReleaseBackpressure(entry);
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
   } finally {
     entry.writePumpRunning = false;
   }
+}
+
+/**
+ * Ask the backend to pause this session's PTY read loop when the write queue
+ * has grown past the HIGH watermark. Called from the channel callback right
+ * after a chunk is queued. Single-shot per pause cycle (guarded by
+ * `flowPaused`).
+ */
+function maybeApplyBackpressure(entry: CachedTerminal): void {
+  if (entry.flowPaused) return;
+  if (entry.writeQueueBytes <= FLOW_HIGH_WATERMARK_BYTES) return;
+  entry.flowPaused = true;
+  pausePtyOutput(entry.sessionId).catch((err) => {
+    // Pause didn't land (e.g. the session just exited). Drop the guard so a
+    // later over-watermark push retries rather than us believing we paused.
+    entry.flowPaused = false;
+    console.error(
+      `[Codemux] flow-control pause failed for ${entry.sessionId}:`,
+      err,
+    );
+  });
+}
+
+/**
+ * Release backpressure once the queue has drained below the LOW watermark.
+ * Called from the pump after each chunk. On failure we still clear
+ * `flowPaused` (fail open): the backend's attach/close/max-park fail-safes
+ * guarantee the PTY resumes regardless, and a fresh flood will re-pause.
+ */
+function maybeReleaseBackpressure(entry: CachedTerminal): void {
+  if (!entry.flowPaused) return;
+  if (entry.writeQueueBytes >= FLOW_LOW_WATERMARK_BYTES) return;
+  entry.flowPaused = false;
+  resumePtyOutput(entry.sessionId).catch((err) => {
+    console.error(
+      `[Codemux] flow-control resume failed for ${entry.sessionId}:`,
+      err,
+    );
+  });
 }
 
 /**
@@ -381,6 +462,10 @@ async function attachPtyChannel(entry: CachedTerminal): Promise<void> {
     // Queue + pump rather than calling terminal.write synchronously. See
     // pumpWrites for the rationale (reattach-replay freeze fix).
     entry.writeQueue.push(bytes);
+    entry.writeQueueBytes += bytes.length;
+    // Flow control: if a fast producer has outrun the pump, ask the backend
+    // to pause the PTY so the queue can't grow without bound.
+    maybeApplyBackpressure(entry);
     void pumpWrites(entry);
   });
 
@@ -406,6 +491,14 @@ function detachPtyChannel(entry: CachedTerminal): void {
   entry.outputAttachEpoch += 1;
   const shouldDetach = entry.outputAttached || entry.outputAttachPromise !== null;
   entry.outputAttached = false;
+  // If we had this session's PTY paused for flow control, resume it on the
+  // way out. A parked/disposed pane keeps its daemon-backed agent running in
+  // the background — leaving it paused would block that agent on write. (The
+  // daemon also resumes on its own fail-safes; this just makes it immediate.)
+  if (entry.flowPaused) {
+    entry.flowPaused = false;
+    resumePtyOutput(entry.sessionId).catch(console.error);
+  }
   if (shouldDetach) {
     detachPtyOutput(entry.sessionId).catch(console.error);
   }
@@ -562,6 +655,7 @@ export function disposeTerminal(sessionId: string): void {
   // Drop any chunks still queued for the throttled write pump — the
   // pump's loop guard re-checks `disposed` between iterations and exits.
   entry.writeQueue.length = 0;
+  entry.writeQueueBytes = 0;
 
   for (const cleanup of entry.cleanups) {
     try {

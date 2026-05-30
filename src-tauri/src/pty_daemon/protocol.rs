@@ -22,9 +22,12 @@ use serde::{Deserialize, Serialize};
 
 /// Daemon wire-protocol version. Bumped when the message shape changes in a
 /// backwards-incompatible way. Adoption on startup compares this against the
-/// running daemon's reported version and force-restarts on mismatch — the
-/// same pattern superset uses for their `EXPECTED_DAEMON_VERSION`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// running daemon's reported version and force-restarts on mismatch.
+///
+/// v2: added `SetFlowPaused` request + `FlowPaused` response (terminal
+/// output flow control). A v1 daemon doesn't understand the pause frame, so
+/// the supervisor must respawn it rather than silently no-op backpressure.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Request from the Tauri app to the daemon. Every request carries a
 /// `request_id` so the client can correlate responses without ordering
@@ -102,6 +105,24 @@ pub enum ClientRequest {
     /// Ask the daemon to exit cleanly. All PTYs are killed first. Mostly
     /// used by tests; production code lets the daemon stay alive.
     Shutdown { request_id: u64 },
+
+    /// Pause or resume the daemon's read loop for a session (terminal output
+    /// flow control). When `paused=true` the daemon stops draining the PTY
+    /// master fd, so the child's `write()` blocks once the kernel PTY buffer
+    /// fills — real, kernel-level backpressure all the way to the producer.
+    ///
+    /// The Tauri app sends `paused=true` when its renderer-side xterm write
+    /// queue is backed up (a fast producer is outrunning the terminal's
+    /// parser) and `paused=false` once that queue drains. Idempotent.
+    ///
+    /// Fail-safe: the daemon auto-clears the paused flag on the next `Attach`
+    /// and on `Close`, plus a max-park backstop in the read loop, so a
+    /// crashed or wedged client can never leave a PTY paused forever.
+    SetFlowPaused {
+        request_id: u64,
+        session_id: String,
+        paused: bool,
+    },
 }
 
 /// One-shot reply to a `ClientRequest`. Always carries the originating
@@ -142,6 +163,12 @@ pub enum ServerResponse {
         sessions: Vec<DaemonSessionInfo>,
     },
     ShuttingDown {
+        request_id: u64,
+    },
+    /// Reply to `SetFlowPaused`. The flag is applied best-effort; an unknown
+    /// session id returns `Error` instead (the session may have just exited,
+    /// which the client treats as benign).
+    FlowPaused {
         request_id: u64,
     },
     /// Generic error reply. Used for any request that fails — unknown
