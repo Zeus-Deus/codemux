@@ -42,7 +42,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
-- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 11-tool stdio MCP bridge — landed in `v0.6.2`) plan at `docs/plans/mcp-on-remote.md`
+- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/plans/remote-workspace-pull-fix.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`

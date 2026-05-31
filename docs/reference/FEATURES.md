@@ -301,7 +301,7 @@
 ## MCP-on-Remote (Headless Codemux Daemon)
 
 - `codemux-remote serve` runs an axum HTTP server on loopback with a bearer-token manifest at `<state-dir>/manifest.json` (mode `0600`)
-- 11-tool stdio MCP catalog (smaller than the desktop's 52 — no panes, no browser, no global notifications): `workspace_{create,list,info,update,close}`, `terminal_{spawn,write,read,list,close}`, `app_status`
+- 12-tool stdio MCP catalog (smaller than the desktop's 52 — no panes, no browser, no global notifications): `workspace_{create,list,info,update,close}`, `worktree_create`, `terminal_{spawn,write,read,list,close}`, `app_status`
 - `codemux-remote mcp` bridges agent CLIs on the host to the daemon over HTTP — drop-in MCP server entry for Claude Code / Codex / Cursor on the remote
 - On every `serve` startup, idempotently writes a `codemux` MCP entry into every supported user-level agent config it finds (`~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`)
 - `Identity` enum on every dispatch carries `Local` today and reserves `Cloud { user_id, org_id, role }` for a future optional paid-tier relay — purely additive

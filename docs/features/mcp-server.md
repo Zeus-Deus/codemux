@@ -44,7 +44,7 @@ for the host runtime.
   MCP client config
 
 > **Headless variant**: `codemux-remote mcp` is a sibling binary that
-> ships a smaller 11-tool catalog (no panes, no browser) and forwards
+> ships a smaller 12-tool catalog (no panes, no browser) and forwards
 > over HTTP+bearer to a local `codemux-remote serve` daemon instead of
 > the desktop's Unix-socket control transport. Same wire protocol,
 > different tool set, different control transport. The desktop's push

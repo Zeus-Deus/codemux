@@ -319,7 +319,7 @@ Again: **do not build this in v1.** The point of listing it is to lock in the fo
   - `pty.rs` — minimal portable-pty wrapper, per-terminal ring buffer (1 MiB cap).
   - `server.rs` — axum HTTP routes: `GET /health`, `GET /tools/list`, `POST /tools/call`.
   - `mcp.rs` — JSON-RPC 2.0 stdio MCP server (`initialize`, `tools/list`, `tools/call`) forwarding to the local daemon over HTTP.
-  - `tools/mod.rs` — 11 headless tools: workspace_{create,list,info,update,close}, terminal_{spawn,write,read,list,close}, app_status.
+  - `tools/mod.rs` — 12 headless tools: workspace_{create,list,info,update,close}, worktree_create (added `v0.7.5`, backed by `remote/git.rs`), terminal_{spawn,write,read,list,close}, app_status.
 - **CLI subcommands on `codemux-remote`**: `serve` (long-running daemon with graceful SIGTERM/SIGINT shutdown), `serve status`, `serve stop`, `mcp` (stdio MCP for an agent CLI).
 - **Tests**: 26 unit tests in the `remote` module + 8 end-to-end integration tests in `src-tauri/tests/codemux_remote_serve_mcp.rs` covering the full HTTP roundtrip, the MCP stdio roundtrip (the headline test), and edge cases (auth required, singleton check, status JSON, missing-daemon error path, PTY echo roundtrip).
 - **Example systemd user unit** at `scripts/codemux-remote.service.example` with install instructions.

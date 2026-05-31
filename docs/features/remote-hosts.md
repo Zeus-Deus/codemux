@@ -123,13 +123,16 @@ can drive Codemux locally without any UI. Module layout:
 - `src-tauri/src/remote/server.rs` — axum routes (`/health`,
   `/tools/list`, `/tools/call`).
 - `src-tauri/src/remote/mcp.rs` — stdio MCP server.
-- `src-tauri/src/remote/tools/mod.rs` — 11-tool catalog.
+- `src-tauri/src/remote/tools/mod.rs` — 12-tool catalog.
+- `src-tauri/src/remote/git.rs` — `create_worktree` (the `worktree_create`
+  tool) plus the adoption-side worktree recreate helpers.
 
 Headless tool surface (advertised via `tools/list`):
 
 | Tool | Purpose |
 |---|---|
 | `workspace_create` | Register a new workspace. |
+| `worktree_create` | `git worktree add` a branch under `~/.codemux/worktrees/<repo>/<branch>` (desktop layout) and register it with `kind = worktree` sharing the parent repo's `project_uid`. |
 | `workspace_list` | All workspaces, newest first. |
 | `workspace_info` | One workspace by id. |
 | `workspace_update` | Mutate name/branch/notes. |
@@ -238,7 +241,7 @@ Run cadence: 60 s, starting ~12 s after app setup (let `hosts_upgrade` finish fi
 
 1. `ssh::probe::probe_host` — skip offline / not-installed hosts.
 2. SSH and run `codemux-remote workspace list` (with the same `~/.local/bin/codemux-remote` PATH fallback the probe uses — non-interactive SSH on Arch/Ubuntu/Fedora doesn't source `~/.profile`).
-3. `parse_inventory_json` + `reconcile_host_inventory` → insert/update/soft-delete sibling-only rows in `workspaces_sync` keyed by `(host_server_id, origin_uid)`.
+3. `parse_inventory_json` + `reconcile_host_inventory` → insert/update/soft-delete sibling-only rows in `workspaces_sync` keyed by `(host_server_id, origin_uid)`. The reconcile records the daemon's real on-host `path` as `origin_path` (`v0.7.5`), distinct from `project_path` (which collapses to the parent repo for a worktree), so a later pull rsyncs from where the files actually live — see `docs/features/workspaces-sync.md` § *Current Constraints* (the host-backed adoption variants).
 
 The next `workspaces_sync::push` tick (30 s) uploads dirty rows to the cloud, so other devices see new host-side workspaces within ~90 s. See `docs/features/workspaces-sync.md` § *Asymmetric publish model* for the full design rationale, identity contract, and known limitations.
 
@@ -388,8 +391,8 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 
 - `src-tauri/src/state/state_impl.rs` — `WorkspaceSnapshot.host_id`, `set_workspace_host_id`.
 - `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`.
-- `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`. Unix-only — Windows builds a no-op stub.
-- `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (11-tool catalog), `config.rs` (state-dir resolution).
+- `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`, `workspace list` (reads the daemon SQLite directly for the host-inventory poller). Unix-only — Windows builds a no-op stub.
+- `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (12-tool catalog), `git.rs` (`worktree_create` + adoption worktree recreate), `config.rs` (state-dir resolution).
 - `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor + zero-touch provisioning of the `serve` daemon).
 - `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start.
 - `src/components/hosts/device-picker.tsx` — shared pill component.
