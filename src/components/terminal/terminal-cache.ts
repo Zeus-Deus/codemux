@@ -1,4 +1,25 @@
 /**
+ * ┌──────────────────────────────────────────────────────────────────────┐
+ * │ DISABLED — NOT WIRED INTO THE LIVE APP.                                │
+ * │                                                                        │
+ * │ The live terminal render path is the per-mount lifecycle in            │
+ * │ TerminalPane.tsx (it constructs its own xterm on mount and disposes    │
+ * │ it on unmount). This module-level persistent cache was shipped in      │
+ * │ commit 14735bf ("persist xterm instances across workspace switches")   │
+ * │ and ROLLED BACK in 2baa42f ("restore pane-local terminal lifecycle")   │
+ * │ for input-lag / malformed-render regressions. Nothing in production    │
+ * │ calls getOrCreateTerminal / attachToContainer / detachFromContainer —  │
+ * │ only terminal-cache.test.ts does, so the cache Map is never populated  │
+ * │ and useTerminalCacheGc / applyThemeToAllTerminals operate on an empty  │
+ * │ map. The flow-control / backpressure code below is therefore inert.    │
+ * │                                                                        │
+ * │ Retained (not deleted) as the basis for a possible future revival      │
+ * │ behind a feature flag (the "keep instances alive, reparent the DOM"    │
+ * │ approach is the true-instant fix; it must be live-verified first).     │
+ * │ The consumer-side write throttle this file pioneered now lives on the  │
+ * │ live path in ./terminal-write-pump.ts. Do NOT assume this file runs.   │
+ * └──────────────────────────────────────────────────────────────────────┘
+ *
  * Terminal cache: keeps xterm.js Terminal instances alive across React unmounts.
  *
  * The xterm Terminal, its addons, the persistent wrapper <div>, the PTY-output
@@ -25,7 +46,8 @@
  *
  * Design references:
  * - v0.1.29 TerminalPane: detach PTY output on unmount for low input latency
- * - Superset's apps/desktop/.../v1-terminal-cache.ts: same wrapper-div pattern
+ * - the standard persistent-wrapper-div reparenting pattern used by terminal
+ *   UIs that keep instances alive across view switches
  */
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
