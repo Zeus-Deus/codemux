@@ -26,8 +26,9 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
@@ -44,6 +45,18 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 /// alt-screen TUI; for shell scrollback we rely on the existing
 /// `scrollback.rs` system.
 const REPLAY_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Flow-control backstop: the maximum time the read loop will honour a
+/// `flow_paused` flag before force-resuming. A healthy client clears the
+/// flag within milliseconds (as soon as its xterm write queue drains), so
+/// this only ever fires when the client crashed, wedged, or lost the resume
+/// frame. Force-resuming bounds the worst case to "a stuck pane self-heals
+/// in ~this long" instead of "the child is blocked on write forever".
+const FLOW_MAX_PARK: Duration = Duration::from_secs(10);
+
+/// Poll interval for the read loop's pause gate. Small enough that a resume
+/// is observed promptly, large enough that a parked thread costs ~nothing.
+const FLOW_PARK_POLL: Duration = Duration::from_millis(10);
 
 /// Frames pushed through a session's broadcast channel. The reader thread
 /// emits `Output` for every PTY chunk; the waiter thread emits `Exited`
@@ -81,6 +94,12 @@ struct DaemonSession {
     /// by late attachers who connect after the child exited: they see this
     /// value in the `Listed` response instead of getting silence.
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Terminal output flow control. When `true`, the per-session read
+    /// thread stops draining the master fd, so the child blocks on write
+    /// once the kernel PTY buffer fills. Set/cleared by `SetFlowPaused`;
+    /// force-cleared on `Attach` and `Close` and by the read loop's
+    /// `FLOW_MAX_PARK` backstop. Shared (Arc) with the read thread.
+    flow_paused: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -349,6 +368,13 @@ async fn handle_request(
                 }
             };
             drop(guard);
+            // Fail-safe: a fresh attach always resumes the read loop. If a
+            // previous client paused this session and then crashed or
+            // dropped its connection without resuming, the new client would
+            // otherwise inherit a wedged (paused) PTY. Clearing here means a
+            // stuck pause self-heals on the next attach (e.g. app restart,
+            // reopening the pane).
+            session.flow_paused.store(false, Ordering::Relaxed);
             // Subscribe to live output (after replay so we don't drop
             // anything in the gap).
             let rx = session.frame_tx.subscribe();
@@ -458,6 +484,11 @@ async fn handle_request(
                 guard.sessions.remove(&session_id)
             };
             if let Some(session) = session {
+                // Clear any pause first so a read thread parked in the
+                // flow-control gate wakes, reads EOF on the now-killed
+                // master, and exits — otherwise it would leak (parked
+                // forever holding the broadcast sender).
+                session.flow_paused.store(false, Ordering::Relaxed);
                 kill_session_pid(session.pid);
             }
             ServerResponse::Closed { request_id }
@@ -498,6 +529,26 @@ async fn handle_request(
                 std::process::exit(0);
             });
             ServerResponse::ShuttingDown { request_id }
+        }
+        ClientRequest::SetFlowPaused {
+            request_id,
+            session_id,
+            paused,
+        } => {
+            let session = {
+                let guard = state.lock().await;
+                guard.sessions.get(&session_id).cloned()
+            };
+            match session {
+                Some(session) => {
+                    session.flow_paused.store(paused, Ordering::Relaxed);
+                    ServerResponse::FlowPaused { request_id }
+                }
+                None => ServerResponse::Error {
+                    request_id,
+                    message: format!("unknown session {session_id}"),
+                },
+            }
         }
     }
 }
@@ -588,6 +639,7 @@ async fn spawn_pty(
     let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
     let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));
     let exit_code = Arc::new(Mutex::new(None));
+    let flow_paused = Arc::new(AtomicBool::new(false));
 
     let session = Arc::new(DaemonSession {
         session_id: session_id.clone(),
@@ -606,6 +658,7 @@ async fn spawn_pty(
         frame_tx: tx.clone(),
         replay: replay.clone(),
         exit_code: exit_code.clone(),
+        flow_paused: flow_paused.clone(),
     });
 
     {
@@ -617,10 +670,42 @@ async fn spawn_pty(
     let read_session_id = session_id.clone();
     let read_tx = tx.clone();
     let read_replay = replay;
+    let read_flow_paused = flow_paused;
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 8192];
+        // Tracks how long we've been continuously parked, for the
+        // `FLOW_MAX_PARK` backstop.
+        let mut paused_since: Option<Instant> = None;
         loop {
+            // Flow-control gate. While the attached client signals it's
+            // behind (its xterm parser can't keep up), we stop draining the
+            // master fd. The kernel PTY buffer then fills and the child's
+            // next `write()` blocks — backpressure straight to the producer,
+            // instead of us overflowing the broadcast channel and dropping
+            // frames (which corrupts the rendered terminal until a redraw).
+            //
+            // We poll the flag rather than block on a condvar: it guarantees
+            // we re-check even if a wake is somehow missed, and it lets the
+            // `FLOW_MAX_PARK` backstop fire so a wedged/crashed client can
+            // never block the child forever. Exit detection is unaffected —
+            // the waiter thread reaps the child and emits `Exited`
+            // independently of this loop.
+            while read_flow_paused.load(Ordering::Relaxed) {
+                let since = *paused_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= FLOW_MAX_PARK {
+                    eprintln!(
+                        "[codemux::pty_daemon] session {read_session_id} flow-paused for \
+                         >{}s — force-resuming (client wedged or resume frame lost)",
+                        FLOW_MAX_PARK.as_secs()
+                    );
+                    read_flow_paused.store(false, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(FLOW_PARK_POLL);
+            }
+            paused_since = None;
+
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {

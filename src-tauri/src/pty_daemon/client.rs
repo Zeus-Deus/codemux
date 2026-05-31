@@ -421,6 +421,35 @@ impl PtyDaemonClient {
         }
     }
 
+    /// Pause or resume the daemon's read loop for a session (terminal output
+    /// flow control — see `ClientRequest::SetFlowPaused`). Best-effort: an
+    /// unknown session id (the session may have just exited) surfaces as a
+    /// `Daemon` error the caller is expected to log-and-ignore.
+    pub async fn set_flow_paused(
+        &self,
+        session_id: String,
+        paused: bool,
+    ) -> Result<(), PtyDaemonError> {
+        let id = self.next_id();
+        match self
+            .send_request(
+                ClientRequest::SetFlowPaused {
+                    request_id: id,
+                    session_id,
+                    paused,
+                },
+                id,
+            )
+            .await?
+        {
+            ServerResponse::FlowPaused { .. } => Ok(()),
+            ServerResponse::Error { message, .. } => Err(PtyDaemonError::Daemon(message)),
+            other => Err(PtyDaemonError::Daemon(format!(
+                "unexpected response to SetFlowPaused: {other:?}"
+            ))),
+        }
+    }
+
     pub async fn shutdown(&self) -> Result<(), PtyDaemonError> {
         let id = self.next_id();
         match self
@@ -447,6 +476,7 @@ fn response_request_id(resp: &ServerResponse) -> u64 {
         | ServerResponse::Closed { request_id }
         | ServerResponse::Listed { request_id, .. }
         | ServerResponse::ShuttingDown { request_id }
+        | ServerResponse::FlowPaused { request_id }
         | ServerResponse::Error { request_id, .. } => *request_id,
     }
 }
