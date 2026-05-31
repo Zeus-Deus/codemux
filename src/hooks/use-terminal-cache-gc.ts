@@ -1,4 +1,9 @@
 /**
+ * DISABLED — operates on an empty cache. The persistent terminal cache in
+ * `terminal-cache.ts` is not wired into the live app (see the banner there),
+ * so its Map is never populated and this GC pass is a no-op every tick. Kept
+ * wired in App.tsx alongside the cache for a possible future flag-gated revival.
+ *
  * Garbage-collect the module-level terminal cache.
  *
  * The xterm Terminal for a session lives in `terminal-cache.ts` for the
