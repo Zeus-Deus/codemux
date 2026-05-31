@@ -1708,7 +1708,11 @@ impl AppStateStore {
         let session_id = SessionId(next_id("session"));
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
-        let cwd = current_project_root().display().to_string();
+        let cwd = snapshot
+            .workspaces
+            .get(workspace_index)
+            .map(|w| w.cwd.clone())
+            .unwrap_or_else(|| current_project_root().display().to_string());
         let shell = env::var("SHELL").ok();
         let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
@@ -4657,6 +4661,45 @@ mod tests {
         assert_eq!(
             snapshot.active_workspace_id, prior_active,
             "Shell creation must not steal the active workspace slot",
+        );
+    }
+
+    #[test]
+    fn split_pane_inherits_workspace_cwd() {
+        // Shift+clicking a preset (or a plain split) opens a new pane
+        // in the same surface. The new terminal session must spawn in
+        // the workspace directory — not the app process's current dir,
+        // which is typically the home directory. Regression guard for
+        // the split-pane preset landing in $HOME instead of the
+        // workspace.
+        let store = AppStateStore::default();
+        let workspace_id =
+            store.create_workspace_at_path(PathBuf::from("/tmp/codemux-split-cwd-test"));
+
+        let active_pane_id = {
+            let snapshot = store.snapshot();
+            let workspace = workspace_by_id(&snapshot, &workspace_id);
+            let surface = workspace
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == workspace.active_surface_id)
+                .expect("workspace must have an active surface");
+            surface.active_pane_id.clone()
+        };
+
+        let new_session_id = store
+            .split_pane(&active_pane_id.0, SplitDirection::Horizontal)
+            .expect("split must succeed");
+
+        let snapshot = store.snapshot();
+        let session = snapshot
+            .terminal_sessions
+            .iter()
+            .find(|session| session.session_id == new_session_id)
+            .expect("split must create a terminal session");
+        assert_eq!(
+            session.cwd, "/tmp/codemux-split-cwd-test",
+            "split pane must inherit the workspace cwd, not the app's current dir",
         );
     }
 
