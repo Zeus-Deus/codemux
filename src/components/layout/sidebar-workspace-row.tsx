@@ -831,7 +831,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               <Button
                 variant="ghost"
                 size="icon-xs"
-                className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover/row:opacity-100 transition-opacity text-muted-foreground hover:text-foreground"
+                className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
                 onClick={(e) => { e.stopPropagation(); setShowRemoveDialog(true); }}
                 aria-label="Remove workspace"
               >
