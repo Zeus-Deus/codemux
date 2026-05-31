@@ -173,16 +173,6 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           >
             Open Browser
           </CommandItem>
-          <CommandItem
-            onSelect={() =>
-              run(() =>
-                ws &&
-                createTab(ws.workspace_id, "diff").catch(console.error),
-              )
-            }
-          >
-            Open Diff Viewer
-          </CommandItem>
         </CommandGroup>
 
         <CommandGroup heading="Search">
