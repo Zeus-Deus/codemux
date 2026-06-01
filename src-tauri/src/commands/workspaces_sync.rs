@@ -826,9 +826,24 @@ async fn adopt_worktree_via_repo_rsync(
             Some(branch.clone()),
         );
         // It's local right away (the files are already on disk) — clear
-        // host_id so panes spawn against the local pty-daemon.
-        app_state.set_workspace_host_id(&workspace_id.0, None)?;
-        db.link_workspace_sync_to_local(&server_id, &workspace_id.0)?;
+        // host_id so panes spawn against the local pty-daemon, and link
+        // the sync row. Roll back the just-created shell if EITHER
+        // mutation fails: otherwise the failure leaves an orphan shell
+        // (host_id maybe still set, row maybe unlinked) that the
+        // idempotency guard can't recover, and a retry would create a
+        // SECOND duplicate shell. Mirrors the single-dir adopt rollback.
+        if let Err(e) = app_state
+            .set_workspace_host_id(&workspace_id.0, None)
+            .and_then(|_| {
+                db.link_workspace_sync_to_local(&server_id, &workspace_id.0)
+            })
+        {
+            let _ = app_state.close_workspace(&workspace_id.0);
+            drop(app_state);
+            drop(db);
+            crate::state::emit_app_state(&app);
+            return Err(e);
+        }
         // Carry the daemon-derived project identity onto the adopted
         // workspace so it converges with its siblings and the upcoming
         // reconcile doesn't push a None uid back over the row (see the
@@ -1057,6 +1072,16 @@ pub async fn workspaces_adopt_via_clone(
     );
     // Clear host_id since this is a local clone (not a remote pull).
     app_state.set_workspace_host_id(&workspace_id.0, None)?;
+
+    // Stamp project identity from the freshly-cloned repo. Clone-adopt
+    // mints a NEW server_id (it doesn't link the sibling row), so the
+    // identity must be (re)derived locally — and because the clone has
+    // the same canonical git remote as its siblings, the deterministic
+    // UUIDv5 matches, so this independent copy still GROUPS/converges
+    // with them in the overview instead of rendering as a stray project
+    // (and being re-adopted as a duplicate). Recomputing from the local
+    // checkout mirrors every other create path.
+    app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
 
     // Nudge sync so the server learns about the new workspace.
     if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
