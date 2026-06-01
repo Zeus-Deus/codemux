@@ -276,6 +276,19 @@ pub fn workspaces_adoption_preview(
                 .map_or(true, |adopted| w.workspace_id.0 != adopted)
     });
 
+    // The set of workspace ids actually live in app_state right now.
+    // The same-branch conflict guard below intersects against this so
+    // a sync row still linked to a CLOSED workspace (its soft-delete
+    // hasn't purged yet, or was resurrected by a pull) is not mistaken
+    // for "you already have this branch open." Mirrors the liveness
+    // check the overview (`use-overview-items`) and the adopt
+    // idempotency path already apply.
+    let live_workspace_ids: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+
     let already_adopted_workspace_id = row.workspace_id.clone();
 
     // Cross-machine same-branch-same-project guard. The dialog uses
@@ -295,6 +308,7 @@ pub fn workspaces_adoption_preview(
     let same_branch_project_exists_at = detect_same_branch_project_conflict(
         &db,
         &row,
+        &live_workspace_ids,
     );
 
     Ok(AdoptionPreview {
@@ -323,9 +337,21 @@ pub fn workspaces_adoption_preview(
 /// repositories on this device with the same basename and the same
 /// branch, both with `project_path` recorded — extremely rare in
 /// practice.
+///
+/// `live_workspace_ids` is the set of workspace ids currently present
+/// in app_state. A sync row's `workspace_id` is only treated as "this
+/// device already has it" when that id is still live. Without this
+/// guard a row left linked to a CLOSED workspace — its soft-delete not
+/// yet purged, or resurrected by a `pull` from the server — would
+/// surface a phantom "you already have this branch open" conflict and
+/// block a legitimate re-pull. This matches the liveness filter the
+/// overview (`use-overview-items`) and the adopt idempotency path
+/// already apply, so the three surfaces agree on what counts as
+/// locally present.
 fn detect_same_branch_project_conflict(
     db: &DatabaseStore,
     previewed: &WorkspaceSyncRecord,
+    live_workspace_ids: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let previewed_branch = previewed.git_branch.as_deref()?;
     // Prefer the stable, deterministic project_uid when the previewed
@@ -351,6 +377,15 @@ fn detect_same_branch_project_conflict(
         let Some(local_wid) = r.workspace_id.as_deref() else {
             continue;
         };
+        // Skip rows whose linked workspace is no longer live in
+        // app_state. A non-null `workspace_id` alone doesn't mean the
+        // workspace still exists — it may have been closed/deleted with
+        // a stale sync row left behind. Treating such an orphan as a
+        // conflict is exactly the phantom "you already have this branch
+        // open" bug this guard must avoid.
+        if !live_workspace_ids.contains(local_wid) {
+            continue;
+        }
         // Don't flag the previewed row's own local copy.
         if previewed.workspace_id.as_deref() == Some(local_wid) {
             continue;
@@ -979,6 +1014,11 @@ mod tests {
     // deliberately basename-based because two devices almost never
     // store the same repo at the same absolute path.
 
+    /// Build the live-workspace-id set the guard intersects against.
+    fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
     fn insert_local(
         db: &DatabaseStore,
         workspace_id: &str,
@@ -1043,11 +1083,44 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        let hit = detect_same_branch_project_conflict(&db, &remote);
+        let hit = detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        );
         assert_eq!(
             hit.as_deref(),
             Some("workspace-local"),
             "matching basename + matching branch must surface the local workspace id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_orphan_closed_workspace() {
+        // Regression: the local row still references a workspace that
+        // was closed/deleted, so its id is NOT in app_state. Pulling
+        // the same branch back from a host must NOT be blocked by this
+        // stale link — the overview already hides such orphans, and
+        // this guard must agree instead of showing a phantom "you
+        // already have this branch open" message.
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-closed",
+            Some("/home/zeus/projects/my-repo"),
+            Some("main"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("main"),
+            None,
+        );
+        // Empty live set → the workspace is gone from app_state.
+        assert!(
+            detect_same_branch_project_conflict(&db, &remote, &live_set(&[]))
+                .is_none(),
+            "an orphaned sync row for a closed workspace must not flag as a conflict"
         );
     }
 
@@ -1068,7 +1141,12 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1086,7 +1164,12 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1109,7 +1192,12 @@ mod tests {
             Some("workspace-local"),
         );
         assert!(
-            detect_same_branch_project_conflict(&db, &remote).is_none(),
+            detect_same_branch_project_conflict(
+                &db,
+                &remote,
+                &live_set(&["workspace-local"]),
+            )
+            .is_none(),
             "the row's own adopted copy must not flag as a conflict"
         );
     }
@@ -1142,7 +1230,14 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        // Sibling row has no local workspace_id, so liveness is moot —
+        // pass it anyway to mirror the production call shape.
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1158,10 +1253,20 @@ mod tests {
         // Missing branch.
         let no_branch =
             make_remote_row(Some("/home/deus/projects/my-repo"), None, None);
-        assert!(detect_same_branch_project_conflict(&db, &no_branch).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_branch,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
         // Missing path.
         let no_path = make_remote_row(None, Some("feature/x"), None);
-        assert!(detect_same_branch_project_conflict(&db, &no_path).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_path,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 }
 
