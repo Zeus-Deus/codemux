@@ -192,7 +192,14 @@ never has to know about manifests, secrets, or systemd:
    drops a `.mcp.json` into the rsynced workspace directory pointing
    `codemux` at `codemux-remote mcp`. Any CLI agent (Claude Code,
    Codex, Gemini) launched in that directory on the host auto-discovers
-   Codemux as an MCP server with zero further config.
+   Codemux as an MCP server with zero further config. **Post-`v0.7.6`:**
+   `provision_workspace_mcp_config` writes an **absolute** command path —
+   it resolves the remote login user's `$HOME` over SSH
+   (`resolve_remote_home`) and substitutes it for the leading `~/`.
+   Previously it emitted the systemd `%h` specifier, which agent CLIs
+   can't expand, silently breaking remote MCP auto-discovery. This now
+   matches the absolute path `mcp_register` writes into the user-level
+   configs.
 4. **Workspace registration.** After rsync,
    `ssh::bootstrap::register_workspace_on_remote` runs `codemux-remote
    workspace register --path ... --name ... --branch ...` on the host
@@ -357,6 +364,15 @@ Returns a `TunnelHandle` whose `local_socket()` is the path the existing `PtyDae
 
 Reconnect cadence is the caller's job for now: a push-then-detach vs. an interactive session want different reconnect policies, so we don't bake one into the handle.
 
+### Failure-mode hardening (post-`v0.7.6`)
+
+A deep code audit plus a live SSH round-trip against a loopback host surfaced several lifecycle/correctness bugs in the transport, all off the happy path:
+
+- **Tunnel + daemon teardown on close.** Both close commands (`close_workspace` and `close_workspace_with_worktree` in `commands/workspace.rs`) now capture the workspace's `host_id` and call `ssh::forget_workspace_client` + `ssh::shutdown_supervisor` on close. Previously only the worktree-kind close had teardown — and even that landed in a later pass — so closing a pushed workspace leaked the `TunnelSupervisor` task, the bound local socket, and the remote pty-daemon for the app's lifetime. Unix-only, idempotent, no-op for local (`host_id IS NULL`) workspaces.
+- **`RemoteNotFound` classification.** `ssh::push::pull_workspace_back` used to string-match `"exit status 7"` to detect a missing remote path, but the formatted error is `"exit status: 7"` (with a colon), so the branch never fired and a missing remote dir was misreported as `HostUnreachable`. It now signals presence via a STDOUT sentinel (`CMX_REMOTE_DIR_OK` / `CMX_REMOTE_DIR_MISSING`) that doesn't depend on `ExitStatus`'s `Display` shape — which also restores the worktree-adopt cleanup that keys on `RemoteNotFound`.
+- **Shell-injection hardening.** `ssh_upload_executable` + `ssh_write_file` route `remote_path` through the tilde-aware `ssh::push::shell_escape` (preserves `~` expansion while single-quoting the body) instead of raw interpolation.
+- **Tunnel socket hash widened 12 → 16 hex chars** (`ssh/registry.rs`): the per-workspace tunnel socket hash truncated the `u64` to 12 hex (48-bit, birthday collisions ~2^24 workspaces); the full 16 hex (64-bit) stays well under the macOS `sun_path` limit.
+
 ## Settings → Hosts pane upgrade (in 2d)
 
 The pane built in 2a now uses the real probe + bootstrap:
@@ -371,6 +387,7 @@ The pane built in 2a now uses the real probe + bootstrap:
 - **SSH probe** (`src-tauri/src/ssh/probe.rs::tests`): 5 tests — argv construction (BatchMode + ConnectTimeout + StrictHostKeyChecking + target + command position), parsing reachable+installed, reachable+missing, unparseable version, empty payload.
 - **SSH bootstrap** (`src-tauri/src/ssh/bootstrap.rs::tests`): 3 tests — `target_for_uname` covers all four release targets including aliases (`amd64`, `arm64`), returns None for unsupported (FreeBSD/Windows/garbage), trims whitespace.
 - **SSH tunnel** (`src-tauri/src/ssh/tunnel.rs::tests`): 4 tests — required ssh flags locked in, `-L` forwarding spec contains both paths, remote command is the last arg, target comes before remote command.
+- **SSH round-trip** (`src-tauri/tests/codemux_ssh_roundtrip.rs`, post-`v0.7.6`): an env-gated (`CODEMUX_E2E_SSH_HOST`) real-host harness that drives a push / `--delete`-mirror / pull-back / `RemoteNotFound` / `.mcp.json`-absolute / tilde round-trip against an SSH target, encoding the `RemoteNotFound`, `.mcp.json`-absolute, and tilde-expansion regressions. Skips with a `SKIP:` message when the env var is unset, so CI stays green without a live host.
 
 All 22 new tests pass alongside the prior suite (1382 lib tests, 1721 frontend tests, no regressions; one pre-existing env-related lib failure unrelated to this change).
 
@@ -391,6 +408,7 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 
 - `src-tauri/src/state/state_impl.rs` — `WorkspaceSnapshot.host_id`, `set_workspace_host_id`.
 - `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`.
+- `src-tauri/src/commands/workspace.rs` — `close_workspace` / `close_workspace_with_worktree` capture `host_id` and tear down the tunnel supervisor + cached client on close (post-`v0.7.6`).
 - `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`, `workspace list` (reads the daemon SQLite directly for the host-inventory poller). Unix-only — Windows builds a no-op stub.
 - `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (12-tool catalog), `git.rs` (`worktree_create` + adoption worktree recreate), `config.rs` (state-dir resolution).
 - `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor + zero-touch provisioning of the `serve` daemon).
@@ -402,6 +420,7 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 - `Cargo.toml` — `[[bin]] codemux-remote`; embedded `axum`, `tower`, `rusqlite`, `portable-pty` for the headless daemon.
 - `scripts/codemux-remote.service.example` — sample systemd user unit (used both by manual install and `provision_serve`).
 - `src-tauri/tests/codemux_remote_serve_mcp.rs` — 8 end-to-end tests covering the full HTTP roundtrip, the MCP stdio roundtrip, auth required, singleton check, status JSON, missing-daemon error path, PTY echo.
+- `src-tauri/tests/codemux_ssh_roundtrip.rs` (post-`v0.7.6`) — env-gated (`CODEMUX_E2E_SSH_HOST`) real-host push / `--delete`-mirror / pull-back / `RemoteNotFound` / `.mcp.json`-absolute / tilde round-trip harness.
 
 ## Troubleshooting
 
