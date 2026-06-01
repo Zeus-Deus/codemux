@@ -1387,6 +1387,40 @@ impl AppStateStore {
         }
     }
 
+    /// Stamp a workspace's cross-device project identity directly from
+    /// known values (e.g. the synced row the workspace was adopted
+    /// from), WITHOUT recomputing the uid or touching `project_root`.
+    ///
+    /// Adoption uses this instead of `set_workspace_project_root`: the
+    /// synced row already carries the daemon-computed `project_uid`, so
+    /// copying it verbatim guarantees the adopted workspace converges
+    /// with its siblings on every device — including local-only repos,
+    /// whose path-derived uid would otherwise DIVERGE if recomputed
+    /// against the (different) local landing path. Without this stamp
+    /// the shell's `project_uid: None` also gets pushed back to the
+    /// sync row by `reconcile_from_snapshot` (a plain SET, not COALESCE),
+    /// actively wiping the row's identity.
+    pub fn set_workspace_project_identity(
+        &self,
+        workspace_id: &str,
+        project_uid: Option<String>,
+        workspace_kind: Option<String>,
+    ) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            if project_uid.is_some() {
+                workspace.project_uid = project_uid;
+            }
+            if workspace_kind.is_some() {
+                workspace.workspace_kind = workspace_kind;
+            }
+        }
+    }
+
     pub fn set_workspace_type(&self, workspace_id: &str, workspace_type: WorkspaceType) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -4639,6 +4673,50 @@ mod tests {
         assert!(
             workspace.tabs.is_empty(),
             "Shell must have no tabs",
+        );
+    }
+
+    #[test]
+    fn set_workspace_project_identity_stamps_uid_from_synced_row() {
+        // Adoption stamps the daemon-derived identity from the synced
+        // row (NOT a local recompute) so the adopted workspace converges
+        // with its siblings and the post-adopt reconcile doesn't push a
+        // None uid back over the row, wiping it.
+        let store = AppStateStore::default();
+        let wid = store.create_synced_workspace_shell(
+            "proj".into(),
+            7,
+            Some("/srv/proj".into()),
+            "/home/zeus/.codemux/worktrees/proj/main".into(),
+            Some("main".into()),
+        );
+        // Shell starts with no project_uid.
+        assert!(workspace_by_id(&store.snapshot(), &wid).project_uid.is_none());
+
+        store.set_workspace_project_identity(
+            &wid.0,
+            Some("daemon-uid-xyz".into()),
+            Some("main".into()),
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert_eq!(
+            w.project_uid.as_deref(),
+            Some("daemon-uid-xyz"),
+            "uid must be copied verbatim from the synced row",
+        );
+        assert_eq!(w.workspace_kind.as_deref(), Some("main"));
+
+        // A None passed in must NOT clobber an already-set value
+        // (older daemons send no uid — leave whatever's there).
+        store.set_workspace_project_identity(&wid.0, None, None);
+        assert_eq!(
+            workspace_by_id(&store.snapshot(), &wid)
+                .project_uid
+                .as_deref(),
+            Some("daemon-uid-xyz"),
+            "None must be a no-op, not a wipe",
         );
     }
 

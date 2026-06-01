@@ -471,7 +471,7 @@ pub async fn workspaces_adopt_synced(
     // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
     // State<'_> guard is dropped before we await anything (Tauri's
     // State is not Send across awaits).
-    let (workspace_id, worktree_path) = {
+    let (workspace_id, worktree_path, adopted_project_uid, adopted_kind) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> =
             app.state();
@@ -581,7 +581,12 @@ pub async fn workspaces_adopt_synced(
         // local entry instead of "lives on another device".
         db.link_workspace_sync_to_local(&server_id, &workspace_id_str)?;
 
-        (workspace_id_str, worktree_path)
+        (
+            workspace_id_str,
+            worktree_path,
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
+        )
     };
 
     // Step 8: drive the existing pull-back machinery. `_impl` takes
@@ -593,6 +598,48 @@ pub async fn workspaces_adopt_synced(
         workspace_id.clone(),
     )
     .await?;
+
+    // CRITICAL: `workspace_pull_back_impl` reports rsync/SSH failure as
+    // `Ok(WorkspacePullOutcome { ok: false, .. })`, NOT `Err`. The `?`
+    // above only unwraps the OUTER Result, so a failed pull would
+    // otherwise fall straight through to the success `Ok(AdoptOutcome)`
+    // below — the user sees a "Pulled!" toast while an empty/broken
+    // shell sits linked with `host_id` still set, and the idempotency
+    // guard at the top then refuses every retry ("already adopted").
+    // Roll the optimistic shell + link back so the row reverts to a
+    // re-pullable sibling and surface the failure as a real error.
+    if !pull_outcome.ok {
+        {
+            let app_state: tauri::State<'_, crate::state::AppStateStore> =
+                app.state();
+            let db: tauri::State<'_, DatabaseStore> = app.state();
+            // Remove the half-created shell (it has no PTY sessions yet,
+            // so this is a clean no-side-effect removal).
+            let _ = app_state.close_workspace(&workspace_id);
+            // Revert the row to a sibling/remote-only row (workspace_id
+            // NULL) so reconcile doesn't tombstone it and the overview
+            // keeps offering "Pull to this device".
+            let _ = db.unlink_workspace_sync_from_local(&server_id);
+        }
+        crate::state::emit_app_state(&app);
+        return Err(pull_outcome.message);
+    }
+
+    // Stamp the adopted workspace's cross-device identity from the synced
+    // row BEFORE the post-adopt reconcile/push runs. The shell was created
+    // with `project_uid: None`; without this, `reconcile_from_snapshot`
+    // (a plain SET) would push that None straight back to the row and WIPE
+    // the daemon-derived uid, so the adopted copy would stop converging
+    // with its siblings and could be re-adopted as a duplicate.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+        app_state.set_workspace_project_identity(
+            &workspace_id,
+            adopted_project_uid,
+            adopted_kind,
+        );
+    }
 
     // Step 9: nudge the reconcile so the server learns the workspace
     // is now also on this device. Failures here are non-fatal — the
@@ -636,7 +683,15 @@ async fn adopt_worktree_via_repo_rsync(
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
     // ── resolve row + host + paths (no awaits) ──
-    let (host, remote_repo_path, local_project_path, branch, title) = {
+    let (
+        host,
+        remote_repo_path,
+        local_project_path,
+        branch,
+        title,
+        adopted_project_uid,
+        adopted_kind,
+    ) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
 
@@ -708,6 +763,8 @@ async fn adopt_worktree_via_repo_rsync(
             local_project_path,
             branch,
             row.title.clone(),
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
         )
     };
 
@@ -772,6 +829,15 @@ async fn adopt_worktree_via_repo_rsync(
         // host_id so panes spawn against the local pty-daemon.
         app_state.set_workspace_host_id(&workspace_id.0, None)?;
         db.link_workspace_sync_to_local(&server_id, &workspace_id.0)?;
+        // Carry the daemon-derived project identity onto the adopted
+        // workspace so it converges with its siblings and the upcoming
+        // reconcile doesn't push a None uid back over the row (see the
+        // single-dir adopt path for the full rationale).
+        app_state.set_workspace_project_identity(
+            &workspace_id.0,
+            adopted_project_uid,
+            adopted_kind,
+        );
         drop(app_state);
         drop(db);
 
@@ -793,7 +859,15 @@ async fn adopt_worktree_via_repo_rsync(
     }
     #[cfg(not(unix))]
     {
-        let _ = (host, remote_repo_path, local_project_path, branch, title);
+        let _ = (
+            host,
+            remote_repo_path,
+            local_project_path,
+            branch,
+            title,
+            adopted_project_uid,
+            adopted_kind,
+        );
         Err("SSH transport is Unix-only for now.".into())
     }
 }
