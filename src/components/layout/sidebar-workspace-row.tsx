@@ -764,7 +764,13 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   )}
 
                   {hasAheadBehind && (
-                    <span className="flex items-center gap-1 shrink-0 tabular-nums">
+                    <span className={cn(
+                      "flex items-center gap-1 shrink-0 tabular-nums",
+                      // Fade out with the diff stats on hover so the issue
+                      // chip never collides with the ahead/behind glyphs as
+                      // it slides left to clear the X button.
+                      canDelete && "transition-opacity group-hover/row:opacity-0",
+                    )}>
                       {workspace.git_behind > 0 && (
                         <span className="text-warning/80">↓{workspace.git_behind}</span>
                       )}
@@ -797,8 +803,21 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                       a PR number. */}
                   {(workspace.linked_issue || workspace.notifications_muted) && (
                     <div className={cn(
-                      "flex items-center gap-1 shrink-0",
+                      "flex items-center gap-1 shrink-0 rounded-md px-1",
                       !hasDiff && "ml-auto",
+                      // The hover-reveal remove (X) button is pinned at the
+                      // right edge and overlays this slot. Unlike the diff
+                      // stats / notification badge (which fade out on hover),
+                      // the linked-issue badge is interactive, so instead of
+                      // hiding it we slide the cluster left by the X button's
+                      // footprint (size-6 + right-2 ≈ 32px) so the issue stays
+                      // visible and clickable while the X gets a clear slot.
+                      // On hover it also gains an opaque chip (bg-muted +
+                      // shadow, mirroring the X button) so it reads as a
+                      // distinct pill sitting cleanly over the branch name it
+                      // now overlaps, instead of colliding glyph-on-glyph.
+                      canDelete &&
+                        "transition-all group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
                     )}>
                       {workspace.notifications_muted && (
                         <Tooltip>
