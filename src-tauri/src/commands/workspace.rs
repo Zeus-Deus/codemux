@@ -660,7 +660,7 @@ pub(crate) async fn close_workspace_with_worktree_impl(
     // Worktree metadata still needs a pre-close snapshot for teardown +
     // MCP cleanup. Session IDs come from `state.close_workspace`'s result
     // below — no TOCTOU race with concurrent pane creation.
-    let (worktree_path, branch, ws_title) = {
+    let (worktree_path, branch, ws_title, ws_host_id) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
@@ -670,6 +670,7 @@ pub(crate) async fn close_workspace_with_worktree_impl(
             ws.and_then(|w| w.worktree_path.clone()),
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
+            ws.and_then(|w| w.host_id),
         )
     };
 
@@ -695,6 +696,23 @@ pub(crate) async fn close_workspace_with_worktree_impl(
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    // Tear down the SSH tunnel + cached remote client for a workspace
+    // that was pushed to a host. Without this, closing a remote
+    // workspace leaks the `TunnelSupervisor` task, the bound local
+    // socket, and the remote `codemux-remote pty-daemon` for the rest
+    // of the app's lifetime — the only other teardown site is
+    // pull-back (commands/hosts.rs). Order matches pull-back: forget the
+    // cached client (it holds the socket) BEFORE shutting down the
+    // supervisor that unbinds it. No-op for local workspaces and
+    // idempotent when no supervisor was ever registered.
+    #[cfg(unix)]
+    if ws_host_id.is_some() {
+        crate::ssh::forget_workspace_client(&workspace_id).await;
+        crate::ssh::shutdown_supervisor(&workspace_id).await;
+    }
+    #[cfg(not(unix))]
+    let _ = ws_host_id;
 
     // Reconcile the sync mirror BEFORE the optimistic emit so the
     // workspaces overview sees the soft-delete in the same tick that
@@ -951,13 +969,16 @@ pub async fn close_workspace(
     // We still need cwd + title for teardown + MCP cleanup before the
     // state mutation. Session IDs are now obtained from
     // `state.close_workspace`'s result below — no snapshot race.
-    let workspace_cwd = {
+    let (workspace_cwd, ws_host_id) = {
         let snapshot = state.snapshot();
-        snapshot
+        let ws = snapshot
             .workspaces
             .iter()
-            .find(|w| w.workspace_id.0 == workspace_id)
-            .map(|w| (w.cwd.clone(), w.title.clone()))
+            .find(|w| w.workspace_id.0 == workspace_id);
+        (
+            ws.map(|w| (w.cwd.clone(), w.title.clone())),
+            ws.and_then(|w| w.host_id),
+        )
     };
 
     // Run teardown scripts before closing
@@ -999,6 +1020,21 @@ pub async fn close_workspace(
     }
 
     let result = state.close_workspace(&workspace_id)?;
+
+    // Tear down the SSH tunnel + cached client for a workspace that was
+    // pushed to a host. This is the sibling of the teardown in
+    // `close_workspace_with_worktree_impl` — a PLAIN (non-worktree)
+    // pushed workspace gets `host_id` set (push falls back to its cwd)
+    // and the sidebar routes its close through THIS command, so without
+    // this it would leak the tunnel supervisor + remote pty-daemon.
+    // Idempotent + no-op for local workspaces.
+    #[cfg(unix)]
+    if ws_host_id.is_some() {
+        crate::ssh::forget_workspace_client(&workspace_id).await;
+        crate::ssh::shutdown_supervisor(&workspace_id).await;
+    }
+    #[cfg(not(unix))]
+    let _ = ws_host_id;
 
     // Reconcile the sync mirror BEFORE the optimistic emit — see the
     // matching block in `close_workspace_with_worktree_impl` for the

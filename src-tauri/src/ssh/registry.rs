@@ -102,7 +102,10 @@ pub fn local_socket_for_workspace(workspace_id: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     workspace_id.hash(&mut hasher);
     let short = format!("{:x}", hasher.finish());
-    let truncated = &short[..short.len().min(12)];
+    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
+    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
+    // under the 104-byte macOS sun_path limit (see the test below).
+    let truncated = &short[..short.len().min(16)];
     std::env::temp_dir().join(format!("codemux-tunnel-{truncated}.sock"))
 }
 
@@ -117,7 +120,10 @@ pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
     let mut hasher = DefaultHasher::new();
     workspace_id.hash(&mut hasher);
     let short = format!("{:x}", hasher.finish());
-    let truncated = &short[..short.len().min(12)];
+    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
+    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
+    // under the 104-byte macOS sun_path limit (see the test below).
+    let truncated = &short[..short.len().min(16)];
     format!("/tmp/codemux-ptyd-{truncated}.sock")
 }
 

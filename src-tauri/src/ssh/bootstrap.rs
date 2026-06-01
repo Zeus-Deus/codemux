@@ -526,7 +526,21 @@ pub async fn provision_workspace_mcp_config(
     // name. The "codemux" key here matches the desktop's per-workspace
     // entry so users get a consistent tool name whether they're on
     // their laptop or on a pushed host.
-    let exec_path = remote_install_path.replacen('~', "%h", 1);
+    // The `.mcp.json` "command" must be an ABSOLUTE path. Agent CLIs
+    // (Claude Code, Codex, …) spawn this command directly — they do NOT
+    // run it through a shell (so `~` is not expanded) and they certainly
+    // don't expand the systemd `%h` specifier. The previous `%h`
+    // rewrite produced a literal `%h/.local/bin/codemux-remote` that no
+    // agent could exec, silently breaking remote MCP auto-discovery.
+    // Resolve the remote $HOME and emit an absolute path, matching the
+    // user-level config `codemux-remote serve` writes via mcp_register
+    // (which uses the daemon's absolute `current_exe()`).
+    let exec_path = if let Some(rest) = remote_install_path.strip_prefix("~/") {
+        let home = resolve_remote_home(ssh_target, deadline).await?;
+        format!("{}/{}", home.trim_end_matches('/'), rest)
+    } else {
+        remote_install_path.to_string()
+    };
     let content = serde_json::to_string_pretty(&serde_json::json!({
         "mcpServers": {
             "codemux": {
@@ -584,12 +598,17 @@ async fn ssh_upload_executable(
     // 0700 before the rename. `mv -f` overwrites whatever was at the
     // destination — important when a stale older binary from a
     // previous Codemux install is sitting there.
+    // Tilde-aware shell quoting: preserves a leading `~/` (so the
+    // remote shell still expands it to $HOME) while single-quoting the
+    // rest, closing any shell-injection surface if a future caller ever
+    // passes a path with metacharacters. Today's callers pass a
+    // hardcoded path, so this is defense-in-depth.
+    let p = crate::ssh::push::shell_escape(remote_path);
     let script = format!(
         "umask 077 && mkdir -p \"$(dirname {p})\" && \
          cat > {p}.tmp && \
          chmod +x {p}.tmp && \
-         mv -f {p}.tmp {p}",
-        p = remote_path
+         mv -f {p}.tmp {p}"
     );
 
     let mut child = Command::new("ssh")
@@ -629,6 +648,44 @@ async fn ssh_upload_executable(
     Ok(())
 }
 
+/// Resolve the remote login user's absolute `$HOME` over SSH. Used to
+/// turn a `~/…`-relative install path into the absolute path agent CLIs
+/// need in `.mcp.json` (they spawn the command directly, with no shell
+/// or systemd token expansion). `printf %s` avoids a trailing newline.
+async fn resolve_remote_home(
+    ssh_target: &str,
+    deadline: Duration,
+) -> Result<String, String> {
+    let out = timeout(
+        deadline,
+        Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg(ssh_target)
+            .arg("printf %s \"$HOME\"")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| "resolving remote $HOME timed out".to_string())?
+    .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "could not resolve remote $HOME: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let home = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if home.is_empty() {
+        return Err("remote $HOME resolved to empty".to_string());
+    }
+    Ok(home)
+}
+
 /// `ssh <target> 'umask 077; mkdir -p <dir>; cat > <path>'` with
 /// `content` streamed over stdin so a secret never appears in an
 /// argv the host's process list could expose.
@@ -646,10 +703,13 @@ async fn ssh_write_file(
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg(ssh_target)
-        .arg(format!(
-            "umask 077 && mkdir -p \"$(dirname {p})\" && cat > {p}",
-            p = remote_path
-        ))
+        .arg({
+            // Tilde-aware shell quoting (see ssh_upload_executable):
+            // keeps `~/` expandable, quotes the body, neutralizes any
+            // metacharacters in a future caller's path.
+            let p = crate::ssh::push::shell_escape(remote_path);
+            format!("umask 077 && mkdir -p \"$(dirname {p})\" && cat > {p}")
+        })
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

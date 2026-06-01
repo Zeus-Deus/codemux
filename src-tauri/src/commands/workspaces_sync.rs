@@ -276,6 +276,19 @@ pub fn workspaces_adoption_preview(
                 .map_or(true, |adopted| w.workspace_id.0 != adopted)
     });
 
+    // The set of workspace ids actually live in app_state right now.
+    // The same-branch conflict guard below intersects against this so
+    // a sync row still linked to a CLOSED workspace (its soft-delete
+    // hasn't purged yet, or was resurrected by a pull) is not mistaken
+    // for "you already have this branch open." Mirrors the liveness
+    // check the overview (`use-overview-items`) and the adopt
+    // idempotency path already apply.
+    let live_workspace_ids: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+
     let already_adopted_workspace_id = row.workspace_id.clone();
 
     // Cross-machine same-branch-same-project guard. The dialog uses
@@ -295,6 +308,7 @@ pub fn workspaces_adoption_preview(
     let same_branch_project_exists_at = detect_same_branch_project_conflict(
         &db,
         &row,
+        &live_workspace_ids,
     );
 
     Ok(AdoptionPreview {
@@ -323,9 +337,21 @@ pub fn workspaces_adoption_preview(
 /// repositories on this device with the same basename and the same
 /// branch, both with `project_path` recorded — extremely rare in
 /// practice.
+///
+/// `live_workspace_ids` is the set of workspace ids currently present
+/// in app_state. A sync row's `workspace_id` is only treated as "this
+/// device already has it" when that id is still live. Without this
+/// guard a row left linked to a CLOSED workspace — its soft-delete not
+/// yet purged, or resurrected by a `pull` from the server — would
+/// surface a phantom "you already have this branch open" conflict and
+/// block a legitimate re-pull. This matches the liveness filter the
+/// overview (`use-overview-items`) and the adopt idempotency path
+/// already apply, so the three surfaces agree on what counts as
+/// locally present.
 fn detect_same_branch_project_conflict(
     db: &DatabaseStore,
     previewed: &WorkspaceSyncRecord,
+    live_workspace_ids: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let previewed_branch = previewed.git_branch.as_deref()?;
     // Prefer the stable, deterministic project_uid when the previewed
@@ -351,6 +377,15 @@ fn detect_same_branch_project_conflict(
         let Some(local_wid) = r.workspace_id.as_deref() else {
             continue;
         };
+        // Skip rows whose linked workspace is no longer live in
+        // app_state. A non-null `workspace_id` alone doesn't mean the
+        // workspace still exists — it may have been closed/deleted with
+        // a stale sync row left behind. Treating such an orphan as a
+        // conflict is exactly the phantom "you already have this branch
+        // open" bug this guard must avoid.
+        if !live_workspace_ids.contains(local_wid) {
+            continue;
+        }
         // Don't flag the previewed row's own local copy.
         if previewed.workspace_id.as_deref() == Some(local_wid) {
             continue;
@@ -436,7 +471,7 @@ pub async fn workspaces_adopt_synced(
     // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
     // State<'_> guard is dropped before we await anything (Tauri's
     // State is not Send across awaits).
-    let (workspace_id, worktree_path) = {
+    let (workspace_id, worktree_path, adopted_project_uid, adopted_kind) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> =
             app.state();
@@ -546,7 +581,12 @@ pub async fn workspaces_adopt_synced(
         // local entry instead of "lives on another device".
         db.link_workspace_sync_to_local(&server_id, &workspace_id_str)?;
 
-        (workspace_id_str, worktree_path)
+        (
+            workspace_id_str,
+            worktree_path,
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
+        )
     };
 
     // Step 8: drive the existing pull-back machinery. `_impl` takes
@@ -558,6 +598,48 @@ pub async fn workspaces_adopt_synced(
         workspace_id.clone(),
     )
     .await?;
+
+    // CRITICAL: `workspace_pull_back_impl` reports rsync/SSH failure as
+    // `Ok(WorkspacePullOutcome { ok: false, .. })`, NOT `Err`. The `?`
+    // above only unwraps the OUTER Result, so a failed pull would
+    // otherwise fall straight through to the success `Ok(AdoptOutcome)`
+    // below — the user sees a "Pulled!" toast while an empty/broken
+    // shell sits linked with `host_id` still set, and the idempotency
+    // guard at the top then refuses every retry ("already adopted").
+    // Roll the optimistic shell + link back so the row reverts to a
+    // re-pullable sibling and surface the failure as a real error.
+    if !pull_outcome.ok {
+        {
+            let app_state: tauri::State<'_, crate::state::AppStateStore> =
+                app.state();
+            let db: tauri::State<'_, DatabaseStore> = app.state();
+            // Remove the half-created shell (it has no PTY sessions yet,
+            // so this is a clean no-side-effect removal).
+            let _ = app_state.close_workspace(&workspace_id);
+            // Revert the row to a sibling/remote-only row (workspace_id
+            // NULL) so reconcile doesn't tombstone it and the overview
+            // keeps offering "Pull to this device".
+            let _ = db.unlink_workspace_sync_from_local(&server_id);
+        }
+        crate::state::emit_app_state(&app);
+        return Err(pull_outcome.message);
+    }
+
+    // Stamp the adopted workspace's cross-device identity from the synced
+    // row BEFORE the post-adopt reconcile/push runs. The shell was created
+    // with `project_uid: None`; without this, `reconcile_from_snapshot`
+    // (a plain SET) would push that None straight back to the row and WIPE
+    // the daemon-derived uid, so the adopted copy would stop converging
+    // with its siblings and could be re-adopted as a duplicate.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+        app_state.set_workspace_project_identity(
+            &workspace_id,
+            adopted_project_uid,
+            adopted_kind,
+        );
+    }
 
     // Step 9: nudge the reconcile so the server learns the workspace
     // is now also on this device. Failures here are non-fatal — the
@@ -601,7 +683,15 @@ async fn adopt_worktree_via_repo_rsync(
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
     // ── resolve row + host + paths (no awaits) ──
-    let (host, remote_repo_path, local_project_path, branch, title) = {
+    let (
+        host,
+        remote_repo_path,
+        local_project_path,
+        branch,
+        title,
+        adopted_project_uid,
+        adopted_kind,
+    ) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
 
@@ -673,6 +763,8 @@ async fn adopt_worktree_via_repo_rsync(
             local_project_path,
             branch,
             row.title.clone(),
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
         )
     };
 
@@ -734,9 +826,33 @@ async fn adopt_worktree_via_repo_rsync(
             Some(branch.clone()),
         );
         // It's local right away (the files are already on disk) — clear
-        // host_id so panes spawn against the local pty-daemon.
-        app_state.set_workspace_host_id(&workspace_id.0, None)?;
-        db.link_workspace_sync_to_local(&server_id, &workspace_id.0)?;
+        // host_id so panes spawn against the local pty-daemon, and link
+        // the sync row. Roll back the just-created shell if EITHER
+        // mutation fails: otherwise the failure leaves an orphan shell
+        // (host_id maybe still set, row maybe unlinked) that the
+        // idempotency guard can't recover, and a retry would create a
+        // SECOND duplicate shell. Mirrors the single-dir adopt rollback.
+        if let Err(e) = app_state
+            .set_workspace_host_id(&workspace_id.0, None)
+            .and_then(|_| {
+                db.link_workspace_sync_to_local(&server_id, &workspace_id.0)
+            })
+        {
+            let _ = app_state.close_workspace(&workspace_id.0);
+            drop(app_state);
+            drop(db);
+            crate::state::emit_app_state(&app);
+            return Err(e);
+        }
+        // Carry the daemon-derived project identity onto the adopted
+        // workspace so it converges with its siblings and the upcoming
+        // reconcile doesn't push a None uid back over the row (see the
+        // single-dir adopt path for the full rationale).
+        app_state.set_workspace_project_identity(
+            &workspace_id.0,
+            adopted_project_uid,
+            adopted_kind,
+        );
         drop(app_state);
         drop(db);
 
@@ -758,7 +874,15 @@ async fn adopt_worktree_via_repo_rsync(
     }
     #[cfg(not(unix))]
     {
-        let _ = (host, remote_repo_path, local_project_path, branch, title);
+        let _ = (
+            host,
+            remote_repo_path,
+            local_project_path,
+            branch,
+            title,
+            adopted_project_uid,
+            adopted_kind,
+        );
         Err("SSH transport is Unix-only for now.".into())
     }
 }
@@ -949,6 +1073,16 @@ pub async fn workspaces_adopt_via_clone(
     // Clear host_id since this is a local clone (not a remote pull).
     app_state.set_workspace_host_id(&workspace_id.0, None)?;
 
+    // Stamp project identity from the freshly-cloned repo. Clone-adopt
+    // mints a NEW server_id (it doesn't link the sibling row), so the
+    // identity must be (re)derived locally — and because the clone has
+    // the same canonical git remote as its siblings, the deterministic
+    // UUIDv5 matches, so this independent copy still GROUPS/converges
+    // with them in the overview instead of rendering as a stray project
+    // (and being re-adopted as a duplicate). Recomputing from the local
+    // checkout mirrors every other create path.
+    app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
+
     // Nudge sync so the server learns about the new workspace.
     if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
         eprintln!(
@@ -978,6 +1112,11 @@ mod tests {
     // doing locally on the same branch" check. The detection is
     // deliberately basename-based because two devices almost never
     // store the same repo at the same absolute path.
+
+    /// Build the live-workspace-id set the guard intersects against.
+    fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
 
     fn insert_local(
         db: &DatabaseStore,
@@ -1043,11 +1182,44 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        let hit = detect_same_branch_project_conflict(&db, &remote);
+        let hit = detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        );
         assert_eq!(
             hit.as_deref(),
             Some("workspace-local"),
             "matching basename + matching branch must surface the local workspace id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_orphan_closed_workspace() {
+        // Regression: the local row still references a workspace that
+        // was closed/deleted, so its id is NOT in app_state. Pulling
+        // the same branch back from a host must NOT be blocked by this
+        // stale link — the overview already hides such orphans, and
+        // this guard must agree instead of showing a phantom "you
+        // already have this branch open" message.
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-closed",
+            Some("/home/zeus/projects/my-repo"),
+            Some("main"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("main"),
+            None,
+        );
+        // Empty live set → the workspace is gone from app_state.
+        assert!(
+            detect_same_branch_project_conflict(&db, &remote, &live_set(&[]))
+                .is_none(),
+            "an orphaned sync row for a closed workspace must not flag as a conflict"
         );
     }
 
@@ -1068,7 +1240,12 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1086,7 +1263,12 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1109,7 +1291,12 @@ mod tests {
             Some("workspace-local"),
         );
         assert!(
-            detect_same_branch_project_conflict(&db, &remote).is_none(),
+            detect_same_branch_project_conflict(
+                &db,
+                &remote,
+                &live_set(&["workspace-local"]),
+            )
+            .is_none(),
             "the row's own adopted copy must not flag as a conflict"
         );
     }
@@ -1142,7 +1329,14 @@ mod tests {
             Some("feature/x"),
             None,
         );
-        assert!(detect_same_branch_project_conflict(&db, &remote).is_none());
+        // Sibling row has no local workspace_id, so liveness is moot —
+        // pass it anyway to mirror the production call shape.
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1158,10 +1352,20 @@ mod tests {
         // Missing branch.
         let no_branch =
             make_remote_row(Some("/home/deus/projects/my-repo"), None, None);
-        assert!(detect_same_branch_project_conflict(&db, &no_branch).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_branch,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
         // Missing path.
         let no_path = make_remote_row(None, Some("feature/x"), None);
-        assert!(detect_same_branch_project_conflict(&db, &no_path).is_none());
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_path,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
     }
 }
 

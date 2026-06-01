@@ -770,6 +770,76 @@ mod tests {
         assert_eq!(listed[0].workspace_id.as_deref(), Some("workspace-42"));
     }
 
+    #[test]
+    #[serial]
+    fn unlink_reverts_adopted_row_to_remote_only() {
+        // Adoption-failure rollback: after linking a row to a local
+        // shell, if the pull fails we must REVERT the row to a sibling
+        // (workspace_id NULL) so reconcile doesn't tombstone it and the
+        // overview keeps offering "Pull to this device".
+        let db = fresh_db();
+        db.upsert_workspace_sync_from_server(
+            "300",
+            "discovered",
+            Some("12"),
+            None,
+            None,
+            None,
+            None,
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:00:00",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.link_workspace_sync_to_local("300", "workspace-42").unwrap();
+        assert_eq!(
+            db.list_workspaces_sync()[0].workspace_id.as_deref(),
+            Some("workspace-42")
+        );
+
+        db.unlink_workspace_sync_from_local("300").unwrap();
+        let listed = db.list_workspaces_sync();
+        assert!(
+            listed[0].workspace_id.is_none(),
+            "unlink must revert the row to a remote-only sibling"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn find_by_host_and_origin_uid_excludes_soft_deleted() {
+        // Contract: the live-row lookup must not return a tombstone — a
+        // future production caller expecting "live" semantics would
+        // otherwise reintroduce the resurrection class of bug. The
+        // dedicated `find_remote_discovered_tombstone` is the only path
+        // that may see soft-deleted rows.
+        let db = fresh_db();
+        let row = db
+            .insert_remote_discovered_workspace_sync(
+                "host-1", "uuid-abc", "ws", None, None, Some("main"), None, None,
+                None,
+            )
+            .unwrap();
+        assert!(db
+            .find_workspace_sync_by_host_and_origin_uid("host-1", "uuid-abc")
+            .is_some());
+
+        db.soft_delete_remote_discovered_workspace_sync_by_id(row.id)
+            .unwrap();
+        assert!(
+            db.find_workspace_sync_by_host_and_origin_uid("host-1", "uuid-abc")
+                .is_none(),
+            "live lookup must not surface a soft-deleted row"
+        );
+        assert!(
+            db.find_remote_discovered_tombstone("host-1", "uuid-abc")
+                .is_some(),
+            "the tombstone lookup still finds it (for undelete-on-reappear)"
+        );
+    }
+
     // ── reconcile_from_snapshot regression guards ───────────────
     //
     // These exercise the full reconcile bridge, not just the DB

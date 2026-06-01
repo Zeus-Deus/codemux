@@ -1264,6 +1264,32 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Revert a sync row back to a sibling/remote-only row by clearing
+    /// its local `workspace_id` link (set NULL). Used to ROLL BACK an
+    /// optimistic adoption whose pull failed: the row must become a
+    /// re-pullable sibling again rather than stay linked to a shell
+    /// that was torn down — otherwise `reconcile_from_snapshot` would
+    /// see a linked row with no live workspace and soft-delete
+    /// (tombstone) it, making the workspace vanish from the overview
+    /// instead of staying available to retry. We deliberately do NOT
+    /// mark the row dirty: clearing a local-only link is not a change
+    /// the cloud needs to hear about (the row's server_id/identity is
+    /// unchanged), and the next inventory poll keeps it fresh.
+    pub fn unlink_workspace_sync_from_local(
+        &self,
+        server_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET workspace_id = NULL, updated_at = datetime('now')
+             WHERE user_id = 'local' AND server_id = ?1",
+            params![server_id],
+        )
+        .map_err(|e| format!("Failed to unlink workspace sync row: {e}"))?;
+        Ok(())
+    }
+
     // ── Host-inventory auto-publish helpers ─────────────────────────
     //
     // The desktop's host-inventory poller (see `hosts_inventory.rs`)
@@ -1317,6 +1343,7 @@ impl DatabaseStore {
                  WHERE user_id = 'local'
                    AND host_server_id = ?1
                    AND origin_uid = ?2
+                   AND deleted_at IS NULL
                  LIMIT 1",
             )
             .ok()?;
@@ -1416,6 +1443,90 @@ impl DatabaseStore {
             ],
         )
         .map_err(|e| format!("Failed to update remote-discovered row: {e}"))?;
+        Ok(())
+    }
+
+    /// Find a remote-discovered row for `(host_server_id, origin_uid)`
+    /// that is SOFT-DELETED (a tombstone). Used only by the inventory
+    /// reconcile's undelete-on-reappear path: when a host workspace that
+    /// was previously adopted-then-closed (its row tombstoned by the
+    /// close-path reconcile) shows up again in a fresh poll, we resurrect
+    /// the SAME row instead of inserting a duplicate — so the cloud
+    /// `server_id` (cross-device identity) survives the close/reopen
+    /// round-trip and other devices don't see the workspace vanish then
+    /// reappear as a brand-new row. If multiple tombstones exist, the
+    /// most recent by id wins.
+    pub fn find_remote_discovered_tombstone(
+        &self,
+        host_server_id: &str,
+        origin_uid: &str,
+    ) -> Option<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, server_id, workspace_id, title, host_server_id,
+                        project_path, project_remote, git_branch, git_head_sha,
+                        created_at, updated_at, deleted_at, dirty, origin_uid,
+                        project_uid, workspace_kind, origin_path
+                 FROM workspaces_sync
+                 WHERE user_id = 'local'
+                   AND host_server_id = ?1
+                   AND origin_uid = ?2
+                   AND deleted_at IS NOT NULL
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row(params![host_server_id, origin_uid], row_to_workspace_sync)
+            .ok()
+    }
+
+    /// Resurrect a soft-deleted remote-discovered row (matched by primary
+    /// `id`): clear `deleted_at`, ALSO clear any stale `workspace_id`
+    /// link, refresh the mutable fields from the latest inventory, and
+    /// mark `dirty=1`.
+    ///
+    /// Clearing `workspace_id` is essential: the tombstone may have been
+    /// created by closing an *adopted* workspace, so it still points at a
+    /// local id that no longer exists. Reviving that link would recreate
+    /// the exact "linked row with no live workspace" orphan that produces
+    /// the phantom "you already have this branch open" pull-conflict. A
+    /// resurrected row must be a clean, re-pullable sibling
+    /// (`workspace_id IS NULL`). Marking dirty makes the next push re-assert
+    /// the row to the cloud as a PATCH on the surviving `server_id` rather
+    /// than a churny DELETE-then-POST.
+    pub fn undelete_remote_discovered_workspace_sync(
+        &self,
+        id: i64,
+        title: &str,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+        origin_path: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET deleted_at = NULL, workspace_id = NULL,
+                 title = ?1, project_path = ?2, project_remote = ?3,
+                 git_branch = ?4, project_uid = ?5, workspace_kind = ?6,
+                 origin_path = ?8,
+                 updated_at = datetime('now'), dirty = 1
+             WHERE id = ?7",
+            params![
+                title,
+                project_path,
+                project_remote,
+                git_branch,
+                project_uid,
+                workspace_kind,
+                id,
+                origin_path,
+            ],
+        )
+        .map_err(|e| format!("Failed to undelete remote-discovered row: {e}"))?;
         Ok(())
     }
 

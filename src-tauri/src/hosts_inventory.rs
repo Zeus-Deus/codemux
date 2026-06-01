@@ -359,7 +359,14 @@ pub fn reconcile_host_inventory(
 
     let mut seen_uids: HashSet<String> = HashSet::new();
     for ws in &inventory.workspaces {
-        seen_uids.insert(ws.id.clone());
+        // Guard against a single inventory envelope listing the same id
+        // twice: `local_by_uid` is built once before the loop and never
+        // updated, so without this a duplicate id would INSERT a second
+        // row (it misses the live map on the second pass). `insert`
+        // returns false when the id was already present this envelope.
+        if !seen_uids.insert(ws.id.clone()) {
+            continue;
+        }
 
         // We use `project_root` (the originating repo root on the
         // host) as a `project_path` analog — it's the closest the
@@ -425,6 +432,32 @@ pub fn reconcile_host_inventory(
                 }
                 stats.updated += 1;
             }
+        } else if let Some(tomb) =
+            db.find_remote_discovered_tombstone(host_server_id, &ws.id)
+        {
+            // Not in the live map, but a soft-deleted tombstone exists for
+            // this (host, origin_uid) — left behind when a previously
+            // adopted-then-closed workspace's row was tombstoned. Resurrect
+            // it (clearing the stale workspace_id link) instead of inserting
+            // a duplicate, so the cloud identity survives the close/reopen
+            // and other devices don't see a vanish-then-reappear.
+            if let Err(e) = db.undelete_remote_discovered_workspace_sync(
+                tomb.id,
+                &ws.name,
+                project_path,
+                project_remote,
+                branch,
+                project_uid,
+                workspace_kind,
+                origin_path,
+            ) {
+                eprintln!(
+                    "[hosts_inventory] undelete failed for {host_server_id}/{}: {e}",
+                    ws.id
+                );
+                continue;
+            }
+            stats.updated += 1;
         } else if let Err(e) = db.insert_remote_discovered_workspace_sync(
             host_server_id,
             &ws.id,
@@ -883,6 +916,74 @@ mod tests {
             tombstone.dirty,
             "tombstone must be dirty so push DELETEs the cloud row"
         );
+    }
+
+    #[test]
+    fn reconcile_undeletes_tombstone_on_reappear_instead_of_duplicating() {
+        // Models the adopt → close → re-poll race that used to leak a
+        // duplicate sibling row (and churn the cloud row). A
+        // remote-discovered workspace is adopted (workspace_id linked),
+        // then the local workspace is CLOSED — the close-path reconcile
+        // soft-deletes the row BY workspace_id, leaving a tombstone that
+        // still carries the host's origin_uid. The host still has the
+        // workspace, so the next poll must RESURRECT the same row (cloud
+        // server_id preserved, stale link cleared), not insert a second.
+        let db = fresh_db();
+        let env = make_envelope(vec![make_remote("uid-1", "proj", Some("main"))]);
+
+        reconcile_host_inventory(&db, "host-99", &env);
+        let row = db
+            .find_workspace_sync_by_host_and_origin_uid("host-99", "uid-1")
+            .expect("first poll inserts the row");
+        // Simulate the first cloud push assigning a server_id.
+        db.mark_workspace_sync_synced(row.id, Some("srv-1")).unwrap();
+        // Simulate ADOPTION (link) then CLOSE (soft-delete by workspace_id).
+        db.link_workspace_sync_to_local("srv-1", "workspace-7").unwrap();
+        db.soft_delete_workspace_sync_by_workspace_id("workspace-7")
+            .unwrap();
+
+        // Now: zero live remote rows, one tombstone still keyed by uid-1.
+        assert!(db.list_remote_discovered_for_host("host-99").is_empty());
+        assert!(db
+            .find_remote_discovered_tombstone("host-99", "uid-1")
+            .is_some());
+
+        // Re-poll: the host still reports uid-1.
+        let stats = reconcile_host_inventory(&db, "host-99", &env);
+        assert_eq!(stats.inserted, 0, "must NOT insert a duplicate row");
+        assert_eq!(stats.updated, 1, "must resurrect the tombstone in place");
+
+        let live = db.list_remote_discovered_for_host("host-99");
+        assert_eq!(live.len(), 1, "exactly one live row — no duplicate");
+        assert_eq!(
+            live[0].id, row.id,
+            "same row resurrected, so the cloud server_id survives"
+        );
+        assert_eq!(live[0].server_id.as_deref(), Some("srv-1"));
+        assert!(
+            live[0].workspace_id.is_none(),
+            "stale adoption link must be cleared so it's a clean re-pullable sibling"
+        );
+        assert!(live[0].deleted_at.is_none());
+        assert!(
+            live[0].dirty,
+            "resurrected row must be dirty so push re-asserts it as a PATCH"
+        );
+    }
+
+    #[test]
+    fn reconcile_dedupes_duplicate_ids_within_one_envelope() {
+        // Defensive guard: `local_by_uid` is built once before the loop,
+        // so if a daemon ever reported the same id twice in one envelope
+        // the second pass would miss the live map and INSERT again.
+        let db = fresh_db();
+        let env = make_envelope(vec![
+            make_remote("dup", "proj", Some("main")),
+            make_remote("dup", "proj", Some("main")),
+        ]);
+        let stats = reconcile_host_inventory(&db, "host-99", &env);
+        assert_eq!(stats.inserted, 1, "duplicate id inserts exactly once");
+        assert_eq!(db.list_remote_discovered_for_host("host-99").len(), 1);
     }
 
     #[test]
