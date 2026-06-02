@@ -78,6 +78,15 @@ vi.mock("@/tauri/commands", () => ({
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
 }));
 
+vi.mock("@/lib/toast", () => ({
+  toast: {
+    info: vi.fn(),
+    success: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
 import {
   listBranches,
   checkIsGitRepo,
@@ -94,6 +103,7 @@ import {
   _defaultBranchCache,
   _defaultBranchInFlight,
 } from "@/components/layout/default-branch-cache";
+import { toast } from "@/lib/toast";
 
 // ── Helpers ──
 
@@ -389,6 +399,45 @@ describe("Submit flow", () => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
     });
 
+    expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+    // The dedup must not be silent — that's what made re-linking an issue
+    // look like "nothing happened" and quietly dropped the typed message.
+    expect(toast.info).toHaveBeenCalledWith(
+      expect.stringContaining("already has a workspace"),
+    );
+  });
+
+  it("surfaces an 'Open it' notice before submit when the branch already has a workspace", async () => {
+    setAppState("/path/to/project", [
+      {
+        cwd: "/path/to/project/wt",
+        git_branch: "my-feature",
+        project_root: "/path/to/project",
+      },
+    ]);
+    const onOpenChange = vi.fn();
+    renderDialog(true, onOpenChange);
+
+    const dialog = await screen.findByRole("dialog");
+    const branchInput = within(dialog).getByPlaceholderText("branch name");
+    // Mirrors what linking an issue does: auto-fill a branch that already
+    // belongs to a workspace.
+    fireEvent.change(branchInput, { target: { value: "my-feature" } });
+
+    // Proactive notice + action appear without submitting.
+    const openBtn = await within(dialog).findByRole("button", {
+      name: /Open it/i,
+    });
+    expect(
+      within(dialog).getByText(/already has a workspace/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(openBtn);
+
+    await waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
     expect(createWorktreeWorkspace).not.toHaveBeenCalled();
   });
 });
