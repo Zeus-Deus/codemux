@@ -18,6 +18,8 @@ Codemux automatically detects TCP ports that dev servers open, displays them in 
 - **Windows**: shells out to `netstat -ano` (with `CREATE_NO_WINDOW` to suppress the console flash) and `tasklist /NH /FO csv`, then parses both via pure cross-platform `parse_netstat_output` / `parse_tasklist_csv` helpers. The parsers are unit-tested on Linux CI so a Windows runner isn't needed to catch parser regressions. Because `netstat -ano` lists EVERY listening socket regardless of owner, an explicit process-name filter (`WINDOWS_SYSTEM_PROCESS_NAMES`) drops kernel-owned sockets that Linux's permission filter would never have surfaced.
 - **Other platforms**: returns an empty list.
 
+On top of the OS scan, `scan_ports` folds in a **Docker source** (`detect_docker_ports`). On Linux, ports published by a container are owned by the root `docker-proxy` process, so the `/proc/*/fd` PID-resolution step hits the same permission wall that hides system services — the listening socket is visible in `/proc/net/tcp` but is never attributed to a PID, so the OS scan drops it. To recover these, Codemux shells out to `docker ps` (tab-delimited `--format`, parsed by the pure cross-platform `parse_docker_ps_output`), and surfaces each *published* TCP host port labeled with its container name. Detection is **scoped to codemux worktrees**: a container is included only if its compose `working_dir` label matches an open workspace's `cwd` or `worktree_path` (see `all_workspace_paths`). Unrelated stacks the user runs by hand are excluded. Docker availability is cached (`DOCKER_CLI_STATE`) so a missing binary doesn't trigger a doomed spawn every cycle, while a transiently-down daemon recovers on its own. On a port collision Docker wins (better label than a rootless `docker-proxy`), and the existing `.codemux` static-config override still takes precedence. These ports carry `source = "docker"`, which the UI renders under a dedicated **Docker** group.
+
 Results are filtered to exclude system services and Codemux-internal port ranges on all platforms. The Windows system-process name filter (case-insensitive ASCII match) covers `System` / `Idle` / `smss.exe` / `csrss.exe` / `wininit.exe` / `winlogon.exe` / `services.exe` / `lsass.exe` / `svchost.exe` / `dwm.exe` / `spoolsv.exe` / `SearchIndexer.exe` / `MsMpEng.exe` / `RuntimeBroker.exe` / `dllhost.exe` / `WmiPrvSE.exe` / and ~10 others. User-runnable dev tools (`node.exe`, `python.exe`, browsers, IDE language servers) are intentionally NOT in the filter — only kernel + service-host processes are dropped.
 
 ## What Works Today
@@ -31,17 +33,21 @@ Results are filtered to exclude system services and Codemux-internal port ranges
 - Windows system-process name filter (`WINDOWS_SYSTEM_PROCESS_NAMES`) drops kernel + service-host owned sockets that `netstat -ano` would otherwise surface (16+ ports on a typical Windows host)
 - IPv4 + IPv6 dedup on Windows (services that bind to both `0.0.0.0:port` and `[::]:port` show as one entry)
 - exact-port matching (not substring) so a process listening on `:92230` is never confused with `:9223`
+- Docker-published container ports for open worktrees (via `docker ps`), shown under a dedicated **Docker** group labeled by container name — recovers ports the Linux `/proc` scan can't see because `docker-proxy` runs as root. Published TCP only; IPv4/IPv6 host-port double-publish is deduped; the kill action is hidden for these rows (killing the socket wouldn't stop the container)
 
 ## Current Constraints
 
 - macOS port detection is not implemented (returns empty list) — needs a `lsof`-based or `libproc` backend
-- polling-based, not event-driven (3-second interval)
-- no per-workspace port scoping (shows all user ports globally)
-- UDP ports are not detected
+- polling-based, not event-driven (3-second interval); the Docker source adds one `docker ps` spawn per cycle when at least one workspace is open and the CLI is available
+- no per-workspace port scoping for OS-detected ports (shows all user ports globally); the Docker source, by contrast, is scoped to open worktrees
+- UDP ports are not detected (including UDP container publishes)
+- Docker detection requires the `docker` CLI on `PATH` and socket access for the current user; only compose containers carry the `working_dir`/`service` labels used for matching and labeling, so non-compose `docker run` containers are not surfaced
+- port-range publishes (`8000-8005->8000-8005/tcp`) are skipped (the host segment doesn't parse to a single `u16`)
 - Windows parent-PID walk uses `wmic process ... get ParentProcessId`, which is deprecated on Windows 11 24H2+ — the workspace attribution degrades gracefully to "unassigned" when it fails
 
 ## Important Touch Points
 
-- `src-tauri/src/ports.rs` — top-level `detect_listening_ports()` dispatch, `PortInfo` struct, `WINDOWS_SYSTEM_PROCESS_NAMES` constant + `is_windows_system_process()` filter, cross-platform `parse_netstat_output` / `parse_tasklist_csv` pure parsers, Linux `/proc` helpers, Windows `windows_impl` module with `netstat`/`tasklist`/`wmic` I/O wrappers
+- `src-tauri/src/ports.rs` — top-level `detect_listening_ports()` dispatch, `PortInfo` struct (incl. `source`), `WINDOWS_SYSTEM_PROCESS_NAMES` constant + `is_windows_system_process()` filter, cross-platform `parse_netstat_output` / `parse_tasklist_csv` / `parse_docker_ps_output` pure parsers, `detect_docker_ports` + `run_docker_ps` + `DOCKER_PS_FORMAT` + `DOCKER_CLI_STATE`, `scan_ports` merge/dedup, Linux `/proc` helpers, Windows `windows_impl` module
+- `src-tauri/src/state/state_impl.rs` — `PortInfoSnapshot` (incl. `source`), `all_workspace_paths()` (path → workspace_id for Docker matching)
 - `src-tauri/src/commands/mod.rs` — `get_detected_ports`, `kill_port` (branches on `cfg!(windows)`)
-- `src/components/layout/sidebar-ports-section.tsx` — sidebar port display and actions
+- `src/components/layout/sidebar-ports-popover.tsx` — sidebar port display, `groupPorts` (workspace / Docker / Other grouping), and actions
