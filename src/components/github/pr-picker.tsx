@@ -1,18 +1,12 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
-import {
-  GitPullRequest,
-  GitPullRequestClosed,
-  GitMerge,
-  GitPullRequestDraft,
-  Search,
-  Loader2,
-} from "lucide-react";
+import { Search, Loader2 } from "lucide-react";
+import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-icon";
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 
 /**
- * Stage 5 — pull-request picker, mirroring `IssuePickerPanel`.
+ * Pull-request picker, mirroring `IssuePickerPanel`.
  *
  * Renders a search input plus a flat list of recent PRs from the
  * given repo path, fetched via the cached `gh pr list` wrapper. The
@@ -20,13 +14,11 @@ import type { PullRequestInfo } from "@/tauri/types";
  * left, `#N` number, title, and a hover-revealed "Link ↵" affordance
  * matching the rest of the picker family.
  *
- * State conventions (icon + tint):
- *   - OPEN (non-draft) → GitPullRequest, primary
- *   - OPEN (draft)     → GitPullRequestDraft, muted
- *   - MERGED           → GitMerge, purple-ish (`text-chart-4` falls
- *                        back nicely if the project hasn't customised
- *                        the chart palette)
- *   - CLOSED           → GitPullRequestClosed, destructive
+ * The status icon + color reuse `PrStatusIcon` — the same component
+ * used for the sidebar PR pill — so a row reads identically here and
+ * in the sidebar: merged → purple GitMerge, open → green
+ * GitPullRequest, draft → muted GitPullRequestDraft, closed → red
+ * GitPullRequestClosed.
  */
 
 function fuzzyMatch(text: string, query: string): boolean {
@@ -39,37 +31,14 @@ function fuzzyMatch(text: string, query: string): boolean {
   return qi === q.length;
 }
 
-interface PrIconConfig {
-  Icon:
-    | typeof GitPullRequest
-    | typeof GitPullRequestClosed
-    | typeof GitMerge
-    | typeof GitPullRequestDraft;
-  className: string;
-}
-
-function configForState(pr: PullRequestInfo): PrIconConfig {
+/** Collapse the `state` string + `is_draft` flag into the single
+ *  state token `PrStatusIcon` understands. A draft only matters while
+ *  the PR is still open; merged/closed take precedence. */
+function effectivePrState(pr: PullRequestInfo): PrStatusState {
   const upper = (pr.state ?? "OPEN").toUpperCase();
-  if (upper === "MERGED") {
-    // Purple is the universal merged colour across GH/GL UIs.
-    // `text-chart-4` is one of shadcn's chart palette tokens that
-    // renders purple in both themes; falls back to muted if the
-    // project tweaked the palette.
-    return { Icon: GitMerge, className: "text-chart-4" };
-  }
-  if (upper === "CLOSED") {
-    return {
-      Icon: GitPullRequestClosed,
-      className: "text-destructive",
-    };
-  }
-  if (pr.is_draft) {
-    return {
-      Icon: GitPullRequestDraft,
-      className: "text-muted-foreground",
-    };
-  }
-  return { Icon: GitPullRequest, className: "text-success" };
+  if (upper === "MERGED") return "merged";
+  if (upper === "CLOSED") return "closed";
+  return pr.is_draft ? "draft" : "open";
 }
 
 function PrRow({
@@ -83,7 +52,6 @@ function PrRow({
   onSelect: () => void;
   onMouseEnter: () => void;
 }) {
-  const { Icon, className: iconClass } = configForState(pr);
   return (
     <div
       role="option"
@@ -97,7 +65,7 @@ function PrRow({
       onClick={onSelect}
       onMouseEnter={onMouseEnter}
     >
-      <Icon className={cn("size-3.5 shrink-0", iconClass)} />
+      <PrStatusIcon state={effectivePrState(pr)} className="shrink-0" />
       <span className="text-muted-foreground text-[0.75rem] shrink-0 font-mono tabular-nums">
         #{pr.number}
       </span>
