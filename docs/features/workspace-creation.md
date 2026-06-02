@@ -74,6 +74,7 @@ After onboarding: scripts saved to project config, worktree workspace created, w
 - `src/components/overlays/project-picker.tsx` — project directory selection
 - `src/components/overlays/clone-dialog.tsx` — git clone flow
 - `src/components/github/issue-picker.tsx` — issue linking UI
+- `src/components/github/pr-picker.tsx` — PR linking UI (floating picker mirroring the issue picker; state-aware icons shared with the sidebar via `pr-status-icon.tsx`)
 - `src-tauri/src/commands/workspace.rs` — workspace creation Tauri commands
 - `src-tauri/src/commands/package_detect.rs` — package manager detection
 - `src-tauri/src/branch_name.rs` — AI branch name generation
