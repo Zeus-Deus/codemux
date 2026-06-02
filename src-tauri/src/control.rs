@@ -1413,6 +1413,7 @@ mod tests {
             process_name: format!("proc-{port}"),
             workspace_id: ws.map(str::to_string),
             label: label.map(str::to_string),
+            source: None,
         }
     }
 

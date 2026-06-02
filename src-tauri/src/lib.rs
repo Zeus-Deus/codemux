@@ -1232,8 +1232,14 @@ pub fn run() {
                     let session_pids = pty_state.get_session_pids();
                     let session_workspaces = app_state.all_session_workspaces();
                     let workspace_cwds = app_state.all_workspace_cwds();
+                    let workspace_paths = app_state.all_workspace_paths();
 
-                    let ports = ports::scan_ports(&session_pids, &session_workspaces, &workspace_cwds);
+                    let ports = ports::scan_ports(
+                        &session_pids,
+                        &session_workspaces,
+                        &workspace_cwds,
+                        &workspace_paths,
+                    );
                     let port_snapshots: Vec<state::PortInfoSnapshot> = ports
                         .into_iter()
                         .map(|p| state::PortInfoSnapshot {
@@ -1242,6 +1248,7 @@ pub fn run() {
                             process_name: p.process_name,
                             workspace_id: p.workspace_id,
                             label: p.label,
+                            source: p.source,
                         })
                         .collect();
 

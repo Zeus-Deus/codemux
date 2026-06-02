@@ -442,6 +442,11 @@ pub struct PortInfoSnapshot {
     pub process_name: String,
     pub workspace_id: Option<String>,
     pub label: Option<String>,
+    /// Discovery source: `None` = OS-level scan, `Some("docker")` = a
+    /// published container port. Drives the dedicated "Docker" group in the
+    /// ports UI. `#[serde(default)]` keeps older persisted snapshots loadable.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1463,6 +1468,30 @@ impl AppStateStore {
             .iter()
             .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
             .collect()
+    }
+
+    /// Returns absolute path -> workspace_id for all workspaces, covering
+    /// both the working directory and the git worktree path. The inverse
+    /// direction of `all_workspace_cwds` (path is the key) because Docker
+    /// container matching looks up by the compose `working_dir` path. Paths
+    /// are stored with any trailing slash trimmed so lookups normalize.
+    pub fn all_workspace_paths(&self) -> std::collections::HashMap<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut map = std::collections::HashMap::new();
+        for w in &snapshot.workspaces {
+            let id = w.workspace_id.0.clone();
+            let cwd = w.cwd.trim_end_matches('/');
+            if !cwd.is_empty() {
+                map.insert(cwd.to_string(), id.clone());
+            }
+            if let Some(worktree_path) = &w.worktree_path {
+                let wt = worktree_path.trim_end_matches('/');
+                if !wt.is_empty() {
+                    map.insert(wt.to_string(), id.clone());
+                }
+            }
+        }
+        map
     }
 
     /// Returns session_id -> workspace_id for all terminal sessions across all workspaces.

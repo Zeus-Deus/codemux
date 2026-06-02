@@ -28,30 +28,64 @@ import { Plug, Globe, X, Copy } from "lucide-react";
 import type { PortInfoSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
 
+type PortGroupKind = "workspace" | "docker" | "other";
+
 interface PortGroup {
+  key: string;
+  kind: PortGroupKind;
   workspaceId: string | null;
   workspaceName: string;
   ports: PortInfoSnapshot[];
 }
 
-function groupPorts(
+const GROUP_RANK: Record<PortGroupKind, number> = {
+  workspace: 0,
+  docker: 1,
+  other: 2,
+};
+
+const DOCKER_KEY = "__docker__";
+const OTHER_KEY = "__other__";
+
+export function groupPorts(
   ports: PortInfoSnapshot[],
   workspaces: WorkspaceSnapshot[],
 ): PortGroup[] {
   const map = new Map<string, PortGroup>();
   for (const port of ports) {
-    const key = port.workspace_id ?? "__other__";
-    if (!map.has(key)) {
+    // Docker container ports collapse into one "Docker" group regardless of
+    // which worktree they belong to; everything else groups by workspace.
+    let key: string;
+    let kind: PortGroupKind;
+    let workspaceId: string | null;
+    let workspaceName: string;
+    if (port.source === "docker") {
+      key = DOCKER_KEY;
+      kind = "docker";
+      workspaceId = null;
+      workspaceName = "Docker";
+    } else if (port.workspace_id) {
+      key = port.workspace_id;
+      kind = "workspace";
+      workspaceId = port.workspace_id;
       const ws = workspaces.find((w) => w.workspace_id === port.workspace_id);
-      map.set(key, {
-        workspaceId: port.workspace_id,
-        workspaceName: ws?.title ?? "Other",
-        ports: [],
-      });
+      workspaceName = ws?.title ?? "Other";
+    } else {
+      key = OTHER_KEY;
+      kind = "other";
+      workspaceId = null;
+      workspaceName = "Other";
+    }
+    if (!map.has(key)) {
+      map.set(key, { key, kind, workspaceId, workspaceName, ports: [] });
     }
     map.get(key)!.ports.push(port);
   }
-  return Array.from(map.values());
+  // Workspaces first, then Docker, then Other. Array.sort is stable, so the
+  // first-seen order is preserved within each rank.
+  return Array.from(map.values()).sort(
+    (a, b) => GROUP_RANK[a.kind] - GROUP_RANK[b.kind],
+  );
 }
 
 export function SidebarPortsPopover() {
@@ -155,7 +189,7 @@ export function SidebarPortsPopover() {
             ) : (
               groups.map((group) => (
                 <CommandGroup
-                  key={group.workspaceId ?? "__other__"}
+                  key={group.key}
                   heading={
                     <span className="text-[10px] uppercase tracking-wide text-muted-foreground/70">
                       {group.workspaceName}
@@ -164,7 +198,7 @@ export function SidebarPortsPopover() {
                 >
                   {group.ports.map((port) => (
                     <CommandItem
-                      key={port.port}
+                      key={`${port.source ?? "os"}-${port.port}`}
                       value={`${port.port}-${port.process_name}-${port.label ?? ""}`}
                       onSelect={() => openInBrowser(port)}
                       className="group/port flex items-center gap-2 py-1.5"
@@ -172,11 +206,16 @@ export function SidebarPortsPopover() {
                       <span className="font-mono text-xs font-semibold text-foreground tabular-nums shrink-0">
                         {port.port}
                       </span>
-                      <span className="truncate text-[11px] text-muted-foreground flex-1 min-w-0">
+                      <span
+                        className="truncate text-[11px] text-muted-foreground flex-1 min-w-0"
+                        title={port.label ?? port.process_name}
+                      >
                         {port.label ?? port.process_name}
                       </span>
                       <span className="text-[10px] text-muted-foreground/50 tabular-nums shrink-0 transition-opacity group-hover/port:opacity-0">
-                        PID {port.pid}
+                        {port.source === "docker"
+                          ? port.process_name
+                          : `PID ${port.pid}`}
                       </span>
                       <div className="absolute right-2 flex items-center gap-0.5 opacity-0 group-hover/port:opacity-100 transition-opacity">
                         <Tooltip>
@@ -215,24 +254,26 @@ export function SidebarPortsPopover() {
                             Copy URL
                           </TooltipContent>
                         </Tooltip>
-                        <Tooltip>
-                          <TooltipTrigger asChild>
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleKill(port);
-                              }}
-                              className="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-danger/15 hover:text-danger"
-                              aria-label="Kill process"
-                            >
-                              <X className="h-3 w-3" />
-                            </button>
-                          </TooltipTrigger>
-                          <TooltipContent side="top" sideOffset={4} className="text-xs">
-                            Kill process
-                          </TooltipContent>
-                        </Tooltip>
+                        {port.source !== "docker" && (
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleKill(port);
+                                }}
+                                className="flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground hover:bg-danger/15 hover:text-danger"
+                                aria-label="Kill process"
+                              >
+                                <X className="h-3 w-3" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top" sideOffset={4} className="text-xs">
+                              Kill process
+                            </TooltipContent>
+                          </Tooltip>
+                        )}
                       </div>
                     </CommandItem>
                   ))}

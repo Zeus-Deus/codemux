@@ -816,6 +816,9 @@ export interface PortInfoSnapshot {
   process_name: string;
   workspace_id: string | null;
   label: string | null;
+  /** Discovery source: `null` for the OS scan, `"docker"` for a published
+   *  container port. Drives the dedicated "Docker" group in the ports UI. */
+  source: string | null;
 }
 
 export interface AppStateSnapshot {
