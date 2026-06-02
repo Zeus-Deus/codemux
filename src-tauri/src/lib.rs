@@ -266,6 +266,16 @@ pub fn run() {
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
                 state.migrate_project_roots();
+                // Backfill repo-root `protected` for workspaces that
+                // predate the repo-unit-sync change. Runs off the boot
+                // thread because it spawns git subprocesses per
+                // workspace; new workspaces get it stamped at create
+                // time in `set_workspace_project_root`.
+                let protection_handle = handle.clone();
+                std::thread::spawn(move || {
+                    let state: tauri::State<'_, state::AppStateStore> = protection_handle.state();
+                    state.backfill_workspace_protection();
+                });
                 layout_loaded = true;
             } else {
                 // First launch — no persisted layout exists. Replace the

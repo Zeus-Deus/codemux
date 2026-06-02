@@ -4120,6 +4120,8 @@ mod tests {
             project_root: project_root.map(String::from),
             project_uid: None,
             workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
