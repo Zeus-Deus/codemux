@@ -325,6 +325,26 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return map;
   }, [appState, projectDir]);
 
+  // When the branch we're about to create already belongs to a workspace,
+  // surface it up-front instead of silently deduping at submit. Linking an
+  // issue auto-fills a deterministic branch name, so this is how the user
+  // learns "you already have a workspace for issue #N" before hitting send.
+  // Scoped to create_new — the open_existing flow is an explicit "open it"
+  // choice already.
+  const existingWorkspaceForBranch = useMemo(() => {
+    if (branchMode !== "create_new") return undefined;
+    const branch = branchName.trim();
+    return branch ? branchWorkspaceMap.get(branch) : undefined;
+  }, [branchMode, branchName, branchWorkspaceMap]);
+
+  const handleOpenExistingWorkspace = useCallback(
+    async (wsId: string) => {
+      onOpenChange(false);
+      await activateWorkspace(wsId);
+    },
+    [onOpenChange],
+  );
+
   // Worktree paths already owned by a Codemux workspace. Used to filter
   // `git worktree list` so "Open ↵ <branch>" doesn't try to re-import a
   // worktree that's already attached to another workspace row.
@@ -474,6 +494,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       if (branchMode === "open_existing" && openExistingBranch) {
         const existingWsId = branchWorkspaceMap.get(openExistingBranch);
         if (existingWsId) {
+          toast.info(
+            linkedIssue
+              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+              : `"${openExistingBranch}" already has a workspace — switched to it.`,
+          );
           await activateWorkspace(existingWsId);
           removePendingWorkspace(tempId);
           return;
@@ -561,9 +586,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
 
-      // Check if workspace already exists for this branch
+      // Check if workspace already exists for this branch. Linking an issue
+      // auto-fills a deterministic `feature/<n>-<slug>` branch name, so
+      // re-linking an issue that already has a workspace lands here. Switch
+      // to it AND tell the user: a silent return reads as "nothing happened"
+      // and quietly drops the message they just typed.
       const existingWsId = branchWorkspaceMap.get(resolvedBranch);
       if (existingWsId) {
+        toast.info(
+          linkedIssue
+            ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+            : `"${resolvedBranch}" already has a workspace — switched to it.`,
+        );
         await activateWorkspace(existingWsId);
         removePendingWorkspace(tempId);
         return;
@@ -794,6 +828,28 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                     </button>
                   </span>
                 ))}
+              </div>
+            )}
+
+            {/* Already-exists notice: the linked issue (or typed branch)
+                already has a workspace. Offer to open it instead of the
+                silent submit-time dedup that drops the typed message. */}
+            {existingWorkspaceForBranch && (
+              <div className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  {linkedIssue
+                    ? `Issue #${linkedIssue.number} already has a workspace.`
+                    : `"${branchName.trim()}" already has a workspace.`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleOpenExistingWorkspace(existingWorkspaceForBranch)
+                  }
+                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:bg-muted"
+                >
+                  Open it
+                </button>
               </div>
             )}
 
