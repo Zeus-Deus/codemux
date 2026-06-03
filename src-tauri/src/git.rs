@@ -1848,31 +1848,42 @@ mod repo_root_tests {
         run(dir, &["commit", "-m", "init"]);
     }
 
+    /// Compare two paths by resolved identity rather than raw string —
+    /// git emits forward-slash, non-verbatim paths while Rust's
+    /// `canonicalize` yields `\\?\` extended-length paths on Windows and
+    /// `/private/var` on macOS. Canonicalising both sides makes the
+    /// equality assertions platform-agnostic; we feed git the
+    /// non-canonicalised temp path so it never sees a `\\?\` prefix
+    /// (which `git worktree add` rejects on Windows).
+    fn same_path(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        }
+    }
+
     #[test]
     fn canonical_root_for_main_checkout_is_itself() {
         let tmp = TempDir::new().unwrap();
-        // canonicalize so macOS /var -> /private/var symlinks don't trip
-        // the path equality assertions below.
-        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
 
         let info = git_canonical_root(&repo).expect("repo root");
         assert!(!info.is_worktree, "main checkout is not a worktree");
         assert!(!info.is_bare);
-        assert_eq!(info.toplevel.as_deref(), Some(repo.as_path()));
-        assert_eq!(info.common_dir, repo.join(".git"));
-        assert_eq!(info.canonical_root_path(), repo);
+        assert!(same_path(info.toplevel.as_deref().unwrap(), &repo));
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
+        assert!(same_path(&info.canonical_root_path(), &repo));
     }
 
     #[test]
     fn canonical_root_for_linked_worktree_points_at_parent() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        let repo = root.join("repo");
+        let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        let wt = root.join("wt");
+        let wt = tmp.path().join("wt");
         run(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
 
         // A real linked worktree has a `.git` FILE.
@@ -1880,9 +1891,9 @@ mod repo_root_tests {
 
         let info = git_canonical_root(&wt).expect("worktree root");
         assert!(info.is_worktree, "linked worktree detected");
-        assert_eq!(info.common_dir, repo.join(".git"));
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
         // The canonical root is the PARENT repo, not the worktree dir.
-        assert_eq!(info.canonical_root_path(), repo);
+        assert!(same_path(&info.canonical_root_path(), &repo));
     }
 
     #[test]
@@ -1918,7 +1929,7 @@ mod repo_root_tests {
     #[test]
     fn protected_for_main_checkout_on_default_branch() {
         let tmp = TempDir::new().unwrap();
-        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
         assert!(is_protected_repo_root(&repo, Some("main")));
@@ -1927,7 +1938,7 @@ mod repo_root_tests {
     #[test]
     fn not_protected_for_worktree_or_wrong_branch_or_non_repo() {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = tmp.path();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
