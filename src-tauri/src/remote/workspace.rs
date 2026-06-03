@@ -57,6 +57,14 @@ pub struct Workspace {
     /// the same `project_uid` for an independently-cloned copy.
     #[serde(default)]
     pub repo_remote: Option<String>,
+    /// The repo's default branch (`origin/HEAD` → main/master → current),
+    /// resolved at registration via `crate::git::resolve_default_branch`.
+    /// Lets a pulling device land the repo ROOT on the right branch and
+    /// classify it as a protected root even when `branch` (the per-checkout
+    /// branch) is null — which it routinely is for a root an agent never
+    /// named. Advisory: the desktop re-resolves locally before protecting.
+    #[serde(default)]
+    pub default_branch: Option<String>,
     /// RFC 3339 UTC timestamp.
     pub created_at: String,
     /// RFC 3339 UTC timestamp.
@@ -207,6 +215,19 @@ impl WorkspaceStore {
         });
         let project_name = project_root.as_deref().map(basename);
         let kind = Some(crate::project_identity::derive_kind(std::path::Path::new(&path)).to_string());
+        // Resolve the repo's default branch from the project root (gated on
+        // `.git` to skip the subprocess for not-yet-materialised / test paths,
+        // same as `git_remote_origin_url`). `resolve_default_branch` falls back
+        // to the current branch for local-only repos with a non-standard
+        // default, so a `main`-defaulting repo like the common case still
+        // records "main" even with no remote.
+        let default_branch = project_root.as_deref().and_then(|pr| {
+            if std::path::Path::new(pr).join(".git").exists() {
+                crate::git::resolve_default_branch(std::path::Path::new(pr))
+            } else {
+                None
+            }
+        });
 
         let ws = Workspace {
             id: id.clone(),
@@ -218,6 +239,7 @@ impl WorkspaceStore {
             project_name,
             kind,
             repo_remote,
+            default_branch,
             created_at: now.clone(),
             updated_at: now,
             owner_id: None,
@@ -230,8 +252,8 @@ impl WorkspaceStore {
             "INSERT INTO workspaces (
                 id, name, path, branch, project_root,
                 created_at, updated_at, owner_id, origin_host_id, notes,
-                project_uid, project_name, kind, repo_remote
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                project_uid, project_name, kind, repo_remote, default_branch
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 ws.id,
                 ws.name,
@@ -247,6 +269,7 @@ impl WorkspaceStore {
                 ws.project_name,
                 ws.kind,
                 ws.repo_remote,
+                ws.default_branch,
             ],
         )
         .map_err(|e| WorkspaceError::Db(e.to_string()))?;
@@ -259,7 +282,7 @@ impl WorkspaceStore {
             .prepare(
                 "SELECT id, name, path, branch, project_root,
                         created_at, updated_at, owner_id, origin_host_id, notes,
-                        project_uid, project_name, kind, repo_remote
+                        project_uid, project_name, kind, repo_remote, default_branch
                  FROM workspaces WHERE id = ?1",
             )
             .map_err(|e| WorkspaceError::Db(e.to_string()))?;
@@ -281,7 +304,7 @@ impl WorkspaceStore {
             .prepare(
                 "SELECT id, name, path, branch, project_root,
                         created_at, updated_at, owner_id, origin_host_id, notes,
-                        project_uid, project_name, kind, repo_remote
+                        project_uid, project_name, kind, repo_remote, default_branch
                  FROM workspaces
                  ORDER BY created_at DESC",
             )
@@ -372,6 +395,13 @@ impl WorkspaceStore {
         let mut updated = 0usize;
         let conn = self.conn.lock().unwrap();
         for ws in rows {
+            // Guard on identity only — NOT on default_branch. default_branch
+            // legitimately stays None for repos with no resolvable default
+            // (no commits / detached / non-repo path), so gating on it would
+            // re-update those rows on every sweep and break idempotency. A
+            // legacy row missing identity is backfilled here (default_branch
+            // included); a row that already has identity but no default_branch
+            // is left to pull-time resolution, which is authoritative anyway.
             if ws.project_uid.is_some() && ws.kind.is_some() {
                 continue;
             }
@@ -387,11 +417,24 @@ impl WorkspaceStore {
             let kind = Some(
                 crate::project_identity::derive_kind(std::path::Path::new(&ws.path)).to_string(),
             );
+            // Backfill the default branch for rows registered before the
+            // column existed (gated on `.git` to avoid spawning git for
+            // stale/never-materialised paths). This is what retroactively
+            // gives a legacy root row a non-null branch so a pull can protect
+            // it instead of rendering it as a deletable "<branch>" worktree.
+            let default_branch = ws.default_branch.clone().or_else(|| {
+                if std::path::Path::new(&project_root).join(".git").exists() {
+                    crate::git::resolve_default_branch(std::path::Path::new(&project_root))
+                } else {
+                    None
+                }
+            });
             conn.execute(
                 "UPDATE workspaces
-                 SET project_uid = ?2, project_name = ?3, kind = ?4, repo_remote = ?5
+                 SET project_uid = ?2, project_name = ?3, kind = ?4, repo_remote = ?5,
+                     default_branch = ?6
                  WHERE id = ?1",
-                rusqlite::params![ws.id, project_uid, project_name, kind, repo_remote],
+                rusqlite::params![ws.id, project_uid, project_name, kind, repo_remote, default_branch],
             )
             .map_err(|e| WorkspaceError::Db(e.to_string()))?;
             updated += 1;
@@ -417,7 +460,8 @@ fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
             project_uid     TEXT,            -- deterministic project identity (UUIDv5)
             project_name    TEXT,
             kind            TEXT,            -- 'main' | 'worktree'
-            repo_remote     TEXT             -- canonical git remote, null for local-only
+            repo_remote     TEXT,            -- canonical git remote, null for local-only
+            default_branch  TEXT             -- repo default branch (origin/HEAD -> main/master -> current)
         );
         CREATE INDEX IF NOT EXISTS idx_workspaces_origin
             ON workspaces (origin_host_id);
@@ -438,6 +482,7 @@ fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
         "ALTER TABLE workspaces ADD COLUMN project_name TEXT",
         "ALTER TABLE workspaces ADD COLUMN kind TEXT",
         "ALTER TABLE workspaces ADD COLUMN repo_remote TEXT",
+        "ALTER TABLE workspaces ADD COLUMN default_branch TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -472,6 +517,7 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<Workspace, WorkspaceError
         project_name: map(11).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         kind: map(12).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         repo_remote: map(13).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        default_branch: map(14).map_err(|e| WorkspaceError::Db(e.to_string()))?,
     })
 }
 

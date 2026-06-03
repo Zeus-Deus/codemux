@@ -23,11 +23,16 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
 import { useAppStore } from "@/stores/app-store";
 import { useHostsStore } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
 
-import type { WorkspaceSyncView } from "@/tauri/commands";
+import {
+  workspacesAdoptProject,
+  workspacesSyncNow,
+  type WorkspaceSyncView,
+} from "@/tauri/commands";
 
 import { WorkspaceOverviewRow } from "./workspace-overview-row";
 import {
@@ -95,6 +100,45 @@ export function WorkspacesOverviewSection() {
   const handleRequestPull = useCallback(
     (item: Extract<OverviewItem, { kind: "remote" }>) => {
       setPullRow(item.sync);
+    },
+    [],
+  );
+
+  // Project-first pull: materialize the repo ROOT + every worktree in one
+  // action (root lands protected at ~/.codemux/projects/<repo>; worktrees
+  // recreate as real linked worktrees under it). Surfaced on a project
+  // cluster header when ≥1 sibling-device row remains un-adopted.
+  const [pullingProjectUid, setPullingProjectUid] = useState<string | null>(
+    null,
+  );
+  const handlePullProject = useCallback(
+    async (projectUid: string, projectName: string) => {
+      setPullingProjectUid(projectUid);
+      try {
+        const result = await workspacesAdoptProject(projectUid);
+        if (result.failures.length > 0) {
+          toast.error(
+            `Pulled ${projectName} with ${result.failures.length} issue(s)`,
+            {
+              description: result.failures
+                .map((f) => `${f.title}: ${f.error}`)
+                .join("\n"),
+            },
+          );
+        } else {
+          toast.success(`Pulled ${projectName} to this device`, {
+            description: result.message,
+          });
+        }
+        // Refresh the overview so the newly-local rows re-bucket.
+        await workspacesSyncNow().catch(() => {});
+      } catch (err) {
+        toast.error(`Failed to pull ${projectName}`, {
+          description: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        setPullingProjectUid(null);
+      }
     },
     [],
   );
@@ -620,6 +664,8 @@ export function WorkspacesOverviewSection() {
                 activeWorkspaceId={activeWorkspaceId}
                 onCloseOverview={() => setShowWorkspacesOverview(false)}
                 onRequestPull={handleRequestPull}
+                onPullProject={handlePullProject}
+                pullingProjectUid={pullingProjectUid}
                 onScrollToFirstRemote={handleScrollToFirstRemote}
                 hasAnySibling={allItems.some((i) => i.kind === "remote")}
                 registerRemoteRow={registerRemoteRow}
@@ -648,6 +694,8 @@ function DeviceSection({
   activeWorkspaceId,
   onCloseOverview,
   onRequestPull,
+  onPullProject,
+  pullingProjectUid,
   onScrollToFirstRemote,
   hasAnySibling,
   registerRemoteRow,
@@ -660,6 +708,10 @@ function DeviceSection({
   onRequestPull: (
     item: Extract<OverviewItem, { kind: "remote" }>,
   ) => void;
+  /** Pull an entire project (root + worktrees) in one action. */
+  onPullProject: (projectUid: string, projectName: string) => void;
+  /** project_uid currently being pulled, so its header shows a spinner. */
+  pullingProjectUid: string | null;
   /** Trigger the "Pull from another device" CTA: scroll the overview
    *  to the first sibling-device row and briefly pulse it. */
   onScrollToFirstRemote: () => void;
@@ -765,6 +817,20 @@ function DeviceSection({
                   <ProjectGroupHeader
                     name={group.name}
                     count={group.items.length}
+                    pullable={
+                      group.projectUid !== null &&
+                      group.pullableRemoteCount > 0
+                    }
+                    pulling={
+                      group.projectUid !== null &&
+                      pullingProjectUid === group.projectUid
+                    }
+                    onPull={
+                      group.projectUid
+                        ? () =>
+                            onPullProject(group.projectUid!, group.name)
+                        : undefined
+                    }
                   />
                   <RowGrid items={group.items} {...rowGridProps} />
                 </div>
@@ -791,8 +857,33 @@ function DeviceSection({
  * cluster together, while two unrelated repos that merely share a
  * basename do not. Falls back to the project name when no key exists.
  */
+/** True when an overview item is the repo ROOT (the protected main
+ *  checkout) rather than a per-branch worktree. Used to float the root to
+ *  the top of its project cluster so worktrees read as nested under it. */
+function isRootItem(it: OverviewItem): boolean {
+  if (it.kind === "local") {
+    return (
+      it.workspace.protected === true ||
+      it.workspace.workspace_kind === "main"
+    );
+  }
+  return it.sync.workspace_kind === "main";
+}
+
+type ProjectCluster = {
+  key: string;
+  name: string;
+  /** The actual (non-lowercased) project_uid, when known — needed to drive
+   *  the project-first pull. Null for clusters grouped only by name/path. */
+  projectUid: string | null;
+  items: OverviewItem[];
+  /** Count of still-un-adopted sibling-device rows in this cluster; >0 means
+   *  the whole project can be pulled to this device in one action. */
+  pullableRemoteCount: number;
+};
+
 function partitionByProject(items: OverviewItem[]): {
-  clustered: { key: string; name: string; items: OverviewItem[] }[];
+  clustered: ProjectCluster[];
   rest: OverviewItem[];
 } {
   const groups = new Map<string, { name: string; items: OverviewItem[] }>();
@@ -805,11 +896,25 @@ function partitionByProject(items: OverviewItem[]): {
     else groups.set(key, { name, items: [it] });
   }
 
-  const clustered: { key: string; name: string; items: OverviewItem[] }[] = [];
+  const clustered: ProjectCluster[] = [];
   const clusteredKeys = new Set<string>();
   for (const [key, g] of groups) {
     if (g.items.length >= 2) {
-      clustered.push({ key, name: g.name, items: g.items });
+      // Float the protected root to the top so its worktrees read as
+      // nested beneath it; otherwise preserve incoming order (stable sort).
+      g.items.sort((a, b) => Number(isRootItem(b)) - Number(isRootItem(a)));
+      const projectUid =
+        g.items.map((it) => it.sync?.project_uid).find(Boolean) ?? null;
+      const pullableRemoteCount = g.items.filter(
+        (it) => it.kind === "remote",
+      ).length;
+      clustered.push({
+        key,
+        name: g.name,
+        projectUid,
+        items: g.items,
+        pullableRemoteCount,
+      });
       clusteredKeys.add(key);
     }
   }
@@ -826,19 +931,45 @@ function partitionByProject(items: OverviewItem[]): {
   return { clustered, rest };
 }
 
-/** Subtle caption above a same-project cluster inside a device bucket. */
+/** Subtle caption above a same-project cluster inside a device bucket.
+ *  When the cluster holds un-adopted sibling-device rows, it also offers a
+ *  one-click "Pull project" that materializes the repo root + all worktrees
+ *  together (root-first) via `workspaces_adopt_project`. */
 function ProjectGroupHeader({
   name,
   count,
+  pullable = false,
+  pulling = false,
+  onPull,
 }: {
   name: string;
   count: number;
+  pullable?: boolean;
+  pulling?: boolean;
+  onPull?: () => void;
 }) {
   return (
     <div className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/70">
       <Folder className="size-3 text-muted-foreground/50" aria-hidden />
       <span className="truncate font-medium text-foreground/75">{name}</span>
       <span className="tabular-nums text-muted-foreground/45">{count}</span>
+      {pullable && onPull && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="ml-1 h-5 gap-1 px-1.5 text-[11px] text-muted-foreground/80 hover:text-foreground"
+          disabled={pulling}
+          onClick={onPull}
+          title="Pull this project's repo root and all its worktrees to this device"
+        >
+          {pulling ? (
+            <Loader2 className="size-3 animate-spin" aria-hidden />
+          ) : (
+            <ArrowDownToLine className="size-3" aria-hidden />
+          )}
+          Pull project
+        </Button>
+      )}
     </div>
   );
 }

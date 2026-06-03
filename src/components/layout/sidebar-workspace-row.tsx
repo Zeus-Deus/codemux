@@ -580,7 +580,13 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   };
 
   const isPrimary = !workspace.worktree_path;
-  const canDelete = !isPrimary;
+  // A protected repo root is never destructively deletable from the sidebar
+  // (close-only), aligning with the overview's `isRepoRoot` guard. Roots
+  // already have a null `worktree_path` (so `isPrimary` covers them), but
+  // gating on `protected` too is belt-and-suspenders against a root that
+  // somehow carries a worktree_path.
+  const isRepoRoot = workspace.protected === true;
+  const canDelete = !isPrimary && !isRepoRoot;
   const isRemote =
     workspace.host_id !== null && workspace.host_id !== undefined;
   const isPushOrPullInFlight = useAppStore(

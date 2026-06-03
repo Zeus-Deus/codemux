@@ -311,6 +311,11 @@ pub struct RemoteWorkspace {
     pub kind: Option<String>,
     #[serde(default)]
     pub repo_remote: Option<String>,
+    /// Repo default branch from the daemon (`origin/HEAD` → main/master →
+    /// current). Older daemons omit it → serde defaults to `None` → the
+    /// desktop falls back to resolving it locally at pull time.
+    #[serde(default)]
+    pub default_branch: Option<String>,
     // `owner_id`, `origin_host_id`, `notes`, `created_at`,
     // `updated_at` are accepted by serde but not used by the
     // reconcile — they live on the remote daemon and have no
@@ -396,6 +401,7 @@ pub fn reconcile_host_inventory(
         let project_uid = ws.project_uid.as_deref();
         let workspace_kind = ws.kind.as_deref();
         let branch = ws.branch.as_deref();
+        let default_branch = ws.default_branch.as_deref();
         // The workspace's REAL absolute path on the host. Unlike
         // `project_path` (which collapses to the project root for a
         // worktree), this is the authoritative rsync source for pulling
@@ -412,7 +418,8 @@ pub fn reconcile_host_inventory(
                 || existing.git_branch.as_deref() != branch
                 || existing.project_uid.as_deref() != project_uid
                 || existing.workspace_kind.as_deref() != workspace_kind
-                || existing.origin_path.as_deref() != origin_path;
+                || existing.origin_path.as_deref() != origin_path
+                || existing.default_branch.as_deref() != default_branch;
             if changed {
                 if let Err(e) = db.update_remote_discovered_workspace_sync(
                     existing.id,
@@ -423,6 +430,7 @@ pub fn reconcile_host_inventory(
                     project_uid,
                     workspace_kind,
                     origin_path,
+                    default_branch,
                 ) {
                     eprintln!(
                         "[hosts_inventory] update failed for {host_server_id}/{}: {e}",
@@ -450,6 +458,7 @@ pub fn reconcile_host_inventory(
                 project_uid,
                 workspace_kind,
                 origin_path,
+                default_branch,
             ) {
                 eprintln!(
                     "[hosts_inventory] undelete failed for {host_server_id}/{}: {e}",
@@ -468,6 +477,7 @@ pub fn reconcile_host_inventory(
             project_uid,
             workspace_kind,
             origin_path,
+            default_branch,
         ) {
             eprintln!(
                 "[hosts_inventory] insert failed for {host_server_id}/{}: {e}",
@@ -522,6 +532,7 @@ mod tests {
             project_uid: Some("uid-origin".into()),
             kind: Some("worktree".into()),
             repo_remote: Some("github.com/acme/origin".into()),
+            default_branch: Some("main".into()),
         }
     }
 

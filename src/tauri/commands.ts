@@ -1772,6 +1772,12 @@ export interface WorkspaceSyncView {
   /** "main" (repo root checkout) | "worktree" (per-branch worktree).
    *  Rendered as a small badge in the overview. */
   workspace_kind: string | null;
+  /** The repo's default branch as reported by the daemon poller
+   *  (origin/HEAD → main/master → current branch). Lets the overview
+   *  render a remote project's root distinctly and land a pull on the
+   *  right branch even when git_branch is null. Local-only — never sent
+   *  to or returned from the cloud API. */
+  default_branch: string | null;
   created_at: string;
   updated_at: string;
   /** True iff the row has unpushed changes. UI surfaces this as a
@@ -1847,3 +1853,24 @@ export const workspacesAdoptSynced = (serverId: string) =>
  *  dialog before reaching this. */
 export const workspacesAdoptViaClone = (serverId: string) =>
   invoke<AdoptOutcome>("workspaces_adopt_via_clone", { serverId });
+
+/** One workspace that failed during a project-granularity pull. */
+export interface ProjectAdoptFailure {
+  server_id: string;
+  title: string;
+  error: string;
+}
+
+export interface ProjectAdoptOutcome {
+  adopted: AdoptOutcome[];
+  failures: ProjectAdoptFailure[];
+  message: string;
+}
+
+/** Project-first pull: materialize the repo ROOT (protected, at
+ *  `~/.codemux/projects/<repo>`) first, then recreate every worktree as a
+ *  real linked worktree hanging off it — in one action. Pass the shared
+ *  `project_uid` of the remote project's rows. Worktree failures are
+ *  collected (non-fatal); a root failure rejects. */
+export const workspacesAdoptProject = (projectUid: string) =>
+  invoke<ProjectAdoptOutcome>("workspaces_adopt_project", { projectUid });
