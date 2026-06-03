@@ -60,7 +60,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`
-- Port detection: `docs/features/ports.md`
+- Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`
 - Project memory: `docs/features/project-memory.md`
@@ -68,7 +68,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Workspace creation: `docs/features/workspace-creation.md`
 - Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
 - Project identity (first-class `project_uid` + `main`/`worktree` kind + boot sweep, Superset-adapted): `docs/plans/project-identity.md`
-- Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync fix** (stop cloning the default-branch checkout into a divergent copy; treat repo root + worktrees as one shared-history unit; protected non-deletable repo-root entry) planned at `docs/plans/repo-unit-sync.md`
+- Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync** (treat repo root + worktrees as one shared-history unit instead of cloning the default-branch checkout into a divergent copy; protected non-deletable `repo root` entry + `standalone copy` warning chip — landed on `main` after the `v0.7.7` tag, snapshot-local only) — current behavior in `docs/features/workspaces-sync.md` + `docs/features/workspaces-overview.md`, plan + remaining follow-ups (SSH round-trip validation, one-click reconcile) at `docs/plans/repo-unit-sync.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
