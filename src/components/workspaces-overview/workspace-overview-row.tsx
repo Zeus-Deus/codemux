@@ -168,6 +168,19 @@ function LocalRow({
   const [busy, setBusy] = useState(false);
   const isRemote = item.hostServerId !== null;
   const isWorktree = !!workspace.worktree_path;
+  // The repo's protected default-branch root checkout owns the shared
+  // git history and must never be deleted like a disposable worktree.
+  // `protected` is stamped by the backend and is divergence-safe — a
+  // full copy living under ~/.codemux/worktrees/ is NOT protected, so
+  // legacy copies stay reconcilable (not falsely guarded). Older
+  // snapshots without the field read as false.
+  const isRepoRoot = workspace.protected === true;
+  const canRemoveWorktree = isWorktree && !isRepoRoot;
+  // Legacy artifact of the old default-branch push/pull: a full copy of
+  // a repo (its own object store) sitting in the worktrees tree, NOT
+  // linked to the real repo's history. We surface a warning so the user
+  // can re-pull cleanly (new adoptions land roots under projects/).
+  const isDivergentCopy = workspace.divergent_copy === true;
 
   // Phase-4d elapsed-time indicator: when a push/pull takes longer
   // than ~2s, surface "12s elapsed" so the user knows it's working
@@ -280,12 +293,16 @@ function LocalRow({
 
   const handleDelete = useCallback(() => {
     const confirmed = window.confirm(
-      isWorktree
+      canRemoveWorktree
         ? `Delete the worktree "${workspace.title}"? Files on disk will be removed.`
-        : `Close "${workspace.title}"? Project files on disk are untouched.`,
+        : isRepoRoot
+          ? `Close "${workspace.title}"? This is the project's root checkout — it's removed from the list but its files on disk are left untouched.`
+          : `Close "${workspace.title}"? Project files on disk are untouched.`,
     );
     if (!confirmed) return;
-    const promise = isWorktree
+    // Never destroy a protected repo root: close (detach) only, leaving
+    // its files and shared git history intact.
+    const promise = canRemoveWorktree
       ? closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false)
       : closeWorkspace(workspace.workspace_id, false);
     promise.catch((err) =>
@@ -293,7 +310,7 @@ function LocalRow({
         description: err instanceof Error ? err.message : String(err),
       }),
     );
-  }, [workspace.workspace_id, workspace.title, isWorktree]);
+  }, [workspace.workspace_id, workspace.title, canRemoveWorktree, isRepoRoot]);
 
   const handleCopyBranch = useCallback(() => {
     if (workspace.git_branch) {
@@ -353,6 +370,22 @@ function LocalRow({
               {workspace.title}
             </h4>
             {divergence && <DivergenceChip info={divergence} />}
+            {isRepoRoot && (
+              <span
+                title="The project's root checkout on its default branch. Protected — it can't be deleted like a worktree."
+                className="shrink-0 rounded-full bg-muted/50 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-muted-foreground/80"
+              >
+                repo root
+              </span>
+            )}
+            {isDivergentCopy && (
+              <span
+                title="Standalone copy — this is a full copy of the repo in the worktrees folder, not linked to the project's real history, so it will drift. Delete it and pull again: new pulls land the repo root cleanly under ~/.codemux/projects/."
+                className="shrink-0 rounded-full border border-amber-400/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-amber-300/90"
+              >
+                standalone copy
+              </span>
+            )}
             {sync?.dirty && (
               <span
                 title="Pending sync to your account"
@@ -507,7 +540,7 @@ function LocalRow({
                   className="text-destructive focus:bg-destructive/10 focus:text-destructive"
                 >
                   <Trash2 className="mr-2 size-3.5" />
-                  {isWorktree ? "Delete worktree…" : "Close workspace…"}
+                  {canRemoveWorktree ? "Delete worktree…" : "Close workspace…"}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -622,7 +655,7 @@ function RemoteRow({
                 }
                 className="shrink-0 rounded-full bg-muted/50 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-muted-foreground/80"
               >
-                {row.workspace_kind}
+                {row.workspace_kind === "worktree" ? "worktree" : "repo root"}
               </span>
             )}
             <span

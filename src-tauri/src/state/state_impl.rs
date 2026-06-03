@@ -363,6 +363,25 @@ pub struct WorkspaceSnapshot {
     /// worktree). Derived from `worktree_path` at create time.
     #[serde(default)]
     pub workspace_kind: Option<String>,
+    /// True when this workspace is the repo's protected default-branch
+    /// root checkout — the genuine main checkout (not a linked worktree,
+    /// not a bare repo, and not a divergent full copy under
+    /// `~/.codemux/worktrees/`) on its default branch. The overview must
+    /// not let a protected workspace be deleted like a disposable
+    /// worktree. Stamped at create time (and backfilled at boot) by
+    /// `crate::git::is_protected_repo_root`. Additive; old persisted
+    /// state deserializes as `false`.
+    #[serde(default)]
+    pub protected: bool,
+    /// True when this workspace's checkout is a *divergent full copy* of
+    /// a repo (its own `.git` object store) living in the worktrees tree
+    /// — the legacy artifact of the old default-branch push/pull. It is
+    /// NOT linked to the real repo's history and will drift from it. The
+    /// overview surfaces a warning so the user can re-pull cleanly. New
+    /// adoptions land repo roots under `~/.codemux/projects/` and never
+    /// produce this. Additive; old snapshots read as `false`.
+    #[serde(default)]
+    pub divergent_copy: bool,
     #[serde(default)]
     pub pr_number: Option<u32>,
     #[serde(default)]
@@ -668,6 +687,8 @@ impl AppStateStore {
             project_root: None,
             project_uid: None,
             workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -796,6 +817,8 @@ impl AppStateStore {
             project_root: None,
             project_uid: None,
             workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -870,6 +893,8 @@ impl AppStateStore {
             // identity from the poller.
             project_uid: None,
             workspace_kind: Some("worktree".into()),
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -893,6 +918,74 @@ impl AppStateStore {
         // completes, not in a half-populated pane tree. The frontend
         // can navigate explicitly on success if it wants.
         workspace_id
+    }
+
+    /// Like [`create_synced_workspace_shell`], but for adopting a repo's
+    /// ROOT (default-branch) checkout — `workspace_kind = "main"`, no
+    /// `worktree_path`. The shell lands at `project_root`
+    /// (`~/.codemux/projects/<repo>`), NOT in the worktrees tree, so the
+    /// adopted root is classified as a genuine repo root rather than a
+    /// divergent copy. `host_id` is pre-set so the upcoming pull routes
+    /// to the right host; it's cleared on success. `protected` is left
+    /// false here and stamped once the pull lands and the root is
+    /// verified on its default branch.
+    pub fn create_synced_root_shell(
+        &self,
+        title: String,
+        host_id: i64,
+        project_root: String,
+        git_branch: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            cwd: project_root.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: None,
+            project_root: Some(project_root),
+            project_uid: None,
+            workspace_kind: Some("main".into()),
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: vec![],
+            host_id: Some(host_id),
+        });
+
+        workspace_id
+    }
+
+    /// Set the repo-root `protected` flag on a workspace (used by the
+    /// adopt path to mark a freshly-pulled repo root protected without
+    /// recomputing its `project_uid`, which would diverge for
+    /// local-only repos — see `set_workspace_project_identity`).
+    pub fn set_workspace_protected(&self, workspace_id: &str, protected: bool) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.protected = protected;
+        }
     }
 
     pub fn create_workspace_with_layout(
@@ -974,6 +1067,8 @@ impl AppStateStore {
             project_root: None,
             project_uid: None,
             workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -1361,6 +1456,27 @@ impl AppStateStore {
     }
 
     pub fn set_workspace_project_root(&self, workspace_id: &str, project_root: String) {
+        // Read the on-disk checkout path + branch under a brief lock so
+        // the git subprocesses below (uid + protection) run WITHOUT
+        // holding the state mutex. The checkout to classify is the
+        // worktree dir when this is a worktree, else the project root.
+        let (checkout_path, git_branch) = {
+            let snapshot = self.inner.lock().unwrap();
+            match snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+            {
+                Some(w) => (
+                    w.worktree_path
+                        .clone()
+                        .unwrap_or_else(|| project_root.clone()),
+                    w.git_branch.clone(),
+                ),
+                None => return,
+            }
+        };
+
         // Compute the deterministic project_uid OUTSIDE the lock — the
         // git remote lookup spawns a subprocess and we don't want to
         // hold the state mutex across it. Uses the canonical remote when
@@ -1372,6 +1488,19 @@ impl AppStateStore {
             crate::project_identity::git_canonical_remote(std::path::Path::new(&project_root));
         let project_uid =
             crate::project_identity::project_uid_for(remote.as_deref(), &project_root);
+
+        // Repo-root protection (also outside the lock — more git
+        // subprocesses). Divergence-safe: a full copy under the
+        // worktrees tree is NOT protected even though its `.git` is a
+        // directory (see `crate::git::is_protected_repo_root`).
+        let protected = crate::git::is_protected_repo_root(
+            std::path::Path::new(&checkout_path),
+            git_branch.as_deref(),
+        );
+        // Cheap pure-filesystem check (no subprocess): is this checkout a
+        // divergent full copy living in the worktrees tree?
+        let divergent_copy =
+            crate::git::is_divergent_copy(std::path::Path::new(&checkout_path));
 
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -1389,6 +1518,59 @@ impl AppStateStore {
             workspace.project_root = Some(project_root);
             workspace.project_uid = Some(project_uid);
             workspace.workspace_kind = Some(kind.to_string());
+            workspace.protected = protected;
+            workspace.divergent_copy = divergent_copy;
+        }
+    }
+
+    /// Boot backfill for `protected` on workspaces that predate the
+    /// repo-unit-sync change (new workspaces get it stamped at create
+    /// time in `set_workspace_project_root`). Spawns git subprocesses
+    /// per workspace, so callers MUST run this off the app-startup path
+    /// (a background thread). Skips remote (host-backed) workspaces —
+    /// their files may not exist locally and they're never protected on
+    /// this device.
+    pub fn backfill_workspace_protection(&self) {
+        // Snapshot the inputs (id, checkout path, branch) under a brief
+        // lock so the git work below runs unlocked.
+        let inputs: Vec<(String, String, Option<String>)> = {
+            let snapshot = self.inner.lock().unwrap();
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|w| w.host_id.is_none())
+                .map(|w| {
+                    let checkout = w
+                        .worktree_path
+                        .clone()
+                        .or_else(|| w.project_root.clone())
+                        .unwrap_or_else(|| w.cwd.clone());
+                    (w.workspace_id.0.clone(), checkout, w.git_branch.clone())
+                })
+                .collect()
+        };
+
+        let computed: Vec<(String, bool, bool)> = inputs
+            .into_iter()
+            .map(|(id, checkout, branch)| {
+                let path = std::path::Path::new(&checkout);
+                let protected =
+                    crate::git::is_protected_repo_root(path, branch.as_deref());
+                let divergent_copy = crate::git::is_divergent_copy(path);
+                (id, protected, divergent_copy)
+            })
+            .collect();
+
+        let mut snapshot = self.inner.lock().unwrap();
+        for (id, protected, divergent_copy) in computed {
+            if let Some(w) = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id.0 == id)
+            {
+                w.protected = protected;
+                w.divergent_copy = divergent_copy;
+            }
         }
     }
 
@@ -3353,6 +3535,8 @@ fn default_app_state() -> AppStateSnapshot {
             project_root: None,
             project_uid: None,
             workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -4702,6 +4886,48 @@ mod tests {
         assert!(
             workspace.tabs.is_empty(),
             "Shell must have no tabs",
+        );
+    }
+
+    #[test]
+    fn create_synced_root_shell_registers_a_repo_root_not_a_worktree() {
+        // Adopting a `main` row creates a ROOT shell: it lands at the
+        // project root (~/.codemux/projects/<repo>), has NO worktree_path,
+        // and is kind "main" — so it classifies as a genuine repo root
+        // rather than a divergent copy in the worktrees tree.
+        let store = AppStateStore::default();
+        let wid = store.create_synced_root_shell(
+            "passpage".into(),
+            42,
+            "/home/zeus/.codemux/projects/passpage".into(),
+            Some("main".into()),
+        );
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == wid)
+            .expect("root shell registered");
+        assert_eq!(ws.host_id, Some(42));
+        assert_eq!(ws.worktree_path, None, "a repo root has no worktree_path");
+        assert_eq!(ws.cwd, "/home/zeus/.codemux/projects/passpage");
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some("/home/zeus/.codemux/projects/passpage"),
+        );
+        assert_eq!(ws.workspace_kind.as_deref(), Some("main"));
+        assert!(!ws.protected, "protected is stamped after the pull lands");
+
+        // The protected setter flips it without touching identity.
+        store.set_workspace_protected(&wid.0, true);
+        assert!(
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == wid)
+                .unwrap()
+                .protected
         );
     }
 

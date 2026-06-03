@@ -471,7 +471,7 @@ pub async fn workspaces_adopt_synced(
     // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
     // State<'_> guard is dropped before we await anything (Tauri's
     // State is not Send across awaits).
-    let (workspace_id, worktree_path, adopted_project_uid, adopted_kind) = {
+    let (workspace_id, worktree_path, adopted_project_uid, adopted_kind, is_root) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
         let app_state: tauri::State<'_, crate::state::AppStateStore> =
             app.state();
@@ -529,10 +529,17 @@ pub async fn workspaces_adopt_synced(
                 )
             })?;
 
-        // Compute canonical local path. Mirrors the suggested_path
-        // logic in `workspaces_adoption_preview` exactly — including the
-        // title fallback — so the path the dialog previews is the path
-        // adoption actually lands at.
+        // A `main` row is the repo ROOT. Land it at
+        // `~/.codemux/projects/<repo>` — a genuine root that classifies
+        // as protected — instead of in the worktrees tree, where a root
+        // checkout gets mistaken for a disposable worktree (the
+        // divergent-copy bug). Null/legacy rows keep the conventional
+        // worktree landing for backward-compat. NOTE: the rsync SOURCE on
+        // the host is resolved independently inside
+        // `workspace_pull_back_impl` (from `origin_path` / the
+        // conventional path), so only the LOCAL landing + classification
+        // change here.
+        let is_root = row.workspace_kind.as_deref() == Some("main");
         let project_name = row
             .project_path
             .as_deref()
@@ -541,14 +548,27 @@ pub async fn workspaces_adopt_synced(
             .filter(|n| !n.is_empty())
             .unwrap_or(row.title.as_str());
         let branch = row.git_branch.as_deref().unwrap_or("main");
-        let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
-        let conv_str = conv.to_string_lossy().to_string();
-        let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
-            dirs::home_dir()
-                .map(|h| h.join(rest).to_string_lossy().to_string())
-                .unwrap_or(conv_str.clone())
+        let worktree_path = if is_root {
+            let home =
+                dirs::home_dir().ok_or_else(|| "home directory unavailable".to_string())?;
+            home.join(".codemux")
+                .join("projects")
+                .join(project_name)
+                .to_string_lossy()
+                .to_string()
         } else {
-            conv_str.clone()
+            // Mirrors the suggested_path logic in
+            // `workspaces_adoption_preview` so the dialog preview matches
+            // where adoption lands.
+            let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
+            let conv_str = conv.to_string_lossy().to_string();
+            if let Some(rest) = conv_str.strip_prefix("~/") {
+                dirs::home_dir()
+                    .map(|h| h.join(rest).to_string_lossy().to_string())
+                    .unwrap_or(conv_str.clone())
+            } else {
+                conv_str.clone()
+            }
         };
 
         // Path collision check — refuse to clobber a workspace that
@@ -566,14 +586,25 @@ pub async fn workspaces_adopt_synced(
         }
 
         // Create the local shell. host_id is set so the upcoming
-        // pull-back call routes to the right host.
-        let workspace_id = app_state.create_synced_workspace_shell(
-            row.title.clone(),
-            local_host.id,
-            row.project_path.clone(),
-            worktree_path.clone(),
-            row.git_branch.clone(),
-        );
+        // pull-back call routes to the right host. A root row gets a
+        // root shell (no worktree_path, kind "main"); everything else
+        // gets the worktree-style shell.
+        let workspace_id = if is_root {
+            app_state.create_synced_root_shell(
+                row.title.clone(),
+                local_host.id,
+                worktree_path.clone(),
+                row.git_branch.clone(),
+            )
+        } else {
+            app_state.create_synced_workspace_shell(
+                row.title.clone(),
+                local_host.id,
+                row.project_path.clone(),
+                worktree_path.clone(),
+                row.git_branch.clone(),
+            )
+        };
         let workspace_id_str = workspace_id.0.clone();
 
         // Link the sync row to the new local id so subsequent
@@ -586,6 +617,7 @@ pub async fn workspaces_adopt_synced(
             worktree_path,
             row.project_uid.clone(),
             row.workspace_kind.clone(),
+            is_root,
         )
     };
 
@@ -639,6 +671,33 @@ pub async fn workspaces_adopt_synced(
             adopted_project_uid,
             adopted_kind,
         );
+    }
+
+    // For an adopted repo ROOT, stamp `protected` now (off-thread git)
+    // so the overview guards it immediately instead of waiting for the
+    // next boot backfill. The root landed at ~/.codemux/projects/<repo>,
+    // so it classifies as a genuine (non-divergent) root.
+    if is_root {
+        let branch_owned = {
+            let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+            app_state
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+                .and_then(|w| w.git_branch.clone())
+        };
+        let landing_for_check = worktree_path.clone();
+        let protected = tokio::task::spawn_blocking(move || {
+            crate::git::is_protected_repo_root(
+                std::path::Path::new(&landing_for_check),
+                branch_owned.as_deref(),
+            )
+        })
+        .await
+        .unwrap_or(false);
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state.set_workspace_protected(&workspace_id, protected);
     }
 
     // Step 9: nudge the reconcile so the server learns the workspace

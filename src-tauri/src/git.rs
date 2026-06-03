@@ -1682,6 +1682,284 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
 ///
 /// Returns the local worktree path. The branch must already exist in
 /// the repo (it came over with the rsync); we attach it, never create.
+/// Identity of the git repository a path belongs to, resolved via a
+/// single `git rev-parse`. Distinguishes the genuine repo root from a
+/// linked worktree, and surfaces the *canonical* root (the main working
+/// tree) so the sync layer can treat a repo + its worktrees as one
+/// connected unit instead of independent folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRoot {
+    /// Working-tree root (`git rev-parse --show-toplevel`). `None` for a
+    /// bare repository (no working tree).
+    pub toplevel: Option<PathBuf>,
+    /// The shared git dir (`--git-common-dir`), absolute. For a linked
+    /// worktree this points at the parent repo's `.git`; for the main
+    /// checkout it is this repo's own `.git`.
+    pub common_dir: PathBuf,
+    /// True when this path is a linked worktree — its per-worktree
+    /// `--git-dir` differs from the shared `--git-common-dir`.
+    pub is_worktree: bool,
+    /// True for a bare repository.
+    pub is_bare: bool,
+}
+
+impl RepoRoot {
+    /// The canonical repo root: the main working tree that owns the
+    /// shared object store. For a linked worktree this is the *parent*
+    /// repo (not the worktree dir); for the main checkout it is the
+    /// checkout itself. Derived from `common_dir` by stripping the
+    /// trailing `.git` leaf, falling back to `toplevel` for unusual /
+    /// bare layouts.
+    pub fn canonical_root_path(&self) -> PathBuf {
+        if self.common_dir.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            self.common_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.common_dir.clone())
+        } else {
+            // Bare repo or non-standard layout: the common dir IS the repo.
+            self.toplevel
+                .clone()
+                .unwrap_or_else(|| self.common_dir.clone())
+        }
+    }
+}
+
+/// Resolve the canonical git identity of `path`. Returns `None` when the
+/// path is not inside a git repository. Uses one combined `rev-parse`
+/// for `--git-dir`/`--git-common-dir` (both valid in bare repos and
+/// linked worktrees), then a permissive `--show-toplevel` (which is empty
+/// for bare repos) and a permissive `--is-bare-repository`.
+pub fn git_canonical_root(path: &Path) -> Option<RepoRoot> {
+    let combined = run_git(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = combined.lines();
+    let resolve = |raw: &str| -> Option<PathBuf> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(s);
+        Some(if p.is_absolute() { p } else { path.join(p) })
+    };
+    let git_dir = resolve(lines.next()?)?;
+    let common_dir = resolve(lines.next()?)?;
+
+    let is_bare = run_git_permissive(path, &["rev-parse", "--is-bare-repository"]) == "true";
+    let toplevel = {
+        let raw = run_git_permissive(path, &["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+        let t = raw.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(t))
+        }
+    };
+
+    Some(RepoRoot {
+        toplevel,
+        is_worktree: git_dir != common_dir,
+        common_dir,
+        is_bare,
+    })
+}
+
+/// True when `path` looks like a *divergent full copy* of a repo rather
+/// than a genuine linked worktree — the failure mode the repo-unit sync
+/// fix targets. A real linked worktree always has a `.git` **file**
+/// (a gitdir pointer); a divergent copy has its own `.git` **directory**
+/// (its own object store) yet sits under `~/.codemux/worktrees/`, where
+/// only linked worktrees are ever supposed to live. So a `.git` directory
+/// in that tree is the unmistakable signature of a whole-dir copy (the
+/// old default-branch rsync fallback), not a legitimate checkout.
+pub fn is_divergent_copy(path: &Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    is_divergent_copy_under(path, &home.join(".codemux").join("worktrees"))
+}
+
+/// Testable core of [`is_divergent_copy`] with the worktrees root injected.
+fn is_divergent_copy_under(path: &Path, worktrees_root: &Path) -> bool {
+    path.join(".git").is_dir() && path.starts_with(worktrees_root)
+}
+
+/// True when `checkout` is the repo's protected default-branch root —
+/// the entry the overview must not let you delete like a disposable
+/// worktree. It qualifies only when ALL hold:
+/// - it's a genuine main checkout (not a linked worktree, not bare),
+/// - it is NOT a divergent full copy living in the worktrees tree
+///   (those are reconciled, not protected — see [`is_divergent_copy`]),
+/// - and it is checked out on the repo's default branch.
+///
+/// Returns `false` (fail-open to "deletable") for non-repos, detached
+/// HEADs, or when the default branch can't be resolved — we only ever
+/// add protection when we're sure, never block deletion on a guess.
+pub fn is_protected_repo_root(checkout: &Path, git_branch: Option<&str>) -> bool {
+    let Some(info) = git_canonical_root(checkout) else {
+        return false;
+    };
+    if info.is_worktree || info.is_bare {
+        return false;
+    }
+    if is_divergent_copy(checkout) {
+        return false;
+    }
+    match (git_branch, find_default_branch(checkout)) {
+        (Some(branch), Some(default)) => branch == default,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "--initial-branch=main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-m", "init"]);
+    }
+
+    /// Compare two paths by resolved identity rather than raw string —
+    /// git emits forward-slash, non-verbatim paths while Rust's
+    /// `canonicalize` yields `\\?\` extended-length paths on Windows and
+    /// `/private/var` on macOS. Canonicalising both sides makes the
+    /// equality assertions platform-agnostic; we feed git the
+    /// non-canonicalised temp path so it never sees a `\\?\` prefix
+    /// (which `git worktree add` rejects on Windows).
+    fn same_path(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn canonical_root_for_main_checkout_is_itself() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let info = git_canonical_root(&repo).expect("repo root");
+        assert!(!info.is_worktree, "main checkout is not a worktree");
+        assert!(!info.is_bare);
+        assert!(same_path(info.toplevel.as_deref().unwrap(), &repo));
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
+        assert!(same_path(&info.canonical_root_path(), &repo));
+    }
+
+    #[test]
+    fn canonical_root_for_linked_worktree_points_at_parent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = tmp.path().join("wt");
+        run(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+
+        // A real linked worktree has a `.git` FILE.
+        assert!(wt.join(".git").is_file(), "linked worktree gitfile");
+
+        let info = git_canonical_root(&wt).expect("worktree root");
+        assert!(info.is_worktree, "linked worktree detected");
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
+        // The canonical root is the PARENT repo, not the worktree dir.
+        assert!(same_path(&info.canonical_root_path(), &repo));
+    }
+
+    #[test]
+    fn canonical_root_none_for_non_repo() {
+        let tmp = TempDir::new().unwrap();
+        assert!(git_canonical_root(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn divergent_copy_detected_only_for_git_dir_under_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let worktrees = tmp.path().join(".codemux").join("worktrees");
+
+        // A whole-dir COPY: `.git` is a directory, living under the
+        // worktrees tree -> divergent copy (the bug signature).
+        let copy = worktrees.join("passpage").join("main");
+        std::fs::create_dir_all(copy.join(".git")).unwrap();
+        assert!(is_divergent_copy_under(&copy, &worktrees));
+
+        // A genuine linked worktree: `.git` is a FILE -> not a copy.
+        let real_wt = worktrees.join("passpage").join("feature");
+        std::fs::create_dir_all(&real_wt).unwrap();
+        std::fs::write(real_wt.join(".git"), "gitdir: /repo/.git/worktrees/feature\n").unwrap();
+        assert!(!is_divergent_copy_under(&real_wt, &worktrees));
+
+        // A real repo root OUTSIDE the worktrees tree -> not a copy even
+        // though `.git` is a directory.
+        let real_root = tmp.path().join("projects").join("passpage");
+        std::fs::create_dir_all(real_root.join(".git")).unwrap();
+        assert!(!is_divergent_copy_under(&real_root, &worktrees));
+    }
+
+    #[test]
+    fn protected_for_main_checkout_on_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        assert!(is_protected_repo_root(&repo, Some("main")));
+    }
+
+    #[test]
+    fn not_protected_for_worktree_or_wrong_branch_or_non_repo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // A linked worktree is never the protected root.
+        let wt = root.join("wt");
+        run(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+        assert!(!is_protected_repo_root(&wt, Some("feature")));
+
+        // The root checked out on a NON-default branch is not protected
+        // (only the default-branch checkout is).
+        run(&repo, &["checkout", "-b", "side"]);
+        assert!(!is_protected_repo_root(&repo, Some("side")));
+
+        // Not a repo at all.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_protected_repo_root(&plain, Some("main")));
+    }
+}
+
 pub fn git_recreate_worktree_for_adopted_repo(
     repo_path: &Path,
     branch: &str,

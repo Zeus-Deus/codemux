@@ -487,6 +487,11 @@ pub async fn workspace_push_to_host(
         .git_branch
         .clone()
         .unwrap_or_else(|| "main".to_string());
+    // A repo ROOT (kind "main", no worktree_path) pushes to
+    // ~/.codemux/projects/<repo> on the host — OUTSIDE the worktrees
+    // tree — so it isn't materialised as a divergent worktree-style
+    // copy. Worktrees keep the conventional worktrees layout.
+    let is_root = ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
 
     #[cfg(unix)]
     {
@@ -518,8 +523,11 @@ pub async fn workspace_push_to_host(
             );
         }
 
-        let remote_path =
-            crate::ssh::conventional_remote_path(&project_name, &branch);
+        let remote_path = if is_root {
+            crate::workspace_paths::conventional_remote_root_path(&project_name)
+        } else {
+            crate::ssh::conventional_remote_path(&project_name, &branch)
+        };
         let remote_path_str = remote_path.to_string_lossy().to_string();
         let opts = crate::ssh::PushOptions::new(
             &host.ssh_target,
@@ -753,7 +761,7 @@ pub async fn workspace_push_to_host(
     }
     #[cfg(not(unix))]
     {
-        let _ = (local_worktree, project_name, branch, host);
+        let _ = (local_worktree, project_name, branch, host, is_root);
         Ok(WorkspacePushOutcome {
             ok: false,
             message: "SSH transport is Unix-only for now.".into(),
@@ -853,22 +861,54 @@ pub async fn workspace_pull_back_impl(
 
     #[cfg(unix)]
     {
-        // Prefer the workspace's REAL recorded path on the host
-        // (`origin_path`, set by the inventory poller from the daemon
-        // registry). Only reconstruct the conventional path when we have
-        // no recorded origin — i.e. a workspace this device pushed, where
-        // the remote path IS the conventional one.
-        let remote_path_str = origin_path.clone().unwrap_or_else(|| {
-            crate::ssh::conventional_remote_path(&project_name, &branch)
-                .to_string_lossy()
-                .to_string()
-        });
-        let opts = crate::ssh::PullOptions::new(
-            &host.ssh_target,
-            &remote_path_str,
-            &local_worktree,
-        );
-        let result = crate::ssh::pull_workspace_back(opts).await;
+        // Source path resolution. Prefer the workspace's REAL recorded
+        // path on the host (`origin_path`, set by the inventory poller
+        // from the daemon registry). Otherwise reconstruct the
+        // conventional path: a repo ROOT lives under `projects/`
+        // (repo-unit sync), a worktree/legacy workspace under the
+        // `worktrees/` tree. For a root with no recorded origin we try
+        // `projects/` first and FALL BACK to the legacy `worktrees/`
+        // path, so roots pushed before the repo-unit change still pull.
+        let is_root =
+            ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
+        let mut candidate_sources: Vec<String> = Vec::new();
+        if let Some(op) = origin_path.clone() {
+            candidate_sources.push(op);
+        } else if is_root {
+            candidate_sources.push(
+                crate::workspace_paths::conventional_remote_root_path(&project_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            candidate_sources.push(
+                crate::ssh::conventional_remote_path(&project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else {
+            candidate_sources.push(
+                crate::ssh::conventional_remote_path(&project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+
+        // Try each candidate; only a "remote path missing" outcome is
+        // worth retrying the next one — success / rsync error / host
+        // unreachable are all authoritative.
+        let mut result_opt = None;
+        for src in &candidate_sources {
+            let opts =
+                crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
+            let r = crate::ssh::pull_workspace_back(opts).await;
+            let keep_trying = matches!(r, crate::ssh::PullResult::RemoteNotFound { .. });
+            result_opt = Some(r);
+            if !keep_trying {
+                break;
+            }
+        }
+        // candidate_sources is never empty, so this always resolves.
+        let result = result_opt.expect("at least one pull source candidate");
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
                 // Symmetric Claude JSONL sync (remote → local) BEFORE
@@ -901,10 +941,16 @@ pub async fn workspace_pull_back_impl(
                                     .trim()
                                     .to_string();
                             if !remote_home.is_empty() {
-                                let conv = crate::ssh::conventional_remote_path(
-                                    &project_name,
-                                    &branch,
-                                );
+                                let conv = if is_root {
+                                    crate::workspace_paths::conventional_remote_root_path(
+                                        &project_name,
+                                    )
+                                } else {
+                                    crate::ssh::conventional_remote_path(
+                                        &project_name,
+                                        &branch,
+                                    )
+                                };
                                 let conv_str = conv.to_string_lossy();
                                 let remote_rel = conv_str
                                     .strip_prefix("~/")

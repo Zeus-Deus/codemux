@@ -763,6 +763,17 @@ export interface WorkspaceSnapshot {
   /** "main" (repo root checkout) | "worktree". Optional for the same
    *  reason. */
   workspace_kind?: string | null;
+  /** True when this is the repo's protected default-branch root
+   *  checkout — the overview must not let it be deleted like a
+   *  disposable worktree. Divergence-safe: a full copy living under
+   *  ~/.codemux/worktrees/ is NOT protected. Defaults to false on
+   *  older snapshots. */
+  protected?: boolean;
+  /** True when this checkout is a legacy divergent full copy of a repo
+   *  (its own object store) sitting in the worktrees tree — not linked
+   *  to the real repo's history. The overview warns so the user can
+   *  re-pull cleanly. Defaults to false. */
+  divergent_copy?: boolean;
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;

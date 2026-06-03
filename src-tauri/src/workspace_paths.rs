@@ -55,6 +55,41 @@ pub fn conventional_remote_path(project_name: &str, branch: &str) -> PathBuf {
 }
 
 /// Expand a `~/` prefix using the OS-detected home dir. Returns the
+/// The canonical layout for a repo ROOT (default-branch) checkout:
+///
+/// ```text
+/// ~/.codemux/projects/<project>
+/// ```
+///
+/// Distinct from [`conventional_remote_path`] (the `worktrees/` tree,
+/// for per-branch worktrees). A repo root must live OUTSIDE the
+/// worktrees tree so it isn't mistaken for a disposable worktree (the
+/// divergent-copy bug). Same sanitisation + `~/`-prefix contract as
+/// [`conventional_remote_path`].
+pub fn conventional_remote_root_path(project_name: &str) -> PathBuf {
+    fn sanitize(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    }
+    let p = sanitize(project_name);
+    let p = if p.is_empty() {
+        "workspace".to_string()
+    } else {
+        p
+    };
+    PathBuf::from(format!("~/.codemux/projects/{p}"))
+}
+
+/// Expand a `~/` prefix using the OS-detected home dir. Returns the
 /// input unchanged when no `~/` prefix is present. Falls back to
 /// the raw path when home_dir is unavailable.
 pub fn expand_tilde(p: &Path) -> PathBuf {
@@ -95,6 +130,25 @@ mod tests {
         assert_eq!(
             p.to_string_lossy(),
             "~/.codemux/worktrees/a_b.c-d/x_y.z-1",
+        );
+    }
+
+    #[test]
+    fn root_path_lives_under_projects_not_worktrees() {
+        // A repo root lands under projects/, never in the worktrees tree,
+        // so it can't be mistaken for a disposable worktree.
+        assert_eq!(
+            conventional_remote_root_path("passpage").to_string_lossy(),
+            "~/.codemux/projects/passpage",
+        );
+        // Sanitisation + empty-default match conventional_remote_path.
+        assert_eq!(
+            conventional_remote_root_path("my/proj").to_string_lossy(),
+            "~/.codemux/projects/my-proj",
+        );
+        assert_eq!(
+            conventional_remote_root_path("").to_string_lossy(),
+            "~/.codemux/projects/workspace",
         );
     }
 }
