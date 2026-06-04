@@ -239,7 +239,77 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
         }
     }
 
+    // Collapse cross-device duplicate sibling rows (see `dedupe_sibling_rows`).
+    dedupe_sibling_rows(db);
+
     Ok(())
+}
+
+/// Collapse duplicate **un-adopted sibling** rows that describe the same
+/// physical remote workspace.
+///
+/// When Device A and Device B both poll the same host before either's push
+/// lands, each POSTs its own cloud row for one workspace; after a pull both
+/// devices then see two cards. Until the server enforces uniqueness
+/// (TODO(server): unique partial index on `codemux_workspaces(origin_uid)`
+/// — lives in the `codemux-api` repo), we converge client-side: group
+/// un-adopted siblings (`workspace_id IS NULL`) by `(host, origin_uid)` —
+/// or, since `origin_uid` is local-only and absent on cloud-pulled rows, by
+/// `(host, project_uid, branch, kind)` — keep the canonical row (one with a
+/// `server_id`, lowest id), and tombstone the rest so the next push removes
+/// the cloud duplicate. Adopted rows (a real local workspace) are never
+/// touched.
+fn dedupe_sibling_rows(db: &DatabaseStore) {
+    use std::collections::HashMap;
+    let rows = db.list_workspaces_sync();
+    let mut groups: HashMap<String, Vec<&crate::database::WorkspaceSyncRecord>> =
+        HashMap::new();
+    for r in &rows {
+        // Only un-adopted siblings are dedup candidates; an adopted row is a
+        // real local workspace, not a duplicate card.
+        if r.workspace_id.is_some() {
+            continue;
+        }
+        let Some(host) = r.host_server_id.as_deref() else {
+            continue;
+        };
+        let key = if let Some(uid) = r.origin_uid.as_deref() {
+            format!("u|{host}|{uid}")
+        } else if let Some(puid) = r.project_uid.as_deref() {
+            format!(
+                "p|{host}|{puid}|{}|{}",
+                r.git_branch.as_deref().unwrap_or(""),
+                r.workspace_kind.as_deref().unwrap_or(""),
+            )
+        } else {
+            // No stable identity to group on — leave it alone.
+            continue;
+        };
+        groups.entry(key).or_default().push(r);
+    }
+    for (_key, mut group) in groups {
+        if group.len() < 2 {
+            continue;
+        }
+        // Keeper = a row WITH a server_id first (already known to the cloud),
+        // then lowest server_id, then lowest local id. Index 0 survives.
+        group.sort_by(|a, b| {
+            b.server_id
+                .is_some()
+                .cmp(&a.server_id.is_some())
+                .then_with(|| a.server_id.cmp(&b.server_id))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let keep = group[0].id;
+        for dup in &group[1..] {
+            eprintln!(
+                "[workspaces-sync] collapsing duplicate sibling row id={} \
+                 (keeping id={keep})",
+                dup.id
+            );
+            let _ = db.soft_delete_remote_discovered_workspace_sync_by_id(dup.id);
+        }
+    }
 }
 
 /// Push every dirty local row to the server. Each row is handled
@@ -738,6 +808,44 @@ mod tests {
             Some("worktree"),
             "server pull updates workspace_kind in place"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn dedupe_collapses_cross_device_duplicate_siblings() {
+        let db = fresh_db();
+        // The cross-device race: two cloud rows for ONE physical workspace,
+        // both un-adopted siblings, same host + project_uid + branch + kind,
+        // origin_uid null (it's local-only, absent on cloud-pulled rows).
+        db.upsert_workspace_sync_from_server(
+            "S1", "proj", Some("host-1"), Some("/srv/proj"), None,
+            Some("main"), None, "t", "t", None, Some("puid-1"), Some("main"),
+        )
+        .unwrap();
+        db.upsert_workspace_sync_from_server(
+            "S2", "proj", Some("host-1"), Some("/srv/proj"), None,
+            Some("main"), None, "t", "t", None, Some("puid-1"), Some("main"),
+        )
+        .unwrap();
+        assert_eq!(db.list_workspaces_sync().len(), 2, "two dup cards before");
+
+        super::dedupe_sibling_rows(&db);
+
+        // Exactly one survives — the lowest server_id (S1); S2 is tombstoned.
+        let live = db.list_workspaces_sync();
+        assert_eq!(live.len(), 1, "duplicate collapsed to one");
+        assert_eq!(live[0].server_id.as_deref(), Some("S1"));
+
+        // An ADOPTED row sharing the same identity is NOT a dedup candidate.
+        db.link_workspace_sync_to_local("S1", "ws-local").unwrap();
+        db.upsert_workspace_sync_from_server(
+            "S3", "proj", Some("host-1"), Some("/srv/proj"), None,
+            Some("main"), None, "t", "t", None, Some("puid-1"), Some("main"),
+        )
+        .unwrap();
+        super::dedupe_sibling_rows(&db);
+        // S1 (adopted) + S3 (sibling) both remain — adopted rows are spared.
+        assert_eq!(db.list_workspaces_sync().len(), 2);
     }
 
     #[test]

@@ -11,6 +11,41 @@ use tauri::{Manager, State};
 
 use crate::database::{DatabaseStore, WorkspaceSyncRecord};
 
+// ── Adoption serialization lock ──
+//
+// Two near-simultaneous adopts of the SAME row — a double-clicked "Pull",
+// or the host-inventory poller racing a manual pull — would both pass the
+// `workspace_id`-already-set idempotency guard (a TOCTOU window) and create
+// duplicate local shells / clobber the same landing path. A per-key async
+// lock serializes them so the second waits, then sees the first's result
+// and short-circuits. Mirrors Superset's `workspaceCreateLocks`.
+//
+// Keyed by `server_id` (the row identity). The map grows by one entry per
+// distinct row ever adopted on this device — bounded in practice, and the
+// guard is the whole point, so we don't bother pruning.
+fn adopt_locks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>
+{
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Acquire the adoption lock for `key`, awaiting any in-flight adopt of the
+/// same key. Hold the returned guard for the whole adopt body.
+async fn acquire_adopt_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let mutex = {
+        let mut map = adopt_locks().lock().unwrap();
+        map.entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    mutex.lock_owned().await
+}
+
 /// Wire shape sent to the frontend. Matches the field naming the
 /// existing UI expects (snake_case from Rust, camelCase from
 /// serde-rename on JS-facing structs would be inconsistent with the
@@ -455,6 +490,11 @@ pub async fn workspaces_adopt_synced(
     app: tauri::AppHandle,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
+    // Serialize concurrent adopts of this same row (double-click, or poller
+    // racing a manual pull) so they can't both slip past the idempotency
+    // guard and duplicate the local shell. Held for the whole adopt.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
     // A `worktree` row can't be pulled as a standalone directory: its
     // `.git` is a gitfile pointing at a parent repo that doesn't exist
     // on this device, so a bare rsync of the worktree dir lands with
@@ -997,6 +1037,9 @@ pub async fn workspaces_adopt_via_clone(
     app: tauri::AppHandle,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
+    // Same per-row serialization as the host-backed adopt path.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
     // Validate + compute paths in a sync scope (no awaits).
     let (project_remote, project_path, worktree_path, branch, title) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
