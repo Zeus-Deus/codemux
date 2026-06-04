@@ -524,12 +524,26 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
         }
         Ok(Some(m)) => {
             let alive = codemux_lib::remote::manifest::pid_alive(m.pid);
+            // When alive, ask the running daemon how many live PTY sessions
+            // it has. The desktop auto-upgrade reads `live_terminals` to
+            // DEFER a daemon restart that would otherwise kill host-side
+            // agents — the "don't end my work when I close my laptop"
+            // guarantee. `app_status` has been in the tool catalog since the
+            // daemon shipped, so this probe works even against an OLD running
+            // daemon during the first upgrade after this change. Best-effort:
+            // a probe failure reports null.
+            let live_terminals = if alive {
+                probe_live_terminals(&m.endpoint, &m.secret)
+            } else {
+                None
+            };
             let payload = serde_json::json!({
                 "endpoint": m.endpoint,
                 "pid": m.pid,
                 "started_at": m.started_at,
                 "host_id": m.host_id,
                 "alive": alive,
+                "live_terminals": live_terminals,
             });
             println!("{}", payload);
             if alive {
@@ -543,6 +557,25 @@ fn run_serve_status(state_dir_arg: Option<PathBuf>) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Best-effort probe of the running daemon's live PTY-session count via its
+/// `app_status` tool (`terminal_count`). Returns `None` on any failure
+/// (timeout, decode, daemon down) — callers treat `None` as "unknown".
+#[cfg(unix)]
+fn probe_live_terminals(endpoint: &str, secret: &str) -> Option<u64> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let res = http
+        .post(format!("{endpoint}/tools/call"))
+        .bearer_auth(secret)
+        .json(&serde_json::json!({ "name": "app_status", "arguments": {} }))
+        .send()
+        .ok()?;
+    let body: serde_json::Value = res.json().ok()?;
+    body.get("data")?.get("terminal_count")?.as_u64()
 }
 
 #[cfg(unix)]

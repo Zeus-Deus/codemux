@@ -171,9 +171,36 @@ async fn check_and_upgrade(
         }
     };
 
-    // Step 4: re-provision serve so the systemd unit content stays
-    // in sync AND the running daemon picks up the new binary.
-    // Idempotent + restart-based, so safe to run unconditionally.
+    // Step 4: re-provision serve so the systemd unit content stays in sync
+    // AND the running daemon picks up the new binary. This RESTARTS the
+    // systemd unit — which kills any PTY agents the user is running ON the
+    // host (the "work on a host without pulling" flow). So FIRST ask the
+    // running daemon whether it has live sessions, and if so DEFER the
+    // restart: the new binary is already on disk and will activate on the
+    // next idle upgrade or host reboot. This is the "don't end my work when
+    // I close my laptop" guarantee — an auto-upgrade must never silently
+    // kill a host agent. (Pushed-workspace agents live in the separate
+    // pty-daemon, not this serve unit, so they're unaffected either way.)
+    let live_sessions = probe_live_host_sessions(&host.ssh_target).await;
+    if let Some(n) = live_sessions {
+        if n > 0 {
+            eprintln!(
+                "[hosts_upgrade] {} upgraded binary to {new_version} but DEFERRED \
+                 daemon restart — {n} live host session(s). New binary activates on \
+                 next idle upgrade or host reboot.",
+                host.name
+            );
+            return Ok(UpgradeOutcome::Skipped {
+                reason: format!(
+                    "binary upgraded to {new_version}; daemon restart deferred — \
+                     {n} live host session(s). Restart the daemon when idle to activate."
+                ),
+            });
+        }
+    }
+
+    // No confirmed live sessions (idle, daemon down, or unknown) — safe to
+    // restart and activate the new binary now.
     if let Err(e) = provision_serve(
         &host.ssh_target,
         "~/.local/bin/codemux-remote",
@@ -194,4 +221,55 @@ async fn check_and_upgrade(
         from: current_version,
         to: new_version,
     })
+}
+
+/// Probe the host daemon for its live PTY-session count by running
+/// `codemux-remote serve status` over SSH and reading `live_terminals` from
+/// its JSON output. Returns:
+/// - `Some(n)` — the daemon answered (`n` may be 0).
+/// - `None` — couldn't determine (daemon down, ssh error, or an OLD daemon
+///   binary whose `serve status` predates the field). Callers treat `None`
+///   as "no confirmed live sessions → safe to restart", because a daemon we
+///   can't reach has nothing to lose by restarting.
+async fn probe_live_host_sessions(ssh_target: &str) -> Option<u64> {
+    use std::process::Stdio;
+    // Mirror the PATH fallback every other SSH call site uses: non-interactive
+    // SSH shells often don't have ~/.local/bin on PATH.
+    let cmd_str = "if command -v codemux-remote >/dev/null 2>&1 ; then \
+                     codemux-remote serve status ; \
+                   elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
+                     \"$HOME/.local/bin/codemux-remote\" serve status ; \
+                   fi";
+    let output = tokio::time::timeout(Duration::from_secs(12), async {
+        tokio::process::Command::new("ssh")
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                ssh_target,
+                cmd_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+    })
+    .await
+    .ok()?
+    .ok()?;
+    // `serve status` prints one JSON line to stdout (even when the daemon is
+    // down, with `live_terminals: null`). Find it and read the field.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            if let Some(n) = v.get("live_terminals").and_then(|x| x.as_u64()) {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
