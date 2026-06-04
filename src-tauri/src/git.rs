@@ -1846,6 +1846,34 @@ fn is_divergent_copy_under(path: &Path, worktrees_root: &Path) -> bool {
     path.join(".git").is_dir() && path.starts_with(worktrees_root)
 }
 
+/// Why a divergent copy can't be "reconciled away" (its workspace card
+/// detached) yet, or `None` if it's safe. Blocks on a dirty working tree or
+/// committed-but-unpushed work so a card never silently vanishes while the
+/// user has changes in flight. Reconcile never deletes files, so this is a
+/// guard against *confusion*, not data loss.
+pub fn reconcile_copy_blocker(path: &Path) -> Option<String> {
+    if let Ok(files) = git_status(path) {
+        if !files.is_empty() {
+            return Some(format!(
+                "{} uncommitted change(s) — commit or stash first",
+                files.len()
+            ));
+        }
+    }
+    if let Some(upstream) = resolve_upstream_ref(path) {
+        let out = run_git_permissive(
+            path,
+            &["rev-list", "--count", &format!("{upstream}..HEAD")],
+        );
+        if let Ok(n) = out.trim().parse::<u64>() {
+            if n > 0 {
+                return Some(format!("{n} unpushed commit(s) — push first"));
+            }
+        }
+    }
+    None
+}
+
 /// True when `checkout` is the repo's protected default-branch root —
 /// the entry the overview must not let you delete like a disposable
 /// worktree. It qualifies only when ALL hold:
@@ -2033,6 +2061,22 @@ mod repo_root_tests {
         // …but the record-stamping resolver falls back to the current branch,
         // so the daemon still records a usable default for a local-only repo.
         assert_eq!(resolve_default_branch(&repo).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn reconcile_copy_blocker_flags_dirty_allows_clean() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Clean, no upstream → safe to reconcile (nothing blocks).
+        assert!(reconcile_copy_blocker(&repo).is_none());
+
+        // Uncommitted change → blocked with guidance.
+        std::fs::write(repo.join("README.md"), "changed").unwrap();
+        let blocker = reconcile_copy_blocker(&repo).expect("dirty tree blocks");
+        assert!(blocker.contains("uncommitted"), "got: {blocker}");
     }
 
     #[test]

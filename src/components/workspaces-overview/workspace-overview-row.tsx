@@ -11,6 +11,7 @@ import {
   MoreHorizontal,
   Pencil,
   Trash2,
+  Wrench,
   Workflow,
 } from "lucide-react";
 
@@ -36,6 +37,7 @@ import {
   activateWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
+  workspacesReconcileCopy,
   renameWorkspace,
   workspacePullBack,
   workspacePushToHost,
@@ -312,6 +314,16 @@ function LocalRow({
     );
   }, [workspace.workspace_id, workspace.title, canRemoveWorktree, isRepoRoot]);
 
+  const handleReconcileCopy = useCallback(() => {
+    workspacesReconcileCopy(workspace.workspace_id)
+      .then((msg) => toast.success("Reconciled standalone copy", { description: msg }))
+      .catch((err) =>
+        toast.error("Couldn't reconcile copy", {
+          description: err instanceof Error ? err.message : String(err),
+        }),
+      );
+  }, [workspace.workspace_id]);
+
   const handleCopyBranch = useCallback(() => {
     if (workspace.git_branch) {
       navigator.clipboard
@@ -531,6 +543,16 @@ function LocalRow({
                       ))}
                     </DropdownMenuSubContent>
                   </DropdownMenuSub>
+                )}
+
+                {isDivergentCopy && (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={handleReconcileCopy}>
+                      <Wrench className="mr-2 size-3.5" />
+                      Reconcile copy…
+                    </DropdownMenuItem>
+                  </>
                 )}
 
                 <DropdownMenuSeparator />

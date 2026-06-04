@@ -1323,6 +1323,62 @@ pub async fn workspaces_adopt_project(
     })
 }
 
+/// Non-destructively "reconcile" a divergent standalone copy — the full
+/// `.git`-dir copy that lands under `~/.codemux/worktrees/<repo>/<branch>`
+/// and gets flagged with the amber "standalone copy" chip. Detaches its
+/// workspace card (so the project reads cleanly; the user can then "Pull
+/// project" to get a proper protected root) — **files are left on disk,
+/// never deleted**. Refuses when the copy has uncommitted changes or
+/// unpushed commits, returning guidance, so a card never disappears while
+/// the user has work in flight.
+#[tauri::command]
+pub async fn workspaces_reconcile_copy(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<String, String> {
+    // Resolve the copy's on-disk path from app_state (sync scope).
+    let path = {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.worktree_path.clone().unwrap_or_else(|| w.cwd.clone()))
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?
+    };
+
+    // Off-thread git checks: must be a divergent copy and safe to detach.
+    let blocker = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        if !crate::git::is_divergent_copy(p) {
+            return Err(
+                "This workspace isn't a standalone copy — nothing to reconcile.".to_string(),
+            );
+        }
+        Ok(crate::git::reconcile_copy_blocker(p))
+    })
+    .await
+    .map_err(|e| format!("git check join failed: {e}"))??;
+
+    if let Some(reason) = blocker {
+        return Err(format!("Can't reconcile yet: {reason}."));
+    }
+
+    // Safe: detach the copy's workspace card. close_workspace (state-level)
+    // removes the workspace from app_state WITHOUT deleting the directory —
+    // the files (and any local-only history) stay on disk.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state.close_workspace(&workspace_id)?;
+    }
+    crate::state::emit_app_state(&app);
+
+    Ok("Closed the standalone copy (files kept on disk). Use \"Pull project\" \
+        to materialize a proper repo root."
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

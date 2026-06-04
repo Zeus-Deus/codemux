@@ -1874,3 +1874,9 @@ export interface ProjectAdoptOutcome {
  *  collected (non-fatal); a root failure rejects. */
 export const workspacesAdoptProject = (projectUid: string) =>
   invoke<ProjectAdoptOutcome>("workspaces_adopt_project", { projectUid });
+
+/** Non-destructively reconcile a divergent "standalone copy": detaches its
+ *  workspace card (files kept on disk) when it's clean, or rejects with
+ *  guidance when it has uncommitted/unpushed work. */
+export const workspacesReconcileCopy = (workspaceId: string) =>
+  invoke<string>("workspaces_reconcile_copy", { workspaceId });
