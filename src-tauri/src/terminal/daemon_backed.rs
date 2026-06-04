@@ -284,6 +284,28 @@ pub async fn spawn_pty_for_agent_via_daemon(
         },
     );
 
+    // OpenFlow comm-log tee (parity with the in-process reader). Without
+    // this, OpenFlow agents on the daemon spawn path — the default since
+    // persistent agents — wrote an EMPTY comm log, so the orchestrator's
+    // stuck-detection / progress analysis went blind. Same env contract as
+    // the in-process path: `CODEMUX_COMMUNICATION_LOG` + the instance id
+    // (preferred) or bare role.
+    let comm_log: Option<(std::sync::Arc<std::sync::Mutex<std::fs::File>>, String)> = {
+        let path = extra_env
+            .iter()
+            .find(|(k, _)| k == "CODEMUX_COMMUNICATION_LOG")
+            .map(|(_, v)| v.clone());
+        let role = extra_env
+            .iter()
+            .find(|(k, _)| k == "CODEMUX_AGENT_INSTANCE_ID")
+            .or_else(|| extra_env.iter().find(|(k, _)| k == "CODEMUX_AGENT_ROLE"))
+            .map(|(_, v)| v.clone());
+        match (path, role) {
+            (Some(p), Some(r)) => Some((super::get_comm_log_lock(&p), r)),
+            _ => None,
+        }
+    };
+
     // Reader task — drains the daemon's mpsc and pushes bytes through the
     // same `queue_or_send_output` the in-process path uses.
     let read_sessions = sessions.clone();
@@ -292,6 +314,18 @@ pub async fn spawn_pty_for_agent_via_daemon(
     let read_client = client.clone();
     tauri::async_runtime::spawn(async move {
         while let Some(chunk) = rx.recv().await {
+            // Tee to the comm log BEFORE handing the chunk off (moved) to the
+            // output queue. Flush per chunk — daemon chunks are already
+            // coalesced and OpenFlow needs the log live for stuck-detection.
+            if let Some((ref log_lock, ref role)) = comm_log {
+                if let Some(entry) = super::comm_log_entry_for_chunk(role, &chunk) {
+                    if let Ok(mut file) = log_lock.lock() {
+                        use std::io::Write;
+                        let _ = file.write_all(entry.as_bytes());
+                        let _ = file.flush();
+                    }
+                }
+            }
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
         }
         eprintln!(
@@ -315,11 +349,8 @@ pub async fn spawn_pty_for_agent_via_daemon(
     //
     // - resource-monitor / process-tree views read `child_pid`; that's the
     //   daemon-side pid, which is correct (it's the actual agent process).
-    // - `comm_log` setup: TODO. The in-process path tees comm log writes
-    //   from inside the read loop; we'd need to do the same here. Marking
-    //   as a follow-up because comm-log is OpenFlow-specific and step 1's
-    //   only goal is "agents survive app close" — OpenFlow agents can opt
-    //   out of persistence for now.
+    // - `comm_log`: teed in the reader task above (parity with the
+    //   in-process path), so OpenFlow agents work on the daemon spawn path.
 
     Ok(())
 }
