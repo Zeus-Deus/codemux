@@ -61,6 +61,10 @@ import {
 } from "@/components/overlays/confirm-push-dialog";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
+import {
+  useTunnelStatusStore,
+  tunnelStatusKind,
+} from "@/stores/tunnel-status-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
@@ -589,6 +593,11 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const canDelete = !isPrimary && !isRepoRoot;
   const isRemote =
     workspace.host_id !== null && workspace.host_id !== undefined;
+  // SSH tunnel health for this remote workspace (sleep/wake, WiFi flap,
+  // circuit-breaker). null for local/healthy → no pill.
+  const tunnelKind = tunnelStatusKind(
+    useTunnelStatusStore((s) => s.byWorkspace[workspace.workspace_id]),
+  );
   const isPushOrPullInFlight = useAppStore(
     (s) => s.workspacePushPullInFlight === workspace.workspace_id,
   );
@@ -763,10 +772,24 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   indicators. Everything that's optional only renders
                   when relevant — when none of these apply the row is
                   one line, keeping the sidebar calm. */}
-              {(workspace.git_branch || hasDiff || hasAheadBehind) && (
+              {(workspace.git_branch || hasDiff || hasAheadBehind || tunnelKind) && (
                 <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   {workspace.git_branch && (
                     <span className="truncate min-w-0">{workspace.git_branch}</span>
+                  )}
+
+                  {/* SSH tunnel health — only renders for a degraded remote
+                      tunnel (reconnecting / circuit-open). A healthy or local
+                      workspace shows nothing here. */}
+                  {tunnelKind === "reconnecting" && (
+                    <span className="shrink-0 rounded px-1 text-[10px] leading-[14px] text-warning bg-warning/15">
+                      Reconnecting…
+                    </span>
+                  )}
+                  {tunnelKind === "lost" && (
+                    <span className="shrink-0 rounded px-1 text-[10px] leading-[14px] text-danger bg-danger/15">
+                      Connection lost — re-push
+                    </span>
                   )}
 
                   {hasAheadBehind && (

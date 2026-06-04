@@ -575,7 +575,15 @@ pub async fn workspace_push_to_host(
                     // here, tunnel must reach here.
                     "$HOME/.local/bin/codemux-remote".to_string(),
                 );
-                crate::ssh::install_supervisor(&workspace_id, supervisor).await;
+                crate::ssh::install_supervisor(&workspace_id, supervisor.clone())
+                    .await;
+                // Surface reconnect / circuit-open state to the UI for this
+                // freshly-pushed workspace.
+                crate::ssh::spawn_tunnel_status_forwarder(
+                    app.clone(),
+                    workspace_id.clone(),
+                    &supervisor,
+                );
 
                 // Sync Claude session JSONLs from
                 // ~/.claude/projects/<local-encoded>/ to the

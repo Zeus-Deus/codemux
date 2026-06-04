@@ -46,6 +46,7 @@ pub use registry::{
     client_for_workspace, forget_workspace_client, get_supervisor,
     install_supervisor, local_socket_for_workspace,
     remote_socket_for_workspace, shutdown_supervisor,
+    spawn_tunnel_status_forwarder,
 };
 pub use tunnel::{spawn_ssh_tunnel, TunnelHandle};
 pub use tunnel_supervisor::{TunnelStatus, TunnelSupervisor};

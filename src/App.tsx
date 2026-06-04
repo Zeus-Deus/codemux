@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { useAppStateInit } from "@/hooks/use-app-state";
 import { useKeyboardShortcuts } from "@/hooks/use-keyboard-shortcuts";
 import { useAuthEvents } from "@/hooks/use-auth-events";
+import { useTunnelStatusEvents } from "@/hooks/use-tunnel-status-events";
 import { useSkillsSync } from "@/hooks/use-skills-sync";
 import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
@@ -34,6 +35,10 @@ function App() {
 
   // Listen for auth state changes from Tauri (OAuth callback, token expiry)
   useAuthEvents();
+
+  // Bridge SSH tunnel health into the tunnel-status store so remote
+  // workspaces can show a "Reconnecting…" / "Connection lost" pill.
+  useTunnelStatusEvents();
 
   // Skills sync engine triggers: kick a sync after sync becomes
   // available and after the file watcher reports `skills-changed`
