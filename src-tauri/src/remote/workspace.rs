@@ -273,6 +273,22 @@ impl WorkspaceStore {
             ],
         )
         .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+        drop(conn);
+
+        // One repo root per (project, host): if this is a `main` checkout and
+        // the project already had one registered, collapse to a single
+        // canonical root (earliest wins) and return the survivor — so
+        // re-registering an existing root is idempotent instead of spawning a
+        // duplicate "repo root" card on every device. A genuinely distinct
+        // root has a different `project_uid` (it's derived from the remote /
+        // root path), so this never merges unrelated projects.
+        if ws.kind.as_deref() == Some("main") {
+            if let Some(puid) = ws.project_uid.clone() {
+                if let Some(survivor) = self.collapse_main_for_uid(&puid)? {
+                    return Ok(survivor);
+                }
+            }
+        }
         Ok(ws)
     }
 
@@ -440,6 +456,94 @@ impl WorkspaceStore {
             updated += 1;
         }
         Ok(updated)
+    }
+
+    /// Ensure at most ONE `kind='main'` row exists for `project_uid`: keep the
+    /// earliest-created one and delete the rest. Only registry rows are
+    /// removed — files on disk are never touched. Returns the surviving row
+    /// (or `None` if the project has no main row). Idempotent.
+    ///
+    /// This is the "one repo root per project, per host" guarantee: an agent
+    /// that registers a project's root more than once (or whose root was
+    /// re-registered after a move) must not produce two "repo root" cards on
+    /// every device.
+    pub fn collapse_main_for_uid(
+        &self,
+        project_uid: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        let ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM workspaces
+                     WHERE project_uid = ?1 AND kind = 'main'
+                     ORDER BY created_at ASC, id ASC",
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![project_uid], |r| r.get::<_, String>(0))
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| WorkspaceError::Db(e.to_string()))?);
+            }
+            out
+        };
+        let Some((keep, extras)) = ids.split_first() else {
+            return Ok(None);
+        };
+        if !extras.is_empty() {
+            let conn = self.conn.lock().unwrap();
+            for id in extras {
+                conn.execute(
+                    "DELETE FROM workspaces WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            }
+        }
+        Ok(Some(self.get(keep.as_str())?))
+    }
+
+    /// Boot-time hygiene: collapse every project that has more than one
+    /// `kind='main'` row down to a single canonical root (see
+    /// [`Self::collapse_main_for_uid`]). Returns the number of duplicate rows
+    /// removed. Safe to run on every daemon boot — idempotent, so it does real
+    /// work only when an agent left duplicate roots behind.
+    pub fn normalize_main_workspaces(&self) -> Result<usize, WorkspaceError> {
+        let uids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT project_uid FROM workspaces
+                     WHERE kind = 'main' AND project_uid IS NOT NULL
+                     GROUP BY project_uid HAVING COUNT(*) > 1",
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| WorkspaceError::Db(e.to_string()))?);
+            }
+            out
+        };
+        let mut removed = 0usize;
+        for uid in uids {
+            let before = {
+                let conn = self.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM workspaces WHERE project_uid = ?1 AND kind = 'main'",
+                    rusqlite::params![uid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))? as usize
+            };
+            self.collapse_main_for_uid(&uid)?;
+            removed += before.saturating_sub(1);
+        }
+        Ok(removed)
     }
 }
 
@@ -678,6 +782,38 @@ mod tests {
             .create(None, repo.display().to_string(), None, None)
             .unwrap();
         assert!(ws.project_uid.is_some());
+    }
+
+    #[test]
+    fn create_collapses_duplicate_main_for_same_project() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let store = open_store(&dir);
+
+        let a = store
+            .create(None, repo.display().to_string(), Some("main".into()), None)
+            .unwrap();
+        assert_eq!(a.kind.as_deref(), Some("main"), "real .git dir → main root");
+
+        // Re-registering the SAME root must NOT create a second main row.
+        let b = store
+            .create(None, repo.display().to_string(), Some("main".into()), None)
+            .unwrap();
+
+        let mains: Vec<_> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind.as_deref() == Some("main"))
+            .collect();
+        assert_eq!(mains.len(), 1, "duplicate root collapsed to one");
+        assert_eq!(
+            mains[0].id, b.id,
+            "create returns the surviving canonical root"
+        );
+        // Boot sweep is then a no-op (already collapsed).
+        assert_eq!(store.normalize_main_workspaces().unwrap(), 0);
     }
 
     #[test]

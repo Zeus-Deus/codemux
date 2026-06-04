@@ -429,6 +429,14 @@ async fn run_serve_async(port: Option<u16>, state_dir: PathBuf) -> Result<(), St
         Err(e) => eprintln!("[codemux-remote] project-identity backfill skipped: {e}"),
     }
 
+    // Collapse any duplicate `main` rows an agent may have registered for the
+    // same project — one repo root per project, per host. Idempotent.
+    match workspaces.normalize_main_workspaces() {
+        Ok(0) => {}
+        Ok(n) => eprintln!("[codemux-remote] collapsed {n} duplicate main workspace row(s)"),
+        Err(e) => eprintln!("[codemux-remote] main-workspace normalize skipped: {e}"),
+    }
+
     let manifest_value = manifest::Manifest::new(endpoint.clone(), host_id);
     let manifest_path = config::manifest_path(&state_dir);
     manifest::write(&manifest_path, &manifest_value)?;
