@@ -152,7 +152,11 @@ pub async fn spawn_pty_for_agent_via_daemon(
         let branch = owning_ws
             .and_then(|w| w.git_branch.clone())
             .unwrap_or_else(|| "main".to_string());
-        crate::ssh::conventional_remote_path(&project_name, &branch)
+        // Key on project_uid so this matches where push landed the workspace
+        // (collision-safe across same-basename repos). Same uid the push used,
+        // so the two always agree for a workspace pushed by this build.
+        let puid = owning_ws.and_then(|w| w.project_uid.clone());
+        crate::ssh::conventional_remote_path_keyed(puid.as_deref(), &project_name, &branch)
             .to_string_lossy()
             .to_string()
     } else {

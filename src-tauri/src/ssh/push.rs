@@ -504,7 +504,9 @@ pub fn claude_project_dir_name(absolute_path: &std::path::Path) -> String {
 /// Kept as a Unix-side re-export so existing call sites compile
 /// unchanged. Windows builds reach the underlying function through
 /// `crate::workspace_paths` directly.
-pub use crate::workspace_paths::conventional_remote_path;
+pub use crate::workspace_paths::{
+    conventional_remote_path, conventional_remote_path_keyed,
+};
 
 #[cfg(test)]
 mod tests {
