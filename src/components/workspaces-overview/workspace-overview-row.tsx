@@ -10,6 +10,7 @@ import {
   Loader2,
   MoreHorizontal,
   Pencil,
+  Server,
   Trash2,
   Wrench,
   Workflow,
@@ -39,6 +40,7 @@ import {
   closeWorkspaceWithWorktree,
   workspacesReconcileCopy,
   renameWorkspace,
+  workspaceOpenOnHost,
   workspacePullBack,
   workspacePushToHost,
   type HostView,
@@ -89,6 +91,7 @@ export function WorkspaceOverviewRow({
       <RemoteRow
         item={item}
         onRequestPull={onRequestPull ?? null}
+        onAfterOpen={onAfterOpen}
         divergence={divergence ?? null}
       />
     );
@@ -183,6 +186,10 @@ function LocalRow({
   // linked to the real repo's history. We surface a warning so the user
   // can re-pull cleanly (new adoptions land roots under projects/).
   const isDivergentCopy = workspace.divergent_copy === true;
+  // "Open on host" / attach-in-place: this workspace runs entirely on its
+  // host with no local files. Push/pull/delete-worktree don't apply — the
+  // only teardown is a detach (close), which leaves the host process alive.
+  const isAttachOnly = workspace.attach_only === true;
 
   // Phase-4d elapsed-time indicator: when a push/pull takes longer
   // than ~2s, surface "12s elapsed" so the user knows it's working
@@ -297,13 +304,16 @@ function LocalRow({
     const confirmed = window.confirm(
       canRemoveWorktree
         ? `Delete the worktree "${workspace.title}"? Files on disk will be removed.`
-        : isRepoRoot
-          ? `Close "${workspace.title}"? This is the project's root checkout — it's removed from the list but its files on disk are left untouched.`
-          : `Close "${workspace.title}"? Project files on disk are untouched.`,
+        : isAttachOnly
+          ? `Close "${workspace.title}"? It runs on its host — the host process keeps running and you can reopen it any time.`
+          : isRepoRoot
+            ? `Close "${workspace.title}"? This is the project's root checkout — it's removed from the list but its files on disk are left untouched.`
+            : `Close "${workspace.title}"? Project files on disk are untouched.`,
     );
     if (!confirmed) return;
-    // Never destroy a protected repo root: close (detach) only, leaving
-    // its files and shared git history intact.
+    // Never destroy a protected repo root or an attach-in-place workspace:
+    // close (detach) only, leaving files/shared history (or the live host
+    // process) intact.
     const promise = canRemoveWorktree
       ? closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false)
       : closeWorkspace(workspace.workspace_id, false);
@@ -312,7 +322,13 @@ function LocalRow({
         description: err instanceof Error ? err.message : String(err),
       }),
     );
-  }, [workspace.workspace_id, workspace.title, canRemoveWorktree, isRepoRoot]);
+  }, [
+    workspace.workspace_id,
+    workspace.title,
+    canRemoveWorktree,
+    isAttachOnly,
+    isRepoRoot,
+  ]);
 
   const handleReconcileCopy = useCallback(() => {
     workspacesReconcileCopy(workspace.workspace_id)
@@ -382,6 +398,15 @@ function LocalRow({
               {workspace.title}
             </h4>
             {divergence && <DivergenceChip info={divergence} />}
+            {isAttachOnly && (
+              <span
+                title="Running in place on its host — no local copy. Closing detaches; the host process keeps running."
+                className="shrink-0 inline-flex items-center gap-1 rounded-full border border-sky-400/30 bg-sky-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-sky-300"
+              >
+                <Server className="size-2.5" aria-hidden />
+                on host
+              </span>
+            )}
             {isRepoRoot && (
               <span
                 title="The project's root checkout on its default branch. Protected — it can't be deleted like a worktree."
@@ -500,70 +525,87 @@ function LocalRow({
                   Rename…
                 </DropdownMenuItem>
 
-                <DropdownMenuSeparator />
-
-                {isRemote ? (
-                  <DropdownMenuItem onClick={() => void handlePullBack()}>
-                    <ArrowDownLeft className="mr-2 size-3.5" />
-                    Pull back to this device
-                  </DropdownMenuItem>
-                ) : !hostsLoaded ? (
-                  <DropdownMenuItem disabled>
-                    <Loader2 className="mr-2 size-3.5 animate-spin" />
-                    Loading hosts…
-                  </DropdownMenuItem>
-                ) : hosts.length === 0 ? (
-                  <DropdownMenuItem
-                    disabled
-                    title="Add a device in Settings → Devices to push workspaces"
-                  >
-                    <ArrowUpRight className="mr-2 size-3.5" />
-                    Push to device…
-                  </DropdownMenuItem>
-                ) : (
-                  <DropdownMenuSub>
-                    <DropdownMenuSubTrigger>
-                      <ArrowUpRight className="mr-2 size-3.5" />
-                      Push to device…
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent className="min-w-[200px]">
-                      <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
-                        Send to
-                      </DropdownMenuLabel>
-                      {hosts.map((host) => (
-                        <DropdownMenuItem
-                          key={host.id}
-                          onClick={() => void handlePushToHost(host)}
-                        >
-                          <span className="truncate">{host.name}</span>
-                          <span className="ml-auto pl-2 font-mono text-[10px] text-muted-foreground/55">
-                            {host.ssh_target}
-                          </span>
-                        </DropdownMenuItem>
-                      ))}
-                    </DropdownMenuSubContent>
-                  </DropdownMenuSub>
-                )}
-
-                {isDivergentCopy && (
+                {/* Push / pull / reconcile / delete don't apply to an
+                    attach-in-place workspace — it runs on its host with no
+                    local copy. Its only teardown is a detach (below). */}
+                {!isAttachOnly && (
                   <>
                     <DropdownMenuSeparator />
-                    <DropdownMenuItem onClick={handleReconcileCopy}>
-                      <Wrench className="mr-2 size-3.5" />
-                      Reconcile copy…
-                    </DropdownMenuItem>
+
+                    {isRemote ? (
+                      <DropdownMenuItem onClick={() => void handlePullBack()}>
+                        <ArrowDownLeft className="mr-2 size-3.5" />
+                        Pull back to this device
+                      </DropdownMenuItem>
+                    ) : !hostsLoaded ? (
+                      <DropdownMenuItem disabled>
+                        <Loader2 className="mr-2 size-3.5 animate-spin" />
+                        Loading hosts…
+                      </DropdownMenuItem>
+                    ) : hosts.length === 0 ? (
+                      <DropdownMenuItem
+                        disabled
+                        title="Add a device in Settings → Devices to push workspaces"
+                      >
+                        <ArrowUpRight className="mr-2 size-3.5" />
+                        Push to device…
+                      </DropdownMenuItem>
+                    ) : (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <ArrowUpRight className="mr-2 size-3.5" />
+                          Push to device…
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent className="min-w-[200px]">
+                          <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
+                            Send to
+                          </DropdownMenuLabel>
+                          {hosts.map((host) => (
+                            <DropdownMenuItem
+                              key={host.id}
+                              onClick={() => void handlePushToHost(host)}
+                            >
+                              <span className="truncate">{host.name}</span>
+                              <span className="ml-auto pl-2 font-mono text-[10px] text-muted-foreground/55">
+                                {host.ssh_target}
+                              </span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                    )}
+
+                    {isDivergentCopy && (
+                      <>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem onClick={handleReconcileCopy}>
+                          <Wrench className="mr-2 size-3.5" />
+                          Reconcile copy…
+                        </DropdownMenuItem>
+                      </>
+                    )}
                   </>
                 )}
 
                 <DropdownMenuSeparator />
 
-                <DropdownMenuItem
-                  onClick={handleDelete}
-                  className="text-destructive focus:bg-destructive/10 focus:text-destructive"
-                >
-                  <Trash2 className="mr-2 size-3.5" />
-                  {canRemoveWorktree ? "Delete worktree…" : "Close workspace…"}
-                </DropdownMenuItem>
+                {isAttachOnly ? (
+                  <DropdownMenuItem
+                    onClick={handleDelete}
+                    title="Close this in-place view. The host process keeps running — reopen any time to reattach."
+                  >
+                    <CloudOff className="mr-2 size-3.5" />
+                    Close (leave running on host)
+                  </DropdownMenuItem>
+                ) : (
+                  <DropdownMenuItem
+                    onClick={handleDelete}
+                    className="text-destructive focus:bg-destructive/10 focus:text-destructive"
+                  >
+                    <Trash2 className="mr-2 size-3.5" />
+                    {canRemoveWorktree ? "Delete worktree…" : "Close workspace…"}
+                  </DropdownMenuItem>
+                )}
               </DropdownMenuContent>
             </DropdownMenu>
           )}
@@ -634,15 +676,52 @@ function LocalRow({
 function RemoteRow({
   item,
   onRequestPull,
+  onAfterOpen,
   divergence,
 }: {
   item: Extract<OverviewItem, { kind: "remote" }>;
   onRequestPull: ((item: Extract<OverviewItem, { kind: "remote" }>) => void) | null;
+  onAfterOpen: () => void;
   divergence: DivergenceInfo | null;
 }) {
   const row = item.sync;
   const branch = row.git_branch;
   const canRequestPull = onRequestPull !== null;
+
+  const hosts = useHostsStore((s) => s.hosts);
+  const setShowWorkspacesOverview = useUIStore(
+    (s) => s.setShowWorkspacesOverview,
+  );
+  const [opening, setOpening] = useState(false);
+
+  // "Open on host" attaches to the workspace in place on its host — no
+  // rsync, no local copy. Only possible when the workspace is backed by a
+  // host this device has configured (so the SSH tunnel can reach it).
+  const localHost =
+    row.host_server_id !== null
+      ? hosts.find((h) => h.server_id === row.host_server_id) ?? null
+      : null;
+  const canOpenOnHost = localHost !== null;
+
+  const handleOpenOnHost = useCallback(async () => {
+    if (opening) return;
+    setOpening(true);
+    try {
+      const result = await workspaceOpenOnHost(row.id);
+      await activateWorkspace(result.workspace_id);
+      setShowWorkspacesOverview(false);
+      onAfterOpen();
+      toast.success(`Opened on ${localHost?.name ?? "host"}`, {
+        description: result.message,
+      });
+    } catch (err) {
+      toast.error("Couldn't open on host", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      setOpening(false);
+    }
+  }, [opening, row.id, localHost?.name, setShowWorkspacesOverview, onAfterOpen]);
 
   return (
     <div
@@ -722,6 +801,23 @@ function RemoteRow({
               <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
                 Lives on another device
               </DropdownMenuLabel>
+              {canOpenOnHost && (
+                <>
+                  <DropdownMenuItem
+                    disabled={opening}
+                    onClick={() => void handleOpenOnHost()}
+                    title="Open this workspace's terminal in place on the host — nothing is copied to this device, and the host process keeps running when you close the app."
+                  >
+                    {opening ? (
+                      <Loader2 className="mr-2 size-3.5 animate-spin" />
+                    ) : (
+                      <Server className="mr-2 size-3.5" />
+                    )}
+                    Open on host
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                </>
+              )}
               {canRequestPull ? (
                 <DropdownMenuItem
                   onClick={() => onRequestPull?.(item)}

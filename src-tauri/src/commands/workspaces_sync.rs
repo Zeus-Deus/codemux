@@ -81,6 +81,11 @@ pub struct WorkspaceSyncView {
     /// root distinctly and the pull land it on the right branch even when
     /// `git_branch` is null. Local-only — never round-trips through the cloud.
     pub default_branch: Option<String>,
+    /// The workspace's actual absolute path on its host (daemon-reported,
+    /// set by the inventory poller). Drives the "Open on host" action and
+    /// lets the overview dedupe a host row against an already-open
+    /// attach-in-place local workspace. Local-only; never synced to cloud.
+    pub origin_path: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// True when the row has unpushed changes. The UI shows a
@@ -103,6 +108,7 @@ impl From<WorkspaceSyncRecord> for WorkspaceSyncView {
             project_uid: r.project_uid,
             workspace_kind: r.workspace_kind,
             default_branch: r.default_branch,
+            origin_path: r.origin_path,
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,
@@ -154,6 +160,152 @@ pub async fn workspaces_sync_now(
         )?;
     }
     crate::workspaces_sync::try_sync_with_app(&app).await
+}
+
+// ─── Open on host (attach in place, no pull) ────────────────────
+//
+// "Open on host" is the no-copy sibling of adoption. Instead of
+// rsyncing a host workspace down to this device, it creates a local
+// *attach-in-place* workspace that runs entirely on the host: its
+// terminal spawns through the same SSH-tunneled pty-daemon the push
+// flow uses, in the workspace's real on-host directory, and nothing
+// lands under `~/.codemux/` locally. Because the host daemon is
+// detached + persistent (see `ssh::tunnel::build_remote_command`),
+// closing the app leaves the process running and reopening reattaches.
+
+/// Result of [`workspace_open_on_host`].
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenOnHostOutcome {
+    /// The new (or already-open) local attach-in-place workspace id.
+    pub workspace_id: String,
+    /// The directory the workspace operates in on the host.
+    pub remote_cwd: String,
+    /// Human-facing summary for the success toast.
+    pub message: String,
+}
+
+/// Resolve the on-host working directory for a host-backed sync row.
+/// Prefers the daemon-reported `origin_path` (works for workspaces an
+/// agent created at an arbitrary path), falling back to the conventional,
+/// `project_uid`-keyed path the push flow uses. Pure so it's unit-testable
+/// without a DB.
+pub(crate) fn resolve_open_on_host_cwd(
+    origin_path: Option<&str>,
+    project_path: Option<&str>,
+    title: &str,
+    project_uid: Option<&str>,
+    git_branch: Option<&str>,
+    default_branch: Option<&str>,
+) -> String {
+    if let Some(p) = origin_path.map(str::trim).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    let project_name = project_path
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(title);
+    let branch = git_branch
+        .or(default_branch)
+        .filter(|b| !b.is_empty())
+        .unwrap_or("main");
+    crate::ssh::conventional_remote_path_keyed(project_uid, project_name, branch)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Open a host-backed workspace **in place on its host** — no local copy.
+///
+/// `sync_row_id` is the local `workspaces_sync` row id (the
+/// `WorkspaceSyncView.id` the overview renders). The row must be
+/// host-backed (`host_server_id` set) and that host must be configured on
+/// this device (so the SSH tunnel can be established). Idempotent: opening
+/// the same host workspace twice re-activates the existing local view.
+#[tauri::command]
+pub async fn workspace_open_on_host(
+    app: tauri::AppHandle,
+    sync_row_id: i64,
+) -> Result<OpenOnHostOutcome, String> {
+    // Serialize concurrent opens of the same row (double-click) so they
+    // can't both pass the idempotency check and create two local views.
+    let _guard = acquire_adopt_lock(&format!("open-on-host:{sync_row_id}")).await;
+
+    let db: State<'_, DatabaseStore> = app.state();
+    let app_state: State<'_, crate::state::AppStateStore> = app.state();
+
+    let row = db
+        .list_workspaces_sync_for_sync()
+        .into_iter()
+        .find(|r| r.id == sync_row_id)
+        .ok_or_else(|| format!("Synced workspace not found: row {sync_row_id}"))?;
+
+    // Must be host-backed — a sibling-device-only row (no host) can't be
+    // operated in place; it has to be pulled.
+    let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+        "open_on_host_unsupported: This workspace isn't backed by a configured \
+         host — it lives only on another device. Pull it to this device instead."
+            .to_string()
+    })?;
+
+    // The host must be configured on THIS device so we can SSH to it.
+    let local_host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.server_id.as_deref() == Some(host_server_id))
+        .ok_or_else(|| {
+            format!(
+                "host_not_configured: The host this workspace lives on \
+                 (host_server_id={host_server_id}) is not configured on this \
+                 device. Add it in Settings → Hosts, then try again."
+            )
+        })?;
+
+    let remote_cwd = resolve_open_on_host_cwd(
+        row.origin_path.as_deref(),
+        row.project_path.as_deref(),
+        row.title.as_str(),
+        row.project_uid.as_deref(),
+        row.git_branch.as_deref(),
+        row.default_branch.as_deref(),
+    );
+
+    // Idempotency: if an attach-in-place view of this exact host + path is
+    // already open, re-activate it instead of stacking a duplicate.
+    {
+        let snapshot = app_state.snapshot();
+        if let Some(existing) = snapshot.workspaces.iter().find(|w| {
+            w.attach_only
+                && w.host_id == Some(local_host.id)
+                && w.remote_cwd.as_deref() == Some(remote_cwd.as_str())
+        }) {
+            let existing_id = existing.workspace_id.0.clone();
+            app_state.activate_workspace(&existing_id);
+            crate::state::emit_app_state(&app);
+            return Ok(OpenOnHostOutcome {
+                workspace_id: existing_id,
+                remote_cwd,
+                message: format!("Already open on {}.", local_host.name),
+            });
+        }
+    }
+
+    let workspace_id = app_state.create_remote_attach_workspace(
+        row.title.clone(),
+        local_host.id,
+        remote_cwd.clone(),
+        row.git_branch.clone(),
+        row.project_path.clone(),
+        row.project_uid.clone(),
+        row.workspace_kind.clone(),
+    );
+    app_state.activate_workspace(&workspace_id.0);
+    crate::state::emit_app_state(&app);
+
+    Ok(OpenOnHostOutcome {
+        workspace_id: workspace_id.0,
+        remote_cwd,
+        message: format!("Opened on {} — running in place on the host.", local_host.name),
+    })
 }
 
 // ─── Cross-device adoption ──────────────────────────────────────
@@ -1384,6 +1536,53 @@ mod tests {
     use super::*;
     use crate::database::DatabaseStore;
     use serial_test::serial;
+
+    // ── resolve_open_on_host_cwd ───────────────────────────────
+    //
+    // Where "Open on host" lands the terminal ON THE HOST. The daemon-
+    // reported `origin_path` is authoritative (works for agent-created
+    // workspaces at arbitrary paths); the conventional path is only a
+    // fallback for rows that predate the poller recording it.
+
+    #[test]
+    fn resolve_open_on_host_cwd_prefers_origin_path() {
+        let cwd = resolve_open_on_host_cwd(
+            Some("/var/data/agent-built/svc"),
+            Some("/home/me/repo"),
+            "svc",
+            Some("uid-9"),
+            Some("feature/x"),
+            None,
+        );
+        assert_eq!(cwd, "/var/data/agent-built/svc");
+    }
+
+    #[test]
+    fn resolve_open_on_host_cwd_falls_back_to_conventional() {
+        // No origin_path → conventional `~/.codemux/worktrees/...` path
+        // keyed on project + branch (basename of project_path is used).
+        let cwd = resolve_open_on_host_cwd(
+            None,
+            Some("/home/me/widgets"),
+            "ignored-title",
+            Some("uid-1"),
+            Some("feature/login"),
+            Some("main"),
+        );
+        assert!(cwd.contains("worktrees"), "got {cwd}");
+        assert!(cwd.contains("widgets"), "uses project basename; got {cwd}");
+        // branch slashes are sanitized to '-' by the conventional path.
+        assert!(cwd.ends_with("feature-login"), "got {cwd}");
+    }
+
+    #[test]
+    fn resolve_open_on_host_cwd_blank_origin_path_falls_back() {
+        // A whitespace-only origin_path must not be treated as a real path.
+        let cwd =
+            resolve_open_on_host_cwd(Some("  "), Some("/home/me/api"), "api", None, None, None);
+        assert!(cwd.contains("api"), "got {cwd}");
+        assert!(cwd.ends_with("main"), "default branch when none given; got {cwd}");
+    }
 
     // ── detect_same_branch_project_conflict ────────────────────
     //
