@@ -119,6 +119,16 @@
 - Agent status indicators (red/amber/green dots) light up for Claude, Codex, Gemini, OpenCode, and Pi sessions
 - Global toast notices for errors and status messages (bottom-right)
 
+## Resource Monitor
+
+- CPU-chip icon in the title bar opens a popover showing CPU + memory usage for Codemux itself and every live terminal process tree
+- Per-terminal usage summed across the full process subtree, grouped Project → Workspace → Session (collapsible, sortable by Memory / CPU / Name)
+- App self-usage split into main / web view / other buckets
+- Host RAM-share readout with a severity-colored progress bar; amber/red dots flag elevated usage
+- Memory reported as PSS (proportional set size) on Linux so shared WebKit/Chromium/node pages aren't overcounted; RSS/working-set on macOS/Windows
+- Click a workspace or session row to activate it
+- Toggle via Settings → Appearance (`appearance.show_resource_monitor`, on by default)
+
 ## Project Memory
 
 - Project brief, current goal, current focus, and constraints fields
@@ -247,6 +257,13 @@
 - Project onboarding flow with package manager detection and setup script configuration
 - Orphan worktree detection and import
 
+## Setup & Teardown Scripts
+
+- Run commands automatically on workspace create/delete, plus a "run" command for dev servers (`Ctrl+Shift+G` opens a dedicated "Workspace Run" terminal tab)
+- Setup commands run after worktree creation (background, non-blocking); teardown runs before deletion
+- Config precedence: `.codemux/config.json` in the workspace dir → repo root → Settings → Projects UI
+- Essential for worktree workflows where each worktree needs its own dependency install, env files, or service setup
+
 ## IDE Integration
 
 - Auto-detect 19 installed editors across four families: **VS Code family** (VS Code, Cursor, VSCodium), **Modern editors** (Zed, Windsurf, Trae, Fleet, Lapce), **JetBrains** (IntelliJ IDEA, PyCharm, PhpStorm, WebStorm, GoLand, RubyMine, CLion, Rider, DataGrip, Android Studio), and **Other** (Sublime Text)
@@ -280,6 +297,15 @@
 - 512 KB per-file limit, 50 MB total index cap
 - Supports 20+ file extensions (rs, ts, tsx, js, jsx, py, go, java, etc.)
 
+## Port Detection
+
+- Automatically detects listening TCP ports that dev servers open and lists them in the sidebar with port number, process name, and optional label
+- Open a detected port in the browser pane, or kill the owning process
+- Linux scan via `/proc/net/tcp{,6}`; Windows via `netstat -ano` + `tasklist` with a kernel/service process-name filter
+- **Docker-published container ports** for open codemux worktrees surface under a dedicated **Docker** group labeled by container name — recovers ports the Linux `/proc` scan can't attribute because `docker-proxy` runs as root; kill is hidden for these rows
+- Static port labels via `.codemux/config.json`; system ports (22/80/443/5432/3306/6379/27017) and Codemux-internal ranges are filtered out
+- macOS port detection is not yet implemented
+
 ## Settings Panel
 
 - Centralized configuration overlay (Ctrl+,)
@@ -296,7 +322,28 @@
 - SSH transport: probe → bootstrap → tunnel → tunnel supervisor with auto-reconnect
 - `WorkspaceSnapshot.host_id` model + shared `<DevicePicker>` pill component wired into the new-workspace dialog
 - **Push workspace to host** action (zero-touch): rsync the worktree, spawn the remote daemon, install + start a systemd user unit, drop a per-workspace `.mcp.json`, register the workspace in the daemon's registry, attach the local UI through an SSH-forwarded socket, and sync the Claude conversation across local/remote ends
-- **Background `hosts_upgrade` poller**: ~5 s after every app start, silently re-bootstraps any host whose `codemux-remote` version differs from the bundled binary
+- **Background `hosts_upgrade` poller**: ~5 s after every app start, silently re-bootstraps any host whose `codemux-remote` version differs from the bundled binary (defers the restart while host agents are running so an upgrade never kills live work)
+
+## Workspaces Overview & Cross-Device Sync
+
+- Full-screen **Workspaces** overlay (sidebar button under Automations) listing every workspace this account tracks — local + every host pushed-to + every sibling device on the same account
+- Device-grouped sections (This device / each configured host / removed-host orphans); same-project workspaces cluster under a project header; configured-host buckets stay visible even when empty
+- Filters: search (title / branch / project), project, device, status; sort by recently-active / name / branch
+- Per-row actions: open, copy branch, rename, push to any host, pull back, delete; live agent-status dots (working / needs-input / ready-to-review) shared with the sidebar
+- **Cross-device sync**: every create / rename / push / pull / delete propagates through the shared API on a 30 s loop, scoped per-user; sibling-device workspaces render as dashed cards under the right host bucket
+- **Asymmetric auto-publish from `codemux-remote` hosts**: workspaces an agent creates directly on a host surface in every device's overview within ~90 s without an explicit push (60 s SSH inventory poll → cloud push)
+- **Sibling-device adoption** ("Pull to this device"): host-backed rsync when both devices share a host, clone-from-git fallback otherwise; one-click **"Pull project"** materialises the protected repo root then recreates each worktree under it
+- **Repo-unit sync**: a repo's default-branch root is a protected `repo root` (close/detach only, never deleted-as-worktree); legacy divergent full copies show an amber `standalone copy` chip with a non-destructive "Reconcile copy…" action
+- **Safety guardrails**: confirm-before-push (per-host "don't ask again") + 10-second Undo toast on every push / pull / adopt; cross-device HEAD-divergence chip; elapsed-time pill while a push or pull is in flight
+- First-run welcome banner + "how it works" popover
+
+## Operate a Remote Workspace In Place ("Open on host")
+
+- "Open on host" action on a host-backed overview row drives a host workspace **in place** — terminal/agent runs on the host in its real directory, output streams live, and **nothing is copied under `~/.codemux/` locally**
+- The third remote mode alongside Push (copy up) and Pull (copy down): use a remote machine's workspace from the desktop without ever materialising a local copy
+- Survives app close: the host pty-daemon is detached (reused via a per-socket pidfile, or spawned with `setsid` / `nohup`), so closing the app leaves the host process running and reopening re-tunnels and reattaches the live sessions
+- Renders an "on host" badge; the only teardown is detach ("Close — leave running on host") — never delete / push / pull
+- Requires the workspace's host to be configured locally (an SSH path is needed); local-FS surfaces (file tree, Changes, ports) are empty for an attach-only workspace
 
 ## MCP-on-Remote (Headless Codemux Daemon)
 
