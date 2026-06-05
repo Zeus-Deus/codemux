@@ -250,9 +250,19 @@ pub async fn pull(token: &str, db: &DatabaseStore) -> Result<(), String> {
 ///
 /// When Device A and Device B both poll the same host before either's push
 /// lands, each POSTs its own cloud row for one workspace; after a pull both
-/// devices then see two cards. Until the server enforces uniqueness
-/// (TODO(server): unique partial index on `codemux_workspaces(origin_uid)`
-/// — lives in the `codemux-api` repo), we converge client-side: group
+/// devices then see two cards. The server now prevents this at the source
+/// (issue #66): `POST /api/workspaces` upserts (`ON CONFLICT`) against a
+/// partial unique index on the workspace's stable identity —
+/// `(user_id, host_server_id, project_uid, git_branch, workspace_kind)`
+/// `WHERE deleted_at IS NULL AND project_uid IS NOT NULL AND host_server_id`
+/// `IS NOT NULL` (lives in the `codemux-api` repo) — so a racing second
+/// insert updates the existing row instead of creating a twin. The server
+/// can only enforce the `project_uid` fallback identity because `origin_uid`
+/// is local-only and never synced.
+///
+/// This client-side pass is kept as defense-in-depth: it still collapses any
+/// duplicates created before the index shipped or by an older server, and it
+/// converges on the same keeper the server's backfill does. We group
 /// un-adopted siblings (`workspace_id IS NULL`) by `(host, origin_uid)` —
 /// or, since `origin_uid` is local-only and absent on cloud-pulled rows, by
 /// `(host, project_uid, branch, kind)` — keep the canonical row (one with a
