@@ -57,6 +57,14 @@ pub struct Workspace {
     /// the same `project_uid` for an independently-cloned copy.
     #[serde(default)]
     pub repo_remote: Option<String>,
+    /// The repo's default branch (`origin/HEAD` → main/master → current),
+    /// resolved at registration via `crate::git::resolve_default_branch`.
+    /// Lets a pulling device land the repo ROOT on the right branch and
+    /// classify it as a protected root even when `branch` (the per-checkout
+    /// branch) is null — which it routinely is for a root an agent never
+    /// named. Advisory: the desktop re-resolves locally before protecting.
+    #[serde(default)]
+    pub default_branch: Option<String>,
     /// RFC 3339 UTC timestamp.
     pub created_at: String,
     /// RFC 3339 UTC timestamp.
@@ -207,6 +215,19 @@ impl WorkspaceStore {
         });
         let project_name = project_root.as_deref().map(basename);
         let kind = Some(crate::project_identity::derive_kind(std::path::Path::new(&path)).to_string());
+        // Resolve the repo's default branch from the project root (gated on
+        // `.git` to skip the subprocess for not-yet-materialised / test paths,
+        // same as `git_remote_origin_url`). `resolve_default_branch` falls back
+        // to the current branch for local-only repos with a non-standard
+        // default, so a `main`-defaulting repo like the common case still
+        // records "main" even with no remote.
+        let default_branch = project_root.as_deref().and_then(|pr| {
+            if std::path::Path::new(pr).join(".git").exists() {
+                crate::git::resolve_default_branch(std::path::Path::new(pr))
+            } else {
+                None
+            }
+        });
 
         let ws = Workspace {
             id: id.clone(),
@@ -218,6 +239,7 @@ impl WorkspaceStore {
             project_name,
             kind,
             repo_remote,
+            default_branch,
             created_at: now.clone(),
             updated_at: now,
             owner_id: None,
@@ -230,8 +252,8 @@ impl WorkspaceStore {
             "INSERT INTO workspaces (
                 id, name, path, branch, project_root,
                 created_at, updated_at, owner_id, origin_host_id, notes,
-                project_uid, project_name, kind, repo_remote
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                project_uid, project_name, kind, repo_remote, default_branch
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 ws.id,
                 ws.name,
@@ -247,9 +269,26 @@ impl WorkspaceStore {
                 ws.project_name,
                 ws.kind,
                 ws.repo_remote,
+                ws.default_branch,
             ],
         )
         .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+        drop(conn);
+
+        // One repo root per (project, host): if this is a `main` checkout and
+        // the project already had one registered, collapse to a single
+        // canonical root (earliest wins) and return the survivor — so
+        // re-registering an existing root is idempotent instead of spawning a
+        // duplicate "repo root" card on every device. A genuinely distinct
+        // root has a different `project_uid` (it's derived from the remote /
+        // root path), so this never merges unrelated projects.
+        if ws.kind.as_deref() == Some("main") {
+            if let Some(puid) = ws.project_uid.clone() {
+                if let Some(survivor) = self.collapse_main_for_uid(&puid)? {
+                    return Ok(survivor);
+                }
+            }
+        }
         Ok(ws)
     }
 
@@ -259,7 +298,7 @@ impl WorkspaceStore {
             .prepare(
                 "SELECT id, name, path, branch, project_root,
                         created_at, updated_at, owner_id, origin_host_id, notes,
-                        project_uid, project_name, kind, repo_remote
+                        project_uid, project_name, kind, repo_remote, default_branch
                  FROM workspaces WHERE id = ?1",
             )
             .map_err(|e| WorkspaceError::Db(e.to_string()))?;
@@ -281,7 +320,7 @@ impl WorkspaceStore {
             .prepare(
                 "SELECT id, name, path, branch, project_root,
                         created_at, updated_at, owner_id, origin_host_id, notes,
-                        project_uid, project_name, kind, repo_remote
+                        project_uid, project_name, kind, repo_remote, default_branch
                  FROM workspaces
                  ORDER BY created_at DESC",
             )
@@ -372,6 +411,13 @@ impl WorkspaceStore {
         let mut updated = 0usize;
         let conn = self.conn.lock().unwrap();
         for ws in rows {
+            // Guard on identity only — NOT on default_branch. default_branch
+            // legitimately stays None for repos with no resolvable default
+            // (no commits / detached / non-repo path), so gating on it would
+            // re-update those rows on every sweep and break idempotency. A
+            // legacy row missing identity is backfilled here (default_branch
+            // included); a row that already has identity but no default_branch
+            // is left to pull-time resolution, which is authoritative anyway.
             if ws.project_uid.is_some() && ws.kind.is_some() {
                 continue;
             }
@@ -387,16 +433,117 @@ impl WorkspaceStore {
             let kind = Some(
                 crate::project_identity::derive_kind(std::path::Path::new(&ws.path)).to_string(),
             );
+            // Backfill the default branch for rows registered before the
+            // column existed (gated on `.git` to avoid spawning git for
+            // stale/never-materialised paths). This is what retroactively
+            // gives a legacy root row a non-null branch so a pull can protect
+            // it instead of rendering it as a deletable "<branch>" worktree.
+            let default_branch = ws.default_branch.clone().or_else(|| {
+                if std::path::Path::new(&project_root).join(".git").exists() {
+                    crate::git::resolve_default_branch(std::path::Path::new(&project_root))
+                } else {
+                    None
+                }
+            });
             conn.execute(
                 "UPDATE workspaces
-                 SET project_uid = ?2, project_name = ?3, kind = ?4, repo_remote = ?5
+                 SET project_uid = ?2, project_name = ?3, kind = ?4, repo_remote = ?5,
+                     default_branch = ?6
                  WHERE id = ?1",
-                rusqlite::params![ws.id, project_uid, project_name, kind, repo_remote],
+                rusqlite::params![ws.id, project_uid, project_name, kind, repo_remote, default_branch],
             )
             .map_err(|e| WorkspaceError::Db(e.to_string()))?;
             updated += 1;
         }
         Ok(updated)
+    }
+
+    /// Ensure at most ONE `kind='main'` row exists for `project_uid`: keep the
+    /// earliest-created one and delete the rest. Only registry rows are
+    /// removed — files on disk are never touched. Returns the surviving row
+    /// (or `None` if the project has no main row). Idempotent.
+    ///
+    /// This is the "one repo root per project, per host" guarantee: an agent
+    /// that registers a project's root more than once (or whose root was
+    /// re-registered after a move) must not produce two "repo root" cards on
+    /// every device.
+    pub fn collapse_main_for_uid(
+        &self,
+        project_uid: &str,
+    ) -> Result<Option<Workspace>, WorkspaceError> {
+        let ids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM workspaces
+                     WHERE project_uid = ?1 AND kind = 'main'
+                     ORDER BY created_at ASC, id ASC",
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let rows = stmt
+                .query_map(rusqlite::params![project_uid], |r| r.get::<_, String>(0))
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| WorkspaceError::Db(e.to_string()))?);
+            }
+            out
+        };
+        let Some((keep, extras)) = ids.split_first() else {
+            return Ok(None);
+        };
+        if !extras.is_empty() {
+            let conn = self.conn.lock().unwrap();
+            for id in extras {
+                conn.execute(
+                    "DELETE FROM workspaces WHERE id = ?1",
+                    rusqlite::params![id],
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            }
+        }
+        Ok(Some(self.get(keep.as_str())?))
+    }
+
+    /// Boot-time hygiene: collapse every project that has more than one
+    /// `kind='main'` row down to a single canonical root (see
+    /// [`Self::collapse_main_for_uid`]). Returns the number of duplicate rows
+    /// removed. Safe to run on every daemon boot — idempotent, so it does real
+    /// work only when an agent left duplicate roots behind.
+    pub fn normalize_main_workspaces(&self) -> Result<usize, WorkspaceError> {
+        let uids: Vec<String> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT project_uid FROM workspaces
+                     WHERE kind = 'main' AND project_uid IS NOT NULL
+                     GROUP BY project_uid HAVING COUNT(*) > 1",
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| WorkspaceError::Db(e.to_string()))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r.map_err(|e| WorkspaceError::Db(e.to_string()))?);
+            }
+            out
+        };
+        let mut removed = 0usize;
+        for uid in uids {
+            let before = {
+                let conn = self.conn.lock().unwrap();
+                conn.query_row(
+                    "SELECT COUNT(*) FROM workspaces WHERE project_uid = ?1 AND kind = 'main'",
+                    rusqlite::params![uid],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| WorkspaceError::Db(e.to_string()))? as usize
+            };
+            self.collapse_main_for_uid(&uid)?;
+            removed += before.saturating_sub(1);
+        }
+        Ok(removed)
     }
 }
 
@@ -417,7 +564,8 @@ fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
             project_uid     TEXT,            -- deterministic project identity (UUIDv5)
             project_name    TEXT,
             kind            TEXT,            -- 'main' | 'worktree'
-            repo_remote     TEXT             -- canonical git remote, null for local-only
+            repo_remote     TEXT,            -- canonical git remote, null for local-only
+            default_branch  TEXT             -- repo default branch (origin/HEAD -> main/master -> current)
         );
         CREATE INDEX IF NOT EXISTS idx_workspaces_origin
             ON workspaces (origin_host_id);
@@ -438,6 +586,7 @@ fn create_schema(conn: &Connection) -> Result<(), WorkspaceError> {
         "ALTER TABLE workspaces ADD COLUMN project_name TEXT",
         "ALTER TABLE workspaces ADD COLUMN kind TEXT",
         "ALTER TABLE workspaces ADD COLUMN repo_remote TEXT",
+        "ALTER TABLE workspaces ADD COLUMN default_branch TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -472,6 +621,7 @@ fn row_to_workspace(row: &rusqlite::Row<'_>) -> Result<Workspace, WorkspaceError
         project_name: map(11).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         kind: map(12).map_err(|e| WorkspaceError::Db(e.to_string()))?,
         repo_remote: map(13).map_err(|e| WorkspaceError::Db(e.to_string()))?,
+        default_branch: map(14).map_err(|e| WorkspaceError::Db(e.to_string()))?,
     })
 }
 
@@ -632,6 +782,38 @@ mod tests {
             .create(None, repo.display().to_string(), None, None)
             .unwrap();
         assert!(ws.project_uid.is_some());
+    }
+
+    #[test]
+    fn create_collapses_duplicate_main_for_same_project() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let store = open_store(&dir);
+
+        let a = store
+            .create(None, repo.display().to_string(), Some("main".into()), None)
+            .unwrap();
+        assert_eq!(a.kind.as_deref(), Some("main"), "real .git dir → main root");
+
+        // Re-registering the SAME root must NOT create a second main row.
+        let b = store
+            .create(None, repo.display().to_string(), Some("main".into()), None)
+            .unwrap();
+
+        let mains: Vec<_> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter(|w| w.kind.as_deref() == Some("main"))
+            .collect();
+        assert_eq!(mains.len(), 1, "duplicate root collapsed to one");
+        assert_eq!(
+            mains[0].id, b.id,
+            "create returns the surviving canonical root"
+        );
+        // Boot sweep is then a no-op (already collapsed).
+        assert_eq!(store.normalize_main_workspaces().unwrap(), 0);
     }
 
     #[test]

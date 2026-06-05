@@ -1662,6 +1662,8 @@ pub fn run() {
             commands::workspaces_adoption_preview,
             commands::workspaces_adopt_synced,
             commands::workspaces_adopt_via_clone,
+            commands::workspaces_adopt_project,
+            commands::workspaces_reconcile_copy,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

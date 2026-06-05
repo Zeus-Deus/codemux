@@ -523,10 +523,15 @@ pub async fn workspace_push_to_host(
             );
         }
 
+        // Key the host landing path on project_uid so two different repos
+        // sharing a basename don't clobber each other on the host. The exact
+        // landing path is recorded (origin_path), so pull-back resolves it
+        // directly regardless of the uid suffix.
+        let puid = ws.project_uid.as_deref();
         let remote_path = if is_root {
-            crate::workspace_paths::conventional_remote_root_path(&project_name)
+            crate::workspace_paths::conventional_remote_root_path_keyed(puid, &project_name)
         } else {
-            crate::ssh::conventional_remote_path(&project_name, &branch)
+            crate::ssh::conventional_remote_path_keyed(puid, &project_name, &branch)
         };
         let remote_path_str = remote_path.to_string_lossy().to_string();
         let opts = crate::ssh::PushOptions::new(
@@ -575,7 +580,15 @@ pub async fn workspace_push_to_host(
                     // here, tunnel must reach here.
                     "$HOME/.local/bin/codemux-remote".to_string(),
                 );
-                crate::ssh::install_supervisor(&workspace_id, supervisor).await;
+                crate::ssh::install_supervisor(&workspace_id, supervisor.clone())
+                    .await;
+                // Surface reconnect / circuit-open state to the UI for this
+                // freshly-pushed workspace.
+                crate::ssh::spawn_tunnel_status_forwarder(
+                    app.clone(),
+                    workspace_id.clone(),
+                    &supervisor,
+                );
 
                 // Sync Claude session JSONLs from
                 // ~/.claude/projects/<local-encoded>/ to the
@@ -873,8 +886,19 @@ pub async fn workspace_pull_back_impl(
             ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
         let mut candidate_sources: Vec<String> = Vec::new();
         if let Some(op) = origin_path.clone() {
+            // The recorded on-disk path is authoritative — try it first.
             candidate_sources.push(op);
-        } else if is_root {
+        }
+        // Fallbacks (used when origin_path is absent — legacy rows). Try the
+        // uid-keyed path first (where new pushes land), then the legacy
+        // basename path so workspaces pushed before the re-key still pull.
+        let puid = ws.project_uid.as_deref();
+        if is_root {
+            candidate_sources.push(
+                crate::workspace_paths::conventional_remote_root_path_keyed(puid, &project_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
             candidate_sources.push(
                 crate::workspace_paths::conventional_remote_root_path(&project_name)
                     .to_string_lossy()
@@ -887,11 +911,18 @@ pub async fn workspace_pull_back_impl(
             );
         } else {
             candidate_sources.push(
+                crate::ssh::conventional_remote_path_keyed(puid, &project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            candidate_sources.push(
                 crate::ssh::conventional_remote_path(&project_name, &branch)
                     .to_string_lossy()
                     .to_string(),
             );
         }
+        // De-dup while preserving order (uid-keyed == basename when no uid).
+        candidate_sources.dedup();
 
         // Try each candidate; only a "remote path missing" outcome is
         // worth retrying the next one — success / rsync error / host

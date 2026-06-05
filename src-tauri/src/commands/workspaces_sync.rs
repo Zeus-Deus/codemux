@@ -11,6 +11,41 @@ use tauri::{Manager, State};
 
 use crate::database::{DatabaseStore, WorkspaceSyncRecord};
 
+// ── Adoption serialization lock ──
+//
+// Two near-simultaneous adopts of the SAME row — a double-clicked "Pull",
+// or the host-inventory poller racing a manual pull — would both pass the
+// `workspace_id`-already-set idempotency guard (a TOCTOU window) and create
+// duplicate local shells / clobber the same landing path. A per-key async
+// lock serializes them so the second waits, then sees the first's result
+// and short-circuits. Mirrors Superset's `workspaceCreateLocks`.
+//
+// Keyed by `server_id` (the row identity). The map grows by one entry per
+// distinct row ever adopted on this device — bounded in practice, and the
+// guard is the whole point, so we don't bother pruning.
+fn adopt_locks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>
+{
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Acquire the adoption lock for `key`, awaiting any in-flight adopt of the
+/// same key. Hold the returned guard for the whole adopt body.
+async fn acquire_adopt_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let mutex = {
+        let mut map = adopt_locks().lock().unwrap();
+        map.entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    mutex.lock_owned().await
+}
+
 /// Wire shape sent to the frontend. Matches the field naming the
 /// existing UI expects (snake_case from Rust, camelCase from
 /// serde-rename on JS-facing structs would be inconsistent with the
@@ -41,6 +76,11 @@ pub struct WorkspaceSyncView {
     pub project_uid: Option<String>,
     /// `"main"` | `"worktree"` — the overview renders a kind badge.
     pub workspace_kind: Option<String>,
+    /// The repo's default branch (daemon-reported: `origin/HEAD` →
+    /// main/master → current). Lets the overview render a remote project's
+    /// root distinctly and the pull land it on the right branch even when
+    /// `git_branch` is null. Local-only — never round-trips through the cloud.
+    pub default_branch: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// True when the row has unpushed changes. The UI shows a
@@ -62,6 +102,7 @@ impl From<WorkspaceSyncRecord> for WorkspaceSyncView {
             git_head_sha: r.git_head_sha,
             project_uid: r.project_uid,
             workspace_kind: r.workspace_kind,
+            default_branch: r.default_branch,
             created_at: r.created_at,
             updated_at: r.updated_at,
             dirty: r.dirty,
@@ -449,6 +490,11 @@ pub async fn workspaces_adopt_synced(
     app: tauri::AppHandle,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
+    // Serialize concurrent adopts of this same row (double-click, or poller
+    // racing a manual pull) so they can't both slip past the idempotency
+    // guard and duplicate the local shell. Held for the whole adopt.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
     // A `worktree` row can't be pulled as a standalone directory: its
     // `.git` is a gitfile pointing at a parent repo that doesn't exist
     // on this device, so a bare rsync of the worktree dir lands with
@@ -678,21 +724,20 @@ pub async fn workspaces_adopt_synced(
     // next boot backfill. The root landed at ~/.codemux/projects/<repo>,
     // so it classifies as a genuine (non-divergent) root.
     if is_root {
-        let branch_owned = {
-            let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-            app_state
-                .snapshot()
-                .workspaces
-                .iter()
-                .find(|w| w.workspace_id.0 == workspace_id)
-                .and_then(|w| w.git_branch.clone())
-        };
         let landing_for_check = worktree_path.clone();
         let protected = tokio::task::spawn_blocking(move || {
-            crate::git::is_protected_repo_root(
-                std::path::Path::new(&landing_for_check),
-                branch_owned.as_deref(),
-            )
+            let p = std::path::Path::new(&landing_for_check);
+            // An rsync-pulled root may have copied an arbitrary checked-out
+            // branch (and a clone leaves `origin/HEAD` unset until we ask).
+            // Populate `origin/HEAD` (no-op for local-only repos) and land the
+            // root on its default branch, then classify against the repo's
+            // ACTUAL on-disk branch rather than the synced `git_branch`, which
+            // is frequently NULL for a root checkout the agent never named.
+            // Without this, a NULL synced branch made `is_protected_repo_root`
+            // fail-open to "deletable" — the "fake main" the user saw.
+            let _ = crate::git::ensure_origin_head(p);
+            let local_branch = crate::git::checkout_default_branch(p).ok().flatten();
+            crate::git::is_protected_repo_root(p, local_branch.as_deref())
         })
         .await
         .unwrap_or(false);
@@ -992,6 +1037,9 @@ pub async fn workspaces_adopt_via_clone(
     app: tauri::AppHandle,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
+    // Same per-row serialization as the host-backed adopt path.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
     // Validate + compute paths in a sync scope (no awaits).
     let (project_remote, project_path, worktree_path, branch, title) = {
         let db: tauri::State<'_, DatabaseStore> = app.state();
@@ -1159,6 +1207,178 @@ pub async fn workspaces_adopt_via_clone(
     })
 }
 
+/// One workspace that failed to adopt during a project-granularity pull.
+/// Collected (not fatal) so a single bad worktree doesn't abort the rest.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAdoptFailure {
+    pub server_id: String,
+    pub title: String,
+    pub error: String,
+}
+
+/// Result of pulling an entire project (its repo root + every worktree)
+/// in one action.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAdoptOutcome {
+    /// Each workspace successfully materialised on this device.
+    pub adopted: Vec<AdoptOutcome>,
+    /// Worktrees that failed (the root failing aborts with an `Err` instead).
+    pub failures: Vec<ProjectAdoptFailure>,
+    pub message: String,
+}
+
+/// Pull an entire project — its repo ROOT first, then every worktree — in a
+/// single action. This is the "project-first" model: instead of pulling a
+/// lone worktree that lands as a deletable "<branch>" copy, we materialise
+/// the protected repo root at `~/.codemux/projects/<repo>` and recreate each
+/// worktree as a real linked worktree hanging off it.
+///
+/// Ordering matters: the root MUST land before the worktrees so the shared
+/// object store + branch refs exist for each `git worktree add`. We compose
+/// the existing, individually-tested per-row commands rather than
+/// re-implementing their rsync/clone/worktree logic:
+/// - the `kind == "main"` row → `workspaces_adopt_synced` (lands a protected
+///   root at `projects/<repo>`),
+/// - each worktree row → `workspaces_adopt_synced` (routes to
+///   `adopt_worktree_via_repo_rsync`, which reuses the now-present
+///   `projects/<repo>` repo and just `git worktree add`s the branch).
+///
+/// If the project has no `main` row (a legacy registry where the root was
+/// never registered), the first worktree adopt rsyncs the parent repo itself,
+/// so the pull still succeeds — just without a standalone protected-root
+/// shell. Worktree failures are collected; a root failure aborts (nothing can
+/// attach to a missing root).
+#[tauri::command]
+pub async fn workspaces_adopt_project(
+    app: tauri::AppHandle,
+    project_uid: String,
+) -> Result<ProjectAdoptOutcome, String> {
+    // Gather the project's un-adopted, host-backed sync rows (sync scope —
+    // no awaits while holding the State guard).
+    let (root_server_id, worktree_server_ids) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let rows: Vec<WorkspaceSyncRecord> = db
+            .list_workspaces_sync()
+            .into_iter()
+            .filter(|r| r.project_uid.as_deref() == Some(project_uid.as_str()))
+            .filter(|r| r.workspace_id.is_none() && r.server_id.is_some())
+            .collect();
+        if rows.is_empty() {
+            return Err(format!(
+                "No un-adopted workspaces found for project {project_uid}. They \
+                 may already be on this device."
+            ));
+        }
+        let root_server_id = rows
+            .iter()
+            .find(|r| r.workspace_kind.as_deref() == Some("main"))
+            .and_then(|r| r.server_id.clone());
+        // Everything that isn't the root (worktrees, plus legacy null-kind
+        // rows) is adopted after the root. Carry (server_id, title) for
+        // failure reporting.
+        let worktree_server_ids: Vec<(String, String)> = rows
+            .iter()
+            .filter(|r| r.workspace_kind.as_deref() != Some("main"))
+            .filter_map(|r| r.server_id.clone().map(|sid| (sid, r.title.clone())))
+            .collect();
+        (root_server_id, worktree_server_ids)
+    };
+
+    let mut adopted: Vec<AdoptOutcome> = Vec::new();
+    let mut failures: Vec<ProjectAdoptFailure> = Vec::new();
+
+    // 1. Root first — a failure here aborts (worktrees can't attach to a
+    //    repo that didn't materialise).
+    if let Some(sid) = root_server_id {
+        let outcome = workspaces_adopt_synced(app.clone(), sid).await?;
+        adopted.push(outcome);
+    }
+
+    // 2. Worktrees — continue-on-error so one bad branch doesn't sink the
+    //    rest. Each reuses the now-present `projects/<repo>` repo.
+    for (sid, title) in worktree_server_ids {
+        match workspaces_adopt_synced(app.clone(), sid.clone()).await {
+            Ok(o) => adopted.push(o),
+            Err(e) => failures.push(ProjectAdoptFailure {
+                server_id: sid,
+                title,
+                error: e,
+            }),
+        }
+    }
+
+    let message = if failures.is_empty() {
+        format!("Pulled {} workspace(s) for this project.", adopted.len())
+    } else {
+        format!(
+            "Pulled {} workspace(s); {} worktree(s) failed.",
+            adopted.len(),
+            failures.len()
+        )
+    };
+    Ok(ProjectAdoptOutcome {
+        adopted,
+        failures,
+        message,
+    })
+}
+
+/// Non-destructively "reconcile" a divergent standalone copy — the full
+/// `.git`-dir copy that lands under `~/.codemux/worktrees/<repo>/<branch>`
+/// and gets flagged with the amber "standalone copy" chip. Detaches its
+/// workspace card (so the project reads cleanly; the user can then "Pull
+/// project" to get a proper protected root) — **files are left on disk,
+/// never deleted**. Refuses when the copy has uncommitted changes or
+/// unpushed commits, returning guidance, so a card never disappears while
+/// the user has work in flight.
+#[tauri::command]
+pub async fn workspaces_reconcile_copy(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<String, String> {
+    // Resolve the copy's on-disk path from app_state (sync scope).
+    let path = {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.worktree_path.clone().unwrap_or_else(|| w.cwd.clone()))
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?
+    };
+
+    // Off-thread git checks: must be a divergent copy and safe to detach.
+    let blocker = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        if !crate::git::is_divergent_copy(p) {
+            return Err(
+                "This workspace isn't a standalone copy — nothing to reconcile.".to_string(),
+            );
+        }
+        Ok(crate::git::reconcile_copy_blocker(p))
+    })
+    .await
+    .map_err(|e| format!("git check join failed: {e}"))??;
+
+    if let Some(reason) = blocker {
+        return Err(format!("Can't reconcile yet: {reason}."));
+    }
+
+    // Safe: detach the copy's workspace card. close_workspace (state-level)
+    // removes the workspace from app_state WITHOUT deleting the directory —
+    // the files (and any local-only history) stay on disk.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state.close_workspace(&workspace_id)?;
+    }
+    crate::state::emit_app_state(&app);
+
+    Ok("Closed the standalone copy (files kept on disk). Use \"Pull project\" \
+        to materialize a proper repo root."
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,6 +1436,7 @@ mod tests {
             project_uid: None,
             workspace_kind: None,
             origin_path: project_path.map(|s| s.into()),
+            default_branch: None,
             created_at: "2026-01-01 00:00:00".into(),
             updated_at: "2026-01-01 00:00:00".into(),
             deleted_at: None,

@@ -176,6 +176,51 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
     );
 
+    // Idle reaper: a daemon with zero live sessions continuously for
+    // `IDLE_REAP` removes its manifest and exits, so an abandoned daemon
+    // doesn't linger forever and stale manifests don't confuse the next
+    // adoption. HARD GUARD: it re-checks the session count under the same
+    // lock immediately before exit, so it can NEVER reap with a live
+    // session — and any spawn/attach naturally resets the idle clock by
+    // making `sessions` non-empty on the next check.
+    {
+        let reaper_state = state.clone();
+        let reaper_socket = socket_path.clone();
+        tokio::spawn(async move {
+            const CHECK_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            const IDLE_REAP: std::time::Duration =
+                std::time::Duration::from_secs(3600);
+            let mut idle_since: Option<tokio::time::Instant> =
+                Some(tokio::time::Instant::now());
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                if !reaper_state.lock().await.sessions.is_empty() {
+                    idle_since = None;
+                    continue;
+                }
+                let since =
+                    idle_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() < IDLE_REAP {
+                    continue;
+                }
+                // Re-check under the lock right before exit — never reap a
+                // daemon that just gained a session between the poll and now.
+                if !reaper_state.lock().await.sessions.is_empty() {
+                    idle_since = None;
+                    continue;
+                }
+                eprintln!(
+                    "[codemux::pty_daemon] idle with no sessions for {IDLE_REAP:?} — \
+                     removing manifest and exiting"
+                );
+                remove_manifest();
+                let _ = std::fs::remove_file(&reaper_socket);
+                std::process::exit(0);
+            }
+        });
+    }
+
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {

@@ -1548,12 +1548,22 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
 
 /// Find the remote tracking ref for a branch (e.g. `origin/main` for `main`).
 /// Find the default branch for the repo (main, master, etc.).
-/// `pub(crate)` so helpers outside the branch-ops module (e.g.
-/// `checkout_default_branch`) can reuse the same resolution logic. Does NOT
-/// supersede `git_default_branch` — that one is the frontend-facing command
-/// with a slightly different fallback (`Ok("main")` instead of `None`).
-/// Consolidating the two is a separate follow-up.
-pub(crate) fn find_default_branch(repo_path: &Path) -> Option<String> {
+/// `pub` so the cross-device daemon (`remote::workspace`) and the protected-root
+/// classifier can reuse the same resolution logic. Does NOT supersede
+/// `git_default_branch` — that one is the frontend-facing command with a
+/// slightly different fallback (`Ok("main")` instead of `None`). Consolidating
+/// the two is a separate follow-up.
+///
+/// IMPORTANT: this resolver is intentionally *conservative* — `origin/HEAD`,
+/// then `main`, then `master`, else `None`. It deliberately does NOT fall back
+/// to "whatever branch is currently checked out", because two callers rely on
+/// that strictness: `is_protected_repo_root` (a current-branch fallback would
+/// protect a root on any branch) and `git_create_worktree` (it checks out the
+/// default to *free* a branch — a current-branch fallback would return the very
+/// branch it's trying to free). For the looser "best effort, never None for a
+/// real repo" form used to stamp the informational `default_branch` column, use
+/// [`resolve_default_branch`].
+pub fn find_default_branch(repo_path: &Path) -> Option<String> {
     // Try origin/HEAD first
     if let Ok(output) = run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         if let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/") {
@@ -1567,6 +1577,50 @@ pub(crate) fn find_default_branch(repo_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Best-effort default-branch resolution for *recording* a repo's default
+/// branch (the cross-device `default_branch` hint), as opposed to the strict
+/// [`find_default_branch`] used for protection/worktree decisions.
+///
+/// Order: `origin/HEAD` → `main`/`master` → the currently checked-out branch.
+/// The last step is what makes this work for **local-only repos whose default
+/// branch is neither `main` nor `master`** (no remote to read `origin/HEAD`
+/// from, e.g. a repo defaulting to `trunk`/`develop`). Returns `None` only for
+/// a detached/unborn HEAD on such a repo.
+///
+/// This value is advisory metadata. The authoritative protection decision is
+/// always recomputed locally via [`is_protected_repo_root`] against the
+/// materialized copy, so a slightly-off hint can never cause a wrong protected
+/// stamp.
+pub fn resolve_default_branch(repo_path: &Path) -> Option<String> {
+    if let Some(b) = find_default_branch(repo_path) {
+        return Some(b);
+    }
+    let current = run_git_permissive(repo_path, &["branch", "--show-current"]);
+    if current.is_empty() {
+        None
+    } else {
+        Some(current)
+    }
+}
+
+/// Populate `refs/remotes/origin/HEAD` so [`find_default_branch`]'s
+/// `origin/HEAD` probe succeeds for freshly-cloned repos. Runs
+/// `git remote set-head origin --auto`.
+///
+/// **No-op by design when there is no `origin` remote** (e.g. local-only repos
+/// adopted via rsync) — calling `set-head` there errors with
+/// "No such remote 'origin'". Any failure of the underlying set-head (offline,
+/// transient) is swallowed: this only ever *improves* default-branch
+/// resolution, never blocks adoption.
+pub fn ensure_origin_head(repo_path: &Path) -> Result<(), String> {
+    let remotes = run_git_permissive(repo_path, &["remote"]);
+    if !remotes.lines().any(|r| r.trim() == "origin") {
+        return Ok(());
+    }
+    let _ = run_git(repo_path, &["remote", "set-head", "origin", "--auto"]);
+    Ok(())
 }
 
 /// Switch the repo to its default branch (main / master / whatever
@@ -1792,6 +1846,34 @@ fn is_divergent_copy_under(path: &Path, worktrees_root: &Path) -> bool {
     path.join(".git").is_dir() && path.starts_with(worktrees_root)
 }
 
+/// Why a divergent copy can't be "reconciled away" (its workspace card
+/// detached) yet, or `None` if it's safe. Blocks on a dirty working tree or
+/// committed-but-unpushed work so a card never silently vanishes while the
+/// user has changes in flight. Reconcile never deletes files, so this is a
+/// guard against *confusion*, not data loss.
+pub fn reconcile_copy_blocker(path: &Path) -> Option<String> {
+    if let Ok(files) = git_status(path) {
+        if !files.is_empty() {
+            return Some(format!(
+                "{} uncommitted change(s) — commit or stash first",
+                files.len()
+            ));
+        }
+    }
+    if let Some(upstream) = resolve_upstream_ref(path) {
+        let out = run_git_permissive(
+            path,
+            &["rev-list", "--count", &format!("{upstream}..HEAD")],
+        );
+        if let Ok(n) = out.trim().parse::<u64>() {
+            if n > 0 {
+                return Some(format!("{n} unpushed commit(s) — push first"));
+            }
+        }
+    }
+    None
+}
+
 /// True when `checkout` is the repo's protected default-branch root —
 /// the entry the overview must not let you delete like a disposable
 /// worktree. It qualifies only when ALL hold:
@@ -1957,6 +2039,56 @@ mod repo_root_tests {
         let plain = root.join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert!(!is_protected_repo_root(&plain, Some("main")));
+    }
+
+    #[test]
+    fn resolve_default_branch_falls_back_to_current_for_nonstandard_local_repo() {
+        // A local-only repo whose default branch is neither `main` nor
+        // `master` and which has no remote — exactly the `passpage`-shaped
+        // case where `origin/HEAD` can't be read.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "--initial-branch=trunk"]);
+        run(&repo, &["config", "user.email", "t@example.com"]);
+        run(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-m", "init"]);
+
+        // The strict resolver gives up (no origin/HEAD, no main, no master)…
+        assert_eq!(find_default_branch(&repo), None);
+        // …but the record-stamping resolver falls back to the current branch,
+        // so the daemon still records a usable default for a local-only repo.
+        assert_eq!(resolve_default_branch(&repo).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn reconcile_copy_blocker_flags_dirty_allows_clean() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Clean, no upstream → safe to reconcile (nothing blocks).
+        assert!(reconcile_copy_blocker(&repo).is_none());
+
+        // Uncommitted change → blocked with guidance.
+        std::fs::write(repo.join("README.md"), "changed").unwrap();
+        let blocker = reconcile_copy_blocker(&repo).expect("dirty tree blocks");
+        assert!(blocker.contains("uncommitted"), "got: {blocker}");
+    }
+
+    #[test]
+    fn ensure_origin_head_is_noop_without_origin_remote() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // No `origin` remote — must succeed (not error on "No such remote")
+        // and leave default-branch resolution working via the main fallback.
+        assert!(ensure_origin_head(&repo).is_ok());
+        assert_eq!(find_default_branch(&repo).as_deref(), Some("main"));
     }
 }
 
