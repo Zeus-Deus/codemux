@@ -32,6 +32,50 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
 
+/// Path of the per-socket liveness pidfile, set once in `run()`. A
+/// `<socket>.pid` sidecar lets an SSH-tunnel reconnect (and the host-side
+/// "is a daemon already serving this socket?" probe) decide whether to
+/// reuse a still-running detached daemon or spawn a fresh one — without
+/// depending on the single shared `pty-daemon-manifest.json` (which a
+/// per-workspace remote daemon would clobber). The daemon owns the file:
+/// it writes it on bind and removes it on clean exit (idle-reap /
+/// Shutdown).
+///
+/// Unix-only: the daemon's `run` loop is `#[cfg(unix)]` (Unix-socket
+/// based), so these helpers have no consumer on Windows.
+#[cfg(unix)]
+static PID_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `<socket>.pid` — the pidfile path for a given daemon socket. Pure so the
+/// host-side reconnect shell and tests agree on the location.
+#[cfg(unix)]
+pub fn pid_file_for(socket_path: &std::path::Path) -> PathBuf {
+    let mut raw = socket_path.as_os_str().to_os_string();
+    raw.push(".pid");
+    PathBuf::from(raw)
+}
+
+/// Write `<socket>.pid` containing this daemon's pid and remember it for
+/// removal on exit. Best-effort: a failure just means a reconnect can't
+/// confirm liveness and will spawn a fresh daemon (correct, if wasteful).
+#[cfg(unix)]
+fn write_pid_file(socket_path: &std::path::Path) {
+    let path = pid_file_for(socket_path);
+    if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
+        eprintln!("[codemux::pty_daemon] WARNING: could not write pidfile {path:?}: {error}");
+    }
+    let _ = PID_FILE.set(path);
+}
+
+/// Remove the pidfile written by `write_pid_file`. Idempotent; no-op if the
+/// daemon never wrote one.
+#[cfg(unix)]
+fn remove_pid_file() {
+    if let Some(path) = PID_FILE.get() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Capacity of the per-session output broadcast channel. Tuned for
 /// short-lived disconnects: roughly 30 seconds of typical TUI redraw output
 /// at 64KB chunks. Slow consumers that lag past this will drop frames; the
@@ -167,6 +211,14 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
         );
     }
 
+    // Per-socket liveness pidfile. The shared manifest above is a single
+    // file that a second per-workspace remote daemon would clobber; the
+    // pidfile is keyed to this socket so the SSH-tunnel reconnect probe can
+    // tell whether THIS socket already has a live (detached) daemon to
+    // reuse — the mechanism behind "close the app, the host agent keeps
+    // running, reopen reattaches."
+    write_pid_file(&socket_path);
+
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
 
     eprintln!(
@@ -215,6 +267,7 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
                      removing manifest and exiting"
                 );
                 remove_manifest();
+                remove_pid_file();
                 let _ = std::fs::remove_file(&reaper_socket);
                 std::process::exit(0);
             }
@@ -567,6 +620,7 @@ async fn handle_request(
             }
             drop(guard);
             remove_manifest();
+            remove_pid_file();
             // Spawn the exit after replying so the client gets the
             // ShuttingDown frame.
             tokio::spawn(async move {
@@ -843,4 +897,23 @@ fn kill_session_pid(pid: u32) {
 fn kill_session_pid(_pid: u32) {
     // Windows path TBD — TerminateProcess + JobObject. Tracked in
     // the windows-support follow-up; for the MVP we only run on Unix.
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::pid_file_for;
+    use std::path::Path;
+
+    #[test]
+    fn pid_file_is_socket_path_plus_pid_suffix() {
+        // The host-side SSH reconnect probe and the daemon must agree on
+        // the pidfile location: it's exactly `<socket>.pid`. A drift here
+        // would silently break daemon reuse (reattach after app close).
+        assert_eq!(
+            pid_file_for(Path::new("/tmp/codemux-ptyd-abc.sock"))
+                .to_str()
+                .unwrap(),
+            "/tmp/codemux-ptyd-abc.sock.pid"
+        );
+    }
 }

@@ -79,6 +79,8 @@ function makeWorkspace(
     active_surface_id: partial.active_surface_id ?? "",
     surfaces: partial.surfaces ?? [],
     host_id: partial.host_id,
+    remote_cwd: partial.remote_cwd ?? null,
+    attach_only: partial.attach_only ?? false,
   } as WorkspaceSnapshot;
 }
 
@@ -103,6 +105,7 @@ function makeSync(
     project_uid: partial.project_uid ?? null,
     workspace_kind: partial.workspace_kind ?? null,
     default_branch: partial.default_branch ?? null,
+    origin_path: partial.origin_path ?? null,
     created_at: partial.created_at ?? "2026-01-01T00:00:00Z",
     updated_at: partial.updated_at ?? "2026-01-01T00:00:00Z",
     dirty: partial.dirty ?? false,
@@ -227,6 +230,71 @@ describe("useOverviewItems", () => {
     expect(titles).toContain("still-here");
     expect(titles).toContain("on-sibling");
     expect(titles).not.toContain("stale-orphan");
+  });
+
+  it("hides a sibling row already opened in place (attach-in-place dedup)", () => {
+    // "Open on host" creates a local attach_only workspace pointing at the
+    // host workspace's path. The same host workspace ALSO has a sibling
+    // sync row (the inventory poller owns it). The overview must show only
+    // the local "running on host" card, not also the "lives on another
+    // device" card — match on (host_server_id, origin_path).
+    mockHosts = [makeHost(5, "homelab", "srv-host-7")];
+    mockWorkspaces = [
+      makeWorkspace({
+        workspace_id: "ws-onhost",
+        title: "svc",
+        host_id: 5,
+        // attach_only + remote_cwd are the open-on-host markers.
+        attach_only: true,
+        remote_cwd: "/srv/agent/svc",
+      } as Partial<WorkspaceSnapshot> & { workspace_id: string }),
+    ];
+    mockSyncRows = [
+      makeSync({
+        id: 40,
+        workspace_id: null,
+        title: "svc",
+        host_server_id: "srv-host-7",
+        origin_path: "/srv/agent/svc",
+      }),
+    ];
+
+    const { result } = renderHook(() => useOverviewItems());
+
+    // Only the local attach-in-place card — the redundant sibling row is
+    // deduped away.
+    expect(result.current.items).toHaveLength(1);
+    expect(result.current.items[0]?.kind).toBe("local");
+  });
+
+  it("keeps the sibling row when no local attach-in-place view matches the path", () => {
+    // A host workspace NOT opened in place (different path) still shows as
+    // a sibling row — the dedup is path-scoped, not host-scoped.
+    mockHosts = [makeHost(5, "homelab", "srv-host-7")];
+    mockWorkspaces = [
+      makeWorkspace({
+        workspace_id: "ws-onhost",
+        title: "svc-a",
+        host_id: 5,
+        attach_only: true,
+        remote_cwd: "/srv/agent/svc-a",
+      } as Partial<WorkspaceSnapshot> & { workspace_id: string }),
+    ];
+    mockSyncRows = [
+      makeSync({
+        id: 41,
+        workspace_id: null,
+        title: "svc-b",
+        host_server_id: "srv-host-7",
+        origin_path: "/srv/agent/svc-b",
+      }),
+    ];
+
+    const { result } = renderHook(() => useOverviewItems());
+
+    const kinds = result.current.items.map((i) => i.kind);
+    expect(kinds).toContain("local");
+    expect(kinds).toContain("remote");
   });
 
   it("falls back to the sync title for a remote row whose project_path is null", () => {

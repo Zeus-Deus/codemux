@@ -4165,6 +4165,8 @@ mod tests {
             active_surface_id: SurfaceId(String::new()),
             surfaces: Vec::new(),
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         }
     }
 

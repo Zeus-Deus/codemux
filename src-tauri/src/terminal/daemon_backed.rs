@@ -45,6 +45,43 @@ pub(crate) fn should_synthesize_agent_relaunch(
     disk_meta_present || claude_uuid_present
 }
 
+/// Resolve the directory a remote (host-backed) workspace's terminals
+/// should spawn into **on the host**. The local `cwd` is a path on this
+/// device that doesn't exist remotely, so it's never used here.
+///
+/// Resolution order:
+/// 1. `remote_cwd` — the workspace's real on-host directory. Set for
+///    "open on host" / attach-in-place workspaces, where the host
+///    directory was discovered by the inventory poller and can live at an
+///    arbitrary path we can't reconstruct. Always preferred when present.
+/// 2. The conventional, `project_uid`-keyed path
+///    (`~/.codemux/worktrees/<uid>-<project>/<branch>`) — where the push
+///    flow lands a pushed workspace. Used for pushed workspaces (no
+///    `remote_cwd`), and matches the path `workspace_push_to_host` chose.
+pub(crate) fn remote_spawn_cwd(owning_ws: Option<&crate::state::WorkspaceSnapshot>) -> String {
+    if let Some(remote_cwd) = owning_ws.and_then(|w| w.remote_cwd.clone()) {
+        if !remote_cwd.trim().is_empty() {
+            return remote_cwd;
+        }
+    }
+    let project_name = owning_ws
+        .and_then(|w| {
+            w.project_root
+                .as_deref()
+                .and_then(|p| std::path::Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "workspace".to_string());
+    let branch = owning_ws
+        .and_then(|w| w.git_branch.clone())
+        .unwrap_or_else(|| "main".to_string());
+    let puid = owning_ws.and_then(|w| w.project_uid.clone());
+    crate::ssh::conventional_remote_path_keyed(puid.as_deref(), &project_name, &branch)
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Public entrypoint. Called from `spawn_pty_for_agent` when the
 /// `persistent_agents.enabled` setting is on. Returns an error if the
 /// daemon can't be reached, the spawn failed, or the attach failed —
@@ -136,29 +173,11 @@ pub async fn spawn_pty_for_agent_via_daemon(
         },
     );
 
-    // Remote workspaces resolve their cwd to the conventional remote path
-    // (`~/.codemux/worktrees/<project>/<branch>`) — the local cwd doesn't
-    // exist on the remote host. Local workspaces keep their actual cwd.
+    // Remote workspaces resolve their cwd to a host path — the local cwd
+    // doesn't exist on the remote host. Local workspaces keep their actual
+    // cwd.
     let cwd = if is_remote {
-        let project_name = owning_ws
-            .and_then(|w| {
-                w.project_root
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "workspace".to_string());
-        let branch = owning_ws
-            .and_then(|w| w.git_branch.clone())
-            .unwrap_or_else(|| "main".to_string());
-        // Key on project_uid so this matches where push landed the workspace
-        // (collision-safe across same-basename repos). Same uid the push used,
-        // so the two always agree for a workspace pushed by this build.
-        let puid = owning_ws.and_then(|w| w.project_uid.clone());
-        crate::ssh::conventional_remote_path_keyed(puid.as_deref(), &project_name, &branch)
-            .to_string_lossy()
-            .to_string()
+        remote_spawn_cwd(owning_ws)
     } else {
         session_working_dir(&app_state, &session_id)
     };
@@ -466,26 +485,14 @@ pub async fn spawn_pty_for_session_via_daemon(
     // path that doesn't exist on the remote host. Local workspaces
     // keep using the local cwd as before.
     let mut effective_cwd = if is_remote {
-        let project_name = owning_ws
-            .and_then(|w| {
-                w.project_root
-                    .as_deref()
-                    .and_then(|p| std::path::Path::new(p).file_name())
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "workspace".to_string());
-        let branch = owning_ws
-            .and_then(|w| w.git_branch.clone())
-            .unwrap_or_else(|| "main".to_string());
-        let computed = crate::ssh::conventional_remote_path(&project_name, &branch)
-            .to_string_lossy()
-            .to_string();
+        let computed = remote_spawn_cwd(owning_ws);
         eprintln!(
             "[codemux::terminal::daemon_backed] remote cwd for {session_id}: \
-             {computed} (owning_ws={}, project_root={:?}, git_branch={:?}, \
-             project_name={project_name:?}, branch={branch:?})",
+             {computed} (owning_ws={}, attach_only={}, remote_cwd={:?}, \
+             project_root={:?}, git_branch={:?})",
             owning_ws.is_some(),
+            owning_ws.map(|w| w.attach_only).unwrap_or(false),
+            owning_ws.and_then(|w| w.remote_cwd.clone()),
             owning_ws.and_then(|w| w.project_root.clone()),
             owning_ws.and_then(|w| w.git_branch.clone()),
         );
@@ -1325,5 +1332,49 @@ mod tests {
         // through both an app restart (disk meta) and a remote round-trip
         // (UUID). Both signals say "this is a real relaunch."
         assert!(should_synthesize_agent_relaunch(true, true));
+    }
+
+    // ── remote_spawn_cwd: where a host-backed terminal lands on the host ──
+
+    #[test]
+    fn remote_spawn_cwd_prefers_remote_cwd_for_attach_in_place() {
+        // The whole point of "open on host": the terminal spawns in the
+        // workspace's REAL on-host directory (which can be an arbitrary,
+        // agent-created path), not a reconstructed conventional path.
+        let store = crate::state::AppStateStore::default();
+        let wid = store.create_remote_attach_workspace(
+            "demo".into(),
+            1,
+            "/srv/agent-made/app".into(),
+            Some("feature/x".into()),
+            Some("/home/me/app".into()),
+            Some("uid-123".into()),
+            Some("worktree".into()),
+        );
+        let snap = store.snapshot();
+        let ws = snap
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == wid.0)
+            .expect("workspace exists");
+        assert!(ws.attach_only, "open-on-host workspace is attach_only");
+        assert_eq!(ws.host_id, Some(1));
+        assert_eq!(ws.remote_cwd.as_deref(), Some("/srv/agent-made/app"));
+        assert_eq!(
+            super::remote_spawn_cwd(Some(ws)),
+            "/srv/agent-made/app",
+            "remote_cwd must win over the reconstructed conventional path"
+        );
+    }
+
+    #[test]
+    fn remote_spawn_cwd_falls_back_to_conventional_without_remote_cwd() {
+        // Pushed workspaces (and any host workspace whose path we don't
+        // know) fall back to the conventional `~/.codemux/worktrees/...`
+        // layout. `None` exercises the safe defaults.
+        let cwd = super::remote_spawn_cwd(None);
+        assert!(cwd.contains("worktrees"), "got {cwd}");
+        assert!(cwd.contains("workspace"), "default project name; got {cwd}");
+        assert!(cwd.ends_with("main"), "default branch; got {cwd}");
     }
 }

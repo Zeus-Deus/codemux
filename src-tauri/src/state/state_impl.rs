@@ -413,6 +413,27 @@ pub struct WorkspaceSnapshot {
     /// `None` as "local" exactly as before.
     #[serde(default)]
     pub host_id: Option<i64>,
+    /// The actual working directory of this workspace **on its host**.
+    /// `None` for ordinary local workspaces and for pushed workspaces
+    /// (which land at a deterministic `conventional_remote_path`). It is
+    /// set for "open on host" / attach-in-place workspaces, where the
+    /// host directory was discovered by the inventory poller and lives at
+    /// an arbitrary path the desktop can't reconstruct. When set, the
+    /// daemon-backed terminal spawns into this exact path on the remote
+    /// instead of the reconstructed conventional path. Additive; old
+    /// snapshots deserialize as `None`.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+    /// True when this workspace is operated **in place on its host with no
+    /// local copy of the files**. Created by `workspace_open_on_host`. The
+    /// `cwd`/`worktree_path` are host paths that do not exist on this
+    /// device, so local-filesystem work (git info, worktree deletion,
+    /// re-push) is skipped and the only teardown is a detach
+    /// (`close_workspace` — never `close_workspace_with_worktree`), which
+    /// leaves the host process running. Additive; old snapshots
+    /// deserialize as `false`.
+    #[serde(default)]
+    pub attach_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -711,6 +732,8 @@ impl AppStateStore {
                 },
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -831,6 +854,8 @@ impl AppStateStore {
             active_surface_id: SurfaceId(String::new()),
             surfaces: vec![],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -910,6 +935,8 @@ impl AppStateStore {
             // follows knows which device to rsync from. It will be
             // cleared to None on successful pull.
             host_id: Some(host_id),
+            remote_cwd: None,
+            attach_only: false,
         });
 
         // We deliberately do NOT set this as the active workspace.
@@ -968,8 +995,123 @@ impl AppStateStore {
             active_surface_id: SurfaceId(String::new()),
             surfaces: vec![],
             host_id: Some(host_id),
+            remote_cwd: None,
+            attach_only: false,
         });
 
+        workspace_id
+    }
+
+    /// Create an **attach-in-place** workspace: a local workspace that is
+    /// operated directly on its host (`host_id`), with its files staying
+    /// on the host (`remote_cwd`) and **nothing copied to this device**.
+    /// This backs the "Open on host" overview action.
+    ///
+    /// Unlike [`create_synced_workspace_shell`] / [`create_synced_root_shell`]
+    /// (which are empty placeholders awaiting an rsync pull), this builds a
+    /// ready-to-use single-terminal layout: opening the workspace
+    /// immediately spawns a shell on the host (the daemon-backed terminal
+    /// path routes `host_id`-bearing workspaces through the SSH-tunneled
+    /// remote daemon, and prefers `remote_cwd` as the spawn directory).
+    ///
+    /// `attach_only` is set so every file-system-bound code path (git info,
+    /// worktree deletion, re-push) is skipped and the only teardown is a
+    /// detach that leaves the host process running.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_remote_attach_workspace(
+        &self,
+        title: String,
+        host_id: i64,
+        remote_cwd: String,
+        git_branch: Option<String>,
+        project_root: Option<String>,
+        project_uid: Option<String>,
+        workspace_kind: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+        let surface_id = SurfaceId(next_id("surface"));
+        let session_id = SessionId(next_id("session"));
+        let base_terminal_index = snapshot.terminal_sessions.len() + 1;
+
+        // A single shell session whose cwd is the host directory. The
+        // daemon-backed spawn path re-derives the effective cwd from
+        // `remote_cwd`, so this value is informational, but we keep it
+        // consistent so the UI shows the right path.
+        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+            session_id: session_id.clone(),
+            title: format!("Terminal {base_terminal_index}"),
+            shell: None,
+            cwd: remote_cwd.clone(),
+            cols: 80,
+            rows: 24,
+            state: TerminalSessionState::Starting,
+            last_message: Some("Preparing shell session".into()),
+            exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
+        });
+
+        let pane_id = PaneId(next_id("pane"));
+        let root = PaneNodeSnapshot::Terminal {
+            pane_id: pane_id.clone(),
+            session_id: session_id.clone(),
+            title: "Terminal".into(),
+        };
+        let default_tab_id = next_id("tab");
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            // `cwd` is a host path that does not exist on this device. It
+            // is never used for local FS work (gated behind `attach_only`)
+            // — it's here so the workspace header shows the host directory.
+            cwd: remote_cwd.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: None,
+            project_root,
+            project_uid,
+            workspace_kind,
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![TabSnapshot {
+                tab_id: default_tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id.clone()),
+                browser_id: None,
+                icon: None,
+            }],
+            active_tab_id: default_tab_id,
+            active_surface_id: surface_id.clone(),
+            surfaces: vec![SurfaceSnapshot {
+                surface_id,
+                title: "Main Surface".into(),
+                active_pane_id: pane_id,
+                root,
+            }],
+            host_id: Some(host_id),
+            remote_cwd: Some(remote_cwd),
+            attach_only: true,
+        });
+
+        snapshot.active_workspace_id = workspace_id.clone();
+        snapshot
+            .notifications
+            .retain(|notification| notification.workspace_id != workspace_id);
         workspace_id
     }
 
@@ -1093,6 +1235,8 @@ impl AppStateStore {
                 root,
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1648,6 +1792,11 @@ impl AppStateStore {
         snapshot
             .workspaces
             .iter()
+            // Attach-in-place ("open on host") workspaces have no local
+            // checkout — their `cwd` is a host path that doesn't exist on
+            // this device, so the periodic git enrichment sweep must skip
+            // them (it would spawn 5-8 doomed git subprocesses every tick).
+            .filter(|w| !w.attach_only)
             .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
             .collect()
     }
@@ -1694,6 +1843,12 @@ impl AppStateStore {
             .workspaces
             .iter()
             .find(|w| w.workspace_id == snapshot.active_workspace_id)?;
+        // Attach-in-place workspaces have no local checkout, so the active-
+        // workspace PR/issue refresh (which shells out to `gh` in `cwd`)
+        // would run against a path that doesn't exist on this device.
+        if workspace.attach_only {
+            return None;
+        }
         Some((workspace.workspace_id.0.clone(), workspace.cwd.clone()))
     }
 
@@ -3565,6 +3720,8 @@ fn default_app_state() -> AppStateSnapshot {
                 },
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
@@ -4678,6 +4835,48 @@ mod tests {
             w.project_uid.as_deref(),
             Some(expected.as_str()),
             "project_uid must be stamped deterministically at create"
+        );
+    }
+
+    #[test]
+    fn create_remote_attach_workspace_sets_in_place_fields_and_a_terminal() {
+        let store = AppStateStore::default();
+        let wid = store.create_remote_attach_workspace(
+            "remote-svc".into(),
+            7,
+            "/srv/agent/work/svc".into(),
+            Some("feature/y".into()),
+            Some("/home/agent/svc".into()),
+            Some("uid-svc".into()),
+            Some("worktree".into()),
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert!(w.attach_only, "open-on-host workspace must be attach_only");
+        assert_eq!(w.host_id, Some(7), "routes terminals to the host daemon");
+        assert_eq!(w.remote_cwd.as_deref(), Some("/srv/agent/work/svc"));
+        // cwd mirrors the host path (display only); no local worktree.
+        assert_eq!(w.cwd, "/srv/agent/work/svc");
+        assert!(w.worktree_path.is_none(), "no local checkout");
+        assert_eq!(w.git_branch.as_deref(), Some("feature/y"));
+        assert_eq!(w.project_uid.as_deref(), Some("uid-svc"));
+        assert_eq!(w.workspace_kind.as_deref(), Some("worktree"));
+        // It opens ready-to-use: one terminal surface, and it's active.
+        assert_eq!(w.surfaces.len(), 1, "a single terminal pane to attach");
+        assert!(matches!(
+            w.surfaces[0].root,
+            PaneNodeSnapshot::Terminal { .. }
+        ));
+        assert_eq!(
+            snap.active_workspace_id, wid,
+            "opening on host activates the workspace"
+        );
+        // It must be excluded from the periodic local git-enrichment sweep
+        // (its cwd is a host path that doesn't exist on this device).
+        assert!(
+            !store.all_workspace_cwds().contains_key(&wid.0),
+            "attach_only workspaces are skipped by the git enrichment sweep"
         );
     }
 

@@ -544,6 +544,15 @@ pub fn reconcile_from_snapshot(
         if matches!(ws.workspace_type, crate::state::WorkspaceType::Home) {
             continue;
         }
+        // Attach-in-place ("open on host") workspaces are a *local view*
+        // onto a workspace that already lives — and is already published —
+        // on its host (the inventory poller owns that row). Mirroring it
+        // here would create a duplicate cloud row that phantoms on every
+        // other device, and closing the local view (a detach) would then
+        // soft-delete it. Skip: the host row is the source of truth.
+        if ws.attach_only {
+            continue;
+        }
 
         let wid = ws.workspace_id.0.clone();
         live_wids.insert(wid.clone());
@@ -998,6 +1007,8 @@ mod tests {
             active_surface_id: SurfaceId(String::new()),
             surfaces: Vec::new(),
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         }
     }
 
@@ -1055,6 +1066,27 @@ mod tests {
         assert_eq!(list[0].workspace_id.as_deref(), Some("workspace-A"));
         assert_eq!(list[0].title, "alpha");
         assert!(list[0].dirty, "freshly inserted row must be dirty");
+    }
+
+    #[test]
+    #[serial]
+    fn reconcile_skips_attach_in_place_workspaces() {
+        // An "open on host" workspace is a local VIEW onto a host workspace
+        // the inventory poller already publishes. Mirroring it here would
+        // create a duplicate cloud row that phantoms on every other device.
+        // The reconcile must skip it entirely (like OpenFlow/Home).
+        let db = fresh_db();
+        let mut attach = make_ws("workspace-onhost", "remote-svc");
+        attach.attach_only = true;
+        attach.host_id = Some(3);
+        attach.remote_cwd = Some("/srv/remote-svc".into());
+        let snapshot = make_snapshot(vec![attach, make_ws("workspace-local", "local")]);
+
+        super::reconcile_from_snapshot(&db, &snapshot).unwrap();
+
+        let list = db.list_workspaces_sync();
+        assert_eq!(list.len(), 1, "only the real local workspace is mirrored");
+        assert_eq!(list[0].workspace_id.as_deref(), Some("workspace-local"));
     }
 
     #[test]

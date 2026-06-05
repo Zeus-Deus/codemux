@@ -236,6 +236,19 @@ export function useOverviewItems(): {
     const result: OverviewItem[] = [];
     const consumedSyncIds = new Set<number>();
 
+    // Attach-in-place ("open on host") workspaces are a local view onto a
+    // host workspace that ALSO has a sibling sync row (the inventory poller
+    // owns it). Without deduping, the overview would show both the local
+    // "running on host" card and the "lives on another device" card for the
+    // same thing. Key by `<host_server_id>::<remote_cwd>` so we can hide the
+    // redundant sibling row below.
+    const openOnHostKeys = new Set<string>();
+    for (const ws of workspaces ?? []) {
+      if (!ws.attach_only || ws.host_id == null || !ws.remote_cwd) continue;
+      const serverId = hostIdToServer.get(ws.host_id) ?? null;
+      if (serverId) openOnHostKeys.add(`${serverId}::${ws.remote_cwd}`);
+    }
+
     // 1) Every local workspace contributes a "local" item. The sync
     //    row (if any) tags it with host_server_id and dirty.
     for (const ws of workspaces ?? []) {
@@ -275,6 +288,15 @@ export function useOverviewItems(): {
     for (const row of syncRows) {
       if (consumedSyncIds.has(row.id)) continue;
       if (row.workspace_id !== null) continue;
+      // Hide a sibling row that's already opened in place on this device
+      // (an attach-in-place local workspace points at the same host+path).
+      if (
+        row.host_server_id &&
+        row.origin_path &&
+        openOnHostKeys.has(`${row.host_server_id}::${row.origin_path}`)
+      ) {
+        continue;
+      }
       result.push({
         kind: "remote",
         key: `remote:${row.server_id ?? row.id}`,

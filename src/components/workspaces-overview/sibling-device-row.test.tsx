@@ -48,6 +48,7 @@ function makeSyncRow(overrides?: Partial<WorkspaceSyncView>): WorkspaceSyncView 
     project_uid: null,
     workspace_kind: null,
     default_branch: null,
+    origin_path: null,
     created_at: "2026-05-20T10:00:00Z",
     updated_at: "2026-05-20T10:00:00Z",
     dirty: false,
@@ -186,14 +187,16 @@ function localItem(
     active_tab_id: "",
     active_surface_id: "",
     surfaces: [],
-    host_id: null,
+    host_id: ws.host_id ?? null,
+    remote_cwd: ws.remote_cwd ?? null,
+    attach_only: ws.attach_only ?? false,
   } as unknown as WorkspaceSnapshot;
   return {
     kind: "local",
     key: `local:${workspace.workspace_id}`,
     workspace,
     sync: null,
-    hostServerId: null,
+    hostServerId: workspace.host_id != null ? "7" : null,
     projectName: "proj",
     projectPath: "/home/test/proj",
     projectKey: "/home/test/proj",
@@ -232,6 +235,24 @@ describe("WorkspaceOverviewRow (local repo-root protection)", () => {
       />,
     );
     expect(queryByText("repo root")).toBeNull();
+  });
+
+  it("renders an 'on host' badge for an attach-in-place (open-on-host) workspace", () => {
+    const { getByText } = render(
+      <WorkspaceOverviewRow
+        item={localItem({
+          workspace_id: "ws-onhost",
+          title: "remote-svc",
+          host_id: 5,
+          attach_only: true,
+          remote_cwd: "/srv/agent/svc",
+        } as Partial<WorkspaceSnapshot> & { workspace_id: string })}
+        isAttached={false}
+        onAfterOpen={() => {}}
+      />,
+    );
+    // It signals it runs in place on the host (no local copy).
+    expect(getByText("on host")).toBeInTheDocument();
   });
 
   it("warns with a 'standalone copy' chip for a divergent copy", () => {

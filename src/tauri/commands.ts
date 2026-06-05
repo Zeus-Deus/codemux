@@ -1778,6 +1778,12 @@ export interface WorkspaceSyncView {
    *  right branch even when git_branch is null. Local-only — never sent
    *  to or returned from the cloud API. */
   default_branch: string | null;
+  /** The workspace's real absolute path on its host (daemon-reported,
+   *  set by the inventory poller). Drives the "Open on host" action and
+   *  lets the overview dedupe a host row against an already-open
+   *  attach-in-place workspace. Local-only; null on rows that never came
+   *  from a host poll. */
+  origin_path: string | null;
   created_at: string;
   updated_at: string;
   /** True iff the row has unpushed changes. UI surfaces this as a
@@ -1880,3 +1886,23 @@ export const workspacesAdoptProject = (projectUid: string) =>
  *  guidance when it has uncommitted/unpushed work. */
 export const workspacesReconcileCopy = (workspaceId: string) =>
   invoke<string>("workspaces_reconcile_copy", { workspaceId });
+
+export interface OpenOnHostOutcome {
+  /** The new (or already-open) local attach-in-place workspace id. */
+  workspace_id: string;
+  /** The directory the workspace operates in on the host. */
+  remote_cwd: string;
+  message: string;
+}
+
+/** Open a host-backed workspace IN PLACE on its host — no rsync, no local
+ *  copy of the files. Creates a local "attach-in-place" workspace whose
+ *  terminal runs on the host (over the existing SSH-tunneled daemon) in the
+ *  workspace's real on-host directory. Because the host daemon is detached +
+ *  persistent, closing the app leaves it running and reopening reattaches.
+ *
+ *  `syncRowId` is the `WorkspaceSyncView.id` of a host-backed row; the host
+ *  must be configured on this device. Idempotent — opening twice
+ *  re-activates the existing local view. */
+export const workspaceOpenOnHost = (syncRowId: number) =>
+  invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });

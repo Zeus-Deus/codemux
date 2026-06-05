@@ -1664,6 +1664,7 @@ pub fn run() {
             commands::workspaces_adopt_via_clone,
             commands::workspaces_adopt_project,
             commands::workspaces_reconcile_copy,
+            commands::workspace_open_on_host,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

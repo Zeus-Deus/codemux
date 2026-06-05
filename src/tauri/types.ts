@@ -790,6 +790,15 @@ export interface WorkspaceSnapshot {
    *  the TS type because older snapshots persisted without the field
    *  and the Rust side falls back to `None` via serde default. */
   host_id?: number | null;
+  /** The workspace's real working directory ON ITS HOST. Set for
+   *  "open on host" / attach-in-place workspaces (terminals spawn here
+   *  on the remote). `null`/undefined for local + pushed workspaces. */
+  remote_cwd?: string | null;
+  /** True when this workspace is operated in place on its host with no
+   *  local copy of the files (`cwd` is a host path). The UI shows a
+   *  host badge and offers only "Close (detach)" — never delete/push.
+   *  Defaults to false on older snapshots. */
+  attach_only?: boolean;
 }
 
 export interface PersistenceSchema {
