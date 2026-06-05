@@ -215,6 +215,21 @@ mod tests {
     }
 
     #[test]
+    fn none_uid_reproduces_legacy_root_layout() {
+        // Root variant of the safety net: with no uid, the keyed root path is
+        // byte-identical to the pre-re-key `projects/` layout, so already-pushed
+        // /already-adopted roots still resolve.
+        assert_eq!(
+            conventional_remote_root_path_keyed(None, "my-proj").to_string_lossy(),
+            conventional_remote_root_path("my-proj").to_string_lossy(),
+        );
+        assert_eq!(
+            conventional_remote_root_path_keyed(None, "my-proj").to_string_lossy(),
+            "~/.codemux/projects/my-proj",
+        );
+    }
+
+    #[test]
     fn root_path_lives_under_projects_not_worktrees() {
         // A repo root lands under projects/, never in the worktrees tree,
         // so it can't be mistaken for a disposable worktree.

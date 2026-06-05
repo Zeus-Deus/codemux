@@ -46,6 +46,115 @@ async fn acquire_adopt_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
     mutex.lock_owned().await
 }
 
+// ── Local adoption landing paths ──
+//
+// When a sibling workspace is adopted onto THIS device, its files land at a
+// local path under `~/.codemux`. Those paths are keyed on the project's
+// deterministic `project_uid` (`<basename>-<short-uid>`) so adopting two
+// DIFFERENT projects that share a basename (e.g. `acme/api` and
+// `widgets/api`) no longer collide locally — mirroring the host-side re-key
+// done in PR #63. Every adoption surface (preview, host-backed adopt, clone,
+// worktree-rsync) routes through these helpers so they all agree on where a
+// row lands; if they disagreed, a re-pull would duplicate.
+//
+// Basename read-fallback: a copy adopted BEFORE the re-key lives at the bare
+// `<basename>` path. When such a directory already exists on disk we reuse it
+// instead of landing a second copy at the new uid-keyed path — so re-pull
+// stays idempotent for already-adopted workspaces. `project_uid = None`
+// makes the keyed path identical to the legacy basename path, so pre-re-key
+// rows are unaffected regardless of what's on disk.
+
+/// Pick between the uid-keyed landing and the legacy bare-basename landing.
+/// Prefer the legacy path ONLY when it differs from the keyed one AND already
+/// exists on disk (a pre-re-key adopted copy we must keep reusing). Kept pure
+/// — the `legacy_exists` flag is injected — so the decision is unit-testable;
+/// real callers pass `legacy.exists()`.
+fn choose_landing(
+    keyed: std::path::PathBuf,
+    legacy: std::path::PathBuf,
+    legacy_exists: bool,
+) -> std::path::PathBuf {
+    if keyed != legacy && legacy_exists {
+        legacy
+    } else {
+        keyed
+    }
+}
+
+/// Absolute local landing dir for an adopted repo ROOT
+/// (`~/.codemux/projects/<basename>-<short-uid>`), with the basename
+/// read-fallback. Used for `main`/root rows and as the repo dir that
+/// worktree adoptions hang their recreated worktrees off of.
+fn adopt_root_landing(project_uid: Option<&str>, project_name: &str) -> String {
+    let keyed = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_root_path_keyed(
+            project_uid,
+            project_name,
+        ),
+    );
+    let legacy = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_root_path(project_name),
+    );
+    let legacy_exists = legacy.exists();
+    choose_landing(keyed, legacy, legacy_exists)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Absolute local landing dir for an adopted WORKTREE
+/// (`~/.codemux/worktrees/<basename>-<short-uid>/<branch>`), with the basename
+/// read-fallback.
+fn adopt_worktree_landing(
+    project_uid: Option<&str>,
+    project_name: &str,
+    branch: &str,
+) -> String {
+    let keyed = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path_keyed(
+            project_uid,
+            project_name,
+            branch,
+        ),
+    );
+    let legacy = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path(project_name, branch),
+    );
+    let legacy_exists = legacy.exists();
+    choose_landing(keyed, legacy, legacy_exists)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Predicted local worktree landing for a row that adopts via **repo-rsync +
+/// `git_create_worktree`** — a `worktree`-kind host row (`adopt_worktree_via_repo_rsync`)
+/// or any clone-adopt (`workspaces_adopt_via_clone`). `git_create_worktree`
+/// derives the worktree dir from the repo ROOT dir's basename, so the
+/// worktree's uid-suffix tracks the ROOT landing decision — NOT an independent
+/// `worktrees/<name>/<branch>` existence check. The preview uses this so it
+/// agrees with where such a row actually lands: e.g. when a copy adopted before
+/// the re-key already occupies the bare `projects/<name>` path, `adopt_root_landing`
+/// reuses it and the worktree lands bare too (`worktrees/<name>/<branch>`).
+///
+/// Single-dir adoptions (null/legacy host rows) use [`adopt_worktree_landing`]
+/// instead, where the worktree dir IS the rsync target and so must key on the
+/// `worktrees/` path directly.
+fn adopt_worktree_landing_via_repo(
+    project_uid: Option<&str>,
+    project_name: &str,
+    branch: &str,
+) -> String {
+    let root = adopt_root_landing(project_uid, project_name);
+    let root_basename = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(project_name);
+    crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path(root_basename, branch),
+    )
+    .to_string_lossy()
+    .to_string()
+}
+
 /// Wire shape sent to the frontend. Matches the field naming the
 /// existing UI expects (snake_case from Rust, camelCase from
 /// serde-rename on JS-facing structs would be inconsistent with the
@@ -295,15 +404,28 @@ pub fn workspaces_adoption_preview(
         .filter(|n| !n.is_empty())
         .unwrap_or(row.title.as_str());
     let branch = row.git_branch.as_deref().unwrap_or("main");
-    let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
-    let conv_str = conv.to_string_lossy().to_string();
-    // The conventional path uses `~/` — expand for the local check.
-    let suggested_path = if let Some(rest) = conv_str.strip_prefix("~/") {
-        dirs::home_dir()
-            .map(|h| h.join(rest).to_string_lossy().to_string())
-            .unwrap_or(conv_str.clone())
-    } else {
-        conv_str.clone()
+    // Key the landing on the row's project_uid (basename read-fallback) so the
+    // preview matches EXACTLY where adoption lands — including the root-vs-
+    // worktree split AND the per-kind adopt route (the worktree dir's uid-suffix
+    // tracks different fallbacks depending on how the row materialises). Without
+    // keying, two different same-basename projects would preview (and land) at
+    // the same local path.
+    let suggested_path = match row.workspace_kind.as_deref() {
+        // A repo ROOT lands under `projects/`.
+        Some("main") => adopt_root_landing(row.project_uid.as_deref(), project_name),
+        // A `worktree`-kind row materialises via repo-rsync + `git worktree add`,
+        // so its worktree dir is derived from the repo ROOT's landing basename —
+        // predict it the same way (see `adopt_worktree_landing_via_repo`) so the
+        // preview still agrees when a pre-re-key root occupies the bare
+        // `projects/<name>` path.
+        Some("worktree") => adopt_worktree_landing_via_repo(
+            row.project_uid.as_deref(),
+            project_name,
+            branch,
+        ),
+        // Null/legacy rows adopt single-dir (the worktree dir IS the rsync
+        // target), so the landing tracks the `worktrees/` fallback directly.
+        _ => adopt_worktree_landing(row.project_uid.as_deref(), project_name, branch),
     };
 
     // Detect path conflict against other live workspaces.
@@ -594,27 +716,15 @@ pub async fn workspaces_adopt_synced(
             .filter(|n| !n.is_empty())
             .unwrap_or(row.title.as_str());
         let branch = row.git_branch.as_deref().unwrap_or("main");
+        // Key the local landing on the row's project_uid (basename read-
+        // fallback) so two different same-basename projects don't collide
+        // locally. These helpers are the SAME ones the preview uses, so the
+        // dialog preview always matches where adoption actually lands. A root
+        // lands under `projects/`, a worktree under `worktrees/`.
         let worktree_path = if is_root {
-            let home =
-                dirs::home_dir().ok_or_else(|| "home directory unavailable".to_string())?;
-            home.join(".codemux")
-                .join("projects")
-                .join(project_name)
-                .to_string_lossy()
-                .to_string()
+            adopt_root_landing(row.project_uid.as_deref(), project_name)
         } else {
-            // Mirrors the suggested_path logic in
-            // `workspaces_adoption_preview` so the dialog preview matches
-            // where adoption lands.
-            let conv = crate::workspace_paths::conventional_remote_path(project_name, branch);
-            let conv_str = conv.to_string_lossy().to_string();
-            if let Some(rest) = conv_str.strip_prefix("~/") {
-                dirs::home_dir()
-                    .map(|h| h.join(rest).to_string_lossy().to_string())
-                    .unwrap_or(conv_str.clone())
-            } else {
-                conv_str.clone()
-            }
+            adopt_worktree_landing(row.project_uid.as_deref(), project_name, branch)
         };
 
         // Path collision check — refuse to clobber a workspace that
@@ -858,8 +968,17 @@ async fn adopt_worktree_via_repo_rsync(
             .map(|s| s.to_string())
             .unwrap_or_else(|| row.title.clone());
         let branch = row.git_branch.clone().unwrap_or_else(|| "main".to_string());
-        let home = dirs::home_dir().ok_or_else(|| "home directory unavailable".to_string())?;
-        let local_project_path = home.join(".codemux").join("projects").join(&project_name);
+        // Key the local repo landing on the row's project_uid (basename read-
+        // fallback) so two different same-basename projects don't collide. The
+        // recreated worktree inherits the uid suffix automatically, because
+        // `git_create_worktree` derives the worktree dir from THIS repo dir's
+        // basename. The fallback keeps the "already adopted? reuse
+        // projects/<name>/.git" idempotency check (just below) intact for
+        // copies adopted before the re-key.
+        let local_project_path = std::path::PathBuf::from(adopt_root_landing(
+            row.project_uid.as_deref(),
+            &project_name,
+        ));
 
         (
             local_host,
@@ -1084,25 +1203,27 @@ pub async fn workspaces_adopt_via_clone(
             .clone()
             .unwrap_or_else(|| "main".to_string());
 
-        // Project goes under ~/.codemux/projects/<basename>. We
-        // deliberately avoid colliding with user-managed paths like
-        // ~/projects/<basename>.
-        let home = dirs::home_dir()
-            .ok_or_else(|| "home directory unavailable".to_string())?;
-        let project_path = home
-            .join(".codemux")
-            .join("projects")
-            .join(&project_name);
-        // Worktree path matches the canonical layout push/pull use,
-        // so a future push to a shared host lands at the same
-        // remote path another device would.
-        let conv = crate::workspace_paths::conventional_remote_path(&project_name, &branch);
-        let conv_str = conv.to_string_lossy().to_string();
-        let worktree_path = if let Some(rest) = conv_str.strip_prefix("~/") {
-            home.join(rest)
-        } else {
-            std::path::PathBuf::from(&conv_str)
-        };
+        // Project goes under ~/.codemux/projects/<basename>-<short-uid> (keyed
+        // on the row's project_uid, basename read-fallback). We deliberately
+        // avoid colliding with user-managed paths like ~/projects/<basename>,
+        // and the uid suffix keeps two different same-basename projects apart.
+        let project_path = std::path::PathBuf::from(adopt_root_landing(
+            row.project_uid.as_deref(),
+            &project_name,
+        ));
+        // Worktree path matches the canonical layout push/pull use, so a future
+        // push to a shared host lands at the same remote path another device
+        // would. Derive it from the chosen project dir's BASENAME — that's
+        // exactly what `git_create_worktree` uses for the worktree dir
+        // component below, so this collision-check path matches where the
+        // worktree actually lands (uid-keyed or legacy, consistently).
+        let project_basename = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(project_name.as_str());
+        let worktree_path = crate::workspace_paths::expand_tilde(
+            &crate::workspace_paths::conventional_remote_path(project_basename, &branch),
+        );
 
         // Path collision check against live workspaces. Defence-in-
         // depth — the preview already showed this; bailing here
@@ -1669,5 +1790,113 @@ fn extract_project_name_from_remote(url: &str) -> Option<String> {
         None
     } else {
         Some(stripped.to_string())
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    //! Local adoption landing paths. Mirrors the spirit of
+    //! `workspace_paths`'s `uid_keyed_path_disambiguates_same_basename` /
+    //! `none_uid_reproduces_legacy_basename_layout` tests, one layer up: at
+    //! the adoption layer where the basename read-fallback decision lives.
+    use super::{
+        adopt_root_landing, adopt_worktree_landing, adopt_worktree_landing_via_repo,
+        choose_landing,
+    };
+    use std::path::PathBuf;
+
+    // ── choose_landing: the basename read-fallback decision ──
+
+    #[test]
+    fn choose_landing_prefers_uid_keyed_when_no_legacy_copy() {
+        // Fresh adoption (no pre-re-key dir on disk) ⇒ the uid-keyed path,
+        // so two different same-basename projects don't collide.
+        let keyed = PathBuf::from("/home/u/.codemux/projects/api-11111111");
+        let legacy = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(keyed.clone(), legacy, false), keyed);
+    }
+
+    #[test]
+    fn choose_landing_reuses_legacy_copy_when_present() {
+        // A copy adopted BEFORE the re-key lives at the bare basename path —
+        // reuse it so a re-pull stays idempotent instead of duplicating into a
+        // new uid-keyed dir.
+        let keyed = PathBuf::from("/home/u/.codemux/projects/api-11111111");
+        let legacy = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(keyed, legacy.clone(), true), legacy);
+    }
+
+    #[test]
+    fn choose_landing_is_noop_without_uid() {
+        // project_uid = None ⇒ keyed == legacy ⇒ that path regardless of what's
+        // on disk. Pre-re-key rows are unaffected.
+        let p = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(p.clone(), p.clone(), true), p);
+        assert_eq!(choose_landing(p.clone(), p.clone(), false), p);
+    }
+
+    // ── adopt_*_landing: two different same-basename projects disambiguate ──
+    //
+    // Uses a fixture basename that won't exist under ~/.codemux so the
+    // read-fallback can't fire and we observe the uid-keyed result.
+
+    const FIXTURE: &str = "codemux-rekey-fixture-zzq";
+    const UID_A: &str = "11111111-2222-3333-4444-555555555555";
+    const UID_B: &str = "99999999-8888-7777-6666-555555555555";
+
+    #[test]
+    fn worktree_landing_disambiguates_same_basename() {
+        let a = adopt_worktree_landing(Some(UID_A), FIXTURE, "main");
+        let b = adopt_worktree_landing(Some(UID_B), FIXTURE, "main");
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/worktrees/{FIXTURE}-11111111/main")),
+            "got {a}"
+        );
+    }
+
+    #[test]
+    fn root_landing_disambiguates_same_basename() {
+        let a = adopt_root_landing(Some(UID_A), FIXTURE);
+        let b = adopt_root_landing(Some(UID_B), FIXTURE);
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/projects/{FIXTURE}-11111111")),
+            "got {a}"
+        );
+    }
+
+    #[test]
+    fn worktree_via_repo_landing_tracks_root_uid() {
+        // A `worktree`-kind / clone adoption derives its worktree dir from the
+        // repo ROOT landing, so different uids still disambiguate — and the
+        // worktree dir carries the same uid suffix the root dir would.
+        let a = adopt_worktree_landing_via_repo(Some(UID_A), FIXTURE, "main");
+        let b = adopt_worktree_landing_via_repo(Some(UID_B), FIXTURE, "main");
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/worktrees/{FIXTURE}-11111111/main")),
+            "got {a}"
+        );
+        // No uid ⇒ bare basename, identical to the single-dir helper.
+        let n = adopt_worktree_landing_via_repo(None, FIXTURE, "feature/x");
+        assert!(
+            n.ends_with(&format!("/worktrees/{FIXTURE}/feature-x")),
+            "got {n}"
+        );
+    }
+
+    #[test]
+    fn landing_without_uid_reproduces_legacy_basename() {
+        // The migration safety net at the adoption layer: no uid ⇒ bare
+        // basename path (byte-identical to the pre-re-key landing), so already-
+        // adopted workspaces still resolve.
+        let w = adopt_worktree_landing(None, FIXTURE, "feature/x");
+        assert!(
+            w.ends_with(&format!("/worktrees/{FIXTURE}/feature-x")),
+            "got {w}"
+        );
+        let r = adopt_root_landing(None, FIXTURE);
+        assert!(r.ends_with(&format!("/projects/{FIXTURE}")), "got {r}");
     }
 }
