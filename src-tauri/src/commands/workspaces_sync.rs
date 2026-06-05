@@ -209,7 +209,10 @@ pub(crate) fn resolve_open_on_host_cwd(
         .or(default_branch)
         .filter(|b| !b.is_empty())
         .unwrap_or("main");
-    crate::ssh::conventional_remote_path_keyed(project_uid, project_name, branch)
+    // Use `workspace_paths` (cross-platform) rather than the `ssh`
+    // re-export — `crate::ssh` is `#[cfg(unix)]`-gated and this command
+    // module compiles on Windows too.
+    crate::workspace_paths::conventional_remote_path_keyed(project_uid, project_name, branch)
         .to_string_lossy()
         .to_string()
 }

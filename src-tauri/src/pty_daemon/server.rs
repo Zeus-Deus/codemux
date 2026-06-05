@@ -40,10 +40,15 @@ use tokio::sync::{broadcast, Mutex};
 /// per-workspace remote daemon would clobber). The daemon owns the file:
 /// it writes it on bind and removes it on clean exit (idle-reap /
 /// Shutdown).
+///
+/// Unix-only: the daemon's `run` loop is `#[cfg(unix)]` (Unix-socket
+/// based), so these helpers have no consumer on Windows.
+#[cfg(unix)]
 static PID_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// `<socket>.pid` — the pidfile path for a given daemon socket. Pure so the
 /// host-side reconnect shell and tests agree on the location.
+#[cfg(unix)]
 pub fn pid_file_for(socket_path: &std::path::Path) -> PathBuf {
     let mut raw = socket_path.as_os_str().to_os_string();
     raw.push(".pid");
@@ -53,6 +58,7 @@ pub fn pid_file_for(socket_path: &std::path::Path) -> PathBuf {
 /// Write `<socket>.pid` containing this daemon's pid and remember it for
 /// removal on exit. Best-effort: a failure just means a reconnect can't
 /// confirm liveness and will spawn a fresh daemon (correct, if wasteful).
+#[cfg(unix)]
 fn write_pid_file(socket_path: &std::path::Path) {
     let path = pid_file_for(socket_path);
     if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
@@ -63,6 +69,7 @@ fn write_pid_file(socket_path: &std::path::Path) {
 
 /// Remove the pidfile written by `write_pid_file`. Idempotent; no-op if the
 /// daemon never wrote one.
+#[cfg(unix)]
 fn remove_pid_file() {
     if let Some(path) = PID_FILE.get() {
         let _ = std::fs::remove_file(path);
@@ -892,7 +899,7 @@ fn kill_session_pid(_pid: u32) {
     // the windows-support follow-up; for the MVP we only run on Unix.
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::pid_file_for;
     use std::path::Path;
