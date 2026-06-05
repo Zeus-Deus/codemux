@@ -75,8 +75,11 @@ codemux-remote serve [--port <n>] [--state-dir <path>]
     listens loopback-only; the desktop tunnels in over SSH.
 
 codemux-remote serve status [--state-dir <path>]
-  → prints {endpoint, pid, started_at, host_id, alive} as JSON.
-    Exit 0 if alive, exit 1 otherwise.
+  → prints {endpoint, pid, started_at, host_id, alive, live_terminals}
+    as JSON. `live_terminals` is the running daemon's live PTY-session
+    count (via its own app_status tool; null when the daemon is down).
+    The desktop's auto-upgrade reads it to DEFER a daemon restart while
+    host agents are running. Exit 0 if alive, exit 1 otherwise.
 
 codemux-remote serve stop [--state-dir <path>]
   → SIGTERM the running daemon (pid read from manifest).
@@ -276,6 +279,32 @@ Consent was implicitly granted the first time the user bootstrapped
 the host; re-uploading a newer version of the same binary to the
 same location is not a meaningful trust escalation.
 
+#### Defer the restart while host agents are live (post-`v0.7.8`)
+
+Re-provisioning the `serve` unit **restarts** it, which kills any PTY
+agents an agent CLI is running *on the host* — the "work on a host
+without pulling" flow. That used to happen silently ~5 s after app
+launch, ending a user's host-side work just because they reopened
+Codemux. The upgrade now probes the running daemon for its live
+session count **before** restarting:
+
+- `probe_live_host_sessions` runs `codemux-remote serve status` over
+  SSH and reads `live_terminals` from its JSON. The desktop's bundled
+  `serve status` queries the daemon's own `app_status` tool (in the
+  catalog since the daemon shipped, so the probe works even against an
+  *old* daemon on the first upgrade).
+- If the daemon reports **>0 live sessions**, the upgrade still uploads
+  the new binary but returns `UpgradeOutcome::Skipped { reason }` with
+  the count — the binary activates on the next *idle* upgrade or a host
+  reboot. The deferral is surfaced, not hidden, so staleness stays
+  visible rather than forcing a kill.
+- `None` (daemon down / unreachable / a binary too old to report the
+  field) is treated as "no confirmed live sessions → safe to restart" —
+  a daemon we can't reach has nothing to lose by restarting.
+
+Pushed-*workspace* agents are unaffected either way: they live in the
+separate pty-daemon, not this `serve` unit.
+
 ### Controlling the daemon from your phone (Tailscale)
 
 v1's transport is SSH-only — there is no cloud relay. The cleanest
@@ -373,6 +402,16 @@ A deep code audit plus a live SSH round-trip against a loopback host surfaced se
 - **Shell-injection hardening.** `ssh_upload_executable` + `ssh_write_file` route `remote_path` through the tilde-aware `ssh::push::shell_escape` (preserves `~` expansion while single-quoting the body) instead of raw interpolation.
 - **Tunnel socket hash widened 12 → 16 hex chars** (`ssh/registry.rs`): the per-workspace tunnel socket hash truncated the `u64` to 12 hex (48-bit, birthday collisions ~2^24 workspaces); the full 16 hex (64-bit) stays well under the macOS `sun_path` limit.
 
+### Tunnel health in the UI (post-`v0.7.8`)
+
+A pushed/remote workspace whose SSH tunnel drops — laptop sleep/wake, WiFi flap — used to just appear *frozen*, and when the supervisor's circuit breaker tripped after repeated reconnect failures the user was never told they had to re-push. `TunnelStatus` was already computed and serialized (it's a tagged enum in `ssh/tunnel_supervisor.rs`: `connected` / `pending` / `reconnecting { attempt, delay_ms }` / `circuit_open { recent_failures }`) but only ever consumed internally in `ssh/registry.rs`. It's now bridged to the frontend:
+
+- **Backend forwarder.** `ssh::registry::spawn_tunnel_status_forwarder` subscribes to the supervisor's status `watch` channel and emits a `tunnel-status-changed` event (`{ workspace_id, status }`) per workspace. It's called at **both** supervisor install sites (push + lazy-create). The forwarder self-terminates when the supervisor is dropped, so a re-push never leaks a second forwarder.
+- **Frontend store.** `src/stores/tunnel-status-store.ts` (zustand, keyed by `workspace_id`) is fed by the `useTunnelStatusEvents` hook mounted once at the app root (`src/App.tsx`). `tunnelStatusKind` narrows the four wire states to the only two worth chrome: `connected`/`pending` → no pill (a healthy tunnel needs no chrome), `reconnecting` → `"reconnecting"`, `circuit_open` → `"lost"`.
+- **Sidebar pill.** `sidebar-workspace-row.tsx` renders an amber **"Reconnecting…"** pill while the supervisor retries and a red **"Connection lost — re-push"** pill once the circuit breaker trips; hidden entirely for connected/local workspaces.
+
+This is the "surface the reconnect state in the UI" follow-up the `tunnel_supervisor` left open. Wire type: `src/tauri/events.ts` (`TunnelStatus`, `onTunnelStatusChanged`).
+
 ## Settings → Hosts pane upgrade (in 2d)
 
 The pane built in 2a now uses the real probe + bootstrap:
@@ -400,7 +439,7 @@ All 22 new tests pass alongside the prior suite (1382 lib tests, 1721 frontend t
 | Workspace list filter | "This device / All / per-host" dropdown matching superset's `V2WorkspacesHeader`. ~2 hours. |
 | "Pull workspace back" action | Reverse of push. ~half day. |
 | Release skill update | Cross-compile + bundling for the four `codemux-remote` targets. Concrete diff in the release pipeline. ~half day. |
-| Tunnel auto-reconnect polish | `ssh::tunnel_supervisor` is in place; tune the backoff (1s→30s, watchdog) and surface the reconnect state in the UI. |
+| Tunnel auto-reconnect polish | `ssh::tunnel_supervisor` is in place and the reconnect state is now **surfaced in the UI** (post-`v0.7.8` — see "Tunnel health in the UI"); remaining polish is tuning the backoff curve (1s→30s, watchdog). |
 
 Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c72b44`) — rsync the worktree, spawn the remote daemon, attach the local UI through the SSH-forwarded socket, and synchronize the Claude conversation across local/remote ends.
 
@@ -412,7 +451,9 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 - `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`, `workspace list` (reads the daemon SQLite directly for the host-inventory poller). Unix-only — Windows builds a no-op stub.
 - `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (12-tool catalog), `git.rs` (`worktree_create` + adoption worktree recreate), `config.rs` (state-dir resolution).
 - `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor + zero-touch provisioning of the `serve` daemon).
-- `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start.
+- `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start. `probe_live_host_sessions` (post-`v0.7.8`) reads `live_terminals` from `serve status` over SSH so the upgrade defers the daemon restart when host agents are live (`UpgradeOutcome::Skipped`).
+- `src-tauri/src/ssh/registry.rs` — `spawn_tunnel_status_forwarder` (post-`v0.7.8`): subscribes to the supervisor's status `watch` channel and emits `tunnel-status-changed` per workspace; called at both supervisor install sites, self-terminates on supervisor drop.
+- `src/stores/tunnel-status-store.ts` / `src/hooks/use-tunnel-status-events.ts` / `src/tauri/events.ts` — frontend tunnel-health store + app-root event hook + `TunnelStatus` wire type; `sidebar-workspace-row.tsx` renders the "Reconnecting…" / "Connection lost — re-push" pill.
 - `src/components/hosts/device-picker.tsx` — shared pill component.
 - `src/components/overlays/new-workspace-dialog.tsx` — DevicePicker wired into bottom bar.
 - `src/components/settings/hosts-section.tsx` — uses real probe + bootstrap modal.

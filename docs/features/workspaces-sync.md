@@ -35,6 +35,8 @@ What does NOT sync (per-device runtime state):
 - Git deltas (ahead/behind/changed_files) — read from the local git tree on each device
 - `notification_count`, `notifications_muted` — per-device user state
 
+Local-only sync columns (threaded device→device through the host-inventory poller but **never sent to the cloud API**, so they add no server schema): `origin_uid`, `origin_path` (see "Identity contract for remote-discovered rows"), and `default_branch` (post-`v0.7.8`). The daemon stamps `default_branch` at creation and backfills legacy rows on boot; the host poller threads it into the `workspaces_sync` row/view/TS so a project-first pull can checkout the repo's real default branch and classify protection against it — see "Project-first pull + protected root" below.
+
 ### Storage layers
 
 | Layer | Where | What it holds |
@@ -102,7 +104,9 @@ So a workspace mutation propagates to other devices within ~30 seconds. A `works
 - `workspaces_sync_list` → `Vec<WorkspaceSyncView>` — what the overview reads
 - `workspaces_sync_now` → `Result<(), String>` — force an immediate pull+push pass
 - `workspaces_adoption_preview(server_id)` → `AdoptionPreview` — dialog opens with this; surfaces `can_host_adopt`, `can_clone_adopt`, `host_configured`, `host_label`, `suggested_path`, `is_path_in_use`, `already_adopted_workspace_id` so the modal can pick the right variant without race conditions
-- `workspaces_adopt_synced(server_id)` → `AdoptOutcome` — host-backed cross-device adoption: creates a local workspace shell with `host_id` set, links the sync row, then drives the existing `workspace_pull_back_impl` to rsync the worktree from the host. Idempotent (re-running on an already-adopted row returns the existing local workspace id). **Failure handling (post-`v0.7.6`):** the command now checks `pull_outcome.ok`, not just the outer `Result` — a failed rsync/SSH pull used to report `Ok(WorkspacePullOutcome { ok: false, .. })`, which the command unwrapped as success, leaving a broken/empty shell linked with `host_id` set that the idempotency guard then refused to retry. On failure it removes the shell, reverts the row to a re-pullable sibling via `unlink_workspace_sync_from_local`, and returns a real `Err`. All three adopt paths (single-dir, worktree-repo-rsync, clone) stamp `project_uid` via `set_workspace_project_identity` from the synced row so an adopted workspace converges with its siblings (see "Adopt-path identity stamping" below).
+- `workspaces_adopt_synced(server_id)` → `AdoptOutcome` — host-backed cross-device adoption: creates a local workspace shell with `host_id` set, links the sync row, then drives the existing `workspace_pull_back_impl` to rsync the worktree from the host. Idempotent (re-running on an already-adopted row returns the existing local workspace id). **Failure handling (post-`v0.7.6`):** the command now checks `pull_outcome.ok`, not just the outer `Result` — a failed rsync/SSH pull used to report `Ok(WorkspacePullOutcome { ok: false, .. })`, which the command unwrapped as success, leaving a broken/empty shell linked with `host_id` set that the idempotency guard then refused to retry. On failure it removes the shell, reverts the row to a re-pullable sibling via `unlink_workspace_sync_from_local`, and returns a real `Err`. All three adopt paths (single-dir, worktree-repo-rsync, clone) stamp `project_uid` via `set_workspace_project_identity` from the synced row so an adopted workspace converges with its siblings (see "Adopt-path identity stamping" below). **Serialized (post-`v0.7.8`):** guarded by a per-`server_id` async creation lock — see "Serialized adopts" below.
+- `workspaces_adopt_project(project_uid)` → `ProjectAdoptOutcome` (post-`v0.7.8`) — **project-first** adoption: gathers every un-adopted host-backed sync row for the `project_uid`, adopts the `kind == "main"` **root first** (a root failure aborts — worktrees can't attach to a repo that didn't materialise), then adopts each worktree continue-on-error (each reuses the now-present `~/.codemux/projects/<repo>` repo and just `git worktree add`s its branch). Composes `workspaces_adopt_synced`, so it inherits the creation lock + identity-stamp + failure-rollback behavior. Backs the overview's one-click **"Pull project"** button. Legacy registries with no `main` row still pull (the first worktree adopt rsyncs the parent repo itself, just without a standalone protected-root shell).
+- `workspaces_reconcile_copy(workspace_id)` → `String` (post-`v0.7.8`) — non-destructively clears a divergent **standalone copy** (the full `.git`-dir copy under `~/.codemux/worktrees/<repo>/<branch>` that gets the amber chip). Confirms the workspace is a divergent copy (`git::is_divergent_copy`), then **refuses** if it has uncommitted changes or unpushed commits (`git::reconcile_copy_blocker`, returns commit/push guidance) — otherwise detaches the workspace card via the state-level `close_workspace` (removes the card, **leaves files on disk**, never deletes). The user then runs "Pull project" to materialise a proper protected root. No work is ever lost.
 
 ### UI integration
 
@@ -188,9 +192,50 @@ Why basename and not full path: across two devices the same repo will almost alw
 
 ### Known limitations (v1)
 
-- **Cross-device race for the same host workspace.** `origin_uid` is local-only. If Device A and Device B both poll Pandora between cloud pulls, both will publish a row for the same physical workspace and the overview will briefly show two entries. They converge on the next pull tick because the second device sees the first device's cloud row (with matching `host_server_id`, `project_remote`, `git_branch`). Single-device users — the common case today — never hit this. Permanent fix is a server-side `origin_uid` column with a unique partial index; tracked but not in scope.
+- **Cross-device race for the same host workspace.** `origin_uid` is local-only. If Device A and Device B both poll Pandora between cloud pulls, both publish a row for the same physical workspace and the overview briefly shows two entries. **Mitigated (post-`v0.7.8`)** by `dedupe_sibling_rows` (see "Client-side duplicate collapse on pull") which collapses the duplicates client-side and tombstones the extras on the next push. Single-device users — the common case today — never hit this anyway. The permanent fix is still a server-side `origin_uid` unique partial index; tracked in `codemux-api`, not yet in scope.
 - **`project_remote` only when the host project has a resolvable remote.** Project-identity Phase 1 made the daemon stamp the canonical `repo_remote` at create time and the poller thread it into `project_remote` for remote-discovered rows (previously hardcoded null). So a host workspace whose project has a git remote now carries `project_remote` — the clone-from-git fallback works for it. A host project with no remote (or one the daemon couldn't resolve) still leaves `project_remote = null` and is adoptable only via the host-backed (rsync) path.
 - **Hosts without a `server_id` are skipped silently.** Until the host record itself has synced (`hosts_sync` pushes it and gets a cloud id), the poller can't tag inventory rows with a stable cross-device host identity. The first cycle after the host syncs picks them up.
+
+## Robustness hardening (post-`v0.7.8`)
+
+A second multi-device pass closed a cluster of duplicate-row / race / collision bugs in the adopt + inventory pipeline.
+
+### Project-first pull + protected root
+
+Pulling a remote project used to land the repo root as a *deletable* `main` worktree under `~/.codemux/worktrees`, not a protected repo root — the daemon recorded root rows with a **null branch**, so the desktop fell back to the literal `"main"` and `is_protected_repo_root` fail-opened to "deletable"; for local-only repos (no remote) there was no reliable default-branch signal at all. The fix makes the repository (root + default branch) a first-class, synced concept:
+
+- **Git.** `find_default_branch` is now `pub`; `resolve_default_branch` (origin/HEAD → main/master → current branch, covering local-only repos whose default is non-standard) and `ensure_origin_head` (no-op without an origin remote) are new. On root adoption Codemux ensures `origin/HEAD` + checks out the default branch, then classifies protection against the repo's **actual on-disk branch** rather than a possibly-null synced branch.
+- **`default_branch` column.** Threaded end-to-end as a **local-only** column (daemon registry → host poller → `workspaces_sync` table/record/view → TS). Not sent to the cloud, so no server-schema change. The daemon stamps it at creation and backfills legacy rows on boot.
+- **`workspaces_adopt_project`** materialises the protected root first (at `~/.codemux/projects/<repo>`) then recreates each worktree as a real linked worktree under it (continue-on-error per worktree). The overview's **"Pull project"** action calls it.
+- **UI.** Sidebar delete respects `protected` (a root is never destructively deletable); the overview floats the protected root to the top of its project cluster and adds the "Pull project" action.
+
+### Serialized adopts (creation lock)
+
+A per-row async lock (`acquire_adopt_lock(server_id)` in `commands/workspaces_sync.rs`, mirroring Superset's `workspaceCreateLocks`) serialises concurrent adopts of the same row — a double-clicked "Pull", or the host-inventory poller racing a manual pull — so they can't both slip past the `workspace_id` idempotency guard and create duplicate local shells / clobber the same landing path. Guards `workspaces_adopt_synced` and `workspaces_adopt_via_clone`; `workspaces_adopt_project` is covered transitively (it composes the former).
+
+### Client-side duplicate collapse on pull
+
+`dedupe_sibling_rows` (run at the tail of `reconcile_from_snapshot`) converges the cross-device race where two devices poll the same host before either's push lands and the cloud ends up with two rows for one physical workspace. It groups **un-adopted** siblings (`workspace_id IS NULL`) by `(host, origin_uid)` — or `(host, project_uid, branch, kind)` since `origin_uid` is local-only and absent on cloud-pulled rows — keeps the canonical row (one with a `server_id`, lowest id) and tombstones the rest so the next push removes the cloud duplicate. **Adopted rows are never touched.** The permanent fix is a server-side unique partial index on `codemux_workspaces(origin_uid)` (TODO in `codemux-api`); this is the client-side stopgap.
+
+### One repo root per project (daemon-side)
+
+The daemon backfilled project identity but had no equivalent of Superset's `ensureMainWorkspace` sweep, so an agent could register a project's root more than once (or re-register after a move), leaving two `kind=main` rows for one `project_uid` — which surfaced as two "repo root" cards on every device. Now:
+
+- `WorkspaceStore::collapse_main_for_uid(project_uid)` keeps the earliest-created `main` row and deletes the rest (**registry rows only; files on disk untouched**); idempotent, returns the survivor.
+- `WorkspaceStore::create` collapses after inserting a `main` row, so re-registering an existing root returns the canonical root instead of spawning a duplicate. A genuinely distinct root has a different `project_uid` (derived from remote/root path), so unrelated projects are never merged.
+- `normalize_main_workspaces()` is a boot-time sweep that collapses every project with >1 main row; wired next to `sweep_backfill_identity` on `serve` startup.
+
+### Collision-safe host paths (uid-keyed)
+
+Push/pull/spawn used to land everything at `~/.codemux/worktrees/<basename>/<branch>` (and `projects/<basename>`), so two **different** repos sharing a basename (`acme/api` vs `widgets/api`) collided on the host — one overwriting the other. The host layout is now keyed on the deterministic `project_uid`:
+
+- `workspace_paths`: `conventional_remote_path_keyed` / `conventional_remote_root_path_keyed` + `project_dir_component` yield `<basename>-<short-uid>` (collision-safe *and* readable) when a uid is known, and reproduce the **exact** legacy basename layout when it isn't (the migration safety net).
+- Push landing (`commands/hosts.rs`) and the remote agent cwd (`terminal/daemon_backed.rs`) key on the workspace's `project_uid`, so they always agree for a workspace pushed by this build.
+- Pull-back keeps the recorded `origin_path` as authoritative and **adds** the uid-keyed path as a fallback candidate *before* the legacy basename one, so both new and already-pushed workspaces resolve. Migration note: a workspace desktop-pushed before this change still pulls back fine (basename fallback); a live agent re-spawn on such a workspace targets the new path and may need a re-push — agent-created workspaces are unaffected (they use the recorded `origin_path`, not the convention).
+
+### Non-destructive "Reconcile copy"
+
+`workspaces_reconcile_copy` (see the Tauri-command list above) clears the divergent-copy chip by detaching the card — files always stay on disk, and the action refuses while uncommitted/unpushed work exists. This is the one-click reconcile follow-up `docs/plans/repo-unit-sync.md` left open.
 
 ## Current Constraints
 
@@ -230,7 +275,11 @@ Wired at three call sites:
 - `src-tauri/src/bin/codemux_remote.rs::run_workspace_list` — `workspace list` CLI subcommand the desktop invokes over SSH. Reads the daemon's SQLite directly, no HTTP, no running daemon required.
 - `src-tauri/src/commands/workspaces_sync.rs::detect_same_branch_project_conflict` — pull-conflict guard; populates `AdoptionPreview.same_branch_project_exists_at`.
 - `src-tauri/src/workspaces_sync.rs` — sync module: `pull`, `push`, `try_sync_with_app`, `sync_workspaces`, `reconcile_from_snapshot`, `ServerWorkspace` wire type.
-- `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`, `workspaces_adoption_preview`, `workspaces_adopt_synced`.
+- `src-tauri/src/commands/workspaces_sync.rs` — Tauri command surface: `workspaces_sync_list`, `workspaces_sync_now`, `workspaces_adoption_preview`, `workspaces_adopt_synced`, `workspaces_adopt_via_clone`, `workspaces_adopt_project` (project-first pull, post-`v0.7.8`), `workspaces_reconcile_copy` (post-`v0.7.8`). Adopt serialization: `adopt_locks()` + `acquire_adopt_lock(server_id)` per-row async lock.
+- `src-tauri/src/workspaces_sync.rs::dedupe_sibling_rows` — client-side cross-device duplicate collapse (post-`v0.7.8`), run at the tail of `reconcile_from_snapshot`.
+- `src-tauri/src/remote/workspace.rs` — `collapse_main_for_uid` / `normalize_main_workspaces` daemon-side one-root-per-project (post-`v0.7.8`); `WorkspaceStore::create` collapses after inserting a `main` row.
+- `src-tauri/src/workspace_paths.rs` — `project_dir_component` + `conventional_remote_path_keyed` / `conventional_remote_root_path_keyed` uid-keyed host paths (post-`v0.7.8`, collision-safe).
+- `src-tauri/src/git.rs` — `resolve_default_branch`, `ensure_origin_head`, `reconcile_copy_blocker` (post-`v0.7.8`); `find_default_branch` promoted to `pub`.
 - `src-tauri/src/commands/hosts.rs` — `workspace_pull_back_impl` (extracted from the `#[tauri::command]` wrapper so the adoption flow can call the rsync machinery without going back through Tauri IPC).
 - `src-tauri/src/state/state_impl.rs` — `create_synced_workspace_shell` helper that adoption uses to create a workspace pre-stamped with `host_id` and the target `worktree_path` before rsync runs.
 - `src/components/workspaces-overview/pull-to-device-dialog.tsx` — adoption dialog with the four-variant body (host-backed form, host-not-configured, path-in-use, already-adopted) and the "What this does" disclosure that pre-expands on first pull.

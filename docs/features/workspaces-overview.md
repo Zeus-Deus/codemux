@@ -97,6 +97,8 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 - **Confirm-before-push + undo** (Phase 4a–b): every push opens `ConfirmPushDialog` (per-host "don't ask again" persists in localStorage); every successful push, pull, and adoption surfaces a 10-second `Undo` toast that fires the reverse action.
 - **Cross-device divergence chip** (Phase 4c): an amber `diverged` chip appears in the title line when the same workspace exists on multiple devices via clone-adoption and their git HEADs diverge. Tooltip suggests push or pull to reconcile.
 - **Repo-root protection + labels** (repo-unit sync — `docs/plans/repo-unit-sync.md`): a workspace that is the repo's protected default-branch root checkout (`WorkspaceSnapshot.protected`, stamped divergence-safely by `crate::git::is_protected_repo_root`) shows a `repo root` badge and can't be deleted like a disposable worktree — its row offers "Close workspace…" (detach, files untouched), never "Delete worktree…". Sibling (`RemoteRow`) rows render `main`-kind as `repo root` too. A legacy divergent full copy (`divergent_copy`, a `.git` directory sitting in the worktrees tree) instead shows an amber `standalone copy` warning chip whose tooltip tells the user to delete + re-pull (new pulls land repo roots cleanly under `~/.codemux/projects/`).
+- **One-click "Pull project"** (post-`v0.7.8`): a project cluster of un-adopted sibling rows shows a single **Pull project** button (header-level) that materialises the protected repo root *first* (at `~/.codemux/projects/<repo>`) and then recreates every worktree as a real linked worktree under it, in one action — via `workspacesAdoptProject(project_uid)`. The protected root floats to the top of its cluster so it reads as the project's anchor.
+- **"Reconcile copy…" row action** (post-`v0.7.8`): when a row is flagged `divergent_copy`, its `⋯` menu gains **Reconcile copy…**, which calls `workspacesReconcileCopy(workspace_id)` to non-destructively detach the standalone-copy card (files left on disk) so the user can then "Pull project" for a clean protected root. Refuses (with a toast) while the copy has uncommitted/unpushed work.
 - **Elapsed-time pill** (Phase 4d): when a push or pull takes longer than ~2s, a compact `12s` pill renders next to the spinner so the user knows the operation is still working.
 - Empty states for "no workspaces yet" (offers `New workspace`) and "filters hide everything" (offers `Clear filters`).
 - "Removed host" orphan bucket prevents workspaces from silently disappearing when a host row is deleted.
@@ -129,7 +131,7 @@ The push/pull flight indicator lives on the shared `useAppStore.workspacePushPul
 - `src/stores/app-store.ts` — `workspaces`, `active_workspace_id`, `workspacePushPullInFlight`, `workspacePushPullStartedAt`, `groupWorkspacesByProject`.
 - `src/stores/hosts-store.ts` — shared `useHostsStore` cache.
 - `src/stores/workspaces-sync-store.ts` — sibling-device rows (sync mirror).
-- `src/tauri/commands.ts` — `workspacePushToHost`, `workspacePullBack`, `workspacesAdoptSynced`, `workspacesAdoptViaClone`, `activateWorkspace`, `renameWorkspace`, `closeWorkspace`, `closeWorkspaceWithWorktree`.
+- `src/tauri/commands.ts` — `workspacePushToHost`, `workspacePullBack`, `workspacesAdoptSynced`, `workspacesAdoptViaClone`, `workspacesAdoptProject` (Pull project), `workspacesReconcileCopy` (Reconcile copy), `activateWorkspace`, `renameWorkspace`, `closeWorkspace`, `closeWorkspaceWithWorktree`.
 - `src/tauri/types.ts` — `WorkspaceSnapshot.host_id` (the field the overview keys off).
 
 ## Notes
