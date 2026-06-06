@@ -549,27 +549,22 @@ pub async fn list_chat_provider_capabilities(
     let _ = app;
     match provider {
         ProviderKind::Claude => {
-            // Hybrid: live-harvest via the Anthropic `/v1/models` API
-            // when `ANTHROPIC_API_KEY` is set; otherwise serve the
-            // hand-maintained bundle (subscription / OAuth users have
-            // no live path). A harvest failure logs and falls back to
-            // maintained so the picker is never blank.
-            if std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
-            {
-                match claude_cache.get_or_harvest().await {
-                    Ok(caps) => Ok(caps),
-                    Err(err) => {
-                        eprintln!(
-                            "[claude] live harvest failed, falling back to maintained: {}",
-                            err.to_command_string()
-                        );
-                        Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
-                    }
+            // Cache + cascade: sidecar `list-models` (SDK
+            // `supportedModels()` — works for any Claude Code user) →
+            // Anthropic `/v1/models` REST API (requires
+            // `ANTHROPIC_API_KEY`) → hand-maintained fallback. The
+            // cache wraps the cascade so a successful live harvest is
+            // reused; failure at every live tier logs and serves the
+            // maintained bundle so the picker is never blank.
+            match claude_cache.get_or_harvest().await {
+                Ok(caps) => Ok(caps),
+                Err(err) => {
+                    eprintln!(
+                        "[claude] live harvest failed, falling back to maintained: {}",
+                        err.to_command_string()
+                    );
+                    Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
                 }
-            } else {
-                Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
             }
         }
         ProviderKind::Codex => {

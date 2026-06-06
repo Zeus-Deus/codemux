@@ -13,12 +13,14 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::agent_provider::{
     ChatModelInfo, ContextWindowOption, EffortGranularity, PermissionModeOption,
     ProviderChatCapabilities,
 };
+use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 // Highest-is-default rule: when a model exposes multiple context
 // windows, the largest is flagged as the default. Users who want the
@@ -49,6 +51,11 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         ("high", "High"),
         ("xhigh", "Extra High"),
         ("max", "Max"),
+        // `ultracode` is xhigh + workflows in Claude Code's TUI slider
+        // (see `/effort` in claude >= 2.1.x). The deployed CLI accepts
+        // it as an `--effort` value even though the bundled SDK's
+        // `EffortLevel` type union doesn't list it yet.
+        ("ultracode", "Ultracode"),
         ("ultrathink", "Ultrathink"),
     ];
     pairs
@@ -70,6 +77,7 @@ fn models() -> Vec<ChatModelInfo> {
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
+                "ultracode".into(),
             ],
             default_effort: Some("xhigh".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
@@ -92,6 +100,7 @@ fn models() -> Vec<ChatModelInfo> {
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
+                "ultracode".into(),
             ],
             default_effort: Some("xhigh".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
@@ -294,8 +303,22 @@ impl ClaudeCapabilityCache {
         Self::default()
     }
 
-    /// Return the cached value if present; otherwise run the live
-    /// harvest, cache it, and return.
+    /// Return the cached value if present; otherwise run a live
+    /// harvest, cache it, and return. Cascades the harvest paths:
+    ///
+    ///   1. **Sidecar** — calls the SDK's `supportedModels()` via the
+    ///      `list-models` RPC method on the claude-agent sidecar.
+    ///      Works for every Claude Code user (subscription, OAuth, or
+    ///      API key) and surfaces the *deployed* CLI's actual
+    ///      effort vocabulary (including levels like `ultracode` the
+    ///      bundled SDK type union doesn't enumerate yet).
+    ///   2. **Anthropic `/v1/models`** — only when
+    ///      `ANTHROPIC_API_KEY` is set. Kept as a fallback for the
+    ///      narrow case where the sidecar can't reach the SDK but the
+    ///      user has an API key handy.
+    ///
+    /// The dispatcher falls back to the hand-maintained
+    /// [`claude_fallback_capabilities`] when both paths fail.
     pub async fn get_or_harvest(
         &self,
     ) -> Result<ProviderChatCapabilities, HarvestError> {
@@ -305,12 +328,31 @@ impl ClaudeCapabilityCache {
                 return Ok(cached);
             }
         }
-        let fresh = harvest_claude_capabilities().await?;
-        {
+        let result = match harvest_via_sidecar().await {
+            Ok(caps) => Ok(caps),
+            Err(sidecar_err) => match harvest_via_api().await {
+                Ok(caps) => Ok(caps),
+                Err(api_err) => {
+                    // If the API path bailed only because there's no
+                    // key, surface the sidecar's error (more
+                    // actionable: install / log into Claude Code);
+                    // otherwise surface the API's error.
+                    eprintln!(
+                        "[claude] sidecar harvest failed: {}",
+                        sidecar_err.to_command_string()
+                    );
+                    Err(match api_err {
+                        HarvestError::NoApiKey => sidecar_err,
+                        other => other,
+                    })
+                }
+            },
+        };
+        if let Ok(ref caps) = result {
             let mut guard = self.inner.lock().await;
-            *guard = Some(fresh.clone());
+            *guard = Some(caps.clone());
         }
-        Ok(fresh)
+        result
     }
 
     /// Drop any cached value. The next call re-harvests.
@@ -320,12 +362,11 @@ impl ClaudeCapabilityCache {
     }
 }
 
-/// Live-harvest the Claude model list from Anthropic. Requires
-/// `ANTHROPIC_API_KEY` in the environment; returns
-/// [`HarvestError::NoApiKey`] otherwise so the caller can choose its
-/// fallback (the dispatcher serves the maintained bundle).
-pub async fn harvest_claude_capabilities()
--> Result<ProviderChatCapabilities, HarvestError> {
+/// Live-harvest the Claude model list from Anthropic's REST API.
+/// Requires `ANTHROPIC_API_KEY` in the environment; returns
+/// [`HarvestError::NoApiKey`] otherwise so the caller (`get_or_harvest`)
+/// can fall through to the maintained bundle.
+async fn harvest_via_api() -> Result<ProviderChatCapabilities, HarvestError> {
     let api_key = std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -410,6 +451,7 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
+                "ultracode".into(),
             ],
             Some("xhigh".into()),
             vec!["ultrathink".into()],
@@ -462,6 +504,199 @@ impl ClaudeFamily {
         } else {
             Self::Other
         }
+    }
+}
+
+// ── Live harvest via the sidecar / SDK `supportedModels()` ───────────
+//
+// Anthropic's Agent SDK exposes a live `query.supportedModels()` API
+// over whichever auth Claude Code is using (subscription, OAuth, API
+// key — the SDK handles it transparently). The sidecar exposes a
+// `list-models` JSON-RPC method that opens a transient `query()`,
+// awaits `supportedModels()`, and returns the array. The result is
+// the *deployed* CLI's actual supported model + effort vocabulary —
+// so effort levels the bundled SDK type union doesn't enumerate yet
+// (currently `ultracode`) still surface.
+
+#[derive(Debug, Deserialize)]
+struct SdkModelInfo {
+    /// SDK's identifier for the model (e.g. `claude-opus-4-8`).
+    value: String,
+    #[serde(default, rename = "displayName")]
+    display_name: String,
+    #[serde(default)]
+    description: String,
+    /// Effort levels the SDK reports for this model. Open-ended
+    /// `Vec<String>` so a runtime addition (like `ultracode`) the
+    /// `.d.ts` union doesn't list still flows through verbatim.
+    #[serde(default, rename = "supportedEffortLevels")]
+    supported_effort_levels: Vec<String>,
+    #[serde(default, rename = "supportsAdaptiveThinking")]
+    supports_adaptive_thinking: Option<bool>,
+    #[serde(default, rename = "supportsFastMode")]
+    supports_fast_mode: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListModelsResponse {
+    #[serde(default)]
+    models: Vec<SdkModelInfo>,
+}
+
+/// Live-harvest the Claude model list via the SDK, by sending a
+/// `list-models` JSON-RPC request to a transient claude-agent sidecar.
+/// Works for every Claude Code user — the SDK uses whatever auth
+/// Claude Code already has — and returns the deployed CLI's actual
+/// supported model + effort vocabulary.
+async fn harvest_via_sidecar() -> Result<ProviderChatCapabilities, HarvestError> {
+    let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
+        .map_err(|e| HarvestError::HarvestFailed {
+            message: format!("resolve sidecar: {e:?}"),
+        })?;
+    let claude_binary = which::which("claude").map_err(|_| HarvestError::HarvestFailed {
+        message: "claude binary not on PATH (install Claude Code or sign in to it)".into(),
+    })?;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+    let child = tokio::time::timeout(
+        Duration::from_secs(20),
+        JsonRpcChild::spawn(SpawnConfig {
+            program: sidecar,
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            default_timeout: Duration::from_secs(20),
+        }),
+    )
+    .await
+    .map_err(|_| HarvestError::HarvestFailed {
+        message: "sidecar spawn timed out".into(),
+    })?
+    .map_err(|e| HarvestError::HarvestFailed {
+        message: format!("sidecar spawn: {e}"),
+    })?;
+
+    let response = child
+        .request(
+            "list-models",
+            json!({
+                "cwd": cwd,
+                "pathToClaudeCodeExecutable": claude_binary.to_string_lossy(),
+            }),
+        )
+        .await;
+    let _ = child.shutdown().await;
+    let response = response.map_err(|e| HarvestError::HarvestFailed {
+        message: format!("list-models RPC: {e}"),
+    })?;
+
+    let parsed: ListModelsResponse =
+        serde_json::from_value(response).map_err(|e| HarvestError::HarvestFailed {
+            message: format!("decode: {e}"),
+        })?;
+
+    if parsed.models.is_empty() {
+        return Err(HarvestError::HarvestFailed {
+            message: "SDK returned an empty model list".into(),
+        });
+    }
+
+    Ok(build_capabilities_from_sdk(parsed.models))
+}
+
+/// Build a `ProviderChatCapabilities` bundle from the SDK's live model
+/// list, merging with hand-maintained per-id metadata.
+fn build_capabilities_from_sdk(
+    sdk_models: Vec<SdkModelInfo>,
+) -> ProviderChatCapabilities {
+    let maintained: HashMap<String, ChatModelInfo> = models()
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
+    let merged: Vec<ChatModelInfo> = sdk_models
+        .into_iter()
+        .filter(|m| !m.value.is_empty())
+        .map(|sdk| merge_sdk_with_maintained(sdk, &maintained))
+        .collect();
+    ProviderChatCapabilities {
+        models: merged,
+        effort_granularity: EffortGranularity::PerSession,
+        effort_label_map: claude_effort_label_map(),
+        permission_modes: claude_permission_modes(),
+        default_permission_mode: Some("bypassPermissions".into()),
+        permission_granularity: EffortGranularity::PerSession,
+    }
+}
+
+/// Merge a single SDK model record with hand-maintained metadata. The
+/// SDK is authoritative for the live model id, display name, and
+/// effort vocabulary (since the deployed CLI is sometimes ahead of
+/// the bundled types); the maintained map fills in Codemux-specific
+/// UX bits the SDK doesn't surface (context windows, prompt-injected
+/// `ultrathink`, default effort, the Haiku thinking toggle).
+fn merge_sdk_with_maintained(
+    sdk: SdkModelInfo,
+    maintained: &HashMap<String, ChatModelInfo>,
+) -> ChatModelInfo {
+    let known = maintained.get(&sdk.value).cloned();
+    let inferred = || infer_model_info(&sdk.value, &sdk.display_name);
+
+    // Effort levels — SDK runtime data wins (so newly-added levels
+    // like `ultracode` flow in). Fall back to maintained / inferred
+    // only when the SDK doesn't report any.
+    let effort_levels = if !sdk.supported_effort_levels.is_empty() {
+        sdk.supported_effort_levels.clone()
+    } else {
+        known
+            .as_ref()
+            .map(|k| k.effort_levels.clone())
+            .unwrap_or_else(|| inferred().effort_levels)
+    };
+    let default_effort = known
+        .as_ref()
+        .and_then(|k| k.default_effort.clone())
+        .or_else(|| effort_levels.first().cloned());
+    let prompt_injected_effort_levels = known
+        .as_ref()
+        .map(|k| k.prompt_injected_effort_levels.clone())
+        .unwrap_or_else(|| inferred().prompt_injected_effort_levels);
+    let context_window_options = known
+        .as_ref()
+        .map(|k| k.context_window_options.clone())
+        .unwrap_or_else(|| inferred().context_window_options);
+
+    let label = if sdk.display_name.trim().is_empty() {
+        sdk.value.clone()
+    } else {
+        sdk.display_name
+    };
+    let description = if sdk.description.trim().is_empty() {
+        known.as_ref().and_then(|k| k.description.clone())
+    } else {
+        Some(sdk.description)
+    };
+
+    ChatModelInfo {
+        id: sdk.value,
+        label,
+        description,
+        effort_levels,
+        default_effort,
+        prompt_injected_effort_levels,
+        context_window_options,
+        supports_adaptive_thinking: sdk
+            .supports_adaptive_thinking
+            .unwrap_or_else(|| known.as_ref().map(|k| k.supports_adaptive_thinking).unwrap_or(false)),
+        supports_thinking_toggle: known
+            .as_ref()
+            .map(|k| k.supports_thinking_toggle)
+            .unwrap_or(false),
+        supports_fast_mode: sdk
+            .supports_fast_mode
+            .unwrap_or_else(|| known.as_ref().map(|k| k.supports_fast_mode).unwrap_or(false)),
+        supports_images: true,
+        sub_provider: None,
+        is_free: false,
     }
 }
 
@@ -601,7 +836,27 @@ mod tests {
     fn label_map_covers_all_effort_levels() {
         let caps = claude_fallback_capabilities();
         assert_eq!(caps.effort_label_map.get("xhigh").map(String::as_str), Some("Extra High"));
+        assert_eq!(caps.effort_label_map.get("ultracode").map(String::as_str), Some("Ultracode"));
         assert_eq!(caps.effort_label_map.get("ultrathink").map(String::as_str), Some("Ultrathink"));
+    }
+
+    #[test]
+    fn opus_models_offer_ultracode_in_maintained_list() {
+        // `ultracode` is the top tier in Claude Code's `/effort` slider
+        // (xhigh + workflows) — every current-flagship Opus must expose
+        // it. Sonnet/Haiku stay at their narrower effort sets.
+        let caps = claude_fallback_capabilities();
+        for id in ["claude-opus-4-8", "claude-opus-4-7"] {
+            let m = caps
+                .models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} should be in the maintained list"));
+            assert!(
+                m.effort_levels.contains(&"ultracode".to_string()),
+                "{id} should expose the `ultracode` effort level"
+            );
+        }
     }
 
     // ── Live-harvest mapping tests ───────────────────────────────────
@@ -637,7 +892,8 @@ mod tests {
     #[test]
     fn infer_opus_gets_full_effort_and_1m() {
         let info = infer_model_info("claude-opus-9-9", "Claude Opus 9.9");
-        assert_eq!(info.effort_levels.len(), 5);
+        assert_eq!(info.effort_levels.len(), 6);
+        assert!(info.effort_levels.contains(&"ultracode".to_string()));
         assert_eq!(info.default_effort.as_deref(), Some("xhigh"));
         assert!(
             info.prompt_injected_effort_levels
@@ -704,7 +960,7 @@ mod tests {
         let new = &caps.models[0];
         assert_eq!(new.id, "claude-opus-9-9");
         assert_eq!(new.label, "Claude Opus 9.9");
-        assert_eq!(new.effort_levels.len(), 5);
+        assert_eq!(new.effort_levels.len(), 6);
     }
 
     #[test]
@@ -737,6 +993,112 @@ mod tests {
             HarvestError::HarvestFailed { message: "x".into() }
                 .to_command_string()
                 .starts_with("claude_harvest_failed:")
+        );
+    }
+
+    // ── SDK / sidecar harvest mapping tests ──────────────────────────
+
+    fn sdk_model(
+        value: &str,
+        display: &str,
+        effort: &[&str],
+        adaptive: Option<bool>,
+        fast: Option<bool>,
+    ) -> SdkModelInfo {
+        SdkModelInfo {
+            value: value.into(),
+            display_name: display.into(),
+            description: "".into(),
+            supported_effort_levels: effort.iter().map(|s| s.to_string()).collect(),
+            supports_adaptive_thinking: adaptive,
+            supports_fast_mode: fast,
+        }
+    }
+
+    #[test]
+    fn sdk_merge_uses_sdk_effort_levels_for_a_known_id() {
+        // SDK reports an effort vocabulary that includes `ultracode` —
+        // even though the maintained Opus 4.7 entry already lists it,
+        // the test confirms the SDK value wins (regression guard for
+        // when the deployed CLI ships a level the maintained list
+        // hasn't been bumped for yet).
+        let live = vec![sdk_model(
+            "claude-opus-4-7",
+            "Claude Opus 4.7",
+            &["low", "medium", "high", "xhigh", "max", "ultracode", "newlevel"],
+            Some(true),
+            Some(false),
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let opus = &caps.models[0];
+        assert!(opus.effort_levels.contains(&"newlevel".to_string()));
+        // Maintained metadata still fills in context windows + ultrathink.
+        assert!(opus.context_window_options.iter().any(|o| o.value == "1m"));
+        assert!(
+            opus.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+    }
+
+    #[test]
+    fn sdk_merge_surfaces_unknown_id_with_inferred_metadata() {
+        // SDK reports a brand-new id Codemux's maintained map has
+        // never seen — must surface in the picker with family-pattern
+        // inferred metadata (1M context for opus, ultrathink, etc.).
+        let live = vec![sdk_model(
+            "claude-opus-5-0",
+            "Claude Opus 5.0",
+            &["low", "medium", "high", "xhigh", "max", "ultracode"],
+            Some(true),
+            Some(false),
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let new = &caps.models[0];
+        assert_eq!(new.id, "claude-opus-5-0");
+        assert_eq!(new.label, "Claude Opus 5.0");
+        assert!(new.effort_levels.contains(&"ultracode".to_string()));
+        assert!(new.context_window_options.iter().any(|o| o.value == "1m"));
+        assert!(
+            new.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+    }
+
+    #[test]
+    fn sdk_merge_falls_back_to_maintained_when_sdk_reports_no_effort() {
+        // SDK returns the id with an empty effort vocabulary —
+        // maintained metadata fills in.
+        let live = vec![sdk_model("claude-opus-4-7", "Claude Opus 4.7", &[], None, None)];
+        let caps = build_capabilities_from_sdk(live);
+        let opus = &caps.models[0];
+        // Maintained Opus 4.7 has 6 effort levels including ultracode.
+        assert_eq!(opus.effort_levels.len(), 6);
+    }
+
+    #[test]
+    fn sdk_merge_skips_empty_value_records() {
+        let live = vec![
+            sdk_model("", "", &["low"], None, None),
+            sdk_model("claude-opus-4-7", "Claude Opus 4.7", &["low"], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        assert_eq!(caps.models.len(), 1);
+    }
+
+    #[test]
+    fn sdk_merge_uses_id_as_label_when_displayname_is_blank() {
+        let live = vec![sdk_model("claude-opus-9-9", "", &["high"], None, None)];
+        let caps = build_capabilities_from_sdk(live);
+        assert_eq!(caps.models[0].label, "claude-opus-9-9");
+    }
+
+    #[test]
+    fn sdk_merge_carries_provider_chrome_through() {
+        let caps = build_capabilities_from_sdk(vec![]);
+        assert_eq!(caps.effort_granularity, EffortGranularity::PerSession);
+        assert_eq!(
+            caps.default_permission_mode.as_deref(),
+            Some("bypassPermissions")
         );
     }
 }

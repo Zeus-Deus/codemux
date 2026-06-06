@@ -61,7 +61,26 @@ Also implemented:
   `launch-models.ts` keeps only `REASONING_FLAG_FAMILIES` — the
   structural fact of which CLIs have a reasoning flag at all.
 
-Hybrid live harvest (follow-up after Opus 4.8 didn't surface):
+SDK-based dynamic harvest (follow-up after `ultracode` wasn't picked up
+from the bundled SDK types):
+
+- **Sidecar `list-models` RPC** — new method in
+  `sidecar/claude-agent/src/methods/list-models.ts` that opens a
+  transient `query()`, awaits `supportedModels()`, and returns the
+  array. Works for every Claude Code user regardless of auth, and
+  surfaces the deployed CLI's actual effort vocabulary (including
+  runtime-only levels like `ultracode` the static SDK type union
+  doesn't enumerate).
+- **Rust `harvest_via_sidecar`** spawns the sidecar transiently
+  (`JsonRpcChild`), sends `list-models`, and merges the live model
+  list with the hand-maintained metadata (SDK wins on
+  `effort_levels`; maintained fills in context windows + ultrathink +
+  the Haiku thinking toggle).
+- **Cascade**: `ClaudeCapabilityCache::get_or_harvest` tries sidecar
+  → `/v1/models` → maintained. The dispatcher is back to a single
+  `match` arm; the env-key check moved into the cache.
+
+Hybrid live harvest (initial follow-up after Opus 4.8 didn't surface):
 
 - **Claude `/v1/models` harvest** — Anthropic's SDK / OAuth path has no
   model-list endpoint, so subscription users still see the
