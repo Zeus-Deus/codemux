@@ -16,6 +16,8 @@
 
 The "Push workspace to host" action that was originally deferred from 2d has since landed (`8c72b44`). The push flow rsyncs the worktree to the host, spawns the remote daemon, attaches the local UI through the SSH-forwarded socket, and synchronizes the **Claude conversation** across local/remote ends. New transport-side modules: `ssh::push`, `ssh::registry`, `ssh::tunnel_supervisor`.
 
+**OpenCode conversation sync (issue #16)** rides the same push/pull flows: `ssh::opencode_db_sync::sync_opencode_session` / `pull_opencode_session` carry the workspace's active OpenCode session between machines so `opencode --session <id>` continues it on either end. Because OpenCode keeps all conversations in one SQLite DB, we use OpenCode's own `export`/`import` CLI (which preserves the session id, associates by the import cwd, and is idempotent) rather than rsyncing the DB — so the host's other OpenCode sessions are never clobbered. Full design + testing in `docs/features/opencode-conversation-sync.md`.
+
 ## DevicePicker (2b)
 
 `src/components/hosts/device-picker.tsx`. Compact pill matching superset-sh's shape:

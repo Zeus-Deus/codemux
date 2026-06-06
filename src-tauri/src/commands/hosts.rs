@@ -639,6 +639,41 @@ pub async fn workspace_push_to_host(
                                          fresh): {error}"
                                     );
                                 }
+
+                                // OpenCode conversation sync (issue #16):
+                                // export this workspace's active OpenCode
+                                // session from the laptop's opencode.db and
+                                // import it into the host's DB associated
+                                // with the remote cwd, so the remote
+                                // relaunch (`opencode --session <id>`)
+                                // continues the laptop's conversation. Only
+                                // this one session id is touched — the
+                                // host's other OpenCode sessions are never
+                                // clobbered. Best-effort, same as Claude.
+                                match crate::ssh::sync_opencode_session(
+                                    &host.ssh_target,
+                                    &local_workspace_cwd,
+                                    &remote_absolute_cwd,
+                                )
+                                .await
+                                {
+                                    Ok(Some(oc_session_id)) => {
+                                        // Stash the id so the daemon-backed
+                                        // remote relaunch can target the
+                                        // exact synced session.
+                                        record_opencode_session_capture(
+                                            &app,
+                                            &workspace_id,
+                                            &oc_session_id,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => eprintln!(
+                                        "[hosts] OpenCode session sync failed (continuing \
+                                         — agent will launch with a fresh conversation): \
+                                         {error}"
+                                    ),
+                                }
                             }
                         }
                         Ok(out) => eprintln!(
@@ -1012,6 +1047,34 @@ pub async fn workspace_pull_back_impl(
                                          (continuing — agent will launch with whatever \
                                          conversation history was already local): {error}"
                                     );
+                                }
+
+                                // OpenCode pull-back (issue #16): symmetric
+                                // to the push sync — export the host's
+                                // (possibly-extended) OpenCode session and
+                                // import it back into the laptop's DB so the
+                                // local relaunch continues the conversation
+                                // that happened on the host.
+                                match crate::ssh::pull_opencode_session(
+                                    &host.ssh_target,
+                                    &remote_absolute_cwd,
+                                    &local_workspace_cwd,
+                                )
+                                .await
+                                {
+                                    Ok(Some(oc_session_id)) => {
+                                        record_opencode_session_capture(
+                                            &app,
+                                            &workspace_id,
+                                            &oc_session_id,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => eprintln!(
+                                        "[hosts] OpenCode pull-back failed (continuing — \
+                                         agent will launch with whatever conversation \
+                                         history was already local): {error}"
+                                    ),
                                 }
                             }
                         }
@@ -1468,6 +1531,49 @@ async fn ensure_remote_binary_current(
     }
 
     Ok(())
+}
+
+/// Stash the synced OpenCode session id into the adapter captures of the
+/// workspace's OpenCode terminal panes, keyed `opencode_session_id`. The
+/// daemon-backed respawn (`terminal::daemon_backed`) reads it from the
+/// in-memory snapshot to synthesize `opencode --session <id>`, so the
+/// relaunch continues the exact conversation we just synced — the OpenCode
+/// analogue of Claude's hook-captured `claude_session_id`.
+///
+/// Set only on panes whose original command is `opencode` so a sibling
+/// shell/agent pane never inherits a stray capture. No-op when the
+/// workspace or its sessions can't be resolved.
+#[cfg(unix)]
+fn record_opencode_session_capture(
+    app: &tauri::AppHandle,
+    workspace_id: &str,
+    oc_session_id: &str,
+) {
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    let Some(ws) = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+    else {
+        return;
+    };
+    for sid in crate::state::collect_terminal_sessions(&ws.surfaces) {
+        let is_opencode = snapshot.terminal_sessions.iter().any(|t| {
+            t.session_id.0 == sid
+                && t.original_command
+                    .as_deref()
+                    .map(|c| c.trim_start().starts_with("opencode"))
+                    .unwrap_or(false)
+        });
+        if is_opencode {
+            app_state.set_terminal_adapter_capture(
+                &sid,
+                "opencode_session_id",
+                oc_session_id,
+            );
+        }
+    }
 }
 
 /// Terminate every PTY session belonging to the given workspace.
