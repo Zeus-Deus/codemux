@@ -30,6 +30,7 @@
 #![cfg(unix)]
 
 pub mod bootstrap;
+pub mod opencode_db_sync;
 pub mod probe;
 pub mod push;
 pub mod registry;
@@ -37,6 +38,7 @@ pub mod tunnel;
 pub mod tunnel_supervisor;
 
 pub use bootstrap::{bootstrap_remote, BootstrapResult};
+pub use opencode_db_sync::{pull_opencode_session, sync_opencode_session};
 pub use probe::{probe_host, ProbeOutcome};
 pub use push::{
     claude_project_dir_name, conventional_remote_path,

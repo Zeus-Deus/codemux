@@ -57,6 +57,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Session persistence: `docs/features/session-persistence.md`
 - Persistent agents (PTY daemon — now the default spawn path, no setting): `docs/features/persistent-agents.md`
 - Remote hosts (DevicePicker + `codemux-remote` binary + SSH transport + zero-touch workspace push + headless `serve` MCP daemon + background version-upgrade poller + **post-`v0.7.8` SSH tunnel-health UI pill + defer-upgrade-restart-while-agents-run**): `docs/features/remote-hosts.md`; deferred desktop pieces (Steps 1/5/6/9) tracked in `docs/plans/mcp-on-remote.md`
+- OpenCode conversation sync across cloud-push (issue #16 — `opencode export`/`import` so a pushed/pulled OpenCode pane continues the same session; sibling of the Claude JSONL sync): `docs/features/opencode-conversation-sync.md`
 - Operate a remote workspace in place — **"Open on host"** (attach-in-place: terminal/agent runs on the host with no local copy; detached pty-daemon survives app close and reattaches on reopen; overview action + `attach_only`/`remote_cwd` snapshot fields): `docs/features/remote-in-place.md`
 - Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`

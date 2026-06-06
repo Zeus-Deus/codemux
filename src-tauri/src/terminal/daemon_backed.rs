@@ -31,18 +31,81 @@ use tauri::{AppHandle, Manager, State};
 ///
 /// True only when there's positive evidence the shell already had a prior
 /// agent run — either persisted scrollback metadata (`disk_meta_present`)
-/// or a captured agent session UUID (`claude_uuid_present`). Without one
-/// of those, this codepath is racing a fresh `apply_preset` call: the
-/// preset handler will write the exact same command via its own
+/// or a captured agent session id (`agent_session_id_present`, e.g.
+/// Claude's hook-captured UUID or OpenCode's push-synced session id).
+/// Without one of those, this codepath is racing a fresh `apply_preset`
+/// call: the preset handler will write the exact same command via its own
 /// `write_command_when_ready`, so synthesizing here produces a duplicate
 /// write. The second write lands inside the just-started agent's input
 /// box — the Linux preset-leak bug. Windows isn't affected because the
 /// whole daemon path is `#[cfg(unix)]`-gated.
 pub(crate) fn should_synthesize_agent_relaunch(
     disk_meta_present: bool,
-    claude_uuid_present: bool,
+    agent_session_id_present: bool,
 ) -> bool {
-    disk_meta_present || claude_uuid_present
+    disk_meta_present || agent_session_id_present
+}
+
+/// Build the agent-relaunch command written into a freshly-spawned shell on
+/// a remote push (or local pull-back) respawn, from the pane's original
+/// command and any captured resume identifiers. The caller gates this behind
+/// [`should_synthesize_agent_relaunch`]; this fn assumes the decision to
+/// relaunch was already made.
+///
+/// Curates a minimal command (binary + resume args) rather than replaying
+/// the full original, which often carries laptop-specific flags the remote
+/// agent rejects:
+///
+/// - `claude` → `claude [--dangerously-skip-permissions] [--resume <uuid>]`.
+///   `--dangerously-skip-permissions` is forwarded only when the original
+///   carried it (matches the user's preset intent); `--resume <uuid>`
+///   continues the conversation whose JSONLs the push flow rsynced.
+/// - `opencode` → `opencode --session <id>` when a session id was synced
+///   (issue #16; the receiving opencode.db got the session via
+///   export/import), else `opencode --continue` (import set the session's
+///   directory to this cwd, so `--continue` resumes the most-recent session
+///   here). The OpenCode preset carries no skip-permissions flag, so none is
+///   forwarded.
+/// - any other binary → the bare binary (relaunch without resume args — the
+///   prior behavior for agents without a resume integration).
+///
+/// Returns `None` only when there's no original command to derive a binary
+/// from (a plain shell, or a preset not yet applied).
+pub(crate) fn build_agent_relaunch_command(
+    original_command: Option<&str>,
+    claude_uuid: Option<&str>,
+    opencode_session_id: Option<&str>,
+) -> Option<String> {
+    let original = original_command?;
+    let binary = original.split_whitespace().next()?.to_string();
+    match binary.as_str() {
+        "claude" => {
+            let mut parts = vec![binary];
+            if original.contains("--dangerously-skip-permissions") {
+                parts.push("--dangerously-skip-permissions".to_string());
+            }
+            if let Some(uuid) = claude_uuid {
+                parts.push("--resume".to_string());
+                parts.push(uuid.to_string());
+            }
+            Some(parts.join(" "))
+        }
+        "opencode" => {
+            let mut parts = vec![binary];
+            if let Some(id) = opencode_session_id {
+                parts.push("--session".to_string());
+                parts.push(id.to_string());
+            } else {
+                // No captured id (sync produced nothing, or this is a local
+                // app-restart) → continue the most-recent session for the
+                // cwd. Harmless when there's no session: opencode just opens
+                // fresh.
+                parts.push("--continue".to_string());
+            }
+            Some(parts.join(" "))
+        }
+        _ => Some(binary),
+    }
 }
 
 /// Resolve the directory a remote (host-backed) workspace's terminals
@@ -547,87 +610,68 @@ pub async fn spawn_pty_for_session_via_daemon(
             .and_then(|s| s.original_command.clone());
 
         if is_remote {
-            // Remote: keep the conventional remote cwd; relaunch with
-            // a CURATED subset of the original command's args, NOT
-            // the full thing. The full command often carries laptop-
-            // specific args like `--system-prompt "$CODEMUX_AGENT_CONTEXT"`
-            // that the agent on the remote rejects (different version,
-            // different env content). What we keep:
-            //   - The binary name (first whitespace token)
-            //   - `--dangerously-skip-permissions` if it was set, so
-            //     remote claude doesn't block on approval prompts
-            //     (matches the user's local preset intent)
-            //   - `--resume <uuid>` if we captured a Claude session
-            //     id locally — the JSONLs were rsynced by the push
-            //     flow so this actually continues the conversation
+            // Remote: keep the conventional remote cwd; relaunch with a
+            // CURATED subset of the original command's args, NOT the full
+            // thing. The full command often carries laptop-specific args
+            // like `--system-prompt "$CODEMUX_AGENT_CONTEXT"` that the agent
+            // on the remote rejects (different version, different env
+            // content). `build_agent_relaunch_command` keeps only the binary
+            // plus the per-agent resume args:
+            //   - claude → [--dangerously-skip-permissions] [--resume <uuid>]
+            //     (the JSONLs were rsynced by the push flow so --resume
+            //     continues the conversation).
+            //   - opencode → --session <id> when the push synced one (id in
+            //     adapter_captures), else --continue (issue #16; the host's
+            //     opencode.db received the session via export/import).
             let full = in_memory_original
                 .clone()
                 .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
-            let agent_binary = full
-                .as_deref()
-                .and_then(|s| s.split_whitespace().next())
-                .map(|t| t.to_string());
-            // Detect --dangerously-skip-permissions in the original.
-            // Restrict to claude only — this flag is Claude-specific
-            // and other agents (opencode, codex, gemini) would either
-            // ignore it or error out. Without the binary check we'd
-            // forward a meaningless / hostile flag to those agents.
-            let had_skip_perms = full
-                .as_deref()
-                .map(|s| s.contains("--dangerously-skip-permissions"))
-                .unwrap_or(false)
-                && agent_binary
-                    .as_deref()
-                    .map(|b| b == "claude")
-                    .unwrap_or(false);
-            // Look up the captured Claude session UUID (if any) from
-            // the in-memory snapshot's adapter_captures.
+            // Resume identifiers captured in the in-memory snapshot:
+            // claude's hook-captured UUID, opencode's push-synced session id.
             let claude_uuid = snapshot
                 .terminal_sessions
                 .iter()
                 .find(|s| s.session_id.0 == session_id)
                 .and_then(|s| s.adapter_captures.get("claude_session_id"))
                 .cloned();
-            // GATE: only synthesize a relaunch command when there's
-            // evidence this is genuinely a relaunch (persisted disk
-            // meta or a captured agent UUID). If neither is set we're
-            // racing a fresh `apply_preset` call that will write the
-            // command itself — synthesizing here would duplicate the
-            // write and leak the command into the agent's input box
-            // (the Linux preset-leak bug). See the local branch below
-            // for the full rationale.
-            let cmd_opt = if should_synthesize_agent_relaunch(
+            let opencode_session_id = snapshot
+                .terminal_sessions
+                .iter()
+                .find(|s| s.session_id.0 == session_id)
+                .and_then(|s| s.adapter_captures.get("opencode_session_id"))
+                .cloned();
+            // GATE: only synthesize a relaunch command when there's evidence
+            // this is genuinely a relaunch (persisted disk meta or a captured
+            // agent session id). If neither is set we're racing a fresh
+            // `apply_preset` call that will write the command itself —
+            // synthesizing here would duplicate the write and leak the
+            // command into the agent's input box (the Linux preset-leak bug).
+            // See the local branch below for the full rationale.
+            let has_evidence = should_synthesize_agent_relaunch(
                 disk_meta.is_some(),
-                claude_uuid.is_some(),
-            ) {
-                agent_binary.map(|bin| {
-                    let mut parts = vec![bin];
-                    if had_skip_perms {
-                        parts.push("--dangerously-skip-permissions".to_string());
-                    }
-                    if let Some(uuid) = claude_uuid.as_ref() {
-                        parts.push("--resume".to_string());
-                        parts.push(uuid.clone());
-                    }
-                    parts.join(" ")
-                })
+                claude_uuid.is_some() || opencode_session_id.is_some(),
+            );
+            let cmd_opt = if has_evidence {
+                build_agent_relaunch_command(
+                    full.as_deref(),
+                    claude_uuid.as_deref(),
+                    opencode_session_id.as_deref(),
+                )
             } else {
                 None
             };
             if let Some(cmd) = cmd_opt {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote relaunch for {session_id}: \
-                     {cmd} (skip_perms={had_skip_perms}, has_uuid={}; \
+                     {cmd} (has_claude_uuid={}, has_opencode_sid={}; \
                      in_memory={}, disk_meta={})",
                     claude_uuid.is_some(),
+                    opencode_session_id.is_some(),
                     in_memory_original.is_some(),
                     disk_meta.is_some(),
                 );
                 auto_resume_command = Some(cmd);
-            } else if should_synthesize_agent_relaunch(
-                disk_meta.is_some(),
-                claude_uuid.is_some(),
-            ) {
+            } else if has_evidence {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] remote respawn for {session_id} \
                      has no original_command (was a plain shell, or preset wasn't yet \
@@ -636,8 +680,8 @@ pub async fn spawn_pty_for_session_via_daemon(
             } else {
                 eprintln!(
                     "[codemux::terminal::daemon_backed] skipping remote in-memory synthesis \
-                     for {session_id}: no disk_meta and no captured agent UUID — treating as \
-                     a fresh preset launch (apply_preset owns the PTY write)"
+                     for {session_id}: no disk_meta and no captured agent session id — \
+                     treating as a fresh preset launch (apply_preset owns the PTY write)"
                 );
             }
         } else {
@@ -657,19 +701,17 @@ pub async fn spawn_pty_for_session_via_daemon(
             let full = in_memory_original
                 .clone()
                 .or_else(|| disk_meta.as_ref().and_then(|(_, _, m)| m.original_command.clone()));
-            let agent_binary = full
-                .as_deref()
-                .and_then(|s| s.split_whitespace().next())
-                .map(|t| t.to_string());
-            let had_skip_perms = full
-                .as_deref()
-                .map(|s| s.contains("--dangerously-skip-permissions"))
-                .unwrap_or(false);
             let claude_uuid = snapshot
                 .terminal_sessions
                 .iter()
                 .find(|s| s.session_id.0 == session_id)
                 .and_then(|s| s.adapter_captures.get("claude_session_id"))
+                .cloned();
+            let opencode_session_id = snapshot
+                .terminal_sessions
+                .iter()
+                .find(|s| s.session_id.0 == session_id)
+                .and_then(|s| s.adapter_captures.get("opencode_session_id"))
                 .cloned();
 
             // Prefer the existing scrollback+adapter pipeline when
@@ -696,54 +738,52 @@ pub async fn spawn_pty_for_session_via_daemon(
                     );
                     auto_resume_command = Some(resume_command);
                 }
-            } else if let Some(bin) = agent_binary {
+            } else {
                 // No disk_meta + adapter pair — this branch is for
                 // pull-back (workspace migrated remote → local while
-                // an agent was running). We synthesize `<binary>
-                // [--dangerously-skip-permissions] [--resume <uuid>]`
-                // from in-memory state so the agent picks up where it
-                // left off on the local host.
+                // an agent was running). We synthesize the per-agent
+                // relaunch from in-memory state (claude `--resume`,
+                // opencode `--session`/`--continue`) so the agent picks
+                // up where it left off on the local host.
                 //
                 // GATE: only synthesize when there is real evidence
                 // this is a *relaunch* — either a captured agent
-                // session UUID (claude_uuid) or persisted scrollback
-                // metadata (disk_meta). Otherwise this is a *fresh
-                // preset launch*, and `apply_preset` is about to
-                // write the exact same command via its own
+                // session id (claude_uuid / opencode_session_id) or
+                // persisted scrollback metadata (disk_meta). Otherwise
+                // this is a *fresh preset launch*, and `apply_preset` is
+                // about to write the exact same command via its own
                 // `write_command_when_ready` call (see
-                // commands/presets.rs::apply_preset → "new_tab"
-                // branch). Without this gate, both writes fire and
-                // the second one lands inside the just-started
-                // agent's input box — the user reported seeing
-                // `claude --dangerously-skip-permissions` typed into
-                // Claude Code's prompt right after launching the
-                // preset on Linux. Windows isn't affected because
-                // the entire daemon-backed path is `#[cfg(unix)]`
-                // and the in-process spawn has no synthesis logic.
-                if should_synthesize_agent_relaunch(
+                // commands/presets.rs::apply_preset → "new_tab" branch).
+                // Without this gate, both writes fire and the second one
+                // lands inside the just-started agent's input box — the
+                // user reported seeing `claude --dangerously-skip-permissions`
+                // typed into Claude Code's prompt right after launching
+                // the preset on Linux. Windows isn't affected because the
+                // entire daemon-backed path is `#[cfg(unix)]` and the
+                // in-process spawn has no synthesis logic.
+                let has_evidence = should_synthesize_agent_relaunch(
                     disk_meta.is_some(),
-                    claude_uuid.is_some(),
-                ) {
-                    let mut parts = vec![bin];
-                    if had_skip_perms {
-                        parts.push("--dangerously-skip-permissions".to_string());
+                    claude_uuid.is_some() || opencode_session_id.is_some(),
+                );
+                if has_evidence {
+                    if let Some(cmd) = build_agent_relaunch_command(
+                        full.as_deref(),
+                        claude_uuid.as_deref(),
+                        opencode_session_id.as_deref(),
+                    ) {
+                        eprintln!(
+                            "[codemux::terminal::daemon_backed] local relaunch via in-memory \
+                             for {session_id}: {cmd} (has_claude_uuid={}, has_opencode_sid={})",
+                            claude_uuid.is_some(),
+                            opencode_session_id.is_some(),
+                        );
+                        auto_resume_command = Some(cmd);
                     }
-                    if let Some(uuid) = claude_uuid.as_ref() {
-                        parts.push("--resume".to_string());
-                        parts.push(uuid.clone());
-                    }
-                    let cmd = parts.join(" ");
-                    eprintln!(
-                        "[codemux::terminal::daemon_backed] local relaunch via in-memory for \
-                         {session_id}: {cmd} (skip_perms={had_skip_perms}, has_uuid={})",
-                        claude_uuid.is_some()
-                    );
-                    auto_resume_command = Some(cmd);
                 } else {
                     eprintln!(
                         "[codemux::terminal::daemon_backed] skipping in-memory synthesis for \
-                         {session_id}: no disk_meta and no captured agent UUID — treating as \
-                         a fresh preset launch (apply_preset owns the PTY write)"
+                         {session_id}: no disk_meta and no captured agent session id — \
+                         treating as a fresh preset launch (apply_preset owns the PTY write)"
                     );
                 }
             }
@@ -1267,7 +1307,81 @@ fn build_agent_env(
 
 #[cfg(test)]
 mod tests {
-    use super::should_synthesize_agent_relaunch;
+    use super::{build_agent_relaunch_command, should_synthesize_agent_relaunch};
+
+    // ── build_agent_relaunch_command: per-agent resume synthesis ──
+
+    #[test]
+    fn relaunch_claude_with_uuid_resumes() {
+        // Claude with a captured UUID → `--resume <uuid>`, skip-perms
+        // forwarded because the original carried it.
+        let cmd = build_agent_relaunch_command(
+            Some("claude --dangerously-skip-permissions"),
+            Some("uuid-abc"),
+            None,
+        );
+        assert_eq!(
+            cmd.as_deref(),
+            Some("claude --dangerously-skip-permissions --resume uuid-abc")
+        );
+    }
+
+    #[test]
+    fn relaunch_claude_without_uuid_omits_resume() {
+        let cmd = build_agent_relaunch_command(Some("claude"), None, None);
+        assert_eq!(cmd.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn relaunch_opencode_with_session_id_uses_session_flag() {
+        // The headline issue #16 case: a pushed/pulled opencode pane resumes
+        // the exact synced session by id.
+        let cmd =
+            build_agent_relaunch_command(Some("opencode"), None, Some("ses_abc123"));
+        assert_eq!(cmd.as_deref(), Some("opencode --session ses_abc123"));
+    }
+
+    #[test]
+    fn relaunch_opencode_without_session_id_falls_back_to_continue() {
+        // No captured id (sync found nothing / local app-restart) → continue
+        // the most-recent session for the cwd.
+        let cmd = build_agent_relaunch_command(Some("opencode"), None, None);
+        assert_eq!(cmd.as_deref(), Some("opencode --continue"));
+    }
+
+    #[test]
+    fn relaunch_opencode_never_forwards_skip_perms() {
+        // The opencode preset carries no skip-permissions flag; even if the
+        // original somehow did, opencode resume args stay clean.
+        let cmd = build_agent_relaunch_command(
+            Some("opencode --dangerously-skip-permissions"),
+            None,
+            Some("ses_x"),
+        );
+        assert_eq!(cmd.as_deref(), Some("opencode --session ses_x"));
+    }
+
+    #[test]
+    fn relaunch_claude_does_not_leak_opencode_session_id() {
+        // A stray opencode capture on a claude pane must not produce
+        // `--session` (wrong flag for claude).
+        let cmd =
+            build_agent_relaunch_command(Some("claude"), None, Some("ses_should_ignore"));
+        assert_eq!(cmd.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn relaunch_unknown_agent_returns_bare_binary() {
+        // Non-resume agents relaunch as the bare binary (prior behavior).
+        let cmd = build_agent_relaunch_command(Some("codex --foo bar"), None, None);
+        assert_eq!(cmd.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn relaunch_none_when_no_original_command() {
+        assert_eq!(build_agent_relaunch_command(None, None, None), None);
+        assert_eq!(build_agent_relaunch_command(Some(""), None, None), None);
+    }
 
     // These tests pin the gate that prevents the Linux preset-leak bug.
     //
