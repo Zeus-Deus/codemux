@@ -73,9 +73,19 @@ instead of accepting the agent's default and restarting.
   preset launching `claude` / `codex` / `opencode` / `gemini` lights up
   the pill with no extra wiring; an unknown binary hides it.
 - **Model source.** Claude / Codex / OpenCode read the shared
-  `provider-capabilities-store` harvest (OpenCode live, Claude/Codex
-  maintained bundles) — the same data as the Beta chat picker. Gemini
-  has no chat driver, so it uses the maintained `GEMINI_MODELS` list.
+  `provider-capabilities-store` harvest — the same data as the Beta
+  chat picker. **Codex** and **OpenCode** are fully live (Codex via
+  `codex app-server` `model/list` JSON-RPC; OpenCode via `GET /provider`
+  against a managed `opencode serve` child). **Claude** is hybrid: a
+  live harvest against the Anthropic `GET /v1/models` endpoint when
+  `ANTHROPIC_API_KEY` is set, falling back to the hand-maintained
+  bundle (with family-pattern-inferred metadata for ids the maintained
+  map hasn't seen yet) — so a brand-new Opus surfaces in the picker
+  without a code change for API-key users; subscription / OAuth users
+  see the maintained list. **Gemini** uses the same hybrid pattern via
+  a backend `list_launch_gemini_models` Tauri command (`GEMINI_API_KEY`
+  → Google's `generativelanguage` `models.list`, else the maintained
+  fallback).
 - **Reasoning.** Shown for the families whose CLI has a reasoning flag
   (`REASONING_FLAG_FAMILIES` — Claude `--effort`, Codex
   `-c model_reasoning_effort`). The *levels* are read live from the

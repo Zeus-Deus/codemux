@@ -316,6 +316,13 @@ export const listChatProviderCapabilities = (
     provider,
   });
 
+/** Gemini launch-time model list. Backend serves a live harvest when
+ *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
+ *  way it returns quickly; failure inside the live path is caught by
+ *  the backend and returns the maintained list. */
+export const listLaunchGeminiModels = () =>
+  invoke<Array<{ id: string; label: string }>>("list_launch_gemini_models");
+
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 

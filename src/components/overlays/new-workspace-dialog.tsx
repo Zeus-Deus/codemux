@@ -77,6 +77,10 @@ import {
   type ReasoningOption,
 } from "@/lib/launch-models";
 import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  useLaunchGeminiModels,
+  useLaunchGeminiModelsInit,
+} from "@/stores/gemini-models-store";
 
 const ISSUE_BODY_MAX_CHARS = 10_000;
 
@@ -136,6 +140,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const opencodeCaps = useProviderCapabilities((s) => s.opencode);
   const capsLoaded = useProviderCapabilities((s) => s.loaded);
   const refreshCaps = useProviderCapabilities((s) => s.refresh);
+
+  // Gemini isn't a chat provider, so its launch list comes from the
+  // backend hybrid harvest (`list_launch_gemini_models`) instead. The
+  // init hook kicks a lazy first fetch on dialog mount; subsequent
+  // opens reuse the cached value.
+  const geminiModels = useLaunchGeminiModels((s) => s.models);
+  useLaunchGeminiModelsInit();
 
   const defaultDir =
     storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
@@ -412,10 +423,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           ? opencodeCaps
           : null;
 
-  // Model list: Gemini uses a small maintained list (it has no chat
-  // driver); every other family reads the shared capability harvest.
+  // Model list: Gemini routes through the backend hybrid harvest
+  // (`list_launch_gemini_models`) — live from Google's API when
+  // GEMINI_API_KEY is set, otherwise the maintained fallback. The
+  // frontend `GEMINI_MODELS` const stays as a paper backstop for the
+  // window between mount and the first fetch resolving. Every other
+  // family reads the shared chat-capability harvest.
   const launchModels = useMemo<LaunchModel[]>(() => {
-    if (launchFamily === "gemini") return GEMINI_MODELS;
+    if (launchFamily === "gemini") return geminiModels ?? GEMINI_MODELS;
     return (
       launchCaps?.models.map((m) => ({
         id: m.id,
@@ -423,7 +438,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         subProvider: m.sub_provider,
       })) ?? []
     );
-  }, [launchFamily, launchCaps]);
+  }, [launchFamily, launchCaps, geminiModels]);
 
   const launchModelsLoading =
     launchFamily !== null &&

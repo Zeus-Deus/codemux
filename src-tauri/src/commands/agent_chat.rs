@@ -535,6 +535,10 @@ pub async fn list_chat_provider_capabilities(
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
     >,
+    claude_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
@@ -544,9 +548,30 @@ pub async fn list_chat_provider_capabilities(
     // need for app-handle-scoped state.
     let _ = app;
     match provider {
-        ProviderKind::Claude => Ok(
-            crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),
-        ),
+        ProviderKind::Claude => {
+            // Hybrid: live-harvest via the Anthropic `/v1/models` API
+            // when `ANTHROPIC_API_KEY` is set; otherwise serve the
+            // hand-maintained bundle (subscription / OAuth users have
+            // no live path). A harvest failure logs and falls back to
+            // maintained so the picker is never blank.
+            if std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .is_some_and(|v| !v.trim().is_empty())
+            {
+                match claude_cache.get_or_harvest().await {
+                    Ok(caps) => Ok(caps),
+                    Err(err) => {
+                        eprintln!(
+                            "[claude] live harvest failed, falling back to maintained: {}",
+                            err.to_command_string()
+                        );
+                        Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
+                    }
+                }
+            } else {
+                Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
+            }
+        }
         ProviderKind::Codex => {
             // Live harvest from `codex app-server` via `model/list`,
             // memoised in the Tauri-managed cache. The fallback static

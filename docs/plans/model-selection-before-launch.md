@@ -61,6 +61,24 @@ Also implemented:
   `launch-models.ts` keeps only `REASONING_FLAG_FAMILIES` — the
   structural fact of which CLIs have a reasoning flag at all.
 
+Hybrid live harvest (follow-up after Opus 4.8 didn't surface):
+
+- **Claude `/v1/models` harvest** — Anthropic's SDK / OAuth path has no
+  model-list endpoint, so subscription users still see the
+  hand-maintained bundle. With `ANTHROPIC_API_KEY` set the dispatcher
+  harvests live and merges the live id list against per-id maintained
+  metadata; unknown ids get family-pattern-inferred defaults so a
+  brand-new Opus surfaces without a code change. Cached in a
+  `ClaudeCapabilityCache` Tauri state, mirroring the Codex pattern.
+- **Gemini hybrid** — Gemini isn't a chat provider, so the launch
+  picker routes through a new `list_launch_gemini_models` Tauri command
+  that does the same hybrid (`GEMINI_API_KEY` → Google's
+  `generativelanguage.googleapis.com/v1beta/models`, else maintained).
+  Frontend stores it in a tiny `gemini-models-store` with lazy init on
+  dialog mount.
+- **Maintained Claude list bumped** to include Opus 4.8 as the current
+  flagship; Opus 4.7 demoted from flagship description.
+
 Post-review hardening (three fresh-context review agents, all "fixes only"):
 
 - **Data-loss fix** — a remembered reasoning/context pick was dropped and

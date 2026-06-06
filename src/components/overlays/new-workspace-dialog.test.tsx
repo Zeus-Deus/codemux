@@ -76,6 +76,11 @@ vi.mock("@/tauri/commands", () => ({
   // module-level promise rejects with the Tauri `invoke` bridge being
   // undefined under jsdom and crashes every dialog test.
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
+  // The dialog calls this on mount via the Gemini lazy-init hook.
+  // Resolved to an empty array so the store sees a successful response
+  // but the dialog (using GEMINI_MODELS as a paper backstop) is
+  // unaffected for tests that don't exercise the Gemini path.
+  listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
 }));
 
 import {
