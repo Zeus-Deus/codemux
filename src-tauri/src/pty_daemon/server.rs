@@ -26,10 +26,55 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Mutex};
+
+/// Path of the per-socket liveness pidfile, set once in `run()`. A
+/// `<socket>.pid` sidecar lets an SSH-tunnel reconnect (and the host-side
+/// "is a daemon already serving this socket?" probe) decide whether to
+/// reuse a still-running detached daemon or spawn a fresh one — without
+/// depending on the single shared `pty-daemon-manifest.json` (which a
+/// per-workspace remote daemon would clobber). The daemon owns the file:
+/// it writes it on bind and removes it on clean exit (idle-reap /
+/// Shutdown).
+///
+/// Unix-only: the daemon's `run` loop is `#[cfg(unix)]` (Unix-socket
+/// based), so these helpers have no consumer on Windows.
+#[cfg(unix)]
+static PID_FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// `<socket>.pid` — the pidfile path for a given daemon socket. Pure so the
+/// host-side reconnect shell and tests agree on the location.
+#[cfg(unix)]
+pub fn pid_file_for(socket_path: &std::path::Path) -> PathBuf {
+    let mut raw = socket_path.as_os_str().to_os_string();
+    raw.push(".pid");
+    PathBuf::from(raw)
+}
+
+/// Write `<socket>.pid` containing this daemon's pid and remember it for
+/// removal on exit. Best-effort: a failure just means a reconnect can't
+/// confirm liveness and will spawn a fresh daemon (correct, if wasteful).
+#[cfg(unix)]
+fn write_pid_file(socket_path: &std::path::Path) {
+    let path = pid_file_for(socket_path);
+    if let Err(error) = std::fs::write(&path, std::process::id().to_string()) {
+        eprintln!("[codemux::pty_daemon] WARNING: could not write pidfile {path:?}: {error}");
+    }
+    let _ = PID_FILE.set(path);
+}
+
+/// Remove the pidfile written by `write_pid_file`. Idempotent; no-op if the
+/// daemon never wrote one.
+#[cfg(unix)]
+fn remove_pid_file() {
+    if let Some(path) = PID_FILE.get() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 /// Capacity of the per-session output broadcast channel. Tuned for
 /// short-lived disconnects: roughly 30 seconds of typical TUI redraw output
@@ -44,6 +89,18 @@ const OUTPUT_CHANNEL_CAPACITY: usize = 512;
 /// alt-screen TUI; for shell scrollback we rely on the existing
 /// `scrollback.rs` system.
 const REPLAY_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Flow-control backstop: the maximum time the read loop will honour a
+/// `flow_paused` flag before force-resuming. A healthy client clears the
+/// flag within milliseconds (as soon as its xterm write queue drains), so
+/// this only ever fires when the client crashed, wedged, or lost the resume
+/// frame. Force-resuming bounds the worst case to "a stuck pane self-heals
+/// in ~this long" instead of "the child is blocked on write forever".
+const FLOW_MAX_PARK: Duration = Duration::from_secs(10);
+
+/// Poll interval for the read loop's pause gate. Small enough that a resume
+/// is observed promptly, large enough that a parked thread costs ~nothing.
+const FLOW_PARK_POLL: Duration = Duration::from_millis(10);
 
 /// Frames pushed through a session's broadcast channel. The reader thread
 /// emits `Output` for every PTY chunk; the waiter thread emits `Exited`
@@ -81,6 +138,12 @@ struct DaemonSession {
     /// by late attachers who connect after the child exited: they see this
     /// value in the `Listed` response instead of getting silence.
     exit_code: Arc<Mutex<Option<i32>>>,
+    /// Terminal output flow control. When `true`, the per-session read
+    /// thread stops draining the master fd, so the child blocks on write
+    /// once the kernel PTY buffer fills. Set/cleared by `SetFlowPaused`;
+    /// force-cleared on `Attach` and `Close` and by the read loop's
+    /// `FLOW_MAX_PARK` backstop. Shared (Arc) with the read thread.
+    flow_paused: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -148,6 +211,14 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
         );
     }
 
+    // Per-socket liveness pidfile. The shared manifest above is a single
+    // file that a second per-workspace remote daemon would clobber; the
+    // pidfile is keyed to this socket so the SSH-tunnel reconnect probe can
+    // tell whether THIS socket already has a live (detached) daemon to
+    // reuse — the mechanism behind "close the app, the host agent keeps
+    // running, reopen reattaches."
+    write_pid_file(&socket_path);
+
     let state: SharedState = Arc::new(Mutex::new(DaemonState::default()));
 
     eprintln!(
@@ -156,6 +227,52 @@ pub async fn run(socket_path: PathBuf) -> Result<(), String> {
         std::process::id(),
         env!("CARGO_PKG_VERSION"),
     );
+
+    // Idle reaper: a daemon with zero live sessions continuously for
+    // `IDLE_REAP` removes its manifest and exits, so an abandoned daemon
+    // doesn't linger forever and stale manifests don't confuse the next
+    // adoption. HARD GUARD: it re-checks the session count under the same
+    // lock immediately before exit, so it can NEVER reap with a live
+    // session — and any spawn/attach naturally resets the idle clock by
+    // making `sessions` non-empty on the next check.
+    {
+        let reaper_state = state.clone();
+        let reaper_socket = socket_path.clone();
+        tokio::spawn(async move {
+            const CHECK_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            const IDLE_REAP: std::time::Duration =
+                std::time::Duration::from_secs(3600);
+            let mut idle_since: Option<tokio::time::Instant> =
+                Some(tokio::time::Instant::now());
+            loop {
+                tokio::time::sleep(CHECK_INTERVAL).await;
+                if !reaper_state.lock().await.sessions.is_empty() {
+                    idle_since = None;
+                    continue;
+                }
+                let since =
+                    idle_since.get_or_insert_with(tokio::time::Instant::now);
+                if since.elapsed() < IDLE_REAP {
+                    continue;
+                }
+                // Re-check under the lock right before exit — never reap a
+                // daemon that just gained a session between the poll and now.
+                if !reaper_state.lock().await.sessions.is_empty() {
+                    idle_since = None;
+                    continue;
+                }
+                eprintln!(
+                    "[codemux::pty_daemon] idle with no sessions for {IDLE_REAP:?} — \
+                     removing manifest and exiting"
+                );
+                remove_manifest();
+                remove_pid_file();
+                let _ = std::fs::remove_file(&reaper_socket);
+                std::process::exit(0);
+            }
+        });
+    }
 
     loop {
         match listener.accept().await {
@@ -349,6 +466,13 @@ async fn handle_request(
                 }
             };
             drop(guard);
+            // Fail-safe: a fresh attach always resumes the read loop. If a
+            // previous client paused this session and then crashed or
+            // dropped its connection without resuming, the new client would
+            // otherwise inherit a wedged (paused) PTY. Clearing here means a
+            // stuck pause self-heals on the next attach (e.g. app restart,
+            // reopening the pane).
+            session.flow_paused.store(false, Ordering::Relaxed);
             // Subscribe to live output (after replay so we don't drop
             // anything in the gap).
             let rx = session.frame_tx.subscribe();
@@ -458,6 +582,11 @@ async fn handle_request(
                 guard.sessions.remove(&session_id)
             };
             if let Some(session) = session {
+                // Clear any pause first so a read thread parked in the
+                // flow-control gate wakes, reads EOF on the now-killed
+                // master, and exits — otherwise it would leak (parked
+                // forever holding the broadcast sender).
+                session.flow_paused.store(false, Ordering::Relaxed);
                 kill_session_pid(session.pid);
             }
             ServerResponse::Closed { request_id }
@@ -491,6 +620,7 @@ async fn handle_request(
             }
             drop(guard);
             remove_manifest();
+            remove_pid_file();
             // Spawn the exit after replying so the client gets the
             // ShuttingDown frame.
             tokio::spawn(async move {
@@ -498,6 +628,26 @@ async fn handle_request(
                 std::process::exit(0);
             });
             ServerResponse::ShuttingDown { request_id }
+        }
+        ClientRequest::SetFlowPaused {
+            request_id,
+            session_id,
+            paused,
+        } => {
+            let session = {
+                let guard = state.lock().await;
+                guard.sessions.get(&session_id).cloned()
+            };
+            match session {
+                Some(session) => {
+                    session.flow_paused.store(paused, Ordering::Relaxed);
+                    ServerResponse::FlowPaused { request_id }
+                }
+                None => ServerResponse::Error {
+                    request_id,
+                    message: format!("unknown session {session_id}"),
+                },
+            }
         }
     }
 }
@@ -588,6 +738,7 @@ async fn spawn_pty(
     let (tx, _rx) = broadcast::channel::<SessionFrame>(OUTPUT_CHANNEL_CAPACITY);
     let replay = Arc::new(Mutex::new(Vec::with_capacity(REPLAY_BUFFER_BYTES)));
     let exit_code = Arc::new(Mutex::new(None));
+    let flow_paused = Arc::new(AtomicBool::new(false));
 
     let session = Arc::new(DaemonSession {
         session_id: session_id.clone(),
@@ -606,6 +757,7 @@ async fn spawn_pty(
         frame_tx: tx.clone(),
         replay: replay.clone(),
         exit_code: exit_code.clone(),
+        flow_paused: flow_paused.clone(),
     });
 
     {
@@ -617,10 +769,42 @@ async fn spawn_pty(
     let read_session_id = session_id.clone();
     let read_tx = tx.clone();
     let read_replay = replay;
+    let read_flow_paused = flow_paused;
     std::thread::spawn(move || {
         let mut reader = reader;
         let mut buf = [0u8; 8192];
+        // Tracks how long we've been continuously parked, for the
+        // `FLOW_MAX_PARK` backstop.
+        let mut paused_since: Option<Instant> = None;
         loop {
+            // Flow-control gate. While the attached client signals it's
+            // behind (its xterm parser can't keep up), we stop draining the
+            // master fd. The kernel PTY buffer then fills and the child's
+            // next `write()` blocks — backpressure straight to the producer,
+            // instead of us overflowing the broadcast channel and dropping
+            // frames (which corrupts the rendered terminal until a redraw).
+            //
+            // We poll the flag rather than block on a condvar: it guarantees
+            // we re-check even if a wake is somehow missed, and it lets the
+            // `FLOW_MAX_PARK` backstop fire so a wedged/crashed client can
+            // never block the child forever. Exit detection is unaffected —
+            // the waiter thread reaps the child and emits `Exited`
+            // independently of this loop.
+            while read_flow_paused.load(Ordering::Relaxed) {
+                let since = *paused_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= FLOW_MAX_PARK {
+                    eprintln!(
+                        "[codemux::pty_daemon] session {read_session_id} flow-paused for \
+                         >{}s — force-resuming (client wedged or resume frame lost)",
+                        FLOW_MAX_PARK.as_secs()
+                    );
+                    read_flow_paused.store(false, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(FLOW_PARK_POLL);
+            }
+            paused_since = None;
+
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -713,4 +897,23 @@ fn kill_session_pid(pid: u32) {
 fn kill_session_pid(_pid: u32) {
     // Windows path TBD — TerminateProcess + JobObject. Tracked in
     // the windows-support follow-up; for the MVP we only run on Unix.
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::pid_file_for;
+    use std::path::Path;
+
+    #[test]
+    fn pid_file_is_socket_path_plus_pid_suffix() {
+        // The host-side SSH reconnect probe and the daemon must agree on
+        // the pidfile location: it's exactly `<socket>.pid`. A drift here
+        // would silently break daemon reuse (reattach after app close).
+        assert_eq!(
+            pid_file_for(Path::new("/tmp/codemux-ptyd-abc.sock"))
+                .to_str()
+                .unwrap(),
+            "/tmp/codemux-ptyd-abc.sock.pid"
+        );
+    }
 }

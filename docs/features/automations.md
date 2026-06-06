@@ -76,7 +76,12 @@ layers still to come.
   placement Codex and Superset use). A sidebar list + detail pane to
   create, edit, pause/resume, and delete automations, with a
   frequency/time/weekday schedule builder (and a raw RFC 5545 escape
-  hatch) and a per-automation run-history view.
+  hatch) and a per-automation run-history view. The project picker
+  lists the projects currently open in the sidebar — derived from the
+  live workspace snapshot the same way the sidebar groups them, not
+  every repo ever opened — with an "Other path…" fallback for a repo
+  that is not currently open. Editing an automation whose project is
+  not open keeps its saved path via that fallback.
 - Desktop command surface — `automations_list`, `automations_get`,
   `automations_create`, `automations_update`, `automations_set_enabled`,
   `automations_delete`, `automations_runs`, plus

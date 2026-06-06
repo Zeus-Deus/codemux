@@ -204,14 +204,37 @@ pub async fn hosts_test_connection(
                 // Automations preflight — flag a host that can't reach
                 // GitHub before an automation silently fails at run time.
                 let github_note = probe_host_github(&host.ssh_target).await;
-                HostTestResult {
-                    ok: true,
-                    message: format!(
-                        "Connected. codemux-remote v{version} is installed{}{github_note}",
-                        uname.map(|u| format!(" ({u})")).unwrap_or_default()
-                    ),
-                    needs_install: false,
-                    uname: None,
+
+                // Version-aware upgrade detection: if the host's
+                // codemux-remote is older than the one bundled with
+                // this Codemux, surface it as `needs_install: true`
+                // so the UI shows the Install button (which then
+                // re-uploads + restarts via the same path as a fresh
+                // install). Without this, an upgraded Codemux would
+                // silently keep using stale codemux-remote on every
+                // host the user never explicitly pushed to.
+                let our_version = env!("CARGO_PKG_VERSION");
+                let upgrade_available = version != our_version;
+                let uname_suffix = uname.as_ref().map(|u| format!(" ({u})")).unwrap_or_default();
+                if upgrade_available {
+                    HostTestResult {
+                        ok: true,
+                        message: format!(
+                            "codemux-remote v{version} on host, v{our_version} bundled — \
+                             Install to upgrade{uname_suffix}{github_note}"
+                        ),
+                        needs_install: true,
+                        uname,
+                    }
+                } else {
+                    HostTestResult {
+                        ok: true,
+                        message: format!(
+                            "Connected. codemux-remote v{version} is installed{uname_suffix}{github_note}"
+                        ),
+                        needs_install: false,
+                        uname: None,
+                    }
                 }
             }
             ProbeOutcome::Reachable {
@@ -329,10 +352,34 @@ pub async fn hosts_bootstrap_install(
                     }
                     _ => String::new(),
                 };
+
+                // Always provision the headless `serve` daemon. Unlike
+                // the scheduler this needs no auth token or server id —
+                // it's a per-host local control plane. After this
+                // returns successfully, an MCP-capable agent on the host
+                // can use `codemux-remote mcp` without any manual setup.
+                // Same best-effort contract: a failure logs and is
+                // surfaced in the result message, doesn't fail bootstrap.
+                let serve_note = match crate::ssh::bootstrap::provision_serve(
+                    &host.ssh_target,
+                    "~/.local/bin/codemux-remote",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                {
+                    Ok(()) => " · MCP control plane enabled".to_string(),
+                    Err(error) => {
+                        eprintln!(
+                            "[codemux::hosts] serve provisioning failed: {error}"
+                        );
+                        " · (MCP control plane not enabled — see logs)".to_string()
+                    }
+                };
+
                 HostBootstrapResult {
                     ok: true,
                     message: format!(
-                        "codemux-remote v{reported_version} installed on {}{scheduler_note}",
+                        "codemux-remote v{reported_version} installed on {}{scheduler_note}{serve_note}",
                         host.name
                     ),
                 }
@@ -440,6 +487,11 @@ pub async fn workspace_push_to_host(
         .git_branch
         .clone()
         .unwrap_or_else(|| "main".to_string());
+    // A repo ROOT (kind "main", no worktree_path) pushes to
+    // ~/.codemux/projects/<repo> on the host — OUTSIDE the worktrees
+    // tree — so it isn't materialised as a divergent worktree-style
+    // copy. Worktrees keep the conventional worktrees layout.
+    let is_root = ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
 
     #[cfg(unix)]
     {
@@ -471,8 +523,16 @@ pub async fn workspace_push_to_host(
             );
         }
 
-        let remote_path =
-            crate::ssh::conventional_remote_path(&project_name, &branch);
+        // Key the host landing path on project_uid so two different repos
+        // sharing a basename don't clobber each other on the host. The exact
+        // landing path is recorded (origin_path), so pull-back resolves it
+        // directly regardless of the uid suffix.
+        let puid = ws.project_uid.as_deref();
+        let remote_path = if is_root {
+            crate::workspace_paths::conventional_remote_root_path_keyed(puid, &project_name)
+        } else {
+            crate::ssh::conventional_remote_path_keyed(puid, &project_name, &branch)
+        };
         let remote_path_str = remote_path.to_string_lossy().to_string();
         let opts = crate::ssh::PushOptions::new(
             &host.ssh_target,
@@ -520,7 +580,15 @@ pub async fn workspace_push_to_host(
                     // here, tunnel must reach here.
                     "$HOME/.local/bin/codemux-remote".to_string(),
                 );
-                crate::ssh::install_supervisor(&workspace_id, supervisor).await;
+                crate::ssh::install_supervisor(&workspace_id, supervisor.clone())
+                    .await;
+                // Surface reconnect / circuit-open state to the UI for this
+                // freshly-pushed workspace.
+                crate::ssh::spawn_tunnel_status_forwarder(
+                    app.clone(),
+                    workspace_id.clone(),
+                    &supervisor,
+                );
 
                 // Sync Claude session JSONLs from
                 // ~/.claude/projects/<local-encoded>/ to the
@@ -550,19 +618,14 @@ pub async fn workspace_push_to_host(
                                     .trim()
                                     .to_string();
                             if !remote_home.is_empty() {
-                                // Build the remote absolute cwd:
-                                // <remote_home>/.codemux/worktrees/<project>/<branch>
-                                let conv = crate::ssh::conventional_remote_path(
-                                    &project_name,
-                                    &branch,
-                                );
-                                let conv_str = conv.to_string_lossy();
-                                let remote_rel = conv_str
-                                    .strip_prefix("~/")
-                                    .unwrap_or(&conv_str);
+                                // Build the remote absolute cwd from the path we
+                                // ACTUALLY pushed to (`remote_path_str`, already
+                                // uid-keyed and root-aware), not a recomputed
+                                // basename — otherwise a uid-keyed pushed
+                                // workspace's history syncs to the wrong encoded
+                                // dir and `claude --resume` finds nothing.
                                 let remote_absolute_cwd =
-                                    std::path::PathBuf::from(&remote_home)
-                                        .join(remote_rel);
+                                    resolve_remote_cwd(&remote_home, &remote_path_str);
                                 if let Err(error) = sync_claude_projects(
                                     &host.ssh_target,
                                     &local_workspace_cwd,
@@ -575,6 +638,41 @@ pub async fn workspace_push_to_host(
                                          agent will launch but conversation will be \
                                          fresh): {error}"
                                     );
+                                }
+
+                                // OpenCode conversation sync (issue #16):
+                                // export this workspace's active OpenCode
+                                // session from the laptop's opencode.db and
+                                // import it into the host's DB associated
+                                // with the remote cwd, so the remote
+                                // relaunch (`opencode --session <id>`)
+                                // continues the laptop's conversation. Only
+                                // this one session id is touched — the
+                                // host's other OpenCode sessions are never
+                                // clobbered. Best-effort, same as Claude.
+                                match crate::ssh::sync_opencode_session(
+                                    &host.ssh_target,
+                                    &local_workspace_cwd,
+                                    &remote_absolute_cwd,
+                                )
+                                .await
+                                {
+                                    Ok(Some(oc_session_id)) => {
+                                        // Stash the id so the daemon-backed
+                                        // remote relaunch can target the
+                                        // exact synced session.
+                                        record_opencode_session_capture(
+                                            &app,
+                                            &workspace_id,
+                                            &oc_session_id,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => eprintln!(
+                                        "[hosts] OpenCode session sync failed (continuing \
+                                         — agent will launch with a fresh conversation): \
+                                         {error}"
+                                    ),
                                 }
                             }
                         }
@@ -706,7 +804,7 @@ pub async fn workspace_push_to_host(
     }
     #[cfg(not(unix))]
     {
-        let _ = (local_worktree, project_name, branch, host);
+        let _ = (local_worktree, project_name, branch, host, is_root);
         Ok(WorkspacePushOutcome {
             ok: false,
             message: "SSH transport is Unix-only for now.".into(),
@@ -722,24 +820,71 @@ pub async fn workspace_push_to_host(
 #[tauri::command]
 pub async fn workspace_pull_back(
     app: tauri::AppHandle,
-    db: tauri::State<'_, DatabaseStore>,
+    _db: tauri::State<'_, DatabaseStore>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
+    workspace_pull_back_impl(app, workspace_id).await
+}
+
+/// Internal entry point for the pull-back machinery. Extracted from
+/// the `#[tauri::command]` wrapper so other Rust code paths (notably
+/// the cross-device adoption flow in
+/// `commands::workspaces_sync::workspaces_adopt_synced`) can drive
+/// the same rsync + tunnel-teardown + session-respawn pipeline
+/// without going back out through the Tauri IPC layer.
+///
+/// Takes only `app` and looks up both `DatabaseStore` and
+/// `AppStateStore` internally — this avoids the `tauri::State<'_>`
+/// lifetime trap where the guard cannot cross an `.await`.
+///
+/// Semantics: requires the local workspace to already exist with
+/// `host_id` set; rsyncs the remote worktree to the local
+/// `worktree_path` (or `cwd` fallback); clears `host_id` on success;
+/// tears down the SSH tunnel; respawns each pane's PTY locally.
+pub async fn workspace_pull_back_impl(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<WorkspacePullOutcome, String> {
+    // Resolve State guards in a tight pre-await scope and capture
+    // owned values so the State guards drop before any `.await`
+    // (they are not Send).
+    let (host, ws_clone, origin_path) = {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let snapshot = app_state.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?
+            .clone();
+        let host_id = ws
+            .host_id
+            .ok_or_else(|| "Workspace is already local.".to_string())?;
+        let host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+        // The authoritative remote source path. For a workspace an agent
+        // CREATED on the host, this is its real on-host path (e.g.
+        // `/home/deus/projects/passpage`) — which is NOT the
+        // `~/.codemux/worktrees/<project>/<branch>` convention the desktop
+        // uses for workspaces it PUSHED. Pulling from the wrong (assumed)
+        // path is exactly what produced empty worktrees. Falls back to the
+        // convention when the sync row has no recorded origin path (the
+        // pushed-workspace case, where the two coincide).
+        let origin_path = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.workspace_id.as_deref() == Some(workspace_id.as_str()))
+            .and_then(|r| r.origin_path);
+        (host, ws, origin_path)
+    };
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-    let snapshot = app_state.snapshot();
-    let ws = snapshot
-        .workspaces
-        .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)
-        .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?;
-    let host_id = ws
-        .host_id
-        .ok_or_else(|| "Workspace is already local.".to_string())?;
-    let host = db
-        .list_hosts()
-        .into_iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| format!("Host {host_id} no longer exists locally"))?;
+    // Rename for compatibility with the original function body below
+    // (which references `ws` and `host`).
+    let ws = &ws_clone;
 
     let local_worktree = match ws.worktree_path.as_ref() {
         Some(p) => std::path::PathBuf::from(p),
@@ -759,15 +904,77 @@ pub async fn workspace_pull_back(
 
     #[cfg(unix)]
     {
-        let remote_path =
-            crate::ssh::conventional_remote_path(&project_name, &branch);
-        let remote_path_str = remote_path.to_string_lossy().to_string();
-        let opts = crate::ssh::PullOptions::new(
-            &host.ssh_target,
-            &remote_path_str,
-            &local_worktree,
-        );
-        let result = crate::ssh::pull_workspace_back(opts).await;
+        // Source path resolution. Prefer the workspace's REAL recorded
+        // path on the host (`origin_path`, set by the inventory poller
+        // from the daemon registry). Otherwise reconstruct the
+        // conventional path: a repo ROOT lives under `projects/`
+        // (repo-unit sync), a worktree/legacy workspace under the
+        // `worktrees/` tree. For a root with no recorded origin we try
+        // `projects/` first and FALL BACK to the legacy `worktrees/`
+        // path, so roots pushed before the repo-unit change still pull.
+        let is_root =
+            ws.worktree_path.is_none() && ws.workspace_kind.as_deref() == Some("main");
+        let mut candidate_sources: Vec<String> = Vec::new();
+        if let Some(op) = origin_path.clone() {
+            // The recorded on-disk path is authoritative — try it first.
+            candidate_sources.push(op);
+        }
+        // Fallbacks (used when origin_path is absent — legacy rows). Try the
+        // uid-keyed path first (where new pushes land), then the legacy
+        // basename path so workspaces pushed before the re-key still pull.
+        let puid = ws.project_uid.as_deref();
+        if is_root {
+            candidate_sources.push(
+                crate::workspace_paths::conventional_remote_root_path_keyed(puid, &project_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            candidate_sources.push(
+                crate::workspace_paths::conventional_remote_root_path(&project_name)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            candidate_sources.push(
+                crate::ssh::conventional_remote_path(&project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else {
+            candidate_sources.push(
+                crate::ssh::conventional_remote_path_keyed(puid, &project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+            candidate_sources.push(
+                crate::ssh::conventional_remote_path(&project_name, &branch)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+        // De-dup while preserving order (uid-keyed == basename when no uid).
+        candidate_sources.dedup();
+
+        // Try each candidate; only a "remote path missing" outcome is
+        // worth retrying the next one — success / rsync error / host
+        // unreachable are all authoritative. Remember which source we
+        // settled on so the Claude JSONL sync below encodes the dir from
+        // the path we ACTUALLY pulled from (uid-keyed or origin_path),
+        // not a recomputed basename.
+        let mut result_opt = None;
+        let mut pulled_src: Option<String> = None;
+        for src in &candidate_sources {
+            let opts =
+                crate::ssh::PullOptions::new(&host.ssh_target, src, &local_worktree);
+            let r = crate::ssh::pull_workspace_back(opts).await;
+            let keep_trying = matches!(r, crate::ssh::PullResult::RemoteNotFound { .. });
+            pulled_src = Some(src.clone());
+            result_opt = Some(r);
+            if !keep_trying {
+                break;
+            }
+        }
+        // candidate_sources is never empty, so this always resolves.
+        let result = result_opt.expect("at least one pull source candidate");
         let outcome = match result {
             crate::ssh::PullResult::Pulled { rsync_summary, .. } => {
                 // Symmetric Claude JSONL sync (remote → local) BEFORE
@@ -800,17 +1007,34 @@ pub async fn workspace_pull_back(
                                     .trim()
                                     .to_string();
                             if !remote_home.is_empty() {
-                                let conv = crate::ssh::conventional_remote_path(
-                                    &project_name,
-                                    &branch,
-                                );
-                                let conv_str = conv.to_string_lossy();
-                                let remote_rel = conv_str
-                                    .strip_prefix("~/")
-                                    .unwrap_or(&conv_str);
+                                // Derive the remote cwd from the path we ACTUALLY
+                                // pulled from (`origin_path` or the uid-keyed
+                                // candidate that resolved), not a recomputed
+                                // basename — so a uid-keyed workspace's history
+                                // pulls back from the right encoded dir. The
+                                // fallback is unreachable in practice (a `Pulled`
+                                // result implies a source succeeded) but stays
+                                // safe by reconstructing the uid-keyed path.
+                                let remote_source = match pulled_src.as_deref() {
+                                    Some(src) => src.to_string(),
+                                    None => {
+                                        let p = if is_root {
+                                            crate::workspace_paths::conventional_remote_root_path_keyed(
+                                                puid,
+                                                &project_name,
+                                            )
+                                        } else {
+                                            crate::ssh::conventional_remote_path_keyed(
+                                                puid,
+                                                &project_name,
+                                                &branch,
+                                            )
+                                        };
+                                        p.to_string_lossy().to_string()
+                                    }
+                                };
                                 let remote_absolute_cwd =
-                                    std::path::PathBuf::from(&remote_home)
-                                        .join(remote_rel);
+                                    resolve_remote_cwd(&remote_home, &remote_source);
                                 if let Err(error) = pull_claude_projects(
                                     &host.ssh_target,
                                     &remote_absolute_cwd,
@@ -823,6 +1047,34 @@ pub async fn workspace_pull_back(
                                          (continuing — agent will launch with whatever \
                                          conversation history was already local): {error}"
                                     );
+                                }
+
+                                // OpenCode pull-back (issue #16): symmetric
+                                // to the push sync — export the host's
+                                // (possibly-extended) OpenCode session and
+                                // import it back into the laptop's DB so the
+                                // local relaunch continues the conversation
+                                // that happened on the host.
+                                match crate::ssh::pull_opencode_session(
+                                    &host.ssh_target,
+                                    &remote_absolute_cwd,
+                                    &local_workspace_cwd,
+                                )
+                                .await
+                                {
+                                    Ok(Some(oc_session_id)) => {
+                                        record_opencode_session_capture(
+                                            &app,
+                                            &workspace_id,
+                                            &oc_session_id,
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => eprintln!(
+                                        "[hosts] OpenCode pull-back failed (continuing — \
+                                         agent will launch with whatever conversation \
+                                         history was already local): {error}"
+                                    ),
                                 }
                             }
                         }
@@ -895,7 +1147,7 @@ pub async fn workspace_pull_back(
     }
     #[cfg(not(unix))]
     {
-        let _ = (local_worktree, project_name, branch, host);
+        let _ = (local_worktree, project_name, branch, host, origin_path);
         Ok(WorkspacePullOutcome {
             ok: false,
             message: "SSH transport is Unix-only for now.".into(),
@@ -932,6 +1184,25 @@ fn schedule_background_sync(app: tauri::AppHandle) {
             eprintln!("[codemux::hosts] background sync failed: {error}");
         }
     });
+}
+
+/// Resolve a remote workspace path — which may be `~/`-relative (the
+/// conventional / uid-keyed landing) or already absolute (a daemon-recorded
+/// `origin_path`) — into an absolute path under the remote `$HOME`.
+///
+/// The Claude session-history directory name is derived from the workspace's
+/// ABSOLUTE cwd (`claude_project_dir_name`), so the JSONL sync must encode the
+/// path the workspace ACTUALLY lives at on the host. Recomputing the bare
+/// basename here was the bug: a uid-keyed pushed workspace lives at
+/// `~/.codemux/worktrees/<name>-<uid>/<branch>`, so a basename-derived encoded
+/// dir never matched and history silently failed to sync. `~/`-prefixed paths
+/// expand against `remote_home`; already-absolute paths pass through unchanged.
+#[cfg(unix)]
+fn resolve_remote_cwd(remote_home: &str, remote_path: &str) -> std::path::PathBuf {
+    match remote_path.strip_prefix("~/") {
+        Some(rel) => std::path::PathBuf::from(remote_home).join(rel),
+        None => std::path::PathBuf::from(remote_path),
+    }
 }
 
 /// Sync the laptop's per-workspace Claude session JSONLs to the
@@ -1189,10 +1460,13 @@ async fn ensure_remote_binary_current(
         return Err("uname probe returned empty string".into());
     }
 
-    // Step 3: kill any running daemon. Otherwise the freshly-bootstrapped
+    // Step 3: kill any running pty-daemon. Otherwise the freshly-bootstrapped
     // binary won't actually be used until the next SSH-spawn cycle, and
     // a stale daemon still bound to the workspace's Unix socket would
-    // make that next spawn fail with "address in use."
+    // make that next spawn fail with "address in use." The narrow `-f`
+    // pattern only matches the SSH-spawned pty-daemon — user-launched
+    // `codemux-remote mcp` or `serve` invocations are spared. `serve`
+    // is restarted via systemctl in step 5 instead.
     let _ = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -1201,26 +1475,103 @@ async fn ensure_remote_binary_current(
         .status()
         .await;
 
-    // Step 4: bootstrap (scp + chmod + verify).
+    // Step 4: bootstrap (upload binary + verify version).
     use crate::ssh::bootstrap::{bootstrap_remote, BootstrapOptions, BootstrapResult};
-    match bootstrap_remote(
+    let outcome = bootstrap_remote(
         BootstrapOptions::new(&host.ssh_target, &uname).with_app(app),
     )
-    .await
-    {
+    .await;
+    match outcome {
         BootstrapResult::Installed { reported_version } => {
             eprintln!(
                 "[hosts] bootstrapped {} → codemux-remote {reported_version}",
                 host.name
             );
-            Ok(())
         }
-        BootstrapResult::BinaryNotBundled { wanted_target } => Err(format!(
-            "this Codemux build doesn't include a codemux-remote for {wanted_target}"
-        )),
-        BootstrapResult::UploadFailed { reason } => Err(format!("upload: {reason}")),
+        BootstrapResult::BinaryNotBundled { wanted_target } => {
+            return Err(format!(
+                "this Codemux build doesn't include a codemux-remote for {wanted_target}"
+            ));
+        }
+        BootstrapResult::UploadFailed { reason } => {
+            return Err(format!("upload: {reason}"));
+        }
         BootstrapResult::PostInstallProbeFailed { reason } => {
-            Err(format!("verify: {reason}"))
+            return Err(format!("verify: {reason}"));
+        }
+    }
+
+    // Step 5: re-provision the headless `serve` daemon. This is
+    // idempotent — it rewrites the systemd unit (so a unit-content
+    // change in this Codemux version takes effect immediately), runs
+    // daemon-reload, and **restarts** the unit (not just `enable
+    // --now` — restart kills the old process so the new binary on
+    // disk actually starts running). If we skipped this, an upgraded
+    // codemux-remote on disk would coexist with an old `serve`
+    // process in memory until the next host reboot, which would
+    // confuse anyone debugging "why doesn't my new MCP tool show up
+    // after I updated Codemux."
+    //
+    // Best-effort: a failure here doesn't fail the upgrade. The
+    // binary is current; the user can `systemctl --user restart
+    // codemux-remote` themselves if needed.
+    if let Err(error) = crate::ssh::bootstrap::provision_serve(
+        &host.ssh_target,
+        "~/.local/bin/codemux-remote",
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    {
+        eprintln!(
+            "[hosts] re-provisioning serve on {} after upgrade failed (continuing): {error}",
+            host.name
+        );
+    } else {
+        eprintln!("[hosts] re-provisioned codemux-remote.service on {}", host.name);
+    }
+
+    Ok(())
+}
+
+/// Stash the synced OpenCode session id into the adapter captures of the
+/// workspace's OpenCode terminal panes, keyed `opencode_session_id`. The
+/// daemon-backed respawn (`terminal::daemon_backed`) reads it from the
+/// in-memory snapshot to synthesize `opencode --session <id>`, so the
+/// relaunch continues the exact conversation we just synced — the OpenCode
+/// analogue of Claude's hook-captured `claude_session_id`.
+///
+/// Set only on panes whose original command is `opencode` so a sibling
+/// shell/agent pane never inherits a stray capture. No-op when the
+/// workspace or its sessions can't be resolved.
+#[cfg(unix)]
+fn record_opencode_session_capture(
+    app: &tauri::AppHandle,
+    workspace_id: &str,
+    oc_session_id: &str,
+) {
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let snapshot = app_state.snapshot();
+    let Some(ws) = snapshot
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+    else {
+        return;
+    };
+    for sid in crate::state::collect_terminal_sessions(&ws.surfaces) {
+        let is_opencode = snapshot.terminal_sessions.iter().any(|t| {
+            t.session_id.0 == sid
+                && t.original_command
+                    .as_deref()
+                    .map(|c| c.trim_start().starts_with("opencode"))
+                    .unwrap_or(false)
+        });
+        if is_opencode {
+            app_state.set_terminal_adapter_capture(
+                &sid,
+                "opencode_session_id",
+                oc_session_id,
+            );
         }
     }
 }
@@ -1299,5 +1650,45 @@ mod tests {
     #[test]
     fn github_probe_flags_an_empty_probe_as_missing_git() {
         assert!(interpret_github_probe("").contains("⚠"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod claude_sync_path_tests {
+    //! The Claude JSONL session-continuity sync derives its remote encoded
+    //! directory from the workspace's ACTUAL on-host path, not a recomputed
+    //! basename — so history syncs for uid-keyed pushed workspaces too.
+    use super::resolve_remote_cwd;
+
+    #[test]
+    fn expands_tilde_relative_uid_keyed_worktree_path() {
+        // A uid-keyed pushed workspace lands at a `~/`-relative path; it must
+        // expand against the remote $HOME so the encoded Claude dir matches the
+        // dir `claude --resume` reads on the remote.
+        let p = resolve_remote_cwd(
+            "/home/deus",
+            "~/.codemux/worktrees/api-11111111/main",
+        );
+        assert_eq!(
+            p.to_string_lossy(),
+            "/home/deus/.codemux/worktrees/api-11111111/main"
+        );
+    }
+
+    #[test]
+    fn expands_tilde_relative_uid_keyed_root_path() {
+        let p = resolve_remote_cwd("/home/deus", "~/.codemux/projects/api-11111111");
+        assert_eq!(
+            p.to_string_lossy(),
+            "/home/deus/.codemux/projects/api-11111111"
+        );
+    }
+
+    #[test]
+    fn passes_absolute_origin_path_through_unchanged() {
+        // An agent-CREATED workspace records an absolute origin_path (e.g.
+        // /home/deus/projects/passpage) — use it verbatim, no $HOME join.
+        let p = resolve_remote_cwd("/home/deus", "/home/deus/projects/passpage");
+        assert_eq!(p.to_string_lossy(), "/home/deus/projects/passpage");
     }
 }

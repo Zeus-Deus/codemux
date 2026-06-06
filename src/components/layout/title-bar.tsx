@@ -9,9 +9,13 @@ import { ResourceMonitor } from "./resource-monitor";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { groupEditors } from "@/lib/editor-groups";
 import {
   Tooltip,
   TooltipContent,
@@ -62,6 +66,8 @@ function IdeLauncher() {
   );
 
   const defaultEditor = editors.find((e) => e.id === defaultEditorId);
+  const groupedEditors = groupEditors(editors);
+  const showGroupLabels = groupedEditors.length > 1;
 
   if (editors.length === 0 || !workspacePath) return null;
 
@@ -109,20 +115,35 @@ function IdeLauncher() {
             <ChevronDown className="h-3 w-3" />
           </button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          {editors.map((editor) => (
-            <DropdownMenuItem
-              key={editor.id}
-              onClick={() => handleOpen(editor.id)}
-            >
-              <EditorIcon id={editor.id} className="h-4 w-4" />
-              <span>{editor.name}</span>
-              {editor.id === defaultEditorId && (
-                <span className="ml-auto text-[10px] text-muted-foreground">
-                  default
-                </span>
+        <DropdownMenuContent align="end" className="w-48">
+          {groupedEditors.map((group, groupIdx) => (
+            // Render each family as a labelled section using
+            // DropdownMenuGroup for proper radix aria semantics. We only
+            // show a header + separator when more than one group is
+            // present — a user with only VS Code installed shouldn't
+            // see a lonely "VS Code family" header above a single item.
+            <DropdownMenuGroup key={group.id}>
+              {groupIdx > 0 && <DropdownMenuSeparator />}
+              {showGroupLabels && (
+                <DropdownMenuLabel className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/70">
+                  {group.label}
+                </DropdownMenuLabel>
               )}
-            </DropdownMenuItem>
+              {group.editors.map((editor) => (
+                <DropdownMenuItem
+                  key={editor.id}
+                  onClick={() => handleOpen(editor.id)}
+                >
+                  <EditorIcon id={editor.id} className="h-4 w-4" />
+                  <span>{editor.name}</span>
+                  {editor.id === defaultEditorId && (
+                    <span className="ml-auto text-[10px] text-muted-foreground">
+                      default
+                    </span>
+                  )}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuGroup>
           ))}
         </DropdownMenuContent>
       </DropdownMenu>

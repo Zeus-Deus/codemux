@@ -125,6 +125,120 @@ fn run_git_permissive(repo_path: &Path, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
+/// Clone a remote repository into `target_dir`. Used by cross-device
+/// workspace adoption when a sibling-device workspace has no shared
+/// host — we clone the git remote and create a fresh worktree at the
+/// branch.
+///
+/// `target_dir` must NOT already exist (git clone refuses if the
+/// target dir is non-empty). Caller is expected to compute a unique
+/// target like `~/.codemux/projects/<basename>` and bail with a
+/// structured error if it collides.
+///
+/// Returns the absolute path of the cloned repo on success.
+///
+/// SSH credentials and any git auth (token, key) live in the user's
+/// `~/.gitconfig` / `~/.ssh` / `~/.netrc` — this helper inherits
+/// them implicitly via the spawned git process. We never marshal
+/// credentials through this layer.
+pub fn git_clone(remote_url: &str, target_dir: &Path) -> Result<String, String> {
+    if remote_url.trim().is_empty() {
+        return Err("git_clone: remote_url cannot be empty".into());
+    }
+    if target_dir.exists() {
+        // Don't clobber — caller should have picked a fresh path.
+        return Err(format!(
+            "git_clone: target directory already exists: {}",
+            target_dir.display()
+        ));
+    }
+    #[cfg(test)]
+    {
+        // Test hook — short-circuit BEFORE spawning git so unit
+        // tests don't need network or git installed. Real callers
+        // never hit this because they pass non-test markers.
+        if remote_url.starts_with("test://") {
+            return Ok(target_dir.to_string_lossy().to_string());
+        }
+    }
+    let parent = target_dir.parent().ok_or_else(|| {
+        format!(
+            "git_clone: target path has no parent directory: {}",
+            target_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|e| {
+        format!("git_clone: failed to create parent {}: {e}", parent.display())
+    })?;
+    let target_str = target_dir.to_string_lossy().to_string();
+    // Use `--no-checkout` so the worktree-add we'll do next chooses
+    // the right branch — clone's default checkout of the remote's
+    // HEAD branch is wasted work for our flow.
+    let output = Command::new("git")
+        .args(["clone", "--no-checkout", remote_url, &target_str])
+        .current_dir(parent)
+        .output()
+        .map_err(|e| format!("git_clone: failed to spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Best-effort cleanup so a half-cloned dir doesn't poison
+        // the next attempt.
+        let _ = std::fs::remove_dir_all(target_dir);
+        return Err(format!(
+            "git clone failed: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(target_str)
+}
+
+#[cfg(test)]
+mod git_clone_input_validation {
+    use super::git_clone;
+    use std::path::PathBuf;
+
+    #[test]
+    fn rejects_empty_remote_url() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = git_clone("", &dir).unwrap_err();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_remote_url() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-ws");
+        let _ = std::fs::remove_dir_all(&dir);
+        let err = git_clone("   \t  ", &dir).unwrap_err();
+        assert!(err.contains("cannot be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_when_target_dir_already_exists() {
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-exists");
+        // Create the directory so the precondition fires.
+        std::fs::create_dir_all(&dir).expect("set up test dir");
+        let err = git_clone("test://foo", &dir).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn accepts_well_formed_input_via_test_hook() {
+        // Uses the `test://` short-circuit so we don't need git or
+        // network on the CI runner. The hook returns success
+        // BEFORE doing any disk I/O — that's the point: the test
+        // only exercises the precondition checks above it (empty
+        // url, existing target), then yields a deterministic
+        // success that proves both checks let valid input through.
+        let dir = std::env::temp_dir().join("codemux-git-clone-test-ok-fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        let result = git_clone("test://foo/bar.git", &dir).unwrap();
+        assert_eq!(PathBuf::from(result), dir);
+    }
+}
+
 /// Run git and return (stdout, stderr, success) regardless of exit code.
 fn run_git_full(repo_path: &Path, args: &[&str]) -> Result<(String, String, bool), String> {
     let output = Command::new("git")
@@ -1434,12 +1548,22 @@ pub fn git_list_branches_detailed(repo_path: &Path) -> Result<Vec<BranchDetail>,
 
 /// Find the remote tracking ref for a branch (e.g. `origin/main` for `main`).
 /// Find the default branch for the repo (main, master, etc.).
-/// `pub(crate)` so helpers outside the branch-ops module (e.g.
-/// `checkout_default_branch`) can reuse the same resolution logic. Does NOT
-/// supersede `git_default_branch` — that one is the frontend-facing command
-/// with a slightly different fallback (`Ok("main")` instead of `None`).
-/// Consolidating the two is a separate follow-up.
-pub(crate) fn find_default_branch(repo_path: &Path) -> Option<String> {
+/// `pub` so the cross-device daemon (`remote::workspace`) and the protected-root
+/// classifier can reuse the same resolution logic. Does NOT supersede
+/// `git_default_branch` — that one is the frontend-facing command with a
+/// slightly different fallback (`Ok("main")` instead of `None`). Consolidating
+/// the two is a separate follow-up.
+///
+/// IMPORTANT: this resolver is intentionally *conservative* — `origin/HEAD`,
+/// then `main`, then `master`, else `None`. It deliberately does NOT fall back
+/// to "whatever branch is currently checked out", because two callers rely on
+/// that strictness: `is_protected_repo_root` (a current-branch fallback would
+/// protect a root on any branch) and `git_create_worktree` (it checks out the
+/// default to *free* a branch — a current-branch fallback would return the very
+/// branch it's trying to free). For the looser "best effort, never None for a
+/// real repo" form used to stamp the informational `default_branch` column, use
+/// [`resolve_default_branch`].
+pub fn find_default_branch(repo_path: &Path) -> Option<String> {
     // Try origin/HEAD first
     if let Ok(output) = run_git(repo_path, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
         if let Some(branch) = output.trim().strip_prefix("refs/remotes/origin/") {
@@ -1453,6 +1577,50 @@ pub(crate) fn find_default_branch(repo_path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Best-effort default-branch resolution for *recording* a repo's default
+/// branch (the cross-device `default_branch` hint), as opposed to the strict
+/// [`find_default_branch`] used for protection/worktree decisions.
+///
+/// Order: `origin/HEAD` → `main`/`master` → the currently checked-out branch.
+/// The last step is what makes this work for **local-only repos whose default
+/// branch is neither `main` nor `master`** (no remote to read `origin/HEAD`
+/// from, e.g. a repo defaulting to `trunk`/`develop`). Returns `None` only for
+/// a detached/unborn HEAD on such a repo.
+///
+/// This value is advisory metadata. The authoritative protection decision is
+/// always recomputed locally via [`is_protected_repo_root`] against the
+/// materialized copy, so a slightly-off hint can never cause a wrong protected
+/// stamp.
+pub fn resolve_default_branch(repo_path: &Path) -> Option<String> {
+    if let Some(b) = find_default_branch(repo_path) {
+        return Some(b);
+    }
+    let current = run_git_permissive(repo_path, &["branch", "--show-current"]);
+    if current.is_empty() {
+        None
+    } else {
+        Some(current)
+    }
+}
+
+/// Populate `refs/remotes/origin/HEAD` so [`find_default_branch`]'s
+/// `origin/HEAD` probe succeeds for freshly-cloned repos. Runs
+/// `git remote set-head origin --auto`.
+///
+/// **No-op by design when there is no `origin` remote** (e.g. local-only repos
+/// adopted via rsync) — calling `set-head` there errors with
+/// "No such remote 'origin'". Any failure of the underlying set-head (offline,
+/// transient) is swallowed: this only ever *improves* default-branch
+/// resolution, never blocks adoption.
+pub fn ensure_origin_head(repo_path: &Path) -> Result<(), String> {
+    let remotes = run_git_permissive(repo_path, &["remote"]);
+    if !remotes.lines().any(|r| r.trim() == "origin") {
+        return Ok(());
+    }
+    let _ = run_git(repo_path, &["remote", "set-head", "origin", "--auto"]);
+    Ok(())
 }
 
 /// Switch the repo to its default branch (main / master / whatever
@@ -1551,6 +1719,389 @@ fn existing_worktree_matches(repo_path: &Path, target_path: &str, branch: &str) 
     }
     // Last record may not be terminated by a blank line.
     path_matches(&current_path) && current_branch.as_deref() == Some(&expected_branch_ref)
+}
+
+/// Recreate a worktree for an EXISTING branch inside a repo that was
+/// copied from another machine (e.g. rsynced from a `codemux-remote`
+/// host during worktree adoption).
+///
+/// Such a repo carries the host's worktree admin entries under
+/// `.git/worktrees/<name>/`, each pointing at an absolute path that
+/// doesn't exist on this machine. Left in place, those stale entries
+/// make git think the branch is "already checked out" and refuse a
+/// fresh `git worktree add`. We `git worktree prune` first (drops every
+/// registration whose path is gone — which is all of them, since they
+/// reference the source machine), then add a clean local worktree for
+/// the branch via `git_create_worktree`.
+///
+/// Returns the local worktree path. The branch must already exist in
+/// the repo (it came over with the rsync); we attach it, never create.
+/// Identity of the git repository a path belongs to, resolved via a
+/// single `git rev-parse`. Distinguishes the genuine repo root from a
+/// linked worktree, and surfaces the *canonical* root (the main working
+/// tree) so the sync layer can treat a repo + its worktrees as one
+/// connected unit instead of independent folders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoRoot {
+    /// Working-tree root (`git rev-parse --show-toplevel`). `None` for a
+    /// bare repository (no working tree).
+    pub toplevel: Option<PathBuf>,
+    /// The shared git dir (`--git-common-dir`), absolute. For a linked
+    /// worktree this points at the parent repo's `.git`; for the main
+    /// checkout it is this repo's own `.git`.
+    pub common_dir: PathBuf,
+    /// True when this path is a linked worktree — its per-worktree
+    /// `--git-dir` differs from the shared `--git-common-dir`.
+    pub is_worktree: bool,
+    /// True for a bare repository.
+    pub is_bare: bool,
+}
+
+impl RepoRoot {
+    /// The canonical repo root: the main working tree that owns the
+    /// shared object store. For a linked worktree this is the *parent*
+    /// repo (not the worktree dir); for the main checkout it is the
+    /// checkout itself. Derived from `common_dir` by stripping the
+    /// trailing `.git` leaf, falling back to `toplevel` for unusual /
+    /// bare layouts.
+    pub fn canonical_root_path(&self) -> PathBuf {
+        if self.common_dir.file_name().and_then(|n| n.to_str()) == Some(".git") {
+            self.common_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| self.common_dir.clone())
+        } else {
+            // Bare repo or non-standard layout: the common dir IS the repo.
+            self.toplevel
+                .clone()
+                .unwrap_or_else(|| self.common_dir.clone())
+        }
+    }
+}
+
+/// Resolve the canonical git identity of `path`. Returns `None` when the
+/// path is not inside a git repository. Uses one combined `rev-parse`
+/// for `--git-dir`/`--git-common-dir` (both valid in bare repos and
+/// linked worktrees), then a permissive `--show-toplevel` (which is empty
+/// for bare repos) and a permissive `--is-bare-repository`.
+pub fn git_canonical_root(path: &Path) -> Option<RepoRoot> {
+    let combined = run_git(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ],
+    )
+    .ok()?;
+    let mut lines = combined.lines();
+    let resolve = |raw: &str| -> Option<PathBuf> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(s);
+        Some(if p.is_absolute() { p } else { path.join(p) })
+    };
+    let git_dir = resolve(lines.next()?)?;
+    let common_dir = resolve(lines.next()?)?;
+
+    let is_bare = run_git_permissive(path, &["rev-parse", "--is-bare-repository"]) == "true";
+    let toplevel = {
+        let raw = run_git_permissive(path, &["rev-parse", "--path-format=absolute", "--show-toplevel"]);
+        let t = raw.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(t))
+        }
+    };
+
+    Some(RepoRoot {
+        toplevel,
+        is_worktree: git_dir != common_dir,
+        common_dir,
+        is_bare,
+    })
+}
+
+/// True when `path` looks like a *divergent full copy* of a repo rather
+/// than a genuine linked worktree — the failure mode the repo-unit sync
+/// fix targets. A real linked worktree always has a `.git` **file**
+/// (a gitdir pointer); a divergent copy has its own `.git` **directory**
+/// (its own object store) yet sits under `~/.codemux/worktrees/`, where
+/// only linked worktrees are ever supposed to live. So a `.git` directory
+/// in that tree is the unmistakable signature of a whole-dir copy (the
+/// old default-branch rsync fallback), not a legitimate checkout.
+pub fn is_divergent_copy(path: &Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    is_divergent_copy_under(path, &home.join(".codemux").join("worktrees"))
+}
+
+/// Testable core of [`is_divergent_copy`] with the worktrees root injected.
+fn is_divergent_copy_under(path: &Path, worktrees_root: &Path) -> bool {
+    path.join(".git").is_dir() && path.starts_with(worktrees_root)
+}
+
+/// Why a divergent copy can't be "reconciled away" (its workspace card
+/// detached) yet, or `None` if it's safe. Blocks on a dirty working tree or
+/// committed-but-unpushed work so a card never silently vanishes while the
+/// user has changes in flight. Reconcile never deletes files, so this is a
+/// guard against *confusion*, not data loss.
+pub fn reconcile_copy_blocker(path: &Path) -> Option<String> {
+    if let Ok(files) = git_status(path) {
+        if !files.is_empty() {
+            return Some(format!(
+                "{} uncommitted change(s) — commit or stash first",
+                files.len()
+            ));
+        }
+    }
+    if let Some(upstream) = resolve_upstream_ref(path) {
+        let out = run_git_permissive(
+            path,
+            &["rev-list", "--count", &format!("{upstream}..HEAD")],
+        );
+        if let Ok(n) = out.trim().parse::<u64>() {
+            if n > 0 {
+                return Some(format!("{n} unpushed commit(s) — push first"));
+            }
+        }
+    }
+    None
+}
+
+/// True when `checkout` is the repo's protected default-branch root —
+/// the entry the overview must not let you delete like a disposable
+/// worktree. It qualifies only when ALL hold:
+/// - it's a genuine main checkout (not a linked worktree, not bare),
+/// - it is NOT a divergent full copy living in the worktrees tree
+///   (those are reconciled, not protected — see [`is_divergent_copy`]),
+/// - and it is checked out on the repo's default branch.
+///
+/// Returns `false` (fail-open to "deletable") for non-repos, detached
+/// HEADs, or when the default branch can't be resolved — we only ever
+/// add protection when we're sure, never block deletion on a guess.
+pub fn is_protected_repo_root(checkout: &Path, git_branch: Option<&str>) -> bool {
+    let Some(info) = git_canonical_root(checkout) else {
+        return false;
+    };
+    if info.is_worktree || info.is_bare {
+        return false;
+    }
+    if is_divergent_copy(checkout) {
+        return false;
+    }
+    match (git_branch, find_default_branch(checkout)) {
+        (Some(branch), Some(default)) => branch == default,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod repo_root_tests {
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "--initial-branch=main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-m", "init"]);
+    }
+
+    /// Compare two paths by resolved identity rather than raw string —
+    /// git emits forward-slash, non-verbatim paths while Rust's
+    /// `canonicalize` yields `\\?\` extended-length paths on Windows and
+    /// `/private/var` on macOS. Canonicalising both sides makes the
+    /// equality assertions platform-agnostic; we feed git the
+    /// non-canonicalised temp path so it never sees a `\\?\` prefix
+    /// (which `git worktree add` rejects on Windows).
+    fn same_path(a: &Path, b: &Path) -> bool {
+        match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        }
+    }
+
+    #[test]
+    fn canonical_root_for_main_checkout_is_itself() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        let info = git_canonical_root(&repo).expect("repo root");
+        assert!(!info.is_worktree, "main checkout is not a worktree");
+        assert!(!info.is_bare);
+        assert!(same_path(info.toplevel.as_deref().unwrap(), &repo));
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
+        assert!(same_path(&info.canonical_root_path(), &repo));
+    }
+
+    #[test]
+    fn canonical_root_for_linked_worktree_points_at_parent() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let wt = tmp.path().join("wt");
+        run(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+
+        // A real linked worktree has a `.git` FILE.
+        assert!(wt.join(".git").is_file(), "linked worktree gitfile");
+
+        let info = git_canonical_root(&wt).expect("worktree root");
+        assert!(info.is_worktree, "linked worktree detected");
+        assert!(same_path(&info.common_dir, &repo.join(".git")));
+        // The canonical root is the PARENT repo, not the worktree dir.
+        assert!(same_path(&info.canonical_root_path(), &repo));
+    }
+
+    #[test]
+    fn canonical_root_none_for_non_repo() {
+        let tmp = TempDir::new().unwrap();
+        assert!(git_canonical_root(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn divergent_copy_detected_only_for_git_dir_under_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let worktrees = tmp.path().join(".codemux").join("worktrees");
+
+        // A whole-dir COPY: `.git` is a directory, living under the
+        // worktrees tree -> divergent copy (the bug signature).
+        let copy = worktrees.join("passpage").join("main");
+        std::fs::create_dir_all(copy.join(".git")).unwrap();
+        assert!(is_divergent_copy_under(&copy, &worktrees));
+
+        // A genuine linked worktree: `.git` is a FILE -> not a copy.
+        let real_wt = worktrees.join("passpage").join("feature");
+        std::fs::create_dir_all(&real_wt).unwrap();
+        std::fs::write(real_wt.join(".git"), "gitdir: /repo/.git/worktrees/feature\n").unwrap();
+        assert!(!is_divergent_copy_under(&real_wt, &worktrees));
+
+        // A real repo root OUTSIDE the worktrees tree -> not a copy even
+        // though `.git` is a directory.
+        let real_root = tmp.path().join("projects").join("passpage");
+        std::fs::create_dir_all(real_root.join(".git")).unwrap();
+        assert!(!is_divergent_copy_under(&real_root, &worktrees));
+    }
+
+    #[test]
+    fn protected_for_main_checkout_on_default_branch() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        assert!(is_protected_repo_root(&repo, Some("main")));
+    }
+
+    #[test]
+    fn not_protected_for_worktree_or_wrong_branch_or_non_repo() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // A linked worktree is never the protected root.
+        let wt = root.join("wt");
+        run(&repo, &["worktree", "add", "-b", "feature", wt.to_str().unwrap()]);
+        assert!(!is_protected_repo_root(&wt, Some("feature")));
+
+        // The root checked out on a NON-default branch is not protected
+        // (only the default-branch checkout is).
+        run(&repo, &["checkout", "-b", "side"]);
+        assert!(!is_protected_repo_root(&repo, Some("side")));
+
+        // Not a repo at all.
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_protected_repo_root(&plain, Some("main")));
+    }
+
+    #[test]
+    fn resolve_default_branch_falls_back_to_current_for_nonstandard_local_repo() {
+        // A local-only repo whose default branch is neither `main` nor
+        // `master` and which has no remote — exactly the `passpage`-shaped
+        // case where `origin/HEAD` can't be read.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "--initial-branch=trunk"]);
+        run(&repo, &["config", "user.email", "t@example.com"]);
+        run(&repo, &["config", "user.name", "T"]);
+        std::fs::write(repo.join("f"), "x").unwrap();
+        run(&repo, &["add", "."]);
+        run(&repo, &["commit", "-m", "init"]);
+
+        // The strict resolver gives up (no origin/HEAD, no main, no master)…
+        assert_eq!(find_default_branch(&repo), None);
+        // …but the record-stamping resolver falls back to the current branch,
+        // so the daemon still records a usable default for a local-only repo.
+        assert_eq!(resolve_default_branch(&repo).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn reconcile_copy_blocker_flags_dirty_allows_clean() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Clean, no upstream → safe to reconcile (nothing blocks).
+        assert!(reconcile_copy_blocker(&repo).is_none());
+
+        // Uncommitted change → blocked with guidance.
+        std::fs::write(repo.join("README.md"), "changed").unwrap();
+        let blocker = reconcile_copy_blocker(&repo).expect("dirty tree blocks");
+        assert!(blocker.contains("uncommitted"), "got: {blocker}");
+    }
+
+    #[test]
+    fn ensure_origin_head_is_noop_without_origin_remote() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // No `origin` remote — must succeed (not error on "No such remote")
+        // and leave default-branch resolution working via the main fallback.
+        assert!(ensure_origin_head(&repo).is_ok());
+        assert_eq!(find_default_branch(&repo).as_deref(), Some("main"));
+    }
+}
+
+pub fn git_recreate_worktree_for_adopted_repo(
+    repo_path: &Path,
+    branch: &str,
+) -> Result<String, String> {
+    // Prune stale worktree registrations inherited from the source
+    // machine. Permissive: a fresh clone with no worktrees is a no-op,
+    // and any failure here shouldn't block the add (which will surface
+    // its own clear error if the state is genuinely broken).
+    let _ = run_git_permissive(repo_path, &["worktree", "prune"]);
+    git_create_worktree(repo_path, branch, false, None, None)
 }
 
 pub fn git_create_worktree(
@@ -2082,6 +2633,42 @@ C  source.txt -> copy.txt";
 
         let branches_after = git_list_branches(&repo, false).expect("list branches after");
         assert!(!branches_after.contains(&"feature-test".to_string()), "branch should be deleted");
+    }
+
+    #[test]
+    fn test_recreate_worktree_for_adopted_repo_prunes_stale_host_entry() {
+        // Simulate a repo rsynced from a codemux-remote host during
+        // worktree adoption: it carries a worktree admin entry for the
+        // branch, but that entry points at the HOST's path, which does
+        // not exist on this machine. A naive `git worktree add` for the
+        // branch then fails ("already used by worktree"). The recreate
+        // helper must prune the stale entry and add a clean local one.
+        let (_dir, repo) = setup_test_repo();
+        // A branch that "came over with the rsync".
+        run_git(&repo, &["branch", "adopted-feature"]).expect("create branch");
+        // A worktree at a path we then delete → stale, prunable, and it
+        // holds the branch "checked out" until pruned.
+        let ghost = _dir.path().join("ghost-host-worktree");
+        run_git(
+            &repo,
+            &["worktree", "add", &ghost.to_string_lossy(), "adopted-feature"],
+        )
+        .expect("add ghost worktree");
+        std::fs::remove_dir_all(&ghost).expect("delete ghost worktree dir");
+
+        // Recreate: prunes the ghost, adds a clean local worktree.
+        let wt_path = git_recreate_worktree_for_adopted_repo(&repo, "adopted-feature")
+            .expect("recreate worktree for adopted repo");
+        let wt = PathBuf::from(&wt_path);
+        assert!(wt.exists(), "recreated worktree dir should exist");
+        assert!(wt.join(".git").is_file(), "should be a linked worktree (.git file)");
+
+        // It's attached to the right branch.
+        let current = run_git_permissive(&wt, &["branch", "--show-current"]);
+        assert_eq!(current.trim(), "adopted-feature");
+
+        // Cleanup so we don't leave a worktree under the real ~/.codemux.
+        let _ = git_remove_worktree(&wt, Some("adopted-feature"), true);
     }
 
     #[test]

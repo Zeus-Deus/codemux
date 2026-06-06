@@ -1,4 +1,10 @@
 /**
+ * DISABLED — applies theme to an empty cache. The persistent terminal cache
+ * in `terminal-cache.ts` is not wired into the live app (see the banner there),
+ * so `applyThemeToAllTerminals` iterates an empty Map and this is a no-op. The
+ * live theme source of truth is TerminalPane's own per-mount MutationObserver.
+ * Kept wired in App.tsx alongside the cache for a possible future revival.
+ *
  * App-level theme MutationObserver for the terminal cache.
  *
  * Theme changes (light/dark, accent updates) are signalled by class/style

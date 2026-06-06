@@ -194,7 +194,8 @@ pub fn prepare_agent_command(
             (format!("{base_command} $'{escaped}'"), false)
         }
         _ => {
-            // Gemini, OpenCode, custom: inject prompt via PTY after startup
+            // Gemini, Antigravity, Copilot, Cursor Agent, Amp, Grok,
+            // Droid, OpenCode, custom: inject prompt via PTY after startup
             (base_command.to_string(), true)
         }
     }

@@ -280,6 +280,62 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_automation_runs_automation
             ON automation_runs(automation_id, scheduled_for DESC);
+
+        -- Workspaces sync mirror (cross-device workspace registry).
+        --
+        -- Holds the metadata that lets *other devices* of the same
+        -- account discover that a workspace exists and (later) pull
+        -- it back. Runtime state — pane tree, terminal sessions, git
+        -- stats, notification count — lives in the app_state JSON
+        -- blob and is per-device. This table is JUST the synced
+        -- identity + host + project metadata.
+        --
+        -- `workspace_id` is THIS device local id (e.g. workspace-42
+        -- from next_id), or NULL when the row was pulled from
+        -- another device and hasn't been adopted here yet. The
+        -- originating device local id is never re-used cross-device
+        -- — every device assigns its own when adopting.
+        --
+        -- `server_id` is the cross-device identity (the
+        -- `codemux_workspaces.id` BIGSERIAL stringified). NULL until
+        -- this row's first successful push.
+        --
+        -- `host_server_id` is the cross-device host identity
+        -- (`codemux_hosts.id` stringified). NULL means the workspace
+        -- lives on the device that created the row. Maps back to a
+        -- local `hosts.id` via the `hosts.server_id` column.
+        --
+        -- Same soft-delete + dirty model as the `hosts` and
+        -- `automations` tables. `workspaces_sync` is intentionally a
+        -- separate table from `workspace_state` because the latter
+        -- is per-device runtime UI state (tab order, collapse), not
+        -- cross-device identity.
+        CREATE TABLE IF NOT EXISTS workspaces_sync (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL DEFAULT 'local',
+            server_id TEXT,
+            workspace_id TEXT,
+            title TEXT NOT NULL,
+            host_server_id TEXT,
+            project_path TEXT,
+            project_remote TEXT,
+            git_branch TEXT,
+            default_branch TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            deleted_at TEXT,
+            dirty INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(user_id, server_id),
+            UNIQUE(user_id, workspace_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_workspaces_sync_user
+            ON workspaces_sync(user_id, deleted_at);
+        CREATE INDEX IF NOT EXISTS idx_workspaces_sync_dirty
+            ON workspaces_sync(user_id, dirty)
+            WHERE dirty = 1;
+        CREATE INDEX IF NOT EXISTS idx_workspaces_sync_host
+            ON workspaces_sync(user_id, host_server_id);
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -293,6 +349,37 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
         "ALTER TABLE automation_runs ADD COLUMN branch TEXT",
         "ALTER TABLE automation_runs ADD COLUMN pr_url TEXT",
+        // Phase-4 divergence detection: workspace git HEAD sha so
+        // the overview can flag when the same project+branch
+        // exists on multiple devices with different HEADs.
+        "ALTER TABLE workspaces_sync ADD COLUMN git_head_sha TEXT",
+        // Auto-publish: stable UUID assigned by the remote daemon
+        // (`remote::workspace::Workspace.id`) when the desktop
+        // discovers a workspace by polling a host. Lets the
+        // host-inventory reconcile pass dedupe across repeated polls
+        // — i.e. "did I already insert a sync row for this host's
+        // workspace UUID?" Always null for rows that originated on
+        // this device or arrived purely via cloud pull.
+        "ALTER TABLE workspaces_sync ADD COLUMN origin_uid TEXT",
+        // First-class project identity (see `project_identity.rs`).
+        // Deterministic `UUIDv5(canonical remote ?? project_root)` so a
+        // project's main checkout + worktrees group together and the
+        // same repo converges across hosts/devices. `workspace_kind` is
+        // 'main' | 'worktree'. Set locally by the host-inventory poller
+        // and `set_workspace_project_root`, and — unlike `origin_uid` —
+        // server-authoritative on pull: the cloud `codemux_workspaces`
+        // schema now carries both, so `upsert_workspace_sync_from_server`
+        // persists them from the server row.
+        "ALTER TABLE workspaces_sync ADD COLUMN project_uid TEXT",
+        "ALTER TABLE workspaces_sync ADD COLUMN workspace_kind TEXT",
+        "ALTER TABLE workspaces_sync ADD COLUMN origin_path TEXT",
+        // The repo's default branch as reported by the daemon poller
+        // (`origin/HEAD` → main/master → current). Local-only column: it is
+        // NOT sent to the cloud API (`ServerWorkspace`/`WorkspaceUpsertBody`
+        // omit it), so it survives cloud pulls untouched and needs no
+        // server-schema change. Lets a pull land a repo ROOT on the right
+        // branch and protect it even when `git_branch` is null.
+        "ALTER TABLE workspaces_sync ADD COLUMN default_branch TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -800,6 +887,743 @@ fn row_to_host(row: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         updated_at: row.get(5)?,
         deleted_at: row.get(6)?,
         dirty: dirty_int != 0,
+    })
+}
+
+// ─── Workspaces sync mirror (cross-device workspace registry) ────
+//
+// This is the local-side mirror of the server-side `codemux_workspaces`
+// table. It is *separate* from `workspace_state` because the two
+// concerns are different: `workspace_state` holds per-device runtime
+// UI state (tab order, collapse, last_active_at); `workspaces_sync`
+// holds the synced identity (title, host, project, branch) that
+// crosses the account-wide network boundary.
+//
+// `workspace_id` is the local id from `next_id` when this row was
+// either created locally OR adopted from a sync-pulled row. NULL
+// means the row was pulled but not yet adopted (the user hasn't
+// clicked "Pull to this device" on it).
+//
+// Lookup paths the sync layer + the UI need:
+// - by local workspace_id (after a local mutation, find the synced row to mark dirty)
+// - by server_id (after a sync pull, upsert the matching local row)
+// - dirty list (push only rows that changed since last sync)
+// - all-non-deleted (overview UI render)
+//
+// The shape mirrors `hosts` 1:1 so the sync client can mostly copy
+// the existing pattern.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceSyncRecord {
+    pub id: i64,
+    pub server_id: Option<String>,
+    /// Local workspace_id (the `WorkspaceSnapshot.workspace_id` value).
+    /// None when the row was pulled from a sibling device and we have
+    /// not adopted it locally yet.
+    pub workspace_id: Option<String>,
+    pub title: String,
+    /// Server-side host id (matches `hosts.server_id`). None = local
+    /// to the device that authored the row.
+    pub host_server_id: Option<String>,
+    pub project_path: Option<String>,
+    pub project_remote: Option<String>,
+    pub git_branch: Option<String>,
+    /// Workspace git HEAD sha at the last reconcile. Phase-4
+    /// divergence detection compares this across devices: when the
+    /// same (project_remote, git_branch) pair has different head
+    /// shas on multiple devices, the overview surfaces a warning
+    /// chip. None for new rows that haven't been reconciled yet,
+    /// or for rows whose worktree had no commits.
+    pub git_head_sha: Option<String>,
+    /// Stable UUID assigned by the remote daemon
+    /// (`remote::workspace::Workspace.id`) when the desktop's
+    /// host-inventory poller discovered this row. Lets the poller's
+    /// reconcile step recognise the same remote workspace across
+    /// repeated polls — without it, every poll would create a fresh
+    /// sync row. Always `None` on rows that originated on this device
+    /// or arrived purely via cloud pull (the cloud schema does not
+    /// carry `origin_uid` today).
+    pub origin_uid: Option<String>,
+    /// Deterministic project identity (`UUIDv5`), see
+    /// `crate::project_identity`. Local-only column today: set by the
+    /// host-inventory poller from the daemon registry; null for rows
+    /// that arrived purely via cloud pull or originated locally before
+    /// Phase 2 stamps `WorkspaceSnapshot`.
+    pub project_uid: Option<String>,
+    /// `"main"` | `"worktree"`. Local-only column, same lifecycle as
+    /// `project_uid`.
+    pub workspace_kind: Option<String>,
+    /// The workspace's ACTUAL absolute path on the originating host, as
+    /// reported by the remote daemon (`remote::workspace::Workspace.path`).
+    /// Set only by the host-inventory poller for remote-discovered rows;
+    /// null otherwise. This is the authoritative rsync source for pulling
+    /// an agent-created workspace back — unlike `project_path` (which is
+    /// the project root, not the worktree dir) and unlike the reconstructed
+    /// `~/.codemux/worktrees/<project>/<branch>` convention (which only
+    /// matches workspaces the desktop *pushed*, not ones the agent created
+    /// at an arbitrary path on the host). Local-only column, same
+    /// lifecycle as `origin_uid`; survives cloud pulls untouched.
+    pub origin_path: Option<String>,
+    /// The repo's default branch from the daemon poller (`origin/HEAD` →
+    /// main/master → current). Local-only column, same lifecycle as
+    /// `origin_path` — set by the host-inventory poller, NOT sent to the
+    /// cloud, survives cloud pulls untouched. Lets a pull land a repo ROOT
+    /// on the right branch and protect it even when `git_branch` is null.
+    pub default_branch: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub deleted_at: Option<String>,
+    pub dirty: bool,
+}
+
+impl DatabaseStore {
+    /// Insert a freshly-created local workspace into the sync mirror.
+    /// Marked dirty so the next push uploads it. Returns the row so
+    /// callers can stash the assigned local sync `id` if useful.
+    pub fn insert_workspace_sync(
+        &self,
+        workspace_id: &str,
+        title: &str,
+        host_server_id: Option<&str>,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+    ) -> Result<WorkspaceSyncRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO workspaces_sync
+                (user_id, workspace_id, title, host_server_id,
+                 project_path, project_remote, git_branch, git_head_sha,
+                 project_uid, workspace_kind, dirty)
+             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+            params![
+                workspace_id,
+                title,
+                host_server_id,
+                project_path,
+                project_remote,
+                git_branch,
+                git_head_sha,
+                project_uid,
+                workspace_kind,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert workspace sync row: {e}"))?;
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync WHERE id = ?1",
+            params![id],
+            row_to_workspace_sync,
+        )
+        .map_err(|e| format!("Failed to re-read inserted workspace sync row: {e}"))
+    }
+
+    /// Update a workspace sync row keyed by the local `workspace_id`.
+    /// Bumps `updated_at` and sets `dirty = 1`. No-op if the row is
+    /// already soft-deleted (matching the hosts/automations pattern).
+    pub fn update_workspace_sync_by_workspace_id(
+        &self,
+        workspace_id: &str,
+        title: &str,
+        host_server_id: Option<&str>,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET title = ?1, host_server_id = ?2, project_path = ?3,
+                 project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
+                 project_uid = ?7, workspace_kind = ?8,
+                 updated_at = datetime('now'), dirty = 1
+             WHERE user_id = 'local' AND workspace_id = ?9
+               AND deleted_at IS NULL",
+            params![
+                title,
+                host_server_id,
+                project_path,
+                project_remote,
+                git_branch,
+                git_head_sha,
+                project_uid,
+                workspace_kind,
+                workspace_id,
+            ],
+        )
+        .map_err(|e| format!("Failed to update workspace sync row: {e}"))?;
+        Ok(())
+    }
+
+    /// Soft-delete a workspace sync row by local workspace_id. Sets
+    /// `deleted_at = now`, `updated_at = now`, `dirty = 1`. The next
+    /// push DELETEs the server row; `purge_acknowledged_workspace_sync_deletes`
+    /// then hard-deletes the local tombstone.
+    pub fn soft_delete_workspace_sync_by_workspace_id(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET deleted_at = datetime('now'),
+                 updated_at = datetime('now'), dirty = 1
+             WHERE user_id = 'local' AND workspace_id = ?1
+               AND deleted_at IS NULL",
+            params![workspace_id],
+        )
+        .map_err(|e| format!("Failed to soft-delete workspace sync row: {e}"))?;
+        Ok(())
+    }
+
+    /// List every non-deleted workspace sync row (live + pulled-but-
+    /// unadopted). UI uses this to render the overview, including
+    /// workspaces that only exist on other devices.
+    pub fn list_workspaces_sync(&self) -> Vec<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync
+             WHERE user_id = 'local' AND deleted_at IS NULL
+             ORDER BY updated_at DESC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], row_to_workspace_sync)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// List EVERY row including tombstones — used by the pull sweep
+    /// to detect rows whose server_id is no longer in the API response.
+    pub fn list_workspaces_sync_for_sync(&self) -> Vec<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync
+             WHERE user_id = 'local'",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], row_to_workspace_sync)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// List only `dirty = 1` rows — the push loop walks this.
+    pub fn list_dirty_workspaces_sync(&self) -> Vec<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync
+             WHERE user_id = 'local' AND dirty = 1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map([], row_to_workspace_sync)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Clear dirty after a successful push. Optionally stamp the
+    /// server_id (first push only). Mirrors `mark_host_synced`.
+    pub fn mark_workspace_sync_synced(
+        &self,
+        id: i64,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        if let Some(sid) = server_id {
+            conn.execute(
+                "UPDATE workspaces_sync SET dirty = 0, server_id = ?1 WHERE id = ?2",
+                params![sid, id],
+            )
+        } else {
+            conn.execute(
+                "UPDATE workspaces_sync SET dirty = 0 WHERE id = ?1",
+                params![id],
+            )
+        }
+        .map_err(|e| format!("Failed to mark workspace sync row synced: {e}"))?;
+        Ok(())
+    }
+
+    /// Hard-delete tombstones the server has acknowledged. Called at
+    /// the end of every push pass.
+    pub fn purge_acknowledged_workspace_sync_deletes(&self) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM workspaces_sync
+             WHERE deleted_at IS NOT NULL AND dirty = 0",
+            [],
+        )
+        .map_err(|e| format!("Failed to purge workspace sync tombstones: {e}"))?;
+        Ok(())
+    }
+
+    /// Idempotent upsert from a server pull. Always sets `dirty = 0`.
+    /// Does NOT clobber the local `workspace_id` if one is already
+    /// stamped — adoption is sticky.
+    pub fn upsert_workspace_sync_from_server(
+        &self,
+        server_id: &str,
+        title: &str,
+        host_server_id: Option<&str>,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        git_head_sha: Option<&str>,
+        created_at: &str,
+        updated_at: &str,
+        deleted_at: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                // `project_uid`/`workspace_kind` are server-authoritative
+                // ONLY when the server actually has a value. A null from
+                // the cloud must never clobber a known-good local identity
+                // that the host-inventory poller derived (the cloud schema
+                // may carry null for older rows). COALESCE(server, local)
+                // keeps the local value when the server's is null.
+                "UPDATE workspaces_sync
+                 SET title = ?1, host_server_id = ?2, project_path = ?3,
+                     project_remote = ?4, git_branch = ?5, git_head_sha = ?6,
+                     created_at = ?7, updated_at = ?8,
+                     deleted_at = ?9,
+                     project_uid = COALESCE(?11, project_uid),
+                     workspace_kind = COALESCE(?12, workspace_kind),
+                     dirty = 0
+                 WHERE user_id = 'local' AND server_id = ?10",
+                params![
+                    title,
+                    host_server_id,
+                    project_path,
+                    project_remote,
+                    git_branch,
+                    git_head_sha,
+                    created_at,
+                    updated_at,
+                    deleted_at,
+                    server_id,
+                    project_uid,
+                    workspace_kind,
+                ],
+            )
+            .map_err(|e| format!("Failed to update workspace sync from server: {e}"))?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO workspaces_sync
+                    (user_id, server_id, workspace_id, title, host_server_id,
+                     project_path, project_remote, git_branch, git_head_sha,
+                     created_at, updated_at, deleted_at,
+                     project_uid, workspace_kind, dirty)
+                 VALUES ('local', ?1, NULL, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                         ?11, ?12, 0)",
+                params![
+                    server_id,
+                    title,
+                    host_server_id,
+                    project_path,
+                    project_remote,
+                    git_branch,
+                    git_head_sha,
+                    created_at,
+                    updated_at,
+                    deleted_at,
+                    project_uid,
+                    workspace_kind,
+                ],
+            )
+            .map_err(|e| format!("Failed to insert workspace sync from server: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Stamp a local workspace_id onto a previously-pulled row (used
+    /// when adopting a synced workspace into this device's app_state).
+    pub fn link_workspace_sync_to_local(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET workspace_id = ?1, updated_at = datetime('now')
+             WHERE user_id = 'local' AND server_id = ?2",
+            params![workspace_id, server_id],
+        )
+        .map_err(|e| format!("Failed to link workspace sync row to local: {e}"))?;
+        Ok(())
+    }
+
+    /// Revert a sync row back to a sibling/remote-only row by clearing
+    /// its local `workspace_id` link (set NULL). Used to ROLL BACK an
+    /// optimistic adoption whose pull failed: the row must become a
+    /// re-pullable sibling again rather than stay linked to a shell
+    /// that was torn down — otherwise `reconcile_from_snapshot` would
+    /// see a linked row with no live workspace and soft-delete
+    /// (tombstone) it, making the workspace vanish from the overview
+    /// instead of staying available to retry. We deliberately do NOT
+    /// mark the row dirty: clearing a local-only link is not a change
+    /// the cloud needs to hear about (the row's server_id/identity is
+    /// unchanged), and the next inventory poll keeps it fresh.
+    pub fn unlink_workspace_sync_from_local(
+        &self,
+        server_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET workspace_id = NULL, updated_at = datetime('now')
+             WHERE user_id = 'local' AND server_id = ?1",
+            params![server_id],
+        )
+        .map_err(|e| format!("Failed to unlink workspace sync row: {e}"))?;
+        Ok(())
+    }
+
+    // ── Host-inventory auto-publish helpers ─────────────────────────
+    //
+    // The desktop's host-inventory poller (see `hosts_inventory.rs`)
+    // periodically SSHes every configured host, fetches the remote
+    // daemon's workspace list, and reconciles it into the local
+    // `workspaces_sync` table as sibling-only rows (no local
+    // `workspace_id`, dirty=1) so the next `push()` tick uploads them
+    // to the cloud and other devices see them in the overview.
+    //
+    // Identity contract for these rows:
+    //
+    // - `host_server_id` = the configured host's `server_id` (the
+    //   stable cross-device host identity). Required.
+    // - `origin_uid`     = `remote::workspace::Workspace.id` (a UUID
+    //   assigned by the host's daemon at workspace-create time).
+    //   Required. Lets repeated polls update-in-place instead of
+    //   creating duplicate rows.
+    // - `workspace_id`   = NULL until the user adopts the row via
+    //   "Pull to this device".
+    //
+    // The cloud schema does not carry `origin_uid` today; it stays
+    // local-only. Cross-device dedupe (two laptops both polling the
+    // same host) is best-effort by `find_remote_discovered_by_origin`
+    // alone — if Device B has not yet pulled the row Device A
+    // published, B may briefly create a parallel row that converges
+    // on the next pull cycle. Acceptable for v1; tracked in the docs.
+
+    /// Find a remote-discovered sync row by `(host_server_id,
+    /// origin_uid)`. Used by the inventory reconcile to decide
+    /// insert-vs-update-in-place per poll tick.
+    ///
+    /// Returns `None` if no row with that pair exists, including the
+    /// case where a row exists with the same `origin_uid` but a
+    /// different `host_server_id` (the same UUID on two different
+    /// hosts must be treated as two distinct workspaces — UUIDs are
+    /// only unique within one host's registry, never assumed unique
+    /// across hosts).
+    pub fn find_workspace_sync_by_host_and_origin_uid(
+        &self,
+        host_server_id: &str,
+        origin_uid: &str,
+    ) -> Option<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, server_id, workspace_id, title, host_server_id,
+                        project_path, project_remote, git_branch, git_head_sha,
+                        created_at, updated_at, deleted_at, dirty, origin_uid,
+                        project_uid, workspace_kind, origin_path, default_branch
+                 FROM workspaces_sync
+                 WHERE user_id = 'local'
+                   AND host_server_id = ?1
+                   AND origin_uid = ?2
+                   AND deleted_at IS NULL
+                 LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row(params![host_server_id, origin_uid], row_to_workspace_sync)
+            .ok()
+    }
+
+    /// Insert a sibling-only sync row discovered by polling a host's
+    /// inventory. `workspace_id` is intentionally NULL — the row is
+    /// only adopted as a local workspace when the user clicks "Pull
+    /// to this device". `dirty=1` so the next `push()` tick uploads
+    /// it to the cloud and other devices of the same account see it.
+    ///
+    /// `host_server_id` and `origin_uid` together identify the row
+    /// uniquely on this device (see `find_workspace_sync_by_host_and_origin_uid`).
+    pub fn insert_remote_discovered_workspace_sync(
+        &self,
+        host_server_id: &str,
+        origin_uid: &str,
+        title: &str,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+        origin_path: Option<&str>,
+        default_branch: Option<&str>,
+    ) -> Result<WorkspaceSyncRecord, String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO workspaces_sync
+                (user_id, workspace_id, title, host_server_id,
+                 project_path, project_remote, git_branch, origin_uid,
+                 project_uid, workspace_kind, origin_path, default_branch, dirty)
+             VALUES ('local', NULL, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1)",
+            params![
+                title,
+                host_server_id,
+                project_path,
+                project_remote,
+                git_branch,
+                origin_uid,
+                project_uid,
+                workspace_kind,
+                origin_path,
+                default_branch,
+            ],
+        )
+        .map_err(|e| format!("Failed to insert remote-discovered workspace sync row: {e}"))?;
+        let id = conn.last_insert_rowid();
+        conn.query_row(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync WHERE id = ?1",
+            params![id],
+            row_to_workspace_sync,
+        )
+        .map_err(|e| format!("Failed to re-read inserted remote-discovered row: {e}"))
+    }
+
+    /// Update mutable fields of a remote-discovered row (matched by
+    /// the row's primary `id`). Bumps `updated_at` and marks
+    /// `dirty=1` so the next push propagates the change. No-op on
+    /// soft-deleted rows, matching `update_workspace_sync_by_workspace_id`.
+    ///
+    /// Note we deliberately do NOT touch `host_server_id` or
+    /// `origin_uid` — those define the row's identity and must be
+    /// stable across reconciles.
+    pub fn update_remote_discovered_workspace_sync(
+        &self,
+        id: i64,
+        title: &str,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+        origin_path: Option<&str>,
+        default_branch: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET title = ?1, project_path = ?2,
+                 project_remote = ?3, git_branch = ?4,
+                 project_uid = ?5, workspace_kind = ?6,
+                 origin_path = ?8, default_branch = ?9,
+                 updated_at = datetime('now'), dirty = 1
+             WHERE id = ?7 AND deleted_at IS NULL",
+            params![
+                title,
+                project_path,
+                project_remote,
+                git_branch,
+                project_uid,
+                workspace_kind,
+                id,
+                origin_path,
+                default_branch,
+            ],
+        )
+        .map_err(|e| format!("Failed to update remote-discovered row: {e}"))?;
+        Ok(())
+    }
+
+    /// Find a remote-discovered row for `(host_server_id, origin_uid)`
+    /// that is SOFT-DELETED (a tombstone). Used only by the inventory
+    /// reconcile's undelete-on-reappear path: when a host workspace that
+    /// was previously adopted-then-closed (its row tombstoned by the
+    /// close-path reconcile) shows up again in a fresh poll, we resurrect
+    /// the SAME row instead of inserting a duplicate — so the cloud
+    /// `server_id` (cross-device identity) survives the close/reopen
+    /// round-trip and other devices don't see the workspace vanish then
+    /// reappear as a brand-new row. If multiple tombstones exist, the
+    /// most recent by id wins.
+    pub fn find_remote_discovered_tombstone(
+        &self,
+        host_server_id: &str,
+        origin_uid: &str,
+    ) -> Option<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, server_id, workspace_id, title, host_server_id,
+                        project_path, project_remote, git_branch, git_head_sha,
+                        created_at, updated_at, deleted_at, dirty, origin_uid,
+                        project_uid, workspace_kind, origin_path, default_branch
+                 FROM workspaces_sync
+                 WHERE user_id = 'local'
+                   AND host_server_id = ?1
+                   AND origin_uid = ?2
+                   AND deleted_at IS NOT NULL
+                 ORDER BY id DESC
+                 LIMIT 1",
+            )
+            .ok()?;
+        stmt.query_row(params![host_server_id, origin_uid], row_to_workspace_sync)
+            .ok()
+    }
+
+    /// Resurrect a soft-deleted remote-discovered row (matched by primary
+    /// `id`): clear `deleted_at`, ALSO clear any stale `workspace_id`
+    /// link, refresh the mutable fields from the latest inventory, and
+    /// mark `dirty=1`.
+    ///
+    /// Clearing `workspace_id` is essential: the tombstone may have been
+    /// created by closing an *adopted* workspace, so it still points at a
+    /// local id that no longer exists. Reviving that link would recreate
+    /// the exact "linked row with no live workspace" orphan that produces
+    /// the phantom "you already have this branch open" pull-conflict. A
+    /// resurrected row must be a clean, re-pullable sibling
+    /// (`workspace_id IS NULL`). Marking dirty makes the next push re-assert
+    /// the row to the cloud as a PATCH on the surviving `server_id` rather
+    /// than a churny DELETE-then-POST.
+    pub fn undelete_remote_discovered_workspace_sync(
+        &self,
+        id: i64,
+        title: &str,
+        project_path: Option<&str>,
+        project_remote: Option<&str>,
+        git_branch: Option<&str>,
+        project_uid: Option<&str>,
+        workspace_kind: Option<&str>,
+        origin_path: Option<&str>,
+        default_branch: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET deleted_at = NULL, workspace_id = NULL,
+                 title = ?1, project_path = ?2, project_remote = ?3,
+                 git_branch = ?4, project_uid = ?5, workspace_kind = ?6,
+                 origin_path = ?8, default_branch = ?9,
+                 updated_at = datetime('now'), dirty = 1
+             WHERE id = ?7",
+            params![
+                title,
+                project_path,
+                project_remote,
+                git_branch,
+                project_uid,
+                workspace_kind,
+                id,
+                origin_path,
+                default_branch,
+            ],
+        )
+        .map_err(|e| format!("Failed to undelete remote-discovered row: {e}"))?;
+        Ok(())
+    }
+
+    /// List every non-deleted remote-discovered row for a host. Used
+    /// by the inventory reconcile pass to compute the
+    /// "disappeared from the host" set: any row in this list whose
+    /// `origin_uid` is no longer in the host's current inventory must
+    /// be soft-deleted so the cloud row goes away on the next push.
+    pub fn list_remote_discovered_for_host(
+        &self,
+        host_server_id: &str,
+    ) -> Vec<WorkspaceSyncRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, server_id, workspace_id, title, host_server_id,
+                    project_path, project_remote, git_branch, git_head_sha,
+                    created_at, updated_at, deleted_at, dirty, origin_uid, project_uid, workspace_kind, origin_path, default_branch
+             FROM workspaces_sync
+             WHERE user_id = 'local'
+               AND host_server_id = ?1
+               AND origin_uid IS NOT NULL
+               AND deleted_at IS NULL",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![host_server_id], row_to_workspace_sync)
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Soft-delete a remote-discovered row by primary `id`. Sets
+    /// `deleted_at` + `dirty=1` so the next push DELETEs the cloud
+    /// row. Unlike `soft_delete_workspace_sync_by_workspace_id`,
+    /// this targets the row's primary key directly because
+    /// remote-discovered rows have `workspace_id IS NULL`.
+    pub fn soft_delete_remote_discovered_workspace_sync_by_id(
+        &self,
+        id: i64,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE workspaces_sync
+             SET deleted_at = datetime('now'),
+                 updated_at = datetime('now'),
+                 dirty = 1
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to soft-delete remote-discovered row: {e}"))?;
+        Ok(())
+    }
+}
+
+fn row_to_workspace_sync(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WorkspaceSyncRecord> {
+    let dirty_int: i64 = row.get(12)?;
+    Ok(WorkspaceSyncRecord {
+        id: row.get(0)?,
+        server_id: row.get(1)?,
+        workspace_id: row.get(2)?,
+        title: row.get(3)?,
+        host_server_id: row.get(4)?,
+        project_path: row.get(5)?,
+        project_remote: row.get(6)?,
+        git_branch: row.get(7)?,
+        git_head_sha: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        deleted_at: row.get(11)?,
+        dirty: dirty_int != 0,
+        origin_uid: row.get(13)?,
+        project_uid: row.get(14)?,
+        workspace_kind: row.get(15)?,
+        origin_path: row.get(16)?,
+        default_branch: row.get(17)?,
     })
 }
 

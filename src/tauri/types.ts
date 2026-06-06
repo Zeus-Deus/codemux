@@ -767,6 +767,24 @@ export interface WorkspaceSnapshot {
   latest_agent_state: string | null;
   worktree_path: string | null;
   project_root: string | null;
+  /** Deterministic project identity (UUIDv5 of canonical remote or
+   *  project root); stamped at create. Optional — older snapshots
+   *  persisted without it. */
+  project_uid?: string | null;
+  /** "main" (repo root checkout) | "worktree". Optional for the same
+   *  reason. */
+  workspace_kind?: string | null;
+  /** True when this is the repo's protected default-branch root
+   *  checkout — the overview must not let it be deleted like a
+   *  disposable worktree. Divergence-safe: a full copy living under
+   *  ~/.codemux/worktrees/ is NOT protected. Defaults to false on
+   *  older snapshots. */
+  protected?: boolean;
+  /** True when this checkout is a legacy divergent full copy of a repo
+   *  (its own object store) sitting in the worktrees tree — not linked
+   *  to the real repo's history. The overview warns so the user can
+   *  re-pull cleanly. Defaults to false. */
+  divergent_copy?: boolean;
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;
@@ -783,6 +801,15 @@ export interface WorkspaceSnapshot {
    *  the TS type because older snapshots persisted without the field
    *  and the Rust side falls back to `None` via serde default. */
   host_id?: number | null;
+  /** The workspace's real working directory ON ITS HOST. Set for
+   *  "open on host" / attach-in-place workspaces (terminals spawn here
+   *  on the remote). `null`/undefined for local + pushed workspaces. */
+  remote_cwd?: string | null;
+  /** True when this workspace is operated in place on its host with no
+   *  local copy of the files (`cwd` is a host path). The UI shows a
+   *  host badge and offers only "Close (detach)" — never delete/push.
+   *  Defaults to false on older snapshots. */
+  attach_only?: boolean;
 }
 
 export interface PersistenceSchema {
@@ -820,6 +847,9 @@ export interface PortInfoSnapshot {
   process_name: string;
   workspace_id: string | null;
   label: string | null;
+  /** Discovery source: `null` for the OS scan, `"docker"` for a published
+   *  container port. Drives the dedicated "Docker" group in the ports UI. */
+  source: string | null;
 }
 
 export interface AppStateSnapshot {

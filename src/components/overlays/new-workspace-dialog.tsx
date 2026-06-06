@@ -38,6 +38,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
+import { PrPickerPanel } from "@/components/github/pr-picker";
 import { useDefaultBranch } from "@/components/layout/default-branch-cache";
 import {
   listBranches,
@@ -177,6 +178,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [attachments, setAttachments] = useState<string[]>([]);
   const [linkedIssue, setLinkedIssue] = useState<GitHubIssue | null>(null);
   const [issuePickerOpen, setIssuePickerOpen] = useState(false);
+  const [prPickerOpen, setPrPickerOpen] = useState(false);
   const [branchAutoFilled, setBranchAutoFilled] = useState(false);
   const [branchMode, setBranchMode] = useState<"create_new" | "open_existing">("create_new");
   const [openExistingBranch, setOpenExistingBranch] = useState<string | null>(null);
@@ -198,11 +200,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
   const [prBranches, setPrBranches] = useState<Set<string>>(new Set());
-  const [openPrs, setOpenPrs] = useState<PullRequestInfo[]>([]);
   const [ghAvailable, setGhAvailable] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const issuePickerRef = useRef<HTMLDivElement>(null);
+  const prPickerRef = useRef<HTMLDivElement>(null);
 
   // Reset state when dialog opens
   const prevOpenRef = useRef(false);
@@ -219,6 +221,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setAttachments([]);
     setLinkedIssue(null);
     setIssuePickerOpen(false);
+    setPrPickerOpen(false);
     setBranchAutoFilled(false);
     setBranchMode("create_new");
     setOpenExistingBranch(null);
@@ -307,7 +310,6 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           listPullRequests(projectDir, "open")
             .then((prs) => {
               if (cancelled) return;
-              setOpenPrs(prs);
               const heads = new Set<string>();
               for (const pr of prs) {
                 if (pr.head_branch) heads.add(pr.head_branch);
@@ -365,6 +367,26 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     }
     return map;
   }, [appState, projectDir]);
+
+  // When the branch we're about to create already belongs to a workspace,
+  // surface it up-front instead of silently deduping at submit. Linking an
+  // issue auto-fills a deterministic branch name, so this is how the user
+  // learns "you already have a workspace for issue #N" before hitting send.
+  // Scoped to create_new — the open_existing flow is an explicit "open it"
+  // choice already.
+  const existingWorkspaceForBranch = useMemo(() => {
+    if (branchMode !== "create_new") return undefined;
+    const branch = branchName.trim();
+    return branch ? branchWorkspaceMap.get(branch) : undefined;
+  }, [branchMode, branchName, branchWorkspaceMap]);
+
+  const handleOpenExistingWorkspace = useCallback(
+    async (wsId: string) => {
+      onOpenChange(false);
+      await activateWorkspace(wsId);
+    },
+    [onOpenChange],
+  );
 
   // Worktree paths already owned by a Codemux workspace. Used to filter
   // `git worktree list` so "Open ↵ <branch>" doesn't try to re-import a
@@ -611,6 +633,16 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     [branchName, branchAutoFilled, branchMode],
   );
 
+  const handlePrSelect = useCallback((pr: PullRequestInfo) => {
+    // Linking a PR fills the branch from its head ref so the workspace
+    // tracks the PR's branch. Mark it as an explicit (non-auto) choice
+    // so a later issue link won't clobber it.
+    if (pr.head_branch) {
+      setBranchName(pr.head_branch);
+      setBranchAutoFilled(false);
+    }
+  }, []);
+
   const handleOpenExisting = useCallback((branch: string) => {
     setBranchMode("open_existing");
     setOpenExistingBranch(branch);
@@ -696,6 +728,11 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       if (branchMode === "open_existing" && openExistingBranch) {
         const existingWsId = branchWorkspaceMap.get(openExistingBranch);
         if (existingWsId) {
+          toast.info(
+            linkedIssue
+              ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+              : `"${openExistingBranch}" already has a workspace — switched to it.`,
+          );
           await activateWorkspace(existingWsId);
           removePendingWorkspace(tempId);
           return;
@@ -791,9 +828,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         }
       }
 
-      // Check if workspace already exists for this branch
+      // Check if workspace already exists for this branch. Linking an issue
+      // auto-fills a deterministic `feature/<n>-<slug>` branch name, so
+      // re-linking an issue that already has a workspace lands here. Switch
+      // to it AND tell the user: a silent return reads as "nothing happened"
+      // and quietly drops the message they just typed.
       const existingWsId = branchWorkspaceMap.get(resolvedBranch);
       if (existingWsId) {
+        toast.info(
+          linkedIssue
+            ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
+            : `"${resolvedBranch}" already has a workspace — switched to it.`,
+        );
         await activateWorkspace(existingWsId);
         removePendingWorkspace(tempId);
         return;
@@ -932,6 +978,18 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return () => document.removeEventListener("mousedown", handleMouseDown);
   }, [issuePickerOpen]);
 
+  // Close PR picker on click outside it (within the dialog)
+  useEffect(() => {
+    if (!prPickerOpen) return;
+    const handleMouseDown = (e: MouseEvent) => {
+      if (prPickerRef.current && !prPickerRef.current.contains(e.target as Node)) {
+        setPrPickerOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleMouseDown);
+    return () => document.removeEventListener("mousedown", handleMouseDown);
+  }, [prPickerOpen]);
+
   // Handle Ctrl+Enter
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
@@ -1041,6 +1099,28 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               </div>
             )}
 
+            {/* Already-exists notice: the linked issue (or typed branch)
+                already has a workspace. Offer to open it instead of the
+                silent submit-time dedup that drops the typed message. */}
+            {existingWorkspaceForBranch && (
+              <div className="mx-3 mb-2 flex items-center justify-between gap-2 rounded-md border border-border bg-muted/40 px-3 py-1.5 text-[11px] text-muted-foreground">
+                <span className="min-w-0 truncate">
+                  {linkedIssue
+                    ? `Issue #${linkedIssue.number} already has a workspace.`
+                    : `"${branchName.trim()}" already has a workspace.`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleOpenExistingWorkspace(existingWorkspaceForBranch)
+                  }
+                  className="shrink-0 rounded-md border border-border bg-background px-2 py-0.5 font-medium text-foreground transition-colors hover:bg-muted"
+                >
+                  Open it
+                </button>
+              </div>
+            )}
+
             {/* Footer inside textarea border */}
             <div className="flex items-center justify-between px-3 pb-3 pt-0">
               <div className="flex items-center gap-2 min-w-0">
@@ -1141,53 +1221,22 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
                 {/* Link pull request */}
                 {ghAvailable && (
-                  <DropdownMenu>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <DropdownMenuTrigger asChild>
-                          <button
-                            type="button"
-                            aria-label="Link pull request"
-                            className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
-                          >
-                            <GitPullRequest className="h-4 w-4" />
-                          </button>
-                        </DropdownMenuTrigger>
-                      </TooltipTrigger>
-                      <TooltipContent side="top">Link pull request</TooltipContent>
-                    </Tooltip>
-                    <DropdownMenuContent align="end" className="w-[260px] max-h-[240px] overflow-y-auto">
-                      {openPrs.length === 0 ? (
-                        <DropdownMenuItem disabled className="text-xs text-muted-foreground">
-                          No open pull requests
-                        </DropdownMenuItem>
-                      ) : (
-                        openPrs.map((pr) => (
-                          <DropdownMenuItem
-                            key={pr.number}
-                            className="text-xs gap-2"
-                            disabled={!pr.head_branch}
-                            onClick={() => {
-                              if (pr.head_branch) setBranchName(pr.head_branch);
-                            }}
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate">{pr.title}</div>
-                              <div className="text-[10px] text-muted-foreground flex items-center gap-1">
-                                <span>#{pr.number}</span>
-                                {pr.head_branch && (
-                                  <>
-                                    <span className="opacity-40">-</span>
-                                    <span className="truncate font-mono">{pr.head_branch}</span>
-                                  </>
-                                )}
-                              </div>
-                            </div>
-                          </DropdownMenuItem>
-                        ))
-                      )}
-                    </DropdownMenuContent>
-                  </DropdownMenu>
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <button
+                        type="button"
+                        aria-label="Link pull request"
+                        className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
+                        onClick={() => {
+                          setIssuePickerOpen(false);
+                          setPrPickerOpen(true);
+                        }}
+                      >
+                        <GitPullRequest className="h-4 w-4" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top">Link pull request</TooltipContent>
+                  </Tooltip>
                 )}
 
                 {/* Link issue */}
@@ -1198,7 +1247,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                         type="button"
                         aria-label="Link issue"
                         className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
-                        onClick={() => setIssuePickerOpen(true)}
+                        onClick={() => {
+                          setPrPickerOpen(false);
+                          setIssuePickerOpen(true);
+                        }}
                       >
                         <CircleDot className="h-4 w-4" />
                       </button>
@@ -1238,6 +1290,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 open={issuePickerOpen}
                 onSelect={handleIssueSelect}
                 onClose={() => setIssuePickerOpen(false)}
+              />
+            </div>
+          )}
+
+          {/* PR picker — same floating treatment as the issue picker */}
+          {prPickerOpen && projectDir && (
+            <div
+              ref={prPickerRef}
+              className="absolute right-0 top-full mt-1 z-50 w-[320px] rounded-lg border border-border bg-popover shadow-lg overflow-hidden animate-in fade-in-0 zoom-in-95 duration-150"
+            >
+              <PrPickerPanel
+                projectPath={projectDir}
+                open={prPickerOpen}
+                onSelect={handlePrSelect}
+                onClose={() => setPrPickerOpen(false)}
               />
             </div>
           )}

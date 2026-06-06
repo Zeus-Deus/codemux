@@ -1,7 +1,7 @@
 [package]
 name = "codemux"
 default-run = "codemux"
-version = "0.6.0"
+version = "0.7.9"
 description = "The Agentic Development Environment for Builders"
 authors = ["Zeus-Deus"]
 license = "Elastic-2.0"
@@ -32,7 +32,7 @@ dirs = "6.0.0"
 portable-pty = "0.8.1"
 tokio = { version = "1.0", features = ["full"] }
 chrono = "0.4"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 notify-rust = "4"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "stream"] }
@@ -82,6 +82,14 @@ sysinfo = "0.33"
 # an iCalendar DTSTART+RRULE block and computes the next occurrence
 # with IANA-timezone / DST correctness. Used by automations::recurrence.
 rrule = "0.14"
+# Axum HTTP server for the new `codemux-remote serve` headless control
+# endpoint. Loopback-only by default (127.0.0.1), bearer-token auth via
+# a manifest file. The transport choice (HTTP+bearer over loopback,
+# tunnelled via SSH when remote) is the v1 design constraint that lets
+# us drop in an optional cloud relay later without changing the daemon.
+# See docs/plans/mcp-on-remote.md.
+axum = "0.7"
+tower = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

@@ -26,6 +26,11 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import {
+  groupWorkspacesByProject,
+  useAppStore,
+  useHomeDir,
+} from "@/stores/app-store";
+import {
   automationsCheckRepoAccess,
   automationsCreate,
   automationsDelete,
@@ -33,7 +38,6 @@ import {
   automationsRuns,
   automationsSetEnabled,
   automationsUpdate,
-  dbGetRecentProjects,
   hostsList,
   type AutomationInput,
   type AutomationRunView,
@@ -42,7 +46,8 @@ import {
   type RepoAccessResult,
 } from "@/tauri/commands";
 
-/** A repository the user has opened — the source for the project picker. */
+/** A project currently open in the Codemux sidebar — the source for
+ *  the project picker. */
 interface ProjectOption {
   name: string;
   path: string;
@@ -241,7 +246,20 @@ export function AutomationsSection() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [projects, setProjects] = useState<ProjectOption[]>([]);
+  // The project picker lists the projects currently open in the
+  // sidebar — derived from the live workspace snapshot the same way
+  // the sidebar groups them — not every repo ever opened. A project
+  // that is not currently open stays reachable through "Other path…",
+  // and editing an automation keeps its saved path via custom mode.
+  const openWorkspaces = useAppStore((s) => s.appState?.workspaces);
+  const homeDir = useHomeDir();
+  const projects = useMemo<ProjectOption[]>(
+    () =>
+      groupWorkspacesByProject(openWorkspaces ?? [], homeDir)
+        .map((g) => ({ name: g.projectName, path: g.projectPath }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [openWorkspaces, homeDir],
+  );
 
   // `null` = not editing. A draft with no matching automation = create.
   const [draft, setDraft] = useState<FormDraft | null>(null);
@@ -250,16 +268,12 @@ export function AutomationsSection() {
   const reload = useCallback(async () => {
     setError(null);
     try {
-      const [fresh, freshHosts, freshProjects] = await Promise.all([
+      const [fresh, freshHosts] = await Promise.all([
         automationsList(),
         hostsList(),
-        dbGetRecentProjects(50),
       ]);
       setAutomations(fresh);
       setHosts(freshHosts);
-      setProjects(
-        freshProjects.map((p) => ({ name: p.name, path: p.path })),
-      );
       if (fresh.length > 0 && selectedId === null) {
         setSelectedId(fresh[0].id);
       } else if (fresh.length === 0) {
@@ -1056,9 +1070,10 @@ function ScheduleField({
   );
 }
 
-/** The project picker — choose one of your opened repositories, or
- *  fall back to a manual path. Solves the "why am I typing a path?"
- *  confusion: you pick a project, the automation handles the worktree. */
+/** The project picker — choose one of the projects currently open in
+ *  the sidebar, or fall back to a manual path. Solves the "why am I
+ *  typing a path?" confusion: you pick a project, the automation
+ *  handles the worktree. */
 function ProjectField({
   draft,
   patch,
@@ -1070,7 +1085,7 @@ function ProjectField({
 }) {
   const known = projects.some((p) => p.path === draft.projectPath);
   // Custom mode: the user explicitly chose "Other path…", or we are
-  // editing an automation whose project is not in the recent list.
+  // editing an automation whose project is not currently open.
   const custom = draft.projectCustom || (draft.projectPath !== "" && !known);
   const selectValue = custom ? "__custom__" : known ? draft.projectPath : "";
 
@@ -1092,7 +1107,10 @@ function ProjectField({
         <SelectTrigger className="h-9 text-[13px]">
           <SelectValue placeholder="Choose a project…" />
         </SelectTrigger>
-        <SelectContent>
+        {/* `popper` + a capped height keeps the menu anchored under
+            the trigger and scrollable when many projects are open,
+            instead of stretching into a full-height strip. */}
+        <SelectContent position="popper" className="max-h-72">
           {projects.map((project) => (
             <SelectItem key={project.path} value={project.path}>
               {project.name}

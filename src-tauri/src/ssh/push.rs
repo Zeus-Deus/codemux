@@ -24,7 +24,7 @@
 #![cfg(unix)]
 
 use serde::Serialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
@@ -220,13 +220,69 @@ pub async fn push_workspace(opts: PushOptions<'_>) -> PushResult {
         cmd.arg(arg);
     }
     let result = run_capture_with_timeout(&mut cmd, opts.step_timeout).await;
-    match result {
+    let pushed = match result {
         Ok(stdout) => PushResult::Pushed {
             remote_path: opts.remote_path.to_string(),
             rsync_summary: trim_rsync_output(&stdout),
         },
-        Err(reason) => PushResult::RsyncFailed { reason },
+        Err(reason) => return PushResult::RsyncFailed { reason },
+    };
+
+    // Best-effort: drop a `.mcp.json` into the pushed workspace dir so
+    // an agent CLI (Claude Code, Codex, Gemini, …) launched on the
+    // remote inside this workspace auto-discovers Codemux via
+    // `codemux-remote mcp`. This mirrors the desktop's per-workspace
+    // `.mcp.json` pattern (`mcp_server::upsert_mcp_config`).
+    //
+    // A failure here does NOT roll back the push — the user's files
+    // are already on the remote, and the daemon itself doesn't need
+    // .mcp.json. The agent on the remote can still be configured by
+    // hand. We log so the host pane can show a soft warning later.
+    if let Err(error) = crate::ssh::bootstrap::provision_workspace_mcp_config(
+        opts.ssh_target,
+        opts.remote_path,
+        "~/.local/bin/codemux-remote",
+        opts.step_timeout,
+    )
+    .await
+    {
+        eprintln!(
+            "[codemux::ssh::push] .mcp.json provisioning failed for {}: {error}",
+            opts.remote_path
+        );
     }
+
+    // Best-effort: register the pushed workspace in the remote
+    // daemon's registry so it shows up in `workspace_list` from any
+    // MCP-aware agent on the host. If the daemon isn't running yet
+    // (host hates systemd, bootstrap was skipped, …) this fails
+    // silently — the user can still register manually via the agent.
+    //
+    // Branch + project_root aren't known at this layer; the push UI
+    // can pass them later by extending PushOptions. v1 just registers
+    // by path so the workspace at least exists in the registry.
+    let workspace_name = std::path::Path::new(opts.remote_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string());
+    if let Err(error) = crate::ssh::bootstrap::register_workspace_on_remote(
+        opts.ssh_target,
+        "~/.local/bin/codemux-remote",
+        opts.remote_path,
+        workspace_name.as_deref(),
+        None,
+        None,
+        opts.step_timeout,
+    )
+    .await
+    {
+        eprintln!(
+            "[codemux::ssh::push] workspace register failed for {}: {error}",
+            opts.remote_path
+        );
+    }
+
+    pushed
 }
 
 /// Pull the worktree back from the remote host.
@@ -249,7 +305,15 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
     // Verify the remote path actually exists. Without this, an empty
     // mirror would happily delete every local file (because of
     // --delete).
-    let remote_check = run_with_timeout(
+    //
+    // We signal presence via a STDOUT sentinel rather than the remote
+    // command's exit code: the remote `if … then echo … fi` always exits
+    // 0, so a genuinely-missing directory is distinguished by the token,
+    // not by string-matching `ExitStatus`'s Display (whose exact shape —
+    // e.g. `exit status: 7` with a colon — is not contractual and bit us
+    // before: a missing path was misreported as `HostUnreachable`). Only
+    // a real SSH/transport failure yields a non-zero exit → `Err` here.
+    let remote_check = run_capture_with_timeout(
         Command::new("ssh")
             .arg("-o")
             .arg("BatchMode=yes")
@@ -257,23 +321,37 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
             .arg("ConnectTimeout=10")
             .arg(opts.ssh_target)
             .arg(format!(
-                "test -d {} || exit 7",
+                "if test -d {} ; then echo CMX_REMOTE_DIR_OK ; else echo CMX_REMOTE_DIR_MISSING ; fi",
                 shell_escape(opts.remote_path)
             )),
         opts.step_timeout,
     )
     .await;
-    if let Err(reason) = remote_check {
-        // exit 7 means our explicit "not a directory" signal; anything
-        // else means SSH itself failed.
-        if reason.contains("exit status 7") {
+    match remote_check {
+        Ok(stdout) if stdout.contains("CMX_REMOTE_DIR_MISSING") => {
             return PullResult::RemoteNotFound {
                 path: opts.remote_path.to_string(),
             };
         }
-        return PullResult::HostUnreachable {
-            reason: format!("remote_check failed: {reason}"),
-        };
+        Ok(stdout) if stdout.contains("CMX_REMOTE_DIR_OK") => {
+            // Remote dir confirmed present — safe to rsync with --delete.
+        }
+        Ok(stdout) => {
+            // SSH connected but didn't return our sentinel (shell init
+            // noise, unexpected error). Treat as unreachable rather than
+            // risk a --delete against an unconfirmed remote.
+            return PullResult::HostUnreachable {
+                reason: format!(
+                    "remote_check returned unexpected output: {}",
+                    stdout.trim()
+                ),
+            };
+        }
+        Err(reason) => {
+            return PullResult::HostUnreachable {
+                reason: format!("remote_check failed: {reason}"),
+            };
+        }
     }
 
     let argv = build_pull_rsync_argv(&opts);
@@ -306,7 +384,7 @@ pub async fn pull_workspace_back(opts: PullOptions<'_>) -> PullResult {
 /// this in production with the push flow: mkdir succeeded
 /// creating `~/...` in cwd, then rsync failed because the
 /// expected `$HOME/...` parent didn't exist.
-fn shell_escape(path: &str) -> String {
+pub(crate) fn shell_escape(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/") {
         return format!("~/{}", shell_escape_body(rest));
     }
@@ -422,24 +500,13 @@ pub fn claude_project_dir_name(absolute_path: &std::path::Path) -> String {
         .collect()
 }
 
-pub fn conventional_remote_path(project_name: &str, branch: &str) -> PathBuf {
-    fn sanitize(s: &str) -> String {
-        s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                c
-            } else {
-                '-'
-            })
-            .collect::<String>()
-            .trim_matches('-')
-            .to_string()
-    }
-    let p = sanitize(project_name);
-    let b = sanitize(branch);
-    let p = if p.is_empty() { "workspace".to_string() } else { p };
-    let b = if b.is_empty() { "main".to_string() } else { b };
-    PathBuf::from(format!("~/.codemux/worktrees/{p}/{b}"))
-}
+/// Cross-platform — see `crate::workspace_paths::conventional_remote_path`.
+/// Kept as a Unix-side re-export so existing call sites compile
+/// unchanged. Windows builds reach the underlying function through
+/// `crate::workspace_paths` directly.
+pub use crate::workspace_paths::{
+    conventional_remote_path, conventional_remote_path_keyed,
+};
 
 #[cfg(test)]
 mod tests {

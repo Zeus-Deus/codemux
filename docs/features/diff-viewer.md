@@ -61,9 +61,15 @@ Diff tabs are created via `createTab(workspaceId, { kind: "diff" })`. Entry poin
 - Clicking a file in the Changes panel (right sidebar)
 - Clicking a commit in the commit history to see the full commit diff
 - Clicking a file in the "against base" sidebar section
-- The command palette "Open Diff Viewer" action
 
 Each tab initializes its state in the diff store on mount if none exists for that `tabId`.
+
+> The standalone "Diff Viewer" new-tab (`+`) menu item and the "Open Diff
+> Viewer" command-palette action were removed in `v0.7.5` (`283660a`): both
+> opened a diff tab with no file selected, landing on an empty "Select a file
+> to view changes" placeholder and duplicating the Changes-panel flow. The
+> diff tab kind and all diff infrastructure stay in place — only the redundant
+> file-less entry points are gone.
 
 ## What Works Today
 

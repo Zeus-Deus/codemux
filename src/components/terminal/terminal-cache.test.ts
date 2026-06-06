@@ -46,6 +46,8 @@ vi.mock("@/tauri/commands", () => {
     detachPtyOutput: vi.fn().mockImplementation(async (sid: string) => {
       handlers.delete(sid);
     }),
+    pausePtyOutput: vi.fn().mockResolvedValue(undefined),
+    resumePtyOutput: vi.fn().mockResolvedValue(undefined),
     getTerminalScrollback: vi.fn().mockResolvedValue(null),
     cacheTerminalScrollback: vi.fn().mockResolvedValue(undefined),
     uncacheTerminalScrollback: vi.fn().mockResolvedValue(undefined),
@@ -129,6 +131,9 @@ const emitChannelBytes = (commands as unknown as {
 const resetChannels = (commands as unknown as {
   __test_resetChannels: () => void;
 }).__test_resetChannels;
+
+const pausePtyOutput = vi.mocked(commands.pausePtyOutput);
+const resumePtyOutput = vi.mocked(commands.resumePtyOutput);
 
 const baseOptions = {
   paneId: "pane-1",
@@ -562,6 +567,90 @@ describe("terminal-cache", () => {
     expect(entry.writePumpRunning).toBe(false);
 
     writeSpy.mockRestore();
+  });
+
+  // ── Flow control (terminal output backpressure) ──
+  //
+  // A fast producer can queue PTY bytes faster than the throttled pump
+  // drains them. When the queued byte count crosses the HIGH watermark we
+  // ask the backend to pause the PTY read loop; once it drains below LOW we
+  // resume. The 9 MiB chunks below are zero-filled (NUL is a no-op in the
+  // xterm parser) and terminal.write is stubbed, so these exercise the
+  // accounting + pause/resume wiring without parsing tens of MiB.
+  const NINE_MIB = 9 * 1024 * 1024;
+
+  it("pauses the PTY when the write queue exceeds the high watermark, resumes when it drains", async () => {
+    const sid = "session-flow-pause-resume";
+    pausePtyOutput.mockClear();
+    resumePtyOutput.mockClear();
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const { entry } = await getOrCreateTerminal(sid, baseOptions);
+    attachToContainer(sid, container);
+
+    const writeSpy = vi
+      .spyOn(entry.terminal, "write")
+      .mockImplementation(() => true);
+
+    // Three 9 MiB chunks emitted synchronously. The pump drains exactly one
+    // chunk synchronously (up to its first `await`), leaving ~18 MiB queued —
+    // past the 16 MiB HIGH watermark — so a pause is requested.
+    for (let i = 0; i < 3; i++) {
+      emitChannelBytes(sid, new Uint8Array(NINE_MIB));
+    }
+
+    expect(pausePtyOutput).toHaveBeenCalledWith(sid);
+    expect(pausePtyOutput).toHaveBeenCalledTimes(1);
+    expect(entry.flowPaused).toBe(true);
+    expect(resumePtyOutput).not.toHaveBeenCalled();
+
+    // Drain everything; once the queue falls below the 4 MiB LOW watermark we
+    // resume exactly once.
+    await waitForPumpDrain();
+
+    expect(resumePtyOutput).toHaveBeenCalledWith(sid);
+    expect(resumePtyOutput).toHaveBeenCalledTimes(1);
+    expect(entry.flowPaused).toBe(false);
+    expect(entry.writeQueueBytes).toBe(0);
+
+    writeSpy.mockRestore();
+    disposeTerminal(sid);
+  });
+
+  it("resumes the PTY on detach if it was paused (so a parked agent isn't left blocked)", async () => {
+    const sid = "session-flow-detach-resume";
+    pausePtyOutput.mockClear();
+    resumePtyOutput.mockClear();
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const { entry } = await getOrCreateTerminal(sid, baseOptions);
+    attachToContainer(sid, container);
+
+    const writeSpy = vi
+      .spyOn(entry.terminal, "write")
+      .mockImplementation(() => true);
+
+    for (let i = 0; i < 3; i++) {
+      emitChannelBytes(sid, new Uint8Array(NINE_MIB));
+    }
+    expect(entry.flowPaused).toBe(true);
+
+    // Park the pane while still paused — detach must resume the PTY so the
+    // background (daemon-backed) agent isn't left blocked on write.
+    detachFromContainer(sid);
+
+    expect(resumePtyOutput).toHaveBeenCalledWith(sid);
+    expect(entry.flowPaused).toBe(false);
+
+    // Draining the leftover queue must NOT issue a second resume (flowPaused
+    // is already cleared).
+    await waitForPumpDrain();
+    expect(resumePtyOutput).toHaveBeenCalledTimes(1);
+
+    writeSpy.mockRestore();
+    disposeTerminal(sid);
   });
 });
 

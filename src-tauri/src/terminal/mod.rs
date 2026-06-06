@@ -55,6 +55,36 @@ pub fn release_comm_log_lock(path: &str) {
     }
 }
 
+/// Turn a raw PTY output chunk into a single OpenFlow comm-log line, or
+/// `None` when the chunk is noise that shouldn't be logged (ANSI-only,
+/// progress spinners, block-glyph redraws, too-short fragments). Shared by
+/// BOTH the in-process reader loop and the daemon-backed reader task so the
+/// two paths can't drift — without it, OpenFlow agents on the daemon spawn
+/// path (the default since persistent agents) wrote an empty comm log and
+/// the orchestrator's stuck-detection went blind.
+pub(crate) fn comm_log_entry_for_chunk(role: &str, data: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(data).ok()?;
+    let cleaned = strip_ansi_codes(text);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty()
+        || trimmed.len() <= 2
+        || trimmed.starts_with('\x1b')
+        || trimmed.starts_with("No orchestration progress detected")
+        || trimmed.starts_with("STOP: General Agent")
+        || trimmed.chars().all(|c| {
+            c.is_whitespace()
+                || c == '\u{2580}'
+                || c == '\u{2584}'
+                || c == '\u{2588}'
+                || c == ' '
+        })
+    {
+        return None;
+    }
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+    Some(format!("[{}] [{}] {}\n", timestamp, role.to_uppercase(), trimmed))
+}
+
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
@@ -2084,6 +2114,70 @@ pub fn detach_pty_output(
     Ok(())
 }
 
+/// Pause the daemon's PTY read loop for a session (terminal output flow
+/// control). The renderer calls this when a fast producer outruns its xterm
+/// write queue; pausing makes the child block on `write()` once the kernel
+/// PTY buffer fills — real backpressure instead of an ever-growing renderer
+/// queue.
+///
+/// In-process (non-daemon) sessions are a deliberate no-op: they keep
+/// today's behavior exactly, so this can never regress the fallback path.
+/// The daemon side fail-safes (resume on attach/close + a max-park backstop)
+/// guarantee a paused PTY always self-heals even if the matching resume is
+/// never delivered.
+#[tauri::command]
+pub fn pause_pty_output(
+    terminal_state: State<'_, PtyState>,
+    session_id: String,
+) -> Result<(), String> {
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, true);
+    Ok(())
+}
+
+/// Resume the daemon's PTY read loop for a session. See `pause_pty_output`.
+/// Idempotent and a no-op for in-process sessions.
+#[tauri::command]
+pub fn resume_pty_output(
+    terminal_state: State<'_, PtyState>,
+    session_id: String,
+) -> Result<(), String> {
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, false);
+    Ok(())
+}
+
+/// Route a flow-control pause/resume to the daemon that owns `session_id`.
+/// Fire-and-forget (mirrors `DaemonWriter`): flow control is advisory and
+/// not latency-sensitive, and a failure (e.g. the session just exited) is
+/// benign. No-op when the session has no daemon client (in-process path).
+fn set_pty_flow_paused(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+    paused: bool,
+) {
+    #[cfg(unix)]
+    {
+        let client = with_existing_session_runtime(sessions, session_id, |runtime| {
+            runtime.daemon_client.clone()
+        })
+        .flatten();
+        if let Some(client) = client {
+            let session_id = session_id.to_string();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = client.set_flow_paused(session_id.clone(), paused).await {
+                    eprintln!(
+                        "[codemux::terminal] flow-control set_flow_paused(paused={paused}) \
+                         for {session_id} failed (benign if the session just exited): {error}"
+                    );
+                }
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (sessions, session_id, paused);
+    }
+}
+
 #[tauri::command]
 pub fn write_to_pty(
     terminal_state: State<'_, PtyState>,
@@ -2869,39 +2963,19 @@ fn spawn_pty_for_agent_in_process(
             |data| {
                 // Buffer agent output for communication log (cleaned); flush periodically
                 if let Some((ref log_lock, ref role)) = log_lock_opt {
-                    if let Ok(text) = std::str::from_utf8(data) {
-                        let cleaned = strip_ansi_codes(text);
-                        let trimmed = cleaned.trim();
-
-                        if !trimmed.is_empty()
-                            && trimmed.len() > 2
-                            && !trimmed.starts_with('\x1b')
-                            && !trimmed.starts_with("No orchestration progress detected")
-                            && !trimmed.starts_with("STOP: General Agent")
-                            && !trimmed.chars().all(|c| {
-                                c.is_whitespace()
-                                    || c == '\u{2580}'
-                                    || c == '\u{2584}'
-                                    || c == '\u{2588}'
-                                    || c == ' '
-                            })
+                    if let Some(entry) = comm_log_entry_for_chunk(role, data) {
+                        comm_log_buffer.push(entry);
+                        if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
+                            || comm_last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
                         {
-                            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-                            let entry =
-                                format!("[{}] [{}] {}\n", timestamp, role.to_uppercase(), trimmed);
-                            comm_log_buffer.push(entry);
-                            if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
-                                || comm_last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
-                            {
-                                if let Ok(mut file) = log_lock.lock() {
-                                    for e in &comm_log_buffer {
-                                        let _ = file.write_all(e.as_bytes());
-                                    }
-                                    let _ = file.flush();
+                            if let Ok(mut file) = log_lock.lock() {
+                                for e in &comm_log_buffer {
+                                    let _ = file.write_all(e.as_bytes());
                                 }
-                                comm_log_buffer.clear();
-                                comm_last_flush = Instant::now();
+                                let _ = file.flush();
                             }
+                            comm_log_buffer.clear();
+                            comm_last_flush = Instant::now();
                         }
                     }
                 }
@@ -3056,6 +3130,29 @@ mod tests {
 
     fn make_sessions() -> Arc<Mutex<HashMap<String, SessionRuntime>>> {
         Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    #[test]
+    fn comm_log_entry_formats_and_filters() {
+        // Real agent output → a tagged, timestamped line.
+        let entry = comm_log_entry_for_chunk("builder-0", b"Implementing the parser\n")
+            .expect("real output should log");
+        assert!(entry.contains("[BUILDER-0]"), "role is upper-cased + tagged: {entry}");
+        assert!(entry.contains("Implementing the parser"));
+        assert!(entry.ends_with('\n'));
+
+        // Noise is dropped: empty / too-short / ANSI-only / known spinners /
+        // block-glyph redraws.
+        assert!(comm_log_entry_for_chunk("b", b"").is_none());
+        assert!(comm_log_entry_for_chunk("b", b"ok").is_none(), "<=2 chars");
+        assert!(comm_log_entry_for_chunk("b", b"\x1b[2J\x1b[H").is_none(), "ansi-only");
+        assert!(
+            comm_log_entry_for_chunk("b", "\u{2588}\u{2588}\u{2580}".as_bytes()).is_none(),
+            "block-glyph redraw"
+        );
+        assert!(
+            comm_log_entry_for_chunk("b", b"No orchestration progress detected yet").is_none(),
+        );
     }
 
     // ── Regression tests for the cross-machine push spawn bugs ────────
@@ -4054,6 +4151,10 @@ mod tests {
             latest_agent_state: None,
             worktree_path: worktree_path.map(String::from),
             project_root: project_root.map(String::from),
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -4064,6 +4165,8 @@ mod tests {
             active_surface_id: SurfaceId(String::new()),
             surfaces: Vec::new(),
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         }
     }
 

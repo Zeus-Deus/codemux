@@ -20,6 +20,13 @@ const PRESET_TITLE_TO_ICON: Record<string, string> = {
   "Codex": "codex",
   "OpenCode": "opencode",
   "Gemini": "gemini",
+  "Antigravity": "antigravity",
+  "Copilot": "copilot",
+  "Cursor Agent": "cursor-agent",
+  "Amp": "amp",
+  "Grok": "grok",
+  "Droid": "factory",
+  "Mastracode": "mastracode",
   "Shell": "terminal",
 };
 

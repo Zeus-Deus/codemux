@@ -48,6 +48,8 @@ pub mod project;
 // module from any code path).
 #[cfg(unix)]
 pub mod pty_daemon;
+#[cfg(unix)]
+pub mod remote;
 // SSH transport for the cloud-push feature. Unix-only — relies on
 // the system `ssh` + `scp` binaries (with the user's existing
 // `~/.ssh/config`, agent, and known_hosts).
@@ -61,6 +63,12 @@ pub mod skills_sync;
 pub mod session_adapters;
 pub mod settings_sync;
 pub mod hosts_sync;
+#[cfg(unix)]
+pub mod hosts_upgrade;
+pub mod hosts_inventory;
+pub mod workspace_paths;
+pub mod project_identity;
+pub mod workspaces_sync;
 pub mod state;
 pub mod hooks;
 pub mod stream_input;
@@ -267,6 +275,16 @@ pub fn run() {
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
                 state.migrate_project_roots();
+                // Backfill repo-root `protected` for workspaces that
+                // predate the repo-unit-sync change. Runs off the boot
+                // thread because it spawns git subprocesses per
+                // workspace; new workspaces get it stamped at create
+                // time in `set_workspace_project_root`.
+                let protection_handle = handle.clone();
+                std::thread::spawn(move || {
+                    let state: tauri::State<'_, state::AppStateStore> = protection_handle.state();
+                    state.backfill_workspace_protection();
+                });
                 layout_loaded = true;
             } else {
                 // First launch — no persisted layout exists. Replace the
@@ -600,6 +618,34 @@ pub fn run() {
             }
 
             control::spawn_control_server(app.handle().clone());
+
+            // Background host-upgrade poller. ~5s after app setup it
+            // walks every registered SSH host, version-checks its
+            // codemux-remote against the one this build ships, and
+            // silently re-bootstraps any host that's behind. So when
+            // the user updates Codemux on the desktop, their hosts
+            // catch up on their own — no Test/Push click required.
+            // Safe to run on every app start: cheap when versions
+            // match (one SSH probe), idempotent re-provision on
+            // upgrade, never installs codemux-remote where it isn't
+            // already present (that still requires the Install
+            // button's consent).
+            #[cfg(unix)]
+            crate::hosts_upgrade::spawn(app.handle().clone());
+
+            // Background host-inventory poller. Asymmetric companion
+            // to the upgrade loop: where the upgrade loop keeps the
+            // remote `codemux-remote` binary at the right version,
+            // this loop keeps the remote daemon's *workspace registry*
+            // visible to the user's account. Without it, a workspace
+            // an agent creates on a host (via the MCP `workspace_create`
+            // tool) never appears in any dev device's overview because
+            // no laptop ever pushed it. See `docs/features/workspaces-sync.md`
+            // for the "asymmetric publish" model: codemux-remote hosts
+            // auto-publish, codemux-app dev devices keep their existing
+            // explicit push/pull.
+            #[cfg(unix)]
+            crate::hosts_inventory::spawn(app.handle().clone());
 
             // Resolve the bundled claude-agent sidecar from Tauri's resource
             // dir and pin the path via env var so the adapter (which has no
@@ -1205,8 +1251,14 @@ pub fn run() {
                     let session_pids = pty_state.get_session_pids();
                     let session_workspaces = app_state.all_session_workspaces();
                     let workspace_cwds = app_state.all_workspace_cwds();
+                    let workspace_paths = app_state.all_workspace_paths();
 
-                    let ports = ports::scan_ports(&session_pids, &session_workspaces, &workspace_cwds);
+                    let ports = ports::scan_ports(
+                        &session_pids,
+                        &session_workspaces,
+                        &workspace_cwds,
+                        &workspace_paths,
+                    );
                     let port_snapshots: Vec<state::PortInfoSnapshot> = ports
                         .into_iter()
                         .map(|p| state::PortInfoSnapshot {
@@ -1215,6 +1267,7 @@ pub fn run() {
                             process_name: p.process_name,
                             workspace_id: p.workspace_id,
                             label: p.label,
+                            source: p.source,
                         })
                         .collect();
 
@@ -1223,6 +1276,48 @@ pub fn run() {
                         // heartbeat — no need for synchronous emit.
                         state::schedule_emit_app_state(&port_handle);
                     }
+                }
+            });
+
+            // Workspaces sync loop — mirror the local workspace list
+            // into the `workspaces_sync` SQLite table, then push/pull
+            // against /api/workspaces. Runs every 30 seconds so cross-
+            // device visibility is eventually consistent within that
+            // window without each individual workspace mutation having
+            // to call out to the sync layer. The reconcile step
+            // (snapshot → workspaces_sync) is cheap (a diff over a
+            // small list); the push/pull only fires when there are
+            // dirty rows OR the server has new rows to advertise.
+            //
+            // Failure mode: any reconcile or sync error is logged and
+            // the loop continues. The dirty flag stays set so the
+            // next tick re-tries.
+            let sync_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Small initial delay so we don't fight startup IO.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                loop {
+                    let app_state: tauri::State<'_, state::AppStateStore> =
+                        sync_handle.state();
+                    let db: tauri::State<'_, database::DatabaseStore> =
+                        sync_handle.state();
+                    let snapshot = app_state.snapshot();
+                    if let Err(error) = workspaces_sync::reconcile_from_snapshot(
+                        db.inner(),
+                        &snapshot,
+                    ) {
+                        eprintln!(
+                            "[codemux::workspaces-sync] reconcile failed: {error}"
+                        );
+                    }
+                    if let Err(error) =
+                        workspaces_sync::try_sync_with_app(&sync_handle).await
+                    {
+                        eprintln!(
+                            "[codemux::workspaces-sync] background sync failed: {error}"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 }
             });
 
@@ -1432,6 +1527,8 @@ pub fn run() {
             terminal::get_terminal_status,
             terminal::attach_pty_output,
             terminal::detach_pty_output,
+            terminal::pause_pty_output,
+            terminal::resume_pty_output,
             terminal::write_to_pty,
             terminal::resize_pty,
             terminal::clear_agent_status,
@@ -1570,6 +1667,14 @@ pub fn run() {
             commands::automations_delete,
             commands::automations_runs,
             commands::automations_check_repo_access,
+            commands::workspaces_sync_list,
+            commands::workspaces_sync_now,
+            commands::workspaces_adoption_preview,
+            commands::workspaces_adopt_synced,
+            commands::workspaces_adopt_via_clone,
+            commands::workspaces_adopt_project,
+            commands::workspaces_reconcile_copy,
+            commands::workspace_open_on_host,
             commands::get_package_format,
             resource_metrics::get_resource_metrics,
             commands::debug_log,

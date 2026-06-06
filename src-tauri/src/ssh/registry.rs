@@ -22,11 +22,55 @@
 
 #![cfg(unix)]
 
-use crate::ssh::tunnel_supervisor::TunnelSupervisor;
+use crate::ssh::tunnel_supervisor::{TunnelStatus, TunnelSupervisor};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::Emitter;
 use tokio::sync::{Mutex, OnceCell};
+
+/// Payload for the `tunnel-status-changed` event the UI listens to so it
+/// can render a "Reconnecting…" / "Connection lost" pill on remote
+/// workspaces. Keyed by `workspace_id`; `status` is the supervisor's own
+/// `TunnelStatus` (tagged enum: `connected` / `reconnecting` /
+/// `circuit_open` / `pending`).
+#[derive(Clone, serde::Serialize)]
+struct TunnelStatusEvent {
+    workspace_id: String,
+    status: TunnelStatus,
+}
+
+/// Bridge a supervisor's status `watch` channel to a Tauri event so the
+/// frontend can show tunnel health. Spawns one detached task per
+/// supervisor instance; it emits the current status immediately, then on
+/// every change, and **self-terminates** when the supervisor is dropped
+/// (its `status_tx` closes → `changed()` errors). Because a re-push
+/// installs a fresh supervisor (the old one is shut down and dropped),
+/// the old forwarder exits on its own — no explicit deregistration, no
+/// leak, and never two forwarders for one live supervisor.
+pub fn spawn_tunnel_status_forwarder(
+    app: tauri::AppHandle,
+    workspace_id: String,
+    supervisor: &Arc<TunnelSupervisor>,
+) {
+    let mut rx = supervisor.subscribe();
+    tokio::spawn(async move {
+        loop {
+            let status = rx.borrow_and_update().clone();
+            let _ = app.emit(
+                "tunnel-status-changed",
+                TunnelStatusEvent {
+                    workspace_id: workspace_id.clone(),
+                    status,
+                },
+            );
+            if rx.changed().await.is_err() {
+                // Supervisor dropped — stop forwarding.
+                break;
+            }
+        }
+    });
+}
 
 static REGISTRY: OnceCell<Mutex<HashMap<String, Arc<TunnelSupervisor>>>> =
     OnceCell::const_new();
@@ -102,7 +146,10 @@ pub fn local_socket_for_workspace(workspace_id: &str) -> PathBuf {
     let mut hasher = DefaultHasher::new();
     workspace_id.hash(&mut hasher);
     let short = format!("{:x}", hasher.finish());
-    let truncated = &short[..short.len().min(12)];
+    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
+    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
+    // under the 104-byte macOS sun_path limit (see the test below).
+    let truncated = &short[..short.len().min(16)];
     std::env::temp_dir().join(format!("codemux-tunnel-{truncated}.sock"))
 }
 
@@ -117,7 +164,10 @@ pub fn remote_socket_for_workspace(workspace_id: &str) -> String {
     let mut hasher = DefaultHasher::new();
     workspace_id.hash(&mut hasher);
     let short = format!("{:x}", hasher.finish());
-    let truncated = &short[..short.len().min(12)];
+    // Full 16 hex chars (the whole u64) — truncating to 12 left only a
+    // 48-bit space (birthday collisions ~2^24 workspaces). 16 stays well
+    // under the 104-byte macOS sun_path limit (see the test below).
+    let truncated = &short[..short.len().min(16)];
     format!("/tmp/codemux-ptyd-{truncated}.sock")
 }
 
@@ -218,6 +268,11 @@ pub async fn client_for_workspace(
                 "$HOME/.local/bin/codemux-remote".to_string(),
             );
             install_supervisor(workspace_id, s.clone()).await;
+            spawn_tunnel_status_forwarder(
+                app.clone(),
+                workspace_id.to_string(),
+                &s,
+            );
             s
         }
     };

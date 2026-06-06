@@ -668,7 +668,7 @@ pub(crate) async fn close_workspace_with_worktree_impl(
     // Worktree metadata still needs a pre-close snapshot for teardown +
     // MCP cleanup. Session IDs come from `state.close_workspace`'s result
     // below — no TOCTOU race with concurrent pane creation.
-    let (worktree_path, branch, ws_title) = {
+    let (worktree_path, branch, ws_title, ws_host_id) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
@@ -678,6 +678,7 @@ pub(crate) async fn close_workspace_with_worktree_impl(
             ws.and_then(|w| w.worktree_path.clone()),
             ws.and_then(|w| w.git_branch.clone()),
             ws.map(|w| w.title.clone()).unwrap_or_default(),
+            ws.and_then(|w| w.host_id),
         )
     };
 
@@ -704,12 +705,61 @@ pub(crate) async fn close_workspace_with_worktree_impl(
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
 
+    // Tear down the SSH tunnel + cached remote client for a workspace
+    // that was pushed to a host. Without this, closing a remote
+    // workspace leaks the `TunnelSupervisor` task, the bound local
+    // socket, and the remote `codemux-remote pty-daemon` for the rest
+    // of the app's lifetime — the only other teardown site is
+    // pull-back (commands/hosts.rs). Order matches pull-back: forget the
+    // cached client (it holds the socket) BEFORE shutting down the
+    // supervisor that unbinds it. No-op for local workspaces and
+    // idempotent when no supervisor was ever registered.
+    #[cfg(unix)]
+    if ws_host_id.is_some() {
+        crate::ssh::forget_workspace_client(&workspace_id).await;
+        crate::ssh::shutdown_supervisor(&workspace_id).await;
+    }
+    #[cfg(not(unix))]
+    let _ = ws_host_id;
+
+    // Reconcile the sync mirror BEFORE the optimistic emit so the
+    // workspaces overview sees the soft-delete in the same tick that
+    // app_state loses the workspace. Without this, the orphan
+    // `workspaces_sync` row (whose `workspace_id` no longer maps to a
+    // live snapshot) is classified as a sibling-device workspace by
+    // `useOverviewItems` and renders with the "other device" badge for
+    // up to ~30 s, until the background reconcile loop catches up.
+    // Errors here are non-fatal: the close itself already succeeded,
+    // and the background tick will retry the reconcile + push.
+    {
+        let snapshot = state.snapshot();
+        if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(
+            db,
+            &snapshot,
+        ) {
+            eprintln!(
+                "[workspaces-sync] reconcile after close failed (will \
+                 retry on next background tick): {error}"
+            );
+        }
+    }
+
     // Optimistic emit: the workspace is gone from in-memory state. Push the
     // update to the frontend NOW so the sidebar row disappears immediately,
     // even when the filesystem cleanup below takes seconds (large worktrees,
     // slow disk). A second emit at the end of the command picks up any
     // session/agent-chat fan-out the cleanup triggers.
     crate::state::emit_app_state(&app);
+
+    // Best-effort push of the soft-delete to the server so sibling
+    // devices learn the workspace is gone immediately instead of
+    // waiting for the 30 s background tick. Non-fatal on failure.
+    if let Err(error) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] sync after close failed (will retry on \
+             next background tick): {error}"
+        );
+    }
 
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
@@ -927,13 +977,16 @@ pub async fn close_workspace(
     // We still need cwd + title for teardown + MCP cleanup before the
     // state mutation. Session IDs are now obtained from
     // `state.close_workspace`'s result below — no snapshot race.
-    let workspace_cwd = {
+    let (workspace_cwd, ws_host_id) = {
         let snapshot = state.snapshot();
-        snapshot
+        let ws = snapshot
             .workspaces
             .iter()
-            .find(|w| w.workspace_id.0 == workspace_id)
-            .map(|w| (w.cwd.clone(), w.title.clone()))
+            .find(|w| w.workspace_id.0 == workspace_id);
+        (
+            ws.map(|w| (w.cwd.clone(), w.title.clone())),
+            ws.and_then(|w| w.host_id),
+        )
     };
 
     // Run teardown scripts before closing
@@ -976,11 +1029,55 @@ pub async fn close_workspace(
 
     let result = state.close_workspace(&workspace_id)?;
 
+    // Tear down the SSH tunnel + cached client for a workspace that was
+    // pushed to a host. This is the sibling of the teardown in
+    // `close_workspace_with_worktree_impl` — a PLAIN (non-worktree)
+    // pushed workspace gets `host_id` set (push falls back to its cwd)
+    // and the sidebar routes its close through THIS command, so without
+    // this it would leak the tunnel supervisor + remote pty-daemon.
+    // Idempotent + no-op for local workspaces.
+    #[cfg(unix)]
+    if ws_host_id.is_some() {
+        crate::ssh::forget_workspace_client(&workspace_id).await;
+        crate::ssh::shutdown_supervisor(&workspace_id).await;
+    }
+    #[cfg(not(unix))]
+    let _ = ws_host_id;
+
+    // Reconcile the sync mirror BEFORE the optimistic emit — see the
+    // matching block in `close_workspace_with_worktree_impl` for the
+    // full reasoning. In short: without this, the orphan
+    // `workspaces_sync` row mis-renders as a sibling-device workspace
+    // in the overview until the 30 s background tick. Non-fatal on
+    // failure.
+    {
+        let snapshot = state.snapshot();
+        if let Err(error) = crate::workspaces_sync::reconcile_from_snapshot(
+            db.inner(),
+            &snapshot,
+        ) {
+            eprintln!(
+                "[workspaces-sync] reconcile after close failed (will \
+                 retry on next background tick): {error}"
+            );
+        }
+    }
+
     // Optimistic emit: the workspace is gone from in-memory state. Push the
     // update to the frontend NOW so the sidebar row disappears immediately,
     // even if a PTY shutdown or agent-chat thread takes a moment to wind
     // down. A second emit at the end of the command picks up any fan-out.
     crate::state::emit_app_state(&app);
+
+    // Best-effort push of the soft-delete to the server so sibling
+    // devices learn the workspace is gone immediately instead of
+    // waiting for the 30 s background tick. Non-fatal on failure.
+    if let Err(error) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] sync after close failed (will retry on \
+             next background tick): {error}"
+        );
+    }
 
     // Kill the PTY child process trees for every session that used to belong
     // to this workspace. Sessions are returned atomically from the same lock
@@ -1444,14 +1541,33 @@ pub struct EditorInfo {
 
 static DETECTED_EDITORS: OnceLock<Vec<EditorInfo>> = OnceLock::new();
 
+// Order matters: this is the order shown in the IDE launcher dropdown when
+// multiple editors are detected, and the first installed entry becomes the
+// auto-picked default on first run. Roughly: VS Code family → AI-first
+// editors → other modern GUI editors → JetBrains family → other GUI.
 const EDITOR_CANDIDATES: &[(&str, &str)] = &[
+    // VS Code family
     ("code", "VS Code"),
     ("cursor", "Cursor"),
+    ("windsurf", "Windsurf"),
+    ("trae", "Trae"),
     ("codium", "VSCodium"),
+    // Modern GUI editors
     ("zed", "Zed"),
+    ("fleet", "Fleet"),
+    ("lapce", "Lapce"),
+    // JetBrains family (shims installed by JetBrains Toolbox land on PATH)
     ("idea", "IntelliJ IDEA"),
-    ("goland", "GoLand"),
+    ("pycharm", "PyCharm"),
+    ("phpstorm", "PhpStorm"),
     ("webstorm", "WebStorm"),
+    ("goland", "GoLand"),
+    ("rubymine", "RubyMine"),
+    ("clion", "CLion"),
+    ("rider", "Rider"),
+    ("datagrip", "DataGrip"),
+    ("studio", "Android Studio"),
+    // Other
     ("sublime_text", "Sublime Text"),
 ];
 
@@ -1470,8 +1586,11 @@ const WINDOWS_EDITOR_FALLBACKS: &[(&str, &[&str])] = &[
         ],
     ),
     ("cursor", &[r"cursor\Cursor.exe"]),
+    ("windsurf", &[r"Windsurf\Windsurf.exe"]),
+    ("trae", &[r"Trae\Trae.exe"]),
     ("codium", &[r"VSCodium\VSCodium.exe"]),
     ("zed", &[r"Zed\Zed.exe"]),
+    ("lapce", &[r"Lapce\lapce.exe"]),
 ];
 
 /// Resolve an editor command to an absolute path:

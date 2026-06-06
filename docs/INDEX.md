@@ -37,12 +37,13 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
 - Skills sync (E2E, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
 - Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)
+- MCP host runtime (Step 9 — Codemux as MCP host/client for chat): current behavior in `docs/features/agent-chat.md` (§ MCP host runtime) + `docs/features/mcp-server.md`; research at `docs/plans/step-9-mcp-servers.md`; Codex MCP gateway feasibility spike (future Step 11) at `docs/plans/step-9-codex-mcp-spike.md`
 - Beta Features toggle (Step 13): `docs/plans/step-13-beta-toggle-research.md`; operator UI smoke at `docs/plans/step-13-ui-smoke-checklist.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
-- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`
+- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/plans/remote-workspace-pull-fix.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
@@ -55,17 +56,22 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
 - Persistent agents (PTY daemon — now the default spawn path, no setting): `docs/features/persistent-agents.md`
-- Remote hosts (DevicePicker + codemux-remote + SSH transport + workspace push action): `docs/features/remote-hosts.md`
+- Remote hosts (DevicePicker + `codemux-remote` binary + SSH transport + zero-touch workspace push + headless `serve` MCP daemon + background version-upgrade poller + **post-`v0.7.8` SSH tunnel-health UI pill + defer-upgrade-restart-while-agents-run**): `docs/features/remote-hosts.md`; deferred desktop pieces (Steps 1/5/6/9) tracked in `docs/plans/mcp-on-remote.md`
+- OpenCode conversation sync across cloud-push (issue #16 — `opencode export`/`import` so a pushed/pulled OpenCode pane continues the same session; sibling of the Claude JSONL sync): `docs/features/opencode-conversation-sync.md`
+- Operate a remote workspace in place — **"Open on host"** (attach-in-place: terminal/agent runs on the host with no local copy; detached pty-daemon survives app close and reattaches on reopen; overview action + `attach_only`/`remote_cwd` snapshot fields): `docs/features/remote-in-place.md`
 - Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config): `docs/features/observability.md`
-- Port detection: `docs/features/ports.md`
+- Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`
 - Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
 - Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/plans/model-selection-before-launch.md`
+- Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
+- Project identity (first-class `project_uid` + `main`/`worktree` kind + boot sweep, Superset-adapted): `docs/plans/project-identity.md`
+- Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync** (treat repo root + worktrees as one shared-history unit instead of cloning the default-branch checkout into a divergent copy; protected non-deletable `repo root` entry + `standalone copy` warning chip — shipped `v0.7.8`, snapshot-local only) — current behavior in `docs/features/workspaces-sync.md` + `docs/features/workspaces-overview.md`, plan + remaining follow-ups (SSH round-trip validation) at `docs/plans/repo-unit-sync.md`; **post-`v0.7.8` multi-device robustness pass** (project-first "Pull project" + protected root + `default_branch`, serialized adopts, `dedupe_sibling_rows`, one-repo-root-per-project, uid-keyed collision-safe host paths, non-destructive "Reconcile copy") in `docs/features/workspaces-sync.md` § "Robustness hardening"
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`

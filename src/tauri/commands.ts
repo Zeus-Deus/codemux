@@ -992,6 +992,16 @@ export const clearAgentStatus = (sessionId: string) =>
 export const detachPtyOutput = (sessionId: string) =>
   invoke("detach_pty_output", { sessionId });
 
+/** Terminal output flow control: pause the daemon's PTY read loop when the
+ *  renderer's xterm write queue is backed up by a fast producer. No-op for
+ *  in-process sessions. See `pause_pty_output` in terminal/mod.rs. */
+export const pausePtyOutput = (sessionId: string) =>
+  invoke("pause_pty_output", { sessionId });
+
+/** Resume the daemon's PTY read loop once the write queue has drained. */
+export const resumePtyOutput = (sessionId: string) =>
+  invoke("resume_pty_output", { sessionId });
+
 export const attachPtyOutput = (
   sessionId: string,
   channel: Channel<unknown>,
@@ -1745,3 +1755,171 @@ export const workspacePullBack = (workspaceId: string) =>
  *  the assignment (back to local). */
 export const setWorkspaceHost = (workspaceId: string, hostId: number | null) =>
   invoke<void>("set_workspace_host", { workspaceId, hostId });
+
+// ── Workspaces sync (cross-device workspace registry) ──
+//
+// One row per workspace this user owns, across every device they
+// have signed in with. Rows whose `workspace_id` is set match a
+// local `WorkspaceSnapshot`; rows whose `workspace_id` is null live
+// only on a sibling device (the UI offers a "Pull to this device"
+// affordance for those).
+//
+// `host_server_id` matches `HostView.server_id`; the local host
+// `id` is unrelated and not portable across devices.
+export interface WorkspaceSyncView {
+  id: number;
+  server_id: string | null;
+  workspace_id: string | null;
+  title: string;
+  host_server_id: string | null;
+  project_path: string | null;
+  project_remote: string | null;
+  git_branch: string | null;
+  /** Phase-4 divergence detection: the workspace's git HEAD sha at
+   *  the last reconcile. Compared across rows in the overview to
+   *  detect when the same (project_remote, git_branch) has different
+   *  HEADs on multiple devices. Null when git isn't available or
+   *  the worktree has no commits yet. */
+  git_head_sha: string | null;
+  /** Deterministic project identity (UUIDv5 of the canonical remote or
+   *  project root). Workspaces sharing this belong to the same project
+   *  — the overview groups by it so a repo's main checkout and its
+   *  worktrees cluster together. Null on rows not yet stamped. */
+  project_uid: string | null;
+  /** "main" (repo root checkout) | "worktree" (per-branch worktree).
+   *  Rendered as a small badge in the overview. */
+  workspace_kind: string | null;
+  /** The repo's default branch as reported by the daemon poller
+   *  (origin/HEAD → main/master → current branch). Lets the overview
+   *  render a remote project's root distinctly and land a pull on the
+   *  right branch even when git_branch is null. Local-only — never sent
+   *  to or returned from the cloud API. */
+  default_branch: string | null;
+  /** The workspace's real absolute path on its host (daemon-reported,
+   *  set by the inventory poller). Drives the "Open on host" action and
+   *  lets the overview dedupe a host row against an already-open
+   *  attach-in-place workspace. Local-only; null on rows that never came
+   *  from a host poll. */
+  origin_path: string | null;
+  created_at: string;
+  updated_at: string;
+  /** True iff the row has unpushed changes. UI surfaces this as a
+   *  "Pending sync" pill the same way Automations does. */
+  dirty: boolean;
+}
+
+export const workspacesSyncList = () =>
+  invoke<WorkspaceSyncView[]>("workspaces_sync_list");
+
+/** Force an immediate pull + push pass. The background loop runs
+ *  every 30s; use this only when the user explicitly hits a "Sync
+ *  now" affordance. Returns Ok even if the user isn't signed in. */
+export const workspacesSyncNow = () =>
+  invoke<void>("workspaces_sync_now");
+
+// ── Cross-device adoption (Phase 2) ──
+//
+// "Adoption" = take a workspace that lives on another device of your
+// account and materialize a local copy on THIS device. Two paths:
+//   - host-backed (this PR): when the workspace lives on a host you
+//     also have configured locally, rsync from the host
+//   - clone (future): when there's no shared host, git-clone from
+//     `project_remote`
+//
+// The frontend opens the Pull-to-this-device dialog with
+// `workspacesAdoptionPreview` (so it knows which variant to render
+// without race conditions), then calls `workspacesAdoptSynced` on
+// confirm.
+
+export interface AdoptionPreview {
+  can_host_adopt: boolean;
+  can_clone_adopt: boolean;
+  host_configured: boolean;
+  host_label: string | null;
+  project_already_cloned_at: string | null;
+  suggested_path: string;
+  is_path_in_use: boolean;
+  /** When the sync row is already linked to a local workspace, this
+   *  carries that local id so the UI can offer "Open existing" instead
+   *  of re-running the adoption flow. */
+  already_adopted_workspace_id: string | null;
+  /** Cross-machine "same branch of the same project" conflict guard.
+   *  When set, another local workspace on THIS device is already on
+   *  the same branch of (heuristically) the same project — matched by
+   *  `(basename(project_path), git_branch)`. Pulling would silently
+   *  create a parallel copy of work the user's already doing, so the
+   *  dialog disables Pull and points at the existing local workspace.
+   *  Null when no conflict was detected. */
+  same_branch_project_exists_at: string | null;
+}
+
+export interface AdoptOutcome {
+  workspace_id: string;
+  worktree_path: string;
+  message: string;
+}
+
+export const workspacesAdoptionPreview = (serverId: string) =>
+  invoke<AdoptionPreview>("workspaces_adoption_preview", { serverId });
+
+export const workspacesAdoptSynced = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_synced", { serverId });
+
+/** Phase-3 clone-fallback adoption: when the sibling-device workspace
+ *  has no shared host (`host_server_id` is null), this clones the
+ *  `project_remote` git URL and creates a worktree at the branch.
+ *
+ *  Important: this creates a NEW local workspace with its own fresh
+ *  `server_id` — it does NOT link to the original sibling row. Both
+ *  devices end up with independent copies that share a git remote.
+ *  The user has been warned about uncommitted-work loss via the
+ *  dialog before reaching this. */
+export const workspacesAdoptViaClone = (serverId: string) =>
+  invoke<AdoptOutcome>("workspaces_adopt_via_clone", { serverId });
+
+/** One workspace that failed during a project-granularity pull. */
+export interface ProjectAdoptFailure {
+  server_id: string;
+  title: string;
+  error: string;
+}
+
+export interface ProjectAdoptOutcome {
+  adopted: AdoptOutcome[];
+  failures: ProjectAdoptFailure[];
+  message: string;
+}
+
+/** Project-first pull: materialize the repo ROOT (protected, at
+ *  `~/.codemux/projects/<repo>`) first, then recreate every worktree as a
+ *  real linked worktree hanging off it — in one action. Pass the shared
+ *  `project_uid` of the remote project's rows. Worktree failures are
+ *  collected (non-fatal); a root failure rejects. */
+export const workspacesAdoptProject = (projectUid: string) =>
+  invoke<ProjectAdoptOutcome>("workspaces_adopt_project", { projectUid });
+
+/** Non-destructively reconcile a divergent "standalone copy": detaches its
+ *  workspace card (files kept on disk) when it's clean, or rejects with
+ *  guidance when it has uncommitted/unpushed work. */
+export const workspacesReconcileCopy = (workspaceId: string) =>
+  invoke<string>("workspaces_reconcile_copy", { workspaceId });
+
+export interface OpenOnHostOutcome {
+  /** The new (or already-open) local attach-in-place workspace id. */
+  workspace_id: string;
+  /** The directory the workspace operates in on the host. */
+  remote_cwd: string;
+  message: string;
+}
+
+/** Open a host-backed workspace IN PLACE on its host — no rsync, no local
+ *  copy of the files. Creates a local "attach-in-place" workspace whose
+ *  terminal runs on the host (over the existing SSH-tunneled daemon) in the
+ *  workspace's real on-host directory. Because the host daemon is detached +
+ *  persistent, closing the app leaves it running and reopening reattaches.
+ *
+ *  `syncRowId` is the `WorkspaceSyncView.id` of a host-backed row; the host
+ *  must be configured on this device. Idempotent — opening twice
+ *  re-activates the existing local view. */
+export const workspaceOpenOnHost = (syncRowId: number) =>
+  invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });

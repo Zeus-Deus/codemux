@@ -351,6 +351,37 @@ pub struct WorkspaceSnapshot {
     pub worktree_path: Option<String>,
     #[serde(default)]
     pub project_root: Option<String>,
+    /// Stable, deterministic project identity — `UUIDv5(canonical git
+    /// remote ?? project_root)`, see `crate::project_identity`. Stamped
+    /// at create time (when `project_root` is set). Shared by a repo's
+    /// main checkout and its worktrees, and identical on every device
+    /// that has the same repo. Additive; old persisted state
+    /// deserializes as `None`.
+    #[serde(default)]
+    pub project_uid: Option<String>,
+    /// `"main"` (repo root checkout) | `"worktree"` (per-branch git
+    /// worktree). Derived from `worktree_path` at create time.
+    #[serde(default)]
+    pub workspace_kind: Option<String>,
+    /// True when this workspace is the repo's protected default-branch
+    /// root checkout — the genuine main checkout (not a linked worktree,
+    /// not a bare repo, and not a divergent full copy under
+    /// `~/.codemux/worktrees/`) on its default branch. The overview must
+    /// not let a protected workspace be deleted like a disposable
+    /// worktree. Stamped at create time (and backfilled at boot) by
+    /// `crate::git::is_protected_repo_root`. Additive; old persisted
+    /// state deserializes as `false`.
+    #[serde(default)]
+    pub protected: bool,
+    /// True when this workspace's checkout is a *divergent full copy* of
+    /// a repo (its own `.git` object store) living in the worktrees tree
+    /// — the legacy artifact of the old default-branch push/pull. It is
+    /// NOT linked to the real repo's history and will drift from it. The
+    /// overview surfaces a warning so the user can re-pull cleanly. New
+    /// adoptions land repo roots under `~/.codemux/projects/` and never
+    /// produce this. Additive; old snapshots read as `false`.
+    #[serde(default)]
+    pub divergent_copy: bool,
     #[serde(default)]
     pub pr_number: Option<u32>,
     #[serde(default)]
@@ -382,6 +413,27 @@ pub struct WorkspaceSnapshot {
     /// `None` as "local" exactly as before.
     #[serde(default)]
     pub host_id: Option<i64>,
+    /// The actual working directory of this workspace **on its host**.
+    /// `None` for ordinary local workspaces and for pushed workspaces
+    /// (which land at a deterministic `conventional_remote_path`). It is
+    /// set for "open on host" / attach-in-place workspaces, where the
+    /// host directory was discovered by the inventory poller and lives at
+    /// an arbitrary path the desktop can't reconstruct. When set, the
+    /// daemon-backed terminal spawns into this exact path on the remote
+    /// instead of the reconstructed conventional path. Additive; old
+    /// snapshots deserialize as `None`.
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+    /// True when this workspace is operated **in place on its host with no
+    /// local copy of the files**. Created by `workspace_open_on_host`. The
+    /// `cwd`/`worktree_path` are host paths that do not exist on this
+    /// device, so local-filesystem work (git info, worktree deletion,
+    /// re-push) is skipped and the only teardown is a detach
+    /// (`close_workspace` — never `close_workspace_with_worktree`), which
+    /// leaves the host process running. Additive; old snapshots
+    /// deserialize as `false`.
+    #[serde(default)]
+    pub attach_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +482,11 @@ pub struct PortInfoSnapshot {
     pub process_name: String,
     pub workspace_id: Option<String>,
     pub label: Option<String>,
+    /// Discovery source: `None` = OS-level scan, `Some("docker")` = a
+    /// published container port. Drives the dedicated "Docker" group in the
+    /// ports UI. `#[serde(default)]` keeps older persisted snapshots loadable.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -649,6 +706,10 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -671,6 +732,8 @@ impl AppStateStore {
                 },
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -775,6 +838,10 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -787,6 +854,8 @@ impl AppStateStore {
             active_surface_id: SurfaceId(String::new()),
             surfaces: vec![],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -794,6 +863,271 @@ impl AppStateStore {
             .notifications
             .retain(|notification| notification.workspace_id != workspace_id);
         workspace_id
+    }
+
+    /// Create a workspace shell that will receive its files from an
+    /// upcoming `workspace_pull_back` call. Differs from
+    /// `create_workspace_at_path` and `create_empty_workspace_at_path`
+    /// in three ways:
+    ///
+    /// 1. No git operations run — the rsync from the remote will
+    ///    populate the worktree directory; running `git worktree add`
+    ///    here would just create files rsync would have to clobber.
+    /// 2. `host_id` is set up front, because the caller already knows
+    ///    which device the workspace is being pulled from and the
+    ///    pull-back path keys off `host_id` to find the remote.
+    /// 3. `worktree_path` is set to a path that doesn't exist yet —
+    ///    rsync creates it. This is the entire point of the helper.
+    ///
+    /// Used by `workspaces_adopt_synced` (cross-device adoption) where
+    /// we're materialising a workspace another device of the same
+    /// account already created and pushed to a host. After this
+    /// returns, the caller is expected to immediately call the
+    /// existing `workspace_pull_back` machinery to fetch the files.
+    pub fn create_synced_workspace_shell(
+        &self,
+        title: String,
+        host_id: i64,
+        project_root: Option<String>,
+        worktree_path: String,
+        git_branch: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            // `cwd` mirrors `worktree_path` for adopted workspaces —
+            // when the user opens the workspace, terminals get
+            // spawned in the worktree directory, same as a
+            // freshly-created worktree workspace.
+            cwd: worktree_path.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: Some(worktree_path),
+            project_root,
+            // Adoption lands at a worktree-style path; project_uid is
+            // stamped when the project root is (re)resolved on this
+            // device. The synced row already carries the cross-device
+            // identity from the poller.
+            project_uid: None,
+            workspace_kind: Some("worktree".into()),
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: vec![],
+            // Critical: host_id is set so the pull-back call that
+            // follows knows which device to rsync from. It will be
+            // cleared to None on successful pull.
+            host_id: Some(host_id),
+            remote_cwd: None,
+            attach_only: false,
+        });
+
+        // We deliberately do NOT set this as the active workspace.
+        // The user clicked "Pull to this device" from the overview;
+        // they should land back in the overview when the pull
+        // completes, not in a half-populated pane tree. The frontend
+        // can navigate explicitly on success if it wants.
+        workspace_id
+    }
+
+    /// Like [`create_synced_workspace_shell`], but for adopting a repo's
+    /// ROOT (default-branch) checkout — `workspace_kind = "main"`, no
+    /// `worktree_path`. The shell lands at `project_root`
+    /// (`~/.codemux/projects/<repo>`), NOT in the worktrees tree, so the
+    /// adopted root is classified as a genuine repo root rather than a
+    /// divergent copy. `host_id` is pre-set so the upcoming pull routes
+    /// to the right host; it's cleared on success. `protected` is left
+    /// false here and stamped once the pull lands and the root is
+    /// verified on its default branch.
+    pub fn create_synced_root_shell(
+        &self,
+        title: String,
+        host_id: i64,
+        project_root: String,
+        git_branch: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            cwd: project_root.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: None,
+            project_root: Some(project_root),
+            project_uid: None,
+            workspace_kind: Some("main".into()),
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![],
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: vec![],
+            host_id: Some(host_id),
+            remote_cwd: None,
+            attach_only: false,
+        });
+
+        workspace_id
+    }
+
+    /// Create an **attach-in-place** workspace: a local workspace that is
+    /// operated directly on its host (`host_id`), with its files staying
+    /// on the host (`remote_cwd`) and **nothing copied to this device**.
+    /// This backs the "Open on host" overview action.
+    ///
+    /// Unlike [`create_synced_workspace_shell`] / [`create_synced_root_shell`]
+    /// (which are empty placeholders awaiting an rsync pull), this builds a
+    /// ready-to-use single-terminal layout: opening the workspace
+    /// immediately spawns a shell on the host (the daemon-backed terminal
+    /// path routes `host_id`-bearing workspaces through the SSH-tunneled
+    /// remote daemon, and prefers `remote_cwd` as the spawn directory).
+    ///
+    /// `attach_only` is set so every file-system-bound code path (git info,
+    /// worktree deletion, re-push) is skipped and the only teardown is a
+    /// detach that leaves the host process running.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_remote_attach_workspace(
+        &self,
+        title: String,
+        host_id: i64,
+        remote_cwd: String,
+        git_branch: Option<String>,
+        project_root: Option<String>,
+        project_uid: Option<String>,
+        workspace_kind: Option<String>,
+    ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace_id = WorkspaceId(next_id("workspace"));
+        let surface_id = SurfaceId(next_id("surface"));
+        let session_id = SessionId(next_id("session"));
+        let base_terminal_index = snapshot.terminal_sessions.len() + 1;
+
+        // A single shell session whose cwd is the host directory. The
+        // daemon-backed spawn path re-derives the effective cwd from
+        // `remote_cwd`, so this value is informational, but we keep it
+        // consistent so the UI shows the right path.
+        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
+            session_id: session_id.clone(),
+            title: format!("Terminal {base_terminal_index}"),
+            shell: None,
+            cwd: remote_cwd.clone(),
+            cols: 80,
+            rows: 24,
+            state: TerminalSessionState::Starting,
+            last_message: Some("Preparing shell session".into()),
+            exit_code: None,
+            original_command: None,
+            adapter_captures: Default::default(),
+        });
+
+        let pane_id = PaneId(next_id("pane"));
+        let root = PaneNodeSnapshot::Terminal {
+            pane_id: pane_id.clone(),
+            session_id: session_id.clone(),
+            title: "Terminal".into(),
+        };
+        let default_tab_id = next_id("tab");
+
+        snapshot.workspaces.push(WorkspaceSnapshot {
+            workspace_id: workspace_id.clone(),
+            title,
+            workspace_type: WorkspaceType::Standard,
+            // `cwd` is a host path that does not exist on this device. It
+            // is never used for local FS work (gated behind `attach_only`)
+            // — it's here so the workspace header shows the host directory.
+            cwd: remote_cwd.clone(),
+            git_branch,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            worktree_path: None,
+            project_root,
+            project_uid,
+            workspace_kind,
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            notification_count: 0,
+            latest_agent_state: Some("idle".into()),
+            tabs: vec![TabSnapshot {
+                tab_id: default_tab_id.clone(),
+                kind: TabKind::Terminal,
+                title: "Terminal".into(),
+                surface_id: Some(surface_id.clone()),
+                browser_id: None,
+                icon: None,
+            }],
+            active_tab_id: default_tab_id,
+            active_surface_id: surface_id.clone(),
+            surfaces: vec![SurfaceSnapshot {
+                surface_id,
+                title: "Main Surface".into(),
+                active_pane_id: pane_id,
+                root,
+            }],
+            host_id: Some(host_id),
+            remote_cwd: Some(remote_cwd),
+            attach_only: true,
+        });
+
+        snapshot.active_workspace_id = workspace_id.clone();
+        snapshot
+            .notifications
+            .retain(|notification| notification.workspace_id != workspace_id);
+        workspace_id
+    }
+
+    /// Set the repo-root `protected` flag on a workspace (used by the
+    /// adopt path to mark a freshly-pulled repo root protected without
+    /// recomputing its `project_uid`, which would diverge for
+    /// local-only repos — see `set_workspace_project_identity`).
+    pub fn set_workspace_protected(&self, workspace_id: &str, protected: bool) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            workspace.protected = protected;
+        }
     }
 
     pub fn create_workspace_with_layout(
@@ -873,6 +1207,10 @@ impl AppStateStore {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -897,6 +1235,8 @@ impl AppStateStore {
                 root,
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1260,13 +1600,155 @@ impl AppStateStore {
     }
 
     pub fn set_workspace_project_root(&self, workspace_id: &str, project_root: String) {
+        // Read the on-disk checkout path + branch under a brief lock so
+        // the git subprocesses below (uid + protection) run WITHOUT
+        // holding the state mutex. The checkout to classify is the
+        // worktree dir when this is a worktree, else the project root.
+        let (checkout_path, git_branch) = {
+            let snapshot = self.inner.lock().unwrap();
+            match snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == workspace_id)
+            {
+                Some(w) => (
+                    w.worktree_path
+                        .clone()
+                        .unwrap_or_else(|| project_root.clone()),
+                    w.git_branch.clone(),
+                ),
+                None => return,
+            }
+        };
+
+        // Compute the deterministic project_uid OUTSIDE the lock — the
+        // git remote lookup spawns a subprocess and we don't want to
+        // hold the state mutex across it. Uses the canonical remote when
+        // the repo has one (so it converges with the same repo on other
+        // devices/hosts), else the project-root path. Matches the daemon
+        // (`remote::workspace::create`) so a host copy and a local copy
+        // of the same repo share a project_uid.
+        let remote =
+            crate::project_identity::git_canonical_remote(std::path::Path::new(&project_root));
+        let project_uid =
+            crate::project_identity::project_uid_for(remote.as_deref(), &project_root);
+
+        // Repo-root protection (also outside the lock — more git
+        // subprocesses). Divergence-safe: a full copy under the
+        // worktrees tree is NOT protected even though its `.git` is a
+        // directory (see `crate::git::is_protected_repo_root`).
+        let protected = crate::git::is_protected_repo_root(
+            std::path::Path::new(&checkout_path),
+            git_branch.as_deref(),
+        );
+        // Cheap pure-filesystem check (no subprocess): is this checkout a
+        // divergent full copy living in the worktrees tree?
+        let divergent_copy =
+            crate::git::is_divergent_copy(std::path::Path::new(&checkout_path));
+
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
             .workspaces
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
         {
+            // kind: a worktree has worktree_path set (the per-branch
+            // checkout); otherwise this is the repo root (main).
+            let kind = if workspace.worktree_path.is_some() {
+                "worktree"
+            } else {
+                "main"
+            };
             workspace.project_root = Some(project_root);
+            workspace.project_uid = Some(project_uid);
+            workspace.workspace_kind = Some(kind.to_string());
+            workspace.protected = protected;
+            workspace.divergent_copy = divergent_copy;
+        }
+    }
+
+    /// Boot backfill for `protected` on workspaces that predate the
+    /// repo-unit-sync change (new workspaces get it stamped at create
+    /// time in `set_workspace_project_root`). Spawns git subprocesses
+    /// per workspace, so callers MUST run this off the app-startup path
+    /// (a background thread). Skips remote (host-backed) workspaces —
+    /// their files may not exist locally and they're never protected on
+    /// this device.
+    pub fn backfill_workspace_protection(&self) {
+        // Snapshot the inputs (id, checkout path, branch) under a brief
+        // lock so the git work below runs unlocked.
+        let inputs: Vec<(String, String, Option<String>)> = {
+            let snapshot = self.inner.lock().unwrap();
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|w| w.host_id.is_none())
+                .map(|w| {
+                    let checkout = w
+                        .worktree_path
+                        .clone()
+                        .or_else(|| w.project_root.clone())
+                        .unwrap_or_else(|| w.cwd.clone());
+                    (w.workspace_id.0.clone(), checkout, w.git_branch.clone())
+                })
+                .collect()
+        };
+
+        let computed: Vec<(String, bool, bool)> = inputs
+            .into_iter()
+            .map(|(id, checkout, branch)| {
+                let path = std::path::Path::new(&checkout);
+                let protected =
+                    crate::git::is_protected_repo_root(path, branch.as_deref());
+                let divergent_copy = crate::git::is_divergent_copy(path);
+                (id, protected, divergent_copy)
+            })
+            .collect();
+
+        let mut snapshot = self.inner.lock().unwrap();
+        for (id, protected, divergent_copy) in computed {
+            if let Some(w) = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id.0 == id)
+            {
+                w.protected = protected;
+                w.divergent_copy = divergent_copy;
+            }
+        }
+    }
+
+    /// Stamp a workspace's cross-device project identity directly from
+    /// known values (e.g. the synced row the workspace was adopted
+    /// from), WITHOUT recomputing the uid or touching `project_root`.
+    ///
+    /// Adoption uses this instead of `set_workspace_project_root`: the
+    /// synced row already carries the daemon-computed `project_uid`, so
+    /// copying it verbatim guarantees the adopted workspace converges
+    /// with its siblings on every device — including local-only repos,
+    /// whose path-derived uid would otherwise DIVERGE if recomputed
+    /// against the (different) local landing path. Without this stamp
+    /// the shell's `project_uid: None` also gets pushed back to the
+    /// sync row by `reconcile_from_snapshot` (a plain SET, not COALESCE),
+    /// actively wiping the row's identity.
+    pub fn set_workspace_project_identity(
+        &self,
+        workspace_id: &str,
+        project_uid: Option<String>,
+        workspace_kind: Option<String>,
+    ) {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id.0 == workspace_id)
+        {
+            if project_uid.is_some() {
+                workspace.project_uid = project_uid;
+            }
+            if workspace_kind.is_some() {
+                workspace.workspace_kind = workspace_kind;
+            }
         }
     }
 
@@ -1310,8 +1792,37 @@ impl AppStateStore {
         snapshot
             .workspaces
             .iter()
+            // Attach-in-place ("open on host") workspaces have no local
+            // checkout — their `cwd` is a host path that doesn't exist on
+            // this device, so the periodic git enrichment sweep must skip
+            // them (it would spawn 5-8 doomed git subprocesses every tick).
+            .filter(|w| !w.attach_only)
             .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
             .collect()
+    }
+
+    /// Returns absolute path -> workspace_id for all workspaces, covering
+    /// both the working directory and the git worktree path. The inverse
+    /// direction of `all_workspace_cwds` (path is the key) because Docker
+    /// container matching looks up by the compose `working_dir` path. Paths
+    /// are stored with any trailing slash trimmed so lookups normalize.
+    pub fn all_workspace_paths(&self) -> std::collections::HashMap<String, String> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut map = std::collections::HashMap::new();
+        for w in &snapshot.workspaces {
+            let id = w.workspace_id.0.clone();
+            let cwd = w.cwd.trim_end_matches('/');
+            if !cwd.is_empty() {
+                map.insert(cwd.to_string(), id.clone());
+            }
+            if let Some(worktree_path) = &w.worktree_path {
+                let wt = worktree_path.trim_end_matches('/');
+                if !wt.is_empty() {
+                    map.insert(wt.to_string(), id.clone());
+                }
+            }
+        }
+        map
     }
 
     /// Returns session_id -> workspace_id for all terminal sessions across all workspaces.
@@ -1332,6 +1843,12 @@ impl AppStateStore {
             .workspaces
             .iter()
             .find(|w| w.workspace_id == snapshot.active_workspace_id)?;
+        // Attach-in-place workspaces have no local checkout, so the active-
+        // workspace PR/issue refresh (which shells out to `gh` in `cwd`)
+        // would run against a path that doesn't exist on this device.
+        if workspace.attach_only {
+            return None;
+        }
         Some((workspace.workspace_id.0.clone(), workspace.cwd.clone()))
     }
 
@@ -1591,7 +2108,11 @@ impl AppStateStore {
         let session_id = SessionId(next_id("session"));
         let new_pane_id = PaneId(next_id("pane"));
         let split_pane_id = PaneId(next_id("pane"));
-        let cwd = current_project_root().display().to_string();
+        let cwd = snapshot
+            .workspaces
+            .get(workspace_index)
+            .map(|w| w.cwd.clone())
+            .unwrap_or_else(|| current_project_root().display().to_string());
         let shell = env::var("SHELL").ok();
         let title = format!("Terminal {}", snapshot.terminal_sessions.len() + 1);
 
@@ -3167,6 +3688,10 @@ fn default_app_state() -> AppStateSnapshot {
             git_changed_files: 0,
             worktree_path: None,
             project_root: None,
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
             pr_number: None,
             pr_state: None,
             pr_url: None,
@@ -3195,6 +3720,8 @@ fn default_app_state() -> AppStateSnapshot {
                 },
             }],
             host_id: None,
+            remote_cwd: None,
+            attach_only: false,
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
@@ -4285,6 +4812,75 @@ mod tests {
     }
 
     #[test]
+    fn set_workspace_project_root_stamps_project_identity() {
+        let store = AppStateStore::default();
+        let wid = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-identity-test"),
+            WorkspacePresetLayout::Single,
+        );
+
+        store.set_workspace_project_root(&wid.0, "/tmp/codemux-identity-test".into());
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        // No worktree_path on a layout workspace → it's the root (main).
+        assert_eq!(w.workspace_kind.as_deref(), Some("main"));
+        // Deterministic uid: this path isn't a git repo, so it falls
+        // back to the path-based identity the helper computes.
+        let expected = crate::project_identity::project_uid_for(
+            None,
+            "/tmp/codemux-identity-test",
+        );
+        assert_eq!(
+            w.project_uid.as_deref(),
+            Some(expected.as_str()),
+            "project_uid must be stamped deterministically at create"
+        );
+    }
+
+    #[test]
+    fn create_remote_attach_workspace_sets_in_place_fields_and_a_terminal() {
+        let store = AppStateStore::default();
+        let wid = store.create_remote_attach_workspace(
+            "remote-svc".into(),
+            7,
+            "/srv/agent/work/svc".into(),
+            Some("feature/y".into()),
+            Some("/home/agent/svc".into()),
+            Some("uid-svc".into()),
+            Some("worktree".into()),
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert!(w.attach_only, "open-on-host workspace must be attach_only");
+        assert_eq!(w.host_id, Some(7), "routes terminals to the host daemon");
+        assert_eq!(w.remote_cwd.as_deref(), Some("/srv/agent/work/svc"));
+        // cwd mirrors the host path (display only); no local worktree.
+        assert_eq!(w.cwd, "/srv/agent/work/svc");
+        assert!(w.worktree_path.is_none(), "no local checkout");
+        assert_eq!(w.git_branch.as_deref(), Some("feature/y"));
+        assert_eq!(w.project_uid.as_deref(), Some("uid-svc"));
+        assert_eq!(w.workspace_kind.as_deref(), Some("worktree"));
+        // It opens ready-to-use: one terminal surface, and it's active.
+        assert_eq!(w.surfaces.len(), 1, "a single terminal pane to attach");
+        assert!(matches!(
+            w.surfaces[0].root,
+            PaneNodeSnapshot::Terminal { .. }
+        ));
+        assert_eq!(
+            snap.active_workspace_id, wid,
+            "opening on host activates the workspace"
+        );
+        // It must be excluded from the periodic local git-enrichment sweep
+        // (its cwd is a host path that doesn't exist on this device).
+        assert!(
+            !store.all_workspace_cwds().contains_key(&wid.0),
+            "attach_only workspaces are skipped by the git enrichment sweep"
+        );
+    }
+
+    #[test]
     fn workspace_mute_toggles_and_scopes_to_the_owning_session() {
         let store = AppStateStore::default();
         let workspace_id = store.create_workspace_with_layout(
@@ -4440,6 +5036,202 @@ mod tests {
         assert_eq!(
             snapshot.active_workspace_id, workspace_id,
             "Empty layout still activates the new workspace (parity with other variants)",
+        );
+    }
+
+    #[test]
+    fn create_synced_workspace_shell_sets_host_id_and_worktree_path() {
+        // The shell is what cross-device adoption creates BEFORE the
+        // rsync runs — host_id must be pre-set (the upcoming
+        // workspace_pull_back routes off it), worktree_path must be
+        // the empty target the rsync will populate, and no tabs /
+        // surfaces / sessions get allocated (the user hasn't opened
+        // panes yet — they will after the pull completes).
+        let store = AppStateStore::default();
+        let workspace_id = store.create_synced_workspace_shell(
+            "codemux/feature-x".into(),
+            42, // local hosts.id
+            Some("/home/zeus/projects/codemux".into()),
+            "/home/zeus/.codemux/worktrees/codemux/feature-x".into(),
+            Some("feature-x".into()),
+        );
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == workspace_id)
+            .expect("shell must be registered");
+        assert_eq!(workspace.title, "codemux/feature-x");
+        assert_eq!(workspace.host_id, Some(42));
+        assert_eq!(
+            workspace.worktree_path.as_deref(),
+            Some("/home/zeus/.codemux/worktrees/codemux/feature-x"),
+        );
+        // cwd mirrors worktree_path so terminals spawn in the right
+        // place once the pull completes.
+        assert_eq!(
+            workspace.cwd,
+            "/home/zeus/.codemux/worktrees/codemux/feature-x",
+        );
+        assert_eq!(
+            workspace.project_root.as_deref(),
+            Some("/home/zeus/projects/codemux"),
+        );
+        assert_eq!(workspace.git_branch.as_deref(), Some("feature-x"));
+        assert!(
+            workspace.surfaces.is_empty(),
+            "Shell must have no surfaces — rsync populates the worktree, panes come later",
+        );
+        assert!(
+            workspace.tabs.is_empty(),
+            "Shell must have no tabs",
+        );
+    }
+
+    #[test]
+    fn create_synced_root_shell_registers_a_repo_root_not_a_worktree() {
+        // Adopting a `main` row creates a ROOT shell: it lands at the
+        // project root (~/.codemux/projects/<repo>), has NO worktree_path,
+        // and is kind "main" — so it classifies as a genuine repo root
+        // rather than a divergent copy in the worktrees tree.
+        let store = AppStateStore::default();
+        let wid = store.create_synced_root_shell(
+            "passpage".into(),
+            42,
+            "/home/zeus/.codemux/projects/passpage".into(),
+            Some("main".into()),
+        );
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == wid)
+            .expect("root shell registered");
+        assert_eq!(ws.host_id, Some(42));
+        assert_eq!(ws.worktree_path, None, "a repo root has no worktree_path");
+        assert_eq!(ws.cwd, "/home/zeus/.codemux/projects/passpage");
+        assert_eq!(
+            ws.project_root.as_deref(),
+            Some("/home/zeus/.codemux/projects/passpage"),
+        );
+        assert_eq!(ws.workspace_kind.as_deref(), Some("main"));
+        assert!(!ws.protected, "protected is stamped after the pull lands");
+
+        // The protected setter flips it without touching identity.
+        store.set_workspace_protected(&wid.0, true);
+        assert!(
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == wid)
+                .unwrap()
+                .protected
+        );
+    }
+
+    #[test]
+    fn set_workspace_project_identity_stamps_uid_from_synced_row() {
+        // Adoption stamps the daemon-derived identity from the synced
+        // row (NOT a local recompute) so the adopted workspace converges
+        // with its siblings and the post-adopt reconcile doesn't push a
+        // None uid back over the row, wiping it.
+        let store = AppStateStore::default();
+        let wid = store.create_synced_workspace_shell(
+            "proj".into(),
+            7,
+            Some("/srv/proj".into()),
+            "/home/zeus/.codemux/worktrees/proj/main".into(),
+            Some("main".into()),
+        );
+        // Shell starts with no project_uid.
+        assert!(workspace_by_id(&store.snapshot(), &wid).project_uid.is_none());
+
+        store.set_workspace_project_identity(
+            &wid.0,
+            Some("daemon-uid-xyz".into()),
+            Some("main".into()),
+        );
+
+        let snap = store.snapshot();
+        let w = workspace_by_id(&snap, &wid);
+        assert_eq!(
+            w.project_uid.as_deref(),
+            Some("daemon-uid-xyz"),
+            "uid must be copied verbatim from the synced row",
+        );
+        assert_eq!(w.workspace_kind.as_deref(), Some("main"));
+
+        // A None passed in must NOT clobber an already-set value
+        // (older daemons send no uid — leave whatever's there).
+        store.set_workspace_project_identity(&wid.0, None, None);
+        assert_eq!(
+            workspace_by_id(&store.snapshot(), &wid)
+                .project_uid
+                .as_deref(),
+            Some("daemon-uid-xyz"),
+            "None must be a no-op, not a wipe",
+        );
+    }
+
+    #[test]
+    fn create_synced_workspace_shell_does_not_activate_workspace() {
+        // The user clicked Pull from the Workspaces overview; they
+        // should land back in the overview when the pull completes,
+        // NOT in a half-populated workspace. Activation is the
+        // frontend's call via the success toast's "Open" action.
+        let store = AppStateStore::default();
+        let prior_active = store.snapshot().active_workspace_id.clone();
+        let _ = store.create_synced_workspace_shell(
+            "shell".into(),
+            1,
+            None,
+            "/tmp/shell".into(),
+            None,
+        );
+        let snapshot = store.snapshot();
+        assert_eq!(
+            snapshot.active_workspace_id, prior_active,
+            "Shell creation must not steal the active workspace slot",
+        );
+    }
+
+    #[test]
+    fn split_pane_inherits_workspace_cwd() {
+        // Shift+clicking a preset (or a plain split) opens a new pane
+        // in the same surface. The new terminal session must spawn in
+        // the workspace directory — not the app process's current dir,
+        // which is typically the home directory. Regression guard for
+        // the split-pane preset landing in $HOME instead of the
+        // workspace.
+        let store = AppStateStore::default();
+        let workspace_id =
+            store.create_workspace_at_path(PathBuf::from("/tmp/codemux-split-cwd-test"));
+
+        let active_pane_id = {
+            let snapshot = store.snapshot();
+            let workspace = workspace_by_id(&snapshot, &workspace_id);
+            let surface = workspace
+                .surfaces
+                .iter()
+                .find(|surface| surface.surface_id == workspace.active_surface_id)
+                .expect("workspace must have an active surface");
+            surface.active_pane_id.clone()
+        };
+
+        let new_session_id = store
+            .split_pane(&active_pane_id.0, SplitDirection::Horizontal)
+            .expect("split must succeed");
+
+        let snapshot = store.snapshot();
+        let session = snapshot
+            .terminal_sessions
+            .iter()
+            .find(|session| session.session_id == new_session_id)
+            .expect("split must create a terminal session");
+        assert_eq!(
+            session.cwd, "/tmp/codemux-split-cwd-test",
+            "split pane must inherit the workspace cwd, not the app's current dir",
         );
     }
 

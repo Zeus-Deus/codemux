@@ -1,0 +1,2104 @@
+//! Tauri commands for the cross-device workspace sync surface.
+//!
+//! The frontend reads `workspaces_sync_list` to render the
+//! Workspaces overview — including workspaces that live on *other*
+//! devices of the same account (rows with `workspace_id: null`).
+//! Sibling-device rows show up as "lives on another device" cards
+//! and can be adopted into this device via `workspaces_sync_adopt`.
+
+use serde::Serialize;
+use tauri::{Manager, State};
+
+use crate::database::{DatabaseStore, WorkspaceSyncRecord};
+
+// ── Adoption serialization lock ──
+//
+// Two near-simultaneous adopts of the SAME row — a double-clicked "Pull",
+// or the host-inventory poller racing a manual pull — would both pass the
+// `workspace_id`-already-set idempotency guard (a TOCTOU window) and create
+// duplicate local shells / clobber the same landing path. A per-key async
+// lock serializes them so the second waits, then sees the first's result
+// and short-circuits. Mirrors Superset's `workspaceCreateLocks`.
+//
+// Keyed by `server_id` (the row identity). The map grows by one entry per
+// distinct row ever adopted on this device — bounded in practice, and the
+// guard is the whole point, so we don't bother pruning.
+fn adopt_locks(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>
+{
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+        >,
+    > = std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Acquire the adoption lock for `key`, awaiting any in-flight adopt of the
+/// same key. Hold the returned guard for the whole adopt body.
+async fn acquire_adopt_lock(key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+    let mutex = {
+        let mut map = adopt_locks().lock().unwrap();
+        map.entry(key.to_string())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    mutex.lock_owned().await
+}
+
+// ── Local adoption landing paths ──
+//
+// When a sibling workspace is adopted onto THIS device, its files land at a
+// local path under `~/.codemux`. Those paths are keyed on the project's
+// deterministic `project_uid` (`<basename>-<short-uid>`) so adopting two
+// DIFFERENT projects that share a basename (e.g. `acme/api` and
+// `widgets/api`) no longer collide locally — mirroring the host-side re-key
+// done in PR #63. Every adoption surface (preview, host-backed adopt, clone,
+// worktree-rsync) routes through these helpers so they all agree on where a
+// row lands; if they disagreed, a re-pull would duplicate.
+//
+// Basename read-fallback: a copy adopted BEFORE the re-key lives at the bare
+// `<basename>` path. When such a directory already exists on disk we reuse it
+// instead of landing a second copy at the new uid-keyed path — so re-pull
+// stays idempotent for already-adopted workspaces. `project_uid = None`
+// makes the keyed path identical to the legacy basename path, so pre-re-key
+// rows are unaffected regardless of what's on disk.
+
+/// Pick between the uid-keyed landing and the legacy bare-basename landing.
+/// Prefer the legacy path ONLY when it differs from the keyed one AND already
+/// exists on disk (a pre-re-key adopted copy we must keep reusing). Kept pure
+/// — the `legacy_exists` flag is injected — so the decision is unit-testable;
+/// real callers pass `legacy.exists()`.
+fn choose_landing(
+    keyed: std::path::PathBuf,
+    legacy: std::path::PathBuf,
+    legacy_exists: bool,
+) -> std::path::PathBuf {
+    if keyed != legacy && legacy_exists {
+        legacy
+    } else {
+        keyed
+    }
+}
+
+/// Absolute local landing dir for an adopted repo ROOT
+/// (`~/.codemux/projects/<basename>-<short-uid>`), with the basename
+/// read-fallback. Used for `main`/root rows and as the repo dir that
+/// worktree adoptions hang their recreated worktrees off of.
+fn adopt_root_landing(project_uid: Option<&str>, project_name: &str) -> String {
+    let keyed = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_root_path_keyed(
+            project_uid,
+            project_name,
+        ),
+    );
+    let legacy = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_root_path(project_name),
+    );
+    let legacy_exists = legacy.exists();
+    choose_landing(keyed, legacy, legacy_exists)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Absolute local landing dir for an adopted WORKTREE
+/// (`~/.codemux/worktrees/<basename>-<short-uid>/<branch>`), with the basename
+/// read-fallback.
+fn adopt_worktree_landing(
+    project_uid: Option<&str>,
+    project_name: &str,
+    branch: &str,
+) -> String {
+    let keyed = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path_keyed(
+            project_uid,
+            project_name,
+            branch,
+        ),
+    );
+    let legacy = crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path(project_name, branch),
+    );
+    let legacy_exists = legacy.exists();
+    choose_landing(keyed, legacy, legacy_exists)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Predicted local worktree landing for a row that adopts via **repo-rsync +
+/// `git_create_worktree`** — a `worktree`-kind host row (`adopt_worktree_via_repo_rsync`)
+/// or any clone-adopt (`workspaces_adopt_via_clone`). `git_create_worktree`
+/// derives the worktree dir from the repo ROOT dir's basename, so the
+/// worktree's uid-suffix tracks the ROOT landing decision — NOT an independent
+/// `worktrees/<name>/<branch>` existence check. The preview uses this so it
+/// agrees with where such a row actually lands: e.g. when a copy adopted before
+/// the re-key already occupies the bare `projects/<name>` path, `adopt_root_landing`
+/// reuses it and the worktree lands bare too (`worktrees/<name>/<branch>`).
+///
+/// Single-dir adoptions (null/legacy host rows) use [`adopt_worktree_landing`]
+/// instead, where the worktree dir IS the rsync target and so must key on the
+/// `worktrees/` path directly.
+fn adopt_worktree_landing_via_repo(
+    project_uid: Option<&str>,
+    project_name: &str,
+    branch: &str,
+) -> String {
+    let root = adopt_root_landing(project_uid, project_name);
+    let root_basename = std::path::Path::new(&root)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(project_name);
+    crate::workspace_paths::expand_tilde(
+        &crate::workspace_paths::conventional_remote_path(root_basename, branch),
+    )
+    .to_string_lossy()
+    .to_string()
+}
+
+/// Wire shape sent to the frontend. Matches the field naming the
+/// existing UI expects (snake_case from Rust, camelCase from
+/// serde-rename on JS-facing structs would be inconsistent with the
+/// rest of the codebase — keep snake_case throughout).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceSyncView {
+    /// Local sync-table row id. Stable across pulls within a device.
+    pub id: i64,
+    /// Server-assigned id. None until the row's first successful push.
+    pub server_id: Option<String>,
+    /// Local workspace_id this row corresponds to. None for rows
+    /// pulled from sibling devices that haven't been adopted here.
+    pub workspace_id: Option<String>,
+    pub title: String,
+    /// Server-side host id (matches `HostView.server_id`). None means
+    /// the workspace is local to the device that authored it.
+    pub host_server_id: Option<String>,
+    pub project_path: Option<String>,
+    pub project_remote: Option<String>,
+    pub git_branch: Option<String>,
+    /// Phase-4 divergence detection: HEAD sha at last reconcile.
+    pub git_head_sha: Option<String>,
+    /// Deterministic project identity (`UUIDv5`); see
+    /// `crate::project_identity`. The overview groups workspaces that
+    /// share this so a project's main checkout and its worktrees read
+    /// as one project. May be null on rows that haven't been stamped
+    /// (e.g. pulled from a sibling device pre-Phase-2).
+    pub project_uid: Option<String>,
+    /// `"main"` | `"worktree"` — the overview renders a kind badge.
+    pub workspace_kind: Option<String>,
+    /// The repo's default branch (daemon-reported: `origin/HEAD` →
+    /// main/master → current). Lets the overview render a remote project's
+    /// root distinctly and the pull land it on the right branch even when
+    /// `git_branch` is null. Local-only — never round-trips through the cloud.
+    pub default_branch: Option<String>,
+    /// The workspace's actual absolute path on its host (daemon-reported,
+    /// set by the inventory poller). Drives the "Open on host" action and
+    /// lets the overview dedupe a host row against an already-open
+    /// attach-in-place local workspace. Local-only; never synced to cloud.
+    pub origin_path: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    /// True when the row has unpushed changes. The UI shows a
+    /// "Pending sync" pill for these.
+    pub dirty: bool,
+}
+
+impl From<WorkspaceSyncRecord> for WorkspaceSyncView {
+    fn from(r: WorkspaceSyncRecord) -> Self {
+        WorkspaceSyncView {
+            id: r.id,
+            server_id: r.server_id,
+            workspace_id: r.workspace_id,
+            title: r.title,
+            host_server_id: r.host_server_id,
+            project_path: r.project_path,
+            project_remote: r.project_remote,
+            git_branch: r.git_branch,
+            git_head_sha: r.git_head_sha,
+            project_uid: r.project_uid,
+            workspace_kind: r.workspace_kind,
+            default_branch: r.default_branch,
+            origin_path: r.origin_path,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+            dirty: r.dirty,
+        }
+    }
+}
+
+/// List every workspace this account knows about (across all devices)
+/// that this device has either authored or pulled from the server.
+/// Tombstones are excluded — only live rows are returned.
+///
+/// Rendering rules for the UI:
+/// - `workspace_id` set → the workspace also exists in this device's
+///   app_state; cross-reference to render the rich local card.
+/// - `workspace_id` null → lives on another device; render a
+///   minimal "remote" card with title + host + branch and offer the
+///   "Pull to this device" affordance (when implemented).
+#[tauri::command]
+pub fn workspaces_sync_list(
+    db: State<'_, DatabaseStore>,
+) -> Vec<WorkspaceSyncView> {
+    db.list_workspaces_sync()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Trigger an immediate sync pass (pull + push). Returns when both
+/// halves have finished or one has errored. Use sparingly — the
+/// background loop already runs every 30 seconds.
+///
+/// Returns Ok(()) when the user is not signed in (sync is a no-op,
+/// not an error in that case — matches the hosts and automations
+/// commands).
+#[tauri::command]
+pub async fn workspaces_sync_now(
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    // Snapshot + reconcile in a sync block so we don't carry the
+    // State<'_> guard (which is not Send) across the await below.
+    {
+        let db_state: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+        let snapshot = app_state.snapshot();
+        crate::workspaces_sync::reconcile_from_snapshot(
+            db_state.inner(),
+            &snapshot,
+        )?;
+    }
+    crate::workspaces_sync::try_sync_with_app(&app).await
+}
+
+// ─── Open on host (attach in place, no pull) ────────────────────
+//
+// "Open on host" is the no-copy sibling of adoption. Instead of
+// rsyncing a host workspace down to this device, it creates a local
+// *attach-in-place* workspace that runs entirely on the host: its
+// terminal spawns through the same SSH-tunneled pty-daemon the push
+// flow uses, in the workspace's real on-host directory, and nothing
+// lands under `~/.codemux/` locally. Because the host daemon is
+// detached + persistent (see `ssh::tunnel::build_remote_command`),
+// closing the app leaves the process running and reopening reattaches.
+
+/// Result of [`workspace_open_on_host`].
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenOnHostOutcome {
+    /// The new (or already-open) local attach-in-place workspace id.
+    pub workspace_id: String,
+    /// The directory the workspace operates in on the host.
+    pub remote_cwd: String,
+    /// Human-facing summary for the success toast.
+    pub message: String,
+}
+
+/// Resolve the on-host working directory for a host-backed sync row.
+/// Prefers the daemon-reported `origin_path` (works for workspaces an
+/// agent created at an arbitrary path), falling back to the conventional,
+/// `project_uid`-keyed path the push flow uses. Pure so it's unit-testable
+/// without a DB.
+pub(crate) fn resolve_open_on_host_cwd(
+    origin_path: Option<&str>,
+    project_path: Option<&str>,
+    title: &str,
+    project_uid: Option<&str>,
+    git_branch: Option<&str>,
+    default_branch: Option<&str>,
+) -> String {
+    if let Some(p) = origin_path.map(str::trim).filter(|p| !p.is_empty()) {
+        return p.to_string();
+    }
+    let project_name = project_path
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(title);
+    let branch = git_branch
+        .or(default_branch)
+        .filter(|b| !b.is_empty())
+        .unwrap_or("main");
+    // Use `workspace_paths` (cross-platform) rather than the `ssh`
+    // re-export — `crate::ssh` is `#[cfg(unix)]`-gated and this command
+    // module compiles on Windows too.
+    crate::workspace_paths::conventional_remote_path_keyed(project_uid, project_name, branch)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Open a host-backed workspace **in place on its host** — no local copy.
+///
+/// `sync_row_id` is the local `workspaces_sync` row id (the
+/// `WorkspaceSyncView.id` the overview renders). The row must be
+/// host-backed (`host_server_id` set) and that host must be configured on
+/// this device (so the SSH tunnel can be established). Idempotent: opening
+/// the same host workspace twice re-activates the existing local view.
+#[tauri::command]
+pub async fn workspace_open_on_host(
+    app: tauri::AppHandle,
+    sync_row_id: i64,
+) -> Result<OpenOnHostOutcome, String> {
+    // Serialize concurrent opens of the same row (double-click) so they
+    // can't both pass the idempotency check and create two local views.
+    let _guard = acquire_adopt_lock(&format!("open-on-host:{sync_row_id}")).await;
+
+    let db: State<'_, DatabaseStore> = app.state();
+    let app_state: State<'_, crate::state::AppStateStore> = app.state();
+
+    let row = db
+        .list_workspaces_sync_for_sync()
+        .into_iter()
+        .find(|r| r.id == sync_row_id)
+        .ok_or_else(|| format!("Synced workspace not found: row {sync_row_id}"))?;
+
+    // Must be host-backed — a sibling-device-only row (no host) can't be
+    // operated in place; it has to be pulled.
+    let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+        "open_on_host_unsupported: This workspace isn't backed by a configured \
+         host — it lives only on another device. Pull it to this device instead."
+            .to_string()
+    })?;
+
+    // The host must be configured on THIS device so we can SSH to it.
+    let local_host = db
+        .list_hosts()
+        .into_iter()
+        .find(|h| h.server_id.as_deref() == Some(host_server_id))
+        .ok_or_else(|| {
+            format!(
+                "host_not_configured: The host this workspace lives on \
+                 (host_server_id={host_server_id}) is not configured on this \
+                 device. Add it in Settings → Hosts, then try again."
+            )
+        })?;
+
+    let remote_cwd = resolve_open_on_host_cwd(
+        row.origin_path.as_deref(),
+        row.project_path.as_deref(),
+        row.title.as_str(),
+        row.project_uid.as_deref(),
+        row.git_branch.as_deref(),
+        row.default_branch.as_deref(),
+    );
+
+    // Idempotency: if an attach-in-place view of this exact host + path is
+    // already open, re-activate it instead of stacking a duplicate.
+    {
+        let snapshot = app_state.snapshot();
+        if let Some(existing) = snapshot.workspaces.iter().find(|w| {
+            w.attach_only
+                && w.host_id == Some(local_host.id)
+                && w.remote_cwd.as_deref() == Some(remote_cwd.as_str())
+        }) {
+            let existing_id = existing.workspace_id.0.clone();
+            app_state.activate_workspace(&existing_id);
+            crate::state::emit_app_state(&app);
+            return Ok(OpenOnHostOutcome {
+                workspace_id: existing_id,
+                remote_cwd,
+                message: format!("Already open on {}.", local_host.name),
+            });
+        }
+    }
+
+    let workspace_id = app_state.create_remote_attach_workspace(
+        row.title.clone(),
+        local_host.id,
+        remote_cwd.clone(),
+        row.git_branch.clone(),
+        row.project_path.clone(),
+        row.project_uid.clone(),
+        row.workspace_kind.clone(),
+    );
+    app_state.activate_workspace(&workspace_id.0);
+    crate::state::emit_app_state(&app);
+
+    Ok(OpenOnHostOutcome {
+        workspace_id: workspace_id.0,
+        remote_cwd,
+        message: format!("Opened on {} — running in place on the host.", local_host.name),
+    })
+}
+
+// ─── Cross-device adoption ──────────────────────────────────────
+//
+// "Adoption" is the act of taking a workspace that exists on another
+// device of the same account and materialising a local copy of it
+// on this device. The synced row in `workspaces_sync` already carries
+// the metadata (title, host_server_id, project_path, branch); the
+// adoption flow's job is to:
+//
+//   1. Validate the user actually CAN adopt (host configured,
+//      target path free, etc.).
+//   2. Create a local workspace shell.
+//   3. Link the sync row to the new local workspace_id.
+//   4. Drive the existing pull-back rsync to populate the files.
+//
+// Two adoption paths exist:
+//   - **Host-backed** (`host_server_id` is set on the sync row): the
+//     workspace lives on a host this device knows about; we rsync
+//     from that host. Implemented in `workspaces_adopt_synced` below.
+//   - **Clone fallback** (`host_server_id` is null, no shared host):
+//     the workspace lives on a sibling device only; we'd need to
+//     `git clone` the project_remote into a fresh worktree. Tracked
+//     for Phase 3, not yet implemented.
+
+/// Snapshot of "can we adopt this synced workspace, and how?". The
+/// frontend calls this when the Pull dialog opens so it can decide
+/// which variant to render (host-backed vs clone fallback) and
+/// surface the suggested target path without a second round-trip.
+///
+/// Field semantics:
+/// - `can_host_adopt`: true when the sync row's `host_server_id`
+///   resolves to a configured local host. The headline pull path.
+/// - `can_clone_adopt`: true when the sync row has a `project_remote`
+///   set. Reserved for Phase 3; this command surfaces the flag so
+///   the dialog can hint at the option even before it ships.
+/// - `host_configured`: same as `can_host_adopt` but separately
+///   named so the dialog can show "Configure your host first" copy
+///   when the row HAS a host_server_id but this device doesn't know
+///   it yet.
+/// - `host_label`: friendly name to render in the dialog summary
+///   (`"From devbox"`). Null when no host applies.
+/// - `project_already_cloned_at`: Phase-3 hint. Always None today.
+/// - `suggested_path`: the canonical local worktree path the rsync
+///   will land at. Pre-computed so the dialog can show it.
+/// - `is_path_in_use`: when the suggested path already belongs to a
+///   different local workspace. Bare-flag for now; the eventual
+///   dialog UX offers `pickFolderDialog()` to choose an alternate.
+/// - `already_adopted_workspace_id`: short-circuit — if the user
+///   clicks Pull on a row they've already adopted, the dialog can
+///   skip itself and just open the existing workspace.
+/// - `same_branch_project_exists_at`: stronger conflict guard than
+///   `is_path_in_use`. Set to the local `workspace_id` of any other
+///   workspace this device has open whose `(basename(project_path),
+///   git_branch)` matches the row being previewed. That tuple is the
+///   cross-device identity for "same branch of the same project,"
+///   even when the two devices store the repo at different absolute
+///   paths. Pulling on top of such a row would silently create a
+///   parallel copy of work the user is already doing — so the dialog
+///   disables Pull and points at the existing workspace instead. Null
+///   when no conflict is detected.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptionPreview {
+    pub can_host_adopt: bool,
+    pub can_clone_adopt: bool,
+    pub host_configured: bool,
+    pub host_label: Option<String>,
+    pub project_already_cloned_at: Option<String>,
+    pub suggested_path: String,
+    pub is_path_in_use: bool,
+    pub already_adopted_workspace_id: Option<String>,
+    pub same_branch_project_exists_at: Option<String>,
+}
+
+/// Successful adoption result. The frontend uses `workspace_id` to
+/// navigate to the newly-adopted workspace (or to surface a "Open
+/// workspace" CTA in the success toast).
+#[derive(Debug, Clone, Serialize)]
+pub struct AdoptOutcome {
+    pub workspace_id: String,
+    pub worktree_path: String,
+    pub message: String,
+}
+
+#[tauri::command]
+pub fn workspaces_adoption_preview(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptionPreview, String> {
+    let db: tauri::State<'_, DatabaseStore> = app.state();
+    let app_state: tauri::State<'_, crate::state::AppStateStore> =
+        app.state();
+
+    // Locate the synced row by its server-assigned id.
+    let row = db
+        .list_workspaces_sync_for_sync()
+        .into_iter()
+        .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+        .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+    // Host resolution: synced row carries `host_server_id`; we map
+    // it to our local hosts row via the matching `hosts.server_id`.
+    let (host_configured, host_label, local_host_id) = match row
+        .host_server_id
+        .as_deref()
+    {
+        Some(hsid) => {
+            let local_host = db
+                .list_hosts()
+                .into_iter()
+                .find(|h| h.server_id.as_deref() == Some(hsid));
+            match local_host {
+                Some(h) => (true, Some(h.name.clone()), Some(h.id)),
+                None => (false, None, None),
+            }
+        }
+        None => (false, None, None),
+    };
+
+    // Phase-3 placeholder: clone adoption is unimplemented for now.
+    let can_clone_adopt = row.project_remote.is_some();
+
+    // Compute the canonical local worktree path. Reuses the same
+    // helper that pushes use, so a workspace pushed from this device
+    // and adopted on another lands at structurally identical paths
+    // on both sides.
+    // Prefer the project_path basename; fall back to the workspace
+    // title when the originating host never recorded a project root
+    // (e.g. a root/main checkout created via the MCP `workspace_create`
+    // tool). The title is always present, so a synced workspace never
+    // collapses to the generic `~/.codemux/worktrees/workspace/<branch>`
+    // landing path. `conventional_remote_path` still guards the empty
+    // case as a last resort.
+    let project_name = row
+        .project_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(row.title.as_str());
+    let branch = row.git_branch.as_deref().unwrap_or("main");
+    // Key the landing on the row's project_uid (basename read-fallback) so the
+    // preview matches EXACTLY where adoption lands — including the root-vs-
+    // worktree split AND the per-kind adopt route (the worktree dir's uid-suffix
+    // tracks different fallbacks depending on how the row materialises). Without
+    // keying, two different same-basename projects would preview (and land) at
+    // the same local path.
+    let suggested_path = match row.workspace_kind.as_deref() {
+        // A repo ROOT lands under `projects/`.
+        Some("main") => adopt_root_landing(row.project_uid.as_deref(), project_name),
+        // A `worktree`-kind row materialises via repo-rsync + `git worktree add`,
+        // so its worktree dir is derived from the repo ROOT's landing basename —
+        // predict it the same way (see `adopt_worktree_landing_via_repo`) so the
+        // preview still agrees when a pre-re-key root occupies the bare
+        // `projects/<name>` path.
+        Some("worktree") => adopt_worktree_landing_via_repo(
+            row.project_uid.as_deref(),
+            project_name,
+            branch,
+        ),
+        // Null/legacy rows adopt single-dir (the worktree dir IS the rsync
+        // target), so the landing tracks the `worktrees/` fallback directly.
+        _ => adopt_worktree_landing(row.project_uid.as_deref(), project_name, branch),
+    };
+
+    // Detect path conflict against other live workspaces.
+    let snapshot = app_state.snapshot();
+    let is_path_in_use = snapshot.workspaces.iter().any(|w| {
+        let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+        p == suggested_path.as_str()
+            && row
+                .workspace_id
+                .as_deref()
+                .map_or(true, |adopted| w.workspace_id.0 != adopted)
+    });
+
+    // The set of workspace ids actually live in app_state right now.
+    // The same-branch conflict guard below intersects against this so
+    // a sync row still linked to a CLOSED workspace (its soft-delete
+    // hasn't purged yet, or was resurrected by a pull) is not mistaken
+    // for "you already have this branch open." Mirrors the liveness
+    // check the overview (`use-overview-items`) and the adopt
+    // idempotency path already apply.
+    let live_workspace_ids: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .map(|w| w.workspace_id.0.clone())
+        .collect();
+
+    let already_adopted_workspace_id = row.workspace_id.clone();
+
+    // Cross-machine same-branch-same-project guard. The dialog uses
+    // this to disable Pull and point the user at the existing local
+    // workspace instead of silently creating a parallel copy of work
+    // they're already doing on this device.
+    //
+    // We identify "same project" by the project_path basename (the
+    // closest cross-machine identity we have without git remote URL
+    // round-tripping — both devices may store the repo at different
+    // absolute paths). "Same branch" is straightforward via
+    // git_branch.
+    //
+    // Skip when the previewed row is itself the local one (already
+    // adopted) — that's the `already_adopted_workspace_id` short-
+    // circuit's job, not this guard's.
+    let same_branch_project_exists_at = detect_same_branch_project_conflict(
+        &db,
+        &row,
+        &live_workspace_ids,
+    );
+
+    Ok(AdoptionPreview {
+        can_host_adopt: host_configured && local_host_id.is_some(),
+        can_clone_adopt,
+        host_configured,
+        host_label,
+        project_already_cloned_at: None,
+        suggested_path,
+        is_path_in_use,
+        already_adopted_workspace_id,
+        same_branch_project_exists_at,
+    })
+}
+
+/// Walk every local sync row this device has a `workspace_id` for
+/// and find one whose `(basename(project_path), git_branch)` matches
+/// the previewed remote row. Returns the matching local workspace_id,
+/// or None.
+///
+/// The basename match is deliberate — across two devices the same git
+/// repo will almost always be checked out at paths that share a final
+/// segment (`~/projects/foo` here, `/home/deus/projects/foo` there).
+/// Comparing the full path would miss this almost every time. False
+/// positives are bounded: the user would have to maintain two
+/// repositories on this device with the same basename and the same
+/// branch, both with `project_path` recorded — extremely rare in
+/// practice.
+///
+/// `live_workspace_ids` is the set of workspace ids currently present
+/// in app_state. A sync row's `workspace_id` is only treated as "this
+/// device already has it" when that id is still live. Without this
+/// guard a row left linked to a CLOSED workspace — its soft-delete not
+/// yet purged, or resurrected by a `pull` from the server — would
+/// surface a phantom "you already have this branch open" conflict and
+/// block a legitimate re-pull. This matches the liveness filter the
+/// overview (`use-overview-items`) and the adopt idempotency path
+/// already apply, so the three surfaces agree on what counts as
+/// locally present.
+fn detect_same_branch_project_conflict(
+    db: &DatabaseStore,
+    previewed: &WorkspaceSyncRecord,
+    live_workspace_ids: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let previewed_branch = previewed.git_branch.as_deref()?;
+    // Prefer the stable, deterministic project_uid when the previewed
+    // row carries one (Phase 1 of the project-identity work). It's an
+    // exact identity — no false positives from two unrelated repos that
+    // happen to share a basename, and no false negatives when the same
+    // repo lives at different paths on two devices. Fall back to the
+    // legacy `basename(project_path)` heuristic for rows that predate
+    // project_uid.
+    let previewed_basename = previewed
+        .project_path
+        .as_deref()
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .and_then(|n| n.to_str());
+    if previewed.project_uid.is_none() && previewed_basename.is_none() {
+        return None;
+    }
+
+    for r in db.list_workspaces_sync() {
+        // Only compare against rows that DO correspond to a local
+        // workspace (workspace_id IS NOT NULL). Sibling-device rows
+        // are not "this device has it already" — skip them.
+        let Some(local_wid) = r.workspace_id.as_deref() else {
+            continue;
+        };
+        // Skip rows whose linked workspace is no longer live in
+        // app_state. A non-null `workspace_id` alone doesn't mean the
+        // workspace still exists — it may have been closed/deleted with
+        // a stale sync row left behind. Treating such an orphan as a
+        // conflict is exactly the phantom "you already have this branch
+        // open" bug this guard must avoid.
+        if !live_workspace_ids.contains(local_wid) {
+            continue;
+        }
+        // Don't flag the previewed row's own local copy.
+        if previewed.workspace_id.as_deref() == Some(local_wid) {
+            continue;
+        }
+        // Branch must match in all cases.
+        if r.git_branch.as_deref() != Some(previewed_branch) {
+            continue;
+        }
+        // Same project: exact project_uid when both sides have one,
+        // otherwise the basename fallback.
+        let same_project = match (previewed.project_uid.as_deref(), r.project_uid.as_deref()) {
+            (Some(a), Some(b)) => a == b,
+            _ => {
+                let local_basename = r
+                    .project_path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|n| n.to_str());
+                previewed_basename.is_some() && local_basename == previewed_basename
+            }
+        };
+        if !same_project {
+            continue;
+        }
+        return Some(local_wid.to_string());
+    }
+    None
+}
+
+/// Adopt a sibling-device workspace into this device via the
+/// host-backed rsync path.
+///
+/// Flow:
+///   1. Look up the sync row by `server_id`.
+///   2. Idempotency: if the row already has a local `workspace_id`,
+///      return early with that id (no work to do; the user clicked
+///      Pull on something already adopted).
+///   3. Resolve `host_server_id` → local `hosts.id`. Fail with a
+///      structured error if the host isn't on this device.
+///   4. Compute the canonical local worktree path.
+///   5. Bail if the path conflicts with a different workspace.
+///   6. Create the local workspace shell with host_id pre-set
+///      (`create_synced_workspace_shell`).
+///   7. Link the sync row to the new local id
+///      (`link_workspace_sync_to_local`).
+///   8. Drive `workspace_pull_back_impl` — the exact same machinery
+///      a manual pull-back uses. This rsyncs the remote worktree to
+///      the local path, clears `host_id` on success, tears down the
+///      SSH tunnel, respawns any PTY sessions locally.
+///   9. Trigger a reconcile + sync push so the server learns the
+///      workspace is now also on this device (and `host_server_id`
+///      goes back to null because pull-back cleared it).
+///
+/// On pull-back failure the local shell is left in place with
+/// `host_id` still set. The overview will render it under the host
+/// bucket with the spinner and the user can retry via the regular
+/// "Pull back to this device" action — the recovery path is the
+/// same as a failed manual pull.
+#[tauri::command]
+pub async fn workspaces_adopt_synced(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // Serialize concurrent adopts of this same row (double-click, or poller
+    // racing a manual pull) so they can't both slip past the idempotency
+    // guard and duplicate the local shell. Held for the whole adopt.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
+    // A `worktree` row can't be pulled as a standalone directory: its
+    // `.git` is a gitfile pointing at a parent repo that doesn't exist
+    // on this device, so a bare rsync of the worktree dir lands with
+    // broken git. Adopt the PARENT repo (rsync incl. `.git`) and
+    // recreate the linked worktree locally instead. `main`/standard
+    // rows fall through to the single-dir pull below.
+    let is_worktree = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        db.list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .and_then(|r| r.workspace_kind)
+            .as_deref()
+            == Some("worktree")
+    };
+    if is_worktree {
+        return adopt_worktree_via_repo_rsync(app, server_id).await;
+    }
+
+    // Step 1+2+3+4+5: do all the sync DB lookups in a scope so the
+    // State<'_> guard is dropped before we await anything (Tauri's
+    // State is not Send across awaits).
+    let (workspace_id, worktree_path, adopted_project_uid, adopted_kind, is_root) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency: if we've already adopted this row, return
+        // the existing local workspace id rather than creating a
+        // duplicate shell. The caller can then `activate_workspace`
+        // on the returned id.
+        if let Some(existing) = row.workspace_id.as_deref() {
+            // Surface whether the workspace still exists in app_state
+            // (it may have been closed locally even though the sync
+            // row remembers the link). If gone, we fall through to
+            // adoption again.
+            let snapshot = app_state.snapshot();
+            if snapshot
+                .workspaces
+                .iter()
+                .any(|w| w.workspace_id.0 == existing)
+            {
+                let worktree = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == existing)
+                    .and_then(|w| w.worktree_path.clone().or_else(|| Some(w.cwd.clone())))
+                    .unwrap_or_default();
+                return Ok(AdoptOutcome {
+                    workspace_id: existing.to_string(),
+                    worktree_path: worktree,
+                    message: "Workspace already adopted on this device.".into(),
+                });
+            }
+        }
+
+        // Resolve host_server_id → local hosts.id.
+        let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+            "This workspace has no host; clone-based adoption is not \
+             implemented yet (Phase 3 of the workspaces-sync rollout)."
+                .to_string()
+        })?;
+        let local_host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.server_id.as_deref() == Some(host_server_id))
+            .ok_or_else(|| {
+                format!(
+                    "host_not_configured: The host this workspace lives on \
+                     (host_server_id={host_server_id}) is not configured on \
+                     this device yet. Add it in Settings → Devices."
+                )
+            })?;
+
+        // A `main` row is the repo ROOT. Land it at
+        // `~/.codemux/projects/<repo>` — a genuine root that classifies
+        // as protected — instead of in the worktrees tree, where a root
+        // checkout gets mistaken for a disposable worktree (the
+        // divergent-copy bug). Null/legacy rows keep the conventional
+        // worktree landing for backward-compat. NOTE: the rsync SOURCE on
+        // the host is resolved independently inside
+        // `workspace_pull_back_impl` (from `origin_path` / the
+        // conventional path), so only the LOCAL landing + classification
+        // change here.
+        let is_root = row.workspace_kind.as_deref() == Some("main");
+        let project_name = row
+            .project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(row.title.as_str());
+        let branch = row.git_branch.as_deref().unwrap_or("main");
+        // Key the local landing on the row's project_uid (basename read-
+        // fallback) so two different same-basename projects don't collide
+        // locally. These helpers are the SAME ones the preview uses, so the
+        // dialog preview always matches where adoption actually lands. A root
+        // lands under `projects/`, a worktree under `worktrees/`.
+        let worktree_path = if is_root {
+            adopt_root_landing(row.project_uid.as_deref(), project_name)
+        } else {
+            adopt_worktree_landing(row.project_uid.as_deref(), project_name, branch)
+        };
+
+        // Path collision check — refuse to clobber a workspace that
+        // already lives here.
+        let snapshot = app_state.snapshot();
+        let collision = snapshot.workspaces.iter().any(|w| {
+            let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+            p == worktree_path.as_str()
+        });
+        if collision {
+            return Err(format!(
+                "path_in_use: A different workspace is already using \
+                 {worktree_path}. Close it first or choose another path."
+            ));
+        }
+
+        // Create the local shell. host_id is set so the upcoming
+        // pull-back call routes to the right host. A root row gets a
+        // root shell (no worktree_path, kind "main"); everything else
+        // gets the worktree-style shell.
+        let workspace_id = if is_root {
+            app_state.create_synced_root_shell(
+                row.title.clone(),
+                local_host.id,
+                worktree_path.clone(),
+                row.git_branch.clone(),
+            )
+        } else {
+            app_state.create_synced_workspace_shell(
+                row.title.clone(),
+                local_host.id,
+                row.project_path.clone(),
+                worktree_path.clone(),
+                row.git_branch.clone(),
+            )
+        };
+        let workspace_id_str = workspace_id.0.clone();
+
+        // Link the sync row to the new local id so subsequent
+        // reconciles keep them paired and the row renders as a
+        // local entry instead of "lives on another device".
+        db.link_workspace_sync_to_local(&server_id, &workspace_id_str)?;
+
+        (
+            workspace_id_str,
+            worktree_path,
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
+            is_root,
+        )
+    };
+
+    // Step 8: drive the existing pull-back machinery. `_impl` takes
+    // only `AppHandle` and resolves DB/state internally, so we can
+    // await freely without juggling `tauri::State<'_>` guards
+    // (which are not Send across awaits).
+    let pull_outcome = crate::commands::hosts::workspace_pull_back_impl(
+        app.clone(),
+        workspace_id.clone(),
+    )
+    .await?;
+
+    // CRITICAL: `workspace_pull_back_impl` reports rsync/SSH failure as
+    // `Ok(WorkspacePullOutcome { ok: false, .. })`, NOT `Err`. The `?`
+    // above only unwraps the OUTER Result, so a failed pull would
+    // otherwise fall straight through to the success `Ok(AdoptOutcome)`
+    // below — the user sees a "Pulled!" toast while an empty/broken
+    // shell sits linked with `host_id` still set, and the idempotency
+    // guard at the top then refuses every retry ("already adopted").
+    // Roll the optimistic shell + link back so the row reverts to a
+    // re-pullable sibling and surface the failure as a real error.
+    if !pull_outcome.ok {
+        {
+            let app_state: tauri::State<'_, crate::state::AppStateStore> =
+                app.state();
+            let db: tauri::State<'_, DatabaseStore> = app.state();
+            // Remove the half-created shell (it has no PTY sessions yet,
+            // so this is a clean no-side-effect removal).
+            let _ = app_state.close_workspace(&workspace_id);
+            // Revert the row to a sibling/remote-only row (workspace_id
+            // NULL) so reconcile doesn't tombstone it and the overview
+            // keeps offering "Pull to this device".
+            let _ = db.unlink_workspace_sync_from_local(&server_id);
+        }
+        crate::state::emit_app_state(&app);
+        return Err(pull_outcome.message);
+    }
+
+    // Stamp the adopted workspace's cross-device identity from the synced
+    // row BEFORE the post-adopt reconcile/push runs. The shell was created
+    // with `project_uid: None`; without this, `reconcile_from_snapshot`
+    // (a plain SET) would push that None straight back to the row and WIPE
+    // the daemon-derived uid, so the adopted copy would stop converging
+    // with its siblings and could be re-adopted as a duplicate.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+        app_state.set_workspace_project_identity(
+            &workspace_id,
+            adopted_project_uid,
+            adopted_kind,
+        );
+    }
+
+    // For an adopted repo ROOT, stamp `protected` now (off-thread git)
+    // so the overview guards it immediately instead of waiting for the
+    // next boot backfill. The root landed at ~/.codemux/projects/<repo>,
+    // so it classifies as a genuine (non-divergent) root.
+    if is_root {
+        let landing_for_check = worktree_path.clone();
+        let protected = tokio::task::spawn_blocking(move || {
+            let p = std::path::Path::new(&landing_for_check);
+            // An rsync-pulled root may have copied an arbitrary checked-out
+            // branch (and a clone leaves `origin/HEAD` unset until we ask).
+            // Populate `origin/HEAD` (no-op for local-only repos) and land the
+            // root on its default branch, then classify against the repo's
+            // ACTUAL on-disk branch rather than the synced `git_branch`, which
+            // is frequently NULL for a root checkout the agent never named.
+            // Without this, a NULL synced branch made `is_protected_repo_root`
+            // fail-open to "deletable" — the "fake main" the user saw.
+            let _ = crate::git::ensure_origin_head(p);
+            let local_branch = crate::git::checkout_default_branch(p).ok().flatten();
+            crate::git::is_protected_repo_root(p, local_branch.as_deref())
+        })
+        .await
+        .unwrap_or(false);
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state.set_workspace_protected(&workspace_id, protected);
+    }
+
+    // Step 9: nudge the reconcile so the server learns the workspace
+    // is now also on this device. Failures here are non-fatal — the
+    // background loop will catch up within 30s.
+    if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] post-adopt sync failed (will retry on next \
+             background tick): {e}"
+        );
+    }
+
+    Ok(AdoptOutcome {
+        workspace_id,
+        worktree_path,
+        message: pull_outcome.message,
+    })
+}
+
+/// Adopt a `worktree` row by materialising its PARENT repo locally and
+/// recreating the linked worktree — the "whole-repo + recreate" model.
+///
+/// Why not just rsync the worktree dir: a worktree's `.git` is a gitfile
+/// pointing at `<parent>/.git/worktrees/<name>`, a path that only exists
+/// on the originating host. Copied alone it's a broken repo. And the
+/// parent may be a **local-only** repo (no remote), so we can't clone it
+/// — rsync is the only way to get the objects + branch refs.
+///
+/// Flow (mirrors `workspaces_adopt_via_clone`, but the source is an SSH
+/// host path instead of a git remote URL):
+///   1. Resolve the row + host; idempotent short-circuit if already adopted.
+///   2. rsync the parent repo (incl. `.git`) from `project_path` on the
+///      host into `~/.codemux/projects/<repo>` — skipped if a local repo
+///      is already there (adopting a second worktree of the same project).
+///   3. `git worktree prune` (drops the host's stale worktree entries),
+///      then `git worktree add` for the branch into the canonical
+///      `~/.codemux/worktrees/<repo>/<branch>` path.
+///   4. Register a local workspace pointing at the recreated worktree and
+///      link the sync row.
+async fn adopt_worktree_via_repo_rsync(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // ── resolve row + host + paths (no awaits) ──
+    let (
+        host,
+        remote_repo_path,
+        local_project_path,
+        branch,
+        title,
+        adopted_project_uid,
+        adopted_kind,
+    ) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency: already adopted and still live → return it.
+        if let Some(existing) = row.workspace_id.as_deref() {
+            let snapshot = app_state.snapshot();
+            if let Some(w) = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == existing)
+            {
+                let worktree = w
+                    .worktree_path
+                    .clone()
+                    .unwrap_or_else(|| w.cwd.clone());
+                return Ok(AdoptOutcome {
+                    workspace_id: existing.to_string(),
+                    worktree_path: worktree,
+                    message: "Workspace already adopted on this device.".into(),
+                });
+            }
+        }
+
+        let host_server_id = row.host_server_id.as_deref().ok_or_else(|| {
+            "This workspace has no host; clone-based adoption is not \
+             implemented yet (Phase 3 of the workspaces-sync rollout)."
+                .to_string()
+        })?;
+        let local_host = db
+            .list_hosts()
+            .into_iter()
+            .find(|h| h.server_id.as_deref() == Some(host_server_id))
+            .ok_or_else(|| {
+                format!(
+                    "host_not_configured: The host this workspace lives on \
+                     (host_server_id={host_server_id}) is not configured on \
+                     this device yet. Add it in Settings → Devices."
+                )
+            })?;
+
+        // For a worktree row, `project_path` is the PARENT repo's path on
+        // the host (the reconcile maps it from the daemon's project_root).
+        // That is the rsync source — NOT `origin_path` (the worktree dir).
+        let remote_repo_path = row.project_path.clone().ok_or_else(|| {
+            "no_parent_repo: this worktree has no recorded parent repo path \
+             on the host, so it can't be reconstructed. Re-poll the host or \
+             adopt its main checkout first."
+                .to_string()
+        })?;
+        let project_name = std::path::Path::new(&remote_repo_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| row.title.clone());
+        let branch = row.git_branch.clone().unwrap_or_else(|| "main".to_string());
+        // Key the local repo landing on the row's project_uid (basename read-
+        // fallback) so two different same-basename projects don't collide. The
+        // recreated worktree inherits the uid suffix automatically, because
+        // `git_create_worktree` derives the worktree dir from THIS repo dir's
+        // basename. The fallback keeps the "already adopted? reuse
+        // projects/<name>/.git" idempotency check (just below) intact for
+        // copies adopted before the re-key.
+        let local_project_path = std::path::PathBuf::from(adopt_root_landing(
+            row.project_uid.as_deref(),
+            &project_name,
+        ));
+
+        (
+            local_host,
+            remote_repo_path,
+            local_project_path,
+            branch,
+            row.title.clone(),
+            row.project_uid.clone(),
+            row.workspace_kind.clone(),
+        )
+    };
+
+    #[cfg(unix)]
+    {
+        // ── 2. rsync the parent repo (incl .git) unless already present ──
+        let already_local = local_project_path.join(".git").exists();
+        if !already_local {
+            if let Err(e) = std::fs::create_dir_all(&local_project_path) {
+                return Err(format!(
+                    "could not create local project dir {}: {e}",
+                    local_project_path.display()
+                ));
+            }
+            let opts = crate::ssh::PullOptions::new(
+                &host.ssh_target,
+                &remote_repo_path,
+                &local_project_path,
+            );
+            match crate::ssh::pull_workspace_back(opts).await {
+                crate::ssh::PullResult::Pulled { .. } => {}
+                crate::ssh::PullResult::RemoteNotFound { path } => {
+                    let _ = std::fs::remove_dir_all(&local_project_path);
+                    return Err(format!(
+                        "Remote repo not found at {path}. The host may have been \
+                         wiped or the project moved."
+                    ));
+                }
+                crate::ssh::PullResult::RsyncFailed { reason } => {
+                    return Err(format!("rsync failed: {reason}"));
+                }
+                crate::ssh::PullResult::HostUnreachable { reason } => {
+                    return Err(format!("Host unreachable: {reason}"));
+                }
+            }
+        }
+
+        // ── 3. prune stale host worktrees + recreate the branch locally ──
+        let repo_for_blocking = local_project_path.clone();
+        let branch_for_blocking = branch.clone();
+        let worktree_actual_path = tokio::task::spawn_blocking(move || {
+            crate::git::git_recreate_worktree_for_adopted_repo(
+                &repo_for_blocking,
+                &branch_for_blocking,
+            )
+        })
+        .await
+        .map_err(|e| format!("worktree recreate join failed: {e}"))??;
+
+        // ── 4. register a local workspace + link the sync row ──
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let local_project_str = local_project_path.to_string_lossy().to_string();
+        let workspace_id = app_state.create_synced_workspace_shell(
+            title,
+            host.id,
+            Some(local_project_str.clone()),
+            worktree_actual_path.clone(),
+            Some(branch.clone()),
+        );
+        // It's local right away (the files are already on disk) — clear
+        // host_id so panes spawn against the local pty-daemon, and link
+        // the sync row. Roll back the just-created shell if EITHER
+        // mutation fails: otherwise the failure leaves an orphan shell
+        // (host_id maybe still set, row maybe unlinked) that the
+        // idempotency guard can't recover, and a retry would create a
+        // SECOND duplicate shell. Mirrors the single-dir adopt rollback.
+        if let Err(e) = app_state
+            .set_workspace_host_id(&workspace_id.0, None)
+            .and_then(|_| {
+                db.link_workspace_sync_to_local(&server_id, &workspace_id.0)
+            })
+        {
+            let _ = app_state.close_workspace(&workspace_id.0);
+            drop(app_state);
+            drop(db);
+            crate::state::emit_app_state(&app);
+            return Err(e);
+        }
+        // Carry the daemon-derived project identity onto the adopted
+        // workspace so it converges with its siblings and the upcoming
+        // reconcile doesn't push a None uid back over the row (see the
+        // single-dir adopt path for the full rationale).
+        app_state.set_workspace_project_identity(
+            &workspace_id.0,
+            adopted_project_uid,
+            adopted_kind,
+        );
+        drop(app_state);
+        drop(db);
+
+        if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+            eprintln!(
+                "[workspaces-sync] post-adopt (worktree) sync failed (will retry): {e}"
+            );
+        }
+        crate::state::emit_app_state(&app);
+
+        Ok(AdoptOutcome {
+            workspace_id: workspace_id.0,
+            worktree_path: worktree_actual_path,
+            message: format!(
+                "Adopted worktree: synced repo to {local_project_str} and \
+                 recreated the '{branch}' worktree."
+            ),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            host,
+            remote_repo_path,
+            local_project_path,
+            branch,
+            title,
+            adopted_project_uid,
+            adopted_kind,
+        );
+        Err("SSH transport is Unix-only for now.".into())
+    }
+}
+
+/// Adopt a sibling-device workspace into this device via the
+/// clone-from-git fallback path. Used when the sync row has no
+/// `host_server_id` (the workspace lives only on another device of
+/// the user, never pushed to a shared host).
+///
+/// Semantics differ from `workspaces_adopt_synced` (Phase 2) in one
+/// important way: this creates a NEW local workspace with its own
+/// fresh `server_id` (the reconcile push assigns one). The
+/// sibling-device's existing sync row is left alone. Result: both
+/// devices independently own a workspace at the same git remote +
+/// branch. They share a git remote but live as two registry
+/// entries.
+///
+/// This semantics tradeoff is the right answer because rsync is not
+/// available (no shared host), so the two devices genuinely have
+/// independent copies. Phase-4's divergence detection (TBD) handles
+/// the "now what?" question when their HEADs diverge.
+///
+/// Flow:
+///   1. Look up the sync row by `server_id`, validate it has
+///      `project_remote` set (clone is impossible without a URL).
+///   2. Refuse if the sync row already has `workspace_id` set on
+///      this device — that's the host-backed adoption's idempotent
+///      path, not ours.
+///   3. Compute target paths: project at `~/.codemux/projects/<basename>`,
+///      worktree at `~/.codemux/worktrees/<basename>/<branch>`.
+///   4. Bail if either path is in use (caller already saw the
+///      preview's `is_path_in_use` flag, so this is defence-in-
+///      depth).
+///   5. `git clone --no-checkout` into the project path.
+///   6. `git worktree add` for the branch into the worktree path —
+///      reuse `git_create_worktree` so PR-ref + branch-fetch logic
+///      is unchanged.
+///   7. Create a brand-new local workspace (NOT linked to the
+///      sync row). The next reconcile push will assign it a fresh
+///      `server_id`.
+///   8. Return the new local id.
+///
+/// Failure mode: any git failure leaves the target dir cleaned up
+/// (see `git_clone`'s rollback). No partial workspace shell is
+/// created until both clone + worktree-add succeed.
+#[tauri::command]
+pub async fn workspaces_adopt_via_clone(
+    app: tauri::AppHandle,
+    server_id: String,
+) -> Result<AdoptOutcome, String> {
+    // Same per-row serialization as the host-backed adopt path.
+    let _adopt_guard = acquire_adopt_lock(&server_id).await;
+
+    // Validate + compute paths in a sync scope (no awaits).
+    let (project_remote, project_path, worktree_path, branch, title) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let app_state: tauri::State<'_, crate::state::AppStateStore> =
+            app.state();
+
+        let row = db
+            .list_workspaces_sync_for_sync()
+            .into_iter()
+            .find(|r| r.server_id.as_deref() == Some(server_id.as_str()))
+            .ok_or_else(|| format!("Synced workspace not found: {server_id}"))?;
+
+        // Idempotency / safety: refuse if the row is already linked
+        // to a local workspace on this device. That row should be
+        // adopted via the host-backed path, not cloned again.
+        if row.workspace_id.is_some() {
+            return Err(format!(
+                "This workspace is already adopted on this device as {}",
+                row.workspace_id.unwrap()
+            ));
+        }
+
+        let project_remote = row.project_remote.as_deref().ok_or_else(|| {
+            "no_project_remote: this workspace has no git remote URL \
+             recorded, so it can't be cloned. Open the device it \
+             lives on and push it to a shared device first."
+                .to_string()
+        })?;
+
+        let project_name = row
+            .project_path
+            .as_deref()
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .map(|s| s.to_string())
+            .or_else(|| extract_project_name_from_remote(project_remote))
+            // Final fallback if we can't infer a name from anywhere.
+            .unwrap_or_else(|| "workspace".to_string());
+
+        let branch = row
+            .git_branch
+            .clone()
+            .unwrap_or_else(|| "main".to_string());
+
+        // Project goes under ~/.codemux/projects/<basename>-<short-uid> (keyed
+        // on the row's project_uid, basename read-fallback). We deliberately
+        // avoid colliding with user-managed paths like ~/projects/<basename>,
+        // and the uid suffix keeps two different same-basename projects apart.
+        let project_path = std::path::PathBuf::from(adopt_root_landing(
+            row.project_uid.as_deref(),
+            &project_name,
+        ));
+        // Worktree path matches the canonical layout push/pull use, so a future
+        // push to a shared host lands at the same remote path another device
+        // would. Derive it from the chosen project dir's BASENAME — that's
+        // exactly what `git_create_worktree` uses for the worktree dir
+        // component below, so this collision-check path matches where the
+        // worktree actually lands (uid-keyed or legacy, consistently).
+        let project_basename = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(project_name.as_str());
+        let worktree_path = crate::workspace_paths::expand_tilde(
+            &crate::workspace_paths::conventional_remote_path(project_basename, &branch),
+        );
+
+        // Path collision check against live workspaces. Defence-in-
+        // depth — the preview already showed this; bailing here
+        // catches races.
+        let snapshot = app_state.snapshot();
+        let collision = snapshot.workspaces.iter().any(|w| {
+            let p = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+            p == worktree_path.to_string_lossy().as_ref()
+        });
+        if collision {
+            return Err(format!(
+                "path_in_use: A different workspace is already using \
+                 {}.",
+                worktree_path.display()
+            ));
+        }
+
+        (
+            project_remote.to_string(),
+            project_path,
+            worktree_path,
+            branch,
+            row.title.clone(),
+        )
+    };
+
+    // Step 5+6: clone + worktree-add, both off the main async
+    // thread via spawn_blocking — git operations can take seconds.
+    let project_path_str = project_path.to_string_lossy().to_string();
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+    let branch_clone = branch.clone();
+    let project_path_clone = project_path.clone();
+    let clone_result = tokio::task::spawn_blocking(move || {
+        // Phase 1: clone the bare-ish project (no checkout —
+        // worktree-add picks the right branch).
+        crate::git::git_clone(&project_remote, &project_path_clone)?;
+        // Phase 2: add the worktree at the requested branch.
+        crate::git::git_create_worktree(
+            project_path_clone.as_path(),
+            &branch_clone,
+            // `new_branch=false` — we want the existing branch from
+            // the remote, not a new one.
+            false,
+            None,
+            None,
+        )
+    })
+    .await
+    .map_err(|e| format!("git_clone join failed: {e}"))?;
+
+    let worktree_actual_path = clone_result.map_err(|e| {
+        // Roll back the cloned project dir on failure so a retry
+        // starts clean.
+        let _ = std::fs::remove_dir_all(&project_path);
+        e
+    })?;
+
+    // Step 7: register a brand-new local workspace pointing at the
+    // freshly-cloned worktree. Crucially we do NOT link to the
+    // existing sync row — the next reconcile push will create a
+    // fresh server-side entry for this device's copy.
+    let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+    let workspace_id = app_state.create_synced_workspace_shell(
+        title,
+        // host_id = -1 sentinel doesn't exist; we use a different
+        // helper that creates a local-only workspace. Since
+        // create_synced_workspace_shell expects host_id and we
+        // don't want that here, fall back to manually setting it
+        // via the closest existing helper.
+        0,
+        Some(project_path_str.clone()),
+        worktree_actual_path.clone(),
+        Some(branch.clone()),
+    );
+    // Clear host_id since this is a local clone (not a remote pull).
+    app_state.set_workspace_host_id(&workspace_id.0, None)?;
+
+    // Stamp project identity from the freshly-cloned repo. Clone-adopt
+    // mints a NEW server_id (it doesn't link the sibling row), so the
+    // identity must be (re)derived locally — and because the clone has
+    // the same canonical git remote as its siblings, the deterministic
+    // UUIDv5 matches, so this independent copy still GROUPS/converges
+    // with them in the overview instead of rendering as a stray project
+    // (and being re-adopted as a duplicate). Recomputing from the local
+    // checkout mirrors every other create path.
+    app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
+
+    // Nudge sync so the server learns about the new workspace.
+    if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {
+        eprintln!(
+            "[workspaces-sync] post-clone-adopt sync failed (will retry): {e}"
+        );
+    }
+
+    Ok(AdoptOutcome {
+        workspace_id: workspace_id.0,
+        worktree_path: worktree_actual_path,
+        message: format!(
+            "Cloned to {} and added worktree at {}",
+            project_path_str, worktree_path_str
+        ),
+    })
+}
+
+/// One workspace that failed to adopt during a project-granularity pull.
+/// Collected (not fatal) so a single bad worktree doesn't abort the rest.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAdoptFailure {
+    pub server_id: String,
+    pub title: String,
+    pub error: String,
+}
+
+/// Result of pulling an entire project (its repo root + every worktree)
+/// in one action.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectAdoptOutcome {
+    /// Each workspace successfully materialised on this device.
+    pub adopted: Vec<AdoptOutcome>,
+    /// Worktrees that failed (the root failing aborts with an `Err` instead).
+    pub failures: Vec<ProjectAdoptFailure>,
+    pub message: String,
+}
+
+/// Pull an entire project — its repo ROOT first, then every worktree — in a
+/// single action. This is the "project-first" model: instead of pulling a
+/// lone worktree that lands as a deletable "<branch>" copy, we materialise
+/// the protected repo root at `~/.codemux/projects/<repo>` and recreate each
+/// worktree as a real linked worktree hanging off it.
+///
+/// Ordering matters: the root MUST land before the worktrees so the shared
+/// object store + branch refs exist for each `git worktree add`. We compose
+/// the existing, individually-tested per-row commands rather than
+/// re-implementing their rsync/clone/worktree logic:
+/// - the `kind == "main"` row → `workspaces_adopt_synced` (lands a protected
+///   root at `projects/<repo>`),
+/// - each worktree row → `workspaces_adopt_synced` (routes to
+///   `adopt_worktree_via_repo_rsync`, which reuses the now-present
+///   `projects/<repo>` repo and just `git worktree add`s the branch).
+///
+/// If the project has no `main` row (a legacy registry where the root was
+/// never registered), the first worktree adopt rsyncs the parent repo itself,
+/// so the pull still succeeds — just without a standalone protected-root
+/// shell. Worktree failures are collected; a root failure aborts (nothing can
+/// attach to a missing root).
+#[tauri::command]
+pub async fn workspaces_adopt_project(
+    app: tauri::AppHandle,
+    project_uid: String,
+) -> Result<ProjectAdoptOutcome, String> {
+    // Gather the project's un-adopted, host-backed sync rows (sync scope —
+    // no awaits while holding the State guard).
+    let (root_server_id, worktree_server_ids) = {
+        let db: tauri::State<'_, DatabaseStore> = app.state();
+        let rows: Vec<WorkspaceSyncRecord> = db
+            .list_workspaces_sync()
+            .into_iter()
+            .filter(|r| r.project_uid.as_deref() == Some(project_uid.as_str()))
+            .filter(|r| r.workspace_id.is_none() && r.server_id.is_some())
+            .collect();
+        if rows.is_empty() {
+            return Err(format!(
+                "No un-adopted workspaces found for project {project_uid}. They \
+                 may already be on this device."
+            ));
+        }
+        let root_server_id = rows
+            .iter()
+            .find(|r| r.workspace_kind.as_deref() == Some("main"))
+            .and_then(|r| r.server_id.clone());
+        // Everything that isn't the root (worktrees, plus legacy null-kind
+        // rows) is adopted after the root. Carry (server_id, title) for
+        // failure reporting.
+        let worktree_server_ids: Vec<(String, String)> = rows
+            .iter()
+            .filter(|r| r.workspace_kind.as_deref() != Some("main"))
+            .filter_map(|r| r.server_id.clone().map(|sid| (sid, r.title.clone())))
+            .collect();
+        (root_server_id, worktree_server_ids)
+    };
+
+    let mut adopted: Vec<AdoptOutcome> = Vec::new();
+    let mut failures: Vec<ProjectAdoptFailure> = Vec::new();
+
+    // 1. Root first — a failure here aborts (worktrees can't attach to a
+    //    repo that didn't materialise).
+    if let Some(sid) = root_server_id {
+        let outcome = workspaces_adopt_synced(app.clone(), sid).await?;
+        adopted.push(outcome);
+    }
+
+    // 2. Worktrees — continue-on-error so one bad branch doesn't sink the
+    //    rest. Each reuses the now-present `projects/<repo>` repo.
+    for (sid, title) in worktree_server_ids {
+        match workspaces_adopt_synced(app.clone(), sid.clone()).await {
+            Ok(o) => adopted.push(o),
+            Err(e) => failures.push(ProjectAdoptFailure {
+                server_id: sid,
+                title,
+                error: e,
+            }),
+        }
+    }
+
+    let message = if failures.is_empty() {
+        format!("Pulled {} workspace(s) for this project.", adopted.len())
+    } else {
+        format!(
+            "Pulled {} workspace(s); {} worktree(s) failed.",
+            adopted.len(),
+            failures.len()
+        )
+    };
+    Ok(ProjectAdoptOutcome {
+        adopted,
+        failures,
+        message,
+    })
+}
+
+/// Non-destructively "reconcile" a divergent standalone copy — the full
+/// `.git`-dir copy that lands under `~/.codemux/worktrees/<repo>/<branch>`
+/// and gets flagged with the amber "standalone copy" chip. Detaches its
+/// workspace card (so the project reads cleanly; the user can then "Pull
+/// project" to get a proper protected root) — **files are left on disk,
+/// never deleted**. Refuses when the copy has uncommitted changes or
+/// unpushed commits, returning guidance, so a card never disappears while
+/// the user has work in flight.
+#[tauri::command]
+pub async fn workspaces_reconcile_copy(
+    app: tauri::AppHandle,
+    workspace_id: String,
+) -> Result<String, String> {
+    // Resolve the copy's on-disk path from app_state (sync scope).
+    let path = {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .map(|w| w.worktree_path.clone().unwrap_or_else(|| w.cwd.clone()))
+            .ok_or_else(|| format!("Workspace not found: {workspace_id}"))?
+    };
+
+    // Off-thread git checks: must be a divergent copy and safe to detach.
+    let blocker = tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        if !crate::git::is_divergent_copy(p) {
+            return Err(
+                "This workspace isn't a standalone copy — nothing to reconcile.".to_string(),
+            );
+        }
+        Ok(crate::git::reconcile_copy_blocker(p))
+    })
+    .await
+    .map_err(|e| format!("git check join failed: {e}"))??;
+
+    if let Some(reason) = blocker {
+        return Err(format!("Can't reconcile yet: {reason}."));
+    }
+
+    // Safe: detach the copy's workspace card. close_workspace (state-level)
+    // removes the workspace from app_state WITHOUT deleting the directory —
+    // the files (and any local-only history) stay on disk.
+    {
+        let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
+        app_state.close_workspace(&workspace_id)?;
+    }
+    crate::state::emit_app_state(&app);
+
+    Ok("Closed the standalone copy (files kept on disk). Use \"Pull project\" \
+        to materialize a proper repo root."
+        .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::DatabaseStore;
+    use serial_test::serial;
+
+    // ── resolve_open_on_host_cwd ───────────────────────────────
+    //
+    // Where "Open on host" lands the terminal ON THE HOST. The daemon-
+    // reported `origin_path` is authoritative (works for agent-created
+    // workspaces at arbitrary paths); the conventional path is only a
+    // fallback for rows that predate the poller recording it.
+
+    #[test]
+    fn resolve_open_on_host_cwd_prefers_origin_path() {
+        let cwd = resolve_open_on_host_cwd(
+            Some("/var/data/agent-built/svc"),
+            Some("/home/me/repo"),
+            "svc",
+            Some("uid-9"),
+            Some("feature/x"),
+            None,
+        );
+        assert_eq!(cwd, "/var/data/agent-built/svc");
+    }
+
+    #[test]
+    fn resolve_open_on_host_cwd_falls_back_to_conventional() {
+        // No origin_path → conventional `~/.codemux/worktrees/...` path
+        // keyed on project + branch (basename of project_path is used).
+        let cwd = resolve_open_on_host_cwd(
+            None,
+            Some("/home/me/widgets"),
+            "ignored-title",
+            Some("uid-1"),
+            Some("feature/login"),
+            Some("main"),
+        );
+        assert!(cwd.contains("worktrees"), "got {cwd}");
+        assert!(cwd.contains("widgets"), "uses project basename; got {cwd}");
+        // branch slashes are sanitized to '-' by the conventional path.
+        assert!(cwd.ends_with("feature-login"), "got {cwd}");
+    }
+
+    #[test]
+    fn resolve_open_on_host_cwd_blank_origin_path_falls_back() {
+        // A whitespace-only origin_path must not be treated as a real path.
+        let cwd =
+            resolve_open_on_host_cwd(Some("  "), Some("/home/me/api"), "api", None, None, None);
+        assert!(cwd.contains("api"), "got {cwd}");
+        assert!(cwd.ends_with("main"), "default branch when none given; got {cwd}");
+    }
+
+    // ── detect_same_branch_project_conflict ────────────────────
+    //
+    // Guards the cross-machine "Pull would clobber work I'm already
+    // doing locally on the same branch" check. The detection is
+    // deliberately basename-based because two devices almost never
+    // store the same repo at the same absolute path.
+
+    /// Build the live-workspace-id set the guard intersects against.
+    fn live_set(ids: &[&str]) -> std::collections::HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn insert_local(
+        db: &DatabaseStore,
+        workspace_id: &str,
+        project_path: Option<&str>,
+        branch: Option<&str>,
+    ) {
+        db.insert_workspace_sync(
+            workspace_id,
+            "local-side",
+            None,
+            project_path,
+            None,
+            branch,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    fn make_remote_row(
+        project_path: Option<&str>,
+        branch: Option<&str>,
+        adopted_as: Option<&str>,
+    ) -> WorkspaceSyncRecord {
+        WorkspaceSyncRecord {
+            id: 0,
+            server_id: Some("srv-x".into()),
+            workspace_id: adopted_as.map(|s| s.into()),
+            title: "remote-side".into(),
+            host_server_id: Some("pandora".into()),
+            project_path: project_path.map(|s| s.into()),
+            project_remote: None,
+            git_branch: branch.map(|s| s.into()),
+            git_head_sha: None,
+            origin_uid: Some("uuid-1".into()),
+            project_uid: None,
+            workspace_kind: None,
+            origin_path: project_path.map(|s| s.into()),
+            default_branch: None,
+            created_at: "2026-01-01 00:00:00".into(),
+            updated_at: "2026-01-01 00:00:00".into(),
+            deleted_at: None,
+            dirty: false,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_matches_on_basename_and_branch() {
+        let db = DatabaseStore::new_in_memory();
+        // Same project name as the remote, same branch, different
+        // absolute path (the realistic cross-device case).
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        let hit = detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        );
+        assert_eq!(
+            hit.as_deref(),
+            Some("workspace-local"),
+            "matching basename + matching branch must surface the local workspace id"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_orphan_closed_workspace() {
+        // Regression: the local row still references a workspace that
+        // was closed/deleted, so its id is NOT in app_state. Pulling
+        // the same branch back from a host must NOT be blocked by this
+        // stale link — the overview already hides such orphans, and
+        // this guard must agree instead of showing a phantom "you
+        // already have this branch open" message.
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-closed",
+            Some("/home/zeus/projects/my-repo"),
+            Some("main"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("main"),
+            None,
+        );
+        // Empty live set → the workspace is gone from app_state.
+        assert!(
+            detect_same_branch_project_conflict(&db, &remote, &live_set(&[]))
+                .is_none(),
+            "an orphaned sync row for a closed workspace must not flag as a conflict"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_mismatched_branch() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("main"),
+        );
+        // Same project, different branch → not a conflict; two
+        // branches can legitimately exist as separate worktrees.
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_mismatched_basename() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/different-repo"),
+            Some("feature/x"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_the_rows_own_local_copy() {
+        // If the remote row was already adopted on this device,
+        // there's a local row that matches (basename, branch).
+        // That match is not a conflict — the `already_adopted_*`
+        // short-circuit is the right surface for it.
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            Some("workspace-local"),
+        );
+        assert!(
+            detect_same_branch_project_conflict(
+                &db,
+                &remote,
+                &live_set(&["workspace-local"]),
+            )
+            .is_none(),
+            "the row's own adopted copy must not flag as a conflict"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_ignores_sibling_only_rows() {
+        // Another sibling-device row with the same basename + branch
+        // is NOT a "this device already has it" conflict — it lives
+        // somewhere else. Skip rows without a local workspace_id.
+        let db = DatabaseStore::new_in_memory();
+        // A sibling-only row pulled from the cloud.
+        db.upsert_workspace_sync_from_server(
+            "srv-other-sibling",
+            "another-sibling",
+            Some("other-host"),
+            Some("/home/eve/projects/my-repo"),
+            None,
+            Some("feature/x"),
+            None,
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:00:00",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let remote = make_remote_row(
+            Some("/home/deus/projects/my-repo"),
+            Some("feature/x"),
+            None,
+        );
+        // Sibling row has no local workspace_id, so liveness is moot —
+        // pass it anyway to mirror the production call shape.
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &remote,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn conflict_detection_returns_none_when_previewed_row_lacks_branch_or_path() {
+        let db = DatabaseStore::new_in_memory();
+        insert_local(
+            &db,
+            "workspace-local",
+            Some("/home/zeus/projects/my-repo"),
+            Some("feature/x"),
+        );
+        // Missing branch.
+        let no_branch =
+            make_remote_row(Some("/home/deus/projects/my-repo"), None, None);
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_branch,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
+        // Missing path.
+        let no_path = make_remote_row(None, Some("feature/x"), None);
+        assert!(detect_same_branch_project_conflict(
+            &db,
+            &no_path,
+            &live_set(&["workspace-local"]),
+        )
+        .is_none());
+    }
+}
+
+/// Best-effort: extract a project name from a git remote URL when
+/// the synced row doesn't carry an explicit `project_path`. Handles
+/// the common cases:
+///   - https://host/owner/name.git → "name"
+///   - git@host:owner/name.git    → "name"
+///   - git@host:owner/name        → "name"
+/// Returns None if no recognisable basename is present.
+fn extract_project_name_from_remote(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    let after_slash_or_colon = trimmed
+        .rsplit(|c: char| c == '/' || c == ':')
+        .next()
+        .unwrap_or(trimmed);
+    let stripped = after_slash_or_colon
+        .strip_suffix(".git")
+        .unwrap_or(after_slash_or_colon);
+    if stripped.is_empty() {
+        None
+    } else {
+        Some(stripped.to_string())
+    }
+}
+
+#[cfg(test)]
+mod landing_tests {
+    //! Local adoption landing paths. Mirrors the spirit of
+    //! `workspace_paths`'s `uid_keyed_path_disambiguates_same_basename` /
+    //! `none_uid_reproduces_legacy_basename_layout` tests, one layer up: at
+    //! the adoption layer where the basename read-fallback decision lives.
+    use super::{
+        adopt_root_landing, adopt_worktree_landing, adopt_worktree_landing_via_repo,
+        choose_landing,
+    };
+    use std::path::PathBuf;
+
+    // ── choose_landing: the basename read-fallback decision ──
+
+    #[test]
+    fn choose_landing_prefers_uid_keyed_when_no_legacy_copy() {
+        // Fresh adoption (no pre-re-key dir on disk) ⇒ the uid-keyed path,
+        // so two different same-basename projects don't collide.
+        let keyed = PathBuf::from("/home/u/.codemux/projects/api-11111111");
+        let legacy = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(keyed.clone(), legacy, false), keyed);
+    }
+
+    #[test]
+    fn choose_landing_reuses_legacy_copy_when_present() {
+        // A copy adopted BEFORE the re-key lives at the bare basename path —
+        // reuse it so a re-pull stays idempotent instead of duplicating into a
+        // new uid-keyed dir.
+        let keyed = PathBuf::from("/home/u/.codemux/projects/api-11111111");
+        let legacy = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(keyed, legacy.clone(), true), legacy);
+    }
+
+    #[test]
+    fn choose_landing_is_noop_without_uid() {
+        // project_uid = None ⇒ keyed == legacy ⇒ that path regardless of what's
+        // on disk. Pre-re-key rows are unaffected.
+        let p = PathBuf::from("/home/u/.codemux/projects/api");
+        assert_eq!(choose_landing(p.clone(), p.clone(), true), p);
+        assert_eq!(choose_landing(p.clone(), p.clone(), false), p);
+    }
+
+    // ── adopt_*_landing: two different same-basename projects disambiguate ──
+    //
+    // Uses a fixture basename that won't exist under ~/.codemux so the
+    // read-fallback can't fire and we observe the uid-keyed result.
+
+    const FIXTURE: &str = "codemux-rekey-fixture-zzq";
+    const UID_A: &str = "11111111-2222-3333-4444-555555555555";
+    const UID_B: &str = "99999999-8888-7777-6666-555555555555";
+
+    #[test]
+    fn worktree_landing_disambiguates_same_basename() {
+        let a = adopt_worktree_landing(Some(UID_A), FIXTURE, "main");
+        let b = adopt_worktree_landing(Some(UID_B), FIXTURE, "main");
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/worktrees/{FIXTURE}-11111111/main")),
+            "got {a}"
+        );
+    }
+
+    #[test]
+    fn root_landing_disambiguates_same_basename() {
+        let a = adopt_root_landing(Some(UID_A), FIXTURE);
+        let b = adopt_root_landing(Some(UID_B), FIXTURE);
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/projects/{FIXTURE}-11111111")),
+            "got {a}"
+        );
+    }
+
+    #[test]
+    fn worktree_via_repo_landing_tracks_root_uid() {
+        // A `worktree`-kind / clone adoption derives its worktree dir from the
+        // repo ROOT landing, so different uids still disambiguate — and the
+        // worktree dir carries the same uid suffix the root dir would.
+        let a = adopt_worktree_landing_via_repo(Some(UID_A), FIXTURE, "main");
+        let b = adopt_worktree_landing_via_repo(Some(UID_B), FIXTURE, "main");
+        assert_ne!(a, b, "different uids must land in different dirs");
+        assert!(
+            a.ends_with(&format!("/worktrees/{FIXTURE}-11111111/main")),
+            "got {a}"
+        );
+        // No uid ⇒ bare basename, identical to the single-dir helper.
+        let n = adopt_worktree_landing_via_repo(None, FIXTURE, "feature/x");
+        assert!(
+            n.ends_with(&format!("/worktrees/{FIXTURE}/feature-x")),
+            "got {n}"
+        );
+    }
+
+    #[test]
+    fn landing_without_uid_reproduces_legacy_basename() {
+        // The migration safety net at the adoption layer: no uid ⇒ bare
+        // basename path (byte-identical to the pre-re-key landing), so already-
+        // adopted workspaces still resolve.
+        let w = adopt_worktree_landing(None, FIXTURE, "feature/x");
+        assert!(
+            w.ends_with(&format!("/worktrees/{FIXTURE}/feature-x")),
+            "got {w}"
+        );
+        let r = adopt_root_landing(None, FIXTURE);
+        assert!(r.ends_with(&format!("/projects/{FIXTURE}")), "got {r}");
+    }
+}

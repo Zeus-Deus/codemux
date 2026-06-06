@@ -83,6 +83,15 @@ vi.mock("@/tauri/commands", () => ({
   listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
 }));
 
+vi.mock("@/lib/toast", () => ({
+  toast: {
+    info: vi.fn(),
+    success: vi.fn(),
+    warning: vi.fn(),
+    error: vi.fn(),
+  },
+}));
+
 import {
   listBranches,
   checkIsGitRepo,
@@ -100,6 +109,7 @@ import {
   _defaultBranchCache,
   _defaultBranchInFlight,
 } from "@/components/layout/default-branch-cache";
+import { toast } from "@/lib/toast";
 
 // ── Helpers ──
 
@@ -463,6 +473,45 @@ describe("Submit flow", () => {
     });
 
     expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+    // The dedup must not be silent — that's what made re-linking an issue
+    // look like "nothing happened" and quietly dropped the typed message.
+    expect(toast.info).toHaveBeenCalledWith(
+      expect.stringContaining("already has a workspace"),
+    );
+  });
+
+  it("surfaces an 'Open it' notice before submit when the branch already has a workspace", async () => {
+    setAppState("/path/to/project", [
+      {
+        cwd: "/path/to/project/wt",
+        git_branch: "my-feature",
+        project_root: "/path/to/project",
+      },
+    ]);
+    const onOpenChange = vi.fn();
+    renderDialog(true, onOpenChange);
+
+    const dialog = await screen.findByRole("dialog");
+    const branchInput = within(dialog).getByPlaceholderText("branch name");
+    // Mirrors what linking an issue does: auto-fill a branch that already
+    // belongs to a workspace.
+    fireEvent.change(branchInput, { target: { value: "my-feature" } });
+
+    // Proactive notice + action appear without submitting.
+    const openBtn = await within(dialog).findByRole("button", {
+      name: /Open it/i,
+    });
+    expect(
+      within(dialog).getByText(/already has a workspace/i),
+    ).toBeInTheDocument();
+
+    fireEvent.click(openBtn);
+
+    await waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
+    });
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(createWorktreeWorkspace).not.toHaveBeenCalled();
   });
 });
 
@@ -810,10 +859,19 @@ describe("Clipboard image paste", () => {
 
     // The chip renders the trailing filename component (the existing
     // attachment-strip logic lifts it via `.split("/").pop()`).
-    await waitFor(() => {
-      const chips = within(dialog).getAllByText("paste-xyz.png");
-      expect(chips.length).toBeGreaterThan(0);
-    });
+    //
+    // The default 1000ms waitFor isn't enough on a busy Windows CI
+    // runner: paste → await mock → setAttachments → React commit can
+    // stretch past a second when the runner is under load. The fail
+    // mode was Windows-only (Linux/macOS resolved well under 100ms),
+    // so we widen the budget rather than pushing on a real bug.
+    await waitFor(
+      () => {
+        const chips = within(dialog).getAllByText("paste-xyz.png");
+        expect(chips.length).toBeGreaterThan(0);
+      },
+      { timeout: 5000 },
+    );
   });
 
   it("stays silent when the OS clipboard has no image", async () => {

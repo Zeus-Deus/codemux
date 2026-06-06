@@ -35,6 +35,7 @@ import {
   type ScrollbackPayload,
 } from "@/tauri/commands";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
+import { createWritePump } from "./terminal-write-pump";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
@@ -135,8 +136,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const restoredCapturesRef = useRef<Record<string, string>>({});
   const kittyStackRef = useRef<number[]>([]);
   const kittyLevelRef = useRef(0);
-  const pendingPtyWrites = useRef<Uint8Array[]>([]);
-  const ptyWriteFrameRef = useRef<number | null>(null);
   const statusRef = useRef<TerminalStatusPayload>({
     session_id: sessionId,
     state: "starting",
@@ -185,44 +184,6 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     );
     kittyLevelRef.current = kittyFlags(kittyStackRef.current);
   }, []);
-
-  // ── PTY output batching ──
-  const flushPtyWrites = useCallback(() => {
-    ptyWriteFrameRef.current = null;
-    const term = termRef.current;
-    const pending = pendingPtyWrites.current;
-    if (!term || pending.length === 0) return;
-
-    if (pending.length === 1) {
-      term.write(pending[0]);
-    } else {
-      let totalLen = 0;
-      for (const chunk of pending) totalLen += chunk.length;
-      const combined = new Uint8Array(totalLen);
-      let offset = 0;
-      for (const chunk of pending) {
-        combined.set(chunk, offset);
-        offset += chunk.length;
-      }
-      term.write(combined);
-    }
-    pendingPtyWrites.current = [];
-  }, []);
-
-  const writePtyChunk = useCallback(
-    (payload: unknown) => {
-      if (!termRef.current) return;
-      const bytes = extractBytes(payload);
-      if (!bytes) return;
-
-      scanKittyProtocol(bytes);
-      pendingPtyWrites.current.push(bytes);
-      if (ptyWriteFrameRef.current === null) {
-        ptyWriteFrameRef.current = requestAnimationFrame(flushPtyWrites);
-      }
-    },
-    [scanKittyProtocol, flushPtyWrites],
-  );
 
   // ── Resize sync ──
   const syncTerminalSize = useCallback(async () => {
@@ -463,8 +424,28 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.)
       const isAlternateBuffer = t.buffer.active.type === "alternate";
 
-      const scrollbackLines = useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
-      const data = sa.serialize({ scrollback: scrollbackLines });
+      // Alt-screen content is garbled when serialized and is therefore NEVER
+      // restored (the mount path guards on `!meta.alternate_buffer`). Running
+      // serializeAddon.serialize on it anyway is pure wasted main-thread work
+      // that blocks the workspace switch — and the dominant case here is
+      // exactly the long-running TUI agents (Claude Code, lazygit, vim, btop)
+      // the user switches between. Skip the serialize for alt-screen panes and
+      // persist an empty buffer with the flag set; the live PTY reattach
+      // replay reconstructs the screen on return regardless.
+      const scrollbackLines =
+        useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
+      const serializeStart = performance.now();
+      const data = isAlternateBuffer
+        ? ""
+        : sa.serialize({ scrollback: scrollbackLines });
+      const serializeMs = performance.now() - serializeStart;
+      if (serializeMs > 30) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[codemux::terminal-serialize] sid=${sid.slice(0, 8)} ` +
+            `serialize=${serializeMs.toFixed(0)}ms bytes=${data.length} alt=${isAlternateBuffer}`,
+        );
+      }
 
       return {
         pane_id: paneId ?? sid,
@@ -505,15 +486,25 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     //
     // Scrollback and status are independent reads — they can run in
     // parallel. The `attachPtyOutput` step must come AFTER scrollback
-    // is written to xterm, otherwise live PTY output could interleave
-    // with the historical bytes (xterm's parser is stateful, so byte
-    // order across the boundary matters for the alt-screen / cursor
-    // state). Status-overlay update is independent of both.
+    // is ENQUEUED, otherwise live PTY output could interleave with the
+    // historical bytes (xterm's parser is stateful, so byte order across
+    // the boundary matters for the alt-screen / cursor state). Both feed
+    // the same ordered write queue, so FIFO drain preserves that order
+    // even though the writes are now throttled across macrotasks.
     //
     // Net: 3 sequential round-trips → 1 parallel pair + 1 = effectively
     // 2 round-trips per terminal on switch.
     let cancelled = false;
     const attachStarted = performance.now();
+
+    // ── Throttled write pump ──
+    //
+    // Every byte that reaches xterm — disk scrollback restore, the PTY
+    // reattach replay, and steady live output — goes through this single
+    // ordered queue, drained a budget-bounded batch per macrotask so a
+    // multi-MB reattach replay can't peg the main thread and freeze the
+    // workspace switch. See ./terminal-write-pump.ts for the full rationale.
+    const pump = createWritePump((data) => term.write(data));
 
     (async () => {
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
@@ -534,10 +525,10 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       ]);
       if (cancelled) return;
 
-      // Apply scrollback first so historical bytes land in the buffer
-      // before the live channel can deliver anything. Errors here are
-      // logged via the catch-all on the IIFE and the pane continues
-      // with a fresh xterm.
+      // Enqueue scrollback first so historical bytes drain before any live
+      // channel byte (FIFO order on the shared pump preserves the parser's
+      // stateful alt-screen / cursor boundary). Errors here are logged via
+      // the catch-all on the IIFE and the pane continues with a fresh xterm.
       if (
         scrollbackResult.status === "fulfilled" &&
         scrollbackResult.value &&
@@ -552,8 +543,12 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
           restoredCapturesRef.current = meta.adapter_captures;
         }
         if (!meta.alternate_buffer && scrollback.data) {
-          term.write(scrollback.data);
-          term.write("\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n");
+          pump.enqueueString(scrollback.data);
+          pump.enqueue(
+            new TextEncoder().encode(
+              "\r\n\x1b[2m── session restored ──\x1b[0m\r\n\r\n",
+            ),
+          );
         }
       }
 
@@ -569,10 +564,17 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         });
       }
 
-      // Stage 2: attach the channel. Must come AFTER the scrollback
-      // write so live bytes don't interleave with historical bytes.
+      // Stage 2: attach the channel. Must come AFTER the scrollback is
+      // enqueued so live bytes drain behind the historical bytes. The
+      // callback advances the kitty stack synchronously (the input handler
+      // reads kittyLevel on every keystroke, so it can't wait behind the
+      // throttled pump) then enqueues the bytes for the shared drain.
       const channel = new Channel<unknown>((payload) => {
-        writePtyChunk(payload);
+        if (cancelled) return;
+        const bytes = extractBytes(payload);
+        if (!bytes) return;
+        scanKittyProtocol(bytes);
+        pump.enqueue(bytes);
       });
 
       try {
@@ -648,11 +650,9 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       dataDisposable.dispose();
       dataDisposableRef.current = null;
 
-      if (ptyWriteFrameRef.current !== null) {
-        cancelAnimationFrame(ptyWriteFrameRef.current);
-        ptyWriteFrameRef.current = null;
-      }
-      pendingPtyWrites.current = [];
+      // Stop the throttled pump and drop anything still queued, so an
+      // in-flight drain can't write into the terminal we're about to dispose.
+      pump.cancel();
 
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;

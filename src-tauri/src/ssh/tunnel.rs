@@ -70,6 +70,51 @@ pub struct TunnelOptions<'a> {
     pub remote_binary: &'a str,
 }
 
+/// The remote shell command the tunnel runs over SSH.
+///
+/// This is the heart of "close the app, the host keeps working, reopen
+/// reattaches." Instead of `exec`-ing the daemon in the foreground (which
+/// tied the daemon's life to the SSH connection — closing the app or a WiFi
+/// flap killed every host-side agent), it:
+///
+/// 1. **Reuses** a still-running daemon. If `<socket>.pid` names a live
+///    process and the socket exists, a detached daemon from a previous
+///    session is already serving — we just hold the `-L` forward open
+///    (`exec sleep`) so the client can reconnect to it. `client.list()` on
+///    the desktop then finds the surviving sessions and reattaches.
+/// 2. Otherwise **spawns the daemon detached** — `setsid` (or `nohup` on
+///    hosts without it, e.g. macOS) with stdio redirected — so it survives
+///    SSH channel close (no SIGHUP, own session), then holds the forward.
+///
+/// The daemon's own idle-reaper (1h with zero sessions) handles cleanup of
+/// an abandoned detached daemon, so this never leaks indefinitely.
+pub fn build_remote_command(remote_socket: &str, binary: &str) -> String {
+    // `SOCK` is a Codemux-generated `/tmp/codemux-ptyd-<hex>.sock` path
+    // (no shell metacharacters), so single-quoting is safe. `BIN` may be
+    // `$HOME/.local/bin/codemux-remote` and must stay expandable, so it's
+    // double-quoted.
+    format!(
+        "SOCK='{remote_socket}' ; BIN=\"{binary}\" ; PIDF=\"$SOCK.pid\" ; LOG=\"$SOCK.log\" ; \
+         alive=0 ; \
+         if [ -S \"$SOCK\" ] && [ -f \"$PIDF\" ] ; then \
+           pid=$(cat \"$PIDF\" 2>/dev/null) ; \
+           if [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null ; then alive=1 ; fi ; \
+         fi ; \
+         if [ \"$alive\" -eq 0 ] ; then \
+           mkdir -p \"$(dirname \"$SOCK\")\" ; rm -f \"$SOCK\" ; \
+           if command -v setsid >/dev/null 2>&1 ; then \
+             setsid \"$BIN\" pty-daemon --socket \"$SOCK\" </dev/null >>\"$LOG\" 2>&1 & \
+           else \
+             nohup \"$BIN\" pty-daemon --socket \"$SOCK\" </dev/null >>\"$LOG\" 2>&1 & \
+           fi ; \
+           i=0 ; while [ ! -S \"$SOCK\" ] && [ \"$i\" -lt 100 ] ; do i=$((i+1)) ; sleep 0.1 ; done ; \
+         fi ; \
+         exec sleep 2147483647",
+        remote_socket = remote_socket,
+        binary = binary,
+    )
+}
+
 /// Build the ssh argv we use to spawn the tunneled daemon. Extracted
 /// so tests can assert the exact flags without forking ssh.
 pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
@@ -92,14 +137,9 @@ pub fn build_tunnel_argv(opts: &TunnelOptions<'_>) -> Vec<String> {
         "-L".into(),
         format!("{}:{}", opts.local_socket.display(), opts.remote_socket),
         opts.ssh_target.into(),
-        // Remote command: ensure the socket dir exists, then run
-        // the daemon. The daemon binds and serves until ssh dies.
-        format!(
-            "rm -f {remote_socket} ; mkdir -p \"$(dirname {remote_socket})\" ; \
-             exec {binary} pty-daemon --socket {remote_socket}",
-            remote_socket = opts.remote_socket,
-            binary = opts.remote_binary,
-        ),
+        // Remote command: reuse a live detached daemon or spawn one
+        // detached, then hold the forward open. See `build_remote_command`.
+        build_remote_command(opts.remote_socket, opts.remote_binary),
     ]
 }
 
@@ -248,6 +288,69 @@ mod tests {
         assert!(
             target_idx < last_idx,
             "target must come before the remote command"
+        );
+    }
+
+    // ── Persistence-aware remote command (the "survive app close + reattach"
+    //    mechanism). These lock in the contract that lets a host agent
+    //    outlive the SSH connection and be reused on reconnect. ──
+
+    #[test]
+    fn remote_command_reuses_a_live_daemon_via_pidfile_probe() {
+        let cmd = build_remote_command("/tmp/codemux-ptyd-abc.sock", "codemux-remote");
+        // Liveness probe: the pidfile + kill -0 check is what tells a
+        // reconnect "a detached daemon is already serving — don't respawn,
+        // just hold the forward." Losing this regresses reattach into
+        // "fresh daemon, sessions lost."
+        assert!(cmd.contains("$SOCK.pid"), "must probe the per-socket pidfile");
+        assert!(cmd.contains("kill -0"), "must verify the pid is alive");
+        // The socket path + binary still appear (same as the old command);
+        // the daemon is invoked via the `$BIN` var so the literal is
+        // `"$BIN" pty-daemon --socket "$SOCK"`.
+        assert!(cmd.contains("/tmp/codemux-ptyd-abc.sock"));
+        assert!(cmd.contains("BIN=\"codemux-remote\""));
+        assert!(cmd.contains("pty-daemon --socket \"$SOCK\""));
+    }
+
+    #[test]
+    fn remote_command_spawns_detached_so_it_survives_ssh_close() {
+        let cmd = build_remote_command("/tmp/codemux-ptyd-abc.sock", "codemux-remote");
+        // The daemon must detach from the SSH session — otherwise the
+        // channel-close SIGHUP kills every host agent when the app quits.
+        // setsid (Linux) with a nohup fallback (macOS) is the contract.
+        assert!(cmd.contains("setsid"), "prefer setsid to detach the daemon");
+        assert!(
+            cmd.contains("nohup"),
+            "fall back to nohup on hosts without setsid (e.g. macOS)"
+        );
+        // stdin detached so the daemon can't be wedged on a closed channel.
+        assert!(cmd.contains("</dev/null"));
+    }
+
+    #[test]
+    fn remote_command_holds_the_forward_open() {
+        let cmd = build_remote_command("/tmp/codemux-ptyd-abc.sock", "codemux-remote");
+        // The SSH `-L` forward only lives as long as the remote command
+        // does. Since the daemon is now detached (not the foreground exec),
+        // we hold the forward with a long-lived `exec sleep`.
+        assert!(cmd.contains("exec sleep"), "must hold the -L forward open");
+    }
+
+    #[test]
+    fn remote_command_keeps_binary_expandable() {
+        // The bootstrap installs to ~/.local/bin, so the binary path is
+        // often `$HOME/.local/bin/codemux-remote` and MUST stay shell-
+        // expandable (double-quoted, not single-quoted) or the daemon never
+        // starts. The socket is a fixed /tmp path, safe to single-quote.
+        let cmd =
+            build_remote_command("/tmp/codemux-ptyd-abc.sock", "$HOME/.local/bin/codemux-remote");
+        assert!(
+            cmd.contains("BIN=\"$HOME/.local/bin/codemux-remote\""),
+            "binary must be double-quoted so $HOME expands: {cmd}"
+        );
+        assert!(
+            cmd.contains("SOCK='/tmp/codemux-ptyd-abc.sock'"),
+            "socket path is single-quoted (no expansion needed)"
         );
     }
 }

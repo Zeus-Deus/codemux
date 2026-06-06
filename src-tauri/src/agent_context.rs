@@ -98,6 +98,14 @@ pub fn build_agent_context(
 /// file and sets the env var, so the file is only created when Gemini actually launches.
 /// The Gemini inline pipeline also needs a PowerShell rewrite on Windows (no `printf`,
 /// no `&&` on PS 5.1, and `GEMINI_SYSTEM_MD=val command` inline-env syntax is Unix-only).
+///
+/// Factory's `droid` is a special case for a different reason: interactive `droid` has
+/// **no skip-permissions / autonomy CLI flag** (only the non-interactive `droid exec`
+/// subcommand does). Full autonomy for an interactive session can only be set through a
+/// settings file. So for `droid` we write a tiny runtime settings file enabling
+/// `sessionDefaultSettings.autonomyLevel = "high"` and append `--settings <path>` — that
+/// is `droid`'s YOLO/skip-permissions equivalent. Same cross-platform inline-write split
+/// as Gemini. If the command already carries a `--settings` flag we leave it untouched.
 pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
     let binary = command.split_whitespace().next().unwrap_or("");
     match binary {
@@ -126,10 +134,32 @@ pub fn inject_agent_context(command: &str, workspace_id: &str) -> String {
                 .into_owned();
             gemini_injection_command(&path, command)
         }
-        // OpenCode: no CLI injection mechanism available.
+        "droid" => {
+            // Respect a user-supplied settings file rather than
+            // double-injecting our own.
+            if command.contains("--settings") {
+                command.to_string()
+            } else {
+                let path = std::env::temp_dir()
+                    .join(format!("codemux-{workspace_id}-droid-settings.json"))
+                    .to_string_lossy()
+                    .into_owned();
+                droid_injection_command(&path, command)
+            }
+        }
+        // OpenCode, and the other agent CLIs (Antigravity, Copilot,
+        // Cursor Agent, Amp, Grok) carry their skip-permissions flag
+        // directly in the preset command — no rewrite needed here.
         _ => command.to_string(),
     }
 }
+
+/// Factory Droid runtime settings JSON enabling full autonomy. `droid`
+/// has no interactive skip-permissions flag; this file, passed via
+/// `--settings`, is its YOLO equivalent. The exact `sessionDefaultSettings`
+/// / `autonomyLevel` schema is what the `droid` binary itself documents.
+const DROID_AUTONOMY_JSON: &str =
+    r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#;
 
 /// Returns the shell-level expansion of the `CODEMUX_AGENT_CONTEXT` env var for
 /// the platform's default shell. Used inside `inject_agent_context` to produce a
@@ -173,6 +203,30 @@ fn gemini_injection_command(path: &str, command: &str) -> String {
     // force `-Encoding` and instead let each host pick its default.
     format!(
         "$env:CODEMUX_AGENT_CONTEXT | Set-Content -Path '{path}' -NoNewline; $env:GEMINI_SYSTEM_MD = '{path}'; {command}"
+    )
+}
+
+/// Builds the Factory Droid pre-command pipeline: write the autonomy
+/// settings file, then launch `droid` with `--settings` pointed at it.
+/// This is droid's interactive skip-permissions equivalent — see the
+/// `inject_agent_context` doc comment.
+#[cfg(unix)]
+fn droid_injection_command(path: &str, command: &str) -> String {
+    // POSIX shell: single-quote the JSON so the embedded double quotes
+    // are literal (the JSON contains no single quotes). `&&`
+    // short-circuits if the write fails so we never launch droid
+    // pointing at a missing/partial settings file.
+    format!("printf '%s' '{DROID_AUTONOMY_JSON}' > {path} && {command} --settings {path}")
+}
+
+#[cfg(windows)]
+fn droid_injection_command(path: &str, command: &str) -> String {
+    // PowerShell (5.1 / 7+): a single-quoted literal (the JSON has no
+    // single quotes) written with `Set-Content -NoNewline`, then droid
+    // launched with `--settings`. Uses `;` rather than `&&` because
+    // `&&` is PowerShell 7+ only — Windows PowerShell 5.1 rejects it.
+    format!(
+        "'{DROID_AUTONOMY_JSON}' | Set-Content -Path '{path}' -NoNewline; {command} --settings '{path}'"
     )
 }
 
@@ -416,6 +470,56 @@ mod tests {
     fn inject_opencode_unchanged() {
         let result = inject_agent_context("opencode", "ws-1");
         assert_eq!(result, "opencode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inject_droid_writes_settings_and_appends_flag_unix() {
+        // Unix pipeline: `printf '%s' '<json>' > path && droid --settings path`
+        let result = inject_agent_context("droid", "test-ws-droid");
+        assert!(result.contains("printf '%s'"));
+        assert!(result.contains(r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#));
+        assert!(result.contains("codemux-test-ws-droid-droid-settings.json"));
+        assert!(result.contains("droid --settings "));
+        assert!(result.ends_with("droid-settings.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inject_droid_writes_settings_and_appends_flag_windows() {
+        // Windows pipeline uses PowerShell `Set-Content -NoNewline`,
+        // never the Unix `printf` form.
+        let result = inject_agent_context("droid", "test-ws-droid");
+        assert!(result.contains("Set-Content"));
+        assert!(result.contains("-NoNewline"));
+        assert!(result.contains(r#"{"sessionDefaultSettings":{"autonomyLevel":"high"}}"#));
+        assert!(result.contains("codemux-test-ws-droid-droid-settings.json"));
+        assert!(result.contains("droid --settings "));
+        assert!(!result.contains("printf"));
+    }
+
+    #[test]
+    fn inject_droid_respects_existing_settings_flag() {
+        // If the user already passed --settings, don't double-inject.
+        let result =
+            inject_agent_context("droid --settings /my/own.json", "ws-1");
+        assert_eq!(result, "droid --settings /my/own.json");
+    }
+
+    #[test]
+    fn inject_droid_settings_path_is_cross_platform() {
+        // Regression guard mirroring the Gemini path: the droid
+        // settings file must resolve via std::env::temp_dir(), never a
+        // hardcoded unix path.
+        let result = inject_agent_context("droid", "test-ws-dx");
+        let expected_temp = std::env::temp_dir()
+            .join("codemux-test-ws-dx-droid-settings.json")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            result.contains(&expected_temp),
+            "droid injection must reference {expected_temp:?}, got {result:?}",
+        );
     }
 
     /// Regression guard: the Gemini injection path MUST resolve its temp

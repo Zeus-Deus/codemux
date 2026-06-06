@@ -126,6 +126,12 @@ pub struct PortInfo {
     pub process_name: String,
     pub workspace_id: Option<String>,
     pub label: Option<String>,
+    /// Where this port was discovered. `None` for the OS-level scan
+    /// (`/proc` on Linux, `netstat` on Windows); `Some("docker")` for a
+    /// published container port surfaced via the Docker CLI. The frontend
+    /// uses this to render container ports under a dedicated "Docker" group.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +271,7 @@ fn resolve_pids_for_inodes(inode_to_port: &HashMap<u64, u16>) -> Vec<PortInfo> {
                                 process_name,
                                 workspace_id: None,
                                 label: None,
+                                source: None,
                             });
                         }
                     }
@@ -394,6 +401,7 @@ fn parse_netstat_output(
             process_name,
             workspace_id: None,
             label: None,
+            source: None,
         });
     }
 
@@ -610,16 +618,187 @@ pub fn load_static_ports(workspace_cwd: &str, workspace_id: &str) -> Option<Vec<
                 process_name: String::new(),
                 workspace_id: Some(workspace_id.to_string()),
                 label: Some(entry.label),
+                source: None,
             })
             .collect(),
     )
 }
 
-/// Full port scan: detect ports, resolve workspaces, apply static configs.
+/// Go-template format passed to `docker ps`. Tab-separated so the pure
+/// parser can split fields unambiguously — container names, paths, and
+/// service names never contain tabs. Docker expands the literal `\t` escape
+/// into a real tab in its output (verified against the CLI).
+///
+/// Fields, in order:
+///   1. `.Names` — container name (e.g. `myproj-web-1`)
+///   2. compose `working_dir` label — absolute path of the compose project
+///      dir, which equals the codemux worktree path for agent-spawned stacks
+///   3. compose `service` label — short service name (e.g. `web`)
+///   4. `.Ports` — published / exposed port list
+const DOCKER_PS_FORMAT: &str = "{{.Names}}\\t{{.Label \"com.docker.compose.project.working_dir\"}}\\t{{.Label \"com.docker.compose.service\"}}\\t{{.Ports}}";
+
+/// Cached availability of the `docker` CLI. 0 = unknown, 1 = present,
+/// 2 = binary not found. Only the "not found" verdict is cached: a missing
+/// binary won't materialize mid-session, so there's no point spawning a
+/// doomed process every 3 seconds. A present-but-erroring daemon (socket
+/// down, missing permission) is deliberately NOT cached so detection
+/// recovers on its own once the daemon is back.
+static DOCKER_CLI_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Run `docker ps` with [`DOCKER_PS_FORMAT`]. Returns raw stdout, or `None`
+/// if docker is unavailable or the command failed. Suppresses the console
+/// window on Windows — this runs every 3s, so a flashing console would be
+/// unacceptable — mirroring the `netstat`/`tasklist` shell-outs.
+fn run_docker_ps() -> Option<String> {
+    use std::sync::atomic::Ordering;
+
+    // Skip the spawn entirely once we've learned docker isn't installed.
+    if DOCKER_CLI_STATE.load(Ordering::Relaxed) == 2 {
+        return None;
+    }
+
+    let mut cmd = std::process::Command::new("docker");
+    cmd.args(["ps", "--no-trunc", "--format", DOCKER_PS_FORMAT]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW — no console flash on the 3s heartbeat.
+        cmd.creation_flags(0x0800_0000);
+    }
+
+    match cmd.output() {
+        Ok(output) if output.status.success() => {
+            DOCKER_CLI_STATE.store(1, Ordering::Relaxed);
+            Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        }
+        // Daemon down or no socket permission — transient, don't cache.
+        Ok(_) => None,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DOCKER_CLI_STATE.store(2, Ordering::Relaxed);
+            }
+            None
+        }
+    }
+}
+
+/// Detect published Docker container ports that belong to an open codemux
+/// worktree.
+///
+/// Why this exists: on Linux, published container ports are owned by the
+/// root `docker-proxy` process, so the `/proc/*/fd` PID-resolution step in
+/// `linux_detect_listening_ports` hits a permission wall and silently drops
+/// them. The listening socket is right there in `/proc/net/tcp` but is never
+/// attributed to a PID, so the OS scan can't surface it. Querying the Docker
+/// CLI recovers these ports with a meaningful label (the container name).
+///
+/// `workspace_paths` maps absolute path -> workspace_id for every open
+/// workspace (both cwd and worktree path). A container is included only if
+/// its compose `working_dir` matches one of those paths — this is what
+/// scopes detection to codemux worktree containers and excludes unrelated
+/// stacks the user runs by hand.
+fn detect_docker_ports(workspace_paths: &HashMap<String, String>) -> Vec<PortInfo> {
+    // No open workspaces → nothing a container could match → skip the spawn.
+    if workspace_paths.is_empty() {
+        return Vec::new();
+    }
+    let Some(stdout) = run_docker_ps() else {
+        return Vec::new();
+    };
+    parse_docker_ps_output(&stdout, workspace_paths)
+}
+
+/// Pure parser for `docker ps` output in [`DOCKER_PS_FORMAT`]. Defined at
+/// module level (not behind any cfg) so its tests run on every platform —
+/// the body is pure string parsing with no syscalls.
+///
+/// Each line is `name \t working_dir \t service \t ports`. A row is kept only
+/// if `working_dir` matches an open workspace path; for each *published* TCP
+/// mapping (`IP:HOSTPORT->CPORT/tcp`) the host port becomes a `PortInfo`
+/// tagged `source = "docker"` and labeled with the container name. Filtered
+/// out: bare exposures with no host binding (`8000/tcp`), UDP mappings,
+/// Codemux-internal ports, and the IPv4/IPv6 double-publish of one host port.
+fn parse_docker_ps_output(
+    stdout: &str,
+    workspace_paths: &HashMap<String, String>,
+) -> Vec<PortInfo> {
+    let mut results: Vec<PortInfo> = Vec::new();
+    let mut seen_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+
+    for line in stdout.lines() {
+        let mut fields = line.splitn(4, '\t');
+        let (Some(name), Some(working_dir), Some(service), Some(ports_str)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+
+        let name = name.trim();
+        // Match the container's compose project dir to an open workspace.
+        // Trim a trailing slash so `/path` and `/path/` compare equal.
+        let working_dir = working_dir.trim().trim_end_matches('/');
+        if working_dir.is_empty() {
+            continue;
+        }
+        let Some(workspace_id) = workspace_paths.get(working_dir) else {
+            continue;
+        };
+        let service = service.trim();
+
+        // `ports_str` looks like:
+        //   "0.0.0.0:8099->8000/tcp, [::]:8099->8000/tcp, 8000/tcp"
+        for segment in ports_str.split(',') {
+            let segment = segment.trim();
+            // Published mappings contain "->"; bare "8000/tcp" exposures don't.
+            let Some((host_side, _container_side)) = segment.split_once("->") else {
+                continue;
+            };
+            // Only TCP — the OS scan is TCP-only, keep parity.
+            if !segment.ends_with("/tcp") {
+                continue;
+            }
+            // `host_side` is "IP:PORT" (IPv4) or "[::]:PORT" (IPv6); the host
+            // port is whatever follows the final ':'.
+            let Some(port_str) = host_side.rsplit(':').next() else {
+                continue;
+            };
+            let Ok(port) = port_str.parse::<u16>() else {
+                continue;
+            };
+            if is_codemux_internal_port(port) {
+                continue;
+            }
+            // The same host port is published once for IPv4 and once for
+            // IPv6 — dedupe so it appears a single time.
+            if !seen_ports.insert(port) {
+                continue;
+            }
+
+            results.push(PortInfo {
+                port,
+                pid: 0,
+                process_name: service.to_string(),
+                workspace_id: Some(workspace_id.clone()),
+                label: Some(name.to_string()),
+                source: Some("docker".to_string()),
+            });
+        }
+    }
+
+    results.sort_by_key(|p| p.port);
+    results
+}
+
+/// Full port scan: detect ports, resolve workspaces, apply static configs,
+/// and fold in Docker-published worktree ports.
+///
+/// `workspace_paths` (absolute path -> workspace_id, covering cwd and
+/// worktree path) is used only for matching Docker containers to worktrees.
 pub fn scan_ports(
     session_pids: &HashMap<String, u32>,
     session_workspaces: &HashMap<String, String>,
     workspace_cwds: &HashMap<String, String>,
+    workspace_paths: &HashMap<String, String>,
 ) -> Vec<PortInfo> {
     // Check for static port configs first
     let mut static_workspace_ids = std::collections::HashSet::new();
@@ -645,6 +824,35 @@ pub fn scan_ports(
             .unwrap_or(false);
         if !dominated_by_static {
             all_ports.push(port);
+        }
+    }
+
+    // Docker-published container ports. On Linux these are owned by the root
+    // `docker-proxy` and so are invisible to the /proc scan above; the Docker
+    // CLI recovers them, scoped to open codemux worktrees.
+    let docker_ports = detect_docker_ports(workspace_paths);
+    if !docker_ports.is_empty() {
+        let mut existing: std::collections::HashSet<u16> =
+            all_ports.iter().map(|p| p.port).collect();
+        for dp in docker_ports {
+            // Honor the static-config override: a workspace with a
+            // .codemux/ports.json owns its port list outright.
+            let dominated_by_static = dp
+                .workspace_id
+                .as_ref()
+                .map(|ws_id| static_workspace_ids.contains(ws_id))
+                .unwrap_or(false);
+            if dominated_by_static {
+                continue;
+            }
+            // Docker wins on a port collision (rootless docker can surface the
+            // same port in the OS scan as `docker-proxy`/`rootlesskit` — the
+            // container name is the better label).
+            if existing.contains(&dp.port) {
+                all_ports.retain(|p| p.port != dp.port);
+            }
+            existing.insert(dp.port);
+            all_ports.push(dp);
         }
     }
 
@@ -1083,6 +1291,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "svchost.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 139,
@@ -1090,6 +1299,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "System".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 445,
@@ -1097,6 +1307,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "System".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 1042,
@@ -1104,6 +1315,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "svchost.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 1043,
@@ -1111,6 +1323,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "svchost.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 5040,
@@ -1118,6 +1331,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "svchost.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 5173,
@@ -1125,6 +1339,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "node.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
         ];
 
@@ -1152,6 +1367,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "node.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 8000,
@@ -1159,6 +1375,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "python.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 9229,
@@ -1166,6 +1383,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "chrome.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
             PortInfo {
                 port: 8080,
@@ -1173,6 +1391,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
                 process_name: "java.exe".into(),
                 workspace_id: None,
                 label: None,
+                source: None,
             },
         ];
 
@@ -1195,6 +1414,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
             process_name: "unknown".into(),
             workspace_id: None,
             label: None,
+            source: None,
         }];
 
         let filtered = apply_windows_system_filter(input.clone());
@@ -1241,6 +1461,231 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
             filtered_ports,
             vec![5173],
             "after the system-process filter only the node.exe dev server should remain"
+        );
+    }
+}
+
+// ── Docker parser tests ─────────────────────────────────────────────────────
+//
+// Exercise `parse_docker_ps_output` with hand-built `docker ps` fixtures.
+// The parser is pure string-processing (no `docker` binary, no syscalls), so
+// these run on every platform on CI — the same cross-platform strategy used
+// for the netstat/tasklist parsers above.
+
+#[cfg(test)]
+mod docker_parser_tests {
+    use super::{parse_docker_ps_output, PortInfo};
+    use std::collections::HashMap;
+
+    const WT: &str = "/home/u/.codemux/worktrees/proj/feature-x";
+    const WS_ID: &str = "ws-feature-x";
+
+    /// One open workspace whose worktree path is `WT`.
+    fn worktree_map() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(WT.to_string(), WS_ID.to_string());
+        m
+    }
+
+    /// Build a single `docker ps` line: name \t working_dir \t service \t ports.
+    fn line(name: &str, working_dir: &str, service: &str, ports: &str) -> String {
+        format!("{name}\t{working_dir}\t{service}\t{ports}")
+    }
+
+    #[test]
+    fn published_port_for_matching_worktree_is_detected() {
+        // A real container publishes the same host port on IPv4 and IPv6.
+        let stdout = line(
+            "proj-web-1",
+            WT,
+            "web",
+            "0.0.0.0:8099->8000/tcp, [::]:8099->8000/tcp",
+        );
+        let ports = parse_docker_ps_output(&stdout, &worktree_map());
+
+        assert_eq!(ports.len(), 1, "IPv4+IPv6 double-publish must dedupe to one");
+        let p = &ports[0];
+        assert_eq!(p.port, 8099);
+        assert_eq!(p.label.as_deref(), Some("proj-web-1"), "label = container name");
+        assert_eq!(p.process_name, "web", "process_name = compose service");
+        assert_eq!(p.workspace_id.as_deref(), Some(WS_ID));
+        assert_eq!(p.source.as_deref(), Some("docker"));
+        assert_eq!(p.pid, 0, "Docker ports carry no OS pid");
+    }
+
+    #[test]
+    fn unpublished_exposure_is_ignored() {
+        // `EXPOSE`d but not published: no "->" host mapping.
+        let stdout = line("proj-db-1", WT, "db", "5432/tcp, 8000/tcp");
+        assert!(
+            parse_docker_ps_output(&stdout, &worktree_map()).is_empty(),
+            "ports with no host binding must not appear"
+        );
+    }
+
+    #[test]
+    fn container_outside_any_worktree_is_excluded() {
+        // working_dir doesn't match an open workspace — unrelated stack.
+        let stdout = line(
+            "random-redis-1",
+            "/opt/other/stack",
+            "redis",
+            "0.0.0.0:6400->6379/tcp",
+        );
+        assert!(
+            parse_docker_ps_output(&stdout, &worktree_map()).is_empty(),
+            "containers outside codemux worktrees must be filtered out"
+        );
+    }
+
+    #[test]
+    fn codemux_internal_ports_are_skipped() {
+        // 4000 (in 3900..=4199) and 9300 (>= 9222) are Codemux-internal;
+        // only the normal 8090 should survive.
+        let stdout = line(
+            "proj-svc-1",
+            WT,
+            "svc",
+            "127.0.0.1:4000->80/tcp, 127.0.0.1:9300->80/tcp, 127.0.0.1:8090->80/tcp",
+        );
+        let ports = parse_docker_ps_output(&stdout, &worktree_map());
+        let nums: Vec<u16> = ports.iter().map(|p| p.port).collect();
+        assert_eq!(nums, vec![8090]);
+    }
+
+    #[test]
+    fn udp_mappings_are_ignored() {
+        let stdout = line("proj-dns-1", WT, "dns", "0.0.0.0:5353->53/udp");
+        assert!(
+            parse_docker_ps_output(&stdout, &worktree_map()).is_empty(),
+            "UDP mappings must be ignored (parity with the TCP-only OS scan)"
+        );
+    }
+
+    #[test]
+    fn multiple_services_in_one_project_each_appear() {
+        let stdout = format!(
+            "{}\n{}\n{}",
+            line("proj-web-1", WT, "web", "127.0.0.1:7000->7000/tcp"),
+            line("proj-api-1", WT, "api", "127.0.0.1:8080->8080/tcp"),
+            line("proj-cache-1", WT, "cache", "6379/tcp"), // unpublished → skipped
+        );
+        let ports = parse_docker_ps_output(&stdout, &worktree_map());
+        let nums: Vec<u16> = ports.iter().map(|p| p.port).collect();
+        assert_eq!(nums, vec![7000, 8080], "results are sorted by port");
+        let services: Vec<&str> = ports.iter().map(|p| p.process_name.as_str()).collect();
+        assert_eq!(services, vec!["web", "api"]);
+    }
+
+    #[test]
+    fn trailing_slash_in_working_dir_still_matches() {
+        // Compose can report the dir with a trailing slash; the workspace
+        // map stores it without one. They must still match.
+        let with_slash = format!("{WT}/");
+        let stdout = line("proj-web-1", &with_slash, "web", "0.0.0.0:9090->80/tcp");
+        let ports = parse_docker_ps_output(&stdout, &worktree_map());
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 9090);
+    }
+
+    #[test]
+    fn blank_and_malformed_lines_are_skipped() {
+        // Empty lines and rows with too few tab fields must not panic.
+        let stdout = format!(
+            "\n{}\nshort-line-no-tabs\n{}",
+            line("proj-web-1", WT, "web", "0.0.0.0:8099->8000/tcp"),
+            "name-only\tdir-only",
+        );
+        let ports = parse_docker_ps_output(&stdout, &worktree_map());
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].port, 8099);
+    }
+
+    #[test]
+    fn empty_workspace_map_yields_nothing() {
+        let stdout = line("proj-web-1", WT, "web", "0.0.0.0:8099->8000/tcp");
+        assert!(parse_docker_ps_output(&stdout, &HashMap::new()).is_empty());
+    }
+
+    /// Ensures the field constants stay aligned with what we construct: a
+    /// `PortInfo` from this parser always has `source = Some("docker")`.
+    #[test]
+    fn detected_ports_are_tagged_docker() {
+        let stdout = line("proj-web-1", WT, "web", "0.0.0.0:8099->8000/tcp");
+        let ports: Vec<PortInfo> = parse_docker_ps_output(&stdout, &worktree_map());
+        assert!(ports.iter().all(|p| p.source.as_deref() == Some("docker")));
+    }
+}
+
+// ── Live Docker integration test (requires a running Docker daemon) ──────────
+//
+// `#[ignore]`d so `cargo test` and CI stay hermetic (no docker dependency).
+// Unlike the pure-parser tests above, this drives the *real* `detect_docker_ports`
+// path — an actual `docker ps` spawn with `DOCKER_PS_FORMAT`, then parse + the
+// worktree-scope filter. Run it manually against a labeled container whose
+// compose `working_dir` you pass via env:
+//
+//   docker run -d --name demo \
+//     --label com.docker.compose.project.working_dir="$PWD" \
+//     --label com.docker.compose.service=web -p 8099:8000 \
+//     python:3.12-slim python -m http.server 8000
+//   CODEMUX_DOCKER_TEST_WD="$PWD" CODEMUX_DOCKER_TEST_PORT=8099 \
+//     cargo test --manifest-path src-tauri/Cargo.toml --lib \
+//     docker_live_tests -- --ignored --nocapture
+#[cfg(test)]
+mod docker_live_tests {
+    use super::detect_docker_ports;
+    use std::collections::HashMap;
+
+    #[test]
+    #[ignore = "requires a running Docker daemon and a labeled test container"]
+    fn detects_live_published_port_for_worktree() {
+        let wd = std::env::var("CODEMUX_DOCKER_TEST_WD")
+            .expect("set CODEMUX_DOCKER_TEST_WD to the container's compose working_dir");
+        let expected_port: u16 = std::env::var("CODEMUX_DOCKER_TEST_PORT")
+            .expect("set CODEMUX_DOCKER_TEST_PORT")
+            .parse()
+            .expect("CODEMUX_DOCKER_TEST_PORT must be a u16");
+
+        let mut paths = HashMap::new();
+        paths.insert(
+            wd.trim_end_matches('/').to_string(),
+            "ws-live-test".to_string(),
+        );
+
+        let ports = detect_docker_ports(&paths);
+        eprintln!("detect_docker_ports({wd}) -> {ports:#?}");
+
+        let hit = ports
+            .iter()
+            .find(|p| p.port == expected_port)
+            .unwrap_or_else(|| panic!("port {expected_port} not detected; got {ports:?}"));
+        assert_eq!(hit.source.as_deref(), Some("docker"));
+        assert_eq!(hit.workspace_id.as_deref(), Some("ws-live-test"));
+        assert!(
+            hit.label.as_deref().is_some_and(|l| !l.is_empty()),
+            "label should be the container name"
+        );
+    }
+
+    /// A container whose `working_dir` matches NO open workspace must be
+    /// excluded — proves the worktree-scope filter against the live daemon.
+    #[test]
+    #[ignore = "requires a running Docker daemon and a labeled test container"]
+    fn excludes_live_container_outside_worktrees() {
+        let expected_port: u16 = std::env::var("CODEMUX_DOCKER_TEST_PORT")
+            .expect("set CODEMUX_DOCKER_TEST_PORT")
+            .parse()
+            .expect("CODEMUX_DOCKER_TEST_PORT must be a u16");
+
+        // Map points at an unrelated path, so the live container shouldn't match.
+        let mut paths = HashMap::new();
+        paths.insert("/nonexistent/worktree".to_string(), "ws-other".to_string());
+
+        let ports = detect_docker_ports(&paths);
+        assert!(
+            !ports.iter().any(|p| p.port == expected_port),
+            "container outside the workspace path set must be filtered out; got {ports:?}"
         );
     }
 }

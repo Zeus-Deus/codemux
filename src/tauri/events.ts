@@ -238,3 +238,26 @@ export const onAgentChatEvent = (
   cb: EventCallback<AgentChatEventPayload>,
 ): Promise<UnlistenFn> =>
   listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
+
+// ── Tunnel health ──
+//
+// Mirror of src-tauri/src/ssh/tunnel_supervisor.rs:TunnelStatus
+// (serde tag = "kind", snake_case) and the registry's
+// TunnelStatusEvent. Lets the overview/sidebar render a
+// "Reconnecting…" / "Connection lost — re-push" pill on remote
+// workspaces instead of a silent freeze.
+export type TunnelStatus =
+  | { kind: "pending" }
+  | { kind: "connected"; ssh_pid: number }
+  | { kind: "reconnecting"; attempt: number; delay_ms: number }
+  | { kind: "circuit_open"; recent_failures: number };
+
+export interface TunnelStatusPayload {
+  workspace_id: string;
+  status: TunnelStatus;
+}
+
+export const onTunnelStatusChanged = (
+  cb: EventCallback<TunnelStatusPayload>,
+): Promise<UnlistenFn> =>
+  listen<TunnelStatusPayload>("tunnel-status-changed", (e) => cb(e.payload));

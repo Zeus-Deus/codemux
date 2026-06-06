@@ -31,7 +31,6 @@ Actions are defined as `CommandItem` components organized into `CommandGroup` co
 - New Terminal Tab (Ctrl+T)
 - Close Tab (Ctrl+W)
 - Open Browser
-- Open Diff Viewer
 
 **Search**
 - Find File by Name (Ctrl+Shift+P)

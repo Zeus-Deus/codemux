@@ -46,7 +46,7 @@ pub struct AdapterConfig {
 }
 
 /// Bump this when the default adapter config changes so stale files get updated.
-const ADAPTERS_CONFIG_VERSION: u32 = 3;
+const ADAPTERS_CONFIG_VERSION: u32 = 4;
 
 /// Top-level TOML structure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,6 +123,25 @@ fn default_config() -> AdaptersFile {
             validate: None,
             // When no session ID was captured (hooks didn't fire, jq missing, etc.),
             // fall back to --continue which resumes the most recent session in the CWD.
+            fallback_resume_args: Some("--continue".into()),
+        },
+    );
+
+    adapters.insert(
+        "opencode".into(),
+        AdapterConfig {
+            detect_pattern: "opencode".into(),
+            // OpenCode's session id isn't scraped from terminal output; it's
+            // determined from its SQLite DB at push/pull time and stashed in
+            // the pane's adapter captures (see ssh::opencode_db_sync). On a
+            // local app restart there's no captured id, so the fallback
+            // `--continue` resumes the most-recent session for the cwd —
+            // import always sets a session's directory to its cwd, so this
+            // is the right one. Mirrors the Claude adapter's shape.
+            capture: vec![],
+            resume_args: Some("--session {opencode_session_id}".into()),
+            resume_label: Some("Resume OpenCode session".into()),
+            validate: None,
             fallback_resume_args: Some("--continue".into()),
         },
     );
@@ -517,6 +536,24 @@ mod tests {
             Some("--resume {claude_session_id}")
         );
         assert_eq!(claude.fallback_resume_args.as_deref(), Some("--continue"));
+    }
+
+    #[test]
+    fn default_config_includes_opencode_adapter() {
+        // Issue #16: OpenCode panes resume by session id (synced from the
+        // SQLite DB at push/pull), with `--continue` as the local-restart
+        // fallback when no id was captured.
+        let config = default_config();
+        let oc = config
+            .adapters
+            .get("opencode")
+            .expect("opencode adapter present");
+        assert_eq!(oc.detect_pattern, "opencode");
+        assert_eq!(
+            oc.resume_args.as_deref(),
+            Some("--session {opencode_session_id}")
+        );
+        assert_eq!(oc.fallback_resume_args.as_deref(), Some("--continue"));
     }
 
     #[test]

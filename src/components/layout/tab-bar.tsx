@@ -354,14 +354,6 @@ export function TabBar({ workspace }: Props) {
                 Terminal
               </DropdownMenuItem>
               <DropdownMenuItem
-                onClick={() =>
-                  createTab(workspace.workspace_id, "diff").catch(console.error)
-                }
-              >
-                <GitCompare className="h-3.5 w-3.5 mr-2" />
-                Diff Viewer
-              </DropdownMenuItem>
-              <DropdownMenuItem
                 onClick={() => {
                   const surface = workspace.surfaces.find((s) => s.surface_id === workspace.active_surface_id);
                   if (surface) createBrowserPane(surface.active_pane_id).catch(console.error);
