@@ -17,6 +17,18 @@
 - Default to `npm run verify` after meaningful changes.
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
+## Visual Verification
+
+### Visual verification (UI work)
+
+When iterating on UI:
+
+1. `npm run dev` — boots Vite with the Tauri mock auto-installed.
+2. `codemux browser open http://localhost:1420` — the real Codemux UI loads with seed data.
+3. `codemux browser screenshot` — capture visual proof.
+
+The mock lives in `src/dev/` and only loads when no real Tauri runtime is detected. For real-IPC testing, use `npm run tauri:dev` (desktop window, not browser-pane-visible).
+
 ## UI & Feature Work
 
 - The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.
