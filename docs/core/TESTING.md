@@ -16,6 +16,16 @@
 
 Default to `npm run verify` after meaningful work. Use the narrower commands when iterating on one layer.
 
+## Visual Verification (UI work)
+
+When iterating on UI, verify visually against the real React UI running in a browser pane:
+
+1. `npm run dev` — boots Vite at `http://localhost:1420` with the dev-only Tauri mock auto-installed.
+2. `codemux browser open http://localhost:1420` — the real Codemux UI loads with seed data.
+3. `codemux browser screenshot` — capture visual proof.
+
+The mock lives in `src/dev/` and only loads when no real Tauri runtime is detected (dual-guarded in `main.tsx`), so it never ships in production and stays dormant under `npm run tauri:dev`. It is a fixture/in-memory backend — not a real one — so terminals, git, agents, and other Rust-backed behavior are not exercised this way; use `npm run tauri:dev` (desktop window, not browser-pane-visible) for real-IPC testing. See `docs/features/dev-mock-runtime.md`.
+
 ## Testing Layers
 
 - Rust domain tests for workspaces, pane trees, terminal lifecycle, persistence, notifications, memory, indexing, and OpenFlow runtime logic

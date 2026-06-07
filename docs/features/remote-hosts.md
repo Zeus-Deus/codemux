@@ -4,7 +4,7 @@
 - Audience: Anyone touching the new-workspace dialog, the Settings → Hosts pane, the `codemux-remote` binary, or the SSH transport.
 - Authority: Canonical feature doc for steps 2b/2c/2d of the cloud-push series. Builds on 2a (`persistent-agents.md`) + Step 1 (`persistent-agents.md`).
 - Update when: The DevicePicker shape, the codemux-remote CLI, the SSH probe/bootstrap/tunnel protocol, or the workspace `host_id` model change.
-- Read next: `docs/features/persistent-agents.md`, `docs/features/hosts.md` (when 2a's doc is split out).
+- Read next: `docs/features/persistent-agents.md`, `docs/features/workspaces-sync.md`, `docs/features/remote-in-place.md`.
 
 ## What These Steps Ship
 
@@ -281,7 +281,7 @@ Consent was implicitly granted the first time the user bootstrapped
 the host; re-uploading a newer version of the same binary to the
 same location is not a meaningful trust escalation.
 
-#### Defer the restart while host agents are live (post-`v0.7.8`)
+#### Defer the restart while host agents are live (`v0.7.9`)
 
 Re-provisioning the `serve` unit **restarts** it, which kills any PTY
 agents an agent CLI is running *on the host* — the "work on a host
@@ -404,7 +404,7 @@ A deep code audit plus a live SSH round-trip against a loopback host surfaced se
 - **Shell-injection hardening.** `ssh_upload_executable` + `ssh_write_file` route `remote_path` through the tilde-aware `ssh::push::shell_escape` (preserves `~` expansion while single-quoting the body) instead of raw interpolation.
 - **Tunnel socket hash widened 12 → 16 hex chars** (`ssh/registry.rs`): the per-workspace tunnel socket hash truncated the `u64` to 12 hex (48-bit, birthday collisions ~2^24 workspaces); the full 16 hex (64-bit) stays well under the macOS `sun_path` limit.
 
-### Tunnel health in the UI (post-`v0.7.8`)
+### Tunnel health in the UI (`v0.7.9`)
 
 A pushed/remote workspace whose SSH tunnel drops — laptop sleep/wake, WiFi flap — used to just appear *frozen*, and when the supervisor's circuit breaker tripped after repeated reconnect failures the user was never told they had to re-push. `TunnelStatus` was already computed and serialized (it's a tagged enum in `ssh/tunnel_supervisor.rs`: `connected` / `pending` / `reconnecting { attempt, delay_ms }` / `circuit_open { recent_failures }`) but only ever consumed internally in `ssh/registry.rs`. It's now bridged to the frontend:
 
@@ -441,7 +441,7 @@ All 22 new tests pass alongside the prior suite (1382 lib tests, 1721 frontend t
 | Workspace list filter | "This device / All / per-host" dropdown matching superset's `V2WorkspacesHeader`. ~2 hours. |
 | "Pull workspace back" action | Reverse of push. ~half day. |
 | Release skill update | Cross-compile + bundling for the four `codemux-remote` targets. Concrete diff in the release pipeline. ~half day. |
-| Tunnel auto-reconnect polish | `ssh::tunnel_supervisor` is in place and the reconnect state is now **surfaced in the UI** (post-`v0.7.8` — see "Tunnel health in the UI"); remaining polish is tuning the backoff curve (1s→30s, watchdog). |
+| Tunnel auto-reconnect polish | `ssh::tunnel_supervisor` is in place and the reconnect state is now **surfaced in the UI** (`v0.7.9` — see "Tunnel health in the UI"); remaining polish is tuning the backoff curve (1s→30s, watchdog). |
 
 Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c72b44`) — rsync the worktree, spawn the remote daemon, attach the local UI through the SSH-forwarded socket, and synchronize the Claude conversation across local/remote ends.
 
@@ -453,8 +453,8 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 - `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`, `workspace list` (reads the daemon SQLite directly for the host-inventory poller). Unix-only — Windows builds a no-op stub.
 - `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (12-tool catalog), `git.rs` (`worktree_create` + adoption worktree recreate), `config.rs` (state-dir resolution).
 - `src-tauri/src/ssh/probe.rs` / `bootstrap.rs` / `tunnel.rs` / `tunnel_supervisor.rs` / `push.rs` / `registry.rs` — SSH transport (push action + reconnect supervisor + zero-touch provisioning of the `serve` daemon).
-- `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start. `probe_live_host_sessions` (post-`v0.7.8`) reads `live_terminals` from `serve status` over SSH so the upgrade defers the daemon restart when host agents are live (`UpgradeOutcome::Skipped`).
-- `src-tauri/src/ssh/registry.rs` — `spawn_tunnel_status_forwarder` (post-`v0.7.8`): subscribes to the supervisor's status `watch` channel and emits `tunnel-status-changed` per workspace; called at both supervisor install sites, self-terminates on supervisor drop.
+- `src-tauri/src/hosts_upgrade.rs` — background re-bootstrap poller that runs once ~5 s after app start. `probe_live_host_sessions` (`v0.7.9`) reads `live_terminals` from `serve status` over SSH so the upgrade defers the daemon restart when host agents are live (`UpgradeOutcome::Skipped`).
+- `src-tauri/src/ssh/registry.rs` — `spawn_tunnel_status_forwarder` (`v0.7.9`): subscribes to the supervisor's status `watch` channel and emits `tunnel-status-changed` per workspace; called at both supervisor install sites, self-terminates on supervisor drop.
 - `src/stores/tunnel-status-store.ts` / `src/hooks/use-tunnel-status-events.ts` / `src/tauri/events.ts` — frontend tunnel-health store + app-root event hook + `TunnelStatus` wire type; `sidebar-workspace-row.tsx` renders the "Reconnecting…" / "Connection lost — re-push" pill.
 - `src/components/hosts/device-picker.tsx` — shared pill component.
 - `src/components/overlays/new-workspace-dialog.tsx` — DevicePicker wired into bottom bar.

@@ -21,6 +21,7 @@
 - Derivative-branch picker with icons, recency, and worktree tab
 - Notification count badges per workspace in the sidebar
 - Window focus indicator (green dot) in sidebar header
+- Per-project avatar in the sidebar project header: paste an image URL, data URL, or a website/domain (websites resolve through a favicon service); re-saving or re-opening the picker cache-busts the derived favicon so a changed site icon refreshes instead of serving stale bytes
 
 ## Tabs
 

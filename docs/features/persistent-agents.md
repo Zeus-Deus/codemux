@@ -114,8 +114,8 @@ The crash circuit prevents a broken daemon from turning into a tight respawn loo
 - **Resize** for daemon-backed sessions routes through `client.resize` over the socket.
 - **Graceful fallback at every error site** — daemon failure never breaks the terminal.
 - **Crash circuit breaker** caps daemon respawn attempts.
-- **Idle reaper (post-`v0.7.8`)**: a daemon with zero live sessions continuously for **1 hour** (checked every 60 s) removes its manifest + socket and exits, so an abandoned daemon doesn't linger and stale manifests don't confuse the next adoption. Hard guard: it re-checks the session count under the lock immediately before exit, so it can **never** reap a live session; any spawn/attach resets the idle clock by making `sessions` non-empty on the next check. Spawned from `pty_daemon::server::run` (`IDLE_REAP = 3600s`, `CHECK_INTERVAL = 60s`).
-- **Comm-log tee on the daemon-backed agent path (post-`v0.7.8`)**: the daemon-backed reader task now tees each cleaned PTY chunk to the OpenFlow communication log, matching the in-process reader — so OpenFlow agents spawned through the daemon (the default since persistent agents) populate the comm log the orchestrator's stuck-detection reads. Both reader paths share the `terminal::comm_log_entry_for_chunk` helper. See `docs/features/openflow.md`.
+- **Idle reaper (`v0.7.9`)**: a daemon with zero live sessions continuously for **1 hour** (checked every 60 s) removes its manifest + socket and exits, so an abandoned daemon doesn't linger and stale manifests don't confuse the next adoption. Hard guard: it re-checks the session count under the lock immediately before exit, so it can **never** reap a live session; any spawn/attach resets the idle clock by making `sessions` non-empty on the next check. Spawned from `pty_daemon::server::run` (`IDLE_REAP = 3600s`, `CHECK_INTERVAL = 60s`).
+- **Comm-log tee on the daemon-backed agent path (`v0.7.9`)**: the daemon-backed reader task now tees each cleaned PTY chunk to the OpenFlow communication log, matching the in-process reader — so OpenFlow agents spawned through the daemon (the default since persistent agents) populate the comm log the orchestrator's stuck-detection reads. Both reader paths share the `terminal::comm_log_entry_for_chunk` helper. See `docs/features/openflow.md`.
 - **Late-attacher exit signal**: clients that attach after a child has already exited receive an immediate `Exited` event instead of hanging.
 - Integration tests (`src-tauri/tests/pty_daemon_persistence.rs` + `pty_daemon_circuit_breaker.rs`): handshake, list, child survives client disconnect, second client sees session, exit code 0 / non-zero reporting, resize round-trip, write-to-unknown error shape, circuit-breaker trip + reset.
 
@@ -127,12 +127,12 @@ The crash circuit prevents a broken daemon from turning into a tight respawn loo
 ## Important Touch Points
 
 - `src-tauri/src/pty_daemon/protocol.rs` — wire types, `PROTOCOL_VERSION`.
-- `src-tauri/src/pty_daemon/server.rs` — daemon main loop, per-session output broadcast, replay buffer, idle reaper (post-`v0.7.8`).
+- `src-tauri/src/pty_daemon/server.rs` — daemon main loop, per-session output broadcast, replay buffer, idle reaper (`v0.7.9`).
 - `src-tauri/src/pty_daemon/client.rs` — Tauri-side socket client; demuxes responses + events.
 - `src-tauri/src/pty_daemon/manifest.rs` — `pty-daemon-manifest.json` read/write/atomic-replace.
 - `src-tauri/src/pty_daemon/supervisor.rs` — `ensure_daemon`, adoption, spawn-detached.
 - `src-tauri/src/terminal/mod.rs` — `spawn_pty_for_session` / `spawn_pty_for_agent` routing, `daemon_path_viable`, persistent-aware `terminate_pty_session` + `Drop for SessionRuntime`, `resize_pty` routing.
-- `src-tauri/src/terminal/daemon_backed.rs` — the daemon-backed spawn implementations, `DaemonWriter`, scrollback + adapter resume wiring, the comm-log tee in the reader task (post-`v0.7.8`).
+- `src-tauri/src/terminal/daemon_backed.rs` — the daemon-backed spawn implementations, `DaemonWriter`, scrollback + adapter resume wiring, the comm-log tee in the reader task (`v0.7.9`).
 - `src-tauri/src/terminal/mod.rs` — `comm_log_entry_for_chunk` shared helper used by both the in-process and daemon-backed reader paths.
 - `src-tauri/src/cli.rs` — `CommandSet::PtyDaemon { socket }` subcommand wiring.
 - `src-tauri/src/lib.rs` — startup adoption warmup (Unix-only).
