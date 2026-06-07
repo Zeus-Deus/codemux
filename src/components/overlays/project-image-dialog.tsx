@@ -33,12 +33,18 @@ export function ProjectImageDialog({
   onSave,
 }: Props) {
   const [value, setValue] = useState(initialValue ?? "");
+  // Fresh token each time the dialog opens so the preview re-fetches the
+  // favicon — lets the user see a site's *current* icon, not a cached one.
+  const [previewBust, setPreviewBust] = useState<string | null>(null);
 
   useEffect(() => {
-    if (open) setValue(initialValue ?? "");
+    if (open) {
+      setValue(initialValue ?? "");
+      setPreviewBust(String(Date.now()));
+    }
   }, [open, initialValue]);
 
-  const resolved = resolveImageUrl(value);
+  const resolved = resolveImageUrl(value, previewBust);
   const isWebsite = resolved.isFavicon;
   const isDirect = !isWebsite && resolved.url.length > 0;
 
@@ -72,6 +78,7 @@ export function ProjectImageDialog({
             <ProjectAvatar
               name={projectName}
               imageUrl={value || null}
+              cacheBust={previewBust}
               size="lg"
               shape="circle"
             />
