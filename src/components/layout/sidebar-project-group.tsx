@@ -82,6 +82,9 @@ export function SidebarProjectGroup({
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
+  // Cache-bust token for the derived favicon. Bumped on every save so a site
+  // that changed its favicon is re-fetched instead of served stale from cache.
+  const [imageVersion, setImageVersion] = useState<string | null>(null);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
@@ -97,6 +100,9 @@ export function SidebarProjectGroup({
     }).catch(() => {});
     dbGetUiState(`project.image:${projectPath}`).then((val) => {
       if (val) setImageUrl(val);
+    }).catch(() => {});
+    dbGetUiState(`project.image.v:${projectPath}`).then((val) => {
+      if (val) setImageVersion(val);
     }).catch(() => {});
   }, [projectPath]);
 
@@ -120,10 +126,17 @@ export function SidebarProjectGroup({
   const handleSaveImage = (next: string | null) => {
     if (!next) {
       setImageUrl(null);
+      setImageVersion(null);
       dbSetUiState(`project.image:${projectPath}`, "").catch(console.error);
+      dbSetUiState(`project.image.v:${projectPath}`, "").catch(console.error);
     } else {
+      // New token on every save forces the favicon to refresh, so re-adding a
+      // site whose favicon changed picks up the new icon instead of the cached one.
+      const version = String(Date.now());
       setImageUrl(next);
+      setImageVersion(version);
       dbSetUiState(`project.image:${projectPath}`, next).catch(console.error);
+      dbSetUiState(`project.image.v:${projectPath}`, version).catch(console.error);
     }
   };
 
@@ -201,6 +214,7 @@ export function SidebarProjectGroup({
                 name={projectName}
                 color={customColor}
                 imageUrl={imageUrl}
+                cacheBust={imageVersion}
                 size="md"
                 shape="circle"
                 className="mr-2.5"

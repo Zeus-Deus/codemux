@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import { resolveImageUrl } from "@/lib/project-image";
 
@@ -6,6 +6,12 @@ interface Props {
   name: string;
   color?: string | null;
   imageUrl?: string | null;
+  /**
+   * Token appended to derived favicon URLs to bust the WebView image cache.
+   * Change it when the user re-saves/re-opens the picker so a site's updated
+   * favicon is actually re-fetched instead of served stale from cache.
+   */
+  cacheBust?: string | number | null;
   size?: "sm" | "md" | "lg";
   shape?: "circle" | "square";
   className?: string;
@@ -28,6 +34,7 @@ export function ProjectAvatar({
   name,
   color,
   imageUrl,
+  cacheBust,
   size = "lg",
   shape = "circle",
   className,
@@ -35,8 +42,16 @@ export function ProjectAvatar({
   const [imgFailed, setImgFailed] = useState(false);
 
   const letter = (name || "?").charAt(0).toUpperCase();
-  const resolved = imageUrl ? resolveImageUrl(imageUrl) : null;
-  const hasImage = !!resolved?.url && !imgFailed;
+  const resolved = imageUrl ? resolveImageUrl(imageUrl, cacheBust) : null;
+  const resolvedUrl = resolved?.url ?? "";
+
+  // Retry the image whenever the resolved URL changes (new image or a fresh
+  // cache-bust token) so a previous load failure doesn't pin us to the letter.
+  useEffect(() => {
+    setImgFailed(false);
+  }, [resolvedUrl]);
+
+  const hasImage = !!resolvedUrl && !imgFailed;
   const hasColor = !!color;
   const shapeClass = shape === "circle" ? "rounded-full" : "rounded";
 
@@ -52,7 +67,7 @@ export function ProjectAvatar({
         )}
       >
         <img
-          src={resolved!.url}
+          src={resolvedUrl}
           alt=""
           className="h-full w-full object-cover"
           onError={() => setImgFailed(true)}
