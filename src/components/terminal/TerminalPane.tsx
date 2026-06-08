@@ -27,6 +27,8 @@ import {
   resizePty,
   detachPtyOutput,
   attachPtyOutput,
+  pausePtyOutput,
+  resumePtyOutput,
   getTerminalStatus,
   clearAgentStatus,
   getTerminalScrollback,
@@ -526,14 +528,42 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     let cancelled = false;
     const attachStarted = performance.now();
 
-    // ── Throttled write pump ──
+    // ── Throttled write pump + PTY producer back-pressure ──
     //
     // Every byte that reaches xterm — disk scrollback restore, the PTY
     // reattach replay, and steady live output — goes through this single
     // ordered queue, drained a budget-bounded batch per macrotask so a
     // multi-MB reattach replay can't peg the main thread and freeze the
     // workspace switch. See ./terminal-write-pump.ts for the full rationale.
-    const pump = createWritePump((data) => term.write(data));
+    //
+    // The consumer-side throttle alone can't stop a fast producer (`yes`, a
+    // verbose build, a runaway agent) from outrunning xterm's ~5–35 MB/s
+    // ingest — without a signal back to the producer, the backend's
+    // pending_output ring grows until it evicts (drops) the oldest output.
+    // So we also watch the pump's queued-byte depth: above HIGH we ask the
+    // backend to pause this session's PTY read loop (the child then blocks on
+    // write() once the kernel PTY buffer fills — real back-pressure); below
+    // LOW we resume. `flowPaused` tracks whether we currently hold that pause
+    // so cleanup can always release it (the backend also self-heals via a
+    // resume-on-attach + max-park backstop).
+    let flowPaused = false;
+    const pump = createWritePump((data) => term.write(data), {
+      onHighWatermark: () => {
+        flowPaused = true;
+        pausePtyOutput(sid).catch((err) => {
+          // Pause didn't land (e.g. the session just exited). Drop the local
+          // guard so cleanup won't issue a spurious resume.
+          flowPaused = false;
+          console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+        });
+      },
+      onLowWatermark: () => {
+        flowPaused = false;
+        resumePtyOutput(sid).catch((err) => {
+          console.error(`[codemux] flow-control resume failed for ${sid}:`, err);
+        });
+      },
+    });
 
     (async () => {
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
@@ -682,6 +712,15 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       // Stop the throttled pump and drop anything still queued, so an
       // in-flight drain can't write into the terminal we're about to dispose.
       pump.cancel();
+
+      // If we're unmounting while holding a flow-control pause, release it so
+      // a backgrounded (daemon-backed) agent isn't left blocked on write().
+      // The backend also self-heals (resume-on-attach + max-park backstop),
+      // but resuming here makes it immediate.
+      if (flowPaused) {
+        flowPaused = false;
+        resumePtyOutput(sid).catch(console.error);
+      }
 
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;

@@ -180,4 +180,132 @@ describe("terminal-write-pump", () => {
     await drainFully();
     expect(writes.length).toBe(0);
   });
+
+  // ── PTY producer back-pressure (queued-byte watermarks) ──
+  //
+  // Under fake timers the first enqueue drains one budget synchronously then
+  // parks on its setTimeout(0); every subsequent synchronous enqueue piles up
+  // (the pump is single-flight). That lets these tests build the queue past a
+  // watermark deterministically without releasing the drain.
+
+  it("fires onHighWatermark once when the queue exceeds HIGH, onLowWatermark once after it drains", async () => {
+    const writes: Uint8Array[] = [];
+    let highCalls = 0;
+    let lowCalls = 0;
+    const pump = createWritePump((d) => writes.push(d as Uint8Array), {
+      highWatermarkBytes: 10,
+      lowWatermarkBytes: 4,
+      onHighWatermark: () => highCalls++,
+      onLowWatermark: () => lowCalls++,
+    });
+
+    // 20 one-byte chunks. The first drains synchronously (queue→0); the rest
+    // pile up, so queuedBytes climbs 1,2,…,19 and crosses HIGH (10) once.
+    for (let i = 0; i < 20; i++) pump.enqueue(bytes(i & 0xff));
+
+    expect(highCalls).toBe(1);
+    expect(lowCalls).toBe(0);
+    expect(pump.flowPaused).toBe(true);
+    expect(pump.queuedBytes).toBe(19);
+
+    await drainFully();
+
+    expect(lowCalls).toBe(1);
+    expect(highCalls).toBe(1); // never re-fired while staying high
+    expect(pump.flowPaused).toBe(false);
+    expect(pump.queuedBytes).toBe(0);
+    expect(writes.length).toBe(20); // back-pressure never drops bytes
+  });
+
+  it("does not trip watermarks for an ordinary sub-HIGH burst", async () => {
+    let highCalls = 0;
+    let lowCalls = 0;
+    const pump = createWritePump(() => {}, {
+      highWatermarkBytes: 1000,
+      lowWatermarkBytes: 100,
+      onHighWatermark: () => highCalls++,
+      onLowWatermark: () => lowCalls++,
+    });
+
+    for (let i = 0; i < 20; i++) pump.enqueue(bytes(1, 2, 3)); // 60 bytes total
+    await drainFully();
+
+    expect(highCalls).toBe(0);
+    expect(lowCalls).toBe(0);
+    expect(pump.flowPaused).toBe(false);
+  });
+
+  it("counts enqueueString bytes toward the watermark", async () => {
+    let highCalls = 0;
+    const pump = createWritePump(() => {}, {
+      highWatermarkBytes: 10,
+      lowWatermarkBytes: 4,
+      onHighWatermark: () => highCalls++,
+    });
+
+    // First enqueueString drains synchronously; the second piles up behind it.
+    pump.enqueueString("AAAAA"); // 5 chars
+    pump.enqueueString("BBBBBB"); // 6 chars -> queuedBytes = 6
+    expect(highCalls).toBe(0);
+    pump.enqueue(bytes(1, 2, 3, 4, 5)); // +5 -> queuedBytes = 11 > 10
+    expect(highCalls).toBe(1);
+    expect(pump.queuedBytes).toBe(11);
+    expect(pump.flowPaused).toBe(true);
+  });
+
+  it("re-arms the high watermark only after dropping below LOW (hysteresis)", async () => {
+    let highCalls = 0;
+    let lowCalls = 0;
+    const pump = createWritePump(() => {}, {
+      highWatermarkBytes: 10,
+      lowWatermarkBytes: 4,
+      onHighWatermark: () => highCalls++,
+      onLowWatermark: () => lowCalls++,
+    });
+
+    for (let i = 0; i < 20; i++) pump.enqueue(bytes(i & 0xff));
+    expect(highCalls).toBe(1);
+    await drainFully();
+    expect(lowCalls).toBe(1);
+
+    // Second flood after a full drain must arm HIGH again.
+    for (let i = 0; i < 20; i++) pump.enqueue(bytes(i & 0xff));
+    expect(highCalls).toBe(2);
+    await drainFully();
+    expect(lowCalls).toBe(2);
+  });
+
+  it("cancel() preserves flowPaused and does not fire onLowWatermark", async () => {
+    let lowCalls = 0;
+    const pump = createWritePump(() => {}, {
+      highWatermarkBytes: 10,
+      lowWatermarkBytes: 4,
+      onLowWatermark: () => lowCalls++,
+    });
+
+    for (let i = 0; i < 20; i++) pump.enqueue(bytes(i & 0xff));
+    expect(pump.flowPaused).toBe(true);
+
+    pump.cancel();
+
+    // The caller (TerminalPane) inspects flowPaused on teardown to decide
+    // whether to resume the backend — cancel must NOT silently clear it or
+    // fire the low callback (which would race that explicit resume).
+    expect(pump.flowPaused).toBe(true);
+    expect(lowCalls).toBe(0);
+    expect(pump.pending).toBe(0);
+    expect(pump.queuedBytes).toBe(0);
+  });
+
+  it("works without watermark callbacks (queuedBytes still tracked)", async () => {
+    const writes: Uint8Array[] = [];
+    const pump = createWritePump((d) => writes.push(d as Uint8Array));
+
+    for (let i = 0; i < 5; i++) pump.enqueue(bytes(i, i)); // 2 bytes each
+    // First chunk drained synchronously (2 bytes), 4 chunks (8 bytes) queued.
+    expect(pump.queuedBytes).toBe(8);
+    await drainFully();
+    expect(pump.queuedBytes).toBe(0);
+    expect(writes.length).toBe(5);
+  });
 });

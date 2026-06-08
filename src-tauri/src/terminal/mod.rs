@@ -15,6 +15,7 @@ use std::os::unix::io::RawFd;
 type PollFd = RawFd;
 #[cfg(windows)]
 type PollFd = ();
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -154,6 +155,15 @@ const OUTPUT_BUFFER_BYTE_LIMIT: usize = 1024;
 const PTY_BATCH_SIZE: usize = 32_768;
 /// PTY output batching: flush after this much time since last flush (~1 frame at 60 Hz).
 const PTY_BATCH_INTERVAL: Duration = Duration::from_millis(16);
+/// Flow-control backstop: maximum time the in-process PTY read loop will stay
+/// parked (not draining the master fd) before force-resuming itself. Mirrors
+/// the daemon's `FLOW_MAX_PARK`. Guards against a renderer that asked to pause
+/// (HIGH watermark) but never delivered the matching resume — e.g. a wedged or
+/// crashed webview — so a paused PTY can never block the child process forever.
+const FLOW_MAX_PARK: Duration = Duration::from_secs(10);
+/// Poll cadence while the in-process read loop is flow-paused. Short enough that
+/// resume is near-instant, long enough that a parked loop costs ~nothing.
+const FLOW_PARK_POLL: Duration = Duration::from_millis(10);
 /// Safety cap so we never spawn hundreds of PTYs on startup (e.g. after corrupted or stale persisted state).
 const MAX_STARTUP_SESSIONS: usize = 50;
 
@@ -205,6 +215,24 @@ pub struct SessionRuntime {
     /// across attach/detach cycles so the cumulative loss across a session
     /// is observable, not just the most recent overflow.
     pub dropped_chunks: u64,
+    /// PTY producer back-pressure flag for the **in-process** read loop. When
+    /// set, `batched_reader_loop` stops draining the PTY master fd; the kernel
+    /// PTY buffer then fills and the child's next `write()` blocks — real
+    /// back-pressure straight to the producer instead of an unbounded renderer
+    /// queue (or, worse, `pending_output` eviction once the 256 MiB ring caps).
+    ///
+    /// Set/cleared by `set_pty_flow_paused` (the `pause_pty_output` /
+    /// `resume_pty_output` commands the renderer calls at its HIGH/LOW
+    /// watermarks). Self-heals three ways so a dropped resume can never wedge a
+    /// PTY: cleared on `attach_pty_output` (a reattaching pane starts live),
+    /// cleared on `detach_pty_output` (a backgrounded agent isn't left
+    /// blocked), and a `FLOW_MAX_PARK` backstop inside the read loop.
+    ///
+    /// Shared (`Arc`) with the reader thread so toggling it needs no lock on
+    /// the hot read path. Daemon-backed (persistent) sessions don't run the
+    /// in-process loop — their back-pressure routes through the daemon's own
+    /// `flow_paused` flag — so this stays unread for them (harmless).
+    pub flow_paused: Arc<AtomicBool>,
     pub last_status: TerminalStatusPayload,
     pub child_pid: Option<u32>,
     pub skip_preset_launch: bool,
@@ -259,6 +287,7 @@ impl SessionRuntime {
             pending_output: VecDeque::new(),
             pending_output_bytes: 0,
             dropped_chunks: 0,
+            flow_paused: Arc::new(AtomicBool::new(false)),
             last_status: TerminalStatusPayload {
                 session_id: session_id.to_string(),
                 state: TerminalLifecycleState::Starting,
@@ -696,6 +725,11 @@ fn poll_read_ready(fd: RawFd, timeout_ms: i32) -> bool {
 ///
 /// `poll_fd` is the raw fd for the PTY master (used for poll readiness checks).
 /// `reader` is the cloned reader (a dup of the same fd, used for actual reads).
+/// `flow_paused` is the session's back-pressure flag: while set, the loop stops
+/// draining the master fd so the kernel PTY buffer fills and the child blocks on
+/// `write()` (real back-pressure). It is polled (not condvar-waited) so a missed
+/// wake can't wedge the loop, with a `FLOW_MAX_PARK` backstop that force-resumes
+/// a never-resumed pause.
 /// `pre_read_hook` is called with each read's raw data before it's batched,
 /// allowing per-read processing (e.g. comm log in the agent loop).
 #[cfg(unix)]
@@ -704,14 +738,43 @@ fn batched_reader_loop(
     poll_fd: PollFd,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
+    flow_paused: &Arc<AtomicBool>,
     mut pre_read_hook: impl FnMut(&[u8]),
 ) {
     let mut buf = [0u8; 4096];
     let mut batch: Vec<u8> = Vec::with_capacity(PTY_BATCH_SIZE);
     let mut last_flush = Instant::now();
     let timeout_ms = PTY_BATCH_INTERVAL.as_millis() as i32;
+    // How long we've been continuously parked, for the `FLOW_MAX_PARK` backstop.
+    let mut paused_since: Option<Instant> = None;
 
     loop {
+        // ── Flow-control gate ──
+        // While the attached renderer signals it's behind (its xterm write
+        // queue crossed the HIGH watermark), stop reading. The child's PTY
+        // writes then block once the kernel buffer fills — back-pressure to
+        // the producer instead of an unbounded queue / dropped scrollback.
+        // A first-flush keeps the renderer from being starved of bytes it has
+        // already accepted before we park. The `FLOW_MAX_PARK` backstop
+        // force-resumes if the renderer wedged and never sent the resume.
+        if flow_paused.load(Ordering::Relaxed) {
+            flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+            while flow_paused.load(Ordering::Relaxed) {
+                let since = *paused_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= FLOW_MAX_PARK {
+                    eprintln!(
+                        "[codemux::terminal] session {session_id} flow-paused for >{}s — \
+                         force-resuming (renderer wedged or resume frame lost)",
+                        FLOW_MAX_PARK.as_secs()
+                    );
+                    flow_paused.store(false, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(FLOW_PARK_POLL);
+            }
+            paused_since = None;
+        }
+
         // If the batch has data, use a timed poll so we flush on timeout.
         // If the batch is empty, block indefinitely until data arrives.
         let poll_timeout = if batch.is_empty() { -1 } else { timeout_ms };
@@ -750,6 +813,7 @@ fn batched_reader_loop(
     _poll_fd: PollFd,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
+    flow_paused: &Arc<AtomicBool>,
     mut pre_read_hook: impl FnMut(&[u8]),
 ) {
     // Windows placeholder: Windows pipes are blocking with no poll() equivalent,
@@ -758,7 +822,31 @@ fn batched_reader_loop(
     let mut buf = [0u8; 4096];
     let mut batch: Vec<u8> = Vec::with_capacity(PTY_BATCH_SIZE);
     let mut last_flush = Instant::now();
+    // How long we've been continuously parked, for the `FLOW_MAX_PARK` backstop.
+    let mut paused_since: Option<Instant> = None;
     loop {
+        // Flow-control gate (see the Unix variant for the rationale). While
+        // paused we stop reading; the ConPTY pipe buffer fills and the child's
+        // next write blocks — back-pressure to the producer. `FLOW_MAX_PARK`
+        // force-resumes a never-resumed pause.
+        if flow_paused.load(Ordering::Relaxed) {
+            flush_pty_batch(sessions, session_id, &mut batch, &mut last_flush);
+            while flow_paused.load(Ordering::Relaxed) {
+                let since = *paused_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= FLOW_MAX_PARK {
+                    eprintln!(
+                        "[codemux::terminal] session {session_id} flow-paused for >{}s — \
+                         force-resuming (renderer wedged or resume frame lost)",
+                        FLOW_MAX_PARK.as_secs()
+                    );
+                    flow_paused.store(false, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(FLOW_PARK_POLL);
+            }
+            paused_since = None;
+        }
+
         match reader.read(&mut buf) {
             Ok(n) if n > 0 => {
                 let data = &buf[..n];
@@ -1510,7 +1598,11 @@ fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
     #[cfg(windows)]
     let poll_fd: PollFd = ();
 
-    with_session_runtime(
+    // Clone the back-pressure flag out under the same lock that publishes the
+    // runtime, so the reader thread and the `pause_pty_output`/`resume_pty_output`
+    // commands share one `Arc<AtomicBool>` with no further locking on the hot
+    // read path. A fresh spawn always starts unpaused.
+    let flow_paused = with_session_runtime(
         &sessions,
         &session_id,
         || SessionRuntime::new(&session_id),
@@ -1520,10 +1612,12 @@ fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
             runtime.child_pid = Some(child_pid);
             runtime.skip_preset_launch = auto_resume_command.is_some();
             runtime.resume_command = auto_resume_command.clone();
+            runtime.flow_paused.store(false, Ordering::Relaxed);
             // Spawn complete — clear the reservation marker so the runtime
             // looks identical to a non-spawning runtime in every downstream
             // check (terminate_pty_session, restart_terminal_session, etc.).
             runtime.is_spawning = false;
+            runtime.flow_paused.clone()
         },
     );
 
@@ -1570,6 +1664,7 @@ fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
 
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let read_flow_paused = flow_paused;
     let scanner_session_id = session_id.clone();
     let mut line_buf = Vec::<u8>::new();
 
@@ -1579,6 +1674,7 @@ fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
             poll_fd,
             &read_sessions,
             &read_session_id,
+            &read_flow_paused,
             |data: &[u8]| {
                 if !has_scanner {
                     return;
@@ -2069,6 +2165,12 @@ pub fn attach_pty_output(
             runtime.output_channel = Some(channel.clone());
             runtime.output_channel_generation =
                 runtime.output_channel_generation.saturating_add(1);
+            // Self-heal: a freshly attached renderer is, by definition, caught
+            // up. Clear any stale flow-control pause so the in-process read
+            // loop resumes — guards against a prior pane that paused and was
+            // torn down before its resume landed. (The daemon clears its own
+            // flag on `Attach` for the same reason.)
+            runtime.flow_paused.store(false, Ordering::Relaxed);
             if skip_pending.unwrap_or(false) {
                 vec![]
             } else {
@@ -2108,23 +2210,29 @@ pub fn detach_pty_output(
             runtime.output_channel = None;
             runtime.output_channel_generation =
                 runtime.output_channel_generation.saturating_add(1);
+            // Self-heal: the renderer that requested back-pressure is going
+            // away. Resume the in-process read loop so a backgrounded child
+            // (e.g. a daemon-less agent left running on tab switch) is not left
+            // blocked on `write()` indefinitely. The renderer also resumes
+            // explicitly on unmount; this is the backend belt-and-suspenders.
+            runtime.flow_paused.store(false, Ordering::Relaxed);
         },
     );
 
     Ok(())
 }
 
-/// Pause the daemon's PTY read loop for a session (terminal output flow
-/// control). The renderer calls this when a fast producer outruns its xterm
-/// write queue; pausing makes the child block on `write()` once the kernel
-/// PTY buffer fills — real backpressure instead of an ever-growing renderer
-/// queue.
+/// Pause a session's PTY read loop (terminal output flow control). The renderer
+/// calls this when a fast producer outruns its xterm write queue; pausing makes
+/// the child block on `write()` once the kernel PTY buffer fills — real
+/// back-pressure instead of an ever-growing renderer queue (or, worse,
+/// `pending_output` eviction once the 256 MiB ring caps).
 ///
-/// In-process (non-daemon) sessions are a deliberate no-op: they keep
-/// today's behavior exactly, so this can never regress the fallback path.
-/// The daemon side fail-safes (resume on attach/close + a max-park backstop)
-/// guarantee a paused PTY always self-heals even if the matching resume is
-/// never delivered.
+/// Works on BOTH spawn paths: daemon-backed sessions route to the daemon's
+/// read loop; in-process sessions flip the shared `flow_paused` flag the
+/// in-process `batched_reader_loop` polls. Both paths self-heal (resume on
+/// attach/detach + a max-park backstop) so a paused PTY can never wedge even
+/// if the matching resume is never delivered.
 #[tauri::command]
 pub fn pause_pty_output(
     terminal_state: State<'_, PtyState>,
@@ -2134,8 +2242,7 @@ pub fn pause_pty_output(
     Ok(())
 }
 
-/// Resume the daemon's PTY read loop for a session. See `pause_pty_output`.
-/// Idempotent and a no-op for in-process sessions.
+/// Resume a session's PTY read loop. See `pause_pty_output`. Idempotent.
 #[tauri::command]
 pub fn resume_pty_output(
     terminal_state: State<'_, PtyState>,
@@ -2145,36 +2252,48 @@ pub fn resume_pty_output(
     Ok(())
 }
 
-/// Route a flow-control pause/resume to the daemon that owns `session_id`.
-/// Fire-and-forget (mirrors `DaemonWriter`): flow control is advisory and
-/// not latency-sensitive, and a failure (e.g. the session just exited) is
-/// benign. No-op when the session has no daemon client (in-process path).
+/// Apply a flow-control pause/resume to whichever read loop owns `session_id`.
+///
+/// In-process path: flip the session's shared `flow_paused` atomic — the
+/// `batched_reader_loop` polls it and stops/starts draining the master fd.
+/// Daemon path: ALSO route to the daemon (fire-and-forget, mirroring
+/// `DaemonWriter`); flow control is advisory and a failure (e.g. the session
+/// just exited) is benign. Setting the in-process flag for a daemon-backed
+/// session is harmless — no in-process loop reads it for that session.
 fn set_pty_flow_paused(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     paused: bool,
 ) {
-    #[cfg(unix)]
-    {
-        let client = with_existing_session_runtime(sessions, session_id, |runtime| {
+    // Flip the in-process flag under the lock and grab the daemon client (if
+    // any) in the same pass, so we touch the session map exactly once.
+    let daemon_client = with_existing_session_runtime(sessions, session_id, |runtime| {
+        runtime.flow_paused.store(paused, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
             runtime.daemon_client.clone()
-        })
-        .flatten();
-        if let Some(client) = client {
-            let session_id = session_id.to_string();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = client.set_flow_paused(session_id.clone(), paused).await {
-                    eprintln!(
-                        "[codemux::terminal] flow-control set_flow_paused(paused={paused}) \
-                         for {session_id} failed (benign if the session just exited): {error}"
-                    );
-                }
-            });
         }
+        #[cfg(not(unix))]
+        {
+            Option::<()>::None
+        }
+    });
+
+    #[cfg(unix)]
+    if let Some(client) = daemon_client.flatten() {
+        let session_id = session_id.to_string();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = client.set_flow_paused(session_id.clone(), paused).await {
+                eprintln!(
+                    "[codemux::terminal] flow-control set_flow_paused(paused={paused}) \
+                     for {session_id} failed (benign if the session just exited): {error}"
+                );
+            }
+        });
     }
     #[cfg(not(unix))]
     {
-        let _ = (sessions, session_id, paused);
+        let _ = daemon_client;
     }
 }
 
@@ -2902,7 +3021,9 @@ fn spawn_pty_for_agent_in_process(
     #[cfg(windows)]
     let poll_fd: PollFd = ();
 
-    with_session_runtime(
+    // Share the back-pressure flag with the reader thread (see the same
+    // pattern in `spawn_pty_for_session_in_process`).
+    let flow_paused = with_session_runtime(
         &sessions,
         &session_id,
         || SessionRuntime::new(&session_id),
@@ -2910,9 +3031,11 @@ fn spawn_pty_for_agent_in_process(
             runtime.writer = Some(writer);
             runtime.master = Some(pty_pair.master);
             runtime.child_pid = Some(child_pid);
+            runtime.flow_paused.store(false, Ordering::Relaxed);
             // Spawn complete — clear the reservation marker. See the same
             // pattern at the end of `spawn_pty_for_session`.
             runtime.is_spawning = false;
+            runtime.flow_paused.clone()
         },
     );
 
@@ -2945,6 +3068,7 @@ fn spawn_pty_for_agent_in_process(
 
     let read_sessions = sessions.clone();
     let read_session_id = session_id.clone();
+    let read_flow_paused = flow_paused;
     let log_lock_opt: Option<(Arc<Mutex<std::fs::File>>, String)> =
         match (comm_log_path.as_ref(), agent_role.as_ref()) {
             (Some(path), Some(role)) => Some((get_comm_log_lock(path), role.clone())),
@@ -2960,6 +3084,7 @@ fn spawn_pty_for_agent_in_process(
             poll_fd,
             &read_sessions,
             &read_session_id,
+            &read_flow_paused,
             |data| {
                 // Buffer agent output for communication log (cleaned); flush periodically
                 if let Some((ref log_lock, ref role)) = log_lock_opt {
@@ -4029,8 +4154,16 @@ mod tests {
 
         // Start the batched reader loop in a background thread.
         let read_sessions = sessions.clone();
+        let flow_paused = Arc::new(AtomicBool::new(false));
         let reader_handle = std::thread::spawn(move || {
-            batched_reader_loop(&mut reader, poll_fd, &read_sessions, "test-pty", |_| {});
+            batched_reader_loop(
+                &mut reader,
+                poll_fd,
+                &read_sessions,
+                "test-pty",
+                &flow_paused,
+                |_| {},
+            );
         });
 
         // Write a small payload — well below PTY_BATCH_SIZE.
@@ -4123,6 +4256,343 @@ mod tests {
         drop(pair.slave);
         drop(writer);
         reader_handle.join().expect("reader thread panicked");
+    }
+
+    /// In-process flow control: while `flow_paused` is set the batched reader
+    /// loop must NOT drain the PTY master fd (so the kernel buffer fills and the
+    /// child blocks on write — real back-pressure), and once cleared it must
+    /// resume and deliver the buffered output. This is the in-process analogue
+    /// of the daemon's flow gate and the core of issue #73's backend change.
+    ///
+    /// Shares the careful "keep slave alive until after the assert" line-
+    /// discipline sequencing documented at length in
+    /// `test_batch_flushes_on_timeout_without_further_writes`.
+    #[cfg(unix)]
+    #[test]
+    fn test_in_process_flow_control_pauses_and_resumes_reader() {
+        use portable_pty::{native_pty_system, PtySize};
+
+        let sessions = make_sessions();
+        with_session_runtime(
+            &sessions,
+            "flow-pty",
+            || SessionRuntime::new("flow-pty"),
+            |_| {},
+        );
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 2,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("failed to open pty");
+
+        let poll_fd = pair.master.as_raw_fd().expect("no raw fd");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+        let mut writer = pair.master.take_writer().expect("take writer");
+
+        // Start PAUSED so the loop parks on its very first iteration.
+        let flow_paused = Arc::new(AtomicBool::new(true));
+        let read_sessions = sessions.clone();
+        let read_flow_paused = flow_paused.clone();
+        let reader_handle = std::thread::spawn(move || {
+            batched_reader_loop(
+                &mut reader,
+                poll_fd,
+                &read_sessions,
+                "flow-pty",
+                &read_flow_paused,
+                |_| {},
+            );
+        });
+
+        // Write a tiny payload (well under the kernel PTY buffer, so the write
+        // itself never blocks). The line discipline echoes it into the master's
+        // read side, where it sits because the loop is parked.
+        let payload = b"paused output should not drain\r\n";
+        writer.write_all(payload).expect("write failed");
+        writer.flush().expect("flush failed");
+
+        // While paused, the bytes must NOT reach pending_output. Wait well past
+        // PTY_BATCH_INTERVAL so a non-gated loop would certainly have flushed.
+        std::thread::sleep(Duration::from_millis(250));
+        {
+            let guard = sessions.lock().unwrap();
+            let runtime = guard.get("flow-pty").unwrap();
+            assert!(
+                runtime.pending_output.is_empty(),
+                "paused reader must not drain the master fd, but pending_output \
+                 had {} chunk(s)",
+                runtime.pending_output.len()
+            );
+        }
+
+        // Resume — the buffered echo should now drain into pending_output.
+        flow_paused.store(false, Ordering::Relaxed);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut found = false;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+            {
+                let guard = sessions.lock().unwrap();
+                let runtime = guard.get("flow-pty").unwrap();
+                if !runtime.pending_output.is_empty() {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found,
+            "after resume, buffered output should drain into pending_output within 3s"
+        );
+
+        let content = {
+            let guard = sessions.lock().unwrap();
+            let runtime = guard.get("flow-pty").unwrap();
+            runtime
+                .pending_output
+                .iter()
+                .flat_map(|c| c.iter().copied())
+                .collect::<Vec<u8>>()
+        };
+        let content_str = String::from_utf8_lossy(&content);
+        assert!(
+            content_str.contains("paused output should not drain"),
+            "resumed output should contain the written payload, got: {content_str:?}"
+        );
+
+        // Tear down (see the sibling test for why slave must drop before join).
+        drop(pair.slave);
+        drop(writer);
+        reader_handle.join().expect("reader thread panicked");
+    }
+
+    /// End-to-end firehose: a real `yes` producer in a real PTY, the real
+    /// `batched_reader_loop`, and a real `tauri::ipc::Channel` consumer — the
+    /// full in-process path issue #73 targets. Exercises every acceptance
+    /// criterion at the backend level:
+    ///   1. with a consumer attached, `pending_output` stays bounded and
+    ///      `dropped_chunks` stays 0 throughout;
+    ///   2. pausing stops bytes reaching the consumer (the producer blocks on
+    ///      write — real back-pressure) and resuming delivers again, with no
+    ///      permanent stall;
+    ///   3. all of this on an in-process (non-daemon) session.
+    #[cfg(unix)]
+    #[test]
+    fn test_firehose_backpressure_bounds_backend_with_consumer_attached() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::sync::atomic::AtomicUsize;
+
+        let sessions = make_sessions();
+        with_session_runtime(&sessions, "fire", || SessionRuntime::new("fire"), |_| {});
+
+        // Real PTY + a real `yes` firehose writing into the slave.
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut child = pair
+            .slave
+            .spawn_command(CommandBuilder::new("yes"))
+            .expect("spawn yes");
+
+        let poll_fd = pair.master.as_raw_fd().expect("raw fd");
+        let mut reader = pair.master.try_clone_reader().expect("clone reader");
+
+        // Real Channel consumer: count the bytes it receives. Installing it on
+        // the runtime means `queue_or_send_output` forwards every chunk to it
+        // (and never counts a drop while a channel is attached).
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_handler = received.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |body| {
+            let bytes = body.deserialize::<Vec<u8>>().expect("decode body");
+            received_handler.fetch_add(bytes.len(), Ordering::SeqCst);
+            Ok(())
+        });
+
+        // Start unpaused; grab the shared flow flag (mirrors the spawn path).
+        let flow_paused = with_session_runtime(
+            &sessions,
+            "fire",
+            || SessionRuntime::new("fire"),
+            |runtime| {
+                runtime.output_channel = Some(channel);
+                runtime.output_channel_generation += 1;
+                runtime.flow_paused.store(false, Ordering::Relaxed);
+                runtime.flow_paused.clone()
+            },
+        );
+
+        let read_sessions = sessions.clone();
+        let read_flow_paused = flow_paused.clone();
+        let reader_handle = std::thread::spawn(move || {
+            batched_reader_loop(
+                &mut reader,
+                poll_fd,
+                &read_sessions,
+                "fire",
+                &read_flow_paused,
+                |_| {},
+            );
+        });
+
+        // Helper: assert the backend never lets the ring overflow into drops
+        // and never exceeds the byte cap, with a consumer attached.
+        let assert_bounded = |sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>| {
+            let guard = sessions.lock().unwrap();
+            let rt = guard.get("fire").unwrap();
+            assert_eq!(
+                rt.dropped_chunks, 0,
+                "with a consumer attached the dropped-chunk counter must stay 0"
+            );
+            assert!(
+                rt.pending_output_bytes <= OUTPUT_BUFFER_BYTE_LIMIT,
+                "pending_output must stay bounded by the ring cap, got {} > {}",
+                rt.pending_output_bytes,
+                OUTPUT_BUFFER_BYTE_LIMIT
+            );
+        };
+
+        // ── Phase A: running — the firehose reaches the consumer. ──
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while received.load(Ordering::SeqCst) < 64 * 1024
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            received.load(Ordering::SeqCst) >= 64 * 1024,
+            "consumer should receive the firehose while running (got {} bytes)",
+            received.load(Ordering::SeqCst)
+        );
+        assert_bounded(&sessions);
+
+        // ── Phase B: paused — back-pressure stops delivery entirely. ──
+        flow_paused.store(true, Ordering::Relaxed);
+        // Let any in-flight read/flush settle, then snapshot.
+        std::thread::sleep(Duration::from_millis(200));
+        let at_pause = received.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        let after_pause = received.load(Ordering::SeqCst);
+        assert_eq!(
+            after_pause, at_pause,
+            "while paused the consumer must receive NOTHING further (producer is \
+             blocked on write) — got {at_pause} then {after_pause}"
+        );
+        assert_bounded(&sessions);
+
+        // ── Phase C: resumed — delivery continues, no permanent stall. ──
+        flow_paused.store(false, Ordering::Relaxed);
+        let resume_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while received.load(Ordering::SeqCst) <= after_pause
+            && std::time::Instant::now() < resume_deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            received.load(Ordering::SeqCst) > after_pause,
+            "consumer must receive again after resume (no permanent stall): \
+             {after_pause} then {}",
+            received.load(Ordering::SeqCst)
+        );
+        assert_bounded(&sessions);
+
+        // ── Teardown ── kill the firehose, ensure the loop isn't parked, then
+        // let it observe EOF and exit so the join returns.
+        flow_paused.store(false, Ordering::Relaxed);
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(pair.slave);
+        reader_handle.join().expect("reader thread panicked");
+    }
+
+    /// `set_pty_flow_paused` must flip the in-process `flow_paused` flag for a
+    /// session with no daemon client — i.e. pause/resume is no longer a no-op on
+    /// the in-process path (issue #73 acceptance criterion). Attach then clears
+    /// it (self-heal).
+    #[test]
+    fn test_set_pty_flow_paused_toggles_in_process_flag() {
+        let sessions = make_sessions();
+        let flag = with_session_runtime(
+            &sessions,
+            "inproc",
+            || SessionRuntime::new("inproc"),
+            |runtime| {
+                // No daemon_client set → this is an in-process session.
+                runtime.flow_paused.clone()
+            },
+        );
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a fresh session starts unpaused"
+        );
+
+        set_pty_flow_paused(&sessions, "inproc", true);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "pause must set the in-process flow_paused flag (not a no-op)"
+        );
+
+        set_pty_flow_paused(&sessions, "inproc", false);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "resume must clear the in-process flow_paused flag"
+        );
+
+        // Re-pause, then simulate a reattach: attach_pty_output clears the flag
+        // as a self-heal so a reattaching pane always starts live.
+        set_pty_flow_paused(&sessions, "inproc", true);
+        assert!(flag.load(Ordering::Relaxed));
+        with_existing_session_runtime(&sessions, "inproc", |runtime| {
+            // Mirror the self-heal line in attach_pty_output.
+            runtime.flow_paused.store(false, Ordering::Relaxed);
+        });
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "attach self-heal must clear a stale pause"
+        );
+    }
+
+    /// `set_pty_flow_paused` on a missing session is a benign no-op (the session
+    /// may have just exited between the renderer's watermark check and the IPC).
+    #[test]
+    fn test_set_pty_flow_paused_missing_session_is_noop() {
+        let sessions = make_sessions();
+        // Must not panic / must not create a phantom runtime.
+        set_pty_flow_paused(&sessions, "ghost", true);
+        let guard = sessions.lock().unwrap();
+        assert!(
+            guard.get("ghost").is_none(),
+            "flow control on a missing session must not materialize a runtime"
+        );
+    }
+
+    /// The `FLOW_MAX_PARK` backstop must force-resume a reader that was paused
+    /// and never resumed, so a wedged/crashed renderer can't block the child
+    /// forever. We can't wait the full 10s in a unit test, so this asserts the
+    /// invariant structurally: the constant is positive and the poll cadence is
+    /// shorter than the cap (a parked loop re-checks the flag and the deadline
+    /// many times before force-resuming).
+    #[test]
+    fn test_flow_max_park_backstop_constants_are_sane() {
+        assert!(
+            FLOW_MAX_PARK > Duration::ZERO,
+            "max-park backstop must be a positive duration"
+        );
+        assert!(
+            FLOW_PARK_POLL > Duration::ZERO && FLOW_PARK_POLL < FLOW_MAX_PARK,
+            "park poll cadence must be positive and well under the max-park cap"
+        );
     }
 
     // -- workspace_pty_env tests -------------------------------------------------
