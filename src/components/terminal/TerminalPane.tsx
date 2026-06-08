@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { WebglAddon } from "@xterm/addon-webgl";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -130,6 +131,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
   // Adapter captures from the scrollback restore — persists across tab switches
   // even when the pane state (layout.json) doesn't have them.
@@ -281,9 +283,36 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     term.loadAddon(serializeAddon);
     term.open(containerEl);
 
+    // ── WebGL renderer ──
+    // Offload glyph rendering to the GPU — substantially faster and smoother
+    // for the long-running, high-output agent sessions Codemux runs. Must load
+    // AFTER term.open() because the addon needs the opened terminal's DOM
+    // element. Wrapped in try/catch so an environment without WebGL2 support
+    // (e.g. a software-only WebView) falls back to the default DOM renderer
+    // instead of throwing and breaking the whole pane.
+    let webglAddon: WebglAddon | null = null;
+    try {
+      const addon = new WebglAddon();
+      // Required: when the GPU drops the canvas context, dispose the addon so
+      // xterm falls back to the DOM renderer rather than rendering a blank pane.
+      addon.onContextLoss(() => {
+        addon.dispose();
+        webglAddonRef.current = null;
+      });
+      term.loadAddon(addon);
+      webglAddon = addon;
+    } catch (err) {
+      console.warn(
+        "[codemux::terminal] WebGL renderer unavailable, using DOM renderer:",
+        err,
+      );
+      webglAddon = null;
+    }
+
     termRef.current = term;
     fitAddonRef.current = fitAddon;
     serializeAddonRef.current = serializeAddon;
+    webglAddonRef.current = webglAddon;
     kittyStackRef.current = [];
     kittyLevelRef.current = 0;
 
@@ -682,6 +711,12 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       }
 
       unregisterSerialize();
+      // Dispose the WebGL addon before the terminal so its GPU context /
+      // canvas is released deterministically (no leak across mounts). The
+      // wrapped dispose unregisters it from xterm's addon manager, so the
+      // following term.dispose() won't double-dispose it.
+      webglAddonRef.current?.dispose();
+      webglAddonRef.current = null;
       serializeAddonRef.current = null;
       fitAddonRef.current = null;
       kittyStackRef.current = [];

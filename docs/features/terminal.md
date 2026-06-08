@@ -12,11 +12,11 @@ The terminal system provides multi-session PTY terminals rendered with xterm.js.
 
 ## Current Model
 
-The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a master PTY handle, a read thread, and a write path. The frontend uses xterm.js's DOM renderer for display, matching the pre-`v0.1.30` latency profile. Data flows: PTY read thread -> Tauri channel -> xterm.js write. User input flows: xterm.js onData -> Tauri command `write_to_pty` -> PTY master write. PTY output delivery clones the Tauri channel under the session lock and sends outside that lock, so active keystrokes do not block behind IPC delivery for busy terminals.
+The Rust layer uses `portable-pty` to spawn shells. Each terminal session has a master PTY handle, a read thread, and a write path. The frontend renders with xterm.js's **WebGL renderer** (`@xterm/addon-webgl`), which offloads glyph rasterization to the GPU — the recommended renderer for the fast, long-running agent output Codemux streams. The addon is loaded after `term.open()` (it needs the opened terminal's DOM element) and registers an `onContextLoss` handler that disposes it so xterm falls back to its DOM renderer if the GPU drops the canvas context; construction is wrapped in try/catch so an environment without WebGL2 support also falls back to the DOM renderer instead of breaking the pane. Data flows: PTY read thread -> Tauri channel -> xterm.js write. User input flows: xterm.js onData -> Tauri command `write_to_pty` -> PTY master write. PTY output delivery clones the Tauri channel under the session lock and sends outside that lock, so active keystrokes do not block behind IPC delivery for busy terminals.
 
 ### Terminal Pane Lifecycle (per-mount) + throttled write pump
 
-The live terminal render path is `src/components/terminal/TerminalPane.tsx`. Each pane constructs its own xterm.js `Terminal` (DOM renderer) on mount and disposes it on unmount. Because `src/components/layout/workspace-main.tsx` only renders the active workspace and `PaneContainer` only renders the active surface (tab), switching workspaces or tabs **unmounts** the previous pane tree and **mounts** the new one — terminals are rebuilt from scratch on every switch (a fresh xterm + scrollback restore + PTY reattach).
+The live terminal render path is `src/components/terminal/TerminalPane.tsx`. Each pane constructs its own xterm.js `Terminal` (WebGL renderer, DOM fallback) on mount and disposes it — including the WebGL addon — on unmount. Because `src/components/layout/workspace-main.tsx` only renders the active workspace and `PaneContainer` only renders the active surface (tab), switching workspaces or tabs **unmounts** the previous pane tree and **mounts** the new one — terminals are rebuilt from scratch on every switch (a fresh xterm + scrollback restore + PTY reattach).
 
 To keep that switch from freezing the UI, every byte destined for xterm — disk-scrollback restore, the PTY reattach replay, and steady live output — is funneled through a single throttled write pump (`src/components/terminal/terminal-write-pump.ts`). The pump drains a bounded byte budget per macrotask and yields between batches, so a multi-MB `attach_pty_output` replay (the backend replays the whole `pending_output` ring on every attach) fills in over a few frames instead of blocking the click + visibly "pouring in". Historical bytes are enqueued **before** the live channel attaches, so the single FIFO drain preserves xterm's stateful parse order (alt-screen / cursor state across the history→live boundary).
 
@@ -31,7 +31,7 @@ On unmount the outgoing pane serializes its buffer (`@xterm/addon-serialize`) an
   - **Unix**: respects `$SHELL` and falls back to `/bin/bash`
   - **Windows**: prefers `pwsh.exe` (PowerShell 7+) when on `PATH`, falls back to `powershell.exe` (Windows PowerShell 5.1, pre-installed on every supported Windows version), then `%COMSPEC%`, then literal `"cmd.exe"`. PowerShell wins because the Windows preset wrappers emit PowerShell `$env:VAR` syntax for context injection — see `agent_context.rs` and `docs/features/presets.md`
 - PTY resize on pane/window resize
-- xterm.js renderer with kitty keyboard protocol support
+- xterm.js WebGL renderer (GPU glyph rendering) with automatic DOM-renderer fallback on GPU context loss or missing WebGL2 support, plus kitty keyboard protocol support
 - terminal theme reads dynamically from CSS variables via MutationObserver
 - session state tracking (running, exited, error)
 - environment injection: `CODEMUX`, `CODEMUX_VERSION`, `CODEMUX_WORKSPACE_ID`, `CODEMUX_BROWSER_CMD`, `BROWSER`, `CODEMUX_AGENT_CONTEXT`
@@ -58,7 +58,7 @@ Note: terminal scrollback is saved and restored across app restarts. See `docs/f
 
 ## Important Touch Points
 
-- `src/components/terminal/TerminalPane.tsx` — **the live terminal component**: per-mount xterm lifecycle, scrollback restore + reattach via the throttled write pump, ResizeObserver, focus, status overlay, custom key handler, alt-screen serialize skip
+- `src/components/terminal/TerminalPane.tsx` — **the live terminal component**: per-mount xterm lifecycle, WebGL renderer load (after `term.open()`, with `onContextLoss` → DOM fallback and a try/catch guard for no-WebGL2 environments; disposed on unmount), scrollback restore + reattach via the throttled write pump, ResizeObserver, focus, status overlay, custom key handler, alt-screen serialize skip
 - `src/components/terminal/terminal-write-pump.ts` — **the live freeze fix**: ordered, byte-budgeted write queue that throttles scrollback restore + reattach replay + live output across macrotasks; unit-tested in `terminal-write-pump.test.ts`
 - `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks, `attach_pty_output` (replays the full `pending_output` ring on attach — the reattach replay the write pump throttles), dropped-chunk observability counter, `pause_pty_output` / `resume_pty_output` flow-control commands
 - `src-tauri/src/pty_daemon/{protocol,client,server}.rs` — `SetFlowPaused` wire request + per-session `flow_paused` flag gating the daemon read loop (with `Attach`/`Close`/max-park fail-safes); only invoked by the disabled cache today (see below)
