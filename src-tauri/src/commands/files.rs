@@ -125,22 +125,32 @@ fn git_ignored_set(
         return ignored;
     }
 
-    // Build stdin: one path per line
-    let paths: Vec<String> = entries
+    // Feed paths RELATIVE to `dir` (just the entry name, with a
+    // trailing `/` for directories) and use `-z` (NUL separators).
+    // Both halves matter: `check-ignore` echoes matching input paths
+    // back verbatim, and in line mode git C-quotes any "unusual"
+    // output — the backslashes of a Windows absolute path or any
+    // non-ASCII byte (core.quotepath) — producing lines like
+    // `"C:\\Users\\..."` whose extracted basename carries a stray
+    // trailing quote and never matches the entry name. That's how
+    // gitignore flagging silently broke on Windows. Relative names
+    // keep the round-trip independent of how the caller spelled the
+    // directory path; `-z` disables quoting entirely, so the echoed
+    // bytes match the fed names exactly on every platform.
+    let stdin_data: Vec<u8> = entries
         .iter()
-        .map(|(_, p, is_dir, _)| {
-            let s = p.to_string_lossy().to_string();
+        .flat_map(|(name, _, is_dir, _)| {
+            let mut bytes = name.clone().into_bytes();
             if *is_dir {
-                format!("{s}/")
-            } else {
-                s
+                bytes.push(b'/');
             }
+            bytes.push(0);
+            bytes
         })
         .collect();
-    let stdin_data = paths.join("\n");
 
     let output = Command::new("git")
-        .args(["check-ignore", "--stdin"])
+        .args(["check-ignore", "--stdin", "-z"])
         .current_dir(dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -149,18 +159,21 @@ fn git_ignored_set(
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(stdin_data.as_bytes());
+                let _ = stdin.write_all(&stdin_data);
             }
             child.wait_with_output()
         });
 
     if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let p = Path::new(line.trim_end_matches('/'));
-            if let Some(name) = p.file_name() {
-                ignored.insert(name.to_string_lossy().to_string());
+        // `-z` output: each ignored input path echoed back verbatim,
+        // NUL-terminated. We fed bare entry names, so each chunk IS
+        // the entry name (modulo the directory marker we appended).
+        for chunk in output.stdout.split(|b| *b == 0) {
+            if chunk.is_empty() {
+                continue;
             }
+            let name = String::from_utf8_lossy(chunk);
+            ignored.insert(name.trim_end_matches('/').to_string());
         }
     }
 
@@ -1183,6 +1196,91 @@ mod tests {
             .find(|e| e.name == "ignored.txt")
             .expect("ignored.txt should be listed");
         assert!(ignored.is_gitignored, "ignored.txt must be flagged");
+        let kept = entries
+            .iter()
+            .find(|e| e.name == "kept.txt")
+            .expect("kept.txt should be listed");
+        assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    /// Same as above, but the directory is reached through a symlink —
+    /// the path handed to `list_directory` then differs from the
+    /// physical path `getcwd()` reports inside the `git check-ignore`
+    /// subprocess (the kernel resolves symlinks for cwd). Real-world
+    /// shape: macOS `/tmp` → `/private/tmp`, or a project tree behind
+    /// a symlinked home dir. Locks in that the cwd-relative feed stays
+    /// immune to how the caller spelled the directory path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_directory_marks_gitignored_entries_via_symlinked_path() {
+        let real = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(real.path())
+            .output()
+            .expect("git must be installed for this test");
+        assert!(init.status.success(), "git init failed");
+
+        fs::write(real.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(real.path().join("ignored.txt"), "x").unwrap();
+        fs::write(real.path().join("kept.txt"), "x").unwrap();
+
+        // Reach the repo through a symlink so the caller-visible path
+        // and git's resolved cwd disagree.
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("repo-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let entries = list_directory(path_str(&link), None).await.unwrap();
+        let ignored = entries
+            .iter()
+            .find(|e| e.name == "ignored.txt")
+            .expect("ignored.txt should be listed");
+        assert!(
+            ignored.is_gitignored,
+            "ignored.txt must be flagged even when listed via a symlinked path"
+        );
+        let kept = entries
+            .iter()
+            .find(|e| e.name == "kept.txt")
+            .expect("kept.txt should be listed");
+        assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    /// Regression guard for `core.quotepath` mangling: when a path fed
+    /// to `git check-ignore --stdin` contains bytes git considers
+    /// "unusual" (non-ASCII, or the backslashes in every Windows
+    /// absolute path), git C-quotes the echoed output line —
+    /// `"tsch\303\274ss.txt"`, literal double quotes included. A parser
+    /// that splits the raw line then extracts a basename with a stray
+    /// trailing quote and the flag silently never matches. This is
+    /// exactly how gitignore flagging broke on the Windows runner
+    /// (absolute `C:\...` input → quoted output); a non-ASCII filename
+    /// reproduces the same class on every platform.
+    #[tokio::test]
+    async fn list_directory_marks_gitignored_entries_with_non_ascii_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be installed for this test");
+        assert!(init.status.success(), "git init failed");
+
+        fs::write(dir.path().join(".gitignore"), "tschüss.txt\n").unwrap();
+        fs::write(dir.path().join("tschüss.txt"), "x").unwrap();
+        fs::write(dir.path().join("kept.txt"), "x").unwrap();
+
+        let entries = list_directory(path_str(dir.path()), None).await.unwrap();
+        let ignored = entries
+            .iter()
+            .find(|e| e.name == "tschüss.txt")
+            .expect("tschüss.txt should be listed");
+        assert!(
+            ignored.is_gitignored,
+            "non-ASCII ignored entry must be flagged — if this fails, \
+             git's core.quotepath quoting is leaking into the parsed names"
+        );
         let kept = entries
             .iter()
             .find(|e| e.name == "kept.txt")
