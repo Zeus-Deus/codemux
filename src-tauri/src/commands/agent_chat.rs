@@ -13,9 +13,12 @@
 //! any session is bound to it. Provider-session commands and the
 //! event bridge land in follow-up commits.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use tauri::ipc::Channel;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
@@ -27,17 +30,27 @@ use crate::database::{AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
-/// Event name emitted by the backend whenever a provider produces a
-/// runtime event. The frontend's `useAgentChatEvents` hook subscribes
-/// to this channel and filters by `thread_id`.
+/// Event name used for the few provider events that are NOT scoped to
+/// a single thread (global `RuntimeWarning`s with no `thread_id`).
+///
+/// Thread-scoped events — including the high-frequency streaming
+/// `content_delta` tokens — do NOT ride this global event bus anymore.
+/// They are routed per-thread through a `tauri::ipc::Channel`
+/// registered via [`attach_agent_chat_output`], mirroring how PTY
+/// output streams through `attach_pty_output` (see
+/// `terminal/mod.rs`). Tauri's event system is JSON-broadcast to every
+/// listener and not designed for high-throughput streaming; Channels
+/// are the documented mechanism for exactly this case.
 pub const AGENT_CHAT_EVENT: &str = "agent_chat_event";
 
-/// Payload emitted on the [`AGENT_CHAT_EVENT`] Tauri channel.
+/// Payload delivered to the frontend for every provider runtime event.
 ///
-/// Carries the originating thread id alongside the raw canonical
-/// event so subscribers can filter without re-parsing the payload.
-/// Events that are not scoped to a single thread (global
-/// `RuntimeWarning`s) are emitted with an empty `ThreadId`.
+/// Thread-scoped events arrive over the per-thread `Channel` attached
+/// via [`attach_agent_chat_output`]; events without a thread id
+/// (global `RuntimeWarning`s) are emitted on the [`AGENT_CHAT_EVENT`]
+/// event bus with an empty `ThreadId`. The shape is identical on both
+/// transports so the frontend reducer does not care which path an
+/// event took.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentChatEventPayload {
     pub thread_id: ThreadId,
@@ -132,6 +145,127 @@ impl ProviderRegistry {
         }
         out
     }
+}
+
+// ── Per-thread live event channels ───────────────────────────────────
+
+/// A live subscriber for one thread's runtime events.
+struct AgentChatChannelEntry {
+    channel: Channel<AgentChatEventPayload>,
+    /// Attach generation minted by the registry. A detach only removes
+    /// the entry when its generation matches, so a stale detach from a
+    /// pane that already lost the thread (unmount racing a remount, or
+    /// a second pane re-attaching the same thread) can never tear down
+    /// the channel a newer subscriber just installed. Same guard idea
+    /// as `SessionRuntime::output_channel_generation` on the PTY path.
+    generation: u64,
+}
+
+/// Registry of per-thread frontend event channels (Tauri-managed
+/// state).
+///
+/// Analogous to `SessionRuntime.output_channel` in `terminal/mod.rs`:
+/// when a chat pane mounts with a bound thread it invokes
+/// [`attach_agent_chat_output`] with a fresh `Channel`; the event
+/// bridge ([`forward_event`]) then routes that thread's live events —
+/// crucially the high-frequency `content_delta` token stream — to
+/// exactly that channel instead of broadcasting them app-wide.
+///
+/// Replay split (decided in issue #75): the channel carries **live
+/// events only**. Transcript-affecting events are persisted to SQLite
+/// by `forward_event` regardless of whether a channel is attached, and
+/// a late-attaching / resumed pane rebuilds history through the
+/// existing DB hydrate (`agent_chat_list_messages` +
+/// `hydrateThread`). Events that fire while no channel is attached and
+/// that are not persisted (lifecycle notices like
+/// `session_state_changed`) are dropped — exactly the behaviour the
+/// event-bus path had for unmounted panes, where no listener was
+/// registered to hear them.
+#[derive(Default)]
+pub struct AgentChatChannelRegistry {
+    channels: Mutex<HashMap<String, AgentChatChannelEntry>>,
+    next_generation: AtomicU64,
+}
+
+impl AgentChatChannelRegistry {
+    /// Install `channel` as the live subscriber for `thread_id`,
+    /// replacing any previous subscriber (newest pane wins, like a PTY
+    /// reattach). Returns the generation token the caller must hand
+    /// back to [`detach`](Self::detach).
+    pub fn attach(
+        &self,
+        thread_id: &str,
+        channel: Channel<AgentChatEventPayload>,
+    ) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut channels = self.channels.lock().expect("channel registry poisoned");
+        channels.insert(
+            thread_id.to_string(),
+            AgentChatChannelEntry {
+                channel,
+                generation,
+            },
+        );
+        generation
+    }
+
+    /// Remove the subscriber for `thread_id`, but only when
+    /// `generation` still matches the installed entry. Returns whether
+    /// an entry was actually removed. Idempotent: detaching an unknown
+    /// thread or a superseded generation is a no-op.
+    pub fn detach(&self, thread_id: &str, generation: u64) -> bool {
+        let mut channels = self.channels.lock().expect("channel registry poisoned");
+        match channels.get(thread_id) {
+            Some(entry) if entry.generation == generation => {
+                channels.remove(thread_id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Clone the live channel for `thread_id`, if any. Cloning is
+    /// cheap (the `Channel` is internally ref-counted) and keeps the
+    /// lock scope tight on the hot streaming path.
+    pub fn channel_for(&self, thread_id: &str) -> Option<Channel<AgentChatEventPayload>> {
+        let channels = self.channels.lock().expect("channel registry poisoned");
+        channels.get(thread_id).map(|entry| entry.channel.clone())
+    }
+}
+
+/// Register a per-thread `Channel` that will receive every live
+/// runtime event for `thread_id` (see [`AgentChatChannelRegistry`]).
+/// Returns the attach generation; the frontend passes it back to
+/// [`detach_agent_chat_output`] on unmount so a stale detach cannot
+/// clobber a newer attach.
+///
+/// Not gated on `enable_agent_chat`, same rationale as
+/// `agent_chat_list_messages`: a pane bound to a session that predates
+/// a flag flip-off must still be able to stream/teardown cleanly, and
+/// attaching is side-effect-free beyond the registry entry.
+#[tauri::command]
+pub fn attach_agent_chat_output(
+    channels: State<'_, AgentChatChannelRegistry>,
+    thread_id: String,
+    channel: Channel<AgentChatEventPayload>,
+) -> Result<u64, String> {
+    if thread_id.is_empty() {
+        return Err("validation_error: thread_id cannot be empty".to_string());
+    }
+    Ok(channels.attach(&thread_id, channel))
+}
+
+/// Tear down the per-thread channel installed by
+/// [`attach_agent_chat_output`]. Idempotent; a mismatched generation
+/// (a newer pane re-attached first) is a silent no-op.
+#[tauri::command]
+pub fn detach_agent_chat_output(
+    channels: State<'_, AgentChatChannelRegistry>,
+    thread_id: String,
+    generation: u64,
+) -> Result<(), String> {
+    channels.detach(&thread_id, generation);
+    Ok(())
 }
 
 fn provider_err(err: ProviderError) -> String {
@@ -697,9 +831,11 @@ pub async fn agent_chat_list_messages(
 /// Start the provider-event forwarding tasks.
 ///
 /// Spawns one Tokio task per registered provider. Each task consumes
-/// the provider's canonical event stream and re-emits each event on
-/// the [`AGENT_CHAT_EVENT`] Tauri channel wrapped in an
-/// [`AgentChatEventPayload`]. When a provider's stream ends (on
+/// the provider's canonical event stream and forwards each event to
+/// the frontend wrapped in an [`AgentChatEventPayload`] —
+/// thread-scoped events go to the thread's attached `Channel` (see
+/// [`AgentChatChannelRegistry`]), thread-less ones to the
+/// [`AGENT_CHAT_EVENT`] event bus. When a provider's stream ends (on
 /// shutdown) the task exits cleanly; the `event_stream()` helper on
 /// each provider already swallows `broadcast::error::RecvError::Lagged`
 /// and continues, so slow subscribers never crash this loop.
@@ -728,7 +864,16 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     }
 }
 
-/// Emit a single provider event to the frontend.
+/// Forward a single provider event to the frontend.
+///
+/// Routing:
+/// - thread-scoped events → the thread's live `Channel`, when one is
+///   attached (high-throughput path; carries the `content_delta`
+///   token stream). No channel attached → the event is dropped after
+///   persistence; a late-attaching pane recovers transcript state via
+///   the DB hydrate.
+/// - thread-less events (global `RuntimeWarning`) → the
+///   [`AGENT_CHAT_EVENT`] global event bus, unchanged.
 ///
 /// Extracted so tests can exercise the translation without spinning a
 /// Tokio task or a real provider. Also used as the inner loop of
@@ -791,9 +936,33 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         // forwarded with an empty ThreadId so the frontend at least
         // sees them; a richer global-warning channel is a follow-up.
         .unwrap_or_else(|| ThreadId(String::new()));
-    let payload = AgentChatEventPayload { thread_id, event };
-    if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
-        eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
+    let payload = AgentChatEventPayload {
+        thread_id: thread_id.clone(),
+        event,
+    };
+    if thread_id.0.is_empty() {
+        // Thread-less lifecycle/warning traffic is low-frequency; the
+        // global event bus stays the simplest transport for it.
+        if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
+            eprintln!(
+                "[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}"
+            );
+        }
+        return;
+    }
+    // Thread-scoped events (incl. the content_delta token stream) go
+    // over the per-thread Channel only — never the global bus. A
+    // missing channel means no pane is currently attached to this
+    // thread; transcript events were already persisted above, so the
+    // DB hydrate replays them on (re)attach.
+    let channels: State<'_, AgentChatChannelRegistry> = app.state();
+    if let Some(channel) = channels.channel_for(&thread_id.0) {
+        if let Err(error) = channel.send(payload) {
+            eprintln!(
+                "[codemux::agent_chat] Failed to send event on thread channel {}: {error}",
+                thread_id.0
+            );
+        }
     }
 }
 
@@ -1051,6 +1220,143 @@ mod tests {
             original_payload: None,
         };
         assert!(!should_persist_event(&e));
+    }
+
+    // ── AgentChatChannelRegistry ──
+    //
+    // Pure registry semantics; the end-to-end routing through
+    // forward_event (incl. DB persistence side effects and the
+    // thread-less event-bus fallback) lives in
+    // tests/agent_chat_commands.rs where a mock app handle exists.
+
+    /// Real `tauri::ipc::Channel` whose handler captures every decoded
+    /// payload — same pattern as the terminal module's channel tests.
+    fn capture_channel() -> (
+        Channel<AgentChatEventPayload>,
+        Arc<Mutex<Vec<AgentChatEventPayload>>>,
+    ) {
+        let captured: Arc<Mutex<Vec<AgentChatEventPayload>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let captured_handler = captured.clone();
+        let channel = Channel::new(move |body| {
+            let payload = body
+                .deserialize::<AgentChatEventPayload>()
+                .expect("decode AgentChatEventPayload");
+            captured_handler.lock().unwrap().push(payload);
+            Ok(())
+        });
+        (channel, captured)
+    }
+
+    fn delta_payload(thread: &str, text: &str) -> AgentChatEventPayload {
+        AgentChatEventPayload {
+            thread_id: ThreadId(thread.into()),
+            event: ProviderRuntimeEvent::ContentDelta {
+                thread_id: ThreadId(thread.into()),
+                turn_id: turn(),
+                delta: ContentDelta::Text { text: text.into() },
+            },
+        }
+    }
+
+    #[test]
+    fn registry_attach_routes_sends_through_channel() {
+        let registry = AgentChatChannelRegistry::default();
+        let (channel, captured) = capture_channel();
+        registry.attach("t1", channel);
+
+        let live = registry.channel_for("t1").expect("channel installed");
+        live.send(delta_payload("t1", "hello")).expect("send ok");
+
+        let received = captured.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].thread_id.0, "t1");
+        match &received[0].event {
+            ProviderRuntimeEvent::ContentDelta { delta, .. } => match delta {
+                ContentDelta::Text { text } => assert_eq!(text, "hello"),
+                other => panic!("unexpected delta: {other:?}"),
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn registry_channel_for_unknown_thread_is_none() {
+        let registry = AgentChatChannelRegistry::default();
+        assert!(registry.channel_for("nope").is_none());
+    }
+
+    #[test]
+    fn registry_newest_attach_wins() {
+        let registry = AgentChatChannelRegistry::default();
+        let (first, first_captured) = capture_channel();
+        let (second, second_captured) = capture_channel();
+        let g1 = registry.attach("t1", first);
+        let g2 = registry.attach("t1", second);
+        assert_ne!(g1, g2, "each attach mints a fresh generation");
+
+        registry
+            .channel_for("t1")
+            .expect("channel installed")
+            .send(delta_payload("t1", "x"))
+            .expect("send ok");
+
+        assert!(
+            first_captured.lock().unwrap().is_empty(),
+            "superseded channel must not receive events"
+        );
+        assert_eq!(second_captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn registry_detach_with_stale_generation_is_noop() {
+        let registry = AgentChatChannelRegistry::default();
+        let (first, _) = capture_channel();
+        let (second, second_captured) = capture_channel();
+        let stale = registry.attach("t1", first);
+        let _current = registry.attach("t1", second);
+
+        // The unmounting pane that owned `first` detaches late — the
+        // newer subscriber must survive.
+        assert!(!registry.detach("t1", stale));
+        registry
+            .channel_for("t1")
+            .expect("newer channel still installed")
+            .send(delta_payload("t1", "still-live"))
+            .expect("send ok");
+        assert_eq!(second_captured.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn registry_detach_with_current_generation_removes() {
+        let registry = AgentChatChannelRegistry::default();
+        let (channel, _) = capture_channel();
+        let generation = registry.attach("t1", channel);
+        assert!(registry.detach("t1", generation));
+        assert!(registry.channel_for("t1").is_none());
+        // Idempotent on repeat.
+        assert!(!registry.detach("t1", generation));
+    }
+
+    #[test]
+    fn registry_threads_are_independent() {
+        let registry = AgentChatChannelRegistry::default();
+        let (a, a_captured) = capture_channel();
+        let (b, b_captured) = capture_channel();
+        registry.attach("thread-a", a);
+        registry.attach("thread-b", b);
+
+        registry
+            .channel_for("thread-a")
+            .unwrap()
+            .send(delta_payload("thread-a", "for-a"))
+            .unwrap();
+
+        assert_eq!(a_captured.lock().unwrap().len(), 1);
+        assert!(
+            b_captured.lock().unwrap().is_empty(),
+            "no cross-thread leakage"
+        );
     }
 
     #[test]
